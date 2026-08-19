@@ -1,11 +1,71 @@
 import { Hono } from "hono";
 import { relayCreate, relayCreateStream } from "./relay/client";
+import { uploadFileFromFormData, getFileContent, getFile, listFiles } from "./proxy/files";
 import { WebSocketServer } from "ws";
 import { createServer as createHttpServer } from "node:http";
 const app = new Hono();
 app.get("/health", (c) => c.json({ ok: true }));
+
+// Files + Prompt Caching Passthrough (Task 7)
+// POST /v1/files -> POST /api/project-files/upload?prism_cache_bust=... (via src/proxy/files.ts)
+// GET /v1/files/:id/content -> GET /s/sandboxes/proxy/zip?prism_cache_bust=... (via src/proxy/files.ts)
+// prompt_cache_key / prompt_cache_options / prompt_cache_breakpoint forwarded verbatim (see relayCreate)
+// tool_choice: allowed_tools forwarded verbatim (Global Constraints: forward verbatim)
+// 15 rpm note: prompt_cache_key is rate-limited to 15 rpm per key; writes cost 1.25x, reads 0.1x
+app.post("/v1/files", async (c) => {
+  try {
+    const formData = await c.req.formData();
+    const file = formData.get("file");
+    if (!file) return c.json({ error: "missing file" }, 400);
+    const result = await uploadFileFromFormData(formData);
+    return c.json(result);
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? String(e) }, 500);
+  }
+});
+app.get("/v1/files", async (c) => {
+  try {
+    const files = await listFiles();
+    return c.json({ object: "list", data: files });
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? String(e) }, 500);
+  }
+});
+app.get("/v1/files/:id", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const file = await getFile(id);
+    return c.json(file);
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? String(e) }, 404);
+  }
+});
+app.get("/v1/files/:id/content", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const data = await getFileContent(id);
+    // Try to infer content-type from file metadata if available
+    let contentType = "application/octet-stream";
+    try {
+      const meta: any = await getFile(id).catch(() => null);
+      if (meta?.filename?.endsWith(".png")) contentType = "image/png";
+      else if (meta?.filename?.endsWith(".jpg") || meta?.filename?.endsWith(".jpeg")) contentType = "image/jpeg";
+      else if (meta?.filename?.endsWith(".json")) contentType = "application/json";
+    } catch {}
+    return new Response(data as any, { headers: { "content-type": contentType } });
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? String(e) }, 404);
+  }
+});
+
 app.post("/v1/responses", async (c) => {
-  const body = await c.req.json();
+  const body: any = await c.req.json();
+  // Prompt caching passthrough: forward verbatim per Global Constraints
+  // - prompt_cache_key: string (15 rpm limit, 1.25x write, 0.1x read)
+  // - prompt_cache_options: {mode:"explicit", ttl:"30m"}
+  // - prompt_cache_breakpoint: {mode:"explicit"}
+  // Tool choice passthrough: allow "auto" | "required" | "none" | {type:"function", name} | {type:"allowed_tools", allowed_tools: [...]}
+  // All fields are preserved via relayCreate's verbatim spread; no stripping.
   if (body.stream) {
     const stream = new ReadableStream({
       async start(controller) {
