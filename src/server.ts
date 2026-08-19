@@ -7,6 +7,29 @@ import { queue } from "./utils/queue";
 const app = new Hono();
 app.get("/health", (c) => c.json({ ok: true }));
 
+// Stable-loop bridge fallback handlers (F2) — no-op 200 for live Prism runs.
+// src/proxy/yjs.ts:42 POSTs to /__bridge/write, src/relay/client.ts:29 POSTs to /__internal/write-job.
+// Without these, a real PRISM_DOC_ID run would 404 after writeJob. Mocked tests use globalThis.fetch mock so they don't hit here.
+app.post("/__bridge/write", async (c) => {
+  try {
+    const body: any = await c.req.json();
+    // Preserve last job for zip synthesis fallback
+    if (body?.content) {
+      try { (globalThis as any).__LAST_JOB__ = JSON.parse(body.content); } catch { (globalThis as any).__LAST_JOB__ = body; }
+    } else {
+      (globalThis as any).__LAST_JOB__ = body;
+    }
+  } catch {}
+  return c.json({ ok: true });
+});
+app.post("/__internal/write-job", async (c) => {
+  try {
+    const body: any = await c.req.json();
+    (globalThis as any).__LAST_JOB__ = body;
+  } catch {}
+  return c.json({ ok: true });
+});
+
 // Files + Prompt Caching Passthrough (Task 7)
 // POST /v1/files -> POST /api/project-files/upload?prism_cache_bust=... (via src/proxy/files.ts)
 // GET /v1/files/:id/content -> GET /s/sandboxes/proxy/zip?prism_cache_bust=... (via src/proxy/files.ts)
@@ -155,7 +178,7 @@ if (import.meta.main) {
       for await (const chunk of req) chunks.push(chunk as Buffer);
       if (chunks.length) body = Buffer.concat(chunks);
     }
-    const request = new Request(url, { method: req.method, headers, body });
+    const request = new Request(url, { method: req.method, headers, body: body ? new Uint8Array(body) : undefined });
     const response = await app.fetch(request);
     res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
     if (response.body) {

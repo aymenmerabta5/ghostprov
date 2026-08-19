@@ -51,7 +51,7 @@ beforeAll(async () => {
       for await (const chunk of req) chunks.push(chunk as Buffer);
       if (chunks.length) body = Buffer.concat(chunks);
     }
-    const request = new Request(url, { method: req.method, headers, body });
+    const request = new Request(url, { method: req.method, headers, body: body ? new Uint8Array(body) : undefined });
     const response = await app.fetch(request);
     res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
     if (response.body) {
