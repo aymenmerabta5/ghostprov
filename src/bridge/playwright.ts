@@ -501,8 +501,23 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   // Also capture via requestfinished for tokens that are in request headers but not response
   // (already handled above, but keep for completeness)
 
-  // Navigate to Prism doc
-  await pwPage.goto(PRISM_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  // Dismiss Chromium restore prompt if present (from previous Ctrl+C)
+  try {
+    const restoreBtn = pwPage.locator('button:has-text("Restore")').first();
+    if (await restoreBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await restoreBtn.click().catch(() => {});
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  } catch {}
+  // Ensure we are on the Prism doc (not about:blank)
+  try {
+    const curUrl: string = pwPage.url?.() ?? "";
+    if (!curUrl.includes("prism.openai.com")) {
+      await pwPage.goto(PRISM_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    }
+  } catch {
+    await pwPage.goto(PRISM_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  }
 
   // --- Login detection (user request: know when logged in vs not) ---
   // Check via in-page API + DOM signals; keep browser open if not logged in
