@@ -184,6 +184,28 @@ export function extractImageGenerationResults(output: unknown): string[] {
  *
  * This is the TS equivalent of ask.py, verbatim forwarding of all fields.
  */
+/**
+ * Helpers for store:false full history handling (Codex defaults 2026-08-19)
+ * - When body.store === false, client sends full history replay (previous input + previous output
+ *   + reasoning items with encrypted_content + new input) and expects verbatim forwarding.
+ * - previous_response_id must NOT be relied upon via in-memory cache; only for store:true.
+ * - When store:false and previous_response_id is present (backwards compat), gracefully handle
+ *   by either stripping previous_response_id or retrying without it on previous_response_not_found.
+ * - Reasoning items with encrypted_content must be preserved for all_turns.
+ */
+export function isStoreFalse(body: any): boolean {
+  return body?.store === false;
+}
+export function hasEncryptedContent(item: any): boolean {
+  return !!item && typeof item === "object" && typeof (item as any).encrypted_content === "string" && (item as any).encrypted_content.length > 0;
+}
+export function isFullHistoryInput(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  if (input.length <= 1) return false;
+  // full history replay contains multiple turns including prior assistant/reasoning items
+  return (input as any[]).some((it: any) => it?.type === "reasoning" || it?.type === "function_call" || it?.type === "function_call_output" || it?.role === "assistant");
+}
+
 export async function relayCreate(body: any): Promise<any> {
   // Plan snippet compatibility: also POST to __internal/write-job if server exposes it
   // (tests mock both __bridge/write and __internal/write-job). We keep writeJob as
@@ -198,35 +220,61 @@ export async function relayCreate(body: any): Promise<any> {
   // the upstream uses it to recall prior reasoning items; we must not strip reasoning items from
   // input/output — all verbatim.
   // prompt_cache handling: prompt_cache_key + prompt_cache_breakpoint + prompt_cache_options forwarded verbatim (Task 7), keep it.
+  // Codex store:false fix (2026-08-19): when store===false, forward full history verbatim including
+  // reasoning items with encrypted_content for all_turns, NOT relying on previous_response_id cache.
+  // Handle graceful fallback when store:false + previous_response_id present.
 
-  // Attempt local bridge mirror endpoint for parity with plan snippet (best-effort, ignore failure)
+  const storeFalse = isStoreFalse(body);
+  const hasPrevId = typeof body?.previous_response_id === "string" && body.previous_response_id.length > 0;
+
+  // Internal attempt function that does the stable loop with a given body variant
+  const attempt = async (b: any): Promise<any> => {
+    // Attempt local bridge mirror endpoint for parity with plan snippet (best-effort, ignore failure)
+    try {
+      await fetch("http://localhost:8787/__internal/write-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(b),
+      });
+    } catch {
+      // ignore — stable Yjs+render+zip is the critical path
+    }
+
+    const { writeJob } = await import("../proxy/yjs");
+    const { triggerRender } = await import("../proxy/render");
+    const { extractResponse, fetchZip } = await import("../utils/zip");
+
+    await writeJob(b);
+    await triggerRender();
+
+    // Primary: use Task 2 extractResponse helper
+    try {
+      const data = await extractResponse();
+      return data;
+    } catch {
+      // Fallback: direct zip decode as in plan snippet (fetchZip from utils/zip)
+      const files = await fetchZip();
+      const raw = files.get("response.json");
+      if (!raw) throw new Error("response.json not found in zip");
+      return JSON.parse(new TextDecoder().decode(raw));
+    }
+  };
+
+  // Codex store:false handling: try original body first (preserving verbatim input including reasoning encrypted_content).
+  // If store:false and previous_response_id is present but upstream returns previous_response_not_found,
+  // retry without previous_response_id using full history replay. This covers both "ignore" and "fallback" strategies.
   try {
-    await fetch("http://localhost:8787/__internal/write-job", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    // ignore — stable Yjs+render+zip is the critical path
-  }
-
-  const { writeJob } = await import("../proxy/yjs");
-  const { triggerRender } = await import("../proxy/render");
-  const { extractResponse, fetchZip } = await import("../utils/zip");
-
-  await writeJob(body);
-  await triggerRender();
-
-  // Primary: use Task 2 extractResponse helper
-  try {
-    const data = await extractResponse();
-    return data;
-  } catch {
-    // Fallback: direct zip decode as in plan snippet (fetchZip from utils/zip)
-    const files = await fetchZip();
-    const raw = files.get("response.json");
-    if (!raw) throw new Error("response.json not found in zip");
-    return JSON.parse(new TextDecoder().decode(raw));
+    return await attempt(body);
+  } catch (e: any) {
+    const msg = String(e?.message ?? (e as any)?.toString?.() ?? "");
+    const isPrevNotFound = /previous_response_not_found|previous_response_id.*not.*found|not found.*previous/i.test(msg);
+    // When store:false and previous_response_id present, retry without it on not found
+    if (storeFalse && hasPrevId && isPrevNotFound) {
+      const fallbackBody: any = { ...body };
+      delete fallbackBody.previous_response_id;
+      return await attempt(fallbackBody);
+    }
+    throw e;
   }
 }
 

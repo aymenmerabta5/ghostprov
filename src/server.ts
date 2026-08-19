@@ -192,18 +192,39 @@ export function attachWss(server: any) {
         if (msg.type === "response.create") {
           const body: any = { ...msg };
           delete body.type;
-          // previous_response_id chaining: keep one in-memory per connection (store:false compatible)
-          // If client did not provide previous_response_id but we have cached, inject it
-          // Preserve reasoning items: reasoning items from prior output are conceptually preserved
-          // via previous_response_id on upstream; we don't strip them from relay output and we
-          // keep them in lastReasoningItems for debugging/expiry.
-          if (!body.previous_response_id && previous_response_id) {
+          // Codex store:false fix (2026-08-19): WSS default is store:false with full history replay.
+          // - When body.store === false, client sends full history (previous input + previous output
+          //   + reasoning items with encrypted_content + new input) verbatim; do NOT inject
+          //   previous_response_id from in-memory cache. Previous_response_id only when store:true
+          //   or when WSS connection has cached value AND client uses store:true semantics.
+          // - When store:false + previous_response_id present (backwards compat), handle gracefully:
+          //   keep it for attempt but fallback to full input on previous_response_not_found.
+          // - Preserve reasoning items with encrypted_content for all_turns (client sends them in input).
+          const isStoreFalse = body.store === false;
+          // Only inject cached previous_response_id when store !== false and client didn't provide one
+          if (!isStoreFalse && !body.previous_response_id && previous_response_id) {
             body.previous_response_id = previous_response_id;
           }
+          // For store:false, ensure full history input is forwarded verbatim (including reasoning encrypted_content)
+          // We do NOT strip reasoning items; relayCreate will handle previous_response_id fallback if needed.
           // Thinking Fast/Pro: reasoning, service_tier, phase are preserved verbatim via relayCreate spread.
           // prompt_cache also preserved.
           // Concurrency: WSS also respects queue (PQUEUE_CONCURRENCY=5) and renderQueue (1)
-          const result: any = await queue.add(() => relayCreate(body));
+          // Handle graceful fallback for store:false + previous_response_id on not_found
+          let result: any;
+          try {
+            result = await queue.add(() => relayCreate(body));
+          } catch (e: any) {
+            const msgStr = String(e?.message ?? "");
+            const isPrevNotFound = /previous_response_not_found|previous_response_id.*not.*found|not found.*previous/i.test(msgStr);
+            if (isStoreFalse && body.previous_response_id && isPrevNotFound) {
+              const fallbackBody: any = { ...body };
+              delete fallbackBody.previous_response_id;
+              result = await queue.add(() => relayCreate(fallbackBody));
+            } else {
+              throw e;
+            }
+          }
           const newId: string =
             result?.id ?? result?.response?.id ?? `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           previous_response_id = newId;

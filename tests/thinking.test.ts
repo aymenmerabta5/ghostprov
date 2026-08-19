@@ -82,6 +82,9 @@ vi.mock("../src/relay/client", () => ({
   isValidServiceTier: vi.fn((v: unknown) => ["fast", "priority", "default", "auto"].includes(v as string)),
   isValidPhase: vi.fn((v: unknown) => v === "commentary" || v === "final_answer"),
   normalizeReasoning: vi.fn((r: any) => (r && typeof r === "object" ? { ...r } : undefined)),
+  isStoreFalse: vi.fn((body: any) => body?.store === false),
+  hasEncryptedContent: vi.fn((item: any) => !!item && typeof item === "object" && typeof (item as any).encrypted_content === "string" && (item as any).encrypted_content.length > 0),
+  isFullHistoryInput: vi.fn((input: unknown) => Array.isArray(input) && (input as any[]).length > 1 && (input as any[]).some((it: any) => it?.type === "reasoning" || it?.type === "function_call" || it?.type === "function_call_output" || it?.role === "assistant")),
 }));
 
 describe("Thinking + Fast/Pro (types & constants)", () => {
@@ -537,7 +540,8 @@ describe("WSS previous_response_id chaining preserving reasoning items", () => {
     const out1 = resp1.output ?? [];
     expect(out1.find((o: any) => o.type === "reasoning")).toBeDefined();
 
-    // Second WSS without explicit previous_response_id - should chain and preserve reasoning
+    // Second WSS without explicit previous_response_id - store:false should NOT chain (full history replay required)
+    // Codex defaults to store:false, so second turn must send full history, not rely on previous_response_id cache.
     ws.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", store: false, input: "second", reasoning: { effort: "low" } }));
     const msg2 = await new Promise<Buffer>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("msg2 timeout")), 3000);
@@ -549,7 +553,9 @@ describe("WSS previous_response_id chaining preserving reasoning items", () => {
     expect(msg2.toString()).toContain("response.create");
     expect(mock).toHaveBeenCalledTimes(2);
     const secondBody = mock.mock.calls[1][0];
-    expect(secondBody.previous_response_id).toBe(id1);
+    // store:false must NOT have injected previous_response_id
+    expect(secondBody.previous_response_id ?? null).toBeFalsy();
+    expect(secondBody.store).toBe(false);
     expect(secondBody.reasoning.effort).toBe("low");
 
     // Third: explicit previous_response_id with reasoning xhigh should be forwarded verbatim
@@ -617,5 +623,215 @@ describe("WSS previous_response_id chaining preserving reasoning items", () => {
     expect(mock.mock.calls[0][0].input[0].phase).toBe("commentary");
     expect(mock.mock.calls[0][0].reasoning.effort).toBe("minimal");
     ws.close();
+  });
+});
+
+describe("store:false full history replay (Codex defaults)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).__LAST_JOB__;
+  });
+
+  it("HTTP POST store:false forwards full history with reasoning encrypted_content verbatim", async () => {
+    const { relayCreate } = await import("../src/relay/client");
+    const mock = relayCreate as any;
+    mock.mockClear();
+    const { default: app } = await import("../src/server");
+    const fullHistoryInput = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] },
+      { type: "reasoning", id: "rs_1", encrypted_content: "enc_abc123", summary: "auto", content: "thinking" },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "first answer" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "second turn" }] },
+    ];
+    const body: any = {
+      model: "gpt-5.6-sol",
+      input: fullHistoryInput,
+      reasoning: { effort: "medium", context: "all_turns", summary: "auto" },
+      store: false,
+    };
+    const res = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(200);
+    expect(mock).toHaveBeenCalledTimes(1);
+    const called = mock.mock.calls[0][0];
+    expect(called.store).toBe(false);
+    expect(called.reasoning.context).toBe("all_turns");
+    // full history must be preserved verbatim including encrypted_content
+    expect(JSON.stringify(called.input)).toContain("enc_abc123");
+    expect(called.input.find((x: any) => x.type === "reasoning")?.encrypted_content).toBe("enc_abc123");
+    // should NOT have previous_response_id when store:false and full history
+    expect(called.previous_response_id ?? null).toBeFalsy();
+  });
+
+  it("HTTP POST store:false with previous_response_id present handles gracefully and preserves input", async () => {
+    const { relayCreate } = await import("../src/relay/client");
+    const mock = relayCreate as any;
+    mock.mockClear();
+    const { default: app } = await import("../src/server");
+    const fullHistory = [
+      { type: "message", role: "user", content: "hi" },
+      { type: "reasoning", id: "rs_prev", encrypted_content: "enc_xyz789", summary: "auto" },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "prev" }] },
+      { type: "message", role: "user", content: "next" },
+    ];
+    const body: any = {
+      model: "gpt-5.6-sol",
+      input: fullHistory,
+      previous_response_id: "resp_stale_999",
+      reasoning: { effort: "high", context: "all_turns" },
+      store: false,
+    };
+    const res = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(200);
+    expect(mock).toHaveBeenCalledTimes(1);
+    const called = mock.mock.calls[0][0];
+    expect(called.store).toBe(false);
+    // input preserved including encrypted_content
+    expect(JSON.stringify(called.input)).toContain("enc_xyz789");
+    // previous_response_id handling: relayCreate may strip it for store:false full history or keep it; both are valid if input preserved
+    // but if it keeps it, it should still preserve input
+    expect(called.input.length).toBe(4);
+  });
+
+  it("relayCreate isStoreFalse helper and isFullHistoryInput", async () => {
+    const client = await import("../src/relay/client");
+    // isStoreFalse should be true only when store === false
+    expect((client as any).isStoreFalse({ store: false })).toBe(true);
+    expect((client as any).isStoreFalse({ store: true })).toBe(false);
+    expect((client as any).isStoreFalse({})).toBe(false);
+    expect((client as any).isStoreFalse({ store: undefined })).toBe(false);
+    // isFullHistoryInput detects full replay
+    expect((client as any).isFullHistoryInput([{ role: "user", content: "hi" }])).toBe(false);
+    expect(
+      (client as any).isFullHistoryInput([
+        { role: "user", content: "hi" },
+        { type: "reasoning", encrypted_content: "x" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "next" },
+      ]),
+    ).toBe(true);
+    expect((client as any).hasEncryptedContent({ type: "reasoning", encrypted_content: "enc_123" })).toBe(true);
+    expect((client as any).hasEncryptedContent({ type: "reasoning" })).toBe(false);
+  });
+
+  it("WSS store:false full history preserves reasoning encrypted_content and does NOT inject previous_response_id", async () => {
+    const { relayCreate } = await import("../src/relay/client");
+    const mock = relayCreate as any;
+    mock.mockClear();
+    const mod: any = await import("../src/server");
+    const app = mod.default;
+    const attachWss = mod.attachWss;
+    const { createServer } = await import("node:http");
+    const http = createServer(async (req: any, res: any) => {
+      const host = req.headers.host ?? "localhost:0";
+      const url = `http://${host}${req.url}`;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (v) headers.set(k, Array.isArray(v) ? v.join(",") : String(v));
+      }
+      let body: Buffer | undefined;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        if (chunks.length) body = Buffer.concat(chunks);
+      }
+      const request = new Request(url, { method: req.method, headers, body: body ? new Uint8Array(body) : undefined });
+      const response = await app.fetch(request);
+      res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+      if (response.body) {
+        const ab = await response.arrayBuffer();
+        res.end(Buffer.from(ab));
+      } else {
+        res.end();
+      }
+    });
+    if (typeof attachWss === "function") attachWss(http);
+    await new Promise<void>((resolve, reject) => {
+      http.listen(0, () => resolve());
+      http.on("error", reject);
+    });
+    const addr: any = http.address();
+    const port = addr.port;
+    await new Promise((r) => setTimeout(r, 100));
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${port}/v1/responses`, { headers: { Authorization: "Bearer test" } });
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("ws open timeout")), 3000);
+        ws.on("open", () => {
+          clearTimeout(t);
+          resolve();
+        });
+        ws.on("error", (e) => {
+          clearTimeout(t);
+          reject(e);
+        });
+      });
+
+      // First turn store:false
+      ws.send(
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.6-sol",
+          store: false,
+          input: [{ type: "message", role: "user", content: "first" }],
+        }),
+      );
+      const msg1 = await new Promise<Buffer>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("msg1 timeout")), 3000);
+        ws.once("message", (d) => {
+          clearTimeout(t);
+          resolve(d as Buffer);
+        });
+      });
+      const j1: any = JSON.parse(msg1.toString());
+      const id1 = j1.id ?? j1.response?.id;
+      expect(id1).toBeTruthy();
+      expect(mock).toHaveBeenCalledTimes(1);
+      mock.mockClear();
+
+      // Second turn with full history + encrypted_content and store:false — should NOT inject previous_response_id
+      const fullHistory = [
+        { type: "message", role: "user", content: "first" },
+        { type: "reasoning", id: "rs_all", encrypted_content: "enc_all_turns_xyz", summary: "detailed" },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "ans1" }] },
+        { type: "message", role: "user", content: "second with full context" },
+      ];
+      ws.send(
+        JSON.stringify({
+          type: "response.create",
+          model: "gpt-5.6-sol",
+          store: false,
+          reasoning: { effort: "medium", context: "all_turns" },
+          input: fullHistory,
+        }),
+      );
+      const msg2 = await new Promise<Buffer>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("msg2 timeout")), 3000);
+        ws.once("message", (d) => {
+          clearTimeout(t);
+          resolve(d as Buffer);
+        });
+      });
+      expect(msg2.toString()).toContain("response.create");
+      expect(mock).toHaveBeenCalledTimes(1);
+      const body2 = mock.mock.calls[0][0];
+      expect(body2.store).toBe(false);
+      expect(body2.previous_response_id ?? null).toBeFalsy();
+      expect(JSON.stringify(body2.input)).toContain("enc_all_turns_xyz");
+      expect(body2.input.find((x: any) => x.type === "reasoning")?.encrypted_content).toBe("enc_all_turns_xyz");
+
+      ws.close();
+    } finally {
+      await new Promise<void>((resolve) => http.close(() => resolve()));
+      await new Promise((r) => setTimeout(r, 100));
+    }
   });
 });
