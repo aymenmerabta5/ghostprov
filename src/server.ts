@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Hono } from "hono";
 import { relayCreate, relayCreateStream } from "./relay/client";
 import { uploadFileFromFormData, getFileContent, getFile, listFiles } from "./proxy/files";
@@ -44,11 +45,13 @@ app.get("/__bridge/token", async (c) => {
       }
     }
   } catch {}
-  // env fallback for CI (mocked tests)
+  // env fallback for CI (mocked tests) — treat empty string as unset to allow bridge auto-mint
+  const envSandbox = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
+  const envYSweet = (process.env.PRISM_Y_TOKEN ?? "").trim();
   return c.json({
     ok: true,
-    sandboxToken: process.env.PRISM_SANDBOX_TOKEN ?? "mock-token",
-    ySweetToken: process.env.PRISM_Y_TOKEN ?? "mock_y_token",
+    sandboxToken: envSandbox.length > 5 ? envSandbox : "mock-token",
+    ySweetToken: envYSweet.length > 5 ? envYSweet : "mock_y_token",
     source: "env",
   });
 });

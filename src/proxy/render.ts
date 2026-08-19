@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { queueRender } from "../utils/queue";
 
 async function getSandboxToken(): Promise<string> {
@@ -21,7 +22,8 @@ async function getSandboxToken(): Promise<string> {
       if (j?.sandboxToken) return j.sandboxToken;
     }
   } catch {}
-  return process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  const envTok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
+  return envTok.length > 5 ? envTok : "mock-token";
 }
 
 async function maybeRefreshOnFailure(status: number, bodyText?: string): Promise<string | null> {

@@ -6,6 +6,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "dotenv": "^16.6.0",
     "fflate": "^0.8.3",
     "hono": "^4.6.0",
     "p-queue": "^8.0.1",

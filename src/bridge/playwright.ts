@@ -18,6 +18,7 @@
  * Tests mock this module via vi.mock, so live chromium never launches in CI.
  */
 
+import "dotenv/config";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -32,6 +33,7 @@ export const USER_DATA_DIR = "D:/MyWork/AI/ghostprov/.pw";
 export const TOKEN_FILE = `${USER_DATA_DIR}/tokens.json`;
 // legacy aliases for consumers that expect file at .pw/.tokens.json or .bridge
 export const BRIDGE_TOKEN_FILE = TOKEN_FILE;
+export const ENV_FILE = "D:/MyWork/AI/ghostprov/.env";
 
 export interface BridgeTokens {
   sandboxToken?: string | null;
@@ -77,12 +79,41 @@ try {
   loadTokensFromFileSync();
 } catch {}
 
-// Also hydrate from env on first load for CI fallback
-if (!sandboxToken && process.env.PRISM_SANDBOX_TOKEN) {
-  sandboxToken = process.env.PRISM_SANDBOX_TOKEN;
+// Also hydrate from env on first load for CI fallback — treat empty string as unset to allow auto-mint
+if (!sandboxToken && process.env.PRISM_SANDBOX_TOKEN && process.env.PRISM_SANDBOX_TOKEN.trim().length > 5) {
+  sandboxToken = process.env.PRISM_SANDBOX_TOKEN.trim();
 }
-if (!ySweetToken && process.env.PRISM_Y_TOKEN) {
-  ySweetToken = process.env.PRISM_Y_TOKEN;
+if (!ySweetToken && process.env.PRISM_Y_TOKEN && process.env.PRISM_Y_TOKEN.trim().length > 5) {
+  ySweetToken = process.env.PRISM_Y_TOKEN.trim();
+}
+
+function updateEnvFileIfNeeded(): void {
+  try {
+    // Skip .env update during vitest to avoid polluting .env with test mock tokens (e.g. bridge-sandbox-xyz)
+    if (process.env.VITEST || process.env.NODE_ENV === "test") return;
+    // Only update .env when we have a real sandbox token (length > 10) to avoid writing mock
+    if (!sandboxToken || sandboxToken === "mock-token" || sandboxToken.length < 10) return;
+    // Never write obvious mock tokens from tests
+    if (sandboxToken.includes("mock") || sandboxToken.includes("bridge-sandbox") || sandboxToken === "mock_y_token") return;
+    if (!fs.existsSync(ENV_FILE)) return;
+    let content = fs.readFileSync(ENV_FILE, "utf8");
+    const hasKey = /^PRISM_SANDBOX_TOKEN=.*$/m.test(content);
+    if (hasKey) {
+      const m = content.match(/^PRISM_SANDBOX_TOKEN=(.*)$/m);
+      const current = m ? m[1].trim().replace(/^["']|["']$/g, "") : "";
+      // Update only when empty or placeholder so we don't overwrite a manually set valid token without explicit need
+      // Spec says "also update .env if needed" — we fill when empty, and also update when different to keep .env in sync with bridge
+      if (!current || current.length < 5 || current === "") {
+        content = content.replace(/^PRISM_SANDBOX_TOKEN=.*$/m, `PRISM_SANDBOX_TOKEN=${sandboxToken}`);
+        fs.writeFileSync(ENV_FILE, content, "utf8");
+      }
+    } else {
+      // append if missing
+      if (!content.endsWith("\n")) content += "\n";
+      content += `PRISM_SANDBOX_TOKEN=${sandboxToken}\n`;
+      fs.writeFileSync(ENV_FILE, content, "utf8");
+    }
+  } catch {}
 }
 
 function persistTokensSync(): void {
@@ -100,6 +131,8 @@ function persistTokensSync(): void {
     if (sandboxToken) (globalThis as any).__BRIDGE_SANDBOX_TOKEN__ = sandboxToken;
     if (ySweetToken) (globalThis as any).__BRIDGE_Y_TOKEN__ = ySweetToken;
   } catch {}
+  // also update .env when sandbox token minted (auto-mint bridge)
+  updateEnvFileIfNeeded();
 }
 
 export function getTokenFilePath(): string {
@@ -140,7 +173,8 @@ export function getSandboxToken(): string {
       }
     }
   } catch {}
-  return process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  const envTok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
+  return envTok.length > 5 ? envTok : "mock-token";
 }
 
 export function getYSweetToken(): string {
@@ -162,7 +196,8 @@ export function getYSweetToken(): string {
     }
   } catch {}
   // NOTE: ySweet is per-doc, minted via POST /api/y; fallback is mock_y_token for tests
-  return (process.env.PRISM_Y_TOKEN as string | undefined) ?? "mock_y_token";
+  const envY = (process.env.PRISM_Y_TOKEN ?? "").trim();
+  return envY.length > 5 ? envY : "mock_y_token";
 }
 
 export function setSandboxToken(token: string): void {

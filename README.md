@@ -8,10 +8,14 @@ Bun + Hono server on `:8787` exposes `POST /v1/responses` and `WSS /v1/responses
 
 ```bash
 bun install
+cp .env.example .env
+# Edit .env if needed — PRISM_DOC_ID is prefilled, PORT=8787
 PORT=8787 bun --watch src/server.ts
 # or
 bun run dev
 ```
+
+Copy .env.example to .env, leave PRISM_SANDBOX_TOKEN empty for auto-mint via Playwright (requires you to be logged in to prism.openai.com in the persistent context on first run).
 
 Health check:
 
@@ -159,19 +163,44 @@ curl -X POST http://localhost:8787/v1/responses \
 - `input_image` data URLs (`data:image/png;base64,...` including 1x1 `iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=`) are preserved verbatim in `input`.
 - `tool_choice: allowed_tools` (`{type:"allowed_tools", allowed_tools:[{type:"function", name:"get_horoscope"}]}`) is forwarded verbatim alongside `tools`.
 
+## Environment & Bridge Auto-mint
+
+- `PRISM_DOC_ID=2a153042-dc25-4ca5-b290-260eed5e8705` (prefilled in `.env.example` / `.env`)
+- `PRISM_SANDBOX_TOKEN=` — leave empty to auto-mint via Playwright (requires you to be logged in to prism.openai.com in the persistent context on first run), or set manually.
+- `PORT=8787`
+- `src/server.ts` loads `.env` via `import "dotenv/config"` (also `src/bridge/playwright.ts`, `src/proxy/*`, `src/utils/zip.ts`).
+- When env token is empty, `src/proxy/*` and `src/utils/zip.ts` fall back to bridge token chain: `bridge memory -> globalThis.__BRIDGE_TOKENS__ -> D:/MyWork/AI/ghostprov/.pw/tokens.json -> env -> mock`.
+- The bridge (`src/bridge/playwright.ts`) is correctly reading/writing `D:/MyWork/AI/ghostprov/.pw/tokens.json`:
+  - launches chromium persistent context with `userDataDir D:/MyWork/AI/ghostprov/.pw`
+  - `goto https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex`
+  - `waitForResponse` heartbeat (`heartbeat` 200) via `waitForHeartbeat`
+  - captures `x-crixet-sandbox-token` via `page.on('request')` header, saves to `.pw/tokens.json` and also updates `.env` if needed, and exposes via `GET /__bridge/token` (source `bridge` | `global` | `file` | `env`).
+
+Run bridge manually:
+
+```bash
+bun src/bridge/playwright.ts              # headful, preserves login in .pw
+bun src/bridge/playwright.ts --headless   # headless
+curl http://localhost:8787/__bridge/token # {"ok":true,"sandboxToken":"...","source":"bridge"}
+```
+
 ## Architecture
 
 ```
 ghostprov/
+  .env.example                  # PRISM_DOC_ID, PRISM_SANDBOX_TOKEN= (empty for auto-mint), PORT=8787
+  .env                          # copy from .env.example, fill PRISM_DOC_ID, leave token empty for auto
+  .pw/tokens.json               # {sandboxToken, ySweetToken, updatedAt} written by bridge, read by proxy
   package.json
-  src/server.ts                 # Hono app, POST /v1/responses, WSS /v1/responses, GET /health
-  src/proxy/yjs.ts              # Yjs WSS client: connect, write job.json
-  src/proxy/render.ts           # POST /render → poll /render-status (queued via queueRender)
-  src/proxy/files.ts            # POST /api/project-files/upload, GET /zip
+  src/server.ts                 # Hono app, POST /v1/responses, WSS /v1/responses, GET /health (loads .env via dotenv)
+  src/bridge/playwright.ts      # Playwright persistent bridge: launch chromium, goto prism URL, wait heartbeat, capture token, save to .pw/tokens.json + .env, GET /__bridge/token
+  src/proxy/yjs.ts              # Yjs WSS client: connect, write job.json (falls back to bridge token when env empty)
+  src/proxy/render.ts           # POST /render → poll /render-status (queued via queueRender, falls back to bridge token)
+  src/proxy/files.ts            # POST /api/project-files/upload, GET /zip (falls back to bridge token)
   src/relay/client.ts           # relayCreate(body): Yjs write → render → zip → response.json
   src/relay/types.ts            # Responses API types
   src/utils/b64.ts              # base64 helpers
-  src/utils/zip.ts              # unzip GET /zip, extract response.json
+  src/utils/zip.ts              # unzip GET /zip, extract response.json (falls back to bridge token)
   src/utils/queue.ts            # p-queue, max 5 concurrent, queue render (PQUEUE_CONCURRENCY=5)
 ```
 

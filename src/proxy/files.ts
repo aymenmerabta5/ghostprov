@@ -22,6 +22,7 @@
  * Excess writes should back off or rotate keys; reads are cheap (0.1x), writes are 1.25x cost.
  */
 
+import "dotenv/config";
 import { fetchZip } from "../utils/zip";
 
 // Bridge token helper (live Playwright persistent context -> file/global -> env fallback for CI)
@@ -46,7 +47,8 @@ async function getSandboxToken(): Promise<string> {
       if (j?.sandboxToken) return j.sandboxToken;
     }
   } catch {}
-  return process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  const envTok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
+  return envTok.length > 5 ? envTok : "mock-token";
 }
 
 async function maybeRefreshOnFailure(status: number, bodyText?: string): Promise<string | null> {

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 
@@ -8,7 +9,8 @@ if (!(globalThis as any).WebSocket) {
 }
 
 export async function writeJob(job: unknown): Promise<void> {
-  const docId = process.env.PRISM_DOC_ID ?? "mock-doc";
+  const rawDocId = (process.env.PRISM_DOC_ID ?? "").trim();
+  const docId = rawDocId.length > 5 ? rawDocId : "mock-doc";
   const token = await mintYSweetToken(docId);
 
   // If token came from bridge and later Yjs sync fails with 401/syncing, bridge will auto-refresh
