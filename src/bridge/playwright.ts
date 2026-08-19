@@ -504,6 +504,38 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   // Navigate to Prism doc
   await pwPage.goto(PRISM_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
 
+  // --- Login detection (user request: know when logged in vs not) ---
+  // Check via in-page API + DOM signals; keep browser open if not logged in
+  let isLoggedIn: boolean | null = null;
+  try {
+    isLoggedIn = await pwPage.evaluate(async () => {
+      // 1. DOM: user workspace vs login button
+      const body = document.body.innerText || "";
+      if (body.includes("Personal workspace") || body.includes("Aimen Merabta")) return true;
+      if (document.querySelector('a[href*="auth"]')?.textContent?.toLowerCase().includes("log in")) return false;
+      // 2. API: try a lightweight auth check (maintenance is public, so check project access)
+      try {
+        const r = await fetch("/api/project-access?d=2a153042-dc25-4ca5-b290-260eed5e8705", { credentials: "include" });
+        if (r.status === 401) return false;
+        if (r.ok) return true;
+      } catch {}
+      return null; // unknown
+    });
+  } catch {}
+  if (isLoggedIn === false) {
+    console.log("[bridge] not logged in — keeping browser open, waiting for login to prism.openai.com...");
+    // Keep browser open and wait for user to log in (max 5 min), then re-check
+    try {
+      await pwPage.waitForFunction(() => document.body.innerText.includes("Personal workspace") || document.body.innerText.includes("New Project"), null, { timeout: 300000 });
+      console.log("[bridge] login detected — continuing to heartbeat capture");
+      isLoggedIn = true;
+    } catch {
+      console.warn("[bridge] login wait timeout — continuing anyway, will retry token capture");
+    }
+  } else if (isLoggedIn === true) {
+    console.log("[bridge] already logged in");
+  }
+
   // Wait for heartbeat (readiness)
   try {
     await waitForHeartbeat(pwPage, timeoutMs);
