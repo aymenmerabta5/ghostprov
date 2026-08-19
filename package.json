@@ -1,0 +1,7 @@
+{
+  "name": "ghostprov",
+  "type": "module",
+  "scripts": { "dev": "bun --watch src/server.ts", "test": "vitest run" },
+  "dependencies": { "hono": "^4.6.0", "yjs": "^13.6.20", "y-websocket": "^2.0.4", "ws": "^8.18.0", "p-queue": "^8.0.1" },
+  "devDependencies": { "vitest": "^2.1.0", "@types/bun": "latest", "typescript": "^5.6.0" }
+}
