@@ -7,6 +7,64 @@ import { queue } from "./utils/queue";
 const app = new Hono();
 app.get("/health", (c) => c.json({ ok: true }));
 
+// Playwright bridge token exposure (Task Bridge)
+// GET /__bridge/token -> { sandboxToken, ySweetToken, updatedAt, source }
+// Exposes tokens minted by Playwright persistent context (chromium userDataDir D:/MyWork/AI/ghostprov/.pw)
+// Fallback chain: bridge memory -> globalThis.__BRIDGE_TOKENS__ -> file D:/MyWork/AI/ghostprov/.pw/tokens.json -> env -> mock
+app.get("/__bridge/token", async (c) => {
+  // try bridge module first (live)
+  try {
+    const bridge: any = await import("./bridge/playwright");
+    const tokens = bridge.getBridgeTokens?.();
+    if (tokens && (tokens.sandboxToken || tokens.ySweetToken)) {
+      return c.json({ ok: true, sandboxToken: tokens.sandboxToken, ySweetToken: tokens.ySweetToken, updatedAt: tokens.updatedAt, source: "bridge" });
+    }
+  } catch {}
+  // global fallback (set by page.on handlers or tests)
+  try {
+    const g: any = (globalThis as any).__BRIDGE_TOKENS__;
+    if (g && (g.sandboxToken || g.ySweetToken)) {
+      return c.json({ ok: true, sandboxToken: g.sandboxToken, ySweetToken: g.ySweetToken, updatedAt: g.updatedAt, source: "global" });
+    }
+    const gs = (globalThis as any).__BRIDGE_SANDBOX_TOKEN__;
+    const gy = (globalThis as any).__BRIDGE_Y_TOKEN__;
+    if (gs || gy) {
+      return c.json({ ok: true, sandboxToken: gs ?? null, ySweetToken: gy ?? null, source: "global-individual" });
+    }
+  } catch {}
+  // file fallback (written by bridge's persistTokensSync)
+  try {
+    const fs: any = await import("node:fs");
+    const path: any = await import("node:path");
+    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
+    if (fs.existsSync(file)) {
+      const j = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (j?.sandboxToken || j?.ySweetToken) {
+        return c.json({ ok: true, sandboxToken: j.sandboxToken ?? null, ySweetToken: j.ySweetToken ?? null, updatedAt: j.updatedAt, source: "file" });
+      }
+    }
+  } catch {}
+  // env fallback for CI (mocked tests)
+  return c.json({
+    ok: true,
+    sandboxToken: process.env.PRISM_SANDBOX_TOKEN ?? "mock-token",
+    ySweetToken: process.env.PRISM_Y_TOKEN ?? "mock_y_token",
+    source: "env",
+  });
+});
+
+// Optional: POST /__bridge/refresh triggers bridge refresh (useful when client sees 401/syncing)
+app.post("/__bridge/refresh", async (c) => {
+  try {
+    const bridge: any = await import("./bridge/playwright");
+    await bridge.refreshBridge?.();
+    const tokens = bridge.getBridgeTokens?.() ?? {};
+    return c.json({ ok: true, ...tokens });
+  } catch (e: any) {
+    return c.json({ ok: false, error: e?.message ?? String(e) }, 500);
+  }
+});
+
 // Stable-loop bridge fallback handlers (F2) — no-op 200 for live Prism runs.
 // src/proxy/yjs.ts:42 POSTs to /__bridge/write, src/relay/client.ts:29 POSTs to /__internal/write-job.
 // Without these, a real PRISM_DOC_ID run would 404 after writeJob. Mocked tests use globalThis.fetch mock so they don't hit here.

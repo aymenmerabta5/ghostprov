@@ -24,6 +24,43 @@
 
 import { fetchZip } from "../utils/zip";
 
+// Bridge token helper (live Playwright persistent context -> file/global -> env fallback for CI)
+async function getSandboxToken(): Promise<string> {
+  try {
+    const bridge: any = await import("../bridge/playwright");
+    const t = bridge.getSandboxToken?.();
+    if (t && t !== "mock-token") return t;
+    const b = bridge.getBridgeTokens?.();
+    if (b?.sandboxToken && b.sandboxToken !== "mock-token") return b.sandboxToken;
+  } catch {}
+  try {
+    const g = (globalThis as any).__BRIDGE_TOKENS__?.sandboxToken ?? (globalThis as any).__BRIDGE_SANDBOX_TOKEN__;
+    if (g && typeof g === "string" && g.length > 10) return g;
+  } catch {}
+  try {
+    const fs: any = await import("node:fs");
+    const path: any = await import("node:path");
+    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
+    if (fs.existsSync(file)) {
+      const j = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (j?.sandboxToken) return j.sandboxToken;
+    }
+  } catch {}
+  return process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+}
+
+async function maybeRefreshOnFailure(status: number, bodyText?: string): Promise<string | null> {
+  try {
+    const bridge: any = await import("../bridge/playwright");
+    if (bridge.shouldRefreshOnStatus?.(status, bodyText)) {
+      await bridge.handleAuthFailure?.(status, bodyText);
+      const t = bridge.getSandboxToken?.();
+      if (t && t !== "mock-token") return t;
+    }
+  } catch {}
+  return null;
+}
+
 // In-memory fallback for mocked unit tests when fetchZip is mocked with file blobs
 const memoryFiles = new Map<string, Uint8Array>();
 const memoryMeta = new Map<string, any>();
@@ -41,7 +78,7 @@ export async function uploadFile(
   filename: string,
   purpose: string = "assistants",
 ): Promise<any> {
-  const tok = process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  let tok = await getSandboxToken();
   const bust = Math.floor(Math.random() * 1e15);
   const form = new FormData();
   // File/Blob handling: ensure filename preserved
@@ -56,7 +93,7 @@ export async function uploadFile(
     memoryFiles.set(filename, bytes);
   } catch {}
 
-  const r = await fetch(
+  let r = await fetch(
     `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
     {
       method: "POST",
@@ -66,7 +103,24 @@ export async function uploadFile(
   );
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`uploadFile ${r.status} ${r.statusText} ${txt}`);
+    const refreshed = await maybeRefreshOnFailure(r.status, txt);
+    if (refreshed) {
+      tok = refreshed;
+      r = await fetch(
+        `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
+        {
+          method: "POST",
+          headers: { "x-crixet-sandbox-token": tok },
+          body: form as any,
+        },
+      );
+      if (!r.ok) {
+        const txt2 = await r.text().catch(() => "");
+        throw new Error(`uploadFile ${r.status} ${r.statusText} ${txt2}`);
+      }
+    } else {
+      throw new Error(`uploadFile ${r.status} ${r.statusText} ${txt}`);
+    }
   }
   const json: any = await r.json();
   // Cache metadata and file bytes for getFileContent fallback in mocked tests
@@ -86,7 +140,7 @@ export async function uploadFile(
  * This preserves the exact file blob + filename + purpose the client sent.
  */
 export async function uploadFileFromFormData(formData: FormData): Promise<any> {
-  const tok = process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  let tok = await getSandboxToken();
   const bust = Math.floor(Math.random() * 1e15);
 
   // Also capture for memory fallback
@@ -99,7 +153,7 @@ export async function uploadFileFromFormData(formData: FormData): Promise<any> {
     }
   } catch {}
 
-  const r = await fetch(
+  let r2 = await fetch(
     `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
     {
       method: "POST",
@@ -107,11 +161,28 @@ export async function uploadFileFromFormData(formData: FormData): Promise<any> {
       body: formData as any,
     },
   );
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`uploadFileFromFormData ${r.status} ${r.statusText} ${txt}`);
+  if (!r2.ok) {
+    const txt = await r2.text().catch(() => "");
+    const refreshed = await maybeRefreshOnFailure(r2.status, txt);
+    if (refreshed) {
+      tok = refreshed;
+      r2 = await fetch(
+        `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
+        {
+          method: "POST",
+          headers: { "x-crixet-sandbox-token": tok },
+          body: formData as any,
+        },
+      );
+      if (!r2.ok) {
+        const txt2 = await r2.text().catch(() => "");
+        throw new Error(`uploadFileFromFormData ${r2.status} ${r2.statusText} ${txt2}`);
+      }
+    } else {
+      throw new Error(`uploadFileFromFormData ${r2.status} ${r2.statusText} ${txt}`);
+    }
   }
-  const json: any = await r.json();
+  const json: any = await r2.json();
   try {
     const file = formData.get("file") as File | Blob | null;
     if (file && json?.id) {
@@ -165,13 +236,24 @@ export async function getFileContent(fileId: string): Promise<Uint8Array> {
   }
 
   // Fallback: try direct Prism content endpoint (for live integration)
-  const tok = process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  let tok = await getSandboxToken();
   const bust = Math.floor(Math.random() * 1e15);
-  const r = await fetch(
+  let r = await fetch(
     `https://prism.openai.com/api/project-files/${fileId}/content?prism_cache_bust=${bust}`,
     { headers: { "x-crixet-sandbox-token": tok } },
   );
-  if (!r.ok) throw new Error(`getFileContent ${fileId} ${r.status}`);
+  if (!r.ok) {
+    const txt = await r.clone().text().catch(() => "");
+    const refreshed = await maybeRefreshOnFailure(r.status, txt);
+    if (refreshed) {
+      tok = refreshed;
+      r = await fetch(
+        `https://prism.openai.com/api/project-files/${fileId}/content?prism_cache_bust=${bust}`,
+        { headers: { "x-crixet-sandbox-token": tok } },
+      );
+    }
+    if (!r.ok) throw new Error(`getFileContent ${fileId} ${r.status}`);
+  }
   return new Uint8Array(await r.arrayBuffer());
 }
 
@@ -196,13 +278,24 @@ export async function getFile(fileId: string): Promise<any> {
     }
   } catch {}
 
-  const tok = process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  let tok2 = await getSandboxToken();
   const bust = Math.floor(Math.random() * 1e15);
-  const r = await fetch(
+  let r = await fetch(
     `https://prism.openai.com/api/project-files/${fileId}?prism_cache_bust=${bust}`,
-    { headers: { "x-crixet-sandbox-token": tok } },
+    { headers: { "x-crixet-sandbox-token": tok2 } },
   );
-  if (!r.ok) throw new Error(`getFile ${fileId} ${r.status}`);
+  if (!r.ok) {
+    const txt = await r.clone().text().catch(() => "");
+    const refreshed = await maybeRefreshOnFailure(r.status, txt);
+    if (refreshed) {
+      tok2 = refreshed;
+      r = await fetch(
+        `https://prism.openai.com/api/project-files/${fileId}?prism_cache_bust=${bust}`,
+        { headers: { "x-crixet-sandbox-token": tok2 } },
+      );
+    }
+    if (!r.ok) throw new Error(`getFile ${fileId} ${r.status}`);
+  }
   return r.json();
 }
 
@@ -220,13 +313,24 @@ export async function listFiles(): Promise<any[]> {
       } catch {}
     }
   } catch {}
-  const tok = process.env.PRISM_SANDBOX_TOKEN ?? "mock-token";
+  let tok3 = await getSandboxToken();
   const bust = Math.floor(Math.random() * 1e15);
-  const r = await fetch(
+  let r = await fetch(
     `https://prism.openai.com/api/project-files?prism_cache_bust=${bust}`,
-    { headers: { "x-crixet-sandbox-token": tok } },
+    { headers: { "x-crixet-sandbox-token": tok3 } },
   );
-  if (!r.ok) return [];
+  if (!r.ok) {
+    const txt = await r.clone().text().catch(() => "");
+    const refreshed = await maybeRefreshOnFailure(r.status, txt);
+    if (refreshed) {
+      tok3 = refreshed;
+      r = await fetch(
+        `https://prism.openai.com/api/project-files?prism_cache_bust=${bust}`,
+        { headers: { "x-crixet-sandbox-token": tok3 } },
+      );
+    }
+    if (!r.ok) return [];
+  }
   const j: any = await r.json();
   return Array.isArray(j) ? j : j.data ?? [];
 }
