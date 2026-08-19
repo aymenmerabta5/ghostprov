@@ -1,10 +1,71 @@
 import "dotenv/config";
+// Bun -> tsx re-exec shim: playwright's chromium.launch hangs under plain `bun src/server.ts`
+// but works via `bun x tsx` (node). Auto re-exec so `bun src/server.ts` just works.
+if (typeof process !== "undefined" && (process as any).versions?.bun && !process.env.GHOSTPROV_VIA_TSX && !process.env.VITEST && process.env.NODE_ENV !== "test" && (import.meta as any).main) {
+  // Only re-exec when actually launching bridge (sandbox token empty)
+  const tok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
+  const needsBridge = !tok || tok.includes("mock") || tok.length < 10;
+  if (needsBridge && !process.env.BRIDGE_DISABLE) {
+    try {
+      const { spawnSync } = await import("node:child_process");
+      // Preserve args: bun src/server.ts [--headless]
+      const args = process.argv.slice(1); // e.g. D:/MyWork/AI/ghostprov/src/server.ts
+      // Find the script arg (contains server.ts)
+      // Use bun x tsx to run same file via node/tsx
+      const bunBin = process.execPath; // path to bun.exe
+      const script = args.find(a => a.includes("server.ts")) ?? "D:/MyWork/AI/ghostprov/src/server.ts";
+      const extra = args.filter(a => a !== script && !a.endsWith("bun.exe") && !a.includes("server.ts"));
+      console.log(`[ghostprov] bun detected — re-exec via bun x tsx ${script} ${extra.join(" ")}`);
+      const res = spawnSync(bunBin, ["x", "tsx", script, ...extra], {
+        stdio: "inherit",
+        env: { ...process.env, GHOSTPROV_VIA_TSX: "1" },
+      });
+      process.exit(res.status ?? 0);
+    } catch (e) {
+      console.warn("[ghostprov] re-exec via tsx failed, continuing with bun:", (e as any)?.message);
+    }
+  }
+}
+
 import { Hono } from "hono";
 import { relayCreate, relayCreateStream } from "./relay/client";
 import { uploadFileFromFormData, getFileContent, getFile, listFiles } from "./proxy/files";
 import { WebSocketServer } from "ws";
 import { createServer as createHttpServer } from "node:http";
 import { queue } from "./utils/queue";
+
+// Auto-launch Playwright bridge — keep browser on for page.evaluate relay (per PRISM_FINDINGS.md, external fetch blocked by JA3)
+// Always launch when not in test, unless explicitly disabled. Tokens are refreshed automatically via page headers.
+function shouldAutoLaunchBridge(): boolean {
+  if (process.env.VITEST || process.env.NODE_ENV === "test") return false;
+  if (process.env.BRIDGE_DISABLE === "1") return false;
+  return true;
+}
+if (shouldAutoLaunchBridge()) {
+  // Defer to next tick so Hono app is ready before bridge logs
+  setTimeout(() => {
+    import("./bridge/playwright").then(({ startPlaywrightBridge }) => {
+      const headless = process.argv.includes("--headless") || process.env.BRIDGE_HEADLESS === "1";
+      // Default to headless false for first run so user can see login
+      console.log(`[ghostprov] PRISM_SANDBOX_TOKEN empty — launching Playwright bridge (headless=${headless})...`);
+      startPlaywrightBridge({ headless }).then(
+        () => console.log("[ghostprov] bridge ready — tokens in .pw/tokens.json + .env"),
+        (e) => console.warn("[ghostprov] bridge auto-start failed (run `bun src/bridge/playwright.ts` manually):", e?.message ?? String(e)),
+      );
+    }).catch((e) => console.warn("[ghostprov] bridge import failed:", e?.message ?? String(e)));
+  }, 500);
+  // Also support legacy import.meta.main path for explicit manual runs
+} else if (import.meta.main && !(process.env.PRISM_SANDBOX_TOKEN ?? "").trim() && !process.env.VITEST) {
+  // fallback legacy path (kept for compat)
+  import("./bridge/playwright").then(({ startPlaywrightBridge }) => {
+    const headless = process.argv.includes("--headless") || process.env.BRIDGE_HEADLESS === "1";
+    console.log(`[ghostprov] PRISM_SANDBOX_TOKEN empty — launching Playwright bridge (headless=${headless})...`);
+    startPlaywrightBridge({ headless }).then(
+      () => console.log("[ghostprov] bridge ready — tokens in .pw/tokens.json + .env"),
+      (e) => console.warn("[ghostprov] bridge auto-start failed (run `bun src/bridge/playwright.ts` manually):", e?.message ?? String(e)),
+    );
+  }).catch(() => {});
+}
 const app = new Hono();
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -13,14 +74,32 @@ app.get("/health", (c) => c.json({ ok: true }));
 // Exposes tokens minted by Playwright persistent context (chromium userDataDir D:/MyWork/AI/ghostprov/.pw)
 // Fallback chain: bridge memory -> globalThis.__BRIDGE_TOKENS__ -> file D:/MyWork/AI/ghostprov/.pw/tokens.json -> env -> mock
 app.get("/__bridge/token", async (c) => {
-  // try bridge module first (live)
+  // try bridge module first (live) - merge with file for completeness
+  let bridgeTokens: any = null;
   try {
     const bridge: any = await import("./bridge/playwright");
-    const tokens = bridge.getBridgeTokens?.();
-    if (tokens && (tokens.sandboxToken || tokens.ySweetToken)) {
-      return c.json({ ok: true, sandboxToken: tokens.sandboxToken, ySweetToken: tokens.ySweetToken, updatedAt: tokens.updatedAt, source: "bridge" });
+    bridgeTokens = bridge.getBridgeTokens?.() ?? null;
+  } catch {}
+  // also read file for fallback/merge
+  let fileTokens: any = null;
+  try {
+    const fs: any = await import("node:fs");
+    const path: any = await import("node:path");
+    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
+    if (fs.existsSync(file)) {
+      fileTokens = JSON.parse(fs.readFileSync(file, "utf8"));
     }
   } catch {}
+  // merge: bridge takes precedence, file fills missing
+  const mergedSandbox = bridgeTokens?.sandboxToken ?? fileTokens?.sandboxToken ?? null;
+  const mergedYSweet = bridgeTokens?.ySweetToken ?? fileTokens?.ySweetToken ?? null;
+  const mergedAt = bridgeTokens?.updatedAt ?? fileTokens?.updatedAt ?? null;
+  if (mergedSandbox || mergedYSweet) {
+    const source = bridgeTokens?.sandboxToken || bridgeTokens?.ySweetToken ? "bridge" : (fileTokens?.sandboxToken || fileTokens?.ySweetToken ? "file" : "bridge");
+    // if both have values, prefer bridge source, but if bridge missing sandbox and file has it, indicate merged
+    const actualSource = (bridgeTokens?.sandboxToken && bridgeTokens?.ySweetToken) ? "bridge" : (mergedSandbox && mergedYSweet ? (bridgeTokens?.sandboxToken || bridgeTokens?.ySweetToken ? "bridge+file" : "file") : source);
+    return c.json({ ok: true, sandboxToken: mergedSandbox, ySweetToken: mergedYSweet, updatedAt: mergedAt, source: actualSource });
+  }
   // global fallback (set by page.on handlers or tests)
   try {
     const g: any = (globalThis as any).__BRIDGE_TOKENS__;
@@ -33,18 +112,6 @@ app.get("/__bridge/token", async (c) => {
       return c.json({ ok: true, sandboxToken: gs ?? null, ySweetToken: gy ?? null, source: "global-individual" });
     }
   } catch {}
-  // file fallback (written by bridge's persistTokensSync)
-  try {
-    const fs: any = await import("node:fs");
-    const path: any = await import("node:path");
-    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
-    if (fs.existsSync(file)) {
-      const j = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (j?.sandboxToken || j?.ySweetToken) {
-        return c.json({ ok: true, sandboxToken: j.sandboxToken ?? null, ySweetToken: j.ySweetToken ?? null, updatedAt: j.updatedAt, source: "file" });
-      }
-    }
-  } catch {}
   // env fallback for CI (mocked tests) — treat empty string as unset to allow bridge auto-mint
   const envSandbox = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
   const envYSweet = (process.env.PRISM_Y_TOKEN ?? "").trim();
@@ -54,6 +121,29 @@ app.get("/__bridge/token", async (c) => {
     ySweetToken: envYSweet.length > 5 ? envYSweet : "mock_y_token",
     source: "env",
   });
+});
+
+// POST /__bridge/eval { code: string } — runs code inside the live Prism tab via page.evaluate; keep browser on
+// code is a string of JS to evaluate inside the page (async). Example: "return monaco.editor.getModels().map(m=>m.uri.toString())"
+// Uses Function wrapper for flexibility. Only available when bridge is active.
+app.post("/__bridge/eval", async (c) => {
+  try {
+    const body: any = await c.req.json().catch(() => ({}));
+    const code: string = body?.code ?? body?.js ?? "";
+    if (!code || typeof code !== "string") return c.json({ ok: false, error: "missing code" }, 400);
+    const bridge: any = await import("./bridge/playwright");
+    const page = bridge.getBridgePage?.();
+    if (!page || typeof page.evaluate !== "function") return c.json({ ok: false, error: "bridge not active" }, 503);
+    // Wrap code as async function body; allow `return` and awaits
+    const result = await page.evaluate(async (codeStr: string) => {
+      // eslint-disable-next-line no-new-func
+      const fn = new Function(`return (async () => { ${codeStr} })()`);
+      return await fn();
+    }, code);
+    return c.json({ ok: true, result });
+  } catch (e: any) {
+    return c.json({ ok: false, error: e?.message ?? String(e), stack: e?.stack?.slice(0, 2000) }, 500);
+  }
 });
 
 // Optional: POST /__bridge/refresh triggers bridge refresh (useful when client sees 401/syncing)
@@ -171,18 +261,23 @@ app.post("/v1/responses", async (c) => {
   // Concurrency + Codex Integration (Task 8): queue with PQUEUE_CONCURRENCY=5
   // - concurrent POST /v1/responses with different prompt_cache_key are queued via p-queue (max 5 concurrent, queue render via renderQueue concurrency 1)
   // - cached_tokens / cache_write_tokens in usage.input_tokens_details are forwarded verbatim (handled by relayCreate returning usage)
-  if (body.stream) {
-    const sse = await queue.add(() => relayCreateStream(body)) as Uint8Array;
-    const stream = new ReadableStream({
-      async start(controller) {
-        controller.enqueue(sse as any);
-        controller.close();
-      },
-    });
-    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  try {
+    if (body.stream) {
+      const sse = await queue.add(() => relayCreateStream(body)) as Uint8Array;
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(sse as any);
+          controller.close();
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    }
+    const res: any = await queue.add(() => relayCreate(body));
+    return c.json(res);
+  } catch (e: any) {
+    console.error("[server] relay error", e?.stack ?? e?.message ?? String(e));
+    return c.json({ error: e?.message ?? String(e), stack: e?.stack?.slice(0, 2000) }, 500);
   }
-  const res: any = await queue.add(() => relayCreate(body));
-  return c.json(res);
 });
 export function attachWss(server: any) {
   const wss = new WebSocketServer({ noServer: true });
@@ -276,8 +371,11 @@ export function attachWss(server: any) {
   return wss;
 }
 
-export default app;
-if (import.meta.main) {
+const _isMainForHmr = import.meta.main;
+// Export null when run directly to prevent Bun's HMR wrapper from double-serving on same port
+// Tests import default as Hono app when not main, so keep app for them
+export default _isMainForHmr ? (null as unknown as typeof app) : app;
+if (_isMainForHmr) {
   const port = Number(process.env.PORT || 8787);
   console.log(`ghostprov listening on http://localhost:${port}`);
   const httpServer = createHttpServer(async (req, res) => {

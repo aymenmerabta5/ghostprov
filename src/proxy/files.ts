@@ -47,6 +47,17 @@ async function getSandboxToken(): Promise<string> {
       if (j?.sandboxToken) return j.sandboxToken;
     }
   } catch {}
+  // WSL fallback: also try linux absolute path when Windows path not found (e.g. running via WSL node)
+  try {
+    const altFile2 = "/mnt/d/MyWork/AI/ghostprov/.pw/tokens.json";
+    const fs2: any = await import("node:fs");
+    if (fs2.existsSync(altFile2)) {
+      const j2 = JSON.parse(fs2.readFileSync(altFile2, "utf8"));
+      if (j2?.sandboxToken && typeof j2.sandboxToken === "string" && j2.sandboxToken.length > 5) {
+        return j2.sandboxToken;
+      }
+    }
+  } catch {}
   const envTok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
   return envTok.length > 5 ? envTok : "mock-token";
 }
@@ -75,6 +86,55 @@ const memoryMeta = new Map<string, any>();
  * The Prism endpoint expects multipart/form-data: file (Blob) + purpose (string).
  * We forward whatever FormData the Hono handler received, preserving filename and purpose.
  */
+async function fetchViaBridgeForUpload(url: string, form: FormData, tok: string): Promise<Response> {
+  try {
+    const bridge: any = await import("../bridge/playwright");
+    if (bridge.isBridgeActive?.()) {
+      const page: any = bridge.getBridgePage?.();
+      if (page && typeof page.evaluate === "function") {
+        // Serialize form to transfer via evaluate (FormData + Blob -> base64)
+        const entries: Array<{ key: string; value: string; filename?: string; isFile: boolean }> = [];
+        for (const [k, v] of (form as any).entries()) {
+          if (v instanceof Blob) {
+            const ab = await (v as Blob).arrayBuffer();
+            const bytes = new Uint8Array(ab);
+            let bin = "";
+            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+            const b64 = btoa(bin);
+            entries.push({ key: k, value: b64, filename: (v as any).name ?? "file.bin", isFile: true });
+          } else {
+            entries.push({ key: k, value: String(v), isFile: false });
+          }
+        }
+        const result: { status: number; headers: Record<string, string>; body: string } = await page.evaluate(
+          async ({ url, entries, tok }: any) => {
+            const fd = new FormData();
+            for (const e of entries) {
+              if (e.isFile) {
+                const bin = atob(e.value);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const blob = new Blob([bytes]);
+                fd.append(e.key, blob, e.filename);
+              } else {
+                fd.append(e.key, e.value);
+              }
+            }
+            const r = await fetch(url, { method: "POST", headers: { "x-crixet-sandbox-token": tok }, body: fd, credentials: "include" });
+            const txt = await r.text();
+            const hdrs: Record<string, string> = {};
+            r.headers.forEach((v, k) => (hdrs[k] = v));
+            return { status: r.status, headers: hdrs, body: txt };
+          },
+          { url, entries, tok },
+        );
+        return new Response(result.body, { status: result.status, headers: result.headers });
+      }
+    }
+  } catch {}
+  return fetch(url, { method: "POST", headers: { "x-crixet-sandbox-token": tok }, body: form as any });
+}
+
 export async function uploadFile(
   file: Blob,
   filename: string,
@@ -95,26 +155,20 @@ export async function uploadFile(
     memoryFiles.set(filename, bytes);
   } catch {}
 
-  let r = await fetch(
+  let r = await fetchViaBridgeForUpload(
     `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
-    {
-      method: "POST",
-      headers: { "x-crixet-sandbox-token": tok },
-      body: form as any,
-    },
+    form,
+    tok,
   );
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
     const refreshed = await maybeRefreshOnFailure(r.status, txt);
     if (refreshed) {
       tok = refreshed;
-      r = await fetch(
+      r = await fetchViaBridgeForUpload(
         `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
-        {
-          method: "POST",
-          headers: { "x-crixet-sandbox-token": tok },
-          body: form as any,
-        },
+        form,
+        tok,
       );
       if (!r.ok) {
         const txt2 = await r.text().catch(() => "");
@@ -155,26 +209,20 @@ export async function uploadFileFromFormData(formData: FormData): Promise<any> {
     }
   } catch {}
 
-  let r2 = await fetch(
+  let r2 = await fetchViaBridgeForUpload(
     `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
-    {
-      method: "POST",
-      headers: { "x-crixet-sandbox-token": tok },
-      body: formData as any,
-    },
+    formData as any,
+    tok,
   );
   if (!r2.ok) {
     const txt = await r2.text().catch(() => "");
     const refreshed = await maybeRefreshOnFailure(r2.status, txt);
     if (refreshed) {
       tok = refreshed;
-      r2 = await fetch(
+      r2 = await fetchViaBridgeForUpload(
         `https://prism.openai.com/api/project-files/upload?prism_cache_bust=${bust}`,
-        {
-          method: "POST",
-          headers: { "x-crixet-sandbox-token": tok },
-          body: formData as any,
-        },
+        formData as any,
+        tok,
       );
       if (!r2.ok) {
         const txt2 = await r2.text().catch(() => "");
