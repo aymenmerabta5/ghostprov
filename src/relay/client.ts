@@ -1,10 +1,26 @@
-import type { ResponsesBody, Reasoning, ServiceTier, ReasoningEffort, ReasoningMode, ReasoningContext, ReasoningSummary } from "./types";
+import type {
+  ResponsesBody,
+  Reasoning,
+  ServiceTier,
+  ReasoningEffort,
+  ReasoningMode,
+  ReasoningContext,
+  ReasoningSummary,
+  ImageDetail,
+  InputImage,
+  InputAudio,
+  ImageGenerationTool,
+  ImageGenerationCall,
+  OutputItem,
+} from "./types";
 import {
   VALID_REASONING_EFFORTS,
   VALID_REASONING_MODES,
   VALID_REASONING_CONTEXTS,
   VALID_REASONING_SUMMARIES,
   VALID_SERVICE_TIERS,
+  VALID_IMAGE_DETAILS,
+  VALID_IMAGE_GENERATION_QUALITIES,
 } from "./types";
 
 // Thinking + Fast/Pro validation helpers — still forward verbatim per Global Constraints
@@ -27,6 +43,18 @@ export function isValidServiceTier(v: unknown): v is ServiceTier {
 export function isValidPhase(v: unknown): boolean {
   return v === "commentary" || v === "final_answer";
 }
+export function isValidImageDetail(v: unknown): v is ImageDetail {
+  return typeof v === "string" && (VALID_IMAGE_DETAILS as readonly string[]).includes(v);
+}
+export function isValidImageGenerationQuality(v: unknown): boolean {
+  return typeof v === "string" && (VALID_IMAGE_GENERATION_QUALITIES as readonly string[]).includes(v);
+}
+export function isValidAudioFormat(v: unknown): boolean {
+  return typeof v === "string" && (v as string).length > 0;
+}
+export function isImageGenerationCall(item: unknown): item is ImageGenerationCall {
+  return !!item && typeof item === "object" && (item as any).type === "image_generation_call";
+}
 
 /**
  * normalizeReasoning — returns a cleaned copy if reasoning is an object, otherwise undefined.
@@ -39,6 +67,84 @@ export function normalizeReasoning(reasoning: unknown): Reasoning | undefined {
   const r = reasoning as Reasoning;
   // Return shallow copy to avoid mutating caller, preserving all keys verbatim
   return { ...r };
+}
+
+// ---- Image helpers (re-exported for convenience, core impl lives in src/utils/image.ts) ----
+export function isDataUrl(url: string): boolean {
+  return typeof url === "string" && url.startsWith("data:");
+}
+export function isHttpUrl(url: string): boolean {
+  return typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"));
+}
+export function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+export function base64ToBytes(b64: string): Uint8Array {
+  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(b64, "base64"));
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+export function encodeImageBytesToDataUrl(bytes: Uint8Array, mimeType: string = "image/png"): string {
+  const b64 = bytesToBase64(bytes);
+  return `data:${mimeType};base64,${b64}`;
+}
+export function encodeBase64ToDataUrl(b64: string, mimeType: string = "image/png"): string {
+  return `data:${mimeType};base64,${b64}`;
+}
+export function createInputImage(params: { image_url?: string; file_id?: string; detail?: ImageDetail }): InputImage {
+  const out: InputImage = { type: "input_image" };
+  if (params.image_url !== undefined) out.image_url = params.image_url;
+  if (params.file_id !== undefined) out.file_id = params.file_id;
+  if (params.detail !== undefined) out.detail = params.detail;
+  return out;
+}
+export function createInputImageFromUrl(url: string, detail: ImageDetail = "auto"): InputImage {
+  if (!url || typeof url !== "string") throw new Error("createInputImageFromUrl: url required");
+  return createInputImage({ image_url: url, detail });
+}
+export function createInputImageFromFileId(fileId: string, detail: ImageDetail = "auto"): InputImage {
+  if (!fileId || typeof fileId !== "string") throw new Error("createInputImageFromFileId: fileId required");
+  return createInputImage({ file_id: fileId, detail });
+}
+export function createInputImageFromBytes(bytes: Uint8Array, mimeType: string = "image/png", detail: ImageDetail = "auto"): InputImage {
+  const dataUrl = encodeImageBytesToDataUrl(bytes, mimeType);
+  return createInputImage({ image_url: dataUrl, detail });
+}
+export function createInputImageFromBase64(b64: string, mimeType: string = "image/png", detail: ImageDetail = "auto"): InputImage {
+  const dataUrl = encodeBase64ToDataUrl(b64, mimeType);
+  return createInputImage({ image_url: dataUrl, detail });
+}
+
+// Audio passthrough helpers (verbatim)
+export function createInputAudioFromBytes(bytes: Uint8Array, format: string = "wav"): InputAudio {
+  const b64 = bytesToBase64(bytes);
+  return { type: "input_audio", input_audio: { data: b64, format } };
+}
+export function createInputAudioFromBase64(b64: string, format: string = "wav"): InputAudio {
+  return { type: "input_audio", input_audio: { data: b64, format } };
+}
+export function createInputAudioFromFileId(fileId: string): InputAudio {
+  return { type: "input_audio", file_id: fileId };
+}
+
+// Image generation output helpers
+export function extractImageGenerationCalls(output: unknown): ImageGenerationCall[] {
+  if (!Array.isArray(output)) return [];
+  return (output as unknown[]).filter(isImageGenerationCall) as ImageGenerationCall[];
+}
+export function extractImageGenerationResults(output: unknown): string[] {
+  const calls = extractImageGenerationCalls(output);
+  const results: string[] = [];
+  for (const c of calls) {
+    if (typeof (c as any).result === "string" && (c as any).result.length > 0) results.push((c as any).result);
+    else if (typeof (c as any).b64_json === "string") results.push((c as any).b64_json);
+  }
+  return results;
 }
 
 /**
@@ -56,12 +162,25 @@ export function normalizeReasoning(reasoning: unknown): Reasoning | undefined {
  * - previous_response_id chaining preserving reasoning items (reasoning output items survive chaining)
  * - prompt_cache handling already exists, keep it (prompt_cache_key, prompt_cache_options, prompt_cache_breakpoint)
  *
- * Stable loop (Yjs write → render → zip) as defined in Task 2:
+ * Images & Vision: preserves verbatim
+ * - input_image with image_url (http URL or data:image/...;base64,...), file_id, detail (low/high/auto/original)
+ * - helper encodeImageBytesToDataUrl, createInputImageFromUrl/FileId/Bytes via utils/image.ts
+ * - helper upload via Files API then file_id (createInputImageFromBytesViaUpload)
+ *
+ * Image Generation: preserves verbatim
+ * - tools: [{type:"image_generation", model:"gpt-image-2", quality, size, output_format, background, ...}]
+ * - output: image_generation_call with result (b64_json) + revised_prompt; helpers extractImageGenerationResults
+ *
+ * Audio: preserves verbatim
+ * - input_audio {type:"input_audio", input_audio:{data:base64, format:"wav"|"mp3"}} or {type:"input_audio", file_id}
+ * - output audio/transcription verbatim
+ *
+ * Stable loop (Yjs write -> render -> zip) as defined in Task 2:
  *   write job.json via Yjs wss://prism.openai.com/y/d/<doc>/ws (or mocked bridge)
  *   trigger POST /s/sandboxes/proxy/render (single, queued)
  *   runner.py inside sandbox does:
  *     curl --cacert $PROXY_CA_CERT_PATH -d @job.json $OPENAI_BASE_URL/responses > response.json
- *   GET /s/sandboxes/proxy/zip → extract response.json
+ *   GET /s/sandboxes/proxy/zip -> extract response.json
  *
  * This is the TS equivalent of ask.py, verbatim forwarding of all fields.
  */
@@ -164,4 +283,24 @@ export async function relayCreateStream(body: any): Promise<Uint8Array> {
 }
 
 // Re-export types for consumers
-export type { ResponsesBody, Reasoning, ServiceTier, ReasoningEffort, ReasoningMode, ReasoningContext, ReasoningSummary, Phase } from "./types";
+export type {
+  ResponsesBody,
+  Reasoning,
+  ServiceTier,
+  ReasoningEffort,
+  ReasoningMode,
+  ReasoningContext,
+  ReasoningSummary,
+  Phase,
+  ImageDetail,
+  InputImage,
+  InputAudio,
+  InputFile,
+  InputContentPart,
+  ImageGenerationTool,
+  ImageGenerationCall,
+  OutputItem,
+  ResponsesOutput,
+} from "./types";
+// Re-export image/audio utils for convenience (also available via src/utils/image.ts / audio.ts)
+export type { ImageGenerationQuality, ImageGenerationSize, ImageGenerationFormat, ImageGenerationBackground } from "./types";

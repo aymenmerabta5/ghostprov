@@ -54,7 +54,115 @@ export type ResponsesBodyFull = ResponsesBody & {
   [key: string]: unknown;
 };
 
-export type ToolDefinition = {
+// ---- Image / Vision types (Task Image) ----
+export type ImageDetail = "low" | "high" | "auto" | "original";
+
+export type InputImage = {
+  type: "input_image";
+  image_url?: string;
+  file_id?: string;
+  detail?: ImageDetail;
+  [key: string]: unknown;
+};
+
+export type InputText = {
+  type: "input_text";
+  text: string;
+  [key: string]: unknown;
+};
+
+export type InputFile = {
+  type: "input_file";
+  file_id?: string;
+  filename?: string;
+  file_data?: string;
+  [key: string]: unknown;
+};
+
+// ---- Audio types (Task Image: Audio and speech, transcription, voice) ----
+export type InputAudio = {
+  type: "input_audio";
+  // Responses API audio input: { data: base64, format: "wav"|"mp3"|... } or file_id
+  input_audio?: {
+    data: string;
+    format: string;
+    [key: string]: unknown;
+  };
+  file_id?: string;
+  // transcription subfields (if audio transcription model)
+  transcript?: string;
+  [key: string]: unknown;
+};
+
+export type AudioOutput = {
+  type: "output_audio";
+  data?: string;
+  format?: string;
+  transcript?: string;
+  [key: string]: unknown;
+};
+
+// Generic content part union for input array entries
+export type InputContentPart = InputText | InputImage | InputAudio | InputFile | { type: string; [key: string]: unknown };
+
+export type UserMessageInput = {
+  role: "user" | "system" | "assistant" | "developer";
+  content: (string | InputContentPart)[] | string;
+  [key: string]: unknown;
+};
+
+// ---- Tool definitions ----
+export type FunctionTool = {
+  type: "function";
+  name: string;
+  description?: string;
+  parameters?: unknown;
+  [key: string]: unknown;
+};
+
+export type CustomTool = {
+  type: "custom";
+  name: string;
+  description?: string;
+  parameters?: unknown;
+  [key: string]: unknown;
+};
+
+export type ImageGenerationQuality = "low" | "medium" | "high" | "auto";
+export type ImageGenerationSize = "1024x1024" | "1024x1536" | "1536x1024" | "auto" | string;
+export type ImageGenerationFormat = "png" | "jpeg" | "webp" | string;
+export type ImageGenerationBackground = "transparent" | "opaque" | "auto" | string;
+
+export type ImageGenerationTool = {
+  type: "image_generation";
+  model?: string; // e.g. "gpt-image-1" | "gpt-image-1.5" | "gpt-image-2"
+  quality?: ImageGenerationQuality;
+  size?: ImageGenerationSize;
+  output_format?: ImageGenerationFormat;
+  output_compression?: number;
+  background?: ImageGenerationBackground;
+  moderation?: string;
+  partial_images?: number;
+  [key: string]: unknown;
+};
+
+export type ToolDefinition =
+  | FunctionTool
+  | CustomTool
+  | ImageGenerationTool
+  | { type: string; [key: string]: unknown };
+
+// ---- Output items ----
+export type ImageGenerationCall = {
+  type: "image_generation_call";
+  id: string;
+  status?: string; // "completed" | "in_progress" | "generating" | etc.
+  result?: string; // base64 b64_json
+  revised_prompt?: string;
+  [key: string]: unknown;
+};
+
+export type ToolDefinitionOld = {
   type: "function" | "custom";
   name: string;
   description?: string;
@@ -68,6 +176,9 @@ export type OutputItem =
   | { type: "function_call"; name: string; arguments: string; call_id: string }
   | { type: "custom_tool_call"; name: string; input: unknown; call_id: string }
   | { type: "function_call_output"; call_id: string; output: unknown }
+  | ImageGenerationCall
+  | { type: "output_text"; text: string; [key: string]: unknown }
+  | { type: "output_audio"; data?: string; transcript?: string; [key: string]: unknown }
   | { type: string; [key: string]: unknown };
 
 export type ResponsesOutput = {
@@ -87,3 +198,6 @@ export const VALID_REASONING_CONTEXTS: readonly ReasoningContext[] = ["current_t
 export const VALID_REASONING_SUMMARIES: readonly ReasoningSummary[] = ["auto", "detailed", "concise"] as const;
 export const VALID_SERVICE_TIERS: readonly ServiceTier[] = ["fast", "priority", "default", "auto"] as const;
 export const VALID_PHASES: readonly Phase[] = ["commentary", "final_answer"] as const;
+export const VALID_IMAGE_DETAILS: readonly ImageDetail[] = ["low", "high", "auto", "original"] as const;
+export const VALID_IMAGE_GENERATION_QUALITIES: readonly ImageGenerationQuality[] = ["low", "medium", "high", "auto"] as const;
+export const VALID_IMAGE_GENERATION_FORMATS: readonly string[] = ["png", "jpeg", "webp"] as const;
