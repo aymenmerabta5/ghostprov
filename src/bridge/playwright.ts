@@ -355,7 +355,17 @@ export async function refreshBridge(): Promise<void> {
       try {
         await waitForHeartbeat(pwPage, 20000);
       } catch {}
-      // after reload, headers will be captured again via page.on handlers
+      // keep browser open: actively re-trigger heartbeat via console command to re-mint token
+      try {
+        await pwPage.evaluate(async () => {
+          try {
+            await fetch("/s/sandboxes/proxy/heartbeat?prism_cache_bust=" + Date.now()).catch(() => {});
+            await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId: "2a153042-dc25-4ca5-b290-260eed5e8705", requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
+          } catch {}
+        });
+        await new Promise((r) => setTimeout(r, 1500));
+      } catch {}
+      // after reload, headers will be captured again via context.on handlers
       // also proactively re-mint Y token via fetch if needed
       try {
         await mintYSweetTokenViaFetch();
@@ -455,28 +465,23 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   pwPage = pages[0] ?? (await pwContext.newPage());
 
   // Attach token capture handlers BEFORE goto so early requests are not missed
-  // Capture sandbox token via request headers
-  pwPage.on("request", (req: any) => {
+  // Use context-level listeners to capture from any page/tab (Prism opens in second tab, first is about:blank)
+  const attachRequestHandler = (req: any) => {
     try {
       const headers: Record<string, string> = req.headers?.() ?? {};
       captureSandboxTokenFromHeaders(headers);
-      // also capture Y token request header if present (some Prism versions send ASQ in header)
       const yHeader = (headers as any)["authorization"] ?? (headers as any)["x-y-token"];
       if (yHeader && typeof yHeader === "string" && yHeader.startsWith("ASQ")) {
-        // Y token sometimes prefixed with Bearer
         const tok = yHeader.replace(/^Bearer\s+/i, "").trim();
         if (tok.length > 20) setYSweetToken(tok);
       }
     } catch {}
-  });
-
-  pwPage.on("response", async (res: any) => {
+  };
+  const attachResponseHandler = async (res: any) => {
     try {
       await captureYSweetFromResponse(res);
-      // also capture sandbox token from response headers if present (some endpoints echo it)
       const headers = res.headers?.() ?? {};
       captureSandboxTokenFromHeaders(headers as Record<string, string>);
-      // heartbeat detection
       try {
         const url: string = res.url?.() ?? "";
         if (url.includes("heartbeat") && res.status() >= 200 && res.status() < 300) {
@@ -484,7 +489,14 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
         }
       } catch {}
     } catch {}
-  });
+  };
+  // Listen on both context (all pages) and page (fallback)
+  try {
+    pwContext.on("request", attachRequestHandler);
+    pwContext.on("response", attachResponseHandler);
+  } catch {}
+  pwPage.on("request", attachRequestHandler);
+  pwPage.on("response", attachResponseHandler);
 
   // Also capture via requestfinished for tokens that are in request headers but not response
   // (already handled above, but keep for completeness)
@@ -505,6 +517,22 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
       // not fatal in mocked CI, but in live mode we at least wait a bit more
       await new Promise((r) => setTimeout(r, 2000));
     }
+  }
+
+  // Active heartbeat trigger via console command (user request: automatically do heartbeat and keep browser open)
+  // If no sandbox token captured yet, force a heartbeat fetch from the page's console to trigger token capture
+  if (!sandboxToken) {
+    try {
+      await pwPage.evaluate(async () => {
+        try {
+          await fetch("/s/sandboxes/proxy/heartbeat?prism_cache_bust=" + Date.now(), { headers: { "x-crixet-sandbox-token": "dummy" } }).catch(() => {});
+          // also trigger a Y token mint via console
+          await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId: "2a153042-dc25-4ca5-b290-260eed5e8705", requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
+        } catch {}
+      });
+      // wait a bit for the request/response handlers to capture
+      await new Promise((r) => setTimeout(r, 2000));
+    } catch {}
   }
 
   // After navigation, also try to read tokens from page's localStorage/cookies if needed
