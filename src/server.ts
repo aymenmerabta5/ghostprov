@@ -3,6 +3,7 @@ import { relayCreate, relayCreateStream } from "./relay/client";
 import { uploadFileFromFormData, getFileContent, getFile, listFiles } from "./proxy/files";
 import { WebSocketServer } from "ws";
 import { createServer as createHttpServer } from "node:http";
+import { queue } from "./utils/queue";
 const app = new Hono();
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -66,17 +67,20 @@ app.post("/v1/responses", async (c) => {
   // - prompt_cache_breakpoint: {mode:"explicit"}
   // Tool choice passthrough: allow "auto" | "required" | "none" | {type:"function", name} | {type:"allowed_tools", allowed_tools: [...]}
   // All fields are preserved via relayCreate's verbatim spread; no stripping.
+  // Concurrency + Codex Integration (Task 8): queue with PQUEUE_CONCURRENCY=5
+  // - concurrent POST /v1/responses with different prompt_cache_key are queued via p-queue (max 5 concurrent, queue render via renderQueue concurrency 1)
+  // - cached_tokens / cache_write_tokens in usage.input_tokens_details are forwarded verbatim (handled by relayCreate returning usage)
   if (body.stream) {
+    const sse = await queue.add(() => relayCreateStream(body)) as Uint8Array;
     const stream = new ReadableStream({
       async start(controller) {
-        const sse = await relayCreateStream(body);
-        controller.enqueue(sse);
+        controller.enqueue(sse as any);
         controller.close();
       },
     });
     return new Response(stream, { headers: { "content-type": "text/event-stream" } });
   }
-  const res = await relayCreate(body);
+  const res: any = await queue.add(() => relayCreate(body));
   return c.json(res);
 });
 export function attachWss(server: any) {
@@ -94,7 +98,8 @@ export function attachWss(server: any) {
           if (!body.previous_response_id && previous_response_id) {
             body.previous_response_id = previous_response_id;
           }
-          const result: any = await relayCreate(body);
+          // Concurrency: WSS also respects queue (PQUEUE_CONCURRENCY=5) and renderQueue (1)
+          const result: any = await queue.add(() => relayCreate(body));
           const newId: string =
             result?.id ?? result?.response?.id ?? `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           previous_response_id = newId;
