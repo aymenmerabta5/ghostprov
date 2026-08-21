@@ -599,7 +599,10 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             // so skipping this breaks agentic clients (Codex).
             if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
               const missed = extractor.feed(JSON.stringify({
-                streaming: true, total: j.gp_sse.length, start: 0, tail: j.gp_sse,
+                streaming: true,
+                total: Number.isFinite(j.gp_total) ? j.gp_total : Array.from(j.gp_sse).length,
+                start: 0,
+                tail: j.gp_sse,
               }));
               if (missed.length) {
                 for (const f of missed) frames.push(f);

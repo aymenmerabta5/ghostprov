@@ -24,7 +24,7 @@ vi.mock("../src/relay/pipeline", () => ({
 vi.mock("../src/bridge/playwright", () => ({ startPlaywrightBridge: vi.fn() }));
 
 import app from "../src/server";
-import { SseDeltaExtractor, parseFrames } from "../src/relay/sse";
+import { SseDeltaExtractor, SseProtocolGapError, parseFrames } from "../src/relay/sse";
 
 function makeHandle(opts: {
   final: any;
@@ -210,14 +210,13 @@ describe("SseDeltaExtractor", () => {
     expect(p4.map(f => f.event)).toEqual(["c"]);
   });
 
-  it("v2: handles window slide past cursor by dropping missed region", () => {
+  it("v2: rejects a window slide past the unconsumed cursor", () => {
     const ex = new SseDeltaExtractor();
     ex.feed(JSON.stringify({ streaming: true, total: 10, start: 0, tail: "0123456789" }));
-    const frames = ex.feed(JSON.stringify({
-      streaming: true, total: 100, start: 90,
+    expect(() => ex.feed(JSON.stringify({
+      streaming: true, total: 110, start: 90,
       tail: "event: z\ndata: {}\n\n",
-    }));
-    expect(frames.map(f => f.event)).toEqual(["z"]);
+    }))).toThrow(SseProtocolGapError);
   });
 
   it("legacy v1: full accumulated sse", () => {

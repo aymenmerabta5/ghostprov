@@ -18,13 +18,23 @@ export function parseFrames(region: string, emitFrom: number): { frames: SseFram
   const frames: SseFrame[] = [];
   let start = emitFrom;
   for (;;) {
-    const idx = region.indexOf("\n\n", start);
+    const lf = region.indexOf("\n\n", start);
+    const crlf = region.indexOf("\r\n\r\n", start);
+    let idx = -1;
+    let delimiterLength = 0;
+    if (lf !== -1 && (crlf === -1 || lf < crlf)) {
+      idx = lf;
+      delimiterLength = 2;
+    } else if (crlf !== -1) {
+      idx = crlf;
+      delimiterLength = 4;
+    }
     if (idx === -1) break;
     const chunk = region.slice(start, idx);
-    start = idx + 2;
+    start = idx + delimiterLength;
     let event = "message";
     const dataLines: string[] = [];
-    for (const line of chunk.split("\n")) {
+    for (const line of chunk.split(/\r?\n/)) {
       if (line.startsWith("event:")) event = line.slice(6).trim();
       else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
     }
@@ -61,53 +71,64 @@ export const SSE_HEADERS = {
   "cache-control": "no-cache",
 } as const;
 
+export class SseProtocolGapError extends Error {
+  readonly code = "sse_window_gap";
+
+  constructor(readonly cursor: number, readonly windowStart: number) {
+    super(`SSE window starts at ${windowStart}, past unconsumed cursor ${cursor}`);
+    this.name = "SseProtocolGapError";
+  }
+}
+
+function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+function sliceCodePoints(value: string, start: number, end?: number): string {
+  return Array.from(value).slice(start, end).join("");
+}
+
 /**
  * Incremental extractor over both protocols.
  * Feed it each poll's raw response.json text; it returns only NEW complete frames.
  */
 export class SseDeltaExtractor {
-  /** absolute chars of the stream consumed so far */
-  private consumed = 0;
-  /** carry-over for a frame split across polls */
-  private pending = "";
-  private pendingBase = 0; // absolute offset of pending[0]
+  /** Absolute daemon code-point offset immediately after the last complete frame. */
+  private cursor = 0;
 
   feed(raw: string): SseFrame[] {
+    let j: any;
     try {
-      const j = JSON.parse(raw);
-      if (j?.streaming !== true) return [];
-      if (typeof j.sse === "string") {
-        // legacy v1: full accumulated stream
-        if (j.sse.length <= this.consumed) return [];
-        const region = j.sse;
-        const from = this.consumed;
-        const { frames, nextOffset } = parseFrames(region, from);
-        this.consumed = nextOffset;
-        return frames;
-      }
-      if (typeof j.tail === "string" && Number.isFinite(j.total) && Number.isFinite(j.start)) {
-        const total: number = j.total;
-        const start: number = j.start;
-        if (total <= this.consumed) return [];
-        if (start > this.consumed) {
-          // window slid past our cursor (client stalled) — drop missed frames
-          this.consumed = start;
-          this.pending = "";
-          this.pendingBase = start;
-        }
-        // region of new bytes we can see: [max(consumed,start), total)
-        const tailFrom = Math.max(this.consumed, start) - start;
-        const region = this.pending + j.tail.slice(tailFrom);
-        const regionBase = this.pendingBase;
-        const { frames, nextOffset } = parseFrames(region, this.consumed - regionBase);
-        // keep unconsumed remainder as pending
-        this.pending = region.slice(nextOffset);
-        this.pendingBase = regionBase + nextOffset;
-        this.consumed = total;
-        return frames;
-      }
+      j = JSON.parse(raw);
     } catch {
       // mid-write partial JSON — retry next poll
+      return [];
+    }
+    if (j?.streaming !== true) return [];
+    if (typeof j.sse === "string") {
+      // legacy v1: full accumulated stream
+      const total = codePointLength(j.sse);
+      if (total <= this.cursor) return [];
+      const region = sliceCodePoints(j.sse, this.cursor);
+      const { frames, nextOffset } = parseFrames(region, 0);
+      this.cursor += codePointLength(region.slice(0, nextOffset));
+      return frames;
+    }
+    if (typeof j.tail === "string" && Number.isFinite(j.total) && Number.isFinite(j.start)) {
+      const total = Math.max(0, Math.trunc(j.total));
+      const start = Math.max(0, Math.trunc(j.start));
+      if (total <= this.cursor) return [];
+      if (start > this.cursor) throw new SseProtocolGapError(this.cursor, start);
+
+      // Python's daemon reports code-point offsets. Slice via Array.from so
+      // astral characters consume one position on both sides of the wire.
+      const tailLength = codePointLength(j.tail);
+      const visibleEnd = start + tailLength;
+      const boundedEnd = Math.min(total, visibleEnd);
+      const region = sliceCodePoints(j.tail, this.cursor - start, boundedEnd - start);
+      const { frames, nextOffset } = parseFrames(region, 0);
+      this.cursor += codePointLength(region.slice(0, nextOffset));
+      return frames;
     }
     return [];
   }
