@@ -25,7 +25,14 @@ import { config } from "../config";
 import { renderQueue } from "../utils/queue";
 import { triggerRender, fetchZipFiles, pageFetch, bust } from "../prism/gateway";
 import { readDocFile, writeDocFile, writeDocFileAppended, ensureDocFolder } from "../prism/ydoc";
-import { planJob, creationSlot, type PlannedJob } from "./segments";
+import {
+  chooseSegmentProtocol,
+  planJob,
+  planV63Job,
+  creationSlot,
+  type PlannedJob,
+  type PlannedV63Job,
+} from "./segments";
 import { SseDeltaExtractor, sanitizeFinal, type SseFrame } from "./sse";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -100,6 +107,16 @@ function parseStatus(raw: string | null): DaemonStatus | null {
   return null;
 }
 
+let liveJobProtocols = new Set<string>();
+
+function rememberDaemonCapabilities(status: DaemonStatus): void {
+  liveJobProtocols = new Set(Array.isArray(status.job_protocols) ? status.job_protocols : []);
+}
+
+export function daemonJobProtocols(): ReadonlySet<string> {
+  return liveJobProtocols;
+}
+
 /** Daemon considered live if heartbeat is fresher than this. */
 function statusFresh(s: DaemonStatus | null): boolean {
   return !!s && Date.now() / 1000 - s.ts < 15;
@@ -163,6 +180,7 @@ export async function ensureReady(): Promise<number> {
   // fast path — no lock contention when healthy
   const quick = parseStatus(await readDiskFile(STATUS_FILE).catch(() => null));
   if (statusFresh(quick)) {
+    rememberDaemonCapabilities(quick!);
     const n = Math.max(1, Math.min(config.slots, quick!.slots || config.slots));
     await ensureProvisioned(n);
     return n;
@@ -272,6 +290,7 @@ async function deployAndRevive(): Promise<number> {
   for (;;) {
     const s = parseStatus(await readDiskFile(STATUS_FILE).catch(() => null));
     if (statusFresh(s)) {
+      rememberDaemonCapabilities(s!);
       console.log(
         `[slots] daemon alive pid=${s!.pid} build=${s!.daemon_build ?? "unknown"} ` +
         `slots=${s!.slots} done=${s!.done} failed=${s!.failed}` +
@@ -383,19 +402,28 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   let closed = false;
 
   // --- job write plan -------------------------------------------------------
-  // v6.2 SEGMENTED JOBS (GP_SEGMENT=1): payloads >512KiB are split into
-  // ≤192KiB (encoded) write-once part entries under the shared "gp" folder,
-  // then a tiny manifest is published LAST into job_sN.json. The daemon
+  // Segmented jobs (GP_SEGMENT=1): payloads >512KiB are split into small
+  // write-once entries under the shared "gp" folder. An advertised v6.3
+  // daemon commits by publishing embedded-header part zero last, avoiding the
+  // shared job_sN cursor; older daemons receive a v6.2 cursor manifest.
+  // The daemon
   // assembles parts, verifies size+sha12, and responds via the UNCHANGED v5
   // windowed/terminal protocol. This removes the single-Yjs-update size
   // ceiling entirely (backend silently truncated monolithic updates at a
   // moving ~2.4-3.5MB limit — deterministic, unfixable by retry).
   const SEGMENT = process.env.GP_SEGMENT === "1";
   let segPlan: PlannedJob | null = null;
+  let v63Plan: PlannedV63Job | null = null;
   if (SEGMENT && jobText.length > 512 * 1024) {
-    segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+    if (chooseSegmentProtocol(liveJobProtocols) === 6.3) {
+      v63Plan = planV63Job(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+    } else {
+      segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+    }
+    const activePlan = v63Plan ?? segPlan!;
     console.log(
-      `[slots ${tag}] segmented job: ${segPlan.parts.length} parts (v6.2${segPlan.enc === "gz+b64" ? "+gz" : ""}, id=${segPlan.reqid})`,
+      `[slots ${tag}] segmented job: ${activePlan.parts.length} parts ` +
+      `(v${v63Plan ? "6.3" : "6.2"}${activePlan.enc === "gz+b64" ? "+gz" : ""}, id=${activePlan.reqid})`,
     );
   }
 
@@ -456,19 +484,24 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
     // full-job sha12; failures come back as bad_v6_* failed statuses which we
     // auto-retry once below with a fresh reqid. (Readback cost 1-3s/request.)
     let segRetried = false;
-    async function publishSegments(plan: PlannedJob): Promise<void> {
-      const t0w = Date.now();
+    async function segmentFolder(dir: string): Promise<string> {
       let folderId: string;
       if (gpFolderId) {
         folderId = gpFolderId;
       } else {
         try {
-          folderId = await ensureDocFolder(plan.dir);
+          folderId = await ensureDocFolder(dir);
           gpFolderId = folderId;
         } catch (e: any) {
           throw new SlotError(`ensureDocFolder failed: ${String(e?.message ?? e).slice(0, 140)}`, "sync");
         }
       }
+      return folderId;
+    }
+
+    async function publishSegments(plan: PlannedJob): Promise<void> {
+      const t0w = Date.now();
+      const folderId = await segmentFolder(plan.dir);
       for (const p of plan.parts) {
         await creationSlot();
         try {
@@ -488,7 +521,28 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
       );
     }
 
-    if (segPlan) {
+    async function publishV63(plan: PlannedV63Job): Promise<void> {
+      const t0w = Date.now();
+      const folderId = await segmentFolder(plan.dir);
+      for (const part of plan.publishOrder) {
+        await creationSlot();
+        try {
+          await writeDocFile(part.base, part.text, { folderId });
+        } catch (e: any) {
+          console.error(`[slots ${tag}] V63 PART WRITE FAILED ${part.key}: ${String(e?.message ?? e).slice(0, 180)}`);
+          throw new SlotError(`v6.3 part write failed: ${part.base}`, e?.kind === "auth" ? "no-bridge" : "sync");
+        }
+        laneArtifactSet(slot.n).add(part.base);
+      }
+      console.log(
+        `[slots ${tag}] transport: v=6.3 parts=${plan.parts.length} enc=${plan.enc} ` +
+        `write=${Date.now() - t0w}ms commit=${plan.parts[0].base}`,
+      );
+    }
+
+    if (v63Plan) {
+      await publishV63(v63Plan);
+    } else if (segPlan) {
       const tGz0 = Date.now();
       // note: gzip ran inside planJob; re-measure is not possible post-hoc,
       // so we log planning+gzip as a single stage next to writes instead.
@@ -521,9 +575,14 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
         if (unlatchAttempts < 2) {
           unlatchAttempts++;
           unlatchDeadline = Date.now() + config.unlatchTimeoutMs;
-          console.warn(`[slots ${tag}] no ack within ${config.unlatchTimeoutMs}ms — rewriting ${jobName} (recovery #${unlatchAttempts})`);
+          console.warn(`[slots ${tag}] no ack within ${config.unlatchTimeoutMs}ms — republishing commit (recovery #${unlatchAttempts})`);
           // Segmented: republish ONLY the manifest (parts are immutable and
           // already verified on disk; a fresh manifest mtime triggers rescan).
+          if (v63Plan) {
+            const commit = v63Plan.parts[0];
+            await writeDocFile(commit.base, commit.text).catch(() => undefined);
+            continue;
+          }
           const rewrite = segPlan ? segPlan.manifestText : (indexText ?? jobText);
           if (!segPlan && rewrite.length > 512 * 1024 && process.env.GP_APPEND_JOBS !== "0") {
             await writeDocFileAppended(jobName, rewrite).catch(() => undefined);
@@ -575,15 +634,20 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             // automatic republish with a fresh reqid before surfacing —
             // covers rare deterministic sync loss without burning a Codex turn.
             const code = typeof j.error?.code === "string" ? j.error.code : "";
-            if (j.status === "failed" && segPlan && !segRetried && code.startsWith("bad_v6")) {
+            if (j.status === "failed" && (segPlan || v63Plan) && !segRetried && code.startsWith("bad_v6")) {
               segRetried = true;
               console.warn(`[slots ${tag}] daemon rejected segments (${code}) — republishing with fresh reqid`);
-              segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+              if (v63Plan) {
+                v63Plan = planV63Job(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+              } else {
+                segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
+              }
               latched = false;
               unlatchAttempts = 0;
               unlatchDeadline = Date.now() + config.unlatchTimeoutMs;
               lastProgressAt = Date.now();
-              await publishSegments(segPlan);
+              if (v63Plan) await publishV63(v63Plan);
+              else await publishSegments(segPlan!);
               continue;
             }
             if (j.status === "failed") {

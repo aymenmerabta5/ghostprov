@@ -96,6 +96,24 @@ export interface PlannedJob {
   enc: "raw" | "gz+b64";
 }
 
+export interface PlannedV63Part {
+  index: number;
+  base: string;
+  key: string;
+  text: string;
+}
+
+export interface PlannedV63Job {
+  version: 6.3;
+  reqid: string;
+  dir: string;
+  parts: PlannedV63Part[];
+  publishOrder: PlannedV63Part[];
+  enc: "raw" | "gz+b64";
+  size: number;
+  sha12: string;
+}
+
 export function newReqid(): string {
   return crypto.randomBytes(5).toString("hex");
 }
@@ -137,4 +155,88 @@ export function planJob(
     ...(enc === "gz+b64" ? { enc } : {}),
   });
   return { reqid, dir, parts, manifestText, enc };
+}
+
+export function chooseSegmentProtocol(protocols: Iterable<string>): 6.2 | 6.3 {
+  return new Set(protocols).has("segmented-v6.3-embedded-commit") ? 6.3 : 6.2;
+}
+
+function splitUtf8WithCaps(text: string, firstMaxBytes: number, nextMaxBytes: number): string[] {
+  const bytes = Buffer.from(text, "utf8");
+  if (!bytes.length) return [""];
+  const out: string[] = [];
+  let start = 0;
+  let cap = firstMaxBytes;
+  while (start < bytes.length) {
+    let end = Math.min(start + cap, bytes.length);
+    if (end < bytes.length) {
+      while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
+    }
+    if (end === start) throw new RangeError("segment byte limit is too small for one UTF-8 code point");
+    out.push(bytes.subarray(start, end).toString("utf8"));
+    start = end;
+    cap = nextMaxBytes;
+  }
+  return out;
+}
+
+export function planV63Job(
+  jobName: string,
+  jobText: string,
+  options: { gzip?: boolean; dir?: string; partBytes?: number; maxPartBytes?: number } = {},
+): PlannedV63Job {
+  const dir = options.dir ?? "gp";
+  const maxPartBytes = Math.trunc(options.maxPartBytes ?? 256 * 1024);
+  const requestedPartBytes = Math.trunc(options.partBytes ?? Number(process.env.GP_PART_BYTES ?? 250 * 1024));
+  if (maxPartBytes <= 1200 || requestedPartBytes < 1) throw new RangeError("invalid v6.3 part byte limits");
+  const subsequentCap = Math.min(requestedPartBytes, maxPartBytes);
+  // The daemon permits up to 1024 header bytes. Reserve that full bound plus
+  // magic/newline so part zero remains valid even as part-count digits grow.
+  const firstPayloadCap = Math.min(requestedPartBytes, maxPartBytes - 1030);
+  const original = Buffer.from(jobText, "utf8");
+  const reqid = newReqid();
+  const digest = crypto.createHash("sha256").update(original).digest("hex").slice(0, 12);
+
+  const rawParts = splitUtf8WithCaps(jobText, firstPayloadCap, subsequentCap);
+  let payloadParts = rawParts;
+  let enc: "raw" | "gz+b64" = "raw";
+  if (options.gzip) {
+    const encoded = zlib.gzipSync(original, { level: 1 }).toString("base64");
+    const gzipParts: string[] = [];
+    gzipParts.push(encoded.slice(0, firstPayloadCap));
+    for (let offset = firstPayloadCap; offset < encoded.length; offset += subsequentCap) {
+      gzipParts.push(encoded.slice(offset, offset + subsequentCap));
+    }
+    if (gzipParts.length < rawParts.length) {
+      payloadParts = gzipParts;
+      enc = "gz+b64";
+    }
+  }
+
+  const header = JSON.stringify({
+    v: 6.3,
+    id: reqid,
+    parts: payloadParts.length,
+    size: original.length,
+    sha12: digest,
+    ...(enc === "gz+b64" ? { enc } : {}),
+  });
+  if (Buffer.byteLength(header, "utf8") > 1024) throw new RangeError("v6.3 commit header exceeds daemon limit");
+
+  const parts = payloadParts.map((payload, index): PlannedV63Part => {
+    const base = `${jobName}.${reqid}.${index}`;
+    const text = index === 0 ? `GP63 ${header}\n${payload}` : payload;
+    if (Buffer.byteLength(text, "utf8") > maxPartBytes) throw new RangeError(`v6.3 part ${index} exceeds daemon limit`);
+    return { index, base, key: `${dir}/${base}`, text };
+  });
+  return {
+    version: 6.3,
+    reqid,
+    dir,
+    parts,
+    publishOrder: [...parts.slice(1), parts[0]],
+    enc,
+    size: original.length,
+    sha12: digest,
+  };
 }

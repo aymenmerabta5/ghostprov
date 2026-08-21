@@ -7,6 +7,7 @@
  * don't exist in the browser (ReferenceError inside evaluate).
  */
 import { config } from "../config";
+import { ZipPollCoordinator } from "./zip-coordinator";
 
 type PageLike = { evaluate: (fn: any, ...args: any[]) => Promise<any> };
 
@@ -199,7 +200,7 @@ export async function pageFetch(
 }
 
 /** Read /zip, inflate entries in-page, return {name → bytes}. */
-export async function fetchZipFiles(names?: string[]): Promise<Map<string, Uint8Array>> {
+async function fetchZipFilesDirect(names?: string[]): Promise<Map<string, Uint8Array>> {
   for (let attempt = 0; attempt < 4; attempt++) {
     const token = await getSandboxTokenAsync();
     const result = await evalInPage<{ status: number; files: Record<string, string> }>(FETCH_ZIP_SRC, {
@@ -228,6 +229,17 @@ export async function fetchZipFiles(names?: string[]): Promise<Map<string, Uint8
     throw new GatewayAuthError(result.status || 500);
   }
   throw new GatewayAuthError(401);
+}
+
+const configuredZipBatchMs = Number(process.env.GP_ZIP_BATCH_MS ?? 10);
+export const zipPollCoordinator = new ZipPollCoordinator(
+  names => fetchZipFilesDirect(names),
+  Number.isFinite(configuredZipBatchMs) && configuredZipBatchMs >= 0 ? configuredZipBatchMs : 10,
+);
+
+/** Coalesced named reads; unfiltered archive reads remain direct. */
+export function fetchZipFiles(names?: string[]): Promise<Map<string, Uint8Array>> {
+  return names ? zipPollCoordinator.read(names) : fetchZipFilesDirect();
 }
 
 export async function readTrackedFile(name: string): Promise<string | null> {
