@@ -16,8 +16,10 @@ export const config = {
    * Fail only when the stream is STALLED (no bytes flowing) for this long.
    * Healthy streams run indefinitely regardless of total duration — huge
    * reasoning/refactors are accepted whatever time they take.
+   * NOTE: reasoning WITHOUT summary streaming can be silent for many minutes
+   * (agentic max-effort turns); keep this generous.
    */
-  stallTimeoutMs: num(process.env.GP_STALL_TIMEOUT_MS, 300_000),
+  stallTimeoutMs: num(process.env.GP_STALL_TIMEOUT_MS, 900_000),
   /** zip poll interval ceiling while waiting (adaptive: 150ms when active) */
   pollIntervalMs: num(process.env.GP_POLL_INTERVAL_MS, 400),
   /** emit SSE comment keepalive every N ms during silent stretches */

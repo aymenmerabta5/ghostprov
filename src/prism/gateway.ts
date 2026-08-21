@@ -181,7 +181,11 @@ export async function pageFetch(
     const res = await evalInPage<{ status: number; body: string }>(FETCH_TEXT_SRC, {
       url, method: init?.method ?? "GET", headers, body,
     });
+    if (res.status !== 200 && res.status !== 202) {
+      console.warn(`[gw] ${init?.method ?? "GET"} ${path.slice(0, 60)} -> ${res.status} ${res.body.slice(0, 120)}`);
+    }
     if ((res.status === 401 || res.status === 403) && attempt < 3) {
+      console.warn(`[gw] auth failure ${res.status} — refreshing sandbox token from bridge…`);
       await refreshSandboxToken(token).catch(() => undefined);
       continue;
     }
@@ -203,6 +207,9 @@ export async function fetchZipFiles(names?: string[]): Promise<Map<string, Uint8
       token,
       want: names ?? null,
     });
+    if (result.status !== 200) {
+      console.warn(`[gw] GET /zip -> ${result.status} (attempt ${attempt + 1}/4)`);
+    }
     if (result.status === 200) {
       const out = new Map<string, Uint8Array>();
       for (const [name, b64] of Object.entries(result.files)) {

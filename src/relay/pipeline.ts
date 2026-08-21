@@ -56,8 +56,8 @@ async function ensureFileSync(name: string, content: string): Promise<void> {
     return;
   }
   await writeTrackedFile(name, content);
-  // scale timeout with payload size (images/audio inflate job.json)
-  const timeout = Math.min(config.syncTimeoutMs + Math.floor(content.length / 200), 120_000);
+  // scale timeout with payload size (agentic turns carry huge tool/history blobs)
+  const timeout = Math.min(config.syncTimeoutMs + Math.floor(content.length / 100), 240_000);
   await verifySync(name, content, timeout);
   verifiedCache.set(name, content);
 }
@@ -70,7 +70,10 @@ function invalidateCache(): void {
 function isFinalObject(raw: string): { final: any } | null {
   try {
     const j = JSON.parse(raw);
-    if (j && typeof j === "object" && j.streaming !== true && (j.status === "completed" || j.status === "failed")) {
+    if (
+      j && typeof j === "object" && j.streaming !== true &&
+      (j.status === "completed" || j.status === "failed" || j.status === "incomplete")
+    ) {
       return { final: j };
     }
   } catch {}
@@ -94,10 +97,14 @@ export interface RunHandle {
  * Poll cadence adapts: 150 ms while frames are actively arriving (max TPS),
  * backing off to config.pollIntervalMs when idle (reasoning pauses).
  */
+let reqCounter = 0;
+
 export async function runRelay(body: Record<string, unknown>): Promise<RunHandle> {
   const jobJson = JSON.stringify(body, null, 2);
+  const tag = `req${++reqCounter}`;
+  console.log(`[relay ${tag}] start model=${body.model} jobJson=${(jobJson.length / 1024).toFixed(1)}KiB stream=${body.stream === true} inputItems=${Array.isArray(body.input) ? body.input.length : "scalar"}`);
   if (jobJson.length > config.inlinePayloadWarnBytes) {
-    console.warn(`[relay] large job.json ${(jobJson.length / 1024) | 0}KiB — sync will be slow`);
+    console.warn(`[relay ${tag}] large job.json ${(jobJson.length / 1024) | 0}KiB — sync will be slow`);
   }
 
   const frames: SseFrame[] = [];
@@ -107,14 +114,19 @@ export async function runRelay(body: Record<string, unknown>): Promise<RunHandle
 
   const finalPromise = renderQueue.add(async () => {
     try {
+      let t = Date.now();
       await ensureFileSync(".latexmkrc", LATEXMKRC);
       await ensureFileSync("job.json", jobJson);
+      console.log(`[relay ${tag}] synced files in ${Date.now() - t}ms`);
 
       // clear stale output so progress polling can't see the previous run
       await deleteFile("response.json");
       await triggerRender();
+      console.log(`[relay ${tag}] render kicked`);
+      t = Date.now();
     } catch (e: any) {
       invalidateCache(); // sandbox may have rebooted — force re-verify next time
+      console.error(`[relay ${tag}] setup failed: ${String(e?.message ?? e).slice(0, 200)}`);
       throw e;
     }
 
@@ -123,10 +135,13 @@ export async function runRelay(body: Record<string, unknown>): Promise<RunHandle
     let lastProgressAt = Date.now();
     let lastTotal = -1;
     let interval = 120;
+    let pollErrors = 0;
+    let lastLogAt = Date.now();
     for (;;) {
       // Stall detection ONLY — a healthy stream runs indefinitely, however long.
       if (Date.now() - lastProgressAt > config.stallTimeoutMs) {
         invalidateCache();
+        console.error(`[relay ${tag}] STALL: no stream growth for ${Math.round(config.stallTimeoutMs / 1000)}s (lastTotal=${lastTotal}, frames=${frames.length})`);
         throw new RelayError(
           `stream stalled ${Math.round(config.stallTimeoutMs / 1000)}s with no data`,
           "timeout",
@@ -138,42 +153,66 @@ export async function runRelay(body: Record<string, unknown>): Promise<RunHandle
         const files = await fetchZipFiles(["response.json"]);
         const data = files.get("response.json");
         if (data) raw = new TextDecoder().decode(data);
-      } catch {
+        pollErrors = 0;
+      } catch (e: any) {
+        pollErrors++;
+        if (pollErrors <= 3 || pollErrors % 20 === 0) {
+          console.warn(`[relay ${tag}] zip poll error #${pollErrors}: ${String(e?.message ?? e).slice(0, 160)}`);
+        }
+        await new Promise((r) => setTimeout(r, interval));
+        continue;
+      }
+      if (raw === null) {
+        // response.json not in zip yet — runner hasn't started writing
+        const now = Date.now();
+        if (now - lastLogAt > 5000) {
+          console.log(`[relay ${tag}] waiting for runner output… ${Math.round((now - t0) / 1000)}s`);
+          lastLogAt = now;
+        }
         await new Promise((r) => setTimeout(r, interval));
         continue;
       }
 
-      if (raw !== null) {
-        const fresh = extractor.feed(raw);
-        if (fresh.length) {
-          for (const f of fresh) frames.push(f);
-          stats.frames += fresh.length;
-          stats.bytes += fresh.reduce((n, f) => n + f.data.length, 0);
-          if (stats.firstByteMs === null) stats.firstByteMs = Date.now() - t0;
-          interval = 120; // actively streaming — max TPS
-          lastProgressAt = Date.now();
-          notify?.();
-        } else {
-          // no complete frames yet — but is the stream still growing? (silent reasoning)
-          try {
-            const j = JSON.parse(raw);
-            const total = typeof j.total === "number" ? j.total : typeof j.sse === "string" ? j.sse.length : -1;
-            if (total > lastTotal) {
-              lastTotal = total;
-              lastProgressAt = Date.now();
-            }
-          } catch {}
-          interval = Math.min(Math.max(interval * 1.5, 150), config.pollIntervalMs);
+      const fresh = extractor.feed(raw);
+      if (fresh.length) {
+        for (const f of fresh) frames.push(f);
+        stats.frames += fresh.length;
+        stats.bytes += fresh.reduce((n, f) => n + f.data.length, 0);
+        if (stats.firstByteMs === null) {
+          stats.firstByteMs = Date.now() - t0;
+          console.log(`[relay ${tag}] first frame at ${stats.firstByteMs}ms`);
         }
-
-        const fin = isFinalObject(raw);
-        if (fin) {
-          if (fin.final.status === "failed") {
-            invalidateCache();
-            throw new RelayError(`upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`, "upstream");
+        interval = 120; // actively streaming — max TPS
+        lastProgressAt = Date.now();
+        lastLogAt = Date.now();
+        notify?.();
+      } else {
+        // no complete frames yet — but is the stream still growing? (silent reasoning)
+        try {
+          const j = JSON.parse(raw);
+          const total = typeof j.total === "number" ? j.total : typeof j.sse === "string" ? j.sse.length : -1;
+          if (total > lastTotal) {
+            lastTotal = total;
+            lastProgressAt = Date.now();
           }
-          return fin.final;
+        } catch {}
+        const now = Date.now();
+        if (now - lastLogAt > 10000) {
+          console.log(`[relay ${tag}] streaming… frames=${frames.length} bytes=${stats.bytes} (${Math.round((now - t0) / 1000)}s)`);
+          lastLogAt = now;
         }
+        interval = Math.min(Math.max(interval * 1.5, 150), config.pollIntervalMs);
+      }
+
+      const fin = isFinalObject(raw);
+      if (fin) {
+        if (fin.final.status === "failed") {
+          invalidateCache();
+          console.error(`[relay ${tag}] UPSTREAM FAILED: ${JSON.stringify(fin.final.error ?? {}).slice(0, 400)}`);
+          throw new RelayError(`upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`, "upstream");
+        }
+        console.log(`[relay ${tag}] completed in ${Date.now() - t0}ms frames=${frames.length} bytes=${stats.bytes}`);
+        return fin.final;
       }
       await new Promise((r) => setTimeout(r, interval));
     }
