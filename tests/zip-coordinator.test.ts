@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "bun:test";
 import { ZipPollCoordinator } from "../src/prism/zip-coordinator";
 
 const bytes = (value: string) => new TextEncoder().encode(value);

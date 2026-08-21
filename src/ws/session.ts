@@ -1,5 +1,6 @@
 import type { WebSocket } from "ws";
 import type { RunHandle } from "../relay/pipeline";
+import { config } from "../config";
 import {
   PreviousResponseNotFoundError,
   ResponseGraph,
@@ -116,10 +117,10 @@ export class ResponsesWebSocketSession {
 
   constructor(private readonly socket: WebSocket, options: ResponsesWebSocketSessionOptions) {
     this.startRelay = options.startRelay;
-    this.maxNamedStreams = options.maxNamedStreams ?? 32;
+    this.maxNamedStreams = options.maxNamedStreams ?? config.wsNamedStreams;
     this.maxBufferedBytes = options.maxBufferedBytes ?? 1024 * 1024;
     this.graph = options.graph ?? new ResponseGraph();
-    this.semaphore = new AsyncSemaphore(options.maxActive ?? 16);
+    this.semaphore = new AsyncSemaphore(options.maxActive ?? config.wsActiveResponses);
   }
 
   receive(raw: string): void {

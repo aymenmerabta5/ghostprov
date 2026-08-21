@@ -14,6 +14,7 @@ export interface ResponseCreateEvent {
 export interface ResolvedRelayRequest {
   relayBody: Record<string, unknown>;
   parentId?: string;
+  clientPreviousResponseId?: string;
   inputDelta: unknown[];
   cacheLocally: boolean;
   exposeEncryptedReasoning: boolean;
@@ -161,6 +162,9 @@ export class ResponseGraph {
     return {
       relayBody,
       parentId,
+      clientPreviousResponseId: typeof event.previous_response_id === "string"
+        ? event.previous_response_id
+        : undefined,
       inputDelta,
       cacheLocally: event.store === false,
       exposeEncryptedReasoning,
@@ -201,7 +205,15 @@ export class ResponseGraph {
   }
 
   sanitizeOutbound<T>(value: T, resolved: ResolvedRelayRequest): T {
-    return (resolved.exposeEncryptedReasoning ? clone(value) : stripEncryptedContent(value)) as T;
+    const sanitized = (resolved.exposeEncryptedReasoning ? clone(value) : stripEncryptedContent(value)) as any;
+    if (resolved.clientPreviousResponseId && sanitized && typeof sanitized === "object") {
+      if (sanitized.response && typeof sanitized.response === "object") {
+        sanitized.response.previous_response_id = resolved.clientPreviousResponseId;
+      } else if (sanitized.object === "response") {
+        sanitized.previous_response_id = resolved.clientPreviousResponseId;
+      }
+    }
+    return sanitized as T;
   }
 
   evict(id: string): void {

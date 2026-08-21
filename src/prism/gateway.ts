@@ -230,10 +230,9 @@ async function fetchZipFilesDirect(names?: string[]): Promise<Map<string, Uint8A
   throw new GatewayAuthError(401);
 }
 
-const configuredZipBatchMs = Number(process.env.GP_ZIP_BATCH_MS ?? 10);
 export const zipPollCoordinator = new ZipPollCoordinator(
   names => fetchZipFilesDirect(names),
-  Number.isFinite(configuredZipBatchMs) && configuredZipBatchMs >= 0 ? configuredZipBatchMs : 10,
+  config.zipBatchMs,
 );
 
 /** Coalesced named reads; unfiltered archive reads remain direct. */

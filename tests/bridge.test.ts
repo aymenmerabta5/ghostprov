@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "bun:test";
 import { zipSync } from "fflate";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -183,7 +183,7 @@ describe("Playwright bridge (src/bridge/playwright.ts)", () => {
     bridge.setBridgeTokens({ sandboxToken: "sand-bridge-123", ySweetToken: "ASQ_y_token_456", updatedAt: Date.now() });
 
     // import server after setting tokens
-    const { default: app } = await import("../src/server");
+    const { app } = await import("../src/server");
     let res = await app.request("/__bridge/token");
     expect(res.status).toBe(200);
     let j: any = await res.json();
@@ -283,7 +283,7 @@ describe("Playwright bridge (src/bridge/playwright.ts)", () => {
         expect(yTok).toBeDefined();
       }
       // also check GET /__bridge/token reflects it (or at least returns ok)
-      const { default: app } = await import("../src/server");
+      const { app } = await import("../src/server");
       const res = await app.request("/__bridge/token");
       const j: any = await res.json();
       expect(j.ok).toBe(true);

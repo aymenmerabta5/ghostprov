@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, get, type Server } from "node:http";
 import { writeFetchResponse } from "../src/http/adapter";
 
@@ -73,7 +73,8 @@ describe("writeFetchResponse", () => {
       request.on("error", reject);
     });
 
-    await new Promise(resolve => setTimeout(resolve, 20));
+    const deadline = Date.now() + 1_000;
+    while (!cancelled && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     expect(cancelled).toBe(true);
   });
 });

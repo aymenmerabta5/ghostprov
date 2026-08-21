@@ -19,19 +19,6 @@
  */
 
 import "dotenv/config";
-// Bun -> tsx re-exec for direct `bun src/bridge/playwright.ts` (same hang as server) — only when run as main, not when imported by server
-if (typeof process !== "undefined" && (process as any).versions?.bun && !process.env.GHOSTPROV_VIA_TSX && !process.env.VITEST && (import.meta as any).main) {
-  try {
-    const { spawnSync } = await import("node:child_process");
-    const bunBin = (process as any).execPath;
-    const args = process.argv.slice(1);
-    const script = args.find((a: string) => a.includes("playwright.ts")) ?? process.argv[1];
-    const extra = args.filter((a: string) => a !== script && !a.includes("playwright.ts") && !a.endsWith("bun.exe"));
-    console.log(`[bridge] bun detected — re-exec via bun x tsx ${script} ${extra.join(" ")}`);
-    const res = spawnSync(bunBin, ["x", "tsx", script, ...extra], { stdio: "inherit", env: { ...process.env, GHOSTPROV_VIA_TSX: "1" } });
-    process.exit(res.status ?? 0);
-  } catch {}
-}
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -104,7 +91,7 @@ if (!ySweetToken && process.env.PRISM_Y_TOKEN && process.env.PRISM_Y_TOKEN.trim(
 
 function updateEnvFileIfNeeded(): void {
   try {
-    // Skip .env update during vitest to avoid polluting .env with test mock tokens (e.g. bridge-sandbox-xyz)
+    // Skip .env updates under test runners to avoid persisting mock tokens.
     if (process.env.VITEST || process.env.NODE_ENV === "test") return;
     // Only update .env when we have a real sandbox token (length > 10) to avoid writing mock
     if (!sandboxToken || sandboxToken === "mock-token" || sandboxToken.length < 10) return;
@@ -458,7 +445,7 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
     fs.mkdirSync(USER_DATA_DIR, { recursive: true });
   } catch {}
 
-  // Dynamic import so CI without playwright still passes tsc/vitest (mocked bridge)
+  // Dynamic import keeps bridge startup lazy and test-friendly.
   let chromium: any;
   try {
     // @ts-ignore - playwright is optional, only needed for live bridge (not CI)

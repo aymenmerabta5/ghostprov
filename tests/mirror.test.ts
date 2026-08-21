@@ -7,7 +7,7 @@
  * Verbatim passthrough guarantee: whatever the client sends in the body must
  * reach runRelay untouched; whatever runRelay returns must reach the client.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "bun:test";
 import type { RunHandle } from "../src/relay/pipeline";
 
 // ---------------------------------------------------------------------------
@@ -23,7 +23,7 @@ vi.mock("../src/relay/pipeline", () => ({
 
 vi.mock("../src/bridge/playwright", () => ({ startPlaywrightBridge: vi.fn() }));
 
-import app from "../src/server";
+import { app } from "../src/server";
 import { SseDeltaExtractor, SseProtocolGapError, parseFrames } from "../src/relay/sse";
 
 function makeHandle(opts: {

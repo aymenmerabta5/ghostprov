@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import { chooseSegmentProtocol, planV63Job } from "../src/relay/segments";

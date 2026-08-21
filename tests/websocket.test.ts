@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import { attachResponsesWebSocket, type WebSocketRelayStarter } from "../src/ws/server";
@@ -143,6 +143,7 @@ describe("Responses WebSocket server", () => {
       input: [{ type: "function_call_output", call_id: "call_1", output: "ok" }],
     }));
     await waitFor(() => messages.some(message => message.response?.id === "resp_child"));
+    expect(messages.find(message => message.response?.id === "resp_child").response.previous_response_id).toBe("resp_parent");
     expect(bodies[1]).not.toHaveProperty("previous_response_id");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call_output");

@@ -22,7 +22,7 @@ import { writeFetchResponse } from "./http/adapter";
 import { ResponseScheduler, scheduleRelay } from "./relay/scheduler";
 import { attachResponsesWebSocket } from "./ws/server";
 
-const app = new Hono();
+export const app = new Hono();
 export const responseScheduler = new ResponseScheduler(config.responseConcurrency);
 
 function startScheduledRelay(body: Record<string, unknown>, signal?: AbortSignal) {
@@ -238,8 +238,6 @@ app.get("/v1/files/:id/content", async (c) => {
     return c.json({ error: { message: String(e?.message ?? e) } }, 404);
   }
 });
-
-export default app;
 
 // ---------------------------------------------------------------------------
 // HTTP + WebSocket server wiring

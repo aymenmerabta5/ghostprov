@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import {
   PreviousResponseNotFoundError,
   ResponseGraph,
@@ -75,7 +75,7 @@ describe("ResponseGraph", () => {
   it("retains encrypted reasoning internally and redacts it unless requested", () => {
     const graph = new ResponseGraph();
     const resolved = graph.resolve(request([user("think")]));
-    const final = {
+    const final: any = {
       id: "resp_reasoning",
       output: [{ type: "reasoning", id: "rs_1", encrypted_content: "secret", summary: [] }],
     };

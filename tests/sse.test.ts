@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { SseDeltaExtractor, SseProtocolGapError, parseFrames } from "../src/relay/sse";
 
 const FRAME = [

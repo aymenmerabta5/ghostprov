@@ -6,7 +6,7 @@
 
 **Architecture:** One global scheduler holds capacity through terminal response completion for both HTTP and WebSocket callers. A dedicated WebSocket session layer provides FIFO lanes and structurally shared response graphs, while the existing slot pipeline remains the upstream execution engine. Gateway zip reads are coalesced and large jobs prefer the daemon's advertised immutable v6.3 commit protocol.
 
-**Tech Stack:** TypeScript 5.6, Bun 1.3, Hono 4, `ws` 8, Yjs, Playwright 1.62, Vitest 2.1, Python 3 daemon fixture.
+**Tech Stack:** TypeScript 7.0.2 native compiler, Bun 1.4, Bun's isolated test runner, Hono 4, `ws` 8, Yjs, Playwright 1.62, Python 3 daemon fixture.
 
 ## Global Constraints
 
@@ -51,7 +51,7 @@ it("parses CRLF and non-BMP text exactly once", () => {
 });
 ```
 
-- [ ] **Step 2: Run `bun x vitest run tests/sse.test.ts` and confirm split-frame/CRLF failures**
+- [ ] **Step 2: Run `bun test --isolate tests/sse.test.ts` and confirm split-frame/CRLF failures**
 - [ ] **Step 3: Replace pending/consumed logic with a complete-frame cursor, code-point slicing helpers, CRLF normalization, and explicit window-gap errors**
 - [ ] **Step 4: Run focused and existing mirror tests**
 - [ ] **Step 5: Commit `fix: preserve split SSE frames`**
@@ -204,7 +204,7 @@ expect(resolved.relayBody.input).toEqual([...priorInput, ...priorOutput, ...newI
 - [ ] **Step 2: Rewrite README around scheduler, WebSocket graph, zip batching, active slot daemon, v6.3 negotiation, and actual test commands**
 - [ ] **Step 3: Label legacy relay/proxy modules compatibility-only and remove legacy tests as evidence for active server behavior**
 - [ ] **Step 4: Add an opt-in live verifier for HTTP first-event timing, Codex-style tool continuation, forks, and eight concurrent lanes; do not run it without explicit live authorization**
-- [ ] **Step 5: Run `bun x vitest run`, `bun x tsc --noEmit`, Python AST parsing, `bun audit --production`, and `git diff --check`**
+- [ ] **Step 5: Run `bun test --isolate`, `bun x tsc --noEmit`, Python AST parsing, `bun audit --production`, and `git diff --check`**
 - [ ] **Step 6: Confirm `sandbox/gp_daemon.py` remains unstaged and preserve the user's diff**
 - [ ] **Step 7: Invoke branch-finishing workflow and present integration options**
 

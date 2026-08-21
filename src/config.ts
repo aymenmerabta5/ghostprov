@@ -5,14 +5,32 @@ function num(v: string | undefined, d: number): number {
   return Number.isFinite(n) && n > 0 ? n : d;
 }
 
-const slots = num(process.env.GP_SLOTS, 8);
+function nonnegative(v: string | undefined, d: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : d;
+}
+
+function integer(v: string | undefined, d: number): number {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : d;
+}
+
+export const CONFIG_DEFAULTS = {
+  port: 8787,
+  slots: 8,
+  zipBatchMs: 10,
+  wsActiveResponses: 16,
+  wsNamedStreams: 32,
+} as const;
+
+const slots = integer(process.env.GP_SLOTS, CONFIG_DEFAULTS.slots);
 const requestedConcurrency = process.env.PQUEUE_CONCURRENCY
-  ? num(process.env.PQUEUE_CONCURRENCY, slots)
+  ? integer(process.env.PQUEUE_CONCURRENCY, slots)
   : slots;
 const responseConcurrency = Math.min(slots, requestedConcurrency);
 
 export const config = {
-  port: num(process.env.PORT, 8787),
+  port: num(process.env.PORT, CONFIG_DEFAULTS.port),
   docId: (process.env.PRISM_DOC_ID ?? "69288e8b-c183-45f3-9131-d64b05b98928").trim(),
   prismOrigin: "https://prism.openai.com",
   gatewayBase: "/s/sandboxes/proxy",
@@ -43,6 +61,9 @@ export const config = {
   responseConcurrency,
   /** slot pool size for the daemon pipeline (must match sandbox GP_SLOTS) */
   slots,
+  zipBatchMs: nonnegative(process.env.GP_ZIP_BATCH_MS, CONFIG_DEFAULTS.zipBatchMs),
+  wsActiveResponses: integer(process.env.GP_WS_ACTIVE_RESPONSES, CONFIG_DEFAULTS.wsActiveResponses),
+  wsNamedStreams: integer(process.env.GP_WS_NAMED_STREAMS, CONFIG_DEFAULTS.wsNamedStreams),
   /** warn threshold for inline data URLs routed through Yjs */
   inlinePayloadWarnBytes: num(process.env.GP_INLINE_WARN_BYTES, 512 * 1024),
 } as const;

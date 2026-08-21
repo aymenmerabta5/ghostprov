@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { ResponseScheduler, scheduleRelay } from "../src/relay/scheduler";
 import type { RunHandle } from "../src/relay/pipeline";
 
