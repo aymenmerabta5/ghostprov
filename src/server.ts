@@ -20,6 +20,7 @@ import { config } from "./config";
 import { queue, enqueue } from "./utils/queue";
 import { runRelay, RelayError } from "./relay/pipeline";
 import { sseFrame, SSE_HEADERS } from "./relay/sse";
+import { writeFetchResponse } from "./http/adapter";
 
 const app = new Hono();
 
@@ -319,9 +320,7 @@ if (isMain) {
         body: body ? new Uint8Array(body) : undefined,
       });
       const response = await app.fetch(request);
-      res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
-      if (response.body) res.end(Buffer.from(await response.arrayBuffer()));
-      else res.end();
+      await writeFetchResponse(res, response);
     })().catch((e) => {
       console.error("[server] handler error:", e);
       res.writeHead(500);
