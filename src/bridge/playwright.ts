@@ -1,12 +1,12 @@
 /**
  * Playwright persistent bridge for Prism token minting (Task Bridge)
  *
- * - Launches chromium with userDataDir D:/MyWork/AI/ghostprov/.pw
- * - Navigates to https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex
+ * - Launches Chromium with the configured persistent GP_USER_DATA_DIR
+ * - Navigates to PRISM_PROJECT_URL (or the URL derived from PRISM_DOC_ID)
  * - Waits for heartbeat (waitForResponse heartbeat)
  * - Captures x-crixet-sandbox-token via page.on('request') header
  * - Captures Y Sweet ASQ token via POST /api/y response {token}
- * - Exposes tokens to Hono via GET /__bridge/token and via file D:/MyWork/AI/ghostprov/.pw/tokens.json + globalThis.__BRIDGE_TOKENS__
+ * - Exposes tokens to Hono via GET /__bridge/token, GP_TOKEN_FILE, and globalThis.__BRIDGE_TOKENS__
  * - Auto-refreshes on 401 / syncing errors (page reload + re-capture)
  *
  * CI fallback: when playwright not installed or bridge not started, getSandboxToken()/getYSweetToken()
@@ -25,7 +25,7 @@ if (typeof process !== "undefined" && (process as any).versions?.bun && !process
     const { spawnSync } = await import("node:child_process");
     const bunBin = (process as any).execPath;
     const args = process.argv.slice(1);
-    const script = args.find((a: string) => a.includes("playwright.ts")) ?? "D:/MyWork/AI/ghostprov/src/bridge/playwright.ts";
+    const script = args.find((a: string) => a.includes("playwright.ts")) ?? process.argv[1];
     const extra = args.filter((a: string) => a !== script && !a.includes("playwright.ts") && !a.endsWith("bun.exe"));
     console.log(`[bridge] bun detected — re-exec via bun x tsx ${script} ${extra.join(" ")}`);
     const res = spawnSync(bunBin, ["x", "tsx", script, ...extra], { stdio: "inherit", env: { ...process.env, GHOSTPROV_VIA_TSX: "1" } });
@@ -35,22 +35,20 @@ if (typeof process !== "undefined" && (process as any).versions?.bun && !process
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { launchBridgeContext, resolveBridgeConfig } from "./config";
 
 // ---------------------------------------------------------------------------
 // Constants (task spec)
 // ---------------------------------------------------------------------------
 // Project is env-driven so ghostprov can move between Prism projects without
 // code changes (the sandbox allocation of an exhausted project may be blocked).
-export const PRISM_URL =
-  process.env.PRISM_PROJECT_URL?.trim() ||
-  "https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex";
-export const USER_DATA_DIR = "D:/MyWork/AI/ghostprov/.pw";
-// Use forward slashes explicitly (task spec uses D:/MyWork/AI/ghostprov/.pw, not Windows backslashes)
-// path.join on Windows would produce backslashes which breaks cross-platform tests
-export const TOKEN_FILE = `${USER_DATA_DIR}/tokens.json`;
+export const BRIDGE_CONFIG = resolveBridgeConfig();
+export const PRISM_URL = BRIDGE_CONFIG.prismUrl;
+export const USER_DATA_DIR = BRIDGE_CONFIG.userDataDir;
+export const TOKEN_FILE = BRIDGE_CONFIG.tokenFile;
 // legacy aliases for consumers that expect file at .pw/.tokens.json or .bridge
 export const BRIDGE_TOKEN_FILE = TOKEN_FILE;
-export const ENV_FILE = "D:/MyWork/AI/ghostprov/.env";
+export const ENV_FILE = BRIDGE_CONFIG.envFile;
 
 export interface BridgeTokens {
   sandboxToken?: string | null;
@@ -140,25 +138,13 @@ function updateEnvFileIfNeeded(): void {
 
 function persistTokensSync(): void {
   try {
-    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
     const payload: BridgeTokens = {
       sandboxToken,
       ySweetToken,
       updatedAt: updatedAt ?? Date.now(),
     };
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(payload, null, 2), "utf8");
-    // WSL compat: also ensure linux absolute path exists when USER_DATA_DIR is Windows-style
-    try {
-      const linuxDir = "/mnt/d/MyWork/AI/ghostprov/.pw";
-      if ((USER_DATA_DIR as string).includes("D:/") && (linuxDir as string) !== (USER_DATA_DIR as string)) {
-        fs.mkdirSync(linuxDir, { recursive: true });
-        const linuxFile = `${linuxDir}/tokens.json`;
-        if ((linuxFile as string) !== (TOKEN_FILE as string)) {
-          try { fs.writeFileSync(linuxFile, JSON.stringify(payload, null, 2), "utf8"); } catch {}
-        }
-      }
-    } catch {}
-    // also write to alternative path for Hono file fallback (tests check both)
     (globalThis as any).__BRIDGE_TOKENS__ = payload;
     // expose individual globals for legacy consumers
     if (sandboxToken) (globalThis as any).__BRIDGE_SANDBOX_TOKEN__ = sandboxToken;
@@ -258,11 +244,6 @@ export function clearBridgeTokens(): void {
   updatedAt = null;
   try {
     if (fs.existsSync(TOKEN_FILE)) fs.unlinkSync(TOKEN_FILE);
-  } catch {}
-  // also clear WSL compat file if present
-  try {
-    const alt = "/mnt/d/MyWork/AI/ghostprov/.pw/tokens.json";
-    if ((alt as string) !== (TOKEN_FILE as string) && fs.existsSync(alt)) fs.unlinkSync(alt);
   } catch {}
   delete (globalThis as any).__BRIDGE_TOKENS__;
   delete (globalThis as any).__BRIDGE_SANDBOX_TOKEN__;
@@ -416,12 +397,12 @@ export async function refreshBridge(): Promise<void> {
       } catch {}
       // keep browser open: actively re-trigger heartbeat via console command to re-mint token
       try {
-        await pwPage.evaluate(async () => {
+        await pwPage.evaluate(async (docId: string) => {
           try {
             await fetch("/s/sandboxes/proxy/heartbeat?prism_cache_bust=" + Date.now()).catch(() => {});
-            await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId: "2a153042-dc25-4ca5-b290-260eed5e8705", requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
+            await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId, requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
           } catch {}
-        });
+        }, BRIDGE_CONFIG.docId);
         await new Promise((r) => setTimeout(r, 1500));
       } catch {}
       // after reload, headers will be captured again via context.on handlers
@@ -472,16 +453,9 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   const headless = opts?.headless ?? false;
   const timeoutMs = opts?.timeoutMs ?? 30000;
 
-  // Ensure userDataDir exists (handle both Windows D:/ and WSL /mnt/d)
+  // Ensure the configured persistent profile exists.
   try {
     fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-  } catch {}
-  // WSL: ensure linux path also exists for cross-platform
-  try {
-    if (USER_DATA_DIR.includes("D:/")) {
-      const alt = "/mnt/d/MyWork/AI/ghostprov/.pw";
-      fs.mkdirSync(alt, { recursive: true });
-    }
   } catch {}
 
   // Dynamic import so CI without playwright still passes tsc/vitest (mocked bridge)
@@ -522,8 +496,6 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
     for (const lock of ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"]) {
       const lp = path.join(USER_DATA_DIR, lock);
       if (fs.existsSync(lp)) { try { fs.unlinkSync(lp); console.log(`[bridge] removed lock ${lock}`); } catch {} }
-      const altLp = `/mnt/d/MyWork/AI/ghostprov/.pw/${lock}`;
-      if (fs.existsSync(altLp)) { try { fs.unlinkSync(altLp); } catch {} }
     }
   } catch {}
 
@@ -557,138 +529,21 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
     const tabs2 = path.join(USER_DATA_DIR, "Default", "Session Storage");
     // don't delete Session Storage, just log
   } catch {}
-  // WSL path too
-  try {
-    if ((USER_DATA_DIR as string).includes("D:/")) {
-      const altPref = "/mnt/d/MyWork/AI/ghostprov/.pw/Default/Preferences";
-      if (fs.existsSync(altPref)) {
-        try {
-          const raw = fs.readFileSync(altPref, "utf8");
-          const j = JSON.parse(raw);
-          if (j.profile) { j.profile.exit_type = "Normal"; j.profile.exited = true; fs.writeFileSync(altPref, JSON.stringify(j)); }
-        } catch {}
-      }
-      const altSess = "/mnt/d/MyWork/AI/ghostprov/.pw/Default/Sessions";
-      if (fs.existsSync(altSess)) fs.rmSync(altSess, { recursive: true, force: true });
-    }
-  } catch {}
 
-  // Use local Windows temp for headless false to persist login; ephemeral for headless true (fast, no profile LOCK)
-  const launchDir = headless ? "" : "C:/Users/Aymen/AppData/Local/Temp/ghostprov-pw";
-  if (!headless) { try { const fs2: any = require("node:fs"); fs2.mkdirSync(launchDir, {recursive:true}); } catch {} }
-  try { const fs2: any = require("node:fs"); fs2.mkdirSync(USER_DATA_DIR, {recursive:true}); } catch {}
-  console.log(`[bridge] using ${headless ? "ephemeral" : "persistent"} launch headless=${headless} dir=${launchDir || "(ephemeral)"}`);
-  console.log(`[bridge] launching ${headless ? "ephemeral" : "persistent"} context headless=${headless} ...`);
-  // Wrap launch in timeout so we can report if restore bubble blocks
-  const launchPromise = headless
-    ? (async () => {
-        const browser: any = await chromium.launch({
-          headless: true,
-          args: [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-session-crashed-bubble",
-            "--disable-infobars",
-            "--no-first-run",
-            "--disable-features=SessionRestore",
-            "--disable-restore-session-state",
-            "--disable-hang-monitor",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-          ],
-        });
-        const context: any = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-        (context as any).__browser = browser;
-        return context;
-      })()
-    : chromium.launchPersistentContext(launchDir, {
-    headless,
-    viewport: { width: 1280, height: 900 },
-    timeout: 60000,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--disable-session-crashed-bubble",
-      "--disable-infobars",
-      "--no-first-run",
-      "--disable-features=SessionRestore",
-      "--disable-restore-session-state",
-      "--disable-hang-monitor",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-dev-shm-usage",
-      "--no-sandbox",
-    ],
-  });
-  const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error("launchPersistentContext timeout 60s - likely restore bubble lock")), 60000));
+  console.log(`[bridge] launching persistent context headless=${headless} dir=${USER_DATA_DIR} ...`);
   try {
-    pwContext = await Promise.race([launchPromise, timeoutPromise]) as any;
+    pwContext = await launchBridgeContext(chromium, BRIDGE_CONFIG, headless);
     console.log("[bridge] persistent context launched");
-  } catch (e:any) {
-    console.warn(`[bridge] launch failed: ${e?.message}, trying to wipe corrupted profile and retry...`);
-    // Close previous hung context and kill chrome that holds the profile
+  } catch (e: any) {
+    console.warn(`[bridge] launch failed: ${e?.message}; cleaning only this bridge profile before retry`);
     try { await stopPlaywrightBridge(); } catch {}
-    try {
-      // Kill chrome holding the profile so next launch doesn't get "Opening in existing browser session"
-      const { execSync } = await import("node:child_process");
-      try { execSync('taskkill /F /IM chrome.exe', {stdio:"ignore"}); console.log("[bridge] killed chrome before retry"); } catch {}
-      await new Promise(r=>setTimeout(r,1500));
-    } catch {}
-    // Aggressive wipe of corrupted .pw that causes hang
-    try {
-      const toRemove = [
-        path.join(USER_DATA_DIR, "Default", "Sessions"),
-        path.join(USER_DATA_DIR, "Default", "shared_proto_db"),
-        path.join(USER_DATA_DIR, "Default", "Cache"),
-        path.join(USER_DATA_DIR, "SingletonLock"),
-        path.join(USER_DATA_DIR, "SingletonSocket"),
-        path.join(USER_DATA_DIR, "SingletonCookie"),
-        path.join(USER_DATA_DIR, "lockfile"),
-        path.join(launchDir, "Default", "Sessions"),
-        path.join(launchDir, "Default", "shared_proto_db"),
-        path.join(launchDir, "SingletonLock"),
-        "/mnt/d/MyWork/AI/ghostprov/.pw/Default/Sessions",
-        "/mnt/d/MyWork/AI/ghostprov/.pw/Default/shared_proto_db",
-        "/mnt/d/MyWork/AI/ghostprov/.pw/SingletonLock",
-      ];
-      for (const f of toRemove) {
-        try { if (fs.existsSync(f)) { fs.rmSync(f, {recursive:true, force:true}); console.log(`[bridge] wiped ${f}`); } } catch {}
-      }
-      // Also try to fix Preferences again, or delete it to force recreate
-      try {
-        const pref = path.join(USER_DATA_DIR, "Default", "Preferences");
-        if (fs.existsSync(pref)) {
-          try { fs.unlinkSync(pref); console.log("[bridge] deleted corrupted Preferences to recreate"); } catch {}
-        }
-      } catch {}
-    } catch {}
-    console.log("[bridge] retrying launch with fresh profile at " + (launchDir || "(ephemeral)") + "...");
-    // Retry with same headless-aware logic
-    pwContext = await (headless
-      ? (async () => {
-          const browser: any = await chromium.launch({
-            headless: true,
-            args: ["--disable-blink-features=AutomationControlled","--no-sandbox"],
-          });
-          const context: any = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-          (context as any).__browser = browser;
-          return context;
-        })()
-      : chromium.launchPersistentContext(launchDir, {
-          headless,
-          viewport: { width: 1280, height: 900 },
-          args: [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-session-crashed-bubble",
-            "--disable-infobars",
-            "--no-first-run",
-            "--disable-features=SessionRestore",
-            "--disable-restore-session-state",
-            "--disable-hang-monitor",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-          ],
-          timeout: 60000,
-        }));
+    const profileRoot = path.resolve(USER_DATA_DIR) + path.sep;
+    for (const relative of ["Default/Sessions", "Default/shared_proto_db", "Default/Cache"]) {
+      const target = path.resolve(USER_DATA_DIR, relative);
+      if (!target.startsWith(profileRoot)) throw new Error(`refusing out-of-profile cleanup: ${target}`);
+      try { if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); } catch {}
+    }
+    pwContext = await launchBridgeContext(chromium, BRIDGE_CONFIG, headless);
     console.log("[bridge] persistent context launched on retry");
   }
 
@@ -883,31 +738,32 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   // --- Login detection (robust) ---
   let isLoggedIn: boolean | null = null;
   try {
-    isLoggedIn = await pwPage.evaluate(async () => {
+    isLoggedIn = await pwPage.evaluate(async (docId: string) => {
       const body = document.body.innerText || "";
       // Expanded DOM signals
       if (body.includes("Personal workspace") || body.includes("Aimen Merabta") || body.includes("New Project") || body.includes("main.tex")) return true;
-      const loginEl = document.querySelector('a[href*="auth"], button:has-text("Log in"), [data-testid*="login"]');
-      if (loginEl && loginEl.textContent?.toLowerCase().includes("log")) return false;
+      const loginEl = document.querySelector('a[href*="auth"], [data-testid*="login"]');
+      const loginButton = [...document.querySelectorAll("button")].find(button => button.textContent?.toLowerCase().includes("log in"));
+      if (loginEl || loginButton) return false;
       if (body.toLowerCase().includes("sign in") && body.toLowerCase().includes("prism")) return false;
       try {
-        const r = await fetch("/api/project-access?d=2a153042-dc25-4ca5-b290-260eed5e8705", { credentials: "include" });
+        const r = await fetch(`/api/project-access?d=${encodeURIComponent(docId)}`, { credentials: "include" });
         if (r.status === 401 || r.status === 403) return false;
         if (r.ok) return true;
       } catch {}
       // also check if we are on login/openai subdomain redirect
       if (location.hostname.includes("auth.openai.com") || location.pathname.includes("/login")) return false;
       return null;
-    });
+    }, BRIDGE_CONFIG.docId);
   } catch {}
   console.log(`[bridge] login check: ${isLoggedIn}`);
   if (isLoggedIn === false) {
     console.log("[bridge] not logged in — keeping browser open, waiting for login to prism.openai.com (5min)...");
     try {
-      await pwPage.waitForFunction(() => {
+      await pwPage.waitForFunction((docId: string) => {
         const b = document.body.innerText || "";
-        return b.includes("Personal workspace") || b.includes("New Project") || b.includes("main.tex") || document.body.innerHTML.includes("2a153042");
-      }, null, { timeout: 300000 });
+        return b.includes("Personal workspace") || b.includes("New Project") || b.includes("main.tex") || document.body.innerHTML.includes(docId);
+      }, BRIDGE_CONFIG.docId, { timeout: 300000 });
       console.log("[bridge] login detected — continuing");
       isLoggedIn = true;
       await new Promise((r) => setTimeout(r, 2000));
@@ -948,13 +804,13 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
   // If no sandbox token captured yet, force a heartbeat fetch from the page's console to trigger token capture
   if (!sandboxToken) {
     try {
-      await pwPage.evaluate(async () => {
+      await pwPage.evaluate(async (docId: string) => {
         try {
           await fetch("/s/sandboxes/proxy/heartbeat?prism_cache_bust=" + Date.now(), { headers: { "x-crixet-sandbox-token": "dummy" } }).catch(() => {});
           // also trigger a Y token mint via console
-          await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId: "2a153042-dc25-4ca5-b290-260eed5e8705", requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
+          await fetch("/api/y", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ docId, requestContext: { source: "initial-bootstrap" } }) }).catch(() => {});
         } catch {}
-      });
+      }, BRIDGE_CONFIG.docId);
       // wait a bit for the request/response handlers to capture
       await new Promise((r) => setTimeout(r, 2000));
     } catch {}
@@ -970,7 +826,7 @@ export async function startPlaywrightBridge(opts?: { headless?: boolean; timeout
         const cur = pwPage.url?.() ?? "";
         if (cur.includes("prism.openai.com")) {
           // try to trigger fetches that carry token
-          try { await pwPage.evaluate(async()=>{ try{await fetch("/api/y",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({docId:"2a153042-dc25-4ca5-b290-260eed5e8705",requestContext:{source:"poll"}})}).catch(()=>{});}catch{} }); } catch {}
+          try { await pwPage.evaluate(async(docId: string)=>{ try{await fetch("/api/y",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({docId,requestContext:{source:"poll"}})}).catch(()=>{});}catch{} }, BRIDGE_CONFIG.docId); } catch {}
           // also scan storage
           try {
             const tok = await pwPage.evaluate(()=>{ try{ for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); const v=k?localStorage.getItem(k):null; if(v&&v.startsWith("gAAAA")&&v.length>50) return v; } }catch{} return null; });

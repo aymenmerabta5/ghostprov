@@ -22,8 +22,11 @@ import { WebsocketProvider } from "y-websocket";
 import ws from "ws";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as path from "node:path";
+import { config } from "../config";
+import { resolveBridgeConfig } from "../bridge/config";
 
-const TOKEN_FILE = "D:/MyWork/AI/ghostprov/.pw/tokens.json";
+const TOKEN_FILE = resolveBridgeConfig({ ...process.env, PRISM_DOC_ID: config.docId }).tokenFile;
 
 if (!(globalThis as any).WebSocket) (globalThis as any).WebSocket = ws;
 
@@ -52,13 +55,18 @@ async function mintYSweetToken(): Promise<string> {
   // 1. live mint via in-page fetch (bypasses Cloudflare JA3 binding)
   try {
     const gateway: any = await import("./gateway");
-    if (gateway.getBridgePage?.()) {
-      const res = await gateway.pageFetch("/api/y", {
+    const res = await gateway.evalInPage(`async (arg) => {
+      const response = await fetch("/api/y", {
         method: "POST",
-        json: { docId: docId(), requestContext: { source: "ghostprov-ydoc" } },
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ docId: arg.docId, requestContext: { source: "ghostprov-ydoc" } }),
       });
+      return { status: response.status, body: await response.text() };
+    }`, { docId: docId() });
+    if (res) {
       if (res.status === 200) {
-        const j = JSON.parse(res.text);
+        const j = JSON.parse(res.body);
         if (typeof j?.token === "string" && j.token.length > 20) {
           rememberToken(j.token);
           return j.token;
@@ -82,7 +90,7 @@ async function mintYSweetToken(): Promise<string> {
 }
 
 function docId(): string {
-  const id = (process.env.PRISM_DOC_ID ?? "").trim();
+  const id = config.docId;
   if (!id) throw new YDocError("PRISM_DOC_ID not set", "auth");
   return id;
 }
@@ -94,7 +102,7 @@ function rememberToken(token: string): void {
     try { j = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); } catch {}
     j.ySweetToken = token;
     j.updatedAt = Date.now();
-    fs.mkdirSync("D:/MyWork/AI/ghostprov/.pw", { recursive: true });
+    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(j, null, 2));
   } catch {}
 }

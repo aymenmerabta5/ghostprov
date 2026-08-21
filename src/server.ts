@@ -122,17 +122,19 @@ app.all("/__debug/gw", async (c) => {
 app.get("/__bridge/token", async (c) => {
   // Resolution order: bridge memory → globalThis → .pw/tokens.json → env
   let mem: any = null;
+  let tokenFile = process.env.GP_TOKEN_FILE?.trim() || "";
   try {
     const bridge: any = await import("./bridge/playwright");
     mem = bridge.getBridgeTokens?.() ?? null;
+    tokenFile = bridge.TOKEN_FILE ?? tokenFile;
   } catch {}
   const glob = (globalThis as any).__BRIDGE_TOKENS__ ?? null;
   let file: any = null;
   try {
     const fs = await import("node:fs");
-    for (const f of ["D:/MyWork/AI/ghostprov/.pw/tokens.json", "/mnt/d/MyWork/AI/ghostprov/.pw/tokens.json"]) {
-      if (fs.existsSync(f)) { file = JSON.parse(fs.readFileSync(f, "utf8")); break; }
-    }
+    const path = await import("node:path");
+    const resolved = path.resolve(tokenFile || path.join(process.cwd(), ".pw", "tokens.json"));
+    if (fs.existsSync(resolved)) file = JSON.parse(fs.readFileSync(resolved, "utf8"));
   } catch {}
   const pick = (k: "sandboxToken" | "ySweetToken"): { v: string | null; src: string } => {
     if (mem?.[k] && !String(mem[k]).includes("mock")) return { v: mem[k], src: "bridge" };

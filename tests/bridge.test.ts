@@ -1,8 +1,20 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
 import { zipSync } from "fflate";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+
+const TEST_BRIDGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ghostprov-bridge-test-"));
+process.env.GP_USER_DATA_DIR = path.join(TEST_BRIDGE_ROOT, ".pw");
+process.env.GP_TOKEN_FILE = path.join(TEST_BRIDGE_ROOT, ".pw", "tokens.json");
+process.env.GP_ENV_FILE = path.join(TEST_BRIDGE_ROOT, ".env");
+process.env.PRISM_DOC_ID = "2a153042-dc25-4ca5-b290-260eed5e8705";
+process.env.PRISM_PROJECT_URL = "https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex";
+fs.writeFileSync(process.env.GP_ENV_FILE, "PRISM_SANDBOX_TOKEN=\n", "utf8");
+
+afterAll(() => {
+  fs.rmSync(TEST_BRIDGE_ROOT, { recursive: true, force: true });
+});
 
 // Mock y-websocket to avoid real WSS (parity with other tests)
 vi.mock("y-websocket", () => {
@@ -17,9 +29,9 @@ vi.mock("y-websocket", () => {
 });
 
 describe("Playwright bridge (src/bridge/playwright.ts)", () => {
-  const TOKEN_FILE = "D:/MyWork/AI/ghostprov/.pw/tokens.json";
+  const TOKEN_FILE = path.resolve(process.env.GP_TOKEN_FILE!);
   const PRISM_URL = "https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex";
-  const USER_DATA_DIR = "D:/MyWork/AI/ghostprov/.pw";
+  const USER_DATA_DIR = path.resolve(process.env.GP_USER_DATA_DIR!);
 
   let originalEnvSandbox: string | undefined;
   let originalEnvY: string | undefined;

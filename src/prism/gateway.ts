@@ -8,6 +8,8 @@
  */
 import { config } from "../config";
 import { ZipPollCoordinator } from "./zip-coordinator";
+import * as fs from "node:fs";
+import { resolveTokenFile } from "../bridge/config";
 
 type PageLike = { evaluate: (fn: any, ...args: any[]) => Promise<any> };
 
@@ -38,13 +40,10 @@ export function getSandboxToken(): string {
     if (typeof g === "string" && g.length > 10 && !g.includes("mock")) return g;
   } catch {}
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const fs = require("node:fs");
-    for (const f of ["D:/MyWork/AI/ghostprov/.pw/tokens.json"]) {
-      if (fs.existsSync(f)) {
-        const j = JSON.parse(fs.readFileSync(f, "utf8"));
-        if (j?.sandboxToken && String(j.sandboxToken).length > 10) return j.sandboxToken;
-      }
+    const file = resolveTokenFile();
+    if (fs.existsSync(file)) {
+      const j = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (j?.sandboxToken && String(j.sandboxToken).length > 10) return j.sandboxToken;
     }
   } catch {}
   const env = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();

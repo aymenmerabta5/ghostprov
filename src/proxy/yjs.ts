@@ -4,6 +4,7 @@ import { WebsocketProvider } from "y-websocket";
 
 // Polyfill WebSocket in Node/Bun for y-websocket (uses global WebSocket)
 import ws from "ws";
+import { resolveTokenFile } from "../bridge/config";
 if (!(globalThis as any).WebSocket) {
   (globalThis as any).WebSocket = ws;
 }
@@ -185,15 +186,9 @@ async function getBridgeYSweetToken(): Promise<string | null> {
   // File fallback when bridge module not importable (e.g. playwright not installed but file exists)
   try {
     const fs: any = await import("node:fs");
-    const path: any = await import("node:path");
-    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
+    const file = resolveTokenFile();
     if (fs.existsSync(file)) {
       const j = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (j?.ySweetToken && typeof j.ySweetToken === "string" && j.ySweetToken.length > 10) return j.ySweetToken;
-    }
-    const altWSL = "/mnt/d/MyWork/AI/ghostprov/.pw/tokens.json";
-    if (fs.existsSync(altWSL)) {
-      const j = JSON.parse(fs.readFileSync(altWSL, "utf8"));
       if (j?.ySweetToken && typeof j.ySweetToken === "string" && j.ySweetToken.length > 10) return j.ySweetToken;
     }
   } catch {}

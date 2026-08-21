@@ -24,6 +24,7 @@
 
 import "dotenv/config";
 import { fetchZip } from "../utils/zip";
+import { resolveTokenFile } from "../bridge/config";
 
 // Bridge token helper (live Playwright persistent context -> file/global -> env fallback for CI)
 async function getSandboxToken(): Promise<string> {
@@ -40,22 +41,10 @@ async function getSandboxToken(): Promise<string> {
   } catch {}
   try {
     const fs: any = await import("node:fs");
-    const path: any = await import("node:path");
-    const file = path.join("D:/MyWork/AI/ghostprov/.pw", "tokens.json");
+    const file = resolveTokenFile();
     if (fs.existsSync(file)) {
       const j = JSON.parse(fs.readFileSync(file, "utf8"));
       if (j?.sandboxToken) return j.sandboxToken;
-    }
-  } catch {}
-  // WSL fallback: also try linux absolute path when Windows path not found (e.g. running via WSL node)
-  try {
-    const altFile2 = "/mnt/d/MyWork/AI/ghostprov/.pw/tokens.json";
-    const fs2: any = await import("node:fs");
-    if (fs2.existsSync(altFile2)) {
-      const j2 = JSON.parse(fs2.readFileSync(altFile2, "utf8"));
-      if (j2?.sandboxToken && typeof j2.sandboxToken === "string" && j2.sandboxToken.length > 5) {
-        return j2.sandboxToken;
-      }
     }
   } catch {}
   const envTok = (process.env.PRISM_SANDBOX_TOKEN ?? "").trim();
