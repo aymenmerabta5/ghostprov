@@ -167,6 +167,35 @@ export async function triggerRenderDirect(): Promise<void> {
   throw new Error("render timeout");
 }
 
+export async function triggerRenderStart(): Promise<{ bust: number; token: string }> {
+  let tok = await getSandboxToken();
+  const bust = Math.floor(Math.random() * 1e15);
+  let r = await fetchViaBridge(
+    `https://prism.openai.com/s/sandboxes/proxy/render?renderMode=async&renderStatusMode=json&prism_cache_bust=${bust}`,
+    {
+      method: "POST",
+      headers: { "x-crixet-sandbox-token": tok, "content-type": "application/json" },
+      body: JSON.stringify({ mainDocument: "main.tex", clientStateVector: "AerAuOEF8wI=", clientDeleteSetUpdate: "AAA=" }),
+    },
+  );
+  if (r.status === 401 || r.status === 403) {
+    const txt = await r.clone().text().catch(() => "");
+    const refreshed = await maybeRefreshOnFailure(r.status, txt);
+    if (refreshed) {
+      tok = refreshed;
+      r = await fetchViaBridge(
+        `https://prism.openai.com/s/sandboxes/proxy/render?renderMode=async&renderStatusMode=json&prism_cache_bust=${bust}`,
+        { method: "POST", headers: { "x-crixet-sandbox-token": tok, "content-type": "application/json" }, body: JSON.stringify({ mainDocument: "main.tex", clientStateVector: "AerAuOEF8wI=", clientDeleteSetUpdate: "AAA=" }) },
+      );
+    }
+  }
+  if (r.status !== 202) {
+    const txt = await r.clone().text().catch(() => "");
+    throw new Error(`render ${r.status} ${txt}`);
+  }
+  return { bust, token: tok };
+}
+
 export async function triggerRender(): Promise<void> {
   return queueRender(() => triggerRenderDirect());
 }

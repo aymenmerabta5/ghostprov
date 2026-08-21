@@ -1,0 +1,11 @@
+node_modules/
+
+# secrets — never commit
+.env
+.pw/
+
+# logs & session artifacts
+*.log
+*.err
+.playwright-mcp/
+.superpowers/

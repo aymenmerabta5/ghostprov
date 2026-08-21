@@ -342,35 +342,11 @@ export async function relayCreate(body: any): Promise<any> {
  * Thinking streaming: if response contains reasoning items, they are emitted as reasoning events.
  */
 export async function relayCreateStream(body: any): Promise<Uint8Array> {
-  // Real SSE via runner.py: job.json with stream:true -> proxy Accept:text/event-stream -> response.sse in zip
-  const streamBody = { ...body, stream: true };
+  // Do NOT forward stream:true to runner — runner's inline json.load only handles JSON.
+  // We fetch as non-stream then synthesize SSE (per PRISM_FINDINGS, stream via SSE would need response.sse handling)
+  const nonStreamBody = { ...body, stream: false };
   try {
-    // Try real SSE closed-loop first (fast path for long max/pro)
-    try {
-      const { writeJob } = await import("../proxy/yjs");
-      const { triggerRenderDirect } = await import("../proxy/render");
-      const { fetchZip } = await import("../utils/zip");
-      const { queueRender } = await import("../utils/queue");
-      const sseBytes: Uint8Array | null = await queueRender(async () => {
-        await writeJob(streamBody);
-        await triggerRenderDirect();
-        const files = await fetchZip();
-        const sse = files.get("response.sse");
-        if (sse) return sse;
-        // fallback: zip may contain sse as text file, try alternative keys
-        for (const [k, v] of files.entries()) {
-          if (k.endsWith(".sse")) return v;
-        }
-        return null;
-      });
-      if (sseBytes) {
-        // ensure it ends with [DONE]
-        const txt = new TextDecoder().decode(sseBytes);
-        if (txt.includes("event:")) return sseBytes;
-      }
-    } catch {}
-    // Fallback: synthesize from non-stream JSON (for mocked tests)
-    const data: any = await relayCreate({ ...body, stream: false });
+    const data: any = await relayCreate(nonStreamBody);
     if (typeof data === "string" && data.includes("event:")) {
       return new TextEncoder().encode(data);
     }

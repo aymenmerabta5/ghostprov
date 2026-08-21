@@ -37,5 +37,10 @@ export async function queueRender<T>(fn: () => Promise<T>): Promise<T> {
   return renderQueue.add(fn) as Promise<T>;
 }
 
+/** Typed enqueue on the main request queue (p-queue's void-union typing is awkward). */
+export function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  return queue.add(fn) as unknown as Promise<T>;
+}
+
 // Re-export PQueue for testability and for consumers that need custom queues
 export { PQueue };
