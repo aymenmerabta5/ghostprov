@@ -12,14 +12,12 @@
  */
 
 import PQueue from "p-queue";
+import { config } from "../config";
 
 // Admission gate for /v1/responses. Real execution concurrency is governed by
 // the slot pool (GP_SLOTS); this only bounds in-flight request handlers.
 // Must not be lower than the slot count — that would idle healthy slots.
-export const PQUEUE_CONCURRENCY: number = (() => {
-  const v = Number(process.env.PQUEUE_CONCURRENCY);
-  return Number.isFinite(v) && v > 0 ? v : 16;
-})();
+export const PQUEUE_CONCURRENCY = config.responseConcurrency;
 
 // Main queue for concurrent subagent requests — max 5 concurrent
 // Interfaces: concurrent POST /v1/responses with different prompt_cache_key

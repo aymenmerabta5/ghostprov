@@ -5,6 +5,12 @@ function num(v: string | undefined, d: number): number {
   return Number.isFinite(n) && n > 0 ? n : d;
 }
 
+const slots = num(process.env.GP_SLOTS, 8);
+const requestedConcurrency = process.env.PQUEUE_CONCURRENCY
+  ? num(process.env.PQUEUE_CONCURRENCY, slots)
+  : slots;
+const responseConcurrency = Math.min(slots, requestedConcurrency);
+
 export const config = {
   port: num(process.env.PORT, 8787),
   docId: (process.env.PRISM_DOC_ID ?? "69288e8b-c183-45f3-9131-d64b05b98928").trim(),
@@ -32,10 +38,11 @@ export const config = {
   pollIntervalMs: num(process.env.GP_POLL_INTERVAL_MS, 400),
   /** emit SSE comment keepalive every N ms during silent stretches */
   keepAliveMs: num(process.env.GP_KEEPALIVE_MS, 15_000),
-  /** max concurrent /v1/responses handled end-to-end */
-  concurrency: num(process.env.PQUEUE_CONCURRENCY, 5),
+  /** max concurrent /v1/responses held end-to-end across HTTP and WebSocket */
+  concurrency: responseConcurrency,
+  responseConcurrency,
   /** slot pool size for the daemon pipeline (must match sandbox GP_SLOTS) */
-  slots: num(process.env.GP_SLOTS, 8),
+  slots,
   /** warn threshold for inline data URLs routed through Yjs */
   inlinePayloadWarnBytes: num(process.env.GP_INLINE_WARN_BYTES, 512 * 1024),
 } as const;

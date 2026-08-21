@@ -17,12 +17,17 @@ import { Hono } from "hono";
 import { createServer as createHttpServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { config } from "./config";
-import { queue, enqueue } from "./utils/queue";
 import { runRelay, RelayError } from "./relay/pipeline";
 import { sseFrame, SSE_HEADERS } from "./relay/sse";
 import { writeFetchResponse } from "./http/adapter";
+import { ResponseScheduler, scheduleRelay } from "./relay/scheduler";
 
 const app = new Hono();
+export const responseScheduler = new ResponseScheduler(config.responseConcurrency);
+
+function startScheduledRelay(body: Record<string, unknown>, signal?: AbortSignal) {
+  return scheduleRelay(responseScheduler, runRelay, body, { signal });
+}
 
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -164,8 +169,8 @@ app.post("/v1/responses", async (c) => {
   const wantsStream = body.stream === true;
   try {
     if (!wantsStream) {
-      const final = await enqueue(() => runRelay(body).then((h) => h.final));
-      return c.json(final);
+      const handle = await startScheduledRelay(body, c.req.raw.signal);
+      return c.json(await handle.final);
     }
 
     // Streaming: pipe real relay frames as they land. SSE comments (`: ka`)
@@ -174,7 +179,7 @@ app.post("/v1/responses", async (c) => {
     // NOTE: the upstream stream already ends with its own response.completed —
     // forward it verbatim and NEVER manufacture a second one from the final
     // object (duplicate terminators break strict Responses-API clients).
-    const handle = await enqueue(() => runRelay(body));
+    const handle = await startScheduledRelay(body, c.req.raw.signal);
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const enc = new TextEncoder();
@@ -257,7 +262,7 @@ export function attachWss(server: import("node:http").Server): void {
       const body: any = { ...msg };
       delete body.type;
       try {
-        const handle = await enqueue(() => runRelay(body));
+        const handle = await startScheduledRelay(body);
         (async () => {
           let sawCompleted = false;
           for await (const frame of handle.events()) {
