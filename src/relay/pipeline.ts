@@ -15,13 +15,10 @@ import { config } from "../config";
 import { renderQueue } from "../utils/queue";
 import { triggerRender, deleteFile, fetchZipFiles, readTrackedFile } from "../prism/gateway";
 import { writeTrackedFile } from "../prism/workspace";
-import { SseDeltaExtractor, type SseFrame } from "./sse";
-
-const LATEXMKRC = [
-  "$pdf_mode = 1;",
-  "system('rm -f main.pdf main.aux main.fls main.fdb_latexmk; rm -f /workspace/response.json');",
-  "$pdflatex = 'nohup python runner.py > /tmp/gp_bg.log 2>&1 & pdflatex -interaction=nonstopmode %O %S'",
-].join("\n") + "\n";
+import { SseDeltaExtractor, sanitizeFinal, type SseFrame } from "./sse";
+// SAME launcher as the slot path — otherwise the fallback rewrites the old
+// .latexmkrc over the daemon-armed one and the two paths fight forever.
+import { LATEXMKRC_SLOTS as LATEXMKRC } from "./slots";
 
 export class RelayError extends Error {
   constructor(message: string, readonly kind: "sync" | "render" | "timeout" | "no-bridge" | "upstream") {
@@ -55,7 +52,14 @@ async function ensureFileSync(name: string, content: string): Promise<void> {
     verifiedCache.set(name, content); // already correct on disk — just cache it
     return;
   }
-  await writeTrackedFile(name, content);
+  // Prefer the persistent Yjs doc connection (works for ANY tracked file,
+  // no monaco heuristics); fall back to the browser editor write.
+  try {
+    const { writeDocFile } = await import("../prism/ydoc");
+    await writeDocFile(name, content);
+  } catch {
+    await writeTrackedFile(name, content);
+  }
   // scale timeout with payload size (agentic turns carry huge tool/history blobs)
   const timeout = Math.min(config.syncTimeoutMs + Math.floor(content.length / 100), 240_000);
   await verifySync(name, content, timeout);
@@ -90,16 +94,35 @@ export interface RunHandle {
 }
 
 /**
- * Execute one relay request. The write+render critical section is serialized
- * by renderQueue (the backend has one shared editor); polling afterwards is
- * concurrent-safe.
+ * Execute one relay request.
  *
- * Poll cadence adapts: 150 ms while frames are actively arriving (max TPS),
- * backing off to config.pollIntervalMs when idle (reasoning pauses).
+ * Dispatch order:
+ *   1. Slot pool (concurrent) — daemon pipeline, one slot per request
+ *   2. Legacy single-job loop — fallback when the daemon can't be brought up
+ *
+ * The write+render critical section of the LEGACY path is serialized by
+ * renderQueue (the backend has one shared editor); polling afterwards is
+ * concurrent-safe. The slot path bypasses the render queue entirely.
  */
+export async function runRelay(body: Record<string, unknown>): Promise<RunHandle> {
+  if (process.env.GP_DISABLE_SLOTS === "1") return runRelayLegacy(body);
+  try {
+    const { runSlotJob } = await import("./slots");
+    return await runSlotJob(body);
+  } catch (e: any) {
+    const kind: string = e?.kind ?? "internal";
+    // infrastructure failures degrade to the proven serial path; request-level
+    // failures (upstream rejected the body) propagate untouched
+    if (kind === "upstream") throw e;
+    console.warn(`[relay] slot path unavailable (${kind}: ${String(e?.message ?? e).slice(0, 160)}) — falling back to legacy render pipeline`);
+    return runRelayLegacy(body);
+  }
+}
+
+/** Proven single-slot pipeline (PRISM_FINDINGS §12.9/§12.10) — fallback. */
 let reqCounter = 0;
 
-export async function runRelay(body: Record<string, unknown>): Promise<RunHandle> {
+export async function runRelayLegacy(body: Record<string, unknown>): Promise<RunHandle> {
   const jobJson = JSON.stringify(body, null, 2);
   const tag = `req${++reqCounter}`;
   console.log(`[relay ${tag}] start model=${body.model} jobJson=${(jobJson.length / 1024).toFixed(1)}KiB stream=${body.stream === true} inputItems=${Array.isArray(body.input) ? body.input.length : "scalar"}`);
@@ -212,7 +235,9 @@ export async function runRelay(body: Record<string, unknown>): Promise<RunHandle
           throw new RelayError(`upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`, "upstream");
         }
         console.log(`[relay ${tag}] completed in ${Date.now() - t0}ms frames=${frames.length} bytes=${stats.bytes}`);
-        return fin.final;
+        // runner.py merges gp_sse/gp_ack/gp_total into the final object —
+        // strip them (private protocol, never exposed to clients)
+        return sanitizeFinal(fin.final);
       }
       await new Promise((r) => setTimeout(r, interval));
     }

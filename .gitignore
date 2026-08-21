@@ -9,3 +9,5 @@ node_modules/
 *.err
 .playwright-mcp/
 .superpowers/
+
+__pycache__/

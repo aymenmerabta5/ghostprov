@@ -25,6 +25,94 @@ const app = new Hono();
 
 app.get("/health", (c) => c.json({ ok: true }));
 
+// --- diagnostics -----------------------------------------------------------
+app.get("/__debug/disk", async (c) => {
+  const name = c.req.query("name") ?? "";
+  if (!name) return c.json({ error: "name required" }, 400);
+  try {
+    const { fetchZipFiles } = await import("./prism/gateway");
+    const files = await fetchZipFiles([name]);
+    const data = files.get(name);
+    if (!data) return c.json({ error: "not found on disk" }, 404);
+    return c.json({ name, size: data.length, content: new TextDecoder().decode(data) });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
+app.get("/__debug/doc", async (c) => {
+  const name = c.req.query("name") ?? "";
+  if (!name) return c.json({ error: "name required" }, 400);
+  try {
+    const { readDocFile } = await import("./prism/ydoc");
+    const content = await readDocFile(name);
+    return c.json({ name, present: content !== null, length: content?.length ?? 0, content });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
+app.get("/__debug/daemon", async (c) => {
+  try {
+    // Daemon writes swap inodes (atomic os.replace) so the WS doc view goes
+    // stale — /zip is the authoritative disk view.
+    const { readDiskFile } = await import("./relay/slots");
+    const { readDocFile } = await import("./prism/ydoc");
+    const [disk, doc] = await Promise.all([
+      readDiskFile("gp_status.json").catch(() => null),
+      readDocFile("gp_status.json").catch(() => null),
+    ]);
+    let parsed: unknown = null;
+    try { parsed = disk ? JSON.parse(disk) : null; } catch {}
+    return c.json({ disk: disk ?? null, parsed, docView: doc ?? null });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
+app.post("/__debug/render", async (c) => {
+  try {
+    const { triggerRender } = await import("./prism/gateway");
+    await triggerRender();
+    return c.json({ ok: true });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
+app.get("/__debug/logs", async (c) => {
+  try {
+    const { pageFetch } = await import("./prism/gateway");
+    const res = await pageFetch(`/s/sandboxes/proxy/logs?prism_cache_bust=${Date.now()}`);
+    let parsed: unknown = res.text;
+    try { parsed = JSON.parse(res.text); } catch {}
+    return c.json({ status: res.status, logs: parsed });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
+// Generic gateway passthrough for diagnostics: /__debug/gw?path=/render-cancel&method=POST&json={"x":1}
+app.all("/__debug/gw", async (c) => {
+  const path = c.req.query("path") ?? "";
+  if (!path.startsWith("/s/sandboxes/proxy/")) return c.json({ error: "path must start with /s/sandboxes/proxy/" }, 400);
+  try {
+    const { pageFetch } = await import("./prism/gateway");
+    let json: unknown;
+    const raw = c.req.query("json");
+    if (raw) { try { json = JSON.parse(raw); } catch { return c.json({ error: "bad json" }, 400); } }
+    const res = await pageFetch(`${path}${path.includes("?") ? "&" : "?"}prism_cache_bust=${Date.now()}`, {
+      method: c.req.method === "GET" ? "GET" : "POST",
+      json,
+    });
+    let parsed: unknown = res.text;
+    try { parsed = JSON.parse(res.text); } catch {}
+    return c.json({ status: res.status, body: parsed });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message ?? e) }, 500);
+  }
+});
+
 app.get("/__bridge/token", async (c) => {
   // Resolution order: bridge memory → globalThis → .pw/tokens.json → env
   let mem: any = null;
@@ -82,19 +170,26 @@ app.post("/v1/responses", async (c) => {
     // Streaming: pipe real relay frames as they land. SSE comments (`: ka`)
     // keep intermediaries from cutting the connection during long silent
     // reasoning phases; they are ignored by every SSE client.
+    // NOTE: the upstream stream already ends with its own response.completed —
+    // forward it verbatim and NEVER manufacture a second one from the final
+    // object (duplicate terminators break strict Responses-API clients).
     const handle = await enqueue(() => runRelay(body));
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const enc = new TextEncoder();
         const push = (s: string) => controller.enqueue(enc.encode(s));
         let closed = false;
+        let sawCompleted = false;
         const ka = setInterval(() => { if (!closed) push(": keepalive\n\n"); }, config.keepAliveMs);
         try {
           for await (const frame of handle.events()) {
+            if (frame.event === "response.completed") sawCompleted = true;
             push(sseFrame(frame.event, frame.data));
           }
-          const final = await handle.final;
-          push(sseFrame("response.completed", { type: "response.completed", response: final }));
+          if (!sawCompleted) {
+            const final = await handle.final;
+            push(sseFrame("response.completed", { type: "response.completed", response: final }));
+          }
         } catch (e: any) {
           push(sseFrame("error", { type: "error", code: e instanceof RelayError ? e.kind : "internal", message: String(e?.message ?? e) }));
         } finally {
@@ -163,12 +258,16 @@ export function attachWss(server: import("node:http").Server): void {
       try {
         const handle = await enqueue(() => runRelay(body));
         (async () => {
+          let sawCompleted = false;
           for await (const frame of handle.events()) {
             if (closed) return;
+            if (frame.event === "response.completed") sawCompleted = true;
             ws.send(JSON.stringify({ type: frame.event, parsed: safeParse(frame.data) }));
           }
-          const final = await handle.final;
-          if (!closed) ws.send(JSON.stringify({ type: "response.completed", response: final }));
+          if (!closed && !sawCompleted) {
+            const final = await handle.final;
+            ws.send(JSON.stringify({ type: "response.completed", response: final }));
+          }
         })().catch((e) => {
           if (!closed) ws.send(JSON.stringify({ type: "error", error: String(e?.message ?? e) }));
         });

@@ -13,11 +13,12 @@
 
 import PQueue from "p-queue";
 
-// PQUEUE_CONCURRENCY=5 — max concurrent POST /v1/responses (subagents)
-// Env override allowed for tuning: PQUEUE_CONCURRENCY env var, default 5 per plan
+// Admission gate for /v1/responses. Real execution concurrency is governed by
+// the slot pool (GP_SLOTS); this only bounds in-flight request handlers.
+// Must not be lower than the slot count — that would idle healthy slots.
 export const PQUEUE_CONCURRENCY: number = (() => {
   const v = Number(process.env.PQUEUE_CONCURRENCY);
-  return Number.isFinite(v) && v > 0 ? v : 5;
+  return Number.isFinite(v) && v > 0 ? v : 16;
 })();
 
 // Main queue for concurrent subagent requests — max 5 concurrent

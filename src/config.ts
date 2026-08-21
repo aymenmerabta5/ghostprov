@@ -7,7 +7,7 @@ function num(v: string | undefined, d: number): number {
 
 export const config = {
   port: num(process.env.PORT, 8787),
-  docId: (process.env.PRISM_DOC_ID ?? "2a153042-dc25-4ca5-b290-260eed5e8705").trim(),
+  docId: (process.env.PRISM_DOC_ID ?? "69288e8b-c183-45f3-9131-d64b05b98928").trim(),
   prismOrigin: "https://prism.openai.com",
   gatewayBase: "/s/sandboxes/proxy",
   /** Yjs browser->sandbox sync lag varies (2-15s); scale with payload size */
@@ -20,12 +20,22 @@ export const config = {
    * (agentic max-effort turns); keep this generous.
    */
   stallTimeoutMs: num(process.env.GP_STALL_TIMEOUT_MS, 900_000),
+  /**
+   * Max wait for the daemon's FIRST ack frame after the job hit disk. The
+   * daemon acks within ~seconds of dispatch, so exceeding this means the job
+   * was never accepted (zombie worker holding the slot, or a boot-baseline
+   * swallow). We attempt in-place recovery rewrites, then fail LOUDLY instead
+   * of hanging the agent for stallTimeoutMs (15min) with zero feedback.
+   */
+  unlatchTimeoutMs: num(process.env.GP_UNLATCH_TIMEOUT_MS, 45_000),
   /** zip poll interval ceiling while waiting (adaptive: 150ms when active) */
   pollIntervalMs: num(process.env.GP_POLL_INTERVAL_MS, 400),
   /** emit SSE comment keepalive every N ms during silent stretches */
   keepAliveMs: num(process.env.GP_KEEPALIVE_MS, 15_000),
   /** max concurrent /v1/responses handled end-to-end */
   concurrency: num(process.env.PQUEUE_CONCURRENCY, 5),
+  /** slot pool size for the daemon pipeline (must match sandbox GP_SLOTS) */
+  slots: num(process.env.GP_SLOTS, 8),
   /** warn threshold for inline data URLs routed through Yjs */
   inlinePayloadWarnBytes: num(process.env.GP_INLINE_WARN_BYTES, 512 * 1024),
 } as const;

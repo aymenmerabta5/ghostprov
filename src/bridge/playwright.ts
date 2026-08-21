@@ -39,7 +39,10 @@ import * as path from "node:path";
 // ---------------------------------------------------------------------------
 // Constants (task spec)
 // ---------------------------------------------------------------------------
+// Project is env-driven so ghostprov can move between Prism projects without
+// code changes (the sandbox allocation of an exhausted project may be blocked).
 export const PRISM_URL =
+  process.env.PRISM_PROJECT_URL?.trim() ||
   "https://prism.openai.com/?u=2a153042-dc25-4ca5-b290-260eed5e8705&pg=1&m=main.tex";
 export const USER_DATA_DIR = "D:/MyWork/AI/ghostprov/.pw";
 // Use forward slashes explicitly (task spec uses D:/MyWork/AI/ghostprov/.pw, not Windows backslashes)

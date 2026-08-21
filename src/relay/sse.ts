@@ -37,6 +37,25 @@ export function sseFrame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
 }
 
+/**
+ * Strip ghostprov-internal protocol keys before a final Responses object
+ * reaches any client. gp_sse/gp_ack/gp_total are our private disk protocol —
+ * Codex and every other Responses-API consumer must never see them.
+ */
+export function sanitizeFinal(obj: any): any {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return obj;
+  const clone = { ...obj };
+  delete clone.gp_sse;
+  delete clone.gp_ack;
+  delete clone.gp_total;
+  delete clone.gp_frames;
+  delete clone.gp_slot;
+  delete clone.gp_request;
+  delete clone.gp_transport;
+  delete clone.transport;
+  return clone;
+}
+
 export const SSE_HEADERS = {
   "content-type": "text/event-stream; charset=utf-8",
   "cache-control": "no-cache",
