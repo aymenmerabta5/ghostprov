@@ -15,12 +15,12 @@
 import "dotenv/config";
 import { Hono } from "hono";
 import { createServer as createHttpServer } from "node:http";
-import { WebSocketServer } from "ws";
 import { config } from "./config";
 import { runRelay, RelayError } from "./relay/pipeline";
 import { sseFrame, SSE_HEADERS } from "./relay/sse";
 import { writeFetchResponse } from "./http/adapter";
 import { ResponseScheduler, scheduleRelay } from "./relay/scheduler";
+import { attachResponsesWebSocket } from "./ws/server";
 
 const app = new Hono();
 export const responseScheduler = new ResponseScheduler(config.responseConcurrency);
@@ -243,62 +243,9 @@ export default app;
 // HTTP + WebSocket server wiring
 // ---------------------------------------------------------------------------
 export function attachWss(server: import("node:http").Server): void {
-  const wss = new WebSocketServer({ noServer: true });
-  wss.on("connection", (ws: any) => {
-    let closed = false;
-    ws.on("message", async (data: any) => {
-      if (closed) return;
-      let msg: any;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch {
-        ws.send(JSON.stringify({ type: "error", error: "invalid JSON" }));
-        return;
-      }
-      if (msg.type !== "response.create") {
-        ws.send(JSON.stringify({ type: "error", error: `unknown type ${msg.type}` }));
-        return;
-      }
-      const body: any = { ...msg };
-      delete body.type;
-      try {
-        const handle = await startScheduledRelay(body);
-        (async () => {
-          let sawCompleted = false;
-          for await (const frame of handle.events()) {
-            if (closed) return;
-            if (frame.event === "response.completed") sawCompleted = true;
-            ws.send(JSON.stringify({ type: frame.event, parsed: safeParse(frame.data) }));
-          }
-          if (!closed && !sawCompleted) {
-            const final = await handle.final;
-            ws.send(JSON.stringify({ type: "response.completed", response: final }));
-          }
-        })().catch((e) => {
-          if (!closed) ws.send(JSON.stringify({ type: "error", error: String(e?.message ?? e) }));
-        });
-      } catch (e: any) {
-        if (!closed) ws.send(JSON.stringify({ type: "error", error: String(e?.message ?? e) }));
-      }
-    });
-    ws.on("close", () => { closed = true; });
+  attachResponsesWebSocket(server, {
+    startRelay: (body, options) => startScheduledRelay(body, options.signal),
   });
-  server.on("upgrade", (req, socket, head) => {
-    try {
-      const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-      if (url.pathname === "/v1/responses") {
-        wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-      } else {
-        socket.destroy();
-      }
-    } catch {
-      socket.destroy();
-    }
-  });
-}
-
-function safeParse(s: string): any {
-  try { return JSON.parse(s); } catch { return s; }
 }
 
 // ---------------------------------------------------------------------------
