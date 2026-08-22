@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError } from "../src/http/errors";
 import { executeImageBatch } from "../src/images/service";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;

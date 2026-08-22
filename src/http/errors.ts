@@ -116,6 +116,35 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
 
+  if (record(error)?.name === "AbortError") {
+    return {
+      status: 499,
+      error: {
+        message: "Request was cancelled",
+        type: "request_aborted",
+        param: null,
+        code: "request_aborted",
+      },
+    };
+  }
+
+  const structured = record(error);
+  if (
+    structured?.name === "RouterShutdownError" &&
+    structured.status === 503 &&
+    structured.code === "router_shutting_down"
+  ) {
+    return {
+      status: 503,
+      error: {
+        message: error instanceof Error ? error.message : "GhostProv is shutting down",
+        type: "service_unavailable_error",
+        param: null,
+        code: "router_shutting_down",
+      },
+    };
+  }
+
   const daemon = normalizeDaemonError(error);
   if (daemon) return daemon;
 

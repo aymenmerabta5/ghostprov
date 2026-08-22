@@ -77,31 +77,6 @@ export function createTranscriptionInputFromBytes(
   return { input_audio: createInputAudioFromBytes(bytes, format), model };
 }
 
-// Upload + file_id path (mirrors image via-upload helper)
-export async function createInputAudioFromBytesViaUpload(
-  bytes: Uint8Array,
-  filename: string,
-  purpose: string = "audio",
-): Promise<InputAudio> {
-  const ext = filename.split(".").pop()?.toLowerCase() ?? "wav";
-  const mimeMap: Record<string, string> = {
-    wav: "audio/wav",
-    mp3: "audio/mpeg",
-    m4a: "audio/m4a",
-    mp4: "audio/mp4",
-    ogg: "audio/ogg",
-    flac: "audio/flac",
-    webm: "audio/webm",
-  };
-  const mime = mimeMap[ext] ?? "audio/wav";
-  const blob = new Blob([bytes as unknown as BlobPart], { type: mime });
-  const { uploadFile } = await import("../proxy/files");
-  const file = await uploadFile(blob as unknown as Blob, filename, purpose);
-  const fileId: string = (file as any)?.id ?? (file as any)?.file_id;
-  if (!fileId) throw new Error("upload failed: no file id returned");
-  return createInputAudioFromFileId(fileId);
-}
-
 // ---- Output audio helpers ----
 export function isOutputAudio(item: unknown): boolean {
   return !!item && typeof item === "object" && (item as any).type === "output_audio";

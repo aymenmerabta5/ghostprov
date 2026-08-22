@@ -1,0 +1,162 @@
+import { describe, expect, it } from "bun:test";
+import { gzipSync } from "fflate";
+import {
+  GP_V2_REQUEST_MAX_BYTES,
+  base64UrlEncode,
+  sha256Hex,
+  type HostFrame,
+  type ReliableFrame,
+  type RequestEncoding,
+} from "../src/v2/protocol/shared";
+import {
+  RequestAssembler,
+  RequestAssemblyError,
+} from "../src/v2/sidecar/assembler";
+
+const REQUEST = "req-assembly-1";
+
+async function frames(
+  decoded: Uint8Array,
+  options: { encoding?: RequestEncoding; partBytes?: number } = {},
+): Promise<ReliableFrame<HostFrame>[]> {
+  const encoding = options.encoding ?? "identity";
+  const encoded = encoding === "identity" ? decoded : gzipSync(decoded);
+  const partBytes = options.partBytes ?? 11;
+  const partCount = Math.ceil(encoded.byteLength / partBytes);
+  const result: ReliableFrame<HostFrame>[] = [{
+    kind: "request_open",
+    requestId: REQUEST,
+    requestDigest: await sha256Hex(decoded),
+    decodedBytes: decoded.byteLength,
+    encodedBytes: encoded.byteLength,
+    encoding,
+    partCount,
+    epoch: 1,
+    sequence: 0,
+  }];
+  for (let offset = 0, partIndex = 0; offset < encoded.length; offset += partBytes, partIndex++) {
+    result.push({
+      kind: "request_data",
+      requestId: REQUEST,
+      partIndex,
+      offset,
+      dataBase64Url: base64UrlEncode(encoded.subarray(offset, offset + partBytes)),
+      epoch: 1,
+      sequence: result.length,
+    });
+  }
+  return result;
+}
+
+describe("RequestAssembler", () => {
+  it("reassembles reordered identity parts after exact integrity proof", async () => {
+    const decoded = new TextEncoder().encode(JSON.stringify({ model: "gpt-5.6-sol", input: "hello 🌍" }));
+    const requestFrames = await frames(decoded, { partBytes: 7 });
+    const assembler = new RequestAssembler();
+    assembler.accept(requestFrames[0]);
+    for (const frame of requestFrames.slice(1).reverse()) assembler.accept(frame);
+
+    await expect(assembler.commit(REQUEST)).resolves.toEqual(decoded);
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
+  });
+
+  it("decompresses gzip only after all parts and enforces decoded length", async () => {
+    const decoded = new TextEncoder().encode(JSON.stringify({ input: "compressible ".repeat(1_000) }));
+    const requestFrames = await frames(decoded, { encoding: "gzip+base64", partBytes: 13 });
+    const assembler = new RequestAssembler();
+    for (const frame of requestFrames) assembler.accept(frame);
+
+    await expect(assembler.commit(REQUEST)).resolves.toEqual(decoded);
+  });
+
+  it("accepts identical duplicates but rejects conflicting duplicate parts", async () => {
+    const decoded = new TextEncoder().encode("duplicate-check");
+    const requestFrames = await frames(decoded, { partBytes: 8 });
+    const firstPart = requestFrames[1] as Extract<ReliableFrame<HostFrame>, { kind: "request_data" }>;
+    const assembler = new RequestAssembler();
+    assembler.accept(requestFrames[0]);
+    assembler.accept(firstPart);
+    assembler.accept(firstPart);
+    expect(() => assembler.accept({
+      ...firstPart,
+      dataBase64Url: base64UrlEncode(new TextEncoder().encode("conflict")),
+    })).toThrow("conflicting duplicate");
+  });
+
+  it("rejects gaps, overlaps, wrong digests, and declared-size mismatches", async () => {
+    const decoded = new TextEncoder().encode("0123456789abcdef");
+    const requestFrames = await frames(decoded, { partBytes: 8 });
+    const open = requestFrames[0] as Extract<ReliableFrame<HostFrame>, { kind: "request_open" }>;
+    const firstPart = requestFrames[1] as Extract<ReliableFrame<HostFrame>, { kind: "request_data" }>;
+    const secondPart = requestFrames[2] as Extract<ReliableFrame<HostFrame>, { kind: "request_data" }>;
+
+    const gap = new RequestAssembler();
+    gap.accept(open);
+    gap.accept(firstPart);
+    await expect(gap.commit(REQUEST)).rejects.toMatchObject({ code: "gap" });
+
+    const overlap = new RequestAssembler();
+    overlap.accept(open);
+    overlap.accept(firstPart);
+    expect(() => overlap.accept({ ...secondPart, offset: 4 })).toThrow("overlap");
+
+    const digest = new RequestAssembler();
+    digest.accept({ ...open, requestDigest: "0".repeat(64) });
+    for (const frame of requestFrames.slice(1)) digest.accept(frame);
+    await expect(digest.commit(REQUEST)).rejects.toMatchObject({ code: "digest" });
+  });
+
+  it("rejects oversized declarations before reserving memory", () => {
+    const assembler = new RequestAssembler();
+    expect(() => assembler.accept({
+      kind: "request_open",
+      requestId: REQUEST,
+      requestDigest: "a".repeat(64),
+      decodedBytes: GP_V2_REQUEST_MAX_BYTES + 1,
+      encodedBytes: 1,
+      encoding: "identity",
+      partCount: 1,
+      epoch: 1,
+      sequence: 0,
+    })).toThrow(RequestAssemblyError);
+    expect(assembler.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("reserves the larger encoded size for hostile compressed declarations", () => {
+    const assembler = new RequestAssembler({ maxReservedBytes: 32 });
+    expect(() => assembler.accept({
+      kind: "request_open",
+      requestId: REQUEST,
+      requestDigest: "a".repeat(64),
+      decodedBytes: 1,
+      encodedBytes: 64,
+      encoding: "gzip+base64",
+      partCount: 1,
+      epoch: 1,
+      sequence: 0,
+    })).toThrow("reservation budget");
+    expect(assembler.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("rejects a decompression bomb when output exceeds its declaration", async () => {
+    const actual = new TextEncoder().encode("x".repeat(1_000_000));
+    const requestFrames = await frames(actual, { encoding: "gzip+base64", partBytes: 1024 });
+    const open = requestFrames[0] as Extract<ReliableFrame<HostFrame>, { kind: "request_open" }>;
+    const assembler = new RequestAssembler();
+    assembler.accept({ ...open, decodedBytes: 32 });
+    for (const frame of requestFrames.slice(1)) assembler.accept(frame);
+
+    await expect(assembler.commit(REQUEST)).rejects.toMatchObject({ code: "bounds" });
+    expect(assembler.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("releases reservations on cancellation", async () => {
+    const decoded = new TextEncoder().encode("cancel");
+    const requestFrames = await frames(decoded);
+    const assembler = new RequestAssembler();
+    assembler.accept(requestFrames[0]);
+    expect(assembler.snapshot()).toEqual({ requests: 1, reservedBytes: decoded.byteLength });
+    assembler.cancel(REQUEST);
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
+  });
+});

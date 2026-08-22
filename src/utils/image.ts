@@ -114,38 +114,6 @@ export function createInputImageFromBase64(b64: string, mimeType: string = "imag
   return createInputImage({ image_url: dataUrl, detail });
 }
 
-// ---- Upload helper: bytes -> Files API -> file_id InputImage ----
-// NOTE: this imports uploadFile lazily to avoid circular deps at module init time;
-// caller can also provide their own uploadFn.
-export async function createInputImageFromBytesViaUpload(
-  bytes: Uint8Array,
-  filename: string,
-  mimeType?: string,
-  detail: ImageDetail = "auto",
-  purpose: string = "vision",
-): Promise<InputImage> {
-  const mime = mimeType ?? inferMimeFromFilename(filename);
-  const blob = new Blob([bytes as unknown as BlobPart], { type: mime });
-  const { uploadFile } = await import("../proxy/files");
-  const file = await uploadFile(blob as unknown as Blob, filename, purpose);
-  const fileId: string = (file as any)?.id ?? (file as any)?.file_id;
-  if (!fileId) throw new Error("upload failed: no file id returned");
-  return createInputImageFromFileId(fileId, detail);
-}
-
-export async function createInputImageFromFileViaUpload(
-  file: Blob,
-  filename: string,
-  detail: ImageDetail = "auto",
-  purpose: string = "vision",
-): Promise<InputImage> {
-  const { uploadFile } = await import("../proxy/files");
-  const res = await uploadFile(file as unknown as Blob, filename, purpose);
-  const fileId: string = (res as any)?.id ?? (res as any)?.file_id;
-  if (!fileId) throw new Error("upload failed: no file id returned");
-  return createInputImageFromFileId(fileId, detail);
-}
-
 // ---- Image generation output helpers ----
 export function isImageGenerationCall(item: unknown): item is ImageGenerationCall {
   return !!item && typeof item === "object" && (item as any).type === "image_generation_call";

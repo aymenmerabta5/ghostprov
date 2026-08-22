@@ -7,26 +7,35 @@
   },
   "scripts": {
     "dev": "bun src/server.ts",
-    "dev:headless": "bun src/server.ts --headless",
+    "dev:candidate": "bun src/server.ts",
     "test": "bun test --isolate",
-    "test:unit": "bun test --isolate tests/sse.test.ts tests/terminal-rescue.test.ts tests/segments.test.ts tests/zip-coordinator.test.ts tests/scheduler.test.ts tests/concurrency.test.ts tests/response-graph.test.ts tests/bridge-config.test.ts tests/ydoc.test.ts tests/http-errors.test.ts tests/http-body.test.ts tests/images-compat.test.ts tests/images-service.test.ts tests/documentation.test.ts",
-    "test:integration": "bun test --isolate tests/http-streaming.test.ts tests/websocket.test.ts tests/images-http.test.ts tests/mirror.test.ts tests/files.test.ts tests/bridge.test.ts",
+    "test:unit": "bun test --isolate tests/sse.test.ts tests/terminal-rescue.test.ts tests/unlatch-recovery.test.ts tests/segments.test.ts tests/zip-coordinator.test.ts tests/scheduler.test.ts tests/concurrency.test.ts tests/response-graph.test.ts tests/ydoc.test.ts tests/http-errors.test.ts tests/http-body.test.ts tests/images-compat.test.ts tests/images-service.test.ts tests/prism-protocol.test.ts tests/multi-sandbox-config.test.ts tests/account-session.test.ts tests/provisioning-client.test.ts tests/sandbox-ydoc.test.ts tests/sandbox-gateway.test.ts tests/heartbeat.test.ts tests/workload.test.ts tests/resource-governor.test.ts tests/cpu-transform-pool.test.ts tests/daemon-controller.test.ts tests/sandbox-runtime.test.ts tests/slot-runner.test.ts tests/router-policy.test.ts tests/no-playwright.test.ts tests/documentation.test.ts",
+    "test:integration": "bun test --isolate tests/http-streaming.test.ts tests/websocket.test.ts tests/images-http.test.ts tests/router-http.test.ts tests/multi-sandbox-router.test.ts tests/multi-sandbox-integration.test.ts",
     "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
     "typecheck": "tsc --noEmit",
-    "verify:live": "bun scripts/live_verify.ts"
+    "verify:live": "bun scripts/live_verify.ts",
+    "verify:browserless": "bun scripts/probe_browserless_prism.ts",
+    "create:test-projects": "bun scripts/create_test_projects.ts",
+    "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",
+    "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",
+    "verify:v2-single": "bun scripts/live_v2_single.ts",
+    "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
+    "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
+    "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
+    "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",
     "fflate": "^0.8.3",
     "hono": "^4.6.0",
-    "p-queue": "^8.0.1",
-    "playwright": "^1.62.1",
+    "tough-cookie": "^6.0.0",
     "ws": "^8.18.0",
     "y-websocket": "^2.0.4",
     "yjs": "^13.6.20"
   },
   "devDependencies": {
     "@types/bun": "1.4.0",
+    "@types/deno": "2.7.0",
     "@types/ws": "^8.18.1",
     "typescript": "7.0.2"
   }

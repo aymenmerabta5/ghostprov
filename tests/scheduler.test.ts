@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { ResponseScheduler, scheduleRelay } from "../src/relay/scheduler";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;

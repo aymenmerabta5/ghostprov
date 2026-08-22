@@ -1,203 +1,173 @@
 # GhostProv
 
-GhostProv is a local OpenAI Responses API mirror backed by an authenticated Prism sandbox. It supports non-streaming HTTP, true incremental SSE, Codex-compatible Responses WebSockets, native-shaped GPT Image generation/edit routes, concurrent sandbox slots, and `store:false` continuation through connection-local response graphs.
+GhostProv is a browserless OpenAI-compatible router over independent Prism sandbox projects. V2 distributes work through per-project Deno Awareness sidecars while preserving terminal proof, streaming replay, GPT Image compatibility, and Codex `store:false` continuation. The file-backed V1 daemon remains only as a lazy authenticated `auto` fallback during rollout.
 
-The project is pinned to Bun 1.4.0, uses Bun's isolated native test runner, and typechecks with the native TypeScript 7.0.2 compiler.
+The project is pinned to Bun 1.4.0, TypeScript 7.0.2, and `bun test --isolate`. Playwright and Chromium are not runtime dependencies.
 
-## Quick start
+## Browserless configuration
+
+Every sandbox uses a separate explicitly allowlisted Prism project under the same authenticated account cookies.
 
 ```powershell
-bun install
-Copy-Item .env.example .env
-bun run dev
+$env:PRISM_PROJECT_IDS = "project-uuid-1,project-uuid-2,project-uuid-3,project-uuid-4"
+$env:PRISM_COOKIE_FILE = "D:\secrets\prism-cookies.json"
+$env:GP_TRANSPORT = "v2"
+$env:GP_PRISM_SESSION = "authenticated"
+$env:GP_TARGET_CONCURRENCY = "512"
+$env:GP_CANDIDATE = "1"
+$env:PORT = "18787"
+bun run dev:candidate
 ```
 
-The Playwright bridge opens the configured Prism project, keeps login state in a persistent profile, captures sandbox/Yjs credentials, and routes authenticated gateway calls through the live page.
+`PRISM_COOKIE` accepts an initial Cookie header when a persisted cookie jar is unavailable. `PRISM_DOC_ID` remains a single-project compatibility fallback. The account session consumes `Set-Cookie`, persists rotations atomically, and hot-reloads a newer cookie file.
 
-```powershell
-curl.exe http://127.0.0.1:8787/health
-# {"ok":true}
+Candidate mode refuses port 8787. Development and load testing use port 18787 so an existing `localhost:8787` process remains untouched. Stable project UUIDs and worker indexes are persisted in `.ghostprov/fleet.json`; restarts reuse them and never create a new fleet blindly.
+
+Project-less automatic creation is available only when explicitly enabled with `GP_AUTO_CREATE_PROJECTS=1`. The signed-in session is the production default. Guest mode requires `GP_PRISM_SESSION=anonymous`, `GP_ALLOW_ANONYMOUS=1`, and `GP_TRANSPORT=v2`; it defaults to one reusable project and is capped separately by `GP_GUEST_MAX_PROJECTS`.
+
+## Architecture
+
+Each V2 project owns an isolated `V2SandboxRuntime`:
+
+- Direct Prism provisioning and token synchronization
+- A scoped Node Yjs connection used only for one offline sidecar bundle and bootstrap ciphertext
+- A dedicated Y-Sweet Awareness channel for bounded request/response frames
+- A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
+- Append-only claims and terminal spools under `/tmp/ghostprov-v2`
+- P-256 ECDH/HKDF/AES-GCM bootstrap and AES-GCM credential rotation
+- A 16 KiB frame ceiling and 32-frame/512 KiB unacknowledged window
+- Up to 128 physical upstream calls plus fair byte-bounded admission
+- One independently phased heartbeat on an exact 10-second cadence
+- Live RTT, completion, failure, quarantine, credential, and memory metrics
+
+V2 never requests a project export or calls the sandbox ZIP endpoint. ZIP, immutable project chunks, and 30 daemon lanes belong only to the optional V1 fallback.
+
+The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, daemon capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
+
+Failure rules:
+
+- Before committed ACK, one safe router retry is allowed.
+- After committed ACK, the request remains pinned to its original sandbox and is never retried.
+- `FETCH_STARTING` is durable before fetch; a crash afterward is ambiguous and quarantined.
+- A request is released only after exact request/response/transcript terminal proof.
+- Proven terminal spools replay after restart without another upstream call.
+- Unproven requests remain quarantined and reduce advertised capacity.
+- One failed project never stops healthy projects.
+
+## Concurrency and latency
+
+One V2 sidecar has a hard physical ceiling of 128 simultaneous upstream calls. Four projects provide 512 physical calls; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
+
+```text
+min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
 ```
 
-Point Codex at the mirror:
+Hardware detection uses physical/free RAM, process RSS, and logical processors:
 
-```powershell
-$env:OPENAI_BASE_URL = "http://127.0.0.1:8787/v1"
-codex --model gpt-5.6-sol
+```text
+system reserve = max(4 GiB, 20% total RAM)
+process ceiling = min(60% total RAM, startup RSS + free RAM - reserve)
+pause admission below max(2 GiB, 10% total RAM) free
+resume above max(3 GiB, 15% total RAM) free
+CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
-## Responses HTTP
+Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory.
+
+Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
+
+Latency acceptance targets:
+
+- Router decision p95 below 2 ms
+- Queue p95 below 250 ms while capacity is available
+- Small Awareness transport p95 below 1 second under 512 accepted/128 active load
+- One-project 128-call first-event p95 below 4 seconds
+- Four-project 512-call first-event p95 below 7 seconds per sandbox
+
+One sequential Codex task normally uses one lane. High utilization requires multiple tasks, API callers, named WebSocket lanes, or image fan-out.
+
+## HTTP Responses
 
 ```powershell
-curl.exe -N -X POST http://127.0.0.1:8787/v1/responses `
+curl.exe -X POST http://127.0.0.1:18787/v1/responses `
   -H "content-type: application/json" `
-  -d '{"model":"gpt-5.6-sol","store":false,"stream":true,"input":"Say hello"}'
+  -d '{"model":"gpt-5.6-sol","store":false,"input":"Reply with hello"}'
 ```
 
-The Node adapter forwards each `ReadableStream` chunk with backpressure. It does not buffer the response before sending it to the client.
+Use `stream:true` for incremental SSE. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
-Reasoning fields are forwarded verbatim, including `effort: "max"`, `mode: "pro"`, `context`, and `summary`. `service_tier: "fast"` is also preserved.
+## Codex WebSocket mode
+
+WebSocket mode follows the [official OpenAI Responses WebSocket contract](https://developers.openai.com/api/docs/guides/websocket-mode/). Clients send direct `response.create` events to `ws://127.0.0.1:18787/v1/responses`. Named lanes execute independently, same-lane work remains FIFO, and `previous_response_id` lineage is separate from lane identity.
+
+Streaming is implicit in WebSocket mode: clients must omit the `stream` field. GhostProv adds `stream:true` only to its internal sandbox HTTP request.
+
+```toml
+[model_providers.ghostprov]
+name = "GhostProv"
+env_key = "OPENAI_API_KEY"
+base_url = "http://127.0.0.1:18787/v1"
+supports_websockets = true
+```
 
 ## Images compatibility
-
-The sandbox upstream exposes only the Responses API, so GhostProv implements native-shaped image routes locally and translates them into live-proven `gpt-image-2` Responses tool calls:
 
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
 
-Generate an image:
+`gpt-image-2` and its pinned snapshot are supported. Native `n=1..10` fans children across independent sandbox runtimes. GPT Image responses return `b64_json`. Image streaming, URL emulation, audio, and DALL-E variation routes return explicit unsupported-capability errors.
+
+## Monitoring
+
+- `GET /health` returns aggregate capacity, active, available, queued, and runtime count; zero routable capacity returns HTTP 503 with `ok:false`.
+- `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, and resource snapshots.
+
+No endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
+
+## Lifecycle and recovery
+
+Startup resolves and locks one persisted Prism identity, reconciles the durable fleet manifest, and binds the public listener as soon as one runtime is ready; remaining projects continue provisioning independently. Shutdown stops listener admission, rejects queued uncommitted work with HTTP 503, waits for existing terminal proofs, drains sidecars, clears Awareness, closes the identity lease, and never creates or deletes a project.
+
+Operational recovery states are intentionally distinct:
+
+- pre-commit rejection: safe for the router's single retry;
+- committed definitive failure: pinned, no fallback;
+- committed ambiguous failure or lost instance: quarantined, no retry;
+- proven terminal spool: replayed and ACKed without a second fetch;
+- expired heartbeat/credential: runtime drains without affecting healthy projects.
+
+Project deletion is never automatic. Preview managed targets first:
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8787/v1/images/generations `
-  -H "content-type: application/json" `
-  -d '{"model":"gpt-image-2","prompt":"a minimal red circle","quality":"low","size":"1024x1024","n":1}'
+bun run decommission:v2 -- --project <managed-project-uuid>
 ```
 
-Edit one or more reference images, optionally with a PNG mask:
+Execution requires the exact preview digest and a separate destructive opt-in:
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8787/v1/images/edits `
-  -F "model=gpt-image-2" `
-  -F "prompt=make the subject blue" `
-  -F "image=@input.png" `
-  -F "mask=@mask.png"
+$env:GP_ALLOW_PROJECT_DELETE = "1"
+bun run decommission:v2 -- --project <managed-project-uuid> --confirm <sha256-digest>
 ```
 
-Compatibility behavior:
+Only manifest records with `managed:true` can be deleted. Explicit user projects are excluded. Cleanup and tombstoning do not erase or conceal Prism-visible project/account activity; they only maintain local lifecycle hygiene.
 
-- `gpt-image-2` and `gpt-image-2-2026-04-21` are supported.
-- `n=1..10` is implemented as concurrent Responses calls through the same global FIFO scheduler used by HTTP and WebSocket requests. Results retain submission order.
-- GPT Image data is returned as `b64_json`; URL emulation is intentionally unsupported.
-- PNG, JPEG, and WebP edit inputs are validated by MIME type, filename, and magic bytes. Up to 16 references are accepted, subject to the aggregate input limit below.
-- Masks must be PNG and no larger than 4 MiB.
-- Image streaming is intentionally deferred and returns an explicit compatibility error.
-- `/v1/images/variations` returns HTTP 501; use `/v1/images/edits` for GPT Image workflows.
-- Audio input is unavailable through the configured Responses-only upstream. `/v1/audio/speech`, `/v1/audio/transcriptions`, and `/v1/audio/translations` return HTTP 501 instead of pretending the capability exists.
+## Operational settings
 
-## Responses WebSocket mode
-
-WebSocket mode follows the [official OpenAI Responses WebSocket contract](https://developers.openai.com/api/docs/guides/websocket-mode/):
-
-- clients send direct `response.create` objects;
-- `stream` is implicit; official clients omit it, while GhostProv tolerates the redundant `stream: true` currently sent by Codex compatibility paths;
-- server events are direct event objects;
-- named events echo `stream_id`; default-lane events omit it;
-- requests sharing a lane execute FIFO and never overlap;
-- different lanes execute concurrently;
-- `previous_response_id` controls lineage independently of the lane;
-- connection-local state supports `store:false` continuation and forks;
-- `previous_session_id` is not a public Codex/OpenAI field.
-
-Custom Codex providers must advertise WebSocket support:
-
-```toml
-[model_providers.custom]
-name = "GhostProv"
-env_key = "OPENAI_API_KEY"
-base_url = "http://127.0.0.1:8787/v1"
-supports_websockets = true
-```
-
-```js
-import { WebSocket } from "ws";
-
-const ws = new WebSocket("ws://127.0.0.1:8787/v1/responses");
-ws.on("message", data => {
-  const event = JSON.parse(data.toString());
-  console.log(event.type, event.stream_id, event);
-});
-ws.on("open", () => {
-  ws.send(JSON.stringify({
-    type: "response.create",
-    stream_id: "codex-main",
-    model: "gpt-5.6-sol",
-    store: false,
-    input: "Find fizz_buzz()",
-  }));
-});
-```
-
-For a `store:false` continuation, GhostProv resolves the client-supplied `previous_response_id` in the socket's bounded response graph, reconstructs stateless input for the internal HTTP relay, and retains encrypted reasoning internally. It never changes `store:false` to `store:true`.
-
-## Concurrency architecture
-
-One global FIFO scheduler owns all end-to-end relay capacity across HTTP and WebSocket callers. A lease remains active until `RunHandle.final` settles; creating a streaming handle does not release capacity early.
-
-The slot daemon executes one upstream request per physical lane. Large requests use segmented transport:
-
-- segmented transport is enabled by default for request bodies above 512 KiB; `GP_SEGMENT=0` is the emergency opt-out;
-- v6.3 is selected only when `gp_status.json` advertises `segmented-v6.3-embedded-commit`;
-- parts `1..K-1` are published first and embedded-header part zero commits last;
-- `job_sN.json` is not rewritten by v6.3;
-- v6.2 remains the compatibility fallback.
-
-Concurrent response/status reads are coalesced by `ZipPollCoordinator`: filenames requested in one short window share one `/zip` archive fetch instead of downloading the archive once per lane.
-
-| Setting | Default | Purpose |
+| Setting | Default | Meaning |
 | --- | ---: | --- |
-| `GP_SLOTS` | `8` | Global end-to-end relay capacity and requested daemon lanes |
-| `PQUEUE_CONCURRENCY` | unset | Compatibility cap; when set, the smaller value with `GP_SLOTS` wins |
-| `GP_ZIP_BATCH_MS` | `10` | Archive-read coalescing window |
-| WebSocket active responses | `16` | Per-connection active response ceiling (`GP_WS_ACTIVE_RESPONSES`) |
-| WebSocket named lanes | `32` | Per-connection distinct named-lane ceiling (`GP_WS_NAMED_STREAMS`) |
-| `GP_IMAGE_RESPONSES_MODEL` | `gpt-5.6-sol` | Responses orchestrator used by Images compatibility routes |
-| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Aggregate raw bytes across edit references and mask |
-| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart request envelope limit applied before buffering |
-| `GP_WS_CACHE_NODES` | `256` | Cached response nodes per WebSocket |
-| `GP_WS_CACHE_BYTES` | `67108864` | Cached response bytes per WebSocket |
-| `GP_WS_CACHE_TOTAL_BYTES` | `536870912` | Process-wide WebSocket graph byte budget |
-
-## Bridge configuration
-
-| Variable | Meaning |
-| --- | --- |
-| `PRISM_DOC_ID` | Prism document/project identifier |
-| `PRISM_PROJECT_URL` | Optional explicit Prism URL; otherwise derived from `PRISM_DOC_ID` |
-| `PRISM_SANDBOX_TOKEN` | Optional initial sandbox credential; the bridge refreshes it |
-| `PRISM_Y_TOKEN` | Optional initial Yjs credential |
-| `GP_USER_DATA_DIR` | Persistent Chromium profile; defaults to `<repo>/.pw` |
-| `GP_TOKEN_FILE` | Token cache; defaults to `<GP_USER_DATA_DIR>/tokens.json` |
-| `GP_ENV_FILE` | Environment file updated by the bridge; defaults to `<repo>/.env` |
-| `BRIDGE_HEADLESS` | Set to `1` for a headless persistent context |
-| `BRIDGE_DISABLE` | Set to `1` to disable bridge auto-start |
-
-Headful and headless modes use the same persistent context. Launch recovery closes only contexts owned by GhostProv; it does not terminate unrelated browser processes, and Chromium is not launched with `--no-sandbox`.
-
-## Files
-
-```powershell
-curl.exe -X POST http://127.0.0.1:8787/v1/files -F file=@image.png -F purpose=vision
-curl.exe http://127.0.0.1:8787/v1/files/<file_id>/content --output image.png
-```
-
-Image/audio data URLs and Responses fields such as `tools`, `tool_choice`, `reasoning`, `prompt_cache_key`, `prompt_cache_options`, and `prompt_cache_breakpoint` pass through the relay body.
-
-## Active source layout
-
-```text
-src/server.ts                 HTTP routes and server startup
-src/http/adapter.ts           Fetch-to-Node incremental response adapter
-src/http/body.ts              bounded multipart request collection
-src/http/errors.ts            OpenAI-shaped validation/upstream errors
-src/images/compat.ts          Images request validation and Responses mapping
-src/images/service.ts         concurrent image execution and aggregation
-src/images/routes.ts          Images/audio capability HTTP routes
-src/ws/server.ts              WebSocket upgrade boundary
-src/ws/session.ts             lanes, limits, event forwarding, disconnect cleanup
-src/ws/response-graph.ts      bounded store:false continuation/fork state
-src/relay/scheduler.ts        global FIFO end-to-end capacity
-src/relay/pipeline.ts         slot-first relay with serial fallback
-src/relay/slots.ts            daemon lanes and transport negotiation
-src/relay/segments.ts         v6.2/v6.3 segmented request plans
-src/prism/zip-coordinator.ts  coalesced archive polling
-src/prism/gateway.ts          authenticated in-page gateway calls
-src/prism/ydoc.ts             persistent Yjs document writer
-src/bridge/config.ts          portable bridge paths and launch policy
-src/bridge/playwright.ts      persistent authenticated browser bridge
-sandbox/gp_daemon.py          Linux concurrent slot daemon
-```
-
-`src/relay/client.ts`, `src/proxy/yjs.ts`, `src/proxy/render.ts`, and `src/utils/zip.ts` are compatibility helpers for older direct callers. The server's active Responses path is `relay/pipeline.ts` → `relay/slots.ts`.
+| `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
+| `GP_TRANSPORT` | `auto` | `v2`, `v1`, or authenticated rollout fallback; guests are V2-only |
+| `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
+| `GP_TARGET_CONCURRENCY` | `512` | Fleet sizing target; divided by per-sandbox V2 capacity |
+| `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
+| `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
+| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216` | Host capacity estimate per active V2 stream |
+| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912` | Sidecar request/queue admission budget |
+| `GP_V2_YSWEET_REFRESH_MS` | `2700000` | Encrypted reconnect-credential rotation horizon |
+| WebSocket active responses | `16` | Per-connection active response ceiling |
+| WebSocket named lanes | `32` | Per-connection named-lane ceiling |
+| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Raw multipart edit-input budget |
+| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart envelope ceiling |
 
 ## Tests
 
@@ -207,50 +177,182 @@ bun run test:unit
 bun run test:integration
 bun run test:daemon
 bun run typecheck
+bun audit --production
 ```
 
-The default suite is isolated from live credentials and includes:
+The isolated suite includes:
 
-- `tests/bridge-config.test.ts`
-- `tests/bridge.test.ts`
+- `tests/account-session.test.ts`
 - `tests/concurrency.test.ts`
+- `tests/cpu-transform-pool.test.ts`
+- `tests/daemon-controller.test.ts`
+- `tests/decommission-script.test.ts`
+- `tests/decommission.test.ts`
 - `tests/documentation.test.ts`
-- `tests/files.test.ts`
+- `tests/file-lease.test.ts`
+- `tests/fleet-manifest.test.ts`
+- `tests/fleet-manager.test.ts`
+- `tests/graceful-shutdown.test.ts`
+- `tests/heartbeat.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
 - `tests/http-streaming.test.ts`
 - `tests/images-compat.test.ts`
 - `tests/images-http.test.ts`
 - `tests/images-service.test.ts`
-- `tests/mirror.test.ts`
+- `tests/multi-sandbox-config.test.ts`
+- `tests/multi-sandbox-integration.test.ts`
+- `tests/multi-sandbox-router.test.ts`
+- `tests/no-playwright.test.ts`
+- `tests/prism-protocol.test.ts`
+- `tests/project-inspector.test.ts`
+- `tests/provisioning-client.test.ts`
+- `tests/projects-client.test.ts`
+- `tests/resource-governor.test.ts`
 - `tests/response-graph.test.ts`
+- `tests/router-http.test.ts`
+- `tests/router-policy.test.ts`
+- `tests/sandbox-gateway.test.ts`
+- `tests/sandbox-runtime.test.ts`
+- `tests/sandbox-ydoc.test.ts`
 - `tests/scheduler.test.ts`
+- `tests/session-manager.test.ts`
 - `tests/segments.test.ts`
+- `tests/slot-runner.test.ts`
 - `tests/sse.test.ts`
+- `tests/system-v2.test.ts`
 - `tests/terminal-rescue.test.ts`
+- `tests/transport-selector.test.ts`
+- `tests/unlatch-recovery.test.ts`
+- `tests/v2-awareness-channel.test.ts`
+- `tests/v2-admission.test.ts`
+- `tests/v2-assembler.test.ts`
+- `tests/v2-bootstrap-crypto.test.ts`
+- `tests/v2-bootstrap-binding.test.ts`
+- `tests/v2-bootstrap-controller.test.ts`
+- `tests/v2-bootstrap-probe.test.ts`
+- `tests/v2-concurrency.test.ts`
+- `tests/v2-credential-rotation.test.ts`
+- `tests/v2-dynamic-fleet.test.ts`
+- `tests/v2-deno-awareness-peer.test.ts`
+- `tests/v2-faults.test.ts`
+- `tests/v2-journal.test.ts`
+- `tests/v2-large-payload.test.ts`
+- `tests/v2-live-guards.test.ts`
+- `tests/v2-protocol.test.ts`
+- `tests/v2-public-api.test.ts`
+- `tests/v2-run-handle.test.ts`
+- `tests/v2-runtime.test.ts`
+- `tests/v2-scheduler.test.ts`
+- `tests/v2-sidecar-assets.test.ts`
+- `tests/v2-sidecar-bootstrap.test.ts`
+- `tests/v2-sidecar-engine.test.ts`
+- `tests/v2-sidecar-rotation.test.ts`
+- `tests/v2-transcript.test.ts`
+- `tests/v2-transport-session.test.ts`
+- `tests/v2-upstream.test.ts`
+- `tests/v2-window.test.ts`
 - `tests/websocket.test.ts`
+- `tests/workload.test.ts`
 - `tests/ydoc.test.ts`
 - `tests/zip-coordinator.test.ts`
 
-`tests/http-streaming.test.ts` and `tests/websocket.test.ts` use real local TCP/WebSocket boundaries. Bridge tests use temporary credential/profile paths and verify no live `.env` or `.pw/tokens.json` mutation.
+The deterministic integration test fills 120 lanes as `30 + 30 + 30 + 30`, verifies terminal settlement and unique execution IDs, and proves a draining project leaves the other 90 lanes usable.
 
-## Optional live verification
+## Live proof
 
-Live verification writes to the configured Prism project and consumes upstream capacity, so it requires an explicit flag:
+Create dedicated test projects only with explicit authorization:
+
+```powershell
+$env:GP_LIVE_CREATE_TEST_PROJECTS = "1"
+$env:GP_LIVE_PROJECT_COUNT = "4"
+bun run create:test-projects
+```
+
+Run direct browserless provisioning/Yjs/heartbeat proof:
 
 ```powershell
 $env:GP_LIVE_VERIFY = "1"
+bun run verify:browserless
+```
+
+Start the candidate on 18787, then run the staged `16 → 32 → 64 → 96 → 120` load proof:
+
+```powershell
+$env:GP_LIVE_VERIFY = "1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
+bun run verify:multi-sandbox
+```
+
+The load script verifies exact output markers, unique response IDs, peak physical occupancy, per-runtime occupancy, zero under-capacity queueing, zero quarantines, and port 8787 health before and after the candidate run.
+
+Run Codex-compatible HTTP streaming, `store:false` WebSocket tool continuation, and eight concurrent named lanes:
+
+```powershell
+$env:GP_LIVE_VERIFY = "1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
 bun run verify:live
 ```
 
-It checks health, max/pro reasoning over first-event HTTP streaming, a multi-turn WebSocket continuation, and concurrent named lanes against the running server. Start GhostProv separately before running it.
-
-Image generation is opt-in because it incurs image-generation usage. Set `GP_LIVE_IMAGE=1` together with the main live-verification flag:
+Native GPT Image generation and multipart editing are separately opt-in because they incur image usage:
 
 ```powershell
 $env:GP_LIVE_VERIFY = "1"
 $env:GP_LIVE_IMAGE = "1"
+$env:GP_LIVE_IMAGE_EDIT = "1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
 bun run verify:live
 ```
 
-The image probe uses the production compatibility translator and sends the resulting body through the existing `/v1/responses` endpoint, so it can verify source changes without restarting the live GhostProv process that the current Codex session depends on.
+## V2 verification
+
+The deterministic candidate smoke uses an OS-assigned port and verifies that the existing service on 8787 stays healthy:
+
+```powershell
+bun run verify:v2-smoke
+```
+
+The secure bootstrap probe is separately guarded and never deletes its project:
+
+```powershell
+$env:GP_LIVE_V2_BOOTSTRAP = "1"
+$env:GP_LIVE_V2_PROJECT_ID = "<dedicated-project-uuid>"
+$env:GP_CANDIDATE = "1"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-bootstrap
+```
+
+The single-project canary performs two complete bootstrap/drain/relaunch cycles plus HTTP and WebSocket checks. GPT Image usage remains separately opt-in with `GP_LIVE_IMAGE=1`:
+
+```powershell
+$env:GP_LIVE_V2 = "1"
+$env:GP_LIVE_PROJECT_COUNT = "1"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-single
+```
+
+The paid four-project scale canary additionally requires `GP_LIVE_SCALE=1`. It runs 128 direct, 256 accepted, 512 routed, and 4 MiB integrity stages without creating or deleting projects:
+
+```powershell
+$env:GP_LIVE_V2 = "1"
+$env:GP_LIVE_SCALE = "1"
+$env:GP_LIVE_PROJECT_COUNT = "4"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-fleet
+```
+
+Set `GP_LIVE_V2_SOAK=1` only for the additional lifecycle soak. Missing live opt-ins are reported as “not run”; deterministic tests are never represented as live Prism proof.
+
+## ScriptC evaluation
+
+Bun remains the production runtime. After Playwright removal, ScriptC 0.0.35 still reports 16 unsupported type-surface sites (web/worker globals, URL/Headers overloads, and crypto typing), so no native binary is produced for a meaningful A/B test. Its dynamic npm tier also uses QuickJS with copied boundaries. Optional coverage can be rerun as ScriptC matures:
+
+```powershell
+$env:GP_BENCHMARK_SCRIPTC = "1"
+bun run benchmark:scriptc
+```
+
+ScriptC is adopted only if full compatibility passes and A/B results improve p95 local latency by at least 10% or RSS by at least 20%, with no more than 5% throughput regression.

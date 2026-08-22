@@ -1,5 +1,5 @@
 import { ApiError } from "../http/errors";
-import type { RunHandle } from "../relay/pipeline";
+import type { RunHandle } from "../relay/run-handle";
 
 export type ImageRelayStarter = (
   body: Record<string, unknown>,

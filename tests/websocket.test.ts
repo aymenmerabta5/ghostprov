@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import { attachResponsesWebSocket, type WebSocketRelayStarter } from "../src/ws/server";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
@@ -110,7 +110,7 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("stream_id");
   });
 
-  it("accepts Codex clients that redundantly send stream:true", async () => {
+  it("accepts Codex stream:true as an implicit-stream compatibility hint but rejects false", async () => {
     const bodies: Record<string, unknown>[] = [];
     const socket = await startServer(async body => {
       bodies.push(body);
@@ -127,16 +127,30 @@ describe("Responses WebSocket server", () => {
       input: "hello from Codex",
     }));
 
-    await waitFor(() => messages.some(message =>
-      message.type === "response.completed" || message.type === "error"
-    ));
+    await waitFor(() => messages.some(message => message.type === "response.completed"));
     expect(messages.some(message => message.type === "error")).toBe(false);
-    expect(messages.some(message =>
-      message.type === "response.completed" && message.stream_id === "codex"
-    )).toBe(true);
     expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({ stream: true, store: false });
-    expect(bodies[0]).not.toHaveProperty("stream_id");
+    expect(bodies[0]).toMatchObject({ stream: true, input: [{ role: "user" }] });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "codex-false",
+      model: "gpt-5.6-sol",
+      store: false,
+      stream: false,
+      input: "invalid non-streaming WebSocket request",
+    }));
+    await waitFor(() => messages.some(message => message.stream_id === "codex-false"));
+    const error = messages.find(message => message.stream_id === "codex-false");
+    expect(error).toMatchObject({
+      stream_id: "codex-false",
+      error: {
+        code: "unsupported_parameter",
+        param: "stream",
+        message: "stream:false is incompatible with implicit WebSocket streaming",
+      },
+    });
+    expect(bodies).toHaveLength(1);
   });
 
   it("serializes the same lane while different lanes overlap", async () => {

@@ -1,9 +1,22 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
-import { RelayError } from "../src/relay/pipeline";
-import { SlotError } from "../src/relay/slots";
+import { RelayError } from "../src/relay/run-handle";
+import { SlotRunnerError } from "../src/relay/slot-runner";
+import { RouterShutdownError } from "../src/router/router";
 
 describe("OpenAI-compatible HTTP errors", () => {
+  it("maps router shutdown admission to a typed service-unavailable response", () => {
+    expect(normalizeApiError(new RouterShutdownError())).toEqual({
+      status: 503,
+      error: {
+        message: "GhostProv is shutting down",
+        type: "service_unavailable_error",
+        param: null,
+        code: "router_shutting_down",
+      },
+    });
+  });
+
   it("preserves typed validation status and fields", async () => {
     const response = apiErrorResponse(new ApiError(400, "prompt is required", {
       param: "prompt",
@@ -89,6 +102,18 @@ describe("OpenAI-compatible HTTP errors", () => {
     }
   });
 
+  it("maps downstream cancellation without reporting an internal failure", () => {
+    expect(normalizeApiError(new DOMException("client disconnected", "AbortError"))).toEqual({
+      status: 499,
+      error: {
+        message: "Request was cancelled",
+        type: "request_aborted",
+        param: null,
+        code: "request_aborted",
+      },
+    });
+  });
+
   it("maps daemon retry exhaustion to a rate-limit error", async () => {
     const daemon = {
       code: "rate_limited_429",
@@ -140,6 +165,6 @@ describe("OpenAI-compatible HTTP errors", () => {
   it("keeps structured upstream details on both relay error implementations", () => {
     const details = { code: "http_400", message: "{}" };
     expect(new RelayError("failed", "upstream", details).details).toBe(details);
-    expect(new SlotError("failed", "upstream", details).details).toBe(details);
+    expect(new SlotRunnerError("failed", "upstream", details).details).toBe(details);
   });
 });
