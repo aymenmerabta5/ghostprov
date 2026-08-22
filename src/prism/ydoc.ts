@@ -272,6 +272,16 @@ function writeContent(doc: Y.Doc, ymap: Y.Map<any>, content: string): void {
   });
 }
 
+/** Mark a tracked entry deleted and release any retained segment payload. */
+export function tombstoneDocEntry(doc: Y.Doc, ymap: Y.Map<any>): void {
+  doc.transact(() => {
+    const content = ymap.get("content");
+    if (content instanceof Y.Text) content.delete(0, content.length);
+    else if (content != null) ymap.set("content", "");
+    ymap.set("deleted", true);
+  });
+}
+
 function rootFolderId(c: Conn): string | null {
   for (const [, val] of c.contentMap.entries()) {
     const m = val as Y.Map<any>;
@@ -331,6 +341,17 @@ export async function writeDocFile(
     });
     c.contentMap.set(uuid, ymap);
     indexEntry(c, filename, { uuid, ymap });
+  });
+}
+
+/** Delete a tracked file entry so the sandbox provider removes it from disk. */
+export async function deleteDocFile(filename: string): Promise<boolean> {
+  return withConn(async c => {
+    const entry = findEntry(c, filename);
+    if (!entry) return false;
+    tombstoneDocEntry(c.doc, entry.ymap);
+    connIndex.get(c.doc)?.delete(filename);
+    return true;
   });
 }
 

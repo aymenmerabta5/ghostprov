@@ -148,6 +148,7 @@ sandbox/gp_daemon.py          Linux concurrent slot daemon
 bun test --isolate
 bun run test:unit
 bun run test:integration
+bun run test:daemon
 bun run typecheck
 ```
 
@@ -164,7 +165,9 @@ The default suite is isolated from live credentials and includes:
 - `tests/scheduler.test.ts`
 - `tests/segments.test.ts`
 - `tests/sse.test.ts`
+- `tests/terminal-rescue.test.ts`
 - `tests/websocket.test.ts`
+- `tests/ydoc.test.ts`
 - `tests/zip-coordinator.test.ts`
 
 `tests/http-streaming.test.ts` and `tests/websocket.test.ts` use real local TCP/WebSocket boundaries. Bridge tests use temporary credential/profile paths and verify no live `.env` or `.pw/tokens.json` mutation.

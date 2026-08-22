@@ -33,6 +33,7 @@ describe("project documentation", () => {
       typecheck: "tsc --noEmit",
       "test:unit": expect.any(String),
       "test:integration": expect.any(String),
+      "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
       "verify:live": expect.any(String),
     });
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);

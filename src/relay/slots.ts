@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "../config";
 import { renderQueue } from "../utils/queue";
 import { triggerRender, fetchZipFiles, pageFetch, bust } from "../prism/gateway";
-import { readDocFile, writeDocFile, writeDocFileAppended, ensureDocFolder } from "../prism/ydoc";
+import { deleteDocFile, readDocFile, writeDocFile, writeDocFileAppended, ensureDocFolder } from "../prism/ydoc";
 import {
   chooseSegmentProtocol,
   planJob,
@@ -34,6 +34,7 @@ import {
   type PlannedV63Job,
 } from "./segments";
 import { SseDeltaExtractor, sanitizeFinal, type SseFrame } from "./sse";
+import { matchesTerminalEnvelope, settleWithTerminalRescue } from "./terminal-rescue";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -400,6 +401,8 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   const stats = { bytes: 0, firstByteMs: null as number | null, frames: 0 };
   let notify: (() => void) | null = null;
   let closed = false;
+  const extractor = new SseDeltaExtractor();
+  let activeReqid: string | null = null;
 
   // --- job write plan -------------------------------------------------------
   // Segmented jobs (GP_SEGMENT=1): payloads >512KiB are split into small
@@ -420,6 +423,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
     } else {
       segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
     }
+    activeReqid = (v63Plan ?? segPlan)!.reqid;
     const activePlan = v63Plan ?? segPlan!;
     console.log(
       `[slots ${tag}] segmented job: ${activePlan.parts.length} parts ` +
@@ -443,6 +447,25 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   }
 
   const norm = (s: string) => s.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+
+  // Deferred settlement + release forensics. finalPromise settles ONLY via
+  // settleFinal/settleError below; the release path then guarantees a PROVEN
+  // terminal (matching gp_ack + request id) before freeing the lane — it must
+  // NEVER release merely because the incremental stream view went quiet.
+  let settleFinal!: (v: any) => void;
+  let settleError!: (e: any) => void;
+  const finalPromise = new Promise<any>((res, rej) => { settleFinal = res; settleError = rej; });
+  let settled = false;
+  let sawTerminal = false;
+  let requestPublished = false;
+  let releaseCause = "pending";
+  function fail(kind: SlotError["kind"], message: string): void {
+    console.error(`[slots ${tag}] FAILED (${kind}): ${message.slice(0, 240)}`);
+    if (!settled) { settled = true; releaseCause = `error:${kind}`; settleError(new SlotError(message, kind)); }
+  }
+  function succeed(value: any, reason: string): void {
+    if (!settled) { settled = true; releaseCause = reason; settleFinal(value); }
+  }
 
   /** Write one doc entry and verify it reached DISK (scaled deadline + diagnostics).
    * Content above GP_APPEND_JOBS threshold (default 512KB) goes out as small
@@ -478,7 +501,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
     }
   }
 
-  const finalPromise = (async (): Promise<any> => {
+  const runLoop = (async (): Promise<any> => {
     // v6.2 publisher: paced part writes → manifest LAST. NO client-side part
     // readback — the daemon validates per-part size, gzip, decoded size, and
     // full-job sha12; failures come back as bad_v6_* failed statuses which we
@@ -552,8 +575,8 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
       for (const p of parts) await writeAndVerify(p.name, p.text);
       await writeAndVerify(jobName, indexText ?? jobText);
     }
+    requestPublished = true;
 
-    const extractor = new SseDeltaExtractor();
     const t0 = Date.now();
     let lastProgressAt = Date.now();
     let lastRaw: string | null = null;
@@ -579,8 +602,10 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
           // Segmented: republish ONLY the manifest (parts are immutable and
           // already verified on disk; a fresh manifest mtime triggers rescan).
           if (v63Plan) {
-            const commit = v63Plan.parts[0];
-            await writeDocFile(commit.base, commit.text).catch(() => undefined);
+            // Republish the commit part INTO THE gp FOLDER — without folderId
+            // this created a root-level stray the daemon could never see.
+            const fid = await segmentFolder(v63Plan.dir);
+            await writeDocFile(v63Plan.parts[0].base, v63Plan.parts[0].text, { folderId: fid }).catch(() => undefined);
             continue;
           }
           const rewrite = segPlan ? segPlan.manifestText : (indexText ?? jobText);
@@ -628,7 +653,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
                    j?.status === "completed" || j?.status === "incomplete") {
           // Terminal write. Authoritative when it carries OUR ack (daemon
           // always stamps gp_ack/ack) or after we latched this run.
-          if (latched || j.gp_ack === ack || j.ack === ack) {
+          if (matchesTerminalEnvelope(j, ack, activeReqid)) {
             latched = true;
             // Daemon rejected our segments (size/gzip/sha validation). One
             // automatic republish with a fresh reqid before surfacing —
@@ -642,6 +667,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
               } else {
                 segPlan = planJob(jobName, jobText, { gzip: process.env.GP_GZIP !== "0" });
               }
+              activeReqid = (v63Plan ?? segPlan)!.reqid;
               latched = false;
               unlatchAttempts = 0;
               unlatchDeadline = Date.now() + config.unlatchTimeoutMs;
@@ -677,6 +703,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
               (notify as (() => void) | null)?.();
             }
             console.log(`[slots ${tag}] completed in ${Date.now() - t0}ms frames=${stats.frames} bytes=${stats.bytes}`);
+            sawTerminal = true;
             return sanitizeFinal(fin);
           }
           // else: stale terminal from a previous run — ignore
@@ -699,20 +726,80 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
     for (let i = 0; i < pm; i++) {
       try { await writeDocFile(`${jobName}.p${i}`, ""); } catch {}
     }
-    for (const base of laneArtifactSet(slot.n)) {
-      try { await writeDocFile(base, ""); } catch {}
+    const artifacts = laneArtifactSet(slot.n);
+    for (const base of artifacts) {
+      try { await deleteDocFile(base); } catch {}
     }
+    artifacts.clear();
     try { await writeDocFile(respName, ""); } catch {}
   }
 
-  void finalPromise.catch(() => undefined).finally(() => {
+  /**
+   * AUTHORITATIVE terminal fetch — the sandbox agent contract: never release
+   * a lane merely because the incremental stream view went quiet. Fetch the
+   * response directly, require matching gp_ack AND request id, replay the
+   * remaining gp_sse (including response.completed), and only then resolve.
+   */
+  async function rescueTerminal(): Promise<any | null> {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      try {
+        const files = await fetchZipFiles([respName]).catch(() => null);
+        const data = files?.get(respName);
+        const txt = data ? new TextDecoder().decode(data) : null;
+        let j: any = null;
+        if (txt && txt.length > 2) { try { j = JSON.parse(txt); } catch { /* partial */ } }
+        if (j && (j.gp_final !== undefined || j.status === "failed")) {
+          if (!matchesTerminalEnvelope(j, ack, activeReqid)) {
+            console.warn(`[slots ${tag}] rescue aborted: response belongs to another request (gp_ack=${j.gp_ack ?? j.ack})`);
+            return null;
+          }
+          if (j.status === "failed") {
+            console.error(`[slots ${tag}] rescue: upstream failed ${JSON.stringify(j.error ?? {}).slice(0, 200)}`);
+            return null;
+          }
+          if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
+            const missed = extractor.feed(JSON.stringify({
+              streaming: true,
+              total: Number.isFinite(j.gp_total) ? j.gp_total : Array.from(j.gp_sse).length,
+              start: 0,
+              tail: j.gp_sse,
+            }));
+            if (missed.length) {
+              for (const f of missed) frames.push(f);
+              stats.frames += missed.length;
+              stats.bytes += missed.reduce((n, f) => n + f.data.length, 0);
+              console.log(`[slots ${tag}] rescue replay: +${missed.length} missed frames`);
+            }
+            (notify as (() => void) | null)?.();
+          }
+          sawTerminal = true;
+          return sanitizeFinal(j.gp_final ?? j);
+        }
+      } catch { /* transient zip/parse issues — keep polling */ }
+      await sleep(500);
+    }
+    return null;
+  }
+
+  const settlement = settleWithTerminalRescue(runLoop, {
+    hasTerminal: () => sawTerminal,
+    rescue: () => requestPublished ? rescueTerminal() : Promise.resolve(null),
+  });
+  void settlement.then(
+    result => succeed(result.value, result.reason),
+    (e: any) => {
+      const kind = typeof e?.kind === "string" ? e.kind : "internal";
+      fail(kind, String(e?.message ?? e));
+    },
+  ).finally(async () => {
     closed = true;
     notify?.();
     // Clear before releasing so the next occupant never races the cleanup;
     // cap the wait — an uncleared file is cosmetic, a blocked lane is not.
     void Promise.race([clearLane(), sleep(5000)]).catch(() => undefined).then(() => {
       pool.release(slot);
-      console.log(`[slots ${tag}] released slot ${slot.n}`);
+      console.log(`[slots ${tag}] released slot ${slot.n} (reason=${releaseCause}, frames=${stats.frames})`);
     });
   });
 
