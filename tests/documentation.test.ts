@@ -18,9 +18,11 @@ describe("project documentation", () => {
   });
 
   it("documents runtime concurrency defaults from the same source", () => {
-    expect(readme).toContain("| `GP_SLOTS` | `30`");
+    expect(readme).toContain("| `GP_V2_SANDBOX_CAPACITY` | `128`");
+    expect(readme).toContain("| `GP_TARGET_CONCURRENCY` | `512`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
-    expect(readme).toContain("| `GP_ZIP_BATCH_MS` | `10`");
+    expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
+    expect(readme).toContain("| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912`");
     expect(readme).toContain("| WebSocket active responses | `16`");
     expect(readme).toContain("| WebSocket named lanes | `32`");
     expect(readme).toContain("| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040`");
@@ -53,6 +55,11 @@ describe("project documentation", () => {
       "verify:live": expect.any(String),
       "verify:browserless": expect.any(String),
       "verify:multi-sandbox": expect.any(String),
+      "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",
+      "verify:v2-single": "bun scripts/live_v2_single.ts",
+      "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
+      "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
+      "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
     });
     expect(pkg.dependencies).not.toHaveProperty("playwright");
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
@@ -63,6 +70,9 @@ describe("project documentation", () => {
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "probe_browserless_prism.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_multi_sandbox.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "live_v2_single.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "live_v2_fleet.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "smoke_v2_candidate.ts"))).toBe(true);
   });
 
   it("keeps live multi-sandbox state out of version control", () => {

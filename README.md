@@ -1,6 +1,6 @@
 # GhostProv
 
-GhostProv is a browserless OpenAI-compatible router over independent Prism sandbox projects. One local HTTP/WebSocket endpoint distributes work across healthy per-project daemons while preserving terminal proof, streaming replay, image compatibility, and Codex `store:false` continuation.
+GhostProv is a browserless OpenAI-compatible router over independent Prism sandbox projects. V2 distributes work through per-project Deno Awareness sidecars while preserving terminal proof, streaming replay, GPT Image compatibility, and Codex `store:false` continuation. The file-backed V1 daemon remains only as a lazy authenticated `auto` fallback during rollout.
 
 The project is pinned to Bun 1.4.0, TypeScript 7.0.2, and `bun test --isolate`. Playwright and Chromium are not runtime dependencies.
 
@@ -11,6 +11,9 @@ Every sandbox uses a separate explicitly allowlisted Prism project under the sam
 ```powershell
 $env:PRISM_PROJECT_IDS = "project-uuid-1,project-uuid-2,project-uuid-3,project-uuid-4"
 $env:PRISM_COOKIE_FILE = "D:\secrets\prism-cookies.json"
+$env:GP_TRANSPORT = "v2"
+$env:GP_PRISM_SESSION = "authenticated"
+$env:GP_TARGET_CONCURRENCY = "512"
 $env:GP_CANDIDATE = "1"
 $env:PORT = "18787"
 bun run dev:candidate
@@ -18,38 +21,45 @@ bun run dev:candidate
 
 `PRISM_COOKIE` accepts an initial Cookie header when a persisted cookie jar is unavailable. `PRISM_DOC_ID` remains a single-project compatibility fallback. The account session consumes `Set-Cookie`, persists rotations atomically, and hot-reloads a newer cookie file.
 
-Candidate mode refuses port 8787. Development and load testing use port 18787 so an existing `localhost:8787` process remains untouched.
+Candidate mode refuses port 8787. Development and load testing use port 18787 so an existing `localhost:8787` process remains untouched. Stable project UUIDs and worker indexes are persisted in `.ghostprov/fleet.json`; restarts reuse them and never create a new fleet blindly.
+
+Project-less automatic creation is available only when explicitly enabled with `GP_AUTO_CREATE_PROJECTS=1`. The signed-in session is the production default. Guest mode requires `GP_PRISM_SESSION=anonymous`, `GP_ALLOW_ANONYMOUS=1`, and `GP_TRANSPORT=v2`; it defaults to one reusable project and is capped separately by `GP_GUEST_MAX_PROJECTS`.
 
 ## Architecture
 
-Each project owns an isolated `SandboxRuntime`:
+Each V2 project owns an isolated `V2SandboxRuntime`:
 
 - Direct Prism provisioning and token synchronization
-- One Node Yjs WebSocket and filename index
-- One direct sandbox gateway and ZIP coordinator
-- One epoch-based workspace-sync coordinator that coalesces concurrent publications
-- One daemon controller and daemon build check
-- One physical slot pool and terminal-recovery state
-- One independent heartbeat every 10 seconds
-- Workload-class latency and failure metrics
+- A scoped Node Yjs connection used only for non-secret sidecar assets and bootstrap ciphertext
+- A dedicated Y-Sweet Awareness channel for bounded request/response frames
+- A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
+- Append-only claims and terminal spools under `/tmp/ghostprov-v2`
+- P-256 ECDH/HKDF/AES-GCM bootstrap and AES-GCM credential rotation
+- A 16 KiB frame ceiling and 32-frame/512 KiB unacknowledged window
+- Up to 128 physical upstream calls plus fair byte-bounded admission
+- One independently phased heartbeat on an exact 10-second cadence
+- Live RTT, completion, failure, quarantine, credential, and memory metrics
+
+V2 never requests a project export or calls the sandbox ZIP endpoint. ZIP, immutable project chunks, and 30 daemon lanes belong only to the optional V1 fallback.
 
 The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, daemon capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
 
 Failure rules:
 
-- Before publication, one safe reroute is allowed.
-- After publication, the request remains pinned to its original sandbox.
-- A lane is released only after matching ACK, request identity, and terminal proof.
-- Missing incremental data is replayed from the authoritative terminal transcript.
-- Unproven lanes remain quarantined and reduce advertised capacity.
+- Before committed ACK, one safe router retry is allowed.
+- After committed ACK, the request remains pinned to its original sandbox and is never retried.
+- `FETCH_STARTING` is durable before fetch; a crash afterward is ambiguous and quarantined.
+- A request is released only after exact request/response/transcript terminal proof.
+- Proven terminal spools replay after restart without another upstream call.
+- Unproven requests remain quarantined and reduce advertised capacity.
 - One failed project never stops healthy projects.
 
 ## Concurrency and latency
 
-Four 30-slot projects provide a physical ceiling of 120 simultaneous requests. Actual admission is:
+One V2 sidecar has a hard physical ceiling of 128 simultaneous upstream calls. Four projects provide 512 physical calls; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
 
 ```text
-min(healthy non-quarantined lanes, work fitting live RAM/CPU reservations)
+min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
 ```
 
 Hardware detection uses physical/free RAM, process RSS, and logical processors:
@@ -62,16 +72,17 @@ resume above max(3 GiB, 15% total RAM) free
 CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
-Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers. ZIP downloads are coalesced and limited to one active archive per sandbox while different sandboxes operate in parallel.
+Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory.
 
-Fresh projects are initialized with Prism's current Yjs root/settings schema. Daemon status and lane files are tracked before launch, render requests use live Yjs state vectors, and each publication crosses a coalesced `wait-for-sync` barrier before polling. Writes arriving during an active barrier receive the next epoch, so batching never weakens publication ordering.
+Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 
 Latency acceptance targets:
 
 - Router decision p95 below 2 ms
 - Queue p95 below 250 ms while capacity is available
-- ≤2 MiB job publish p50/p95 below 600/1500 ms
-- First-event overhead within 10% of a one-project candidate
+- Small Awareness transport p95 below 1 second under 512 accepted/128 active load
+- One-project 128-call first-event p95 below 4 seconds
+- Four-project 512-call first-event p95 below 7 seconds per sandbox
 
 One sequential Codex task normally uses one lane. High utilization requires multiple tasks, API callers, named WebSocket lanes, or image fan-out.
 
@@ -113,15 +124,46 @@ supports_websockets = true
 
 No endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 
+## Lifecycle and recovery
+
+Startup resolves and locks one persisted Prism identity, reconciles the durable fleet manifest, and binds the public listener as soon as one runtime is ready; remaining projects continue provisioning independently. Shutdown stops listener admission, rejects queued uncommitted work with HTTP 503, waits for existing terminal proofs, drains sidecars, clears Awareness, closes the identity lease, and never creates or deletes a project.
+
+Operational recovery states are intentionally distinct:
+
+- pre-commit rejection: safe for the router's single retry;
+- committed definitive failure: pinned, no fallback;
+- committed ambiguous failure or lost instance: quarantined, no retry;
+- proven terminal spool: replayed and ACKed without a second fetch;
+- expired heartbeat/credential: runtime drains without affecting healthy projects.
+
+Project deletion is never automatic. Preview managed targets first:
+
+```powershell
+bun run decommission:v2 -- --project <managed-project-uuid>
+```
+
+Execution requires the exact preview digest and a separate destructive opt-in:
+
+```powershell
+$env:GP_ALLOW_PROJECT_DELETE = "1"
+bun run decommission:v2 -- --project <managed-project-uuid> --confirm <sha256-digest>
+```
+
+Only manifest records with `managed:true` can be deleted. Explicit user projects are excluded. Cleanup and tombstoning do not erase or conceal Prism-visible project/account activity; they only maintain local lifecycle hygiene.
+
 ## Operational settings
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
-| `GP_SLOTS` | `30` | Per-project lanes; configurable from 1 through the daemon maximum of 30 |
-| `GP_MAX_PROJECTS` | `4` minimum | Maximum allowlisted projects |
+| `GP_TRANSPORT` | `auto` | `v2`, `v1`, or authenticated rollout fallback; guests are V2-only |
+| `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
+| `GP_TARGET_CONCURRENCY` | `512` | Fleet sizing target; divided by per-sandbox V2 capacity |
+| `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
-| `GP_ZIP_BATCH_MS` | `10` | Same-runtime ZIP coalescing window |
+| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216` | Host capacity estimate per active V2 stream |
+| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912` | Sidecar request/queue admission budget |
+| `GP_V2_YSWEET_REFRESH_MS` | `2700000` | Encrypted reconnect-credential rotation horizon |
 | WebSocket active responses | `16` | Per-connection active response ceiling |
 | WebSocket named lanes | `32` | Per-connection named-lane ceiling |
 | `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Raw multipart edit-input budget |
@@ -194,6 +236,7 @@ The isolated suite includes:
 - `tests/v2-faults.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
+- `tests/v2-live-guards.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
 - `tests/v2-run-handle.test.ts`
@@ -258,6 +301,48 @@ $env:GP_LIVE_IMAGE_EDIT = "1"
 $env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
 bun run verify:live
 ```
+
+## V2 verification
+
+The deterministic candidate smoke uses an OS-assigned port and verifies that the existing service on 8787 stays healthy:
+
+```powershell
+bun run verify:v2-smoke
+```
+
+The secure bootstrap probe is separately guarded and never deletes its project:
+
+```powershell
+$env:GP_LIVE_V2_BOOTSTRAP = "1"
+$env:GP_LIVE_V2_PROJECT_ID = "<dedicated-project-uuid>"
+$env:GP_CANDIDATE = "1"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-bootstrap
+```
+
+The single-project canary performs two complete bootstrap/drain/relaunch cycles plus HTTP and WebSocket checks. GPT Image usage remains separately opt-in with `GP_LIVE_IMAGE=1`:
+
+```powershell
+$env:GP_LIVE_V2 = "1"
+$env:GP_LIVE_PROJECT_COUNT = "1"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-single
+```
+
+The paid four-project scale canary additionally requires `GP_LIVE_SCALE=1`. It runs 128 direct, 256 accepted, 512 routed, and 4 MiB integrity stages without creating or deleting projects:
+
+```powershell
+$env:GP_LIVE_V2 = "1"
+$env:GP_LIVE_SCALE = "1"
+$env:GP_LIVE_PROJECT_COUNT = "4"
+$env:GP_TRANSPORT = "v2"
+$env:PORT = "18787"
+bun run verify:v2-fleet
+```
+
+Set `GP_LIVE_V2_SOAK=1` only for the additional lifecycle soak. Missing live opt-ins are reported as “not run”; deterministic tests are never represented as live Prism proof.
 
 ## ScriptC evaluation
 

@@ -17,6 +17,11 @@
     "verify:browserless": "bun scripts/probe_browserless_prism.ts",
     "create:test-projects": "bun scripts/create_test_projects.ts",
     "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",
+    "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",
+    "verify:v2-single": "bun scripts/live_v2_single.ts",
+    "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
+    "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
+    "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
     "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts"
   },
   "dependencies": {
