@@ -28,6 +28,7 @@
 - Serialize each child request once and keep gzip, ZIP, and large base64 work off the main event loop.
 - Use red-green TDD for every behavior change.
 - Use Bun 1.4.0, `bun test --isolate`, and TypeScript 7.0.2.
+- Bun remains the production runtime; ScriptC is an optional post-Playwright A/B gate and is never adopted without full compatibility plus ≥10% p95 latency or ≥20% RSS improvement and ≤5% throughput regression.
 
 ---
 
@@ -980,6 +981,7 @@ git commit -m "test: verify four-project router integration"
 - Create: `scripts/probe_browserless_prism.ts`
 - Create: `scripts/create_test_projects.ts`
 - Create: `scripts/live_multi_sandbox.ts`
+- Create: `scripts/benchmark_scriptc.ts`
 - Modify: `scripts/live_verify.ts`
 - Modify: `README.md`
 - Modify: `tests/documentation.test.ts`
@@ -1035,6 +1037,8 @@ It checks port 8787 health before and after, verifies four ready daemons and hea
 Document cookie provisioning, project allowlisting, candidate startup, adaptive sizing, monitoring, heartbeat contract, expected single-agent behavior, upstream account limits, and rollback.
 
 - [ ] **Step 6: Run documentation tests and all local verification**
+
+Before local verification, implement `benchmark_scriptc.ts` to run coverage only when `GP_BENCHMARK_SCRIPTC=1`. It records the current 24-error baseline, reruns coverage after Playwright removal, and proceeds to a compiled A/B test only when coverage has no reachable unsupported sites and a native toolchain is available. It never changes the default `dev` or production scripts.
 
 Run:
 

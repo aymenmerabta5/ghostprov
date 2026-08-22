@@ -506,6 +506,19 @@ Removal occurs only after direct parity tests and live proof:
 
 No hidden browser fallback remains. Missing/expired cookies produce an explicit aggregate `auth_required` state.
 
+## Runtime Compilation Strategy
+
+Bun 1.4 remains the reference and production runtime. ScriptC 0.0.35 is experimental and the first real coverage probe could not analyze the existing entrypoint because it reported 24 type-surface errors, including active URL, FormData/Blob, and crypto paths in addition to Playwright code. ScriptC's dynamic npm tier embeds QuickJS, copies values across the static/dynamic boundary, and documents slower CPU-bound dependency execution; GhostProv depends heavily on Yjs, WebSockets, Hono, fflate, and cookie packages.
+
+After Playwright removal, an optional ScriptC gate may run without changing production dependencies:
+
+1. `scriptc coverage src/server.ts --dynamic` must typecheck and report no reachable unsupported sites.
+2. The compiled candidate must pass the complete unit, integration, protocol, and live compatibility suites.
+3. A/B load tests must show at least 10% lower p95 local latency or 20% lower RSS.
+4. Throughput and event-loop latency may not regress by more than 5%.
+
+ScriptC is adopted only when every gate passes. Coverage failure or neutral performance leaves Bun unchanged; the project will not be distorted to satisfy an experimental compiler.
+
 ## Testing Strategy
 
 ### Unit tests
