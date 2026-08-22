@@ -110,7 +110,7 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("stream_id");
   });
 
-  it("accepts Codex clients that redundantly send stream:true", async () => {
+  it("rejects explicit stream because WebSocket streaming is implicit", async () => {
     const bodies: Record<string, unknown>[] = [];
     const socket = await startServer(async body => {
       bodies.push(body);
@@ -130,13 +130,16 @@ describe("Responses WebSocket server", () => {
     await waitFor(() => messages.some(message =>
       message.type === "response.completed" || message.type === "error"
     ));
-    expect(messages.some(message => message.type === "error")).toBe(false);
-    expect(messages.some(message =>
-      message.type === "response.completed" && message.stream_id === "codex"
-    )).toBe(true);
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({ stream: true, store: false });
-    expect(bodies[0]).not.toHaveProperty("stream_id");
+    const error = messages.find(message => message.type === "error");
+    expect(error).toMatchObject({
+      stream_id: "codex",
+      error: {
+        code: "unsupported_parameter",
+        param: "stream",
+        message: "stream is implicit and must not be sent in WebSocket mode",
+      },
+    });
+    expect(bodies).toHaveLength(0);
   });
 
   it("serializes the same lane while different lanes overlap", async () => {

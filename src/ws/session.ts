@@ -175,8 +175,12 @@ export class ResponsesWebSocketSession {
     if (event.background != null) {
       return errorEvent("unsupported_parameter", "background is not supported in WebSocket mode", { streamId, param: "background" });
     }
-    if (event.stream != null && event.stream !== true) {
-      return errorEvent("unsupported_parameter", "stream is implicit; omit it or send true in WebSocket mode", { streamId, param: "stream" });
+    if (event.stream !== undefined) {
+      return errorEvent(
+        "unsupported_parameter",
+        "stream is implicit and must not be sent in WebSocket mode",
+        { streamId, param: "stream" },
+      );
     }
     if (streamId && !this.namedStreams.has(streamId) && this.namedStreams.size >= this.maxNamedStreams) {
       return errorEvent("websocket_stream_limit_reached", "This WebSocket connection has reached its stream limit.", {

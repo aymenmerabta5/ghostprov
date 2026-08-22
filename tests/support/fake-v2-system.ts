@@ -61,6 +61,7 @@ export class FakeScaleUpstream {
   active = 0;
   maxActive = 0;
   readonly startedInputs: string[] = [];
+  readonly receivedBodies: Record<string, unknown>[] = [];
 
   constructor(
     readonly runtimeIndex: number,
@@ -74,30 +75,58 @@ export class FakeScaleUpstream {
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
     this.startedInputs.push(String(body.input ?? ""));
+    this.receivedBodies.push(body);
     try {
       await this.gate.wait();
       const responseId = `resp_${this.runtimeIndex}_${call}`;
+      const tools = Array.isArray(body.tools) ? body.tools as Array<Record<string, unknown>> : [];
+      const imageTool = tools.find(tool => tool.type === "image_generation");
+      const functionTool = tools.find(tool => tool.type === "function");
+      const output = imageTool
+        ? [{
+          id: `ig_${this.runtimeIndex}_${call}`,
+          type: "image_generation_call",
+          status: "completed",
+          result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          revised_prompt: "deterministic image",
+          background: imageTool.background ?? "opaque",
+          output_format: imageTool.output_format ?? "png",
+          quality: imageTool.quality ?? "low",
+          size: imageTool.size ?? "1024x1024",
+        }]
+        : functionTool
+          ? [{
+            id: `fc_${this.runtimeIndex}_${call}`,
+            type: "function_call",
+            status: "completed",
+            call_id: "call_fake_1",
+            name: functionTool.name,
+            arguments: JSON.stringify({ value: "V2_TOOL_OK" }),
+          }]
+          : [{
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: String(body.input ?? "") }],
+          }];
       const final = {
         id: responseId,
         object: "response",
         status: "completed",
-        output: [{
-          type: "message",
-          content: [{ type: "output_text", text: String(body.input ?? "") }],
-        }],
+        output,
       };
       const events: SseFrame[] = [
         {
           event: "response.created",
           data: JSON.stringify({ type: "response.created", response: { id: responseId } }),
         },
-        {
+        ...(!imageTool && !functionTool ? [{
           event: "response.output_text.delta",
           data: JSON.stringify({
             type: "response.output_text.delta",
             delta: String(body.input ?? ""),
           }),
-        },
+        }] : []),
         {
           event: "response.completed",
           data: JSON.stringify({ type: "response.completed", response: final }),

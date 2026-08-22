@@ -89,6 +89,8 @@ Use `stream:true` for incremental SSE. Reasoning fields including `effort:"max"`
 
 WebSocket mode follows the [official OpenAI Responses WebSocket contract](https://developers.openai.com/api/docs/guides/websocket-mode/). Clients send direct `response.create` events to `ws://127.0.0.1:18787/v1/responses`. Named lanes execute independently, same-lane work remains FIFO, and `previous_response_id` lineage is separate from lane identity.
 
+Streaming is implicit in WebSocket mode: clients must omit the `stream` field. GhostProv adds `stream:true` only to its internal sandbox HTTP request.
+
 ```toml
 [model_providers.ghostprov]
 name = "GhostProv"
@@ -193,6 +195,7 @@ The isolated suite includes:
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
 - `tests/v2-protocol.test.ts`
+- `tests/v2-public-api.test.ts`
 - `tests/v2-run-handle.test.ts`
 - `tests/v2-runtime.test.ts`
 - `tests/v2-scheduler.test.ts`
