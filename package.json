@@ -21,6 +21,7 @@
     "hono": "^4.6.0",
     "p-queue": "^8.0.1",
     "playwright": "^1.62.1",
+    "tough-cookie": "^6.0.0",
     "ws": "^8.18.0",
     "y-websocket": "^2.0.4",
     "yjs": "^13.6.20"
