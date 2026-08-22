@@ -23,6 +23,7 @@ import {
   type SidecarFrame,
 } from "../protocol/shared";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
+import { computeV2RetransmitDelayMs } from "../protocol/retransmit";
 import {
   TranscriptProof,
   validateTerminalProof,
@@ -37,24 +38,9 @@ import {
   V2RunHandle,
 } from "./run-handle";
 
-const REQUEST_PART_BYTES = 8 * 1024;
+export { computeV2RetransmitDelayMs } from "../protocol/retransmit";
 
-export function computeV2RetransmitDelayMs(
-  awarenessRttMs: number | null,
-  jitterSeed: number,
-  minimumMs = 250,
-): number {
-  if (!Number.isFinite(minimumMs) || minimumMs < 1) {
-    throw new RangeError("minimumMs must be positive");
-  }
-  const rtt = awarenessRttMs === null || !Number.isFinite(awarenessRttMs)
-    ? 0
-    : Math.max(0, awarenessRttMs);
-  const base = Math.max(minimumMs, 2 * rtt);
-  const normalizedSeed = Math.max(0, Math.min(1, jitterSeed));
-  const jitterCeiling = Math.min(100, base * 0.1);
-  return Math.ceil(base + jitterCeiling * normalizedSeed);
-}
+const REQUEST_PART_BYTES = 8 * 1024;
 
 export interface V2TransportSnapshot {
   connected: boolean;
@@ -190,6 +176,7 @@ export class V2TransportSession {
   #creditReservations = 0;
   #quarantined = 0;
   #retransmissions = 0;
+  #retransmissionAttempt = 0;
   #lastAckSequence = -1;
   #lastPublishAtMs: number | null = null;
   #awarenessRttMs: number | null = null;
@@ -502,6 +489,7 @@ export class V2TransportSession {
     this.#outbound.acknowledge(envelope.ack);
     if (envelope.ack.epoch === 1 && envelope.ack.sequence > previousAck) {
       this.#lastAckSequence = envelope.ack.sequence;
+      this.#retransmissionAttempt = 0;
       if (this.#lastPublishAtMs !== null) {
         const sample = Math.max(0, this.#clock.now() - this.#lastPublishAtMs);
         this.#awarenessRttMs = this.#awarenessRttMs === null
@@ -832,6 +820,7 @@ export class V2TransportSession {
 
   #pump(): boolean {
     if (!this.#connected || this.#closed) return false;
+    const wasEmpty = this.#outbound.snapshot().frames.length === 0;
     let changed = false;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
@@ -847,6 +836,7 @@ export class V2TransportSession {
       }
       changed = true;
     }
+    if (changed && wasEmpty) this.#retransmissionAttempt = 0;
     return changed;
   }
 
@@ -890,12 +880,14 @@ export class V2TransportSession {
       this.#awarenessRttMs,
       jitterSeed,
       this.#retransmitMs,
+      this.#retransmissionAttempt,
     );
     this.#timer = setTimeout(() => {
       this.#timer = null;
       if (!this.#connected || this.#closed) return;
       if (this.#outbound.snapshot().frames.length === 0) return;
       this.#retransmissions++;
+      this.#retransmissionAttempt++;
       this.#publish(true);
     }, delay);
   }

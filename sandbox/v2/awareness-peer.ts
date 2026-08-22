@@ -21,6 +21,7 @@ import {
   WeightedFrameScheduler,
   type FramePriority,
 } from "../../src/v2/protocol/scheduler.ts";
+import { computeV2RetransmitDelayMs } from "../../src/v2/protocol/retransmit.ts";
 import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 
 export interface DenoAwarenessPeerOptions {
@@ -91,7 +92,10 @@ export class DenoAwarenessPeer {
   #hostPeerId: string | null = null;
   #hostClientId: number | null = null;
   #hostRevision = -1;
+  #hostCredits = -1;
   #timer: number | null = null;
+  #retransmissionAttempt = 0;
+  #publishScheduled = false;
   #closed = false;
   #acceptChain: Promise<void> = Promise.resolve();
 
@@ -140,9 +144,6 @@ export class DenoAwarenessPeer {
       this.#provider.connect();
     });
     this.#publish();
-    this.#timer = setInterval(() => {
-      if (this.#outbound.snapshot().frames.length) this.#publish();
-    }, this.#retransmitMs) as unknown as number;
   }
 
   enqueue(
@@ -153,13 +154,14 @@ export class DenoAwarenessPeer {
   ): void {
     if (this.#closed) return;
     this.#scheduler.enqueue(priority, streamId, frame, weight);
-    this.#pump();
+    if (this.#pump()) this.#schedulePublish();
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#timer !== null) clearInterval(this.#timer);
+    if (this.#timer !== null) clearTimeout(this.#timer);
+    this.#timer = null;
     await this.#acceptChain.catch(() => undefined);
     this.#provider.awareness.off("change", this.#onAwarenessChange);
     this.#provider.awareness.setLocalState(null);
@@ -194,8 +196,14 @@ export class DenoAwarenessPeer {
       this.#hostClientId = clientId;
       this.#hostRevision = envelope.revision;
       try {
+        const previousOutstanding = this.#outbound.snapshot().frames.length;
+        const ceilingChanged = envelope.credits !== this.#hostCredits;
+        this.#hostCredits = envelope.credits;
         this.#engine.setHostCeiling(envelope.credits);
         this.#outbound.acknowledge(envelope.ack);
+        const acknowledgementAdvanced =
+          this.#outbound.snapshot().frames.length < previousOutstanding;
+        if (acknowledgementAdvanced) this.#retransmissionAttempt = 0;
         const currentEpoch = this.#inbound.ack().epoch;
         if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
         const frames = this.#inbound.accept(envelope.frames);
@@ -204,7 +212,10 @@ export class DenoAwarenessPeer {
             .then(() => this.#acceptHostFrame(frame))
             .catch(() => undefined);
         }
-        this.#pump();
+        const pumped = this.#pump();
+        if (ceilingChanged || acknowledgementAdvanced || frames.length > 0 || pumped) {
+          this.#schedulePublish();
+        }
       } catch {
         // Invalid ACK/window transitions are ignored; a valid current host
         // envelope must re-establish contiguous state.
@@ -212,7 +223,9 @@ export class DenoAwarenessPeer {
     }
   };
 
-  #pump(): void {
+  #pump(): boolean {
+    const wasEmpty = this.#outbound.snapshot().frames.length === 0;
+    let changed = false;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const remainingFrames = GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length;
@@ -221,8 +234,19 @@ export class DenoAwarenessPeer {
       const next = this.#scheduler.take(1, Math.min(15 * 1024, remainingBytes - 256));
       if (!next.length) break;
       this.#outbound.push(next[0]);
+      changed = true;
     }
-    this.#publish();
+    if (changed && wasEmpty) this.#retransmissionAttempt = 0;
+    return changed;
+  }
+
+  #schedulePublish(): void {
+    if (this.#closed || this.#publishScheduled) return;
+    this.#publishScheduled = true;
+    queueMicrotask(() => {
+      this.#publishScheduled = false;
+      if (!this.#closed) this.#publish();
+    });
   }
 
   #publish(): void {
@@ -249,6 +273,26 @@ export class DenoAwarenessPeer {
       frames: outbound.frames,
     };
     this.#provider.awareness.setLocalStateField("ghostprovV2", envelope);
+    this.#armRetransmission();
+  }
+
+  #armRetransmission(): void {
+    if (this.#timer !== null) clearTimeout(this.#timer);
+    this.#timer = null;
+    if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
+    const jitterSeed = ((this.#revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
+    const delay = computeV2RetransmitDelayMs(
+      null,
+      jitterSeed,
+      this.#retransmitMs,
+      this.#retransmissionAttempt,
+    );
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
+      this.#retransmissionAttempt++;
+      this.#publish();
+    }, delay) as unknown as number;
   }
 
   async #acceptHostFrame(frame: ReliableFrame<HostFrame>): Promise<void> {

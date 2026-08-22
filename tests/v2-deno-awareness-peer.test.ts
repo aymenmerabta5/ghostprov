@@ -86,4 +86,103 @@ describe("DenoAwarenessPeer", () => {
     await peer.close();
     expect(provider!.destroyed).toBe(true);
   });
+
+  it("coalesces burst frames and never republishes an unchanged full window", async () => {
+    let provider: FakeProvider | null = null;
+    const engine = {
+      snapshot: () => ({ credits: 128, active: 16, queued: 0, draining: false }),
+      setHostCeiling: () => undefined,
+      accept: async () => undefined,
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: doc => {
+        provider = new FakeProvider(doc);
+        return provider;
+      },
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    await peer.connect();
+    let publications = 0;
+    provider!.awareness.on("update", () => { publications++; });
+
+    for (let eventIndex = 0; eventIndex < 64; eventIndex++) {
+      peer.enqueue({
+        kind: "response_event",
+        requestId: `req-${eventIndex % 16}`,
+        eventIndex,
+        event: "response.output_text.delta",
+        partIndex: 0,
+        partCount: 1,
+        offset: 0,
+        dataBase64Url: "eA",
+      }, "data", `req-${eventIndex % 16}`);
+    }
+    await Bun.sleep(0);
+
+    const envelope = provider!.awareness.getLocalState()?.ghostprovV2;
+    expect(envelope.frames).toHaveLength(32);
+    expect(publications).toBe(1);
+    await peer.close();
+  });
+
+  it("backs off repeated full-window publication until ACK progress resumes", async () => {
+    let provider: FakeProvider | null = null;
+    const engine = {
+      snapshot: () => ({ credits: 128, active: 1, queued: 0, draining: false }),
+      setHostCeiling: () => undefined,
+      accept: async () => undefined,
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: doc => {
+        provider = new FakeProvider(doc);
+        return provider;
+      },
+      retransmitMs: 50,
+      connectTimeoutMs: 100,
+    });
+    await peer.connect();
+    let publications = 0;
+    provider!.awareness.on("update", () => { publications++; });
+    peer.enqueue({
+      kind: "response_event",
+      requestId: "req-1",
+      eventIndex: 0,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: "eA",
+    }, "data", "req-1");
+    await Bun.sleep(0);
+    expect(publications).toBe(1);
+
+    await Bun.sleep(70);
+    expect(publications).toBe(2);
+    await Bun.sleep(60);
+    expect(publications).toBe(2);
+    await peer.close();
+  });
 });

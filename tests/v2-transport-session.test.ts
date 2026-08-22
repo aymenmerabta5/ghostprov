@@ -224,6 +224,8 @@ describe("V2TransportSession", () => {
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);
     expect(computeV2RetransmitDelayMs(200, 1)).toBeGreaterThan(400);
     expect(computeV2RetransmitDelayMs(200, 1)).toBeLessThanOrEqual(440);
+    expect(computeV2RetransmitDelayMs(null, 0, 250, 1)).toBe(500);
+    expect(computeV2RetransmitDelayMs(null, 0, 250, 20)).toBe(30_000);
   });
 
   it("does not return a RunHandle before a matching committed ACK", async () => {
