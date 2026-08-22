@@ -9,7 +9,7 @@
 
 GhostProv v2 will preserve the existing host API, router, Codex WebSocket behavior, image compatibility, project provisioning, resource governor, terminal validation, and quarantine rules.
 
-Prism sessions may be signed-in or backend-owned anonymous guest sessions. Signed-in sessions remain the preferred production mode during migration. Guest sessions are an explicit, capability-gated V2 mode; they are not described as an authentication bypass and never scrape browser cookies or storage.
+Prism sessions may be signed-in or backend-owned anonymous guest sessions. Signed-in sessions are the production default. Guest operation is an explicit, capped, capability-gated V2 mode for development and controlled low-volume deployments; it is not described as an authentication bypass and never scrapes browser cookies or storage. GhostProv reuses one durable identity and managed project pool across restarts instead of creating guest identities or projects per run.
 
 Fleet size is dynamic. Four sandboxes remain the live-tested default, not an architectural limit. The desired fleet is derived from configured target concurrency or an explicit sandbox count, and the control plane may reconcile any operator-approved number of projects within a configurable safety ceiling.
 
@@ -150,6 +150,7 @@ Every probe used a dedicated guest identity and exact probe project UUIDs; the c
 - Loads one durable Prism cookie jar and refreshes it under an exclusive account lock.
 - Reuses a valid signed-in or anonymous session before creating any identity.
 - In anonymous mode, calls only the backend-owned `POST /api/auth/anonymous-session` flow and resolves an existing-session conflict through `/auth/session`.
+- Never creates a guest identity unless anonymous mode was explicitly enabled.
 - Persists the cookie jar atomically with owner-only permissions; losing this jar means losing access to its guest-owned project fleet.
 - Never reads Chrome cookies, local storage, profiles, or passwords.
 - Runs a bounded startup capability probe before guest workers enter the registry.
@@ -173,7 +174,7 @@ Every probe used a dedicated guest identity and exact probe project UUIDs; the c
 
 #### `V2RuntimeController`
 
-- Writes or updates the tracked bootstrap source/config files.
+- Writes or updates only non-secret tracked bootstrap source/config files.
 - Forces a render launch with a unique build hash and cleaned LaTeX artifacts.
 - Retries launch up to three times with condition-based readiness.
 - Mints and installs a fresh Y-Sweet token before replacement.
@@ -199,6 +200,7 @@ Every probe used a dedicated guest identity and exact probe project UUIDs; the c
 - Defines the frame schema, protocol version, state-machine transitions, limits, and canonical digest rules once for the host and generated Deno sidecar.
 - Produces a deterministic build hash embedded in both peers.
 - Rejects readiness, claims, or frames when protocol version, schema hash, build hash, project, session, or leader generation does not match.
+- Defines the bootstrap key-exchange transcript and authenticated-encryption associated data shared by the launcher and host.
 
 #### Existing host layers retained
 
@@ -366,22 +368,24 @@ A lane is released only when terminal identity and digest match the committed re
 
 1. Resolve one persisted signed-in or guest Prism session and acquire its single-writer account lock.
 2. Provision the Prism sandbox and resource/Y-Sweet credentials.
-3. Synchronize the tracked text bootstrap files through Yjs: sidecar source, sidecar config, and launcher.
-4. Write a temporary `.latexmkrc` launcher with a unique build marker.
-5. Remove LaTeX result artifacts so the launch command is guaranteed to run.
-6. Trigger render.
-7. Restore the normal launcher immediately.
-8. Wait for an Awareness readiness announcement matching project, session, leader generation, instance, schema, and build.
-9. Retry up to three times before marking V2 unavailable.
+3. Install resource and Y-Sweet credentials into the existing Crixet endpoints; no credential enters a tracked project file.
+4. Synchronize only non-secret tracked text files through Yjs: sidecar source, static config, and launcher.
+5. Write a temporary `.latexmkrc` launcher with a unique build marker, remove stale LaTeX artifacts, and trigger render.
+6. The phase-zero sidecar generates an ephemeral P-256 ECDH key pair and bootstrap nonce, keeps the private key only in process memory, and emits the public key plus nonce through the authenticated render status/log channel.
+7. The host validates project, sandbox session, leader generation, build, and nonce; derives an AES-256-GCM key with ECDH plus HKDF-SHA-256; and writes only the encrypted Y-Sweet envelope into a transient Yjs bootstrap entry. Those identity fields are authenticated associated data.
+8. Crixet synchronizes the ciphertext, the sidecar decrypts it in memory, connects to Y-Sweet, deletes its private bootstrap material, and announces readiness through Awareness.
+9. The host requires readiness matching project, sandbox session, leader generation, instance, schema, and build, then tombstones the transient ciphertext entry and restores the normal launcher.
+10. Retry up to three times before marking V2 unavailable.
 
-No bootstrap step downloads a project export or calls the sandbox `/zip` endpoint.
+No bootstrap step downloads a project export or calls the sandbox `/zip` endpoint. Project CRDT history may retain public bootstrap material and ciphertext, but never plaintext cookies, API keys, resource tokens, or Y-Sweet tokens.
 
 ### 7.2 Token refresh
 
 - Host refreshes the Y-Sweet token before its expiry horizon.
-- Host writes the new token atomically to the tracked sidecar config.
 - Host asks the old sidecar to drain.
-- Host launches a replacement and requires a new instance ID.
+- Host launches a replacement with a new ephemeral bootstrap key and sends the refreshed credential only as authenticated ciphertext.
+- After a sidecar has an Awareness connection, subsequent same-instance credential rotation uses the in-memory derived session key and an encrypted control frame, never a persistent Yjs entry.
+- Host requires a new instance ID and matching leader generation before switching traffic.
 - Host switches traffic only after the replacement advertises readiness.
 
 The crash prototype proved that a fresh token plus forced render launch can restore a replacement sidecar and recover uncommitted work.
@@ -389,13 +393,24 @@ The crash prototype proved that a fresh token plus forced render launch can rest
 ### 7.3 Guest-session lifecycle
 
 - One durable anonymous cookie jar owns the complete guest fleet; workers do not create independent guest identities.
+- One managed project pool is reused across process restarts; guest projects are created only when reconciliation proves capacity is missing.
 - The jar and fleet manifest are written atomically under an exclusive process lock and use owner-only filesystem permissions.
 - Startup reuses `/auth/session` when the jar is valid and calls `POST /api/auth/anonymous-session` only when no session exists.
 - Guest capability gating proves project create/list, Y-Sweet mint, resource mint, sandbox allocation, credential installation, workspace readiness, Yjs text synchronization, and V2 sidecar readiness.
 - Capability gating does not require ZIP and does not delete an existing Prism project.
 - A lost or rejected guest session drains its workers and requires recovery of the same cookie jar; GhostProv does not silently create a replacement identity and orphan the old fleet.
 
-### 7.4 Sandbox loss
+### 7.4 Graceful shutdown and decommissioning
+
+1. Stop admission and drain accepted requests to matching terminal proof.
+2. Acknowledge terminal recovery spools and require `DRAINED` from every reachable sidecar.
+3. Clear local Awareness state and disconnect the host and sidecar providers.
+4. Tombstone transient credential ciphertext, restore the inert launcher, and remove `/tmp/ghostprov-v2` only after no ambiguous request remains.
+5. Retain managed project IDs, markers, non-secret sidecar source, and static config for low-latency reuse on the next start.
+
+Normal shutdown never deletes a Prism project and never tries to hide provider-visible activity. A separate explicit decommission command may delete selected GhostProv-managed projects only after displaying exact IDs and receiving confirmation; it does not claim to erase Prism logs or prior Yjs history. After a crash, journals and recovery spools are preserved for reconciliation rather than cleaned blindly.
+
+### 7.5 Sandbox loss
 
 If the complete Prism sandbox is reprovisioned, local claim/terminal journals disappear. The host treats committed requests without received terminal proof as ambiguous and quarantines them. It never guesses that an upstream call did not happen.
 
@@ -422,7 +437,9 @@ GP_MAX_PROJECTS=32              operator safety ceiling, not a protocol/architec
 GP_AUTO_CREATE_PROJECTS=1       create missing managed Prism projects
 GP_PROJECT_REUSE=managed        managed | eligible-owned | explicit
 GP_PROVISION_CONCURRENCY=4      maximum simultaneous sandbox bootstraps
-GP_PRISM_SESSION=auto           auto | authenticated | anonymous
+GP_PRISM_SESSION=authenticated  authenticated | auto | anonymous
+GP_ALLOW_ANONYMOUS=0            permit `auto` to bootstrap a guest when no jar exists
+GP_GUEST_MAX_PROJECTS=1         conservative guest safety ceiling; explicitly raise when tested
 GP_PRISM_COOKIE_FILE=<path>     durable owner-only signed-in or guest cookie jar
 ```
 
@@ -435,7 +452,9 @@ desired = GP_TARGET_SANDBOXES
 
 The desired count must be positive and no greater than the operator's `GP_MAX_PROJECTS`. Increasing `GP_MAX_PROJECTS` requires no code change.
 
-`auto` reuses whichever valid identity is already stored in `GP_PRISM_COOKIE_FILE`; when the file is absent it creates one backend-owned guest session. `authenticated` fails if that jar is not signed in. `anonymous` rejects a signed-in jar and creates or reuses only a guest identity. A single configuration never mixes identities inside one fleet manager.
+`authenticated` is the default and fails if the jar is not signed in. `auto` reuses whichever valid identity is already stored in `GP_PRISM_COOKIE_FILE`; with no usable jar it fails unless `GP_ALLOW_ANONYMOUS=1`, in which case it creates one backend-owned guest session. `anonymous` is itself explicit opt-in, rejects a signed-in jar, and creates or reuses only a guest identity. A single configuration never mixes identities inside one fleet manager.
+
+For a guest identity, the desired count is additionally capped by `GP_GUEST_MAX_PROJECTS`. Its default is one. Raising it up to the live-proven four requires an operator choice; guest mode is not the default heavy-workload deployment.
 
 ### 8.2 Project discovery and reuse
 
@@ -456,6 +475,8 @@ Managed project identity:
 - tracked project marker containing protocol version, stable worker index, and creation timestamp;
 - no credentials or account tokens in the marker.
 
+Tracked bootstrap entries may contain source, static limits, public bootstrap keys, nonces, and encrypted credential blobs. They must never contain a plaintext cookie, OpenAI key, Prism session token, project resource token, or Y-Sweet token. Tombstoning is lifecycle hygiene, not secret erasure, because Yjs history can retain prior values.
+
 ### 8.3 Idempotent automatic creation
 
 For every missing worker, the fleet manager:
@@ -466,7 +487,7 @@ For every missing worker, the fleet manager:
 4. creates the project only when the UUID/title is absent;
 5. atomically records the returned project ID;
 6. initializes the Prism Yjs root/settings schema when absent;
-7. writes the GhostProv worker marker and text bootstrap assets through Yjs without ZIP;
+7. writes the GhostProv worker marker and non-secret text bootstrap assets through Yjs without ZIP;
 8. provisions resource/Y-Sweet credentials and launches the sidecar;
 9. registers capacity only after matching build/readiness proof.
 
@@ -564,6 +585,8 @@ There is no dual execution of the same request.
 - gzip integrity and decompression bounds;
 - sequence/epoch wrap and stale-frame rejection;
 - stale leader-generation and build/schema rejection;
+- bootstrap ECDH/HKDF/AES-GCM round trips, tampering, replay, wrong nonce, and wrong associated-data rejection;
+- serialized Yjs history contains no plaintext credential canaries;
 - ACK window advancement;
 - 16 KiB frame and 32-frame/512 KiB window enforcement;
 - credit enforcement;
@@ -585,14 +608,18 @@ There is no dual execution of the same request.
 - ambiguous committed crash quarantines instead of replaying;
 - v2 bootstrap failure falls back to v1 only before commitment.
 - guest bootstrap persists and reuses one anonymous identity without browser storage access;
+- authenticated mode is the default and guest bootstrap requires explicit configuration;
 - guest configuration never invokes ZIP or v1;
 - losing a guest jar does not create a replacement identity silently;
+- repeated starts reuse the same guest projects instead of creating new ones;
 - project inventory reuses existing managed IDs before creating anything;
 - partial inventories create exactly the missing workers;
 - repeated reconciliation is idempotent after failures at every creation checkpoint;
 - dynamic fake fleets of 1, 4, 8, 16, and 32 runtimes route without fixed-size assumptions;
 - runtime addition/removal never pauses healthy routing;
 - automatic scale-down drains but never deletes cloud projects.
+- graceful shutdown removes only transient state and preserves reusable managed projects;
+- explicit decommission refuses ambiguous or unconfirmed project targets.
 
 ### Live gates
 
@@ -604,6 +631,7 @@ There is no dual execution of the same request.
 - sidecar crash with queued and committed cases;
 - token rotation during idle and active periods;
 - anonymous session bootstrap, four-project inventory, V2 sidecar readiness, and restart reuse;
+- encrypted bootstrap credential handoff with a scan proving no plaintext token entered Yjs;
 - HTTP SSE, Codex WebSocket continuation, and named lanes;
 - GPT Image generation and multipart editing;
 - production port 8787 health before and after every candidate run.
@@ -631,6 +659,7 @@ Performance:
 - queueing occurs only at configured credits/resource limits;
 - no request-time ZIP polling or workspace synchronization in healthy v2 mode.
 - zero ZIP/export calls during V2 bootstrap, steady state, recovery, and anonymous operation;
+- zero plaintext credentials in tracked project files or serialized Yjs updates;
 - fleet reconciliation does not hold the router hot-path lock;
 - routing remains below the 2 ms p95 budget at the configured safety ceiling.
 
@@ -644,6 +673,7 @@ Lifecycle:
 - a partial fleet becomes available incrementally instead of waiting for every project;
 - no automatic workflow deletes a Prism project.
 - a restarted anonymous fleet reuses the same cookie jar and project IDs.
+- normal shutdown creates zero new projects and deletes zero existing projects.
 
 ## 14. Explicit non-goals
 
@@ -655,6 +685,8 @@ Lifecycle:
 - Removing v1 recovery before v2 has completed its canary period.
 - Treating guest-only internal Prism endpoints as a guaranteed public API.
 - Scraping or importing credentials from Chrome.
+- Concealing project, sandbox, or API activity from Prism.
+- Deleting reusable projects or tracked source on every shutdown.
 
 ## 15. Conclusion
 
@@ -662,6 +694,8 @@ The prototype proves that the Awareness sidecar is materially more scalable than
 
 The implementation is not limited to four sandboxes. Four is the default live-proven fleet; desired capacity, project discovery, idempotent creation, and the dynamic runtime registry allow larger fleets without changing transport or routing code.
 
-The supported backend-owned guest flow can remove manual sign-in for an isolated V2 fleet, but it does not change the transport safety model. Guest capability probes, durable identity storage, and fail-closed V2-only behavior contain the risk of Prism's guest UI restrictions changing.
+The supported backend-owned guest flow can remove manual sign-in for an isolated V2 fleet, but it is not the heavy-workload default and does not change the transport safety model. Explicit opt-in, conservative caps, stable identity/project reuse, capability probes, and fail-closed V2-only behavior contain the risk of Prism's guest UI restrictions changing.
+
+Graceful shutdown removes ephemeral Awareness, ciphertext, and `/tmp` state after a proven drain. It deliberately retains managed projects and non-secret bootstrap source. Prism-visible activity is treated as normal provider operation, not something cleanup can or should conceal.
 
 The production design must not copy the prototype's growing result array. Its bounded acknowledged frame protocol, host-issued leader fence, strict `FETCH_STARTING` boundary, and append-only local claim journal preserve GhostProv's strongest property: no lane is released, rerouted, or retried after an unproven committed request. Signed-in `auto` fleets alone retain v1 as a pre-commit migration fallback.
