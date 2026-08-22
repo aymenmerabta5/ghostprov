@@ -31,6 +31,120 @@ export interface GhostProvAppOptions {
   keepAliveMs?: number;
 }
 
+const CODEX_BASE_INSTRUCTIONS =
+  "You are Codex, an expert agentic coding assistant working in a shared workspace. " +
+  "Follow system, developer, and user instructions in priority order. Work autonomously, " +
+  "preserve existing user changes, use tools safely, communicate concise progress, and " +
+  "run relevant verification before claiming completion.";
+
+const REASONING_DESCRIPTIONS = {
+  low: "Fast responses with lighter reasoning",
+  medium: "Balances speed and reasoning depth for everyday tasks",
+  high: "Greater reasoning depth for complex problems",
+  xhigh: "Extra high reasoning depth for complex problems",
+  max: "Maximum reasoning depth for the hardest problems",
+  ultra: "Maximum reasoning with automatic task delegation",
+} as const;
+
+function codexModel(input: {
+  slug: string;
+  displayName: string;
+  description: string;
+  defaultReasoning: keyof typeof REASONING_DESCRIPTIONS;
+  reasoning: readonly (keyof typeof REASONING_DESCRIPTIONS)[];
+  priority: number;
+  maxContextWindow?: number;
+  compHash?: string;
+  useResponsesLite?: boolean;
+  multiAgentVersion?: "v1" | "v2";
+}) {
+  return {
+    slug: input.slug,
+    display_name: input.displayName,
+    description: input.description,
+    base_instructions: CODEX_BASE_INSTRUCTIONS,
+    default_reasoning_level: input.defaultReasoning,
+    supported_reasoning_levels: input.reasoning.map(effort => ({
+      effort,
+      description: REASONING_DESCRIPTIONS[effort],
+    })),
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: input.priority,
+    additional_speed_tiers: [],
+    service_tiers: [{
+      id: "priority",
+      name: "Fast",
+      description: "Lower-latency priority processing",
+    }],
+    availability_nux: null,
+    upgrade: null,
+    include_skills_usage_instructions: true,
+    include_plugin_usage_instructions: true,
+    include_apps_usage_instructions: true,
+    default_reasoning_summary: "none",
+    support_verbosity: true,
+    default_verbosity: "low",
+    apply_patch_tool_type: "freeform",
+    web_search_tool_type: "text_and_image",
+    truncation_policy: { mode: "tokens", limit: 10_000 },
+    supports_image_detail_original: true,
+    context_window: 272_000,
+    max_context_window: input.maxContextWindow ?? 872_000,
+    comp_hash: input.compHash ?? "3000",
+    effective_context_window_percent: 95,
+    experimental_supported_tools: [],
+    input_modalities: ["text", "image"],
+    supports_search_tool: true,
+    use_responses_lite: input.useResponsesLite ?? true,
+    node_repl_auto_review_required: false,
+    node_repl_disabled: false,
+    tool_mode: "code_mode_only",
+    multi_agent_version: input.multiAgentVersion ?? "v1",
+  };
+}
+
+const CODEX_MODELS = Object.freeze([
+  codexModel({
+    slug: "gpt-5.6-sol",
+    displayName: "GPT-5.6-Sol",
+    description: "Latest frontier agentic coding model.",
+    defaultReasoning: "max",
+    reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    priority: 1,
+    multiAgentVersion: "v2",
+  }),
+  codexModel({
+    slug: "gpt-5.6-terra",
+    displayName: "GPT-5.6-Terra",
+    description: "Balanced agentic coding model for everyday work.",
+    defaultReasoning: "medium",
+    reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    priority: 2,
+    multiAgentVersion: "v2",
+  }),
+  codexModel({
+    slug: "gpt-5.6-luna",
+    displayName: "GPT-5.6-Luna",
+    description: "Fast and affordable agentic coding model.",
+    defaultReasoning: "medium",
+    reasoning: ["low", "medium", "high", "xhigh", "max"],
+    priority: 3,
+  }),
+  codexModel({
+    slug: "gpt-5.5",
+    displayName: "GPT-5.5",
+    description: "Frontier model for complex coding, research, and real-world work.",
+    defaultReasoning: "medium",
+    reasoning: ["low", "medium", "high", "xhigh"],
+    priority: 7,
+    maxContextWindow: 272_000,
+    compHash: "2911",
+    useResponsesLite: false,
+  }),
+]);
+
 export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const app = new Hono();
   const keepAliveMs = options.keepAliveMs ?? 15_000;
@@ -59,6 +173,19 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       resources: snapshot.resources,
     });
   });
+
+  app.get("/v1/models", c => c.json({
+    object: "list",
+    data: [
+      { id: "gpt-5.6-sol", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-5.6-terra", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-5.6-luna", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-5.5", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-image-2", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-image-2-2026-04-21", object: "model", created: 0, owned_by: "ghostprov" },
+    ],
+    models: CODEX_MODELS,
+  }));
 
   app.post("/v1/responses", async c => {
     let body: Record<string, unknown>;

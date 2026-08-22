@@ -99,6 +99,36 @@ describe("router HTTP composition", () => {
     expect(JSON.stringify(sandboxes)).not.toMatch(/token|cookie/i);
   });
 
+  it("serves a Codex-compatible models list without contacting a sandbox", async () => {
+    const router = new FakeRouter();
+    const response = await createGhostProvApp({ router }).request(
+      "/v1/models?client_version=0.149.0",
+    );
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ object: "list" });
+    expect(body.data.map((model: any) => model.id)).toEqual(expect.arrayContaining([
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-image-2",
+    ]));
+    expect(body.models.map((model: any) => model.slug)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+    ]);
+    expect(body.models.every((model: any) => (
+      typeof model.base_instructions === "string" &&
+      model.base_instructions.length > 0 &&
+      model.service_tiers.some((tier: any) => tier.id === "priority")
+    ))).toBe(true);
+    expect(router.workloads).toHaveLength(0);
+  });
+
   it("reports an unhealthy status when no sandbox capacity is routable", async () => {
     const router = new FakeRouter();
     router.snapshot = () => ({ capacity: 0, active: 0, available: 0, queued: 0, runtimes: [], resources: {} });

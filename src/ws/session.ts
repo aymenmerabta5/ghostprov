@@ -175,10 +175,10 @@ export class ResponsesWebSocketSession {
     if (event.background != null) {
       return errorEvent("unsupported_parameter", "background is not supported in WebSocket mode", { streamId, param: "background" });
     }
-    if (event.stream !== undefined) {
+    if (event.stream !== undefined && event.stream !== true) {
       return errorEvent(
         "unsupported_parameter",
-        "stream is implicit and must not be sent in WebSocket mode",
+        "stream:false is incompatible with implicit WebSocket streaming",
         { streamId, param: "stream" },
       );
     }

@@ -18,6 +18,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
+  readonly bodies: Record<string, unknown>[] = [];
   constructor(readonly projectId: ProjectId, readonly capacity = 30) {}
   async start(): Promise<void> {}
   async drain(): Promise<void> {
@@ -43,8 +44,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
       failure: null,
     } as const;
   }
-  async run(): Promise<RunHandle> {
+  async run(body: Record<string, unknown>): Promise<RunHandle> {
     this.executions++;
+    this.bodies.push(body);
     if (this.failStarts > 0) {
       this.failStarts--;
       throw new Error("pre-publication failure");
@@ -158,6 +160,26 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
     system.runtimes.find(runtime => runtime.finals.length)?.completeOne();
     await expect(handle.final).resolves.toBeDefined();
+  });
+
+  it("defaults omitted service tiers to fast and preserves explicit tiers", async () => {
+    const system = createSystem(1, 1);
+    const implicit = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "implicit",
+    });
+    expect(system.runtimes[0].bodies[0]).toMatchObject({ service_tier: "fast" });
+    system.runtimes[0].completeOne();
+    await implicit.final;
+
+    const explicit = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "explicit",
+      service_tier: "priority",
+    });
+    expect(system.runtimes[0].bodies[1]).toMatchObject({ service_tier: "priority" });
+    system.runtimes[0].completeOne();
+    await explicit.final;
   });
 
   it("never reroutes a rejection after a handle was published", async () => {

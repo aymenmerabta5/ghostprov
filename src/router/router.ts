@@ -84,7 +84,10 @@ export class MultiSandboxRouter {
     options: StartRelayOptions = {},
   ): Promise<RunHandle> {
     if (this.#closed || this.#shuttingDown) throw new RouterShutdownError();
-    const workload = classifyWorkload(body);
+    const relayBody = body.service_tier === undefined
+      ? { ...body, service_tier: "fast" }
+      : body;
+    const workload = classifyWorkload(relayBody);
     const memoryLease = await this.#governor.acquire(workload, options.signal);
     if (options.signal?.aborted || this.#closed || this.#shuttingDown) {
       memoryLease.release();
@@ -94,7 +97,7 @@ export class MultiSandboxRouter {
     return new Promise<RunHandle>((resolve, reject) => {
       const clientId = options.clientId ?? "default";
       const job: QueuedJob = {
-        body,
+        body: relayBody,
         workload,
         clientId,
         source: options.source ?? "internal",

@@ -110,7 +110,7 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("stream_id");
   });
 
-  it("rejects explicit stream because WebSocket streaming is implicit", async () => {
+  it("accepts Codex stream:true as an implicit-stream compatibility hint but rejects false", async () => {
     const bodies: Record<string, unknown>[] = [];
     const socket = await startServer(async body => {
       bodies.push(body);
@@ -127,19 +127,30 @@ describe("Responses WebSocket server", () => {
       input: "hello from Codex",
     }));
 
-    await waitFor(() => messages.some(message =>
-      message.type === "response.completed" || message.type === "error"
-    ));
-    const error = messages.find(message => message.type === "error");
+    await waitFor(() => messages.some(message => message.type === "response.completed"));
+    expect(messages.some(message => message.type === "error")).toBe(false);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toMatchObject({ stream: true, input: [{ role: "user" }] });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "codex-false",
+      model: "gpt-5.6-sol",
+      store: false,
+      stream: false,
+      input: "invalid non-streaming WebSocket request",
+    }));
+    await waitFor(() => messages.some(message => message.stream_id === "codex-false"));
+    const error = messages.find(message => message.stream_id === "codex-false");
     expect(error).toMatchObject({
-      stream_id: "codex",
+      stream_id: "codex-false",
       error: {
         code: "unsupported_parameter",
         param: "stream",
-        message: "stream is implicit and must not be sent in WebSocket mode",
+        message: "stream:false is incompatible with implicit WebSocket streaming",
       },
     });
-    expect(bodies).toHaveLength(0);
+    expect(bodies).toHaveLength(1);
   });
 
   it("serializes the same lane while different lanes overlap", async () => {

@@ -108,16 +108,30 @@ describe("V2 public API compatibility", () => {
     }
   });
 
-  it("enforces implicit WebSocket streaming and reconstructs store:false continuation", async () => {
+  it("accepts Codex stream:true compatibility and reconstructs store:false continuation", async () => {
     const value = await harness();
     const client = await openSocket(value.baseUrl);
     try {
       client.socket.send(JSON.stringify({
         type: "response.create",
+        stream_id: "codex-prewarm",
+        model: "gpt-5.6-sol",
+        input: "prewarm",
+        stream: true,
+        generate: false,
+      }));
+      const prewarmed = await client.next(message => message.stream_id === "codex-prewarm");
+      expect(prewarmed).toMatchObject({
+        type: "response.completed",
+        response: { status: "completed" },
+      });
+
+      client.socket.send(JSON.stringify({
+        type: "response.create",
         stream_id: "invalid-stream",
         model: "gpt-5.6-sol",
         input: "invalid",
-        stream: true,
+        stream: false,
       }));
       const rejected = await client.next(message => message.stream_id === "invalid-stream");
       expect(rejected).toMatchObject({
