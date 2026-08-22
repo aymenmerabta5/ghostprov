@@ -6,6 +6,10 @@ import { chooseRuntime, type RouteCandidate } from "./policy";
 import { ResourceGovernor } from "./resource-governor";
 import type { ReleasableLease } from "./types";
 import { classifyWorkload, type WorkloadDescriptor } from "./workload";
+import type { LoggerLike } from "../observability/logger";
+import { observabilityEvent, type JsonValue } from "../observability/events";
+import { sanitizeDiagnosticMessage } from "../observability/redaction";
+import { traceRunHandle } from "../observability/traced-run-handle";
 
 export type RelaySource = "http" | "websocket" | "image" | "internal";
 
@@ -27,6 +31,17 @@ interface QueuedJob {
   resolve: (handle: RunHandle) => void;
   reject: (error: unknown) => void;
   onAbort?: () => void;
+  traceId: string;
+  acceptedAtMs: number;
+  admittedAtMs: number;
+  queuedAtMs: number;
+  queueWaitMs: number;
+}
+
+interface RouteSelection {
+  runtime: RoutableSandboxRuntime;
+  candidate: RouteCandidate;
+  eligibleCandidates: number;
 }
 
 export interface MultiSandboxRouterSnapshot {
@@ -57,6 +72,9 @@ export class MultiSandboxRouter {
   readonly #governor: ResourceGovernor;
   readonly #random: RandomSource;
   readonly #clock: Clock;
+  readonly #logger?: LoggerLike;
+  readonly #slowRequestMs: number;
+  readonly #transport: string;
   readonly #registryUnsubscribe: () => void;
   readonly #reserved = new Map<ProjectId, number>();
   readonly #queues = new Map<string, QueuedJob[]>();
@@ -71,11 +89,16 @@ export class MultiSandboxRouter {
     governor: ResourceGovernor;
     random?: RandomSource;
     clock?: Clock;
+    logger?: LoggerLike;
+    observability?: { slowRequestMs?: number; transport?: string };
   }) {
     this.#registry = options.registry;
     this.#governor = options.governor;
     this.#random = options.random ?? SYSTEM_RANDOM;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#logger = options.logger;
+    this.#slowRequestMs = options.observability?.slowRequestMs ?? 10_000;
+    this.#transport = options.observability?.transport ?? "unknown";
     this.#registryUnsubscribe = this.#registry.subscribe(() => this.#scheduleDrain());
   }
 
@@ -84,11 +107,44 @@ export class MultiSandboxRouter {
     options: StartRelayOptions = {},
   ): Promise<RunHandle> {
     if (this.#closed || this.#shuttingDown) throw new RouterShutdownError();
+    const acceptedAtMs = this.#clock.now();
+    const traceId = this.#random.uuid();
     const relayBody = body.service_tier === undefined
       ? { ...body, service_tier: "fast" }
       : body;
     const workload = classifyWorkload(relayBody);
-    const memoryLease = await this.#governor.acquire(workload, options.signal);
+    const initial = this.snapshot();
+    this.#emit("request.accepted", {
+      trace_id: traceId,
+      source: options.source ?? "internal",
+      model: workload.model ?? "unknown",
+      service_tier: typeof relayBody.service_tier === "string" ? relayBody.service_tier : "unknown",
+      stream: workload.stream,
+      workload_class: workload.class,
+      request_bytes: workload.requestBytes,
+      reserved_bytes: workload.reservedBytes,
+      capacity: initial.capacity,
+      active: initial.active,
+      available: initial.available,
+      queued: initial.queued,
+    });
+    let memoryLease: ReleasableLease;
+    try {
+      memoryLease = await this.#governor.acquire(workload, options.signal);
+    } catch (error) {
+      this.#failure(traceId, acceptedAtMs, "admission", error, 0);
+      throw error;
+    }
+    const admittedAtMs = this.#clock.now();
+    const resources = this.#governor.snapshot();
+    this.#emit("admission.acquired", {
+      trace_id: traceId,
+      admission_wait_ms: Math.max(0, admittedAtMs - acceptedAtMs),
+      reserved_bytes: workload.reservedBytes,
+      reserved_total_bytes: resources.reservedBytes,
+      reservation_capacity_bytes: resources.reservationCapacityBytes,
+      memory_paused: resources.paused,
+    });
     if (options.signal?.aborted || this.#closed || this.#shuttingDown) {
       memoryLease.release();
       if (options.signal?.aborted) throw abortError();
@@ -107,14 +163,29 @@ export class MultiSandboxRouter {
         excluded: new Set(),
         resolve,
         reject,
+        traceId,
+        acceptedAtMs,
+        admittedAtMs,
+        queuedAtMs: this.#clock.now(),
+        queueWaitMs: 0,
       };
       job.onAbort = () => {
         if (!this.#removeJob(job)) return;
         memoryLease.release();
-        reject(abortError());
+        const error = abortError();
+        this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
+        reject(error);
       };
       options.signal?.addEventListener("abort", job.onAbort, { once: true });
       this.#enqueue(job);
+      const queued = this.snapshot();
+      this.#emit("request.queued", {
+        trace_id: job.traceId,
+        queued: queued.queued,
+        client_queue_depth: this.#queues.get(clientId)?.length ?? 0,
+        active: queued.active,
+        available: queued.available,
+      });
       this.#scheduleDrain();
     });
   }
@@ -163,6 +234,7 @@ export class MultiSandboxRouter {
       for (const job of queue) {
         job.signal?.removeEventListener("abort", job.onAbort!);
         job.memoryLease.release();
+        this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
         job.reject(error);
       }
     }
@@ -258,18 +330,41 @@ export class MultiSandboxRouter {
         job.reject(abortError());
         continue;
       }
-      const runtime = this.#choose(job);
-      if (!runtime) {
+      const routeStarted = this.#clock.now();
+      const selection = this.#choose(job);
+      if (!selection) {
         this.#enqueue(job, true);
         return;
       }
+      const runtime = selection.runtime;
+      const selectedAtMs = this.#clock.now();
+      job.queueWaitMs = Math.max(0, selectedAtMs - job.queuedAtMs);
+      const candidate = selection.candidate;
+      this.#emit("route.selected", {
+        trace_id: job.traceId,
+        project_id: runtime.projectId,
+        route_ms: Math.max(0, selectedAtMs - routeStarted),
+        queue_wait_ms: job.queueWaitMs,
+        sandbox_capacity: candidate.capacity,
+        sandbox_active: candidate.active,
+        sandbox_reserved: candidate.reserved,
+        sandbox_queued: candidate.queueDepth,
+        sandbox_quarantined: candidate.quarantined,
+        awareness_rtt_ms: candidate.ackEwmaMs,
+        completion_ewma_ms: candidate.completionEwmaMs,
+        recent_failure_rate: candidate.recentFailureRate,
+        heartbeat_age_ms: candidate.heartbeatAgeMs,
+        credential_expires_in_ms: candidate.credentialExpiresInMs,
+        memory_pressure: candidate.memoryPressure,
+        eligible_candidates: selection.eligibleCandidates,
+      });
       const reserved = (this.#reserved.get(runtime.projectId) ?? 0) + 1;
       this.#reserved.set(runtime.projectId, reserved);
       void this.#dispatch(job, runtime);
     }
   }
 
-  #choose(job: QueuedJob): RoutableSandboxRuntime | null {
+  #choose(job: QueuedJob): RouteSelection | null {
     const candidates: RouteCandidate[] = this.#registry.runtimes()
       .filter(runtime => !job.excluded.has(runtime.projectId))
       .map(runtime => {
@@ -280,17 +375,46 @@ export class MultiSandboxRouter {
         };
       });
     const decision = chooseRuntime(job.workload, candidates, this.#random);
-    return decision ? this.#registry.get(decision.projectId) ?? null : null;
+    if (!decision) return null;
+    const runtime = this.#registry.get(decision.projectId);
+    const candidate = candidates.find(value => value.projectId === decision.projectId);
+    return runtime && candidate
+      ? { runtime, candidate, eligibleCandidates: candidates.length }
+      : null;
   }
 
   async #dispatch(job: QueuedJob, runtime: RoutableSandboxRuntime): Promise<void> {
     const started = this.#clock.now();
     try {
       const handle = await runtime.run(job.body, job.signal);
+      const committedAtMs = this.#clock.now();
+      const commitAckMs = Math.max(0, committedAtMs - started);
       this.#decrementReserved(runtime.projectId);
       job.signal?.removeEventListener("abort", job.onAbort!);
-      job.resolve(handle);
-      void handle.final.then(
+      this.#emit("transport.committed", {
+        trace_id: job.traceId,
+        project_id: runtime.projectId,
+        transport: this.#transport,
+        queue_wait_ms: job.queueWaitMs,
+        commit_ack_ms: commitAckMs,
+        retry_count: job.attempts,
+      });
+      const traced = this.#logger
+        ? traceRunHandle(handle, {
+          logger: this.#logger,
+          clock: this.#clock,
+          traceId: job.traceId,
+          projectId: runtime.projectId,
+          acceptedAtMs: job.acceptedAtMs,
+          queueWaitMs: job.queueWaitMs,
+          commitAckMs,
+          committedAtMs,
+          retryCount: job.attempts,
+          slowRequestMs: this.#slowRequestMs,
+        })
+        : handle;
+      job.resolve(traced);
+      void traced.final.then(
         () => undefined,
         () => undefined,
       ).finally(() => {
@@ -308,10 +432,40 @@ export class MultiSandboxRouter {
       } else {
         job.signal?.removeEventListener("abort", job.onAbort!);
         job.memoryLease.release();
+        this.#failure(job.traceId, job.acceptedAtMs, "pre-commit", error, job.attempts);
         job.reject(error);
       }
       this.#scheduleDrain();
     }
+  }
+
+  #emit(event: Parameters<typeof observabilityEvent>[0], fields: Record<string, JsonValue>): void {
+    this.#logger?.emit(observabilityEvent(event, fields), event === "request.failed" ? "terminal" : "progress");
+  }
+
+  #failure(
+    traceId: string,
+    acceptedAtMs: number,
+    stage: string,
+    error: unknown,
+    retryCount: number,
+  ): void {
+    const value = error && typeof error === "object"
+      ? error as Record<string, unknown>
+      : {};
+    this.#emit("request.failed", {
+      trace_id: traceId,
+      project_id: null,
+      total_ms: Math.max(0, this.#clock.now() - acceptedAtMs),
+      stage,
+      error_name: error instanceof Error ? error.name : "Error",
+      error_kind: typeof value.kind === "string" ? value.kind : null,
+      status: typeof value.status === "number" ? value.status : null,
+      error_message: sanitizeDiagnosticMessage(error instanceof Error ? error.message : error),
+      committed: false,
+      quarantined: false,
+      retry_count: retryCount,
+    });
   }
 
   #decrementReserved(projectId: ProjectId): void {

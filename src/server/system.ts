@@ -35,6 +35,12 @@ import { V2TransportSession } from "../v2/transport/session";
 import { TransportSelectingRuntime } from "../v2/transport-selector";
 import { createGhostProvApp } from "./app";
 import { createGhostProvServer } from "./runtime";
+import { resolveObservabilityConfig } from "../observability/config";
+import {
+  createObservabilityLogger,
+  type LoggerLike,
+} from "../observability/logger";
+import { observabilityEvent } from "../observability/events";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -67,6 +73,7 @@ export interface BrowserlessSystemDependencies {
   server?: BrowserlessSystemServer;
   cpuPool?: BrowserlessCpuPool;
   assets?: V2SidecarAssets;
+  logger?: LoggerLike;
 }
 
 export interface BrowserlessSystem {
@@ -78,6 +85,7 @@ export interface BrowserlessSystem {
   fleet: ProjectFleetManager;
   app: ReturnType<typeof createGhostProvApp>;
   server: BrowserlessSystemServer;
+  logger: LoggerLike;
   start(): Promise<void>;
   close(): Promise<void>;
 }
@@ -219,6 +227,8 @@ export async function createBrowserlessSystem(
 ): Promise<BrowserlessSystem> {
   const machineProbe = dependencies.machineProbe ?? new SystemMachineProbe();
   const config = resolveMultiSandboxConfig(env, machineProbe.sample());
+  const observabilityConfig = resolveObservabilityConfig(env);
+  const logger = dependencies.logger ?? createObservabilityLogger(observabilityConfig);
   const sessionManager = dependencies.sessionManager ?? await PrismSessionManager.create({
     origin: config.prismOrigin,
     mode: config.sessionMode,
@@ -231,6 +241,7 @@ export async function createBrowserlessSystem(
     identity = await sessionManager.resolve();
   } catch (error) {
     await sessionManager.close().catch(() => undefined);
+    await logger.close().catch(() => undefined);
     throw error;
   }
   const governor = dependencies.governor ?? new ResourceGovernor({ probe: machineProbe });
@@ -274,7 +285,15 @@ export async function createBrowserlessSystem(
     registry,
     runtimeFactory,
   });
-  const router = dependencies.router ?? new MultiSandboxRouter({ registry, governor });
+  const router = dependencies.router ?? new MultiSandboxRouter({
+    registry,
+    governor,
+    logger,
+    observability: {
+      slowRequestMs: observabilityConfig.slowRequestMs,
+      transport: config.transport,
+    },
+  });
   const app = createGhostProvApp({ router });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -295,6 +314,7 @@ export async function createBrowserlessSystem(
     fleet,
     app,
     server,
+    logger,
     start() {
       if (starting) return starting;
       starting = (async () => {
@@ -316,12 +336,26 @@ export async function createBrowserlessSystem(
             resolve();
           });
         });
+        const snapshot = router.snapshot();
+        logger.emit(observabilityEvent("server.started", {
+          port: config.port,
+          transport: config.transport,
+          runtimes: snapshot.runtimes.length,
+          capacity: snapshot.capacity,
+          pid: process.pid,
+        }), "terminal");
       })();
       return starting;
     },
     close() {
       if (closing) return closing;
       closing = (async () => {
+        const before = router.snapshot();
+        logger.emit(observabilityEvent("server.stopping", {
+          reason: "system-shutdown",
+          active: before.active,
+          queued: before.queued,
+        }), "terminal");
         const serverClosing = closeServer(server);
         router.beginShutdown();
         let firstError: unknown = null;
@@ -339,6 +373,7 @@ export async function createBrowserlessSystem(
         await serverClosing.catch(error => { firstError ??= error; });
         await sessionManager.close().catch(error => { firstError ??= error; });
         await cpuPool.close().catch(error => { firstError ??= error; });
+        await logger.close().catch(error => { firstError ??= error; });
         if (firstError) throw firstError;
       })();
       return closing;

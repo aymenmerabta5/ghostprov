@@ -168,6 +168,7 @@ async function harness(): Promise<{
       GP_MAX_PROJECTS: "8",
       GP_PROVISION_CONCURRENCY: "4",
       GP_CANDIDATE: "1",
+      GP_LOG_LEVEL: "off",
       PORT: "18787",
     },
     dependencies: {
