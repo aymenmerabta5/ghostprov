@@ -14,7 +14,10 @@ import {
   PrismSessionManager,
   type ResolvedPrismIdentity,
 } from "../prism/session-manager";
-import { CpuTransformPool } from "../router/cpu-transform-pool";
+import {
+  CpuTransformPool,
+  type CpuTransformPoolSnapshot,
+} from "../router/cpu-transform-pool";
 import { ResourceGovernor, SystemMachineProbe } from "../router/resource-governor";
 import { MultiSandboxRouter } from "../router/router";
 import { SandboxGateway } from "../sandbox/gateway";
@@ -41,6 +44,7 @@ import {
   type LoggerLike,
 } from "../observability/logger";
 import { observabilityEvent } from "../observability/events";
+import { FleetSampler } from "../observability/sampler";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -57,6 +61,12 @@ export interface BrowserlessSessionManager {
 
 export interface BrowserlessCpuPool {
   gzip?(bytes: Uint8Array): Promise<Uint8Array>;
+  snapshot?(): CpuTransformPoolSnapshot;
+  close(): Promise<void>;
+}
+
+export interface BrowserlessFleetSampler {
+  start(): void;
   close(): Promise<void>;
 }
 
@@ -74,6 +84,7 @@ export interface BrowserlessSystemDependencies {
   cpuPool?: BrowserlessCpuPool;
   assets?: V2SidecarAssets;
   logger?: LoggerLike;
+  sampler?: BrowserlessFleetSampler;
 }
 
 export interface BrowserlessSystem {
@@ -86,6 +97,7 @@ export interface BrowserlessSystem {
   app: ReturnType<typeof createGhostProvApp>;
   server: BrowserlessSystemServer;
   logger: LoggerLike;
+  sampler: BrowserlessFleetSampler;
   start(): Promise<void>;
   close(): Promise<void>;
 }
@@ -294,6 +306,13 @@ export async function createBrowserlessSystem(
       transport: config.transport,
     },
   });
+  const sampler = dependencies.sampler ?? new FleetSampler({
+    logger,
+    routerSnapshot: () => router.snapshot(),
+    machineProbe,
+    intervalMs: observabilityConfig.metricsIntervalMs,
+    cpuPoolSnapshot: cpuPool.snapshot ? () => cpuPool.snapshot!() : undefined,
+  });
   const app = createGhostProvApp({ router });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -315,6 +334,7 @@ export async function createBrowserlessSystem(
     app,
     server,
     logger,
+    sampler,
     start() {
       if (starting) return starting;
       starting = (async () => {
@@ -327,6 +347,7 @@ export async function createBrowserlessSystem(
             }
           }),
         ]);
+        sampler.start();
         if (server.listening) return;
         await new Promise<void>((resolve, reject) => {
           const onError = (error: Error) => reject(error);
@@ -359,6 +380,7 @@ export async function createBrowserlessSystem(
         const serverClosing = closeServer(server);
         router.beginShutdown();
         let firstError: unknown = null;
+        await sampler.close().catch(error => { firstError ??= error; });
         try {
           await router.awaitIdle(30_000);
         } catch (error) {

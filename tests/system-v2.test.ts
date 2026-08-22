@@ -47,6 +47,13 @@ class FakeServer implements BrowserlessSystemServer {
   }
 }
 
+class FakeSampler {
+  starts = 0;
+  closes = 0;
+  start(): void { this.starts++; }
+  async close(): Promise<void> { this.closes++; }
+}
+
 class DeferredRuntime implements RoutableSandboxRuntime {
   state = "configured";
   readonly listeners = new Set<() => void>();
@@ -124,6 +131,7 @@ async function harness(): Promise<{
   dependencies: BrowserlessSystemDependencies;
   factory: Factory;
   server: FakeServer;
+  sampler: FakeSampler;
   sessionCloses: () => number;
   order: string[];
 }> {
@@ -144,6 +152,7 @@ async function harness(): Promise<{
   const order: string[] = [];
   const factory = new Factory(order);
   const server = new FakeServer(order);
+  const sampler = new FakeSampler();
   let closes = 0;
   const machineProbe: MachineProbe = {
     sample: () => ({
@@ -197,10 +206,12 @@ async function harness(): Promise<{
       inspector,
       runtimeFactory: factory,
       server,
+      sampler,
       cpuPool: { close: async () => { order.push("cpu-pool-close"); } },
     },
     factory,
     server,
+    sampler,
     sessionCloses: () => closes,
     order,
   };
@@ -214,11 +225,13 @@ describe("V2 browserless system composition", () => {
     await system.start();
 
     expect(value.server.listening).toBe(true);
+    expect(value.sampler.starts).toBe(1);
     expect(system.registry.readyRuntimes()).toHaveLength(1);
     value.factory.releaseAll();
     await system.fleet.waitForReady(4);
     expect(system.registry.readyRuntimes()).toHaveLength(4);
     await system.close();
+    expect(value.sampler.closes).toBe(1);
     expect(value.sessionCloses()).toBe(1);
   });
 
