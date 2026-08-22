@@ -218,7 +218,7 @@ export class SidecarEngine {
         requestId,
         requestDigest: active.requestDigest,
         committed: true,
-      }, "control", requestId);
+      }, "terminal", requestId);
       return;
     }
 
@@ -292,7 +292,7 @@ export class SidecarEngine {
           requestId,
           requestDigest: digest,
           committed: true,
-        }, "control", requestId);
+        }, "terminal", requestId);
       } catch (error) {
         this.#active.delete(requestId);
         lease.release();

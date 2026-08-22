@@ -186,8 +186,12 @@ The isolated suite includes:
 - `tests/v2-bootstrap-crypto.test.ts`
 - `tests/v2-bootstrap-controller.test.ts`
 - `tests/v2-bootstrap-probe.test.ts`
+- `tests/v2-concurrency.test.ts`
 - `tests/v2-credential-rotation.test.ts`
+- `tests/v2-dynamic-fleet.test.ts`
+- `tests/v2-faults.test.ts`
 - `tests/v2-journal.test.ts`
+- `tests/v2-large-payload.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-run-handle.test.ts`
 - `tests/v2-runtime.test.ts`

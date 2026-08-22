@@ -5,7 +5,7 @@ import type {
 } from "../../src/v2/awareness/channel";
 import type { AwarenessEnvelope } from "../../src/v2/protocol/shared";
 
-interface FaultOptions {
+export interface FaultOptions {
   drop?: readonly number[];
   duplicate?: readonly number[];
   reverseEvery?: number;
