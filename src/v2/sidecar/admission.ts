@@ -76,7 +76,10 @@ export class AdmissionController {
     }
     const immediate = this.tryAcquire(reservedBytes);
     if (immediate) return Promise.resolve(immediate);
-    if (this.#active + this.#waiters.length >= this.#acceptedMax) {
+    if (
+      this.#active + this.#waiters.length >= this.#acceptedMax ||
+      this.#reservedBytes + reservedBytes > this.#memoryBudgetBytes
+    ) {
       return Promise.reject(new AdmissionError("Accepted request queue is full", "capacity"));
     }
     return new Promise((resolve, reject) => {
@@ -85,10 +88,12 @@ export class AdmissionController {
         const index = this.#waiters.indexOf(waiter);
         if (index < 0) return;
         this.#waiters.splice(index, 1);
+        this.#reservedBytes -= waiter.reservedBytes;
         reject(abortError());
       };
       signal?.addEventListener("abort", waiter.onAbort, { once: true });
       this.#waiters.push(waiter);
+      this.#reservedBytes += reservedBytes;
     });
   }
 
@@ -100,8 +105,12 @@ export class AdmissionController {
       this.#active >= this.#effectiveLimit() ||
       this.#reservedBytes + reservedBytes > this.#memoryBudgetBytes
     ) return null;
+    return this.#grant(reservedBytes, false);
+  }
+
+  #grant(reservedBytes: number, alreadyReserved: boolean): { release(): void } {
     this.#active++;
-    this.#reservedBytes += reservedBytes;
+    if (!alreadyReserved) this.#reservedBytes += reservedBytes;
     let released = false;
     return {
       release: () => {
@@ -149,6 +158,7 @@ export class AdmissionController {
     this.#closed = true;
     for (const waiter of this.#waiters.splice(0)) {
       waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+      this.#reservedBytes -= waiter.reservedBytes;
       waiter.reject(new AdmissionError("Admission is closed", "closed"));
     }
   }
@@ -189,20 +199,16 @@ export class AdmissionController {
       if (!waiter) return;
       if (waiter.signal?.aborted) {
         this.#waiters.shift();
+        this.#reservedBytes -= waiter.reservedBytes;
         waiter.reject(abortError());
         continue;
       }
       if (
-        this.#active >= this.#effectiveLimit() ||
-        this.#reservedBytes + waiter.reservedBytes > this.#memoryBudgetBytes
+        this.#active >= this.#effectiveLimit()
       ) return;
       this.#waiters.shift();
       waiter.signal?.removeEventListener("abort", waiter.onAbort!);
-      const lease = this.tryAcquire(waiter.reservedBytes);
-      if (!lease) {
-        this.#waiters.unshift(waiter);
-        return;
-      }
+      const lease = this.#grant(waiter.reservedBytes, true);
       waiter.resolve(lease);
     }
   }

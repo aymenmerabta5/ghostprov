@@ -60,7 +60,7 @@ describe("AdmissionController", () => {
       physicalMax: 1,
       acceptedMax: 3,
       hostCeiling: 1,
-      memoryBudgetBytes: 8 * MiB,
+      memoryBudgetBytes: 12 * MiB,
     });
     const active = await admission.acquire(4 * MiB);
     const first = admission.acquire(4 * MiB);
@@ -72,6 +72,26 @@ describe("AdmissionController", () => {
     const admitted = await first;
     expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
     admitted.release();
+  });
+
+  it("counts queued reservations against the memory budget", async () => {
+    const admission = new AdmissionController({
+      physicalMax: 1,
+      acceptedMax: 4,
+      hostCeiling: 1,
+      memoryBudgetBytes: 8 * MiB,
+    });
+    const active = await admission.acquire(4 * MiB);
+    const queued = admission.acquire(4 * MiB);
+
+    await expect(admission.acquire(1)).rejects.toMatchObject({ code: "capacity" });
+    expect(admission.snapshot()).toMatchObject({
+      active: 1,
+      queued: 1,
+      reservedBytes: 8 * MiB,
+    });
+    active.release();
+    (await queued).release();
   });
 
   it("rejects work beyond the bounded accepted queue", async () => {

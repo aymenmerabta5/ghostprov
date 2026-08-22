@@ -181,7 +181,9 @@ The isolated suite includes:
 - `tests/v2-journal.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-scheduler.test.ts`
+- `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-transcript.test.ts`
+- `tests/v2-upstream.test.ts`
 - `tests/v2-window.test.ts`
 - `tests/websocket.test.ts`
 - `tests/workload.test.ts`

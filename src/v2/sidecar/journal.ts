@@ -225,6 +225,48 @@ export class ClaimJournal {
     return this.#states.get(requestId)?.state === "claimed";
   }
 
+  status(requestId: string): ClaimState | null {
+    return this.#states.get(requestId)?.state ?? null;
+  }
+
+  identity(requestId: string): {
+    requestDigest: string;
+    leaderGeneration: number;
+    state: ClaimState;
+  } | null {
+    const current = this.#states.get(requestId);
+    return current ? {
+      requestDigest: current.requestDigest,
+      leaderGeneration: current.leaderGeneration,
+      state: current.state,
+    } : null;
+  }
+
+  async readRecoveredTerminal(requestId: string): Promise<{
+    requestDigest: string;
+    leaderGeneration: number;
+    responseId: string;
+    terminalDigest: string;
+    bytes: Uint8Array;
+  } | null> {
+    await this.#ready;
+    const current = this.#states.get(requestId);
+    if (
+      current?.state !== "terminal" ||
+      !current.responseId ||
+      !current.terminalDigest
+    ) return null;
+    const bytes = await this.#storage.readTerminal(requestId);
+    if (!bytes) return null;
+    return {
+      requestDigest: current.requestDigest,
+      leaderGeneration: current.leaderGeneration,
+      responseId: current.responseId,
+      terminalDigest: current.terminalDigest,
+      bytes,
+    };
+  }
+
   async recover(): Promise<{
     terminals: readonly string[];
     ambiguous: readonly string[];
