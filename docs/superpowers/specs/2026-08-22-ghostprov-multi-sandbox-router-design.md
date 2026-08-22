@@ -66,6 +66,42 @@ min(healthy physical lanes, work fitting the live memory/CPU budget)
 
 Four projects multiply throughput and remove queueing under concurrent load. They do not reduce the model-generation duration of one sequential response. A single sequential Codex task normally occupies one lane; reaching high concurrency requires multiple tasks, callers, named WebSocket lanes, or image fan-out.
 
+## Steady-State Latency Budget
+
+Provisioning, cookie reload, resource-token refresh, Y-Sweet minting, workspace synchronization, and daemon deployment are control-plane operations. They execute before a runtime enters `ready` or asynchronously before credential expiry; none may run on the steady-state request hot path.
+
+The hot path is limited to:
+
+```text
+classify/reserve → choose ready runtime → acquire physical lane
+→ publish pre-serialized job → consume progress/terminal → release leases
+```
+
+Latency objectives on the measured host are:
+
+- Router classification, resource reservation, and four-runtime selection: p95 below 2 ms.
+- Queue wait while aggregate capacity and memory are available: p95 below 250 ms.
+- Job serialization occurs once per child request and is reused for hashing, segmentation, publication, and diagnostics.
+- Browserless publish time for a compressed request up to 2 MiB: p50 below 600 ms and p95 below 1.5 seconds.
+- ACK latency must not regress the observed single-project baseline of approximately 1.43 seconds p50 and 2.94 seconds p95.
+- HTTP/SSE first-event latency must not regress the equivalent single-project candidate by more than 10% at the same workload and upstream conditions.
+- Routing remains work-conserving and performs no network I/O while selecting a runtime.
+
+Latency engineering rules:
+
+- Keep account HTTP and sandbox-origin connections warm and reusable.
+- Keep all ready Yjs providers connected; never connect per request.
+- Pre-create stable slot entries/folders and cache verified daemon/file hashes.
+- Maintain one adaptive ZIP poll coordinator per runtime; runtimes poll in parallel and each coalesces simultaneous filenames.
+- Use 60–250 ms adaptive active polling and slower idle polling without synchronized bursts.
+- Move gzip, large base64 work, and ZIP decompression off the main event loop through the resource governor's CPU worker permits.
+- Use level-1 gzip and skip gzip when sampling predicts no reduction.
+- Stream bounded SSE queues to downstream clients and discard consumed frames while retaining authoritative terminal replay capability.
+- Avoid copying large request buffers between router, runner, and segment planner; immutable payload ownership is explicit.
+- Heartbeats and metrics never acquire relay lanes or block request publication.
+
+Candidate verification records router-decision, queue, serialization, publish, ACK, first-event, and terminal timings independently so upstream generation time cannot hide local latency regressions.
+
 ## Module Architecture
 
 ```text
@@ -538,6 +574,7 @@ Acceptance requires:
 - Zero early releases.
 - Every response has terminal proof or an explicitly retained quarantine.
 - Router and transport overhead do not regress the single-project baseline.
+- Router p95 is below 2 ms, under-capacity queue p95 is below 250 ms, publish p50/p95 meet 600/1500 ms for the defined payload, and first-event overhead stays within 10% of the single-project candidate.
 
 ## Rollout
 

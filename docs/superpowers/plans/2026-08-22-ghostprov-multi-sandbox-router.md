@@ -23,6 +23,9 @@
 - Admission also requires adaptive byte and CPU reservations derived from machine specs and live pressure.
 - Remove Playwright only after direct parity and candidate-port proof pass.
 - Preserve existing HTTP, SSE, Codex WebSocket, Images, error, and `store:false` contracts.
+- Provisioning, token refresh, and daemon deployment must never execute on the steady-state request path.
+- Router decision p95 must stay below 2 ms; under-capacity queue p95 below 250 ms; ≤2 MiB publish p50/p95 below 600/1500 ms; first-event overhead within 10% of the single-project candidate.
+- Serialize each child request once and keep gzip, ZIP, and large base64 work off the main event loop.
 - Use red-green TDD for every behavior change.
 - Use Bun 1.4.0, `bun test --isolate`, and TypeScript 7.0.2.
 
@@ -457,7 +460,7 @@ Expected: FAIL because gateway/heartbeat modules do not exist.
 
 - [ ] **Step 4: Implement direct gateway operations and streaming ZIP decode**
 
-`SandboxGateway` exposes `heartbeat`, `waitForSync`, `fetchText`, `postJson`, `readFiles`, `triggerRender`, and `deleteFile`. All URLs are sandbox-runtime scoped. Feed `response.body.getReader()` chunks into `fflate.Unzip`; a missing body is a protocol error. Only one archive request/decode runs per runtime.
+`SandboxGateway` exposes `heartbeat`, `waitForSync`, `fetchText`, `postJson`, `readFiles`, `triggerRender`, and `deleteFile`. All URLs are sandbox-runtime scoped and reuse persistent fetch connections. Feed `response.body.getReader()` chunks into `fflate.Unzip`; a missing body is a protocol error. Only one archive request/decode runs per runtime, while different runtimes decode in parallel. Active polling adapts between 60 and 250 ms without synchronized bursts.
 
 - [ ] **Step 5: Implement monotonic deadline heartbeat**
 
@@ -532,6 +535,8 @@ it("admits 120 text jobs but throttles large images by bytes rather than a fixed
 
 Add pause/resume hysteresis, abort while queued, idempotent release, CPU permit, pre-body reservation, rolling estimate bounds, and no-starvation tests.
 
+Add an event-loop responsiveness test proving six concurrent compression/ZIP transforms do not delay a 10 ms timer beyond the test's 50 ms bound on the measured host.
+
 - [ ] **Step 3: Run focused tests and verify RED**
 
 Run: `bun test --isolate tests/workload.test.ts tests/resource-governor.test.ts`
@@ -554,6 +559,8 @@ export interface WorkloadDescriptor {
 ```
 
 Image-edit reservation includes raw body, base64 expansion, JSON/segment copies, and response reserve. Text reservation uses encoded bytes and bounded stream reserve. Rolling observations may raise/lower estimates only inside configured safety bounds.
+
+CPU-heavy gzip, ZIP, and large base64 transformations run through a bounded worker executor sized by `cpuTransformWorkers`. Level-1 gzip is skipped when a bounded sample predicts that encoded size will not shrink.
 
 - [ ] **Step 5: Implement `ResourceGovernor`**
 
@@ -755,6 +762,8 @@ it("admits exactly 120 simultaneous text jobs across four 30-slot runtimes", asy
 
 Add deterministic tie-breaking, workload-class EWMAs, client deficit round robin, aging, work-conserving behavior, dynamic capacity loss/recovery, byte reservation, queued abort, pre-publication reroute once, and post-publication no-reroute tests.
 
+Add a pure-policy benchmark over four candidates and 100,000 decisions; require measured p95 below 2 ms per decision with no allocation growth proportional to request history.
+
 - [ ] **Step 3: Run focused tests and verify RED**
 
 Run: `bun test --isolate tests/router-policy.test.ts tests/multi-sandbox-router.test.ts`
@@ -948,6 +957,8 @@ it("runs 120 requests across four projects with no oversubscription or duplicate
 
 Cover 10-second heartbeats under load, one project expiry, token rotation, ZIP 500, initial SSE gaps, one quarantined lane, memory-limited images, queued client fairness, and recovery restoring capacity.
 
+Record local timing spans in the fake integration and require under-capacity queue p95 below 250 ms. Use a controllable publish transport to assert the router adds less than 10 ms beyond scripted publication latency.
+
 - [ ] **Step 4: Run integration tests and fix only production defects they expose**
 
 Run: `bun test --isolate tests/multi-sandbox-integration.test.ts`
@@ -1017,7 +1028,7 @@ OPENAI_BASE_URL=http://127.0.0.1:18787/v1
 PRISM_PROJECT_IDS=<four explicit test project IDs>
 ```
 
-It checks port 8787 health before and after, verifies four ready daemons and heartbeat gaps, then ramps `16 → 32 → 64 → 96 → 120`. It records distribution, active peaks, queue/publish/ACK/terminal latencies, RSS/free RAM, errors, retries, and quarantines.
+It checks port 8787 health before and after, verifies four ready daemons and heartbeat gaps, then ramps `16 → 32 → 64 → 96 → 120`. It records distribution, active peaks, router-decision/queue/serialization/publish/ACK/first-event/terminal latencies, RSS/free RAM, errors, retries, and quarantines. It runs an equivalent one-project candidate baseline and fails when first-event overhead regresses by more than 10% under equivalent upstream conditions.
 
 - [ ] **Step 5: Update README and tests**
 
@@ -1077,7 +1088,7 @@ Expected: direct account HTTP, resource token, Y-Sweet, direct Yjs, token push, 
 
 Run: `bun scripts/live_multi_sandbox.ts`
 
-Expected: all stages through 120 pass when permitted by the upstream account. If an account-wide limit is lower, the router must discover it, maintain stable adaptive backpressure, and report the measured ceiling without oversubscription, duplication, early release, or lost terminal proof.
+Expected: all stages through 120 pass when permitted by the upstream account. If an account-wide limit is lower, the router must discover it, maintain stable adaptive backpressure, and report the measured ceiling without oversubscription, duplication, early release, or lost terminal proof. Router p95 must remain below 2 ms, under-capacity queue p95 below 250 ms, defined publish p50/p95 below 600/1500 ms, and first-event overhead within 10% of the one-project candidate.
 
 - [ ] **Step 5: Stop only the candidate process and recheck port 8787**
 
