@@ -41,6 +41,7 @@ function hostEnvelope(epoch = 1): AwarenessEnvelope<HostFrame> {
     instanceId: "host-instance",
     leaderGeneration: BINDING.leaderGeneration,
     epoch,
+    revision: epoch,
     ack: { epoch, sequence: -1 },
     credits: 32,
     active: 0,

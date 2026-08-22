@@ -118,6 +118,45 @@ describe("SandboxYDoc", () => {
     expect((await doc.listFiles()).filter(file => file.filename === "request.json")).toHaveLength(1);
   });
 
+  it("creates, reads, updates, and tombstones normalized nested paths", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+
+    const first = await doc.ensurePath(".ghostprov-v2/src/main.ts");
+    const second = await doc.ensurePath(".ghostprov-v2/src/main.ts");
+    expect(second).toEqual(first);
+    await doc.writePath(".ghostprov-v2/src/main.ts", "one");
+    await doc.writePath(".ghostprov-v2/src/main.ts", "two");
+    expect(await doc.readPath(".ghostprov-v2/src/main.ts")).toBe("two");
+
+    const entries = [...factory.docs[0].getMap<Y.Map<any>>("content").values()];
+    expect(entries.filter(entry => entry.get("filename") === ".ghostprov-v2")).toHaveLength(1);
+    expect(entries.filter(entry => entry.get("filename") === "src")).toHaveLength(1);
+    expect(entries.filter(entry => entry.get("filename") === "main.ts")).toHaveLength(1);
+
+    expect(await doc.tombstonePath(".ghostprov-v2/src/main.ts")).toBe(true);
+    expect(await doc.readPath(".ghostprov-v2/src/main.ts")).toBeNull();
+
+    await doc.writePath("same/same", "repeated component");
+    expect(await doc.readPath("same/same")).toBe("repeated component");
+    expect(await doc.tombstonePath("same/same")).toBe(true);
+  });
+
+  it("rejects path traversal, absolute paths, empty components, and node collisions", async () => {
+    const { doc } = createDoc(A);
+    await doc.connect();
+
+    for (const invalid of ["/absolute", "../escape", "a//b", "a/./b", "a\\b", "a/\0b", ""]) {
+      await expect(doc.ensurePath(invalid)).rejects.toMatchObject({ kind: "missing" });
+    }
+
+    await doc.writePath("collision", "file");
+    await expect(doc.ensurePath("collision/child.ts")).rejects.toThrow("not a folder");
+    await doc.ensurePath("folder/child.ts");
+    await expect(doc.ensurePath("folder")).rejects.toThrow("folder");
+  });
+
   it("initializes an empty project root once and attaches new entries to it", async () => {
     const factory = new FakeProviderFactory(true, false);
     const { doc } = createDoc(A, factory);

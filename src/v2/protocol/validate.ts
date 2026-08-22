@@ -366,7 +366,7 @@ export function parseAwarenessEnvelope(
   exactKeys(raw, [
     "protocol", "schemaVersion", "schemaHash", "buildHash", "projectId", "sessionId",
     "peerId", "instanceId", "leaderGeneration", "epoch", "ack", "credits", "active",
-    "queued", "draining", "frames",
+    "revision", "queued", "draining", "frames",
   ], "Awareness envelope");
   if (raw.protocol !== GP_V2_PROTOCOL) fail("Awareness protocol is invalid", "protocol");
   if (raw.schemaVersion !== GP_V2_SCHEMA_VERSION) fail("Awareness schema version is invalid", "schema");
@@ -377,6 +377,7 @@ export function parseAwarenessEnvelope(
   const leaderGeneration = integer(raw.leaderGeneration, "leaderGeneration", 1);
   if (leaderGeneration !== expected.leaderGeneration) fail("Awareness leader binding mismatch", "binding");
   const epoch = integer(raw.epoch, "epoch");
+  const revision = integer(raw.revision, "revision");
   const ackRaw = object(raw.ack, "Awareness ACK");
   exactKeys(ackRaw, ["epoch", "sequence"], "Awareness ACK");
   const ack = {
@@ -415,6 +416,7 @@ export function parseAwarenessEnvelope(
     instanceId: safeId(raw.instanceId, "instanceId"),
     leaderGeneration,
     epoch,
+    revision,
     ack,
     credits: integer(raw.credits, "credits"),
     active: integer(raw.active, "active"),

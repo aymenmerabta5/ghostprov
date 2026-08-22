@@ -50,6 +50,7 @@ function validEnvelope(): AwarenessEnvelope<HostFrame> {
     instanceId: "host-instance-1",
     leaderGeneration: BINDING.leaderGeneration,
     epoch: 3,
+    revision: 1,
     ack: { epoch: 2, sequence: 9 },
     credits: 16,
     active: 1,
@@ -83,6 +84,7 @@ describe("V2 shared protocol", () => {
       { ...envelope, schemaHash: "c".repeat(64) },
       { ...envelope, buildHash: "d".repeat(64) },
       { ...envelope, leaderGeneration: 8 },
+      (({ revision: _revision, ...withoutRevision }) => withoutRevision)(envelope),
       { ...envelope, frames: [{ kind: "unknown", epoch: 3, sequence: 0 }] },
       { ...envelope, unexpected: true },
     ];

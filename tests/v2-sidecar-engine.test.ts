@@ -185,4 +185,36 @@ describe("SidecarEngine", () => {
       code: "draining",
     }));
   });
+
+  it("applies the host admission ceiling without exceeding the physical limit", async () => {
+    const harness = new SidecarHarness();
+
+    harness.engine.setHostCeiling(17);
+
+    expect(harness.admission.hostCeilings).toEqual([17]);
+    expect(harness.engine.snapshot().credits).toBe(17);
+  });
+
+  it("notifies the process lifecycle once when a host drain frame arrives", async () => {
+    const reasons: string[] = [];
+    const harness = new SidecarHarness({
+      onDrainRequested: reason => reasons.push(reason),
+    });
+    await harness.engine.start();
+
+    await harness.engine.accept({
+      kind: "drain",
+      reason: "fleet shutdown",
+      epoch: 1,
+      sequence: 0,
+    });
+    await harness.engine.accept({
+      kind: "drain",
+      reason: "duplicate",
+      epoch: 1,
+      sequence: 1,
+    });
+
+    expect(reasons).toEqual(["fleet shutdown"]);
+  });
 });

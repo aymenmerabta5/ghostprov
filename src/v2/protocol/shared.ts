@@ -109,6 +109,7 @@ export interface AwarenessEnvelope<T> {
   instanceId: string;
   leaderGeneration: number;
   epoch: number;
+  revision: number;
   ack: AckCursor;
   credits: number;
   active: number;
@@ -135,6 +136,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "instanceId",
     "leaderGeneration",
     "epoch",
+    "revision",
     "ack",
     "credits",
     "active",

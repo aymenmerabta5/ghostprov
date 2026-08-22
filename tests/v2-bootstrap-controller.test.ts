@@ -1,0 +1,362 @@
+import { describe, expect, it } from "bun:test";
+import type { Clock, RandomSource } from "../src/core/ports";
+import { parseYSweetEnvelope } from "../src/prism/protocol";
+import { projectId } from "../src/sandbox/types";
+import type { AwarenessPeerUpdate } from "../src/v2/awareness/channel";
+import {
+  V2BootstrapController,
+  V2BootstrapError,
+  type V2BootstrapAwareness,
+  type V2BootstrapGateway,
+  type V2BootstrapYDoc,
+} from "../src/v2/bootstrap/controller";
+import {
+  createBootstrapKeyPair,
+  openBootstrapCredential,
+  type BootstrapBinding,
+  type SealedBootstrapCredential,
+} from "../src/v2/bootstrap/crypto";
+import {
+  base64UrlEncode,
+  canonicalJson,
+  type AwarenessEnvelope,
+  type HostFrame,
+  type SidecarFrame,
+  utf8Bytes,
+} from "../src/v2/protocol/shared";
+import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
+
+const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
+const BUILD_HASH = "a".repeat(64);
+const SCHEMA_HASH = "b".repeat(64);
+const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
+
+type Fault =
+  | "none"
+  | "wrong-nonce"
+  | "wrong-build"
+  | "wrong-generation"
+  | "stale-instance"
+  | "timeout"
+  | "first-wrong-nonce";
+
+class FakeClock implements Clock {
+  value = 1_787_400_000_000;
+  now(): number { return this.value; }
+  async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    this.value += ms;
+    await Promise.resolve();
+  }
+  async waitUntil(deadlineMs: number, signal?: AbortSignal): Promise<void> {
+    await this.sleep(Math.max(0, deadlineMs - this.value), signal);
+  }
+}
+
+class FakeRandom implements RandomSource {
+  sequence = 0;
+  next(): number { return 0.5; }
+  uuid(): string {
+    this.sequence++;
+    return `00000000-0000-4000-8000-${String(this.sequence).padStart(12, "0")}`;
+  }
+}
+
+class FakeYDoc implements V2BootstrapYDoc {
+  readonly files = new Map<string, string>();
+  readonly writes: Array<{ path: string; content: string }> = [];
+  readonly deleted: string[] = [];
+  onWrite?: (path: string, content: string) => void | Promise<void>;
+
+  async readPath(path: string): Promise<string | null> {
+    return this.files.get(path) ?? null;
+  }
+  async writePath(path: string, content: string): Promise<void> {
+    this.files.set(path, content);
+    this.writes.push({ path, content });
+    await this.onWrite?.(path, content);
+  }
+  async tombstonePath(path: string): Promise<boolean> {
+    this.deleted.push(path);
+    const existed = this.files.has(path);
+    this.files.delete(path);
+    return existed;
+  }
+  async renderSyncState() {
+    return {
+      clientStateVector: "state-vector",
+      clientDeleteSetUpdate: "delete-set",
+    };
+  }
+}
+
+class FakeAwareness implements V2BootstrapAwareness {
+  readonly projectId = PROJECT;
+  readonly localPeerId = "host-bootstrap";
+  readonly listeners = new Set<(update: AwarenessPeerUpdate<SidecarFrame>) => void>();
+  readonly published: AwarenessEnvelope<HostFrame>[] = [];
+  connects = 0;
+  clears = 0;
+  onPublish?: (envelope: AwarenessEnvelope<HostFrame>) => void;
+
+  async connect(): Promise<void> { this.connects++; }
+  publish(envelope: AwarenessEnvelope<HostFrame>): void {
+    this.published.push(envelope);
+    this.onPublish?.(envelope);
+  }
+  clear(): void { this.clears++; }
+  subscribe(listener: (update: AwarenessPeerUpdate<SidecarFrame>) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  peerIds(): readonly string[] { return []; }
+  async close(): Promise<void> {}
+  sidecar(envelope: AwarenessEnvelope<SidecarFrame>): void {
+    for (const listener of this.listeners) {
+      listener({ peerClientId: "sidecar", envelope });
+    }
+  }
+}
+
+class FakeGateway implements V2BootstrapGateway {
+  readonly calls: string[] = [];
+  readonly nonces: string[] = [];
+  logs = "";
+  renders = 0;
+  current: {
+    binding: BootstrapBinding;
+    instanceId: string;
+    keys: Awaited<ReturnType<typeof createBootstrapKeyPair>>;
+  } | null = null;
+
+  constructor(
+    readonly ydoc: FakeYDoc,
+    readonly fault: Fault,
+  ) {}
+
+  async syncWorkspace(): Promise<void> { this.calls.push("wait-for-sync"); }
+  async triggerRender(): Promise<void> {
+    this.calls.push("render");
+    this.renders++;
+    const config = JSON.parse(this.ydoc.files.get(".ghostprov-v2/static.json")!) as {
+      binding: BootstrapBinding;
+    };
+    this.nonces.push(config.binding.nonce);
+    const helloBinding = (
+      this.fault === "wrong-nonce" ||
+      (this.fault === "first-wrong-nonce" && this.renders === 1)
+    )
+      ? { ...config.binding, nonce: `stale-${config.binding.nonce}` }
+      : config.binding;
+    const keys = await createBootstrapKeyPair(helloBinding);
+    const instanceId = `sidecar-instance-${this.renders}`;
+    this.current = { binding: helloBinding, instanceId, keys };
+    this.logs = `render starting\nGPV2_BOOTSTRAP ${base64UrlEncode(utf8Bytes(canonicalJson({
+      version: 1,
+      binding: helloBinding,
+      instanceId,
+      publicJwk: keys.publicJwk,
+    })))}\n`;
+  }
+  async fetchText(suffix: string): Promise<{ status: number; text: string; headers: Headers }> {
+    this.calls.push(suffix);
+    return { status: 200, text: this.logs, headers: new Headers() };
+  }
+}
+
+const ASSETS: V2SidecarAssets = {
+  buildHash: BUILD_HASH,
+  schemaHash: SCHEMA_HASH,
+  files: Object.freeze([
+    {
+      path: ".ghostprov-v2/deno.json",
+      content: "{}\n",
+      sha256: "c".repeat(64),
+    },
+    {
+      path: ".ghostprov-v2/sandbox/v2/main.ts",
+      content: "await Promise.resolve();\n",
+      sha256: "d".repeat(64),
+    },
+  ]),
+};
+
+function readyEnvelope(
+  binding: BootstrapBinding,
+  instanceId: string,
+  fault: Fault,
+): AwarenessEnvelope<SidecarFrame> {
+  return {
+    protocol: "gp-awareness-v2",
+    schemaVersion: 1,
+    schemaHash: binding.schemaHash,
+    buildHash: fault === "wrong-build" ? "f".repeat(64) : binding.buildHash,
+    projectId: PROJECT,
+    sessionId: binding.sandboxSessionId,
+    peerId: "sidecar",
+    instanceId: fault === "stale-instance" ? "stale-sidecar" : instanceId,
+    leaderGeneration: fault === "wrong-generation"
+      ? binding.leaderGeneration + 1
+      : binding.leaderGeneration,
+    epoch: 1,
+    revision: 1,
+    ack: { epoch: 1, sequence: -1 },
+    credits: 128,
+    active: 0,
+    queued: 0,
+    draining: false,
+    frames: [],
+  };
+}
+
+function bootstrapHarness(fault: Fault = "none") {
+  const clock = new FakeClock();
+  const random = new FakeRandom();
+  const ydoc = new FakeYDoc();
+  const awareness = new FakeAwareness();
+  const gateway = new FakeGateway(ydoc, fault);
+  const decrypted: string[] = [];
+  const ySweet = parseYSweetEnvelope({
+    url: `wss://prism.test/y/d/${PROJECT}/ws`,
+    baseUrl: `https://prism.test/y/d/${PROJECT}`,
+    docId: PROJECT,
+    token: TOKEN,
+    authorization: "full",
+  });
+  ydoc.onWrite = async (path, content) => {
+    if (path !== ".ghostprov-v2/bootstrap.enc.json") return;
+    const current = gateway.current!;
+    const credential = await openBootstrapCredential({
+      sealed: JSON.parse(content) as SealedBootstrapCredential,
+      sidecarPrivateKey: current.keys.privateKey,
+      expectedBinding: current.binding,
+    });
+    decrypted.push(credential.token);
+    if (fault !== "timeout") {
+      awareness.sidecar(readyEnvelope(current.binding, current.instanceId, fault));
+    }
+  };
+  const controller = new V2BootstrapController({
+    projectId: PROJECT,
+    workerIndex: 7,
+    sandboxSessionId: "sandbox-session-1",
+    leaderGeneration: 4,
+    ySweet,
+    ydoc,
+    gateway,
+    awareness,
+    assets: ASSETS,
+    attempts: 3,
+    timeoutMs: 20,
+    pollMs: 5,
+    clock,
+    random,
+  });
+  return { controller, clock, random, ydoc, awareness, gateway, decrypted, ySweet };
+}
+
+describe("V2BootstrapController", () => {
+  it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
+    const harness = bootstrapHarness();
+
+    await expect(harness.controller.ensureReady()).resolves.toEqual({
+      instanceId: "sidecar-instance-1",
+      buildHash: BUILD_HASH,
+      schemaHash: SCHEMA_HASH,
+      leaderGeneration: 4,
+      capacity: 128,
+    });
+    expect(harness.decrypted).toEqual([TOKEN]);
+    expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
+    expect(harness.ydoc.writes.every(write => !write.content.includes(TOKEN))).toBe(true);
+    expect(harness.ydoc.deleted).toContain(".ghostprov-v2/bootstrap.enc.json");
+    expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
+    expect(harness.awareness.connects).toBe(1);
+  });
+
+  it("retries with a fresh nonce and succeeds after a stale hello", async () => {
+    const harness = bootstrapHarness("first-wrong-nonce");
+
+    await expect(harness.controller.ensureReady()).resolves.toMatchObject({
+      instanceId: "sidecar-instance-2",
+    });
+    expect(harness.gateway.nonces).toHaveLength(2);
+    expect(new Set(harness.gateway.nonces).size).toBe(2);
+    expect(harness.ydoc.deleted.filter(path => path.endsWith("bootstrap.enc.json"))).toHaveLength(2);
+  });
+
+  it("requests a proven drain before clearing sidecar presence", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    const current = harness.gateway.current!;
+    harness.awareness.onPublish = envelope => {
+      const drain = envelope.frames.find(frame => frame.kind === "drain");
+      if (!drain) return;
+      harness.awareness.sidecar({
+        ...readyEnvelope(current.binding, current.instanceId, "none"),
+        revision: 2,
+        ack: { epoch: envelope.epoch, sequence: drain.sequence },
+        credits: 0,
+        draining: true,
+        frames: [{
+          kind: "drained",
+          active: 0,
+          queued: 0,
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+    };
+
+    await harness.controller.drainAndStop("test shutdown");
+
+    expect(harness.awareness.published.some(envelope => (
+      envelope.frames.some(frame => frame.kind === "drain" && frame.reason === "test shutdown")
+    ))).toBe(true);
+    expect(harness.awareness.clears).toBe(1);
+  });
+
+  it("proves a bound ping round trip before handing the sidecar to transport", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    const current = harness.gateway.current!;
+    harness.awareness.onPublish = envelope => {
+      const ping = envelope.frames.find(frame => frame.kind === "ping");
+      if (!ping) return;
+      harness.awareness.sidecar({
+        ...readyEnvelope(current.binding, current.instanceId, "none"),
+        revision: 2,
+        ack: { epoch: envelope.epoch, sequence: ping.sequence },
+        frames: [{
+          kind: "pong",
+          sentAtMs: ping.sentAtMs,
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+    };
+
+    await expect(harness.controller.ping()).resolves.toBe(0);
+    expect(harness.awareness.published.at(-1)?.frames[0]).toMatchObject({
+      kind: "ping",
+      sequence: 0,
+    });
+  });
+
+  it.each([
+    "wrong-nonce",
+    "wrong-build",
+    "wrong-generation",
+    "stale-instance",
+    "timeout",
+  ] as const)("fails closed after bounded retries on %s", async fault => {
+    const harness = bootstrapHarness(fault);
+
+    await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
+    expect(harness.gateway.renders).toBe(3);
+    expect(new Set(harness.gateway.nonces).size).toBe(3);
+    expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
+    expect(harness.ydoc.writes.every(write => !write.content.includes(TOKEN))).toBe(true);
+    expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
+  });
+});

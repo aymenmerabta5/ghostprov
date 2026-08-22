@@ -25,6 +25,7 @@ const RESPONSE_PART_BYTES = 8 * 1024;
 
 export interface SidecarAdmission {
   acquire(reservedBytes: number, signal?: AbortSignal): Promise<{ release(): void }>;
+  setHostCeiling(value: number): void;
   close(): void;
   snapshot(): {
     active: number;
@@ -69,6 +70,7 @@ export class SidecarEngine {
     priority: FramePriority,
     streamId: string,
   ) => void;
+  readonly #onDrainRequested?: (reason: string) => void;
   readonly #active = new Map<string, ActiveRequest>();
   readonly #ambiguous = new Set<string>();
   readonly #terminalDigests = new Map<string, string>();
@@ -78,6 +80,7 @@ export class SidecarEngine {
   #draining = false;
   #committing = 0;
   #drainedEmitted = false;
+  #drainNotified = false;
 
   constructor(options: {
     binding: ProtocolBinding;
@@ -85,6 +88,7 @@ export class SidecarEngine {
     journal: ClaimJournal;
     admission: SidecarAdmission;
     upstream: SidecarUpstream;
+    onDrainRequested?: (reason: string) => void;
     emit(
       frame: SidecarFrame,
       priority: FramePriority,
@@ -96,6 +100,7 @@ export class SidecarEngine {
     this.#journal = options.journal;
     this.#admission = options.admission;
     this.#upstream = options.upstream;
+    this.#onDrainRequested = options.onDrainRequested;
     this.#emitFrame = options.emit;
   }
 
@@ -148,6 +153,10 @@ export class SidecarEngine {
         await this.#ackTerminal(frame.requestId, frame.terminalDigest);
         return;
       case "drain":
+        if (!this.#drainNotified) {
+          this.#drainNotified = true;
+          this.#onDrainRequested?.(frame.reason);
+        }
         await this.drain(frame.reason);
         return;
       case "ping":
@@ -177,6 +186,10 @@ export class SidecarEngine {
       return;
     }
     await new Promise<void>(resolve => this.#drainWaiters.push(resolve));
+  }
+
+  setHostCeiling(value: number): void {
+    this.#admission.setHostCeiling(value);
   }
 
   snapshot(): SidecarEngineSnapshot {

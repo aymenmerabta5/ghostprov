@@ -158,6 +158,7 @@ The isolated suite includes:
 - `tests/multi-sandbox-router.test.ts`
 - `tests/no-playwright.test.ts`
 - `tests/prism-protocol.test.ts`
+- `tests/project-inspector.test.ts`
 - `tests/provisioning-client.test.ts`
 - `tests/projects-client.test.ts`
 - `tests/resource-governor.test.ts`
@@ -178,9 +179,13 @@ The isolated suite includes:
 - `tests/v2-admission.test.ts`
 - `tests/v2-assembler.test.ts`
 - `tests/v2-bootstrap-crypto.test.ts`
+- `tests/v2-bootstrap-controller.test.ts`
+- `tests/v2-bootstrap-probe.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-scheduler.test.ts`
+- `tests/v2-sidecar-assets.test.ts`
+- `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-upstream.test.ts`

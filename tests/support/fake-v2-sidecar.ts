@@ -70,6 +70,7 @@ class FakeAdmission implements SidecarAdmission {
   active = 0;
   queued = 0;
   effectiveLimit = 128;
+  readonly hostCeilings: number[] = [];
 
   constructor(readonly timeline: string[]) {}
 
@@ -87,6 +88,11 @@ class FakeAdmission implements SidecarAdmission {
   }
 
   close(): void {}
+
+  setHostCeiling(value: number): void {
+    this.hostCeilings.push(value);
+    this.effectiveLimit = Math.min(128, value);
+  }
 
   snapshot() {
     return {
@@ -154,6 +160,7 @@ export interface SidecarHarnessOptions {
   behavior?: (input: DirectResponsesExecution) => Promise<UpstreamTerminal>;
   records?: JournalRecord[];
   terminals?: Map<string, Uint8Array>;
+  onDrainRequested?: (reason: string) => void;
 }
 
 export class SidecarHarness {
@@ -189,6 +196,7 @@ export class SidecarHarness {
       journal: this.journal,
       admission: this.admission,
       upstream: this.upstream,
+      onDrainRequested: options.onDrainRequested,
       emit: frame => {
         this.frames.push(frame);
         this.timeline.push(`emit:${frame.kind}`);

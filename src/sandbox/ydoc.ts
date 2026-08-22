@@ -31,6 +31,11 @@ export interface YDocFileMeta {
   deleted: boolean;
 }
 
+export interface ScopedYDocFile {
+  path: string;
+  content: string;
+}
+
 export interface YDocSnapshot {
   projectId: ProjectId;
   connected: boolean;
@@ -117,6 +122,29 @@ function deterministicRootId(projectId: ProjectId): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+function normalizedPath(value: string): string[] {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 1024 ||
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    value.includes("\0")
+  ) {
+    throw new YDocSessionError("Project path is invalid", "missing");
+  }
+  const parts = value.split("/");
+  if (
+    parts.some(part => (
+      part.length < 1 ||
+      part.length > 255 ||
+      part === "." ||
+      part === ".."
+    ))
+  ) throw new YDocSessionError("Project path is invalid", "missing");
+  return parts;
+}
+
 function ensureProjectStructure(
   doc: Y.Doc,
   content: Y.Map<any>,
@@ -195,6 +223,124 @@ export class SandboxYDoc {
         });
       }
       return files;
+    });
+  }
+
+  async ensurePath(path: string): Promise<{ fileId: string; folderId: string }> {
+    const parts = normalizedPath(path);
+    return this.#withConnection(connection => {
+      const root = this.#rootFolderId(connection);
+      if (!root) throw new YDocSessionError("root folder not found", "missing");
+      let result: { fileId: string; folderId: string } | null = null;
+      connection.doc.transact(() => {
+        let parentId = root;
+        for (const folderName of parts.slice(0, -1)) {
+          let folder = this.#findChild(connection, parentId, folderName);
+          if (folder && folder.map.get("type") !== "folder") {
+            throw new YDocSessionError(`Path component is not a folder: ${folderName}`, "missing");
+          }
+          if (!folder) {
+            const id = crypto.randomUUID();
+            const map = new Y.Map();
+            map.set("id", id);
+            map.set("filename", folderName);
+            map.set("deleted", false);
+            map.set("inFolder", parentId);
+            map.set("type", "folder");
+            connection.content.set(id, map);
+            folder = { uuid: id, map };
+          }
+          parentId = String(folder.map.get("id") ?? folder.uuid);
+        }
+
+        const filename = parts.at(-1)!;
+        const existing = this.#findChild(connection, parentId, filename);
+        if (existing?.map.get("type") === "folder") {
+          throw new YDocSessionError(`Project path is an existing folder: ${path}`, "missing");
+        }
+        if (existing) {
+          const id = String(existing.map.get("id") ?? existing.uuid);
+          const current = readContent(existing.map) ?? "";
+          if (!(existing.map.get("content") instanceof Y.Text)) {
+            const text = new Y.Text();
+            if (current) text.insert(0, current);
+            existing.map.set("content", text);
+          }
+          existing.map.set("type", "text");
+          existing.map.set("inFolder", parentId);
+          result = { fileId: id, folderId: parentId };
+          return;
+        }
+
+        const id = crypto.randomUUID();
+        const map = new Y.Map();
+        map.set("id", id);
+        map.set("filename", filename);
+        map.set("deleted", false);
+        map.set("inFolder", parentId);
+        map.set("type", "text");
+        map.set("content", new Y.Text());
+        connection.content.set(id, map);
+        result = { fileId: id, folderId: parentId };
+      });
+      if (!result) throw new YDocSessionError(`Failed to ensure project path: ${path}`, "missing");
+      return result;
+    });
+  }
+
+  async writePath(path: string, content: string): Promise<void> {
+    const ensured = await this.ensurePath(path);
+    await this.#withConnection(connection => {
+      const map = connection.content.get(ensured.fileId) as Y.Map<any> | undefined;
+      if (!map || map.get("deleted") === true) {
+        throw new YDocSessionError(`Project path disappeared: ${path}`, "missing");
+      }
+      writeContent(connection.doc, map, content);
+    });
+  }
+
+  async readPath(path: string): Promise<string | null> {
+    const parts = normalizedPath(path);
+    return this.#withConnection(connection => {
+      const root = this.#rootFolderId(connection);
+      if (!root) return null;
+      let parentId = root;
+      for (let index = 0; index < parts.length; index++) {
+        const component = parts[index];
+        const child = this.#findChild(connection, parentId, component);
+        if (!child) return null;
+        if (index < parts.length - 1) {
+          if (child.map.get("type") !== "folder") return null;
+          parentId = String(child.map.get("id") ?? child.uuid);
+          continue;
+        }
+        if (child.map.get("type") === "folder") return null;
+        return readContent(child.map);
+      }
+      return null;
+    });
+  }
+
+  async tombstonePath(path: string): Promise<boolean> {
+    const parts = normalizedPath(path);
+    return this.#withConnection(connection => {
+      const root = this.#rootFolderId(connection);
+      if (!root) return false;
+      let parentId = root;
+      for (let index = 0; index < parts.length; index++) {
+        const component = parts[index];
+        const child = this.#findChild(connection, parentId, component);
+        if (!child) return false;
+        if (index < parts.length - 1) {
+          if (child.map.get("type") !== "folder") return false;
+          parentId = String(child.map.get("id") ?? child.uuid);
+          continue;
+        }
+        if (child.map.get("type") === "folder") return false;
+        tombstoneYDocEntry(connection.doc, child.map);
+        return true;
+      }
+      return false;
     });
   }
 
@@ -476,6 +622,22 @@ export class SandboxYDoc {
         connection.index.set(filename, entry);
         return entry;
       }
+    }
+    return null;
+  }
+
+  #findChild(
+    connection: Connection,
+    parentId: string,
+    filename: string,
+  ): { uuid: string; map: Y.Map<any> } | null {
+    for (const [uuid, value] of connection.content.entries()) {
+      const map = value as Y.Map<any>;
+      if (
+        map.get("deleted") !== true &&
+        map.get("inFolder") === parentId &&
+        map.get("filename") === filename
+      ) return { uuid, map };
     }
     return null;
   }

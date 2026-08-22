@@ -1,12 +1,12 @@
 import type {
   JournalRecord,
   JournalStorage,
-} from "./journal.ts";
+} from "../../src/v2/sidecar/journal.ts";
 import {
   canonicalJson,
   sha256Hex,
   utf8Bytes,
-} from "./shared.ts";
+} from "../../src/v2/protocol/shared.ts";
 
 interface StoredRecord {
   record: JournalRecord;
