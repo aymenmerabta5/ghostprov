@@ -7,7 +7,6 @@
   },
   "scripts": {
     "dev": "bun src/server.ts",
-    "dev:candidate": "bun src/server.ts",
     "test": "bun test --isolate",
     "test:unit": "bun test --isolate tests/sse.test.ts tests/terminal-rescue.test.ts tests/unlatch-recovery.test.ts tests/segments.test.ts tests/zip-coordinator.test.ts tests/scheduler.test.ts tests/concurrency.test.ts tests/response-graph.test.ts tests/ydoc.test.ts tests/http-errors.test.ts tests/http-body.test.ts tests/images-compat.test.ts tests/images-service.test.ts tests/prism-protocol.test.ts tests/multi-sandbox-config.test.ts tests/account-session.test.ts tests/provisioning-client.test.ts tests/sandbox-ydoc.test.ts tests/sandbox-gateway.test.ts tests/heartbeat.test.ts tests/workload.test.ts tests/resource-governor.test.ts tests/cpu-transform-pool.test.ts tests/daemon-controller.test.ts tests/sandbox-runtime.test.ts tests/slot-runner.test.ts tests/router-policy.test.ts tests/no-playwright.test.ts tests/documentation.test.ts",
     "test:integration": "bun test --isolate tests/http-streaming.test.ts tests/websocket.test.ts tests/images-http.test.ts tests/router-http.test.ts tests/multi-sandbox-router.test.ts tests/multi-sandbox-integration.test.ts",
@@ -22,7 +21,8 @@
     "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
     "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
     "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
-    "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts"
+    "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts",
+    "monitor:v2": "bun scripts/monitor_v2.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",

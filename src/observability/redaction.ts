@@ -1,6 +1,6 @@
 import type { ObservabilityEvent, ObservabilityEventName } from "./events";
 
-const CREDENTIAL = /(?:\bBearer\s+[^\s]+|\bsk-[A-Za-z0-9_-]{16,}|\bgAAAA[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{8,})?|\b(?:token|key|secret)\s*[=:]\s*[^\s,;]+)/gi;
+const CREDENTIAL = /(?:\bBearer\s+(?!\[REDACTED\](?:\s|$))[^\s]+|\bsk-[A-Za-z0-9_-]{16,}|\bgAAAA[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{8,})?|\b(?:token|key|secret)\s*[=:]\s*(?!\[REDACTED\](?:[\s,;]|$))[^\s,;]+)/gi;
 const FORBIDDEN_KEY = /(?:prompt|instructions|output|content|arguments|headers?|cookie|authorization|token|secret|encrypted|body|url)/i;
 const COMMON = new Set(["schema", "event", "ts", "mono_ms"]);
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {

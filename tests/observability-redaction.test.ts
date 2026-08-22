@@ -16,6 +16,18 @@ describe("observability privacy", () => {
     expect(value).not.toContain("sk-bootstrap-secret");
     expect(value).not.toContain("gAAAA-super-secret");
     expect(value).not.toMatch(/[\n\r\0]/);
+    expect(() => assertSafeObservabilityEvent({
+      schema: 1,
+      event: "monitor.error",
+      ts: "2026-08-22T00:00:00.000Z",
+      mono_ms: 100,
+      poll_ms: 1,
+      attempt: 1,
+      status: null,
+      error_name: "transport",
+      error_message: value,
+      retry_ms: 500,
+    })).not.toThrow();
   });
 
   it("accepts an allowlisted request event", () => {
