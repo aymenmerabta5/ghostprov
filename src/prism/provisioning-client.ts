@@ -40,6 +40,10 @@ export interface ProvisionedRuntimeCredentials {
   provisionedAtMs: number;
 }
 
+export interface ProvisioningHooks {
+  onSandboxAcquired?: (sandbox: ProvisionedSandbox) => void | Promise<void>;
+}
+
 export type ProvisioningErrorKind =
   | "auth"
   | "reprovision"
@@ -129,7 +133,11 @@ export class PrismProvisioningClient {
     this.#readinessPollMs = options.readinessPollMs ?? 250;
   }
 
-  async provision(projectId: ProjectId, signal?: AbortSignal): Promise<ProvisionedRuntimeCredentials> {
+  async provision(
+    projectId: ProjectId,
+    signal?: AbortSignal,
+    hooks: ProvisioningHooks = {},
+  ): Promise<ProvisionedRuntimeCredentials> {
     checkAbort(signal);
     const provisionedAtMs = this.#clock.now();
     const sandboxResponse = await this.#requestWithRetry(
@@ -139,6 +147,7 @@ export class PrismProvisioningClient {
       signal,
     );
     const sandbox = parseProvisionedSandbox(await parseJsonResponse(sandboxResponse, "Sandbox acquisition"));
+    await hooks.onSandboxAcquired?.(sandbox);
 
     const resource = await this.#syncResources(projectId, sandbox, signal);
     const context: YSweetRequestContext = {

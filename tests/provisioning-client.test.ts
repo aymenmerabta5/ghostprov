@@ -35,9 +35,11 @@ class FakeClock implements Clock {
   }
 }
 
+type ScriptedResponse = Response | ((call: Call) => Response);
+
 class ScriptedAccountSession implements AccountRequestClient {
   calls: Call[] = [];
-  constructor(private readonly responses: Array<Response | ((call: Call) => Response)>) {}
+  constructor(private readonly responses: ScriptedResponse[]) {}
   async request(pathOrUrl: string, init: RequestInit = {}): Promise<Response> {
     const url = new URL(pathOrUrl, "https://prism.test/");
     const rawBody = typeof init.body === "string" ? init.body : "";
@@ -63,7 +65,7 @@ function json(status: number, body: unknown, headers?: HeadersInit): Response {
   return Response.json(body, { status, headers });
 }
 
-function successResponses(): Response[] {
+function successResponses(): ScriptedResponse[] {
   return [
     json(200, { url: "/s/sandboxes/proxy", token: "sandbox-token", sandbox_id: SANDBOX, sandbox_session_id: SESSION }),
     json(200, { access_token: "resource-token", expires_at: 2_000_000_000, resources_base_url: "https://prism.test/s/sandbox-resources/", scopes: ["project_files:read"] }),
@@ -126,6 +128,25 @@ describe("PrismProvisioningClient", () => {
     expect(account.calls[4].json).toMatchObject({ docId: PROJECT, token: "y-token" });
     expect(account.calls[2].headers.get("x-crixet-sandbox-token")).toBe("sandbox-token");
     expect(clock.sleeps).toEqual([250]);
+  });
+
+  it("exposes the sandbox immediately so heartbeat can start during credential sync", async () => {
+    let acquired = false;
+    const responses = successResponses();
+    responses[1] = call => {
+      expect(acquired).toBe(true);
+      return json(200, { access_token: "resource-token", expires_at: 2_000_000_000, resources_base_url: "https://prism.test/s/sandbox-resources/" });
+    };
+    const provisioning = client(new ScriptedAccountSession(responses));
+
+    await provisioning.provision(projectId(PROJECT), undefined, {
+      onSandboxAcquired: async sandbox => {
+        expect(sandbox.token.reveal()).toBe("sandbox-token");
+        acquired = true;
+      },
+    });
+
+    expect(acquired).toBe(true);
   });
 
   it("accepts the proven legacy readiness shape", async () => {

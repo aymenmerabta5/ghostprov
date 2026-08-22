@@ -86,10 +86,14 @@ export type SandboxLifecycleState =
 export interface SandboxSnapshot {
   projectId: ProjectId;
   state: SandboxLifecycleState;
+  generation: number;
   capacity: number;
   active: number;
   available: number;
   quarantined: number;
   heartbeatAgeMs: number | null;
   resourceExpiresInMs: number | null;
+  daemonBuild: string | null;
+  daemonPid: number | null;
+  protocols: readonly string[];
 }
