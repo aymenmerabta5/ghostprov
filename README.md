@@ -174,6 +174,7 @@ The isolated suite includes:
 - `tests/sse.test.ts`
 - `tests/terminal-rescue.test.ts`
 - `tests/unlatch-recovery.test.ts`
+- `tests/v2-bootstrap-crypto.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-scheduler.test.ts`
 - `tests/v2-transcript.test.ts`
