@@ -13,7 +13,11 @@
     "test:integration": "bun test --isolate tests/http-streaming.test.ts tests/websocket.test.ts tests/images-http.test.ts tests/router-http.test.ts tests/multi-sandbox-router.test.ts tests/multi-sandbox-integration.test.ts",
     "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
     "typecheck": "tsc --noEmit",
-    "verify:live": "bun scripts/live_verify.ts"
+    "verify:live": "bun scripts/live_verify.ts",
+    "verify:browserless": "bun scripts/probe_browserless_prism.ts",
+    "create:test-projects": "bun scripts/create_test_projects.ts",
+    "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",
+    "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",

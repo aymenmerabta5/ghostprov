@@ -26,6 +26,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.cookieFile).toMatch(/prism-cookies\.json$/);
     expect(config.port).toBe(18787);
     expect(config.candidate).toBe(true);
+    expect(config.slotsPerProject).toBe(30);
   });
 
   it("preserves legacy PRISM_DOC_ID as a single-project allowlist", () => {
@@ -61,9 +62,11 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE: "session=value",
       GP_HEARTBEAT_MS: "10000",
       GP_MAX_PROJECTS: "4",
+      GP_SLOTS: "24",
     }, MACHINE);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.maxProjects).toBe(4);
+    expect(config.slotsPerProject).toBe(24);
     expect(() => resolveMultiSandboxConfig({
       PRISM_PROJECT_IDS: A,
       PRISM_COOKIE: "session=value",

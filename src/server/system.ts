@@ -187,7 +187,7 @@ export async function createBrowserlessSystem(env: Record<string, string | undef
     cpuPool,
     daemonSource: source,
     expectedBuild: daemonBuild(source),
-    requestedCapacity: 30,
+    requestedCapacity: config.slotsPerProject,
   }));
   const registry = new SandboxRegistry(runtimes);
   const router = new MultiSandboxRouter({ registry, governor });

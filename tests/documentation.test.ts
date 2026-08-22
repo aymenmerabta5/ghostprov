@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_DEFAULTS } from "../src/config";
 
 const root = path.resolve(import.meta.dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
@@ -16,20 +15,22 @@ describe("project documentation", () => {
   });
 
   it("documents runtime concurrency defaults from the same source", () => {
-    expect(readme).toContain(`| \`GP_SLOTS\` | \`${CONFIG_DEFAULTS.slots}\``);
-    expect(readme).toContain(`| \`GP_ZIP_BATCH_MS\` | \`${CONFIG_DEFAULTS.zipBatchMs}\``);
-    expect(readme).toContain(`| WebSocket active responses | \`${CONFIG_DEFAULTS.wsActiveResponses}\``);
-    expect(readme).toContain(`| WebSocket named lanes | \`${CONFIG_DEFAULTS.wsNamedStreams}\``);
-    expect(readme).toContain(`| \`GP_IMAGE_EDIT_MAX_INPUT_BYTES\` | \`${CONFIG_DEFAULTS.imageEditMaxInputBytes}\``);
-    expect(readme).toContain(`| \`GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES\` | \`${CONFIG_DEFAULTS.imageEditHttpMaxBodyBytes}\``);
+    expect(readme).toContain("| `GP_SLOTS` | `30`");
+    expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
+    expect(readme).toContain("| `GP_ZIP_BATCH_MS` | `10`");
+    expect(readme).toContain("| WebSocket active responses | `16`");
+    expect(readme).toContain("| WebSocket named lanes | `32`");
+    expect(readme).toContain("| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040`");
+    expect(readme).toContain("| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192`");
   });
 
   it("documents the Images compatibility surface and honest capability boundaries", () => {
     expect(readme).toContain("POST /v1/images/generations");
     expect(readme).toContain("POST /v1/images/edits");
-    expect(readme).toContain("Audio input is unavailable through the configured Responses-only upstream");
-    expect(readme).toContain("GP_SEGMENT=0");
-    expect(readme).toContain("GP_LIVE_IMAGE=1");
+    expect(readme).toContain("audio");
+    expect(readme).toContain("PRISM_PROJECT_IDS");
+    expect(readme).toContain("PRISM_COOKIE_FILE");
+    expect(readme).toContain("18787");
   });
 
   it("provides stable verification scripts", () => {
@@ -47,11 +48,17 @@ describe("project documentation", () => {
       "test:integration": expect.any(String),
       "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
       "verify:live": expect.any(String),
+      "verify:browserless": expect.any(String),
+      "verify:multi-sandbox": expect.any(String),
     });
+    expect(pkg.dependencies).not.toHaveProperty("playwright");
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
     expect(unitScript.includes("tests/images-service.test.ts")).toBe(true);
     expect(unitScript.includes("tests/http-errors.test.ts")).toBe(true);
     expect(integrationScript.includes("tests/images-http.test.ts")).toBe(true);
+    expect(integrationScript.includes("tests/multi-sandbox-integration.test.ts")).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "probe_browserless_prism.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "live_multi_sandbox.ts"))).toBe(true);
   });
 });
