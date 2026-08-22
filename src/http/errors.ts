@@ -116,6 +116,18 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
 
+  if (record(error)?.name === "AbortError") {
+    return {
+      status: 499,
+      error: {
+        message: "Request was cancelled",
+        type: "request_aborted",
+        param: null,
+        code: "request_aborted",
+      },
+    };
+  }
+
   const daemon = normalizeDaemonError(error);
   if (daemon) return daemon;
 

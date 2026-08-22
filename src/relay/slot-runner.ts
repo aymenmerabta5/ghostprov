@@ -25,6 +25,7 @@ export interface SlotRunnerYDoc {
 
 export interface SlotRunnerGateway {
   readFiles(names: string[]): Promise<Map<string, Uint8Array>>;
+  syncWorkspace(signal?: AbortSignal): Promise<void>;
 }
 
 export interface SlotRunnerDaemon {
@@ -109,6 +110,7 @@ export class SandboxSlotRunner {
   readonly #gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
   #folderId: string | null = null;
   #provisioning: Promise<void> | null = null;
+  #lanesPrepared = false;
 
   constructor(options: SandboxSlotRunnerOptions) {
     this.projectId = options.projectId;
@@ -172,36 +174,46 @@ export class SandboxSlotRunner {
       closed: false,
     };
     const stats = { bytes: 0, firstByteMs: null as number | null, frames: 0 };
+    let publicationFailed = false;
+    let publicationError: unknown;
     try {
       await this.#publish(state);
-      state.published = true;
     } catch (error) {
-      lease.release();
-      throw error;
+      if (!state.published) {
+        await Promise.allSettled(state.artifacts.map(name => this.#ydoc.deleteFile(name)));
+        lease.release();
+        throw error;
+      }
+      publicationFailed = true;
+      publicationError = error;
     }
 
-    const final = this.#poll(state, stats, signal).then(
-      async value => {
-        await this.#clearLane(lease.slot, state);
-        lease.release();
-        state.closed = true;
-        state.notify?.();
-        return value;
-      },
-      async error => {
-        state.closed = true;
-        state.notify?.();
-        if (!state.published || state.terminal) {
-          await this.#clearLane(lease.slot, state).catch(() => undefined);
+    const transport = publicationFailed
+      ? Promise.reject(publicationError)
+      : this.#gateway.syncWorkspace(signal).then(() => this.#poll(state, stats, signal));
+    const final = transport
+      .then(
+        async value => {
+          await this.#clearLane(lease.slot, state);
           lease.release();
-        } else {
-          lease.quarantine();
-          lease.release();
-          void this.#recoverQuarantine(lease, state).catch(() => undefined);
-        }
-        throw error;
-      },
-    );
+          state.closed = true;
+          state.notify?.();
+          return value;
+        },
+        async error => {
+          state.closed = true;
+          state.notify?.();
+          if (!state.published || state.terminal) {
+            await this.#clearLane(lease.slot, state).catch(() => undefined);
+            lease.release();
+          } else {
+            lease.quarantine();
+            lease.release();
+            void this.#recoverQuarantine(lease, state).catch(() => undefined);
+          }
+          throw error;
+        },
+      );
 
     async function* events(): AsyncGenerator<SseFrame> {
       let index = 0;
@@ -217,6 +229,7 @@ export class SandboxSlotRunner {
   }
 
   async #ensureLaneEntries(): Promise<void> {
+    if (this.#lanesPrepared) return;
     if (!this.#provisioning) {
       this.#provisioning = (async () => {
         for (let slot = 1; slot <= this.#capacity; slot++) {
@@ -224,6 +237,7 @@ export class SandboxSlotRunner {
             if (await this.#ydoc.readFile(name) === null) await this.#ydoc.writeFile(name, "");
           }
         }
+        this.#lanesPrepared = true;
       })().finally(() => { this.#provisioning = null; });
     }
     return this.#provisioning;
@@ -236,13 +250,15 @@ export class SandboxSlotRunner {
 
   async #publish(state: PollState): Promise<void> {
     if (!state.plan) {
+      state.published = true;
       await this.#ydoc.writeFile(state.jobName, state.serialized);
       return;
     }
     const folderId = await this.#folder();
     for (const part of state.plan.publishOrder) {
+      if (!state.artifacts.includes(part.base)) state.artifacts.push(part.base);
+      if (part.index === 0) state.published = true;
       await this.#ydoc.writeFile(part.base, part.text, { folderId });
-      state.artifacts.push(part.base);
     }
   }
 
@@ -287,7 +303,10 @@ export class SandboxSlotRunner {
               throw new SlotRunnerError("Daemon capacity shrank during recovery", "capacity");
             }
           },
-          republish: () => this.#republish(state),
+          republish: async () => {
+            await this.#republish(state);
+            await this.#gateway.syncWorkspace(signal);
+          },
         });
         if (!recovery.recovered) {
           throw new SlotRunnerError("Daemon never accepted the published job", "sync");

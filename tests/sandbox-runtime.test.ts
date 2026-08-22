@@ -152,4 +152,33 @@ describe("SandboxRuntime", () => {
     expect(runtime.snapshot().state.type).toBe("ready");
     expect(runtime.snapshot().generation).toBe(2);
   });
+
+  it("exposes a bounded sanitized failure summary for monitoring", async () => {
+    const secret = "session-secret-value";
+    const error = Object.assign(
+      new Error(`Render returned 401; cookie=${secret}; token=${"a".repeat(96)}`),
+      { name: "SandboxGatewayError", status: 401, operation: "render" },
+    );
+    const runtime = new SandboxRuntime({
+      projectId: A,
+      provision: async () => credentials(A),
+      createYDoc: () => new FakeYDoc(),
+      createHeartbeat: () => new FakeHeartbeat(),
+      createDaemonController: () => ({ ensureReady: async () => { throw error; } }),
+    });
+
+    await expect(runtime.start()).rejects.toBe(error);
+
+    const failure = runtime.snapshot().failure;
+    expect(failure).toMatchObject({
+      name: "SandboxGatewayError",
+      kind: null,
+      status: 401,
+      operation: "render",
+    });
+    expect(failure?.message).toContain("Render returned 401");
+    expect(failure?.message.length).toBeLessThanOrEqual(240);
+    expect(JSON.stringify(failure)).not.toContain(secret);
+    expect(JSON.stringify(failure)).not.toContain("a".repeat(64));
+  });
 });

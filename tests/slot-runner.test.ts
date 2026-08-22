@@ -25,6 +25,12 @@ class FastClock implements Clock {
 class FakeGateway {
   response = "";
   reads = 0;
+  syncs = 0;
+  onSync?: () => void;
+  async syncWorkspace(): Promise<void> {
+    this.syncs++;
+    this.onSync?.();
+  }
   async readFiles(names: string[]): Promise<Map<string, Uint8Array>> {
     this.reads++;
     return this.response && names.some(name => name.startsWith("resp_s"))
@@ -36,13 +42,19 @@ class FakeGateway {
 class FakeYDoc {
   files = new Map<string, string>();
   writes: string[] = [];
+  reads = 0;
   folder = "gp-folder";
   onWrite?: (name: string, content: string) => void;
-  async readFile(name: string): Promise<string | null> { return this.files.get(name) ?? null; }
+  throwAfterWrite?: (name: string, content: string) => boolean;
+  async readFile(name: string): Promise<string | null> {
+    this.reads++;
+    return this.files.get(name) ?? null;
+  }
   async writeFile(name: string, content: string): Promise<void> {
     this.files.set(name, content);
     this.writes.push(name);
     this.onWrite?.(name, content);
+    if (this.throwAfterWrite?.(name, content)) throw new Error("ambiguous write failure");
   }
   async deleteFile(name: string): Promise<boolean> { return this.files.delete(name); }
   async ensureFolder(): Promise<string> { return this.folder; }
@@ -129,6 +141,36 @@ describe("SlotPool", () => {
 });
 
 describe("SandboxSlotRunner", () => {
+  it("synchronizes the published workspace revision before polling", async () => {
+    const value = runner(A, 1);
+    let published = false;
+    value.ydoc.onWrite = (name, content) => {
+      if (name !== "job_s1.json" || !content) return;
+      published = true;
+      value.gateway.response = terminal(sha12(content), "resp_synced");
+    };
+    value.gateway.onSync = () => expect(published).toBe(true);
+
+    const handle = await value.runner.run({ model: "gpt-5.6-sol", input: "sync", stream: true });
+    await expect(handle.final).resolves.toMatchObject({ id: "resp_synced" });
+
+    expect(value.gateway.syncs).toBe(1);
+  });
+
+  it("prepares physical lane entries only once across sequential requests", async () => {
+    const value = runner(A, 1);
+    completeOnPublish(value, "resp_first");
+    const first = await value.runner.run({ model: "gpt-5.6-sol", input: "first" });
+    await first.final;
+    const readsAfterFirst = value.ydoc.reads;
+
+    const second = await value.runner.run({ model: "gpt-5.6-sol", input: "second" });
+    await second.final;
+
+    expect(readsAfterFirst).toBe(2);
+    expect(value.ydoc.reads).toBe(readsAfterFirst);
+  });
+
   it("uses independent physical slot one in two projects", async () => {
     const left = runner(A, 1);
     const right = runner(B, 1);
@@ -205,6 +247,16 @@ describe("SandboxSlotRunner", () => {
     };
     const handle = await value.runner.run({ model: "gpt-5.6-sol", input: "quarantine", stream: true });
     await expect(handle.final).rejects.toBeDefined();
+    expect(value.runner.snapshot().quarantined).toBe(1);
+  });
+
+  it("returns a pinned failed handle when a commit write fails ambiguously", async () => {
+    const value = runner(A, 1);
+    value.ydoc.throwAfterWrite = (name, content) => name === "job_s1.json" && content.length > 0;
+
+    const handle = await value.runner.run({ model: "gpt-5.6-sol", input: "ambiguous" });
+
+    await expect(handle.final).rejects.toThrow("ambiguous write failure");
     expect(value.runner.snapshot().quarantined).toBe(1);
   });
 });

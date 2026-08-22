@@ -5,6 +5,9 @@ export interface DaemonAssets {
   daemonSource: string;
   launcherFile: string;
   launcherSource: string;
+  mainFile: string;
+  mainSource: string;
+  trackedFiles: readonly string[];
   expectedBuild: string;
   requiredProtocols: readonly string[];
 }
@@ -12,10 +15,16 @@ export interface DaemonAssets {
 export interface DaemonYDoc {
   readFile(name: string): Promise<string | null>;
   writeFile(name: string, content: string): Promise<void>;
+  ensureFiles(names: readonly string[]): Promise<void>;
+  renderSyncState(): Promise<{
+    clientStateVector: string;
+    clientDeleteSetUpdate: string;
+  }>;
 }
 
 export interface DaemonGateway {
   readFiles(names: string[]): Promise<Map<string, Uint8Array>>;
+  syncWorkspace(signal?: AbortSignal): Promise<void>;
   triggerRender(request?: {
     mainDocument: string;
     clientStateVector: string;
@@ -45,6 +54,7 @@ export interface DaemonControllerOptions {
   pollMs?: number;
   timeoutMs?: number;
   freshnessMs?: number;
+  cacheMs?: number;
 }
 
 interface DaemonStatus {
@@ -55,6 +65,12 @@ interface DaemonStatus {
   job_protocols: string[];
 }
 
+function isMissingBootstrapArchive(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const failure = error as { status?: unknown; operation?: unknown };
+  return failure.status === 500 && failure.operation === "zip";
+}
+
 export class DaemonController {
   readonly #ydoc: DaemonYDoc;
   readonly #gateway: DaemonGateway;
@@ -63,6 +79,9 @@ export class DaemonController {
   readonly #pollMs: number;
   readonly #timeoutMs: number;
   readonly #freshnessMs: number;
+  readonly #cacheMs: number;
+  #cached: { descriptor: DaemonDescriptor; verifiedAtMs: number } | null = null;
+  #ensuring: Promise<DaemonDescriptor> | null = null;
 
   constructor(options: DaemonControllerOptions) {
     this.#ydoc = options.ydoc;
@@ -72,16 +91,42 @@ export class DaemonController {
     this.#pollMs = options.pollMs ?? 500;
     this.#timeoutMs = options.timeoutMs ?? 60_000;
     this.#freshnessMs = options.freshnessMs ?? 15_000;
+    this.#cacheMs = options.cacheMs ?? 2_000;
+    if (!Number.isFinite(this.#cacheMs) || this.#cacheMs < 0 || this.#cacheMs >= this.#freshnessMs) {
+      throw new RangeError("Daemon readiness cache must be non-negative and shorter than freshness");
+    }
   }
 
   async ensureReady(signal?: AbortSignal): Promise<DaemonDescriptor> {
-    const [daemonSource, launcherSource, initialStatus] = await Promise.all([
+    if (signal?.aborted) throw new DOMException("Daemon readiness aborted", "AbortError");
+    const cached = this.#cached;
+    if (cached && this.#clock.now() - cached.verifiedAtMs <= this.#cacheMs) return cached.descriptor;
+    if (!this.#ensuring) {
+      const tracked = this.#ensureReadyUncached(signal)
+        .then(descriptor => {
+          this.#cached = { descriptor, verifiedAtMs: this.#clock.now() };
+          return descriptor;
+        })
+        .finally(() => {
+          if (this.#ensuring === tracked) this.#ensuring = null;
+        });
+      this.#ensuring = tracked;
+    }
+    return this.#ensuring;
+  }
+
+  async #ensureReadyUncached(signal?: AbortSignal): Promise<DaemonDescriptor> {
+    const [daemonSource, launcherSource, mainSource, initialStatus] = await Promise.all([
       this.#ydoc.readFile(this.#assets.daemonFile),
       this.#ydoc.readFile(this.#assets.launcherFile),
+      this.#ydoc.readFile(this.#assets.mainFile),
       this.#readStatus(),
     ]);
     const unchanged = daemonSource === this.#assets.daemonSource &&
-      launcherSource === this.#assets.launcherSource;
+      launcherSource === this.#assets.launcherSource &&
+      mainSource !== null;
+    await this.#ydoc.ensureFiles(this.#assets.trackedFiles);
+    await this.#gateway.syncWorkspace(signal);
     const initial = this.#descriptor(initialStatus);
     if (unchanged && initial) return initial;
 
@@ -91,10 +136,13 @@ export class DaemonController {
     if (launcherSource !== this.#assets.launcherSource) {
       await this.#ydoc.writeFile(this.#assets.launcherFile, this.#assets.launcherSource);
     }
+    if (mainSource === null) {
+      await this.#ydoc.writeFile(this.#assets.mainFile, this.#assets.mainSource);
+    }
+    const renderSyncState = await this.#ydoc.renderSyncState();
     await this.#gateway.triggerRender({
-      mainDocument: "main.tex",
-      clientStateVector: "AerAuOEF8wI=",
-      clientDeleteSetUpdate: "AAA=",
+      mainDocument: this.#assets.mainFile,
+      ...renderSyncState,
     });
 
     const deadline = this.#clock.now() + this.#timeoutMs;
@@ -113,7 +161,13 @@ export class DaemonController {
   }
 
   async #readStatus(): Promise<DaemonStatus | null> {
-    const files = await this.#gateway.readFiles(["gp_status.json"]);
+    let files: Map<string, Uint8Array>;
+    try {
+      files = await this.#gateway.readFiles(["gp_status.json"]);
+    } catch (error) {
+      if (isMissingBootstrapArchive(error)) return null;
+      throw error;
+    }
     const bytes = files.get("gp_status.json");
     if (!bytes) return null;
     try {

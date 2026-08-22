@@ -19,47 +19,61 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     throw new RangeError("Candidate server cannot bind protected port 8787");
   }
   const server = createHttpServer((request, response) => {
+    const relayAbort = new AbortController();
+    const abortRelay = () => relayAbort.abort();
+    const abortOnIncompleteClose = () => {
+      if (!response.writableEnded) abortRelay();
+    };
+    request.once("aborted", abortRelay);
+    response.once("close", abortOnIncompleteClose);
     void (async () => {
-      const host = request.headers.host ?? `127.0.0.1:${options.port}`;
-      const headers = new Headers();
-      for (const [name, value] of Object.entries(request.headers)) {
-        if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(",") : String(value));
-      }
-      let bodyLease: { release(): void } | null = null;
-      let fetchResponse: Response;
       try {
-        let body: Uint8Array | undefined;
-        if (request.method !== "GET" && request.method !== "HEAD") {
-          const maxBodyBytes = options.maxBodyBytes ?? 64 * 1024 ** 2;
-          if (contentLengthExceeds(request.headers["content-length"], maxBodyBytes)) {
-            request.resume();
-            fetchResponse = apiErrorResponse(new ApiError(
-              413,
-              `Request body exceeds the configured ${maxBodyBytes}-byte limit.`,
-              { type: "invalid_request_error", param: "body", code: "request_too_large" },
-            ));
-            await writeFetchResponse(response, fetchResponse);
-            return;
-          }
-          const declared = Number(request.headers["content-length"]);
-          const reservationBytes = Number.isFinite(declared) && declared >= 0
-            ? declared
-            : maxBodyBytes;
-          bodyLease = await options.router.acquireIncomingBody?.(reservationBytes) ?? null;
-          const collected = await collectRequestBody(request, maxBodyBytes);
-          if (collected.length) body = new Uint8Array(collected);
+        const host = request.headers.host ?? `127.0.0.1:${options.port}`;
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(request.headers)) {
+          if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(",") : String(value));
         }
-        const fetchRequest = new Request(`http://${host}${request.url ?? "/"}`, {
-          method: request.method,
-          headers,
-          body: body as unknown as BodyInit,
-        });
-        fetchResponse = await options.app.fetch(fetchRequest);
+        let bodyLease: { release(): void } | null = null;
+        let fetchResponse: Response;
+        try {
+          let body: Uint8Array | undefined;
+          if (request.method !== "GET" && request.method !== "HEAD") {
+            const maxBodyBytes = options.maxBodyBytes ?? 64 * 1024 ** 2;
+            if (contentLengthExceeds(request.headers["content-length"], maxBodyBytes)) {
+              request.resume();
+              fetchResponse = apiErrorResponse(new ApiError(
+                413,
+                `Request body exceeds the configured ${maxBodyBytes}-byte limit.`,
+                { type: "invalid_request_error", param: "body", code: "request_too_large" },
+              ));
+              await writeFetchResponse(response, fetchResponse);
+              return;
+            }
+            const declared = Number(request.headers["content-length"]);
+            const reservationBytes = Number.isFinite(declared) && declared >= 0
+              ? declared
+              : maxBodyBytes;
+            bodyLease = await options.router.acquireIncomingBody?.(reservationBytes) ?? null;
+            const collected = await collectRequestBody(request, maxBodyBytes);
+            if (collected.length) body = new Uint8Array(collected);
+          }
+          const fetchRequest = new Request(`http://${host}${request.url ?? "/"}`, {
+            method: request.method,
+            headers,
+            body: body as unknown as BodyInit,
+            signal: relayAbort.signal,
+          });
+          fetchResponse = await options.app.fetch(fetchRequest);
+        } finally {
+          bodyLease?.release();
+        }
+        await writeFetchResponse(response, fetchResponse);
       } finally {
-        bodyLease?.release();
+        request.off("aborted", abortRelay);
+        response.off("close", abortOnIncompleteClose);
       }
-      await writeFetchResponse(response, fetchResponse);
     })().catch(async error => {
+      if (response.destroyed) return;
       if (response.headersSent) {
         response.destroy(error as Error);
         return;

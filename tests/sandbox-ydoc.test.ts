@@ -29,16 +29,23 @@ class FakeProvider implements YProviderLike {
 class FakeProviderFactory implements YProviderFactory {
   providers: FakeProvider[] = [];
   tokens: string[] = [];
-  constructor(private readonly autoSync = true) {}
+  docs: Y.Doc[] = [];
+  constructor(
+    private readonly autoSync = true,
+    private readonly seedRoot = true,
+  ) {}
   create(envelope: YSweetEnvelope, doc: Y.Doc): YProviderLike {
     this.tokens.push(envelope.token.reveal());
-    const content = doc.getMap("content");
-    const root = new Y.Map();
-    root.set("id", `root-${envelope.docId}`);
-    root.set("filename", "root");
-    root.set("type", "folder");
-    root.set("deleted", false);
-    content.set(`root-${envelope.docId}`, root);
+    this.docs.push(doc);
+    if (this.seedRoot) {
+      const content = doc.getMap("content");
+      const root = new Y.Map();
+      root.set("id", `root-${envelope.docId}`);
+      root.set("filename", "root");
+      root.set("type", "folder");
+      root.set("deleted", false);
+      content.set(`root-${envelope.docId}`, root);
+    }
     const provider = new FakeProvider();
     this.providers.push(provider);
     if (this.autoSync) queueMicrotask(() => provider.emit("sync", true));
@@ -109,6 +116,71 @@ describe("SandboxYDoc", () => {
 
     expect(await doc.readFile("request.json")).toBe("two");
     expect((await doc.listFiles()).filter(file => file.filename === "request.json")).toHaveLength(1);
+  });
+
+  it("initializes an empty project root once and attaches new entries to it", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+
+    await doc.writeFile("gp_daemon.py", "daemon");
+    const folder = await doc.ensureFolder("gp");
+    expect(await doc.ensureFolder("gp")).toBe(folder);
+
+    const entries = [...factory.docs[0].getMap<Y.Map<any>>("content").values()];
+    const roots = entries.filter(entry => entry.get("filename") === "root" && entry.get("type") === "folder");
+    const daemon = entries.find(entry => entry.get("filename") === "gp_daemon.py");
+    const gp = entries.find(entry => entry.get("filename") === "gp");
+    expect(roots).toHaveLength(1);
+    expect(roots[0].get("id")).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(daemon?.get("inFolder")).toBe(roots[0].get("id"));
+    expect(gp?.get("inFolder")).toBe(roots[0].get("id"));
+    expect(factory.docs[0].getMap("settings").get("init")).toBe(true);
+    expect(factory.docs[0].getMap("settings").get("deleted")).toBe(false);
+  });
+
+  it("derives render synchronization vectors from the current project document", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    await doc.writeFile("main.tex", "current revision");
+
+    const state = await doc.renderSyncState();
+    const expectedVector = Y.encodeStateVector(factory.docs[0]);
+    const expectedDeleteSet = Y.encodeStateAsUpdate(factory.docs[0], expectedVector);
+
+    expect([...Buffer.from(state.clientStateVector, "base64")]).toEqual([...expectedVector]);
+    expect([...Buffer.from(state.clientDeleteSetUpdate, "base64")]).toEqual([...expectedDeleteSet]);
+  });
+
+  it("batch-creates tracked daemon files once under the project root", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+
+    const legacy = new Y.Map();
+    factory.docs[0].transact(() => {
+      legacy.set("id", "legacy-job");
+      legacy.set("filename", "job_s1.json");
+      legacy.set("deleted", false);
+      legacy.set("type", "text");
+      legacy.set("content", new Y.Text("legacy"));
+      factory.docs[0].getMap("content").set("legacy-job", legacy);
+    });
+
+    await doc.ensureFiles(["gp_status.json", "job_s1.json", "resp_s1.json", "resp_s1.json"]);
+    await doc.ensureFiles(["gp_status.json", "resp_s1.json"]);
+
+    const entries = [...factory.docs[0].getMap<Y.Map<any>>("content").values()];
+    const root = entries.find(entry => entry.get("filename") === "root");
+    for (const name of ["gp_status.json", "job_s1.json", "resp_s1.json"]) {
+      const matches = entries.filter(entry => entry.get("filename") === name && entry.get("deleted") !== true);
+      expect(matches).toHaveLength(1);
+      expect(matches[0].get("inFolder")).toBe(root?.get("id"));
+      expect(matches[0].get("type")).toBe("text");
+      expect(matches[0].get("content")).toBeInstanceOf(Y.Text);
+    }
+    expect((entries.find(entry => entry.get("filename") === "job_s1.json")?.get("content") as Y.Text).toString()).toBe("legacy");
   });
 
   it("appends large content in chunks and tombstones deleted entries", async () => {

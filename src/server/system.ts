@@ -24,6 +24,13 @@ const LAUNCHER_SOURCE = [
   "$pdflatex = 'nohup python gp_daemon.py >> /tmp/gp_daemon.log 2>&1 & pdflatex -interaction=nonstopmode %O %S'",
 ].join("\n") + "\n";
 
+const MAIN_SOURCE = [
+  "\\documentclass{article}",
+  "\\begin{document}",
+  "GhostProv daemon bootstrap.",
+  "\\end{document}",
+].join("\n") + "\n";
+
 function daemonSource(): string {
   return readFileSync(fileURLToPath(new URL("../../sandbox/gp_daemon.py", import.meta.url)), "utf8");
 }
@@ -32,6 +39,14 @@ function daemonBuild(source: string): string {
   const match = /DAEMON_BUILD\s*=\s*["']([^"']+)["']/.exec(source);
   if (!match) throw new Error("Bundled gp_daemon.py does not declare DAEMON_BUILD");
   return match[1];
+}
+
+function trackedDaemonFiles(capacity: number): readonly string[] {
+  const files = ["gp_status.json"];
+  for (let slot = 1; slot <= capacity; slot++) {
+    files.push(`job_s${slot}.json`, `resp_s${slot}.json`);
+  }
+  return Object.freeze(files);
 }
 
 class ManagedSandboxRuntime implements RoutableSandboxRuntime {
@@ -101,6 +116,9 @@ class ManagedSandboxRuntime implements RoutableSandboxRuntime {
             daemonSource: options.daemonSource,
             launcherFile: ".latexmkrc",
             launcherSource: LAUNCHER_SOURCE,
+            mainFile: "main.tex",
+            mainSource: MAIN_SOURCE,
+            trackedFiles: trackedDaemonFiles(options.requestedCapacity),
             expectedBuild: options.expectedBuild,
             requiredProtocols: ["segmented-v6.3-embedded-commit"],
           },
@@ -152,6 +170,7 @@ class ManagedSandboxRuntime implements RoutableSandboxRuntime {
       recentFailureRate: 0,
       queueDepth: lanes?.queued ?? 0,
       memoryPressure: 0,
+      failure: lifecycle.failure,
     };
   }
 }

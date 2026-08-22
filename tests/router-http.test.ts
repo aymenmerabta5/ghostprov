@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
-import type { Server } from "node:http";
+import { request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
@@ -99,6 +99,14 @@ describe("router HTTP composition", () => {
     expect(JSON.stringify(sandboxes)).not.toMatch(/token|cookie/i);
   });
 
+  it("reports an unhealthy status when no sandbox capacity is routable", async () => {
+    const router = new FakeRouter();
+    router.snapshot = () => ({ capacity: 0, active: 0, available: 0, queued: 0, runtimes: [], resources: {} });
+    const response = await createGhostProvApp({ router }).request("/health");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ ok: false, capacity: 0 });
+  });
+
   it("refuses candidate mode on protected port 8787", () => {
     const router = new FakeRouter();
     const app = createGhostProvApp({ router });
@@ -156,5 +164,49 @@ describe("router HTTP composition", () => {
     expect(router.bodyReservations).toEqual([Buffer.byteLength(body)]);
     expect(router.bodyReservationReleases).toBe(1);
     expect(router.bodyReservationActive).toBe(0);
+  });
+
+  it("propagates a downstream HTTP disconnect to the relay signal", async () => {
+    let markStarted!: () => void;
+    let markAborted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const aborted = new Promise<void>(resolve => { markAborted = resolve; });
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: (_body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) => {
+        markStarted();
+        return new Promise<RunHandle>((_resolve, reject) => {
+          const fallback = setTimeout(() => reject(new Error("disconnect signal not propagated")), 1_000);
+          options.signal?.addEventListener("abort", () => {
+            clearTimeout(fallback);
+            markAborted();
+            reject(new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        });
+      },
+    };
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const body = JSON.stringify({ model: "gpt-5.6-sol", input: "disconnect" });
+    const client = httpRequest({
+      hostname: "127.0.0.1",
+      port: address.port,
+      path: "/v1/responses",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    });
+    client.on("error", () => undefined);
+    client.end(body);
+    await started;
+    client.destroy();
+
+    await Promise.race([
+      aborted,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("abort not observed")), 300)),
+    ]);
   });
 });

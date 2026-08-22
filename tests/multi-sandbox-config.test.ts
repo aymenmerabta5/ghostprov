@@ -72,5 +72,10 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE: "session=value",
       GP_HEARTBEAT_MS: "10001",
     }, MACHINE)).toThrow("10000");
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_PROJECT_IDS: A,
+      PRISM_COOKIE: "session=value",
+      GP_SLOTS: "31",
+    }, MACHINE)).toThrow("30");
   });
 });

@@ -1,5 +1,5 @@
 import type { RunHandle } from "../relay/run-handle";
-import type { ProjectId } from "./types";
+import type { ProjectId, SandboxFailureSnapshot } from "./types";
 
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
@@ -15,6 +15,7 @@ export interface RoutableSandboxSnapshot {
   recentFailureRate: number;
   queueDepth: number;
   memoryPressure: number;
+  failure: SandboxFailureSnapshot | null;
 }
 
 export interface RoutableSandboxRuntime {

@@ -83,6 +83,14 @@ export type SandboxLifecycleState =
   | { type: "failed"; projectId: ProjectId; generation: number; error: Error }
   | { type: "stopped"; projectId: ProjectId; generation: number };
 
+export interface SandboxFailureSnapshot {
+  name: string;
+  kind: string | null;
+  status: number | null;
+  operation: string | null;
+  message: string;
+}
+
 export interface SandboxSnapshot {
   projectId: ProjectId;
   state: SandboxLifecycleState;
@@ -96,4 +104,5 @@ export interface SandboxSnapshot {
   daemonBuild: string | null;
   daemonPid: number | null;
   protocols: readonly string[];
+  failure: SandboxFailureSnapshot | null;
 }

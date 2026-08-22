@@ -31,7 +31,7 @@ export function resolveMultiSandboxConfig(
   const projectIds = [...new Set(rawProjects.split(",").map(value => value.trim()).filter(Boolean))].map(projectId);
   const maxProjects = positiveInteger(env.GP_MAX_PROJECTS, Math.max(4, projectIds.length), "GP_MAX_PROJECTS");
   const slotsPerProject = positiveInteger(env.GP_SLOTS, 30, "GP_SLOTS");
-  if (slotsPerProject > 4096) throw new RangeError("GP_SLOTS must not exceed 4096");
+  if (slotsPerProject > 30) throw new RangeError("GP_SLOTS must not exceed the daemon's 30-lane capacity");
   if (projectIds.length > maxProjects) throw new RangeError(`Configured ${projectIds.length} projects exceeds GP_MAX_PROJECTS=${maxProjects}`);
 
   const cookieFile = env.PRISM_COOKIE_FILE?.trim();

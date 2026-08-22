@@ -97,6 +97,61 @@ describe("SandboxGateway", () => {
     expect(account.maxZipActive).toBe(1);
   });
 
+  it("coalesces concurrent workspace synchronization barriers", async () => {
+    const account = new FakeAccount(path => path.endsWith("/wait-for-sync")
+      ? Response.json({
+        status: "synced",
+        readinessCapabilities: ["current_y_sweet_provider"],
+        tokens: { hasCurrentYSweetToken: true, hasSyncedYSweetProvider: true },
+      })
+      : new Response("not found", { status: 404 }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      syncBatchMs: 0,
+    });
+
+    await Promise.all(Array.from({ length: 20 }, () => gateway.syncWorkspace()));
+
+    expect(account.calls.filter(call => call.path.endsWith("/wait-for-sync"))).toHaveLength(1);
+  });
+
+  it("runs another workspace barrier for a write arriving mid-flight", async () => {
+    let releaseFirst!: () => void;
+    let enteredFirst!: () => void;
+    const firstEntered = new Promise<void>(resolve => { enteredFirst = resolve; });
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let barriers = 0;
+    const account = new FakeAccount(async path => {
+      if (!path.endsWith("/wait-for-sync")) return new Response("not found", { status: 404 });
+      barriers++;
+      if (barriers === 1) {
+        enteredFirst();
+        await firstGate;
+      }
+      return Response.json({
+        status: "synced",
+        readinessCapabilities: ["current_y_sweet_provider"],
+        tokens: { hasCurrentYSweetToken: true, hasSyncedYSweetProvider: true },
+      });
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      syncBatchMs: 0,
+    });
+
+    const first = gateway.syncWorkspace();
+    await firstEntered;
+    const second = gateway.syncWorkspace();
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(barriers).toBe(2);
+  });
+
   it("posts render and delete payloads through the same scoped gateway", async () => {
     const account = new FakeAccount(path => new Response("{}", {
       status: path.endsWith("/render") ? 202 : 200,

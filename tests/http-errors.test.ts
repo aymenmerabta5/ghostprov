@@ -89,6 +89,18 @@ describe("OpenAI-compatible HTTP errors", () => {
     }
   });
 
+  it("maps downstream cancellation without reporting an internal failure", () => {
+    expect(normalizeApiError(new DOMException("client disconnected", "AbortError"))).toEqual({
+      status: 499,
+      error: {
+        message: "Request was cancelled",
+        type: "request_aborted",
+        param: null,
+        code: "request_aborted",
+      },
+    });
+  });
+
   it("maps daemon retry exhaustion to a rate-limit error", async () => {
     const daemon = {
       code: "rate_limited_429",

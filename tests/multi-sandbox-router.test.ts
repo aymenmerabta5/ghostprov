@@ -36,6 +36,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
       recentFailureRate: 0,
       queueDepth: 0,
       memoryPressure: 0,
+      failure: null,
     } as const;
   }
   async run(): Promise<RunHandle> {

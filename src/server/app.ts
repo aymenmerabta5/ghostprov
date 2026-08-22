@@ -37,14 +37,15 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
 
   app.get("/health", c => {
     const snapshot = options.router.snapshot();
+    const healthy = snapshot.capacity > 0;
     return c.json({
-      ok: true,
+      ok: healthy,
       capacity: snapshot.capacity,
       active: snapshot.active,
       available: snapshot.available,
       queued: snapshot.queued,
       runtimes: snapshot.runtimes.length,
-    });
+    }, healthy ? 200 : 503);
   });
 
   app.get("/__sandboxes", c => {
@@ -102,7 +103,9 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       return new Response(stream, { headers: SSE_HEADERS });
     } catch (error) {
       const normalized = normalizeApiError(error);
-      console.error(`[responses] ${normalized.error.type}: ${normalized.error.message.slice(0, 240)}`);
+      if (normalized.status !== 499) {
+        console.error(`[responses] ${normalized.error.type}: ${normalized.error.message.slice(0, 240)}`);
+      }
       return apiErrorResponse(error);
     }
   });

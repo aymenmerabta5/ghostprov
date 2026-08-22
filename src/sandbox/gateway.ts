@@ -15,6 +15,7 @@ export interface SandboxGatewayOptions {
   sandbox: ProvisionedSandbox;
   clock?: Clock;
   zipBatchMs?: number;
+  syncBatchMs?: number;
 }
 
 export interface HeartbeatResult {
@@ -119,14 +120,22 @@ export class SandboxGateway {
   readonly #sandbox: ProvisionedSandbox;
   readonly #clock: Clock;
   readonly #zipCoordinator: ZipPollCoordinator;
+  readonly #syncBatchMs: number;
   #cacheBust = 0;
   #zipChain: Promise<void> = Promise.resolve();
+  #syncRequestedEpoch = 0;
+  #syncCompletedEpoch = 0;
+  #syncLoop: Promise<void> | null = null;
 
   constructor(options: SandboxGatewayOptions) {
     this.projectId = options.projectId;
     this.#account = options.account;
     this.#sandbox = options.sandbox;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#syncBatchMs = options.syncBatchMs ?? 5;
+    if (!Number.isFinite(this.#syncBatchMs) || this.#syncBatchMs < 0 || this.#syncBatchMs > 1_000) {
+      throw new RangeError("syncBatchMs must be between 0 and 1000");
+    }
     this.#zipCoordinator = new ZipPollCoordinator(
       names => this.#serializeZip(names),
       options.zipBatchMs ?? 10,
@@ -149,6 +158,20 @@ export class SandboxGateway {
     let body: unknown = null;
     try { body = await response.json(); } catch {}
     return { response, body };
+  }
+
+  async syncWorkspace(signal?: AbortSignal): Promise<void> {
+    const targetEpoch = ++this.#syncRequestedEpoch;
+    while (this.#syncCompletedEpoch < targetEpoch) {
+      if (signal?.aborted) throw new DOMException("Workspace synchronization aborted", "AbortError");
+      if (!this.#syncLoop) {
+        const tracked = this.#drainWorkspaceSync().finally(() => {
+          if (this.#syncLoop === tracked) this.#syncLoop = null;
+        });
+        this.#syncLoop = tracked;
+      }
+      await this.#awaitSharedSync(this.#syncLoop, signal);
+    }
   }
 
   async fetchText(suffix: string, init: RequestInit = {}): Promise<{ status: number; text: string; headers: Headers }> {
@@ -189,6 +212,62 @@ export class SandboxGateway {
     const headers = new Headers(init.headers);
     headers.set("x-crixet-sandbox-token", this.#sandbox.token.reveal());
     return this.#account.request(path, { ...init, headers });
+  }
+
+  async #drainWorkspaceSync(): Promise<void> {
+    while (this.#syncCompletedEpoch < this.#syncRequestedEpoch) {
+      await this.#clock.sleep(this.#syncBatchMs);
+      const targetEpoch = this.#syncRequestedEpoch;
+      await this.#syncWorkspaceOnce();
+      this.#syncCompletedEpoch = Math.max(this.#syncCompletedEpoch, targetEpoch);
+    }
+  }
+
+  async #syncWorkspaceOnce(): Promise<void> {
+    const deadline = this.#clock.now() + 30_000;
+    for (;;) {
+      const { response, body } = await this.waitForSync();
+      if (!response.ok) {
+        throw new SandboxGatewayError(
+          `Workspace synchronization returned ${response.status}`,
+          response.status,
+          "wait-for-sync",
+        );
+      }
+      const value = body && typeof body === "object" ? body as Record<string, any> : {};
+      const tokens = value.tokens && typeof value.tokens === "object" ? value.tokens as Record<string, unknown> : {};
+      const capabilities = Array.isArray(value.readinessCapabilities)
+        ? value.readinessCapabilities.filter((item: unknown) => typeof item === "string") as string[]
+        : [];
+      const currentProvider = capabilities.includes("current_y_sweet_provider");
+      if (
+        value.status === "synced" &&
+        tokens.hasCurrentYSweetToken === true &&
+        (!currentProvider || tokens.hasSyncedYSweetProvider === true)
+      ) return;
+      if (value.status !== "syncing" && value.status !== "synced") {
+        throw new SandboxGatewayError("Invalid workspace synchronization state", 409, "wait-for-sync");
+      }
+      if (this.#clock.now() >= deadline) {
+        throw new SandboxGatewayError("Workspace synchronization timed out", 408, "wait-for-sync");
+      }
+      await this.#clock.sleep(Math.min(50, deadline - this.#clock.now()));
+    }
+  }
+
+  async #awaitSharedSync(sync: Promise<void>, signal?: AbortSignal): Promise<void> {
+    if (!signal) return sync;
+    if (signal.aborted) throw new DOMException("Workspace synchronization aborted", "AbortError");
+    let abort!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new DOMException("Workspace synchronization aborted", "AbortError"));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      await Promise.race([sync, aborted]);
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
   }
 
   #serializeZip(names: string[]): Promise<Map<string, Uint8Array>> {

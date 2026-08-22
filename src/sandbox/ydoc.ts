@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { Buffer } from "node:buffer";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
@@ -37,6 +38,11 @@ export interface YDocSnapshot {
   entries: number;
   connectedAtMs: number | null;
   stopped: boolean;
+}
+
+export interface RenderSyncState {
+  clientStateVector: string;
+  clientDeleteSetUpdate: string;
 }
 
 export type YDocSessionErrorKind = "auth" | "sync" | "missing" | "stopped";
@@ -98,6 +104,49 @@ function writeContent(doc: Y.Doc, map: Y.Map<any>, content: string): void {
     text.insert(0, content);
     map.set("content", text);
   });
+}
+
+function deterministicRootId(projectId: ProjectId): string {
+  const bytes = crypto.createHash("sha256")
+    .update(`ghostprov:root:${projectId}`)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function ensureProjectStructure(
+  doc: Y.Doc,
+  content: Y.Map<any>,
+  settings: Y.Map<any>,
+  projectId: ProjectId,
+): string {
+  let rootId: string | null = null;
+  for (const [uuid, value] of content.entries()) {
+    const map = value as Y.Map<any>;
+    if (map.get("filename") !== "root" || map.get("type") !== "folder" || map.get("deleted") === true) continue;
+    const id = map.get("id");
+    rootId = typeof id === "string" && id ? id : uuid;
+    break;
+  }
+  const uuid = rootId ?? deterministicRootId(projectId);
+  doc.transact(() => {
+    if (!rootId) {
+      const map = new Y.Map();
+      map.set("id", uuid);
+      map.set("filename", "root");
+      map.set("deleted", false);
+      map.set("type", "folder");
+      content.set(uuid, map);
+    }
+    if (settings.get("init") !== true) {
+      settings.set("init", true);
+      settings.set("deleted", false);
+    }
+  });
+  return uuid;
 }
 
 export function tombstoneYDocEntry(doc: Y.Doc, map: Y.Map<any>): void {
@@ -218,6 +267,73 @@ export class SandboxYDoc {
     });
   }
 
+  async ensureFiles(filenames: readonly string[]): Promise<void> {
+    const names = [...new Set(filenames)];
+    if (names.some(name => typeof name !== "string" || !name.trim())) {
+      throw new TypeError("Tracked filenames must be non-empty strings");
+    }
+    await this.#withConnection(connection => {
+      const folderId = this.#rootFolderId(connection);
+      if (!folderId) throw new YDocSessionError("root folder not found", "missing");
+      const creations: Array<{ uuid: string; filename: string; map: Y.Map<any> }> = [];
+      const normalizations: Array<{ uuid: string; map: Y.Map<any>; content: string }> = [];
+      for (const filename of names) {
+        const existing = this.#findEntry(connection, filename);
+        if (existing) {
+          if (
+            existing.map.get("type") !== "text" ||
+            existing.map.get("inFolder") !== folderId ||
+            !(existing.map.get("content") instanceof Y.Text)
+          ) {
+            normalizations.push({
+              uuid: existing.uuid,
+              map: existing.map,
+              content: readContent(existing.map) ?? "",
+            });
+          }
+          continue;
+        }
+        creations.push({ uuid: crypto.randomUUID(), filename, map: new Y.Map() });
+      }
+      if (!creations.length && !normalizations.length) return;
+      connection.doc.transact(() => {
+        for (const { uuid, map, content } of normalizations) {
+          if (typeof map.get("id") !== "string" || !map.get("id")) map.set("id", uuid);
+          map.set("inFolder", folderId);
+          map.set("type", "text");
+          if (!(map.get("content") instanceof Y.Text)) {
+            const text = new Y.Text();
+            if (content) text.insert(0, content);
+            map.set("content", text);
+          }
+        }
+        for (const { uuid, filename, map } of creations) {
+          map.set("id", uuid);
+          map.set("filename", filename);
+          map.set("deleted", false);
+          map.set("inFolder", folderId);
+          map.set("type", "text");
+          map.set("content", new Y.Text());
+          connection.content.set(uuid, map);
+        }
+      });
+      for (const { uuid, filename, map } of creations) {
+        connection.index.set(filename, { uuid, map });
+      }
+    });
+  }
+
+  async renderSyncState(): Promise<RenderSyncState> {
+    return this.#withConnection(connection => {
+      const stateVector = Y.encodeStateVector(connection.doc);
+      const deleteSetUpdate = Y.encodeStateAsUpdate(connection.doc, stateVector);
+      return {
+        clientStateVector: Buffer.from(stateVector).toString("base64"),
+        clientDeleteSetUpdate: Buffer.from(deleteSetUpdate).toString("base64"),
+      };
+    });
+  }
+
   async ensureFolder(name: string): Promise<string> {
     return this.#withConnection(connection => {
       for (const [uuid, value] of connection.content.entries()) {
@@ -331,10 +447,13 @@ export class SandboxYDoc {
       if (generation !== this.#generation) throw new YDocSessionError("Yjs connection superseded", "sync");
       throw new YDocSessionError(`Yjs sync failed within ${this.#syncTimeoutMs}ms`, "sync");
     }
+    const content = doc.getMap("content");
+    const settings = doc.getMap("settings");
+    ensureProjectStructure(doc, content, settings, this.projectId);
     const connection: Connection = {
       doc,
       provider,
-      content: doc.getMap("content"),
+      content,
       index: new Map(),
       generation,
       connectedAtMs: this.#clock.now(),
@@ -364,7 +483,7 @@ export class SandboxYDoc {
   #rootFolderId(connection: Connection): string | null {
     for (const [uuid, value] of connection.content.entries()) {
       const map = value as Y.Map<any>;
-      if (map.get("filename") === "root" && map.get("type") === "folder") {
+      if (map.get("filename") === "root" && map.get("type") === "folder" && map.get("deleted") !== true) {
         const id = map.get("id");
         return typeof id === "string" && id ? id : uuid;
       }

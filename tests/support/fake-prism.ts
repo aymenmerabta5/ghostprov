@@ -75,6 +75,8 @@ class FakeProjectTransport {
     return output;
   }
 
+  async syncWorkspace(): Promise<void> {}
+
   completeAll(): void {
     for (const lane of this.lanes.values()) lane.terminal = true;
   }
@@ -142,6 +144,7 @@ export class FakePrismRuntime implements RoutableSandboxRuntime {
       recentFailureRate: 0,
       queueDepth: lanes.queued,
       memoryPressure: 0,
+      failure: null,
     };
   }
   completeAll(): void { this.transport.completeAll(); }
