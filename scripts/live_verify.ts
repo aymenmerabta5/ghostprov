@@ -103,6 +103,7 @@ async function verifyWebSocket(): Promise<void> {
       stream_id: "codex-tool",
       model,
       store: false,
+      stream: true,
       input: "Call gp_live_echo with value LIVE_TOOL_OK.",
       tools: [tool],
       tool_choice: { type: "function", name: "gp_live_echo" },
@@ -117,6 +118,7 @@ async function verifyWebSocket(): Promise<void> {
       stream_id: "codex-tool",
       model,
       store: false,
+      stream: true,
       previous_response_id: first.response.id,
       input: [{ type: "function_call_output", call_id: call.call_id, output: "LIVE_TOOL_OK" }],
       tools: [tool],
@@ -134,6 +136,7 @@ async function verifyWebSocket(): Promise<void> {
         stream_id: streamId,
         model,
         store: false,
+        stream: true,
         input: `Reply with exactly LANE_${index}`,
       }));
     }

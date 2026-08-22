@@ -15,7 +15,7 @@ import { config } from "../config";
 import { renderQueue } from "../utils/queue";
 import { triggerRender, deleteFile, fetchZipFiles, readTrackedFile } from "../prism/gateway";
 import { writeTrackedFile } from "../prism/workspace";
-import { SseDeltaExtractor, sanitizeFinal, type SseFrame } from "./sse";
+import { TerminalBackedSseExtractor, sanitizeFinal, type SseFrame } from "./sse";
 // SAME launcher as the slot path — otherwise the fallback rewrites the old
 // .latexmkrc over the daemon-armed one and the two paths fight forever.
 import { LATEXMKRC_SLOTS as LATEXMKRC } from "./slots";
@@ -153,7 +153,7 @@ export async function runRelayLegacy(body: Record<string, unknown>): Promise<Run
       throw e;
     }
 
-    const extractor = new SseDeltaExtractor();
+    const extractor = new TerminalBackedSseExtractor();
     const t0 = Date.now();
     let lastProgressAt = Date.now();
     let lastTotal = -1;
@@ -196,7 +196,15 @@ export async function runRelayLegacy(body: Record<string, unknown>): Promise<Run
         continue;
       }
 
-      const fresh = extractor.feed(raw);
+      const hadDeferredGap = extractor.deferredGap !== null;
+      const fresh = extractor.feedProgress(raw);
+      if (!hadDeferredGap && extractor.deferredGap) {
+        console.warn(
+          `[relay ${tag}] incremental SSE window gap ` +
+          `(cursor=${extractor.deferredGap.cursor}, start=${extractor.deferredGap.windowStart}); ` +
+          "deferring deltas until authoritative terminal replay",
+        );
+      }
       if (fresh.length) {
         for (const f of fresh) frames.push(f);
         stats.frames += fresh.length;
@@ -233,6 +241,19 @@ export async function runRelayLegacy(body: Record<string, unknown>): Promise<Run
           invalidateCache();
           console.error(`[relay ${tag}] UPSTREAM FAILED: ${JSON.stringify(fin.final.error ?? {}).slice(0, 400)}`);
           throw new RelayError(`upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`, "upstream");
+        }
+        if (typeof fin.final.gp_sse === "string" && fin.final.gp_sse.length > 0) {
+          const missed = extractor.replayTerminal(
+            fin.final.gp_sse,
+            Number.isFinite(fin.final.gp_total) ? fin.final.gp_total : undefined,
+          );
+          if (missed.length) {
+            for (const frame of missed) frames.push(frame);
+            stats.frames += missed.length;
+            stats.bytes += missed.reduce((total, frame) => total + frame.data.length, 0);
+            if (stats.firstByteMs === null) stats.firstByteMs = Date.now() - t0;
+            notify?.();
+          }
         }
         console.log(`[relay ${tag}] completed in ${Date.now() - t0}ms frames=${frames.length} bytes=${stats.bytes}`);
         // runner.py merges gp_sse/gp_ack/gp_total into the final object —

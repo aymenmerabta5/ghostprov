@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { SseDeltaExtractor, SseProtocolGapError, parseFrames } from "../src/relay/sse";
+import {
+  SseDeltaExtractor,
+  SseProtocolGapError,
+  TerminalBackedSseExtractor,
+  parseFrames,
+} from "../src/relay/sse";
 
 const FRAME = [
   "event: response.output_text.delta",
@@ -76,6 +81,31 @@ describe("SseDeltaExtractor windowed protocol", () => {
     expect(() => extractor.feed(progress(FRAME, codePoints(FRAME).length, 11))).toThrow(
       SseProtocolGapError,
     );
+  });
+});
+
+describe("TerminalBackedSseExtractor", () => {
+  it("defers an initial window gap and replays the complete terminal transcript", () => {
+    const first = FRAME.replace("hello", "first");
+    const second = FRAME.replace("hello", "second");
+    const full = first + second;
+    const firstLength = codePoints(first).length;
+    const extractor = new TerminalBackedSseExtractor();
+
+    expect(extractor.feedProgress(progress(full, codePoints(full).length, firstLength))).toEqual([]);
+    expect(extractor.deferredGap).toMatchObject({ cursor: 0, windowStart: firstLength });
+    expect(extractor.feedProgress(progress(full, codePoints(full).length, firstLength))).toEqual([]);
+
+    expect(extractor.replayTerminal(full)).toEqual([
+      {
+        event: "response.output_text.delta",
+        data: '{"type":"response.output_text.delta","delta":"first"}',
+      },
+      {
+        event: "response.output_text.delta",
+        data: '{"type":"response.output_text.delta","delta":"second"}',
+      },
+    ]);
   });
 });
 

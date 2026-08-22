@@ -33,7 +33,7 @@ import {
   type PlannedJob,
   type PlannedV63Job,
 } from "./segments";
-import { SseDeltaExtractor, sanitizeFinal, type SseFrame } from "./sse";
+import { TerminalBackedSseExtractor, sanitizeFinal, type SseFrame } from "./sse";
 import { matchesTerminalEnvelope, settleWithTerminalRescue } from "./terminal-rescue";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -401,7 +401,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   const stats = { bytes: 0, firstByteMs: null as number | null, frames: 0 };
   let notify: (() => void) | null = null;
   let closed = false;
-  const extractor = new SseDeltaExtractor();
+  const extractor = new TerminalBackedSseExtractor();
   let activeReqid: string | null = null;
 
   // --- job write plan -------------------------------------------------------
@@ -640,7 +640,15 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
               stats.firstByteMs = Date.now() - t0;
               console.log(`[slots ${tag}] ack latched at ${stats.firstByteMs}ms`);
             }
-            const freshFrames = extractor.feed(raw);
+            const hadDeferredGap = extractor.deferredGap !== null;
+            const freshFrames = extractor.feedProgress(raw);
+            if (!hadDeferredGap && extractor.deferredGap) {
+              console.warn(
+                `[slots ${tag}] incremental SSE window gap ` +
+                `(cursor=${extractor.deferredGap.cursor}, start=${extractor.deferredGap.windowStart}); ` +
+                "deferring deltas until authoritative terminal replay",
+              );
+            }
             if (freshFrames.length) {
               for (const f of freshFrames) frames.push(f);
               stats.frames += freshFrames.length;
@@ -688,12 +696,10 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             // only unconsumed frames come back. Tool-call deltas live here,
             // so skipping this breaks agentic clients (Codex).
             if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
-              const missed = extractor.feed(JSON.stringify({
-                streaming: true,
-                total: Number.isFinite(j.gp_total) ? j.gp_total : Array.from(j.gp_sse).length,
-                start: 0,
-                tail: j.gp_sse,
-              }));
+              const missed = extractor.replayTerminal(
+                j.gp_sse,
+                Number.isFinite(j.gp_total) ? j.gp_total : undefined,
+              );
               if (missed.length) {
                 for (const f of missed) frames.push(f);
                 stats.frames += missed.length;
@@ -759,12 +765,10 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             return null;
           }
           if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
-            const missed = extractor.feed(JSON.stringify({
-              streaming: true,
-              total: Number.isFinite(j.gp_total) ? j.gp_total : Array.from(j.gp_sse).length,
-              start: 0,
-              tail: j.gp_sse,
-            }));
+            const missed = extractor.replayTerminal(
+              j.gp_sse,
+              Number.isFinite(j.gp_total) ? j.gp_total : undefined,
+            );
             if (missed.length) {
               for (const f of missed) frames.push(f);
               stats.frames += missed.length;

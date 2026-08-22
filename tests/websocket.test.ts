@@ -88,6 +88,35 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("stream_id");
   });
 
+  it("accepts Codex clients that redundantly send stream:true", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const socket = await startServer(async body => {
+      bodies.push(body);
+      return relayHandle(Promise.resolve(completed("resp_codex")));
+    });
+    const messages = collect(socket);
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "codex",
+      model: "gpt-5.6-sol",
+      store: false,
+      stream: true,
+      input: "hello from Codex",
+    }));
+
+    await waitFor(() => messages.some(message =>
+      message.type === "response.completed" || message.type === "error"
+    ));
+    expect(messages.some(message => message.type === "error")).toBe(false);
+    expect(messages.some(message =>
+      message.type === "response.completed" && message.stream_id === "codex"
+    )).toBe(true);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toMatchObject({ stream: true, store: false });
+    expect(bodies[0]).not.toHaveProperty("stream_id");
+  });
+
   it("serializes the same lane while different lanes overlap", async () => {
     const gates = new Map<string, ReturnType<typeof deferred<any>>>();
     const started: string[] = [];
@@ -199,12 +228,13 @@ describe("Responses WebSocket server", () => {
     socket.send("not json");
     socket.send(JSON.stringify({ type: "response.create", stream_id: "bad space", input: "x" }));
     socket.send(JSON.stringify({ type: "response.create", stream_id: "background", background: true, input: "x" }));
-    socket.send(JSON.stringify({ type: "response.create", stream_id: "stream", stream: true, input: "x" }));
+    socket.send(JSON.stringify({ type: "response.create", stream_id: "stream", stream: false, input: "x" }));
     socket.send(JSON.stringify({ type: "response.create", stream_id: "one", input: "x" }));
     socket.send(JSON.stringify({ type: "response.create", stream_id: "two", input: "x" }));
     socket.send(JSON.stringify({ type: "response.create", stream_id: "three", input: "x" }));
     await waitFor(() => messages.filter(message => message.type === "error").length === 5);
     expect(messages.every(message => !("parsed" in message))).toBe(true);
+    expect(messages.some(message => message.error?.param === "stream")).toBe(true);
     expect(messages.some(message => message.error?.code === "websocket_stream_limit_reached")).toBe(true);
     expect(socket.readyState).toBe(WebSocket.OPEN);
   });

@@ -133,3 +133,37 @@ export class SseDeltaExtractor {
     return [];
   }
 }
+
+/**
+ * Slot streams are backed by an authoritative terminal transcript (`gp_sse`).
+ * If polling misses the beginning of the daemon's bounded window, preserve the
+ * strict extractor invariant but defer delivery until that transcript arrives.
+ * This never fabricates or skips frames: terminal replay starts at offset zero
+ * and the wrapped extractor's cursor makes already-delivered frames idempotent.
+ */
+export class TerminalBackedSseExtractor {
+  private readonly extractor = new SseDeltaExtractor();
+  deferredGap: SseProtocolGapError | null = null;
+
+  feedProgress(raw: string): SseFrame[] {
+    if (this.deferredGap) return [];
+    try {
+      return this.extractor.feed(raw);
+    } catch (error) {
+      if (!(error instanceof SseProtocolGapError)) throw error;
+      this.deferredGap = error;
+      return [];
+    }
+  }
+
+  replayTerminal(fullSse: string, total = codePointLength(fullSse)): SseFrame[] {
+    const frames = this.extractor.feed(JSON.stringify({
+      streaming: true,
+      total,
+      start: 0,
+      tail: fullSse,
+    }));
+    this.deferredGap = null;
+    return frames;
+  }
+}

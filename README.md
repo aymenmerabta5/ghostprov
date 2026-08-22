@@ -41,7 +41,7 @@ The Node adapter forwards each `ReadableStream` chunk with backpressure. It does
 WebSocket mode follows the [official OpenAI Responses WebSocket contract](https://developers.openai.com/api/docs/guides/websocket-mode/):
 
 - clients send direct `response.create` objects;
-- `stream` is implicit and must be omitted;
+- `stream` is implicit; official clients omit it, while GhostProv tolerates the redundant `stream: true` currently sent by Codex compatibility paths;
 - server events are direct event objects;
 - named events echo `stream_id`; default-lane events omit it;
 - requests sharing a lane execute FIFO and never overlap;
@@ -49,6 +49,16 @@ WebSocket mode follows the [official OpenAI Responses WebSocket contract](https:
 - `previous_response_id` controls lineage independently of the lane;
 - connection-local state supports `store:false` continuation and forks;
 - `previous_session_id` is not a public Codex/OpenAI field.
+
+Custom Codex providers must advertise WebSocket support:
+
+```toml
+[model_providers.custom]
+name = "GhostProv"
+env_key = "OPENAI_API_KEY"
+base_url = "http://127.0.0.1:8787/v1"
+supports_websockets = true
+```
 
 ```js
 import { WebSocket } from "ws";
