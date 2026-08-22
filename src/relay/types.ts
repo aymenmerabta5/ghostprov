@@ -136,6 +136,7 @@ export type ImageGenerationBackground = "transparent" | "opaque" | "auto" | stri
 export type ImageGenerationTool = {
   type: "image_generation";
   model?: string; // e.g. "gpt-image-1" | "gpt-image-1.5" | "gpt-image-2"
+  action?: "generate" | "edit" | string;
   quality?: ImageGenerationQuality;
   size?: ImageGenerationSize;
   output_format?: ImageGenerationFormat;
@@ -143,6 +144,8 @@ export type ImageGenerationTool = {
   background?: ImageGenerationBackground;
   moderation?: string;
   partial_images?: number;
+  input_fidelity?: "low" | "high" | string;
+  input_image_mask?: { file_id?: string; image_url?: string; [key: string]: unknown };
   [key: string]: unknown;
 };
 
