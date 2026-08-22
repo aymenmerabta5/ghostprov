@@ -21,6 +21,8 @@ export const CONFIG_DEFAULTS = {
   zipBatchMs: 10,
   wsActiveResponses: 16,
   wsNamedStreams: 32,
+  imageEditMaxInputBytes: 40 * 1024 * 1024,
+  imageEditHttpMaxBodyBytes: 42 * 1024 * 1024,
 } as const;
 
 const slots = integer(process.env.GP_SLOTS, CONFIG_DEFAULTS.slots);
@@ -28,6 +30,10 @@ const requestedConcurrency = process.env.PQUEUE_CONCURRENCY
   ? integer(process.env.PQUEUE_CONCURRENCY, slots)
   : slots;
 const responseConcurrency = Math.min(slots, requestedConcurrency);
+const imageEditMaxInputBytes = integer(
+  process.env.GP_IMAGE_EDIT_MAX_INPUT_BYTES,
+  CONFIG_DEFAULTS.imageEditMaxInputBytes,
+);
 
 export const config = {
   port: num(process.env.PORT, CONFIG_DEFAULTS.port),
@@ -64,6 +70,15 @@ export const config = {
   zipBatchMs: nonnegative(process.env.GP_ZIP_BATCH_MS, CONFIG_DEFAULTS.zipBatchMs),
   wsActiveResponses: integer(process.env.GP_WS_ACTIVE_RESPONSES, CONFIG_DEFAULTS.wsActiveResponses),
   wsNamedStreams: integer(process.env.GP_WS_NAMED_STREAMS, CONFIG_DEFAULTS.wsNamedStreams),
+  /** Responses orchestrator used by native-shaped Images compatibility routes. */
+  imageResponsesModel: (process.env.GP_IMAGE_RESPONSES_MODEL ?? "gpt-5.6-sol").trim() || "gpt-5.6-sol",
+  /** Maximum aggregate raw bytes across edit images and mask before base64 expansion. */
+  imageEditMaxInputBytes,
+  /** Multipart envelope limit applied while collecting POST /v1/images/edits. */
+  imageEditHttpMaxBodyBytes: Math.max(
+    imageEditMaxInputBytes,
+    integer(process.env.GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES, CONFIG_DEFAULTS.imageEditHttpMaxBodyBytes),
+  ),
   /** warn threshold for inline data URLs routed through Yjs */
   inlinePayloadWarnBytes: num(process.env.GP_INLINE_WARN_BYTES, 512 * 1024),
 } as const;

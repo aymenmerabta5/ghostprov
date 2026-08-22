@@ -449,6 +449,14 @@ export async function parseEditRequest(
   }
   const background = optionalEnum(backgroundText, BACKGROUNDS, "background");
   const outputFormat = formEnum(form, "output_format", OUTPUT_FORMATS);
+  const prompt = requiredPrompt(formString(form, "prompt"));
+  const model = parseModel(formString(form, "model"));
+  const n = parseFormCount(formString(form, "n"));
+  const quality = formEnum(form, "quality", QUALITIES);
+  const size = parseSize(formString(form, "size"));
+  const outputCompression = parseFormCompression(formString(form, "output_compression"), outputFormat);
+  const inputFidelity = formEnum(form, "input_fidelity", INPUT_FIDELITIES);
+  const user = parseUser(formString(form, "user"));
 
   const encodedImages = await Promise.all(images.map(async file => {
     const encoded = await encodeUploadedImage(file, "image");
@@ -465,18 +473,18 @@ export async function parseEditRequest(
   return {
     kind: "edit",
     responsesModel: options.responsesModel,
-    prompt: requiredPrompt(formString(form, "prompt")),
-    model: parseModel(formString(form, "model")),
-    n: parseFormCount(formString(form, "n")),
+    prompt,
+    model,
+    n,
     images: encodedImages,
     maskDataUrl: encodedMask,
-    quality: formEnum(form, "quality", QUALITIES),
-    size: parseSize(formString(form, "size")),
+    quality,
+    size,
     outputFormat,
-    outputCompression: parseFormCompression(formString(form, "output_compression"), outputFormat),
+    outputCompression,
     background,
-    inputFidelity: formEnum(form, "input_fidelity", INPUT_FIDELITIES),
-    user: parseUser(formString(form, "user")),
+    inputFidelity,
+    user,
   };
 }
 

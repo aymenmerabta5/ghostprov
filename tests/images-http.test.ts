@@ -1,0 +1,191 @@
+import { describe, expect, it } from "bun:test";
+import { Hono } from "hono";
+import { registerImageRoutes } from "../src/images/routes";
+import type { ImageCompatOptions } from "../src/images/compat";
+import type { RunHandle } from "../src/relay/pipeline";
+import { app as productionApp } from "../src/server";
+
+const OPTIONS: ImageCompatOptions = {
+  responsesModel: "gpt-5.6-sol",
+  maxEditInputBytes: 40 * 1024 * 1024,
+};
+const PNG = new Uint8Array([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  0x00, 0x00, 0x00, 0x0d,
+]);
+
+function imageFinal(result: string) {
+  return {
+    status: "completed",
+    created_at: 123,
+    output: [{
+      type: "image_generation_call",
+      status: "completed",
+      result,
+      background: "opaque",
+      output_format: "png",
+      quality: "low",
+      size: "1024x1024",
+    }],
+  };
+}
+
+function handle(final: Promise<unknown>): RunHandle {
+  return {
+    async *events() {},
+    final,
+    stats: { bytes: 0, firstByteMs: null, frames: 0 },
+  };
+}
+
+function testApp(startRelay: (body: Record<string, unknown>, signal?: AbortSignal) => Promise<RunHandle>) {
+  const app = new Hono();
+  registerImageRoutes(app, { options: OPTIONS, startRelay });
+  return app;
+}
+
+describe("Images compatibility HTTP routes", () => {
+  it("registers the compatibility routes on the production Hono app", async () => {
+    const imageResponse = await productionApp.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-image-2" }),
+    });
+    const audioResponse = await productionApp.request("/v1/audio/transcriptions", { method: "POST" });
+
+    expect(imageResponse.status).toBe(400);
+    expect(audioResponse.status).toBe(501);
+  });
+
+  it("returns native Images JSON while fanning n through separate relay calls", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const app = testApp(async body => {
+      bodies.push(body);
+      return handle(Promise.resolve(imageFinal(`PNG-${bodies.length}`)));
+    });
+
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: "a circle",
+        model: "gpt-image-2",
+        n: 2,
+        quality: "low",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      created: 123,
+      data: [{ b64_json: "PNG-1" }, { b64_json: "PNG-2" }],
+      background: "opaque",
+      output_format: "png",
+      quality: "low",
+      size: "1024x1024",
+    });
+    expect(bodies).toHaveLength(2);
+    expect((bodies[0].tools as any[])[0]).not.toHaveProperty("n");
+  });
+
+  it("parses multipart edits and sends an edit tool call", async () => {
+    let body: Record<string, unknown> | undefined;
+    const app = testApp(async value => {
+      body = value;
+      return handle(Promise.resolve(imageFinal("EDITED")));
+    });
+    const form = new FormData();
+    form.append("prompt", "make it blue");
+    form.append("image", new File([PNG], "input.png", { type: "image/png" }));
+
+    const response = await app.request("/v1/images/edits", { method: "POST", body: form });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ data: [{ b64_json: "EDITED" }] });
+    expect((body!.tools as any[])[0]).toMatchObject({
+      type: "image_generation",
+      model: "gpt-image-2",
+      action: "edit",
+    });
+  });
+
+  it("returns OpenAI-shaped validation errors without starting the relay", async () => {
+    let calls = 0;
+    const app = testApp(async () => {
+      calls++;
+      return handle(Promise.resolve(imageFinal("never")));
+    });
+
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-image-2" }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: {
+      message: "Missing required parameter: 'prompt'.",
+      type: "invalid_request_error",
+      param: "prompt",
+      code: "missing_required_parameter",
+    }});
+    expect(calls).toBe(0);
+  });
+
+  it("normalizes structured upstream failures", async () => {
+    const details = {
+      code: "http_400",
+      message: JSON.stringify({ error: {
+        message: "Upstream rejected the image",
+        type: "invalid_request_error",
+        param: "prompt",
+        code: "content_policy_violation",
+      }}),
+    };
+    const app = testApp(async () => handle(Promise.reject(Object.assign(
+      new Error("upstream failed"),
+      { kind: "upstream", details },
+    ))));
+
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "blocked" }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: {
+      code: "content_policy_violation",
+      param: "prompt",
+    }});
+  });
+
+  it("rejects malformed JSON with the standard error shape", async () => {
+    const app = testApp(async () => handle(Promise.resolve(imageFinal("never"))));
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: {
+      type: "invalid_request_error",
+      code: "invalid_json",
+    }});
+  });
+
+  it.each([
+    "/v1/images/variations",
+    "/v1/audio/speech",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+  ])("returns an explicit unsupported-capability error for %s", async path => {
+    const app = testApp(async () => handle(Promise.resolve(imageFinal("never"))));
+    const response = await app.request(path, { method: "POST" });
+    expect(response.status).toBe(501);
+    expect(await response.json()).toMatchObject({ error: {
+      type: "unsupported_feature",
+      code: "unsupported_feature",
+    }});
+  });
+});

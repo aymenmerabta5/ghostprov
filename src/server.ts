@@ -19,9 +19,11 @@ import { config } from "./config";
 import { runRelay } from "./relay/pipeline";
 import { sseFrame, SSE_HEADERS } from "./relay/sse";
 import { writeFetchResponse } from "./http/adapter";
-import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "./http/errors";
+import { collectRequestBody, contentLengthExceeds } from "./http/body";
+import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "./http/errors";
 import { ResponseScheduler, scheduleRelay } from "./relay/scheduler";
 import { attachResponsesWebSocket } from "./ws/server";
+import { registerImageRoutes } from "./images/routes";
 
 export const app = new Hono();
 export const responseScheduler = new ResponseScheduler(config.responseConcurrency);
@@ -216,6 +218,14 @@ app.post("/v1/responses", async (c) => {
   }
 });
 
+registerImageRoutes(app, {
+  options: {
+    responsesModel: config.imageResponsesModel,
+    maxEditInputBytes: config.imageEditMaxInputBytes,
+  },
+  startRelay: startScheduledRelay,
+});
+
 // ---------------------------------------------------------------------------
 // Files (vision / audio assets)
 // ---------------------------------------------------------------------------
@@ -262,9 +272,27 @@ if (isMain) {
       }
       let body: Buffer | undefined;
       if (req.method !== "GET" && req.method !== "HEAD") {
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk as Buffer);
-        if (chunks.length) body = Buffer.concat(chunks);
+        const pathname = new URL(req.url ?? "/", `http://${host}`).pathname;
+        const maxBodyBytes = pathname === "/v1/images/edits"
+          ? config.imageEditHttpMaxBodyBytes
+          : Number.POSITIVE_INFINITY;
+        if (contentLengthExceeds(req.headers["content-length"], maxBodyBytes)) {
+          req.resume();
+          await writeFetchResponse(res, apiErrorResponse(new ApiError(
+            413,
+            `Request body exceeds the configured ${maxBodyBytes}-byte limit.`,
+            { type: "invalid_request_error", param: "body", code: "request_too_large" },
+          )));
+          return;
+        }
+        try {
+          const collected = await collectRequestBody(req, maxBodyBytes);
+          if (collected.length) body = collected;
+        } catch (error) {
+          req.resume();
+          await writeFetchResponse(res, apiErrorResponse(error));
+          return;
+        }
       }
       const request = new Request(`http://${host}${req.url}`, {
         method: req.method,
