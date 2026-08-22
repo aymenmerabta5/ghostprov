@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { Clock } from "../src/core/ports";
-import { SandboxHeartbeat } from "../src/sandbox/heartbeat";
+import {
+  SandboxHeartbeat,
+  heartbeatPhaseOffset,
+} from "../src/sandbox/heartbeat";
 import { projectId } from "../src/sandbox/types";
 import type { HeartbeatResult } from "../src/sandbox/gateway";
 
@@ -64,6 +67,30 @@ const PROJECTS = [
 ];
 
 describe("SandboxHeartbeat", () => {
+  it("phases many projects deterministically while preserving exact cadence", async () => {
+    const projects = Array.from({ length: 32 }, (_, index) => projectId(
+      `${index.toString(16).padStart(8, "0")}-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+    ));
+    const offsets = projects.map(project => heartbeatPhaseOffset(project));
+    expect(offsets.every(offset => offset >= 0 && offset < 10_000)).toBe(true);
+    expect(new Set(offsets).size).toBeGreaterThan(16);
+    expect(projects.map(project => heartbeatPhaseOffset(project))).toEqual(offsets);
+
+    const clock = new ManualClock();
+    const gateway = new FakeHeartbeatGateway(clock);
+    const heartbeat = new SandboxHeartbeat({
+      projectId: projects[0],
+      gateway,
+      clock,
+    });
+    heartbeat.start();
+    await clock.advanceBy(offsets[0]);
+    await clock.advanceBy(10_000);
+    await clock.advanceBy(10_000);
+    expect(gateway.calls).toEqual([offsets[0], offsets[0] + 10_000, offsets[0] + 20_000]);
+    await heartbeat.stop();
+  });
+
   it("heartbeats every sandbox on independent ten-second deadlines", async () => {
     const clock = new ManualClock();
     const gateways = PROJECTS.map(() => new FakeHeartbeatGateway(clock));

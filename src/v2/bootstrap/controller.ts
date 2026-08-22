@@ -5,7 +5,9 @@ import type { RenderSyncState } from "../../sandbox/ydoc";
 import type { ProjectId } from "../../sandbox/types";
 import type { AwarenessChannel } from "../awareness/channel";
 import {
+  createCredentialRotationKey,
   sealBootstrapCredential,
+  sealCredentialRotation,
   type BootstrapBinding,
   type SealedBootstrapCredential,
 } from "./crypto";
@@ -288,6 +290,7 @@ export class V2BootstrapController {
   readonly #random: RandomSource;
   #ready: V2ReadyDescriptor | null = null;
   #readyBinding: BootstrapBinding | null = null;
+  #rotationKey: string | null = null;
   #ensuring: Promise<V2ReadyDescriptor> | null = null;
   #revision = 0;
   #hostSequence = 0;
@@ -368,6 +371,42 @@ export class V2BootstrapController {
     return ensuring;
   }
 
+  async sealCredentialRotation(
+    ySweet: YSweetEnvelope,
+    rotationId: string,
+  ): Promise<string> {
+    const descriptor = this.#ready;
+    const binding = this.#readyBinding;
+    const rotationKey = this.#rotationKey;
+    if (!descriptor || !binding || !rotationKey) {
+      throw new V2BootstrapError("Sidecar is not ready for credential rotation", "readiness", 1);
+    }
+    const sealed = await sealCredentialRotation({
+      rotationKey,
+      binding: {
+        projectId: binding.projectId,
+        sandboxSessionId: binding.sandboxSessionId,
+        leaderGeneration: binding.leaderGeneration,
+        buildHash: binding.buildHash,
+        schemaHash: binding.schemaHash,
+        instanceId: descriptor.instanceId,
+        rotationId,
+      },
+      credential: {
+        url: ySweet.url,
+        baseUrl: ySweet.baseUrl,
+        docId: ySweet.docId,
+        token: ySweet.token.reveal(),
+        authorization: ySweet.authorization,
+      },
+    });
+    const serialized = canonicalJson(sealed);
+    if (serialized.length > 10_000) {
+      throw new V2BootstrapError("Encrypted credential rotation is too large", "crypto", 1);
+    }
+    return serialized;
+  }
+
   async ping(signal?: AbortSignal): Promise<number> {
     const descriptor = this.#ready;
     const binding = this.#readyBinding;
@@ -442,6 +481,7 @@ export class V2BootstrapController {
       this.#awareness.clear();
       this.#ready = null;
       this.#readyBinding = null;
+      this.#rotationKey = null;
       await this.#cleanupTransient(true);
     } finally {
       unsubscribe();
@@ -469,6 +509,7 @@ export class V2BootstrapController {
         schemaHash: this.#assets.schemaHash,
         nonce: this.#random.uuid(),
       };
+      this.#rotationKey = null;
       try {
         const descriptor = await this.#attempt(binding, attempt, signal);
         await this.#cleanupTransient(true);
@@ -537,6 +578,7 @@ export class V2BootstrapController {
     }
 
     const hello = await this.#waitForHello(binding, attempt, signal);
+    const rotationKey = createCredentialRotationKey();
     let sealed: SealedBootstrapCredential;
     try {
       sealed = await sealBootstrapCredential({
@@ -548,6 +590,7 @@ export class V2BootstrapController {
           docId: this.#ySweet.docId,
           token: this.#ySweet.token.reveal(),
           authorization: this.#ySweet.authorization,
+          rotationKey,
         },
       });
     } catch (cause) {
@@ -559,13 +602,15 @@ export class V2BootstrapController {
     try {
       await this.#ydoc.writePath(CIPHERTEXT_PATH, canonicalJson(sealed));
       await this.#gateway.syncWorkspace(signal);
-      return await this.#waitForReadiness(
+      const descriptor = await this.#waitForReadiness(
         binding,
         hello.instanceId,
         readiness,
         attempt,
         signal,
       );
+      this.#rotationKey = rotationKey;
+      return descriptor;
     } catch (cause) {
       if (cause instanceof V2BootstrapError) throw cause;
       if (cause instanceof DOMException && cause.name === "AbortError") throw cause;

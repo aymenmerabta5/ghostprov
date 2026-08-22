@@ -26,6 +26,7 @@ export interface BootstrapCredentialPayload {
   docId: string;
   token: string;
   authorization: string;
+  rotationKey: string;
 }
 
 export interface SealedBootstrapCredential {
@@ -33,6 +34,25 @@ export interface SealedBootstrapCredential {
   binding: BootstrapBinding;
   hostPublicJwk: JsonWebKey;
   salt: string;
+  iv: string;
+  ciphertext: string;
+}
+
+export interface CredentialRotationBinding {
+  projectId: string;
+  sandboxSessionId: string;
+  leaderGeneration: number;
+  buildHash: string;
+  schemaHash: string;
+  instanceId: string;
+  rotationId: string;
+}
+
+export type RotatableCredentialPayload = Omit<BootstrapCredentialPayload, "rotationKey">;
+
+export interface SealedCredentialRotation {
+  version: 1;
+  binding: CredentialRotationBinding;
   iv: string;
   ciphertext: string;
 }
@@ -113,10 +133,10 @@ function validateUrl(value: string, protocols: readonly string[], label: string)
   return value;
 }
 
-function validateCredential(
-  value: BootstrapCredentialPayload,
+function validateRotatableCredential(
+  value: RotatableCredentialPayload,
   binding: BootstrapBinding,
-): BootstrapCredentialPayload {
+): RotatableCredentialPayload {
   if (!value || typeof value !== "object") {
     throw new BootstrapCryptoError("Bootstrap credential must be an object", "payload");
   }
@@ -140,6 +160,15 @@ function validateCredential(
     token: value.token,
     authorization: value.authorization,
   };
+}
+
+function validateCredential(
+  value: BootstrapCredentialPayload,
+  binding: BootstrapBinding,
+): BootstrapCredentialPayload {
+  const credential = validateRotatableCredential(value, binding);
+  rotationKeyBytes(value.rotationKey).fill(0);
+  return { ...credential, rotationKey: value.rotationKey };
 }
 
 async function importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
@@ -339,5 +368,176 @@ export async function openBootstrapCredential(input: {
     associatedData.fill(0);
     derived.shared.fill(0);
     sealed.ciphertext.fill(0);
+  }
+}
+
+function validateRotationBinding(
+  value: CredentialRotationBinding,
+): CredentialRotationBinding {
+  const bootstrap = validateBinding({
+    projectId: value.projectId,
+    sandboxSessionId: value.sandboxSessionId,
+    leaderGeneration: value.leaderGeneration,
+    buildHash: value.buildHash,
+    schemaHash: value.schemaHash,
+    nonce: value.rotationId,
+  });
+  if (!SAFE_ID.test(value.instanceId)) {
+    throw new BootstrapCryptoError("Credential rotation instance is invalid", "binding");
+  }
+  return {
+    projectId: bootstrap.projectId,
+    sandboxSessionId: bootstrap.sandboxSessionId,
+    leaderGeneration: bootstrap.leaderGeneration,
+    buildHash: bootstrap.buildHash,
+    schemaHash: bootstrap.schemaHash,
+    instanceId: value.instanceId,
+    rotationId: bootstrap.nonce,
+  };
+}
+
+function rotationKeyBytes(value: string): Uint8Array {
+  let bytes: Uint8Array;
+  try {
+    bytes = base64UrlDecode(value);
+  } catch {
+    throw new BootstrapCryptoError("Credential rotation key is invalid", "key");
+  }
+  if (bytes.byteLength !== 32) {
+    bytes.fill(0);
+    throw new BootstrapCryptoError("Credential rotation key must be 256 bits", "key");
+  }
+  return bytes;
+}
+
+async function importRotationKey(
+  value: string,
+  usages: KeyUsage[],
+): Promise<{ key: CryptoKey; bytes: Uint8Array }> {
+  const bytes = rotationKeyBytes(value);
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      buffer(bytes),
+      { name: "AES-GCM", length: 256 },
+      false,
+      usages,
+    );
+    return { key, bytes };
+  } catch {
+    bytes.fill(0);
+    throw new BootstrapCryptoError("Credential rotation key import failed", "key");
+  }
+}
+
+export function createCredentialRotationKey(): string {
+  return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+export async function sealCredentialRotation(input: {
+  rotationKey: string;
+  binding: CredentialRotationBinding;
+  credential: RotatableCredentialPayload;
+}): Promise<SealedCredentialRotation> {
+  const binding = validateRotationBinding(input.binding);
+  const credential = validateRotatableCredential(input.credential, {
+    projectId: binding.projectId,
+    sandboxSessionId: binding.sandboxSessionId,
+    leaderGeneration: binding.leaderGeneration,
+    buildHash: binding.buildHash,
+    schemaHash: binding.schemaHash,
+    nonce: binding.rotationId,
+  });
+  const imported = await importRotationKey(input.rotationKey, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = utf8Bytes(canonicalJson(credential));
+  const associatedData = utf8Bytes(canonicalJson(binding));
+  try {
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: buffer(iv),
+        additionalData: buffer(associatedData),
+        tagLength: 128,
+      },
+      imported.key,
+      buffer(plaintext),
+    ));
+    return {
+      version: 1,
+      binding,
+      iv: base64UrlEncode(iv),
+      ciphertext: base64UrlEncode(ciphertext),
+    };
+  } catch {
+    throw new BootstrapCryptoError("Credential rotation encryption failed", "ciphertext");
+  } finally {
+    imported.bytes.fill(0);
+    plaintext.fill(0);
+    associatedData.fill(0);
+  }
+}
+
+export async function openCredentialRotation(input: {
+  rotationKey: string;
+  sealed: SealedCredentialRotation;
+  expectedBinding: CredentialRotationBinding;
+}): Promise<RotatableCredentialPayload> {
+  const expected = validateRotationBinding(input.expectedBinding);
+  const sealed = input.sealed;
+  if (!sealed || typeof sealed !== "object" || sealed.version !== 1) {
+    throw new BootstrapCryptoError("Sealed credential rotation is invalid", "ciphertext");
+  }
+  const binding = validateRotationBinding(sealed.binding);
+  if (canonicalJson(binding) !== canonicalJson(expected)) {
+    throw new BootstrapCryptoError("Credential rotation binding does not match", "binding");
+  }
+  let iv: Uint8Array;
+  let ciphertext: Uint8Array;
+  try {
+    iv = base64UrlDecode(sealed.iv);
+    ciphertext = base64UrlDecode(sealed.ciphertext);
+  } catch {
+    throw new BootstrapCryptoError("Credential rotation bytes are invalid", "ciphertext");
+  }
+  if (iv.byteLength !== 12 || ciphertext.byteLength < 16) {
+    throw new BootstrapCryptoError("Credential rotation byte lengths are invalid", "ciphertext");
+  }
+  const imported = await importRotationKey(input.rotationKey, ["decrypt"]);
+  const associatedData = utf8Bytes(canonicalJson(expected));
+  let plaintext: Uint8Array | null = null;
+  try {
+    plaintext = new Uint8Array(await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: buffer(iv),
+        additionalData: buffer(associatedData),
+        tagLength: 128,
+      },
+      imported.key,
+      buffer(ciphertext),
+    ));
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(utf8Text(plaintext));
+    } catch {
+      throw new BootstrapCryptoError("Credential rotation payload is invalid", "payload");
+    }
+    return validateRotatableCredential(decoded as RotatableCredentialPayload, {
+      projectId: expected.projectId,
+      sandboxSessionId: expected.sandboxSessionId,
+      leaderGeneration: expected.leaderGeneration,
+      buildHash: expected.buildHash,
+      schemaHash: expected.schemaHash,
+      nonce: expected.rotationId,
+    });
+  } catch (error) {
+    if (error instanceof BootstrapCryptoError) throw error;
+    throw new BootstrapCryptoError("Credential rotation decryption failed", "ciphertext");
+  } finally {
+    imported.bytes.fill(0);
+    plaintext?.fill(0);
+    associatedData.fill(0);
+    ciphertext.fill(0);
   }
 }

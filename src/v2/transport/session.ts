@@ -76,6 +76,7 @@ export interface V2TransportSessionOptions {
   maxBufferedResponseBytes?: number;
   hostCeiling?: number;
   retransmitMs?: number;
+  rotationTimeoutMs?: number;
 }
 
 interface EventPart {
@@ -109,6 +110,14 @@ interface RequestState {
   assemblies: Map<number, EventAssembly>;
   completedEvents: Map<number, SseFrame>;
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
+}
+
+interface RotationWaiter {
+  resolve: () => void;
+  reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 function abortError(message: string): DOMException {
@@ -155,13 +164,15 @@ export class V2TransportSession {
   readonly #gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
   readonly #maxResponseBytes: number;
   readonly #maxBufferedResponseBytes: number;
-  readonly #hostCeiling: number;
+  #hostCeiling: number;
   readonly #retransmitMs: number;
+  readonly #rotationTimeoutMs: number;
   readonly #hostInstanceId = `host-${crypto.randomUUID()}`;
   readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
   readonly #requests = new Map<string, RequestState>();
+  readonly #rotations = new Map<string, RotationWaiter>();
   readonly #pending: RequestState[] = [];
   readonly #idleWaiters = new Set<() => void>();
   readonly #retiredSidecarInstances = new Set<string>();
@@ -211,6 +222,10 @@ export class V2TransportSession {
     if (!Number.isFinite(retransmitMs) || retransmitMs < 1) {
       throw new RangeError("retransmitMs must be positive");
     }
+    const rotationTimeoutMs = options.rotationTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(rotationTimeoutMs) || rotationTimeoutMs < 1) {
+      throw new RangeError("rotationTimeoutMs must be a positive safe integer");
+    }
     this.#binding = options.binding;
     this.#channel = options.channel;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -219,6 +234,7 @@ export class V2TransportSession {
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
     this.#hostCeiling = hostCeiling;
     this.#retransmitMs = retransmitMs;
+    this.#rotationTimeoutMs = rotationTimeoutMs;
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -338,6 +354,53 @@ export class V2TransportSession {
     await this.close();
   }
 
+  rotateCredential(
+    rotationId: string,
+    sealedJson: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.#connected || this.#closed || this.#draining) {
+      return Promise.reject(new Error("V2 transport is unavailable for credential rotation"));
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rotationId)) {
+      return Promise.reject(new TypeError("rotationId is invalid"));
+    }
+    if (typeof sealedJson !== "string" || sealedJson.length < 1 || sealedJson.length > 10_000) {
+      return Promise.reject(new RangeError("sealed credential rotation is invalid"));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(abortError("Credential rotation aborted"));
+    }
+    if (this.#rotations.has(rotationId)) {
+      return Promise.reject(new Error(`Credential rotation is already pending: ${rotationId}`));
+    }
+    const pending = new Promise<void>((resolve, reject) => {
+      const waiter: RotationWaiter = { resolve, reject, signal };
+      waiter.onAbort = () => {
+        if (this.#rotations.get(rotationId) !== waiter) return;
+        this.#rotations.delete(rotationId);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        reject(abortError("Credential rotation aborted"));
+      };
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.#rotations.set(rotationId, waiter);
+      waiter.timer = setTimeout(() => {
+        if (this.#rotations.get(rotationId) !== waiter) return;
+        this.#rotations.delete(rotationId);
+        signal?.removeEventListener("abort", waiter.onAbort!);
+        reject(new Error(`Credential rotation ACK timed out: ${rotationId}`));
+      }, this.#rotationTimeoutMs);
+    });
+    void pending.catch(() => undefined);
+    this.#scheduler.enqueue("control", `rotation:${rotationId}`, {
+      kind: "credential_rotate",
+      rotationId,
+      sealedJson,
+    });
+    if (this.#pump()) this.#publish(false);
+    return pending;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -358,6 +421,12 @@ export class V2TransportSession {
       } else {
         this.#failPreCommit(state, error);
       }
+    }
+    for (const [rotationId, waiter] of this.#rotations) {
+      waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(error);
+      this.#rotations.delete(rotationId);
     }
     this.#drainReject?.(error);
     this.#drainResolve = null;
@@ -382,6 +451,15 @@ export class V2TransportSession {
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#awarenessRttMs,
     };
+  }
+
+  setHostCeiling(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 128) {
+      throw new RangeError("host ceiling must be an integer from 0 through 128");
+    }
+    if (value === this.#hostCeiling) return;
+    this.#hostCeiling = value;
+    if (this.#connected && !this.#closed) this.#publish(false);
   }
 
   readonly #onAwarenessUpdate = (
@@ -537,8 +615,16 @@ export class V2TransportSession {
           this.#drainReject = null;
         }
         return;
+      case "credential_ack": {
+        const waiter = this.#rotations.get(frame.rotationId);
+        if (!waiter) return;
+        this.#rotations.delete(frame.rotationId);
+        waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.resolve();
+        return;
+      }
       case "pong":
-      case "credential_ack":
         return;
     }
   }

@@ -27,6 +27,7 @@ function credential(token = "ysweet-token-canary"): BootstrapCredentialPayload {
     docId: PROJECT,
     token,
     authorization: "full",
+    rotationKey: "A".repeat(43),
   };
 }
 

@@ -174,6 +174,7 @@ The isolated suite includes:
 - `tests/slot-runner.test.ts`
 - `tests/sse.test.ts`
 - `tests/terminal-rescue.test.ts`
+- `tests/transport-selector.test.ts`
 - `tests/unlatch-recovery.test.ts`
 - `tests/v2-awareness-channel.test.ts`
 - `tests/v2-admission.test.ts`
@@ -181,13 +182,16 @@ The isolated suite includes:
 - `tests/v2-bootstrap-crypto.test.ts`
 - `tests/v2-bootstrap-controller.test.ts`
 - `tests/v2-bootstrap-probe.test.ts`
+- `tests/v2-credential-rotation.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-run-handle.test.ts`
+- `tests/v2-runtime.test.ts`
 - `tests/v2-scheduler.test.ts`
 - `tests/v2-sidecar-assets.test.ts`
 - `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
+- `tests/v2-sidecar-rotation.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`

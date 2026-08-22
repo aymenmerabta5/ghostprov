@@ -12,7 +12,9 @@ import {
 } from "../src/v2/bootstrap/controller";
 import {
   createBootstrapKeyPair,
+  openCredentialRotation,
   openBootstrapCredential,
+  type BootstrapCredentialPayload,
   type BootstrapBinding,
   type SealedBootstrapCredential,
 } from "../src/v2/bootstrap/crypto";
@@ -216,6 +218,7 @@ function bootstrapHarness(fault: Fault = "none") {
   const awareness = new FakeAwareness();
   const gateway = new FakeGateway(ydoc, fault);
   const decrypted: string[] = [];
+  const decryptedCredentials: BootstrapCredentialPayload[] = [];
   const ySweet = parseYSweetEnvelope({
     url: `wss://prism.test/y/d/${PROJECT}/ws`,
     baseUrl: `https://prism.test/y/d/${PROJECT}`,
@@ -232,6 +235,7 @@ function bootstrapHarness(fault: Fault = "none") {
       expectedBinding: current.binding,
     });
     decrypted.push(credential.token);
+    decryptedCredentials.push(credential);
     if (fault !== "timeout") {
       awareness.sidecar(readyEnvelope(current.binding, current.instanceId, fault));
     }
@@ -252,7 +256,17 @@ function bootstrapHarness(fault: Fault = "none") {
     clock,
     random,
   });
-  return { controller, clock, random, ydoc, awareness, gateway, decrypted, ySweet };
+  return {
+    controller,
+    clock,
+    random,
+    ydoc,
+    awareness,
+    gateway,
+    decrypted,
+    decryptedCredentials,
+    ySweet,
+  };
 }
 
 describe("V2BootstrapController", () => {
@@ -341,6 +355,35 @@ describe("V2BootstrapController", () => {
       kind: "ping",
       sequence: 0,
     });
+  });
+
+  it("seals same-instance credential rotation with the in-memory bootstrap key", async () => {
+    const harness = bootstrapHarness();
+    const descriptor = await harness.controller.ensureReady();
+    const rotated = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "rotated-y-token",
+      authorization: "full",
+    });
+
+    const serialized = await harness.controller.sealCredentialRotation(rotated, "rotation-1");
+
+    expect(serialized).not.toContain("rotated-y-token");
+    await expect(openCredentialRotation({
+      rotationKey: harness.decryptedCredentials[0]!.rotationKey,
+      sealed: JSON.parse(serialized),
+      expectedBinding: {
+        projectId: PROJECT,
+        sandboxSessionId: "sandbox-session-1",
+        leaderGeneration: 4,
+        buildHash: BUILD_HASH,
+        schemaHash: SCHEMA_HASH,
+        instanceId: descriptor.instanceId,
+        rotationId: "rotation-1",
+      },
+    })).resolves.toMatchObject({ token: "rotated-y-token" });
   });
 
   it.each([

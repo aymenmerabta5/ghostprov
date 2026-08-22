@@ -1,12 +1,14 @@
 import * as Y from "npm:yjs@13.6.27";
 import { YSweetProvider } from "npm:@y-sweet/client@0.9.1";
 import type { BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
+import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
+  type ReliableFrame,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared.ts";
 import { parseAwarenessEnvelope } from "../../src/v2/protocol/validate.ts";
@@ -32,6 +34,7 @@ export class DenoAwarenessPeer {
   readonly #binding: ProtocolBinding;
   readonly #instanceId: string;
   readonly #engine: SidecarEngine;
+  readonly #rotator: SidecarCredentialRotator;
   readonly #doc: Y.Doc;
   readonly #provider: YSweetProvider;
   readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
@@ -44,20 +47,26 @@ export class DenoAwarenessPeer {
   #hostRevision = -1;
   #timer: number | null = null;
   #closed = false;
+  #acceptChain: Promise<void> = Promise.resolve();
 
   constructor(options: DenoAwarenessPeerOptions) {
     this.#binding = options.binding;
     this.#instanceId = options.instanceId;
     this.#engine = options.engine;
+    this.#rotator = new SidecarCredentialRotator({
+      credential: options.credential,
+      binding: options.binding,
+      instanceId: options.instanceId,
+    });
     this.#retransmitMs = options.retransmitMs ?? 250;
     this.#doc = new Y.Doc({ guid: options.credential.docId });
     this.#provider = new YSweetProvider(
-      async () => options.credential as any,
+      async () => this.#clientToken(this.#rotator.current()),
       options.credential.docId,
       this.#doc,
       {
         connect: false,
-        initialClientToken: options.credential as any,
+        initialClientToken: this.#clientToken(options.credential),
         offlineSupport: false,
         showDebuggerLink: false,
       },
@@ -89,6 +98,7 @@ export class DenoAwarenessPeer {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#timer !== null) clearInterval(this.#timer);
+    await this.#acceptChain.catch(() => undefined);
     this.#provider.awareness.off("change", this.#onAwarenessChange);
     this.#provider.awareness.setLocalState(null);
     this.#provider.disconnect();
@@ -128,7 +138,9 @@ export class DenoAwarenessPeer {
         if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
         const frames = this.#inbound.accept(envelope.frames);
         for (const frame of frames) {
-          void this.#engine.accept(frame).catch(() => undefined);
+          this.#acceptChain = this.#acceptChain
+            .then(() => this.#acceptHostFrame(frame))
+            .catch(() => undefined);
         }
         this.#pump();
       } catch {
@@ -175,5 +187,24 @@ export class DenoAwarenessPeer {
       frames: outbound.frames,
     };
     this.#provider.awareness.setLocalStateField("ghostprovV2", envelope);
+  }
+
+  async #acceptHostFrame(frame: ReliableFrame<HostFrame>): Promise<void> {
+    if (frame.kind !== "credential_rotate") {
+      await this.#engine.accept(frame);
+      return;
+    }
+    const credential = await this.#rotator.accept(frame.rotationId, frame.sealedJson);
+    this.#provider.clientToken = this.#clientToken(credential);
+    this.enqueue(
+      { kind: "credential_ack", rotationId: frame.rotationId },
+      "control",
+      "credential",
+    );
+  }
+
+  #clientToken(credential: BootstrapCredentialPayload): any {
+    const { rotationKey: _rotationKey, ...clientToken } = credential;
+    return clientToken;
   }
 }

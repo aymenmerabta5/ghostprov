@@ -216,4 +216,46 @@ describe("Awareness channels", () => {
 
     await expect(pending).rejects.toMatchObject({ kind: "closed" });
   });
+
+  it("updates the credential source used by future reconnects", async () => {
+    const first = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret-1",
+      authorization: "full",
+    });
+    let current!: () => typeof first;
+    const channel = new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: first,
+      localPeerId: "host",
+      field: "ghostprovV2",
+      parseRemote: value => parseAwarenessEnvelope(value, BINDING, "sidecar"),
+      providerFactory: (doc, credential) => {
+        current = credential;
+        return new FakeProvider(doc);
+      },
+      syncTimeoutMs: 100,
+    });
+    await channel.connect();
+    const rotated = parseYSweetEnvelope({
+      url: first.url,
+      baseUrl: first.baseUrl,
+      docId: PROJECT,
+      token: "y-secret-2",
+      authorization: "full",
+    });
+
+    channel.rotateCredential(rotated);
+
+    expect(current().token.reveal()).toBe("y-secret-2");
+    expect(() => channel.rotateCredential(parseYSweetEnvelope({
+      url: first.url,
+      baseUrl: first.baseUrl,
+      docId: "69288e8b-c183-45f3-9131-d64b05b98928",
+      token: "foreign",
+      authorization: "full",
+    }))).toThrow("another project");
+    await channel.close();
+  });
 });

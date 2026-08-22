@@ -1,4 +1,5 @@
 import type { ProjectId } from "../../sandbox/types";
+import type { YSweetEnvelope } from "../../prism/protocol";
 import type { AwarenessEnvelope } from "../protocol/shared";
 
 export interface AwarenessPeerUpdate<T> {
@@ -14,5 +15,6 @@ export interface AwarenessChannel<TLocal, TRemote> {
   clear(): void;
   subscribe(listener: (update: AwarenessPeerUpdate<TRemote>) => void): () => void;
   peerIds(): readonly string[];
+  rotateCredential?(envelope: YSweetEnvelope): void;
   close(): Promise<void>;
 }

@@ -62,6 +62,7 @@ class TransportHarness {
     maxResponseBytes?: number;
     maxBufferedResponseBytes?: number;
     gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+    rotationTimeoutMs?: number;
   } = {}) {
     this.network = new FakeAwarenessNetwork({ drop: options.drop });
     this.host = this.network.connectHost("host", PROJECT);
@@ -86,6 +87,7 @@ class TransportHarness {
       maxResponseBytes: options.maxResponseBytes ?? 2 * 1024 * 1024,
       maxBufferedResponseBytes: options.maxBufferedResponseBytes,
       gzip: options.gzip,
+      rotationTimeoutMs: options.rotationTimeoutMs,
       retransmitMs: options.retransmitMs ?? 250,
     });
   }
@@ -462,6 +464,41 @@ describe("V2TransportSession", () => {
     await harness.settle();
     await expect(draining).resolves.toBeUndefined();
     expect(harness.session.snapshot().connected).toBe(false);
+    await harness.close();
+  });
+
+  it("settles credential rotation only after a matching sidecar ACK", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const rotating = harness.session.rotateCredential(
+      "rotation-1",
+      JSON.stringify({ encrypted: "ciphertext" }),
+    );
+    await harness.settle();
+    expect([...harness.hostFrames.values()]).toContainEqual(expect.objectContaining({
+      kind: "credential_rotate",
+      rotationId: "rotation-1",
+    }));
+    expect(await promiseState(rotating)).toBe("pending");
+
+    harness.publish([{ kind: "credential_ack", rotationId: "rotation-1" }]);
+    await harness.settle();
+
+    await expect(rotating).resolves.toBeUndefined();
+    await harness.close();
+  });
+
+  it("bounds a credential rotation whose ACK never arrives", async () => {
+    const harness = new TransportHarness({ rotationTimeoutMs: 5 });
+    await harness.start();
+
+    const result = await Promise.race([
+      harness.session.rotateCredential("rotation-timeout", "ciphertext")
+        .then(() => "resolved", () => "rejected"),
+      Bun.sleep(30).then(() => "hung"),
+    ]);
+
+    expect(result).toBe("rejected");
     await harness.close();
   });
 

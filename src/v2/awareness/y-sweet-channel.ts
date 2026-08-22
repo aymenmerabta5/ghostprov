@@ -42,24 +42,26 @@ export interface YSweetAwarenessChannelOptions<TLocal, TRemote> {
   localPeerId: string;
   field: "ghostprovV2";
   parseRemote(value: unknown): AwarenessEnvelope<TRemote>;
-  providerFactory?: (doc: Y.Doc) => AwarenessProviderLike;
+  providerFactory?: (
+    doc: Y.Doc,
+    credential: () => YSweetEnvelope,
+  ) => AwarenessProviderLike;
   syncTimeoutMs?: number;
 }
 
 function defaultProviderFactory(
-  envelope: YSweetEnvelope,
+  credential: () => YSweetEnvelope,
 ): (doc: Y.Doc) => AwarenessProviderLike {
-  const token = envelope.token.reveal();
   class AuthenticatedWebSocket extends WebSocket {
     constructor(url: string | URL, protocols?: string | string[]) {
       const target = new URL(String(url));
-      target.searchParams.set("token", token);
+      target.searchParams.set("token", credential().token.reveal());
       super(target, protocols as any);
     }
   }
   return doc => new WebsocketProvider(
-    envelope.url,
-    envelope.docId,
+    credential().url,
+    credential().docId,
     doc,
     {
       connect: false,
@@ -84,6 +86,7 @@ implements AwarenessChannel<TLocal, TRemote> {
   #closed = false;
   #connecting: Promise<void> | null = null;
   #cancelConnecting: ((error: Error) => void) | null = null;
+  #credential: YSweetEnvelope;
 
   constructor(options: YSweetAwarenessChannelOptions<TLocal, TRemote>) {
     if (!options.localPeerId || options.localPeerId.length > 128) {
@@ -94,14 +97,16 @@ implements AwarenessChannel<TLocal, TRemote> {
       throw new AwarenessChannelError("syncTimeoutMs must be positive", "state");
     }
     this.projectId = options.envelope.docId;
+    this.#credential = options.envelope;
     this.localPeerId = options.localPeerId;
     this.#field = options.field;
     this.#parseRemote = options.parseRemote;
     this.#syncTimeoutMs = timeout;
     this.#doc = new Y.Doc({ guid: options.envelope.docId });
-    this.#provider = (options.providerFactory ?? defaultProviderFactory(options.envelope))(
-      this.#doc,
-    );
+    const credential = () => this.#credential;
+    this.#provider = options.providerFactory
+      ? options.providerFactory(this.#doc, credential)
+      : defaultProviderFactory(credential)(this.#doc);
     this.#provider.awareness.on("change", this.#onAwarenessChange);
   }
 
@@ -176,6 +181,19 @@ implements AwarenessChannel<TLocal, TRemote> {
 
   peerIds(): readonly string[] {
     return [...new Set(this.#peers.values())].sort();
+  }
+
+  rotateCredential(envelope: YSweetEnvelope): void {
+    if (this.#closed) {
+      throw new AwarenessChannelError("Awareness channel is closed", "closed");
+    }
+    if (envelope.docId !== this.projectId) {
+      throw new AwarenessChannelError(
+        "Rotated Y-Sweet credential belongs to another project",
+        "state",
+      );
+    }
+    this.#credential = envelope;
   }
 
   async close(): Promise<void> {

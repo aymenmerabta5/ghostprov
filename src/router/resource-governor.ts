@@ -128,6 +128,26 @@ export class ResourceGovernor {
     });
   }
 
+  capacityHint(perActiveRequestBytes: number, physicalMaximum: number): number {
+    if (!Number.isFinite(perActiveRequestBytes) || perActiveRequestBytes <= 0) {
+      throw new RangeError("perActiveRequestBytes must be positive");
+    }
+    if (!Number.isSafeInteger(physicalMaximum) || physicalMaximum < 0) {
+      throw new RangeError("physicalMaximum must be a non-negative safe integer");
+    }
+    this.refreshPressure();
+    const snapshot = this.snapshot();
+    if (snapshot.paused) return 0;
+    const remaining = Math.max(
+      0,
+      snapshot.reservationCapacityBytes - snapshot.reservedBytes,
+    );
+    return Math.max(
+      0,
+      Math.min(physicalMaximum, Math.floor(remaining / perActiveRequestBytes)),
+    );
+  }
+
   tryAcquireCpu(): ReleasableLease | null {
     if (this.#cpuActive >= this.#sizing.cpuTransformWorkers) return null;
     this.#cpuActive++;

@@ -29,13 +29,19 @@ export interface HeartbeatSnapshot {
   lastStatus: number | null;
 }
 
-function defaultInitialDelay(projectId: ProjectId): number {
+export function heartbeatPhaseOffset(
+  projectId: ProjectId,
+  intervalMs = 10_000,
+): number {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1) {
+    throw new RangeError("Heartbeat phase interval must be a positive safe integer");
+  }
   let hash = 2166136261;
   for (const character of projectId) {
     hash ^= character.charCodeAt(0);
     hash = Math.imul(hash, 16777619);
   }
-  return 1 + (Math.abs(hash) % 10_000);
+  return (hash >>> 0) % intervalMs;
 }
 
 export class SandboxHeartbeat {
@@ -62,7 +68,7 @@ export class SandboxHeartbeat {
     this.#gateway = options.gateway;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#periodMs = options.periodMs ?? 10_000;
-    this.#initialDelayMs = options.initialDelayMs ?? defaultInitialDelay(options.projectId);
+    this.#initialDelayMs = options.initialDelayMs ?? heartbeatPhaseOffset(options.projectId);
     if (this.#periodMs !== 10_000) throw new RangeError("Heartbeat period must be exactly 10000ms");
     if (!(this.#initialDelayMs >= 0 && this.#initialDelayMs <= 10_000)) {
       throw new RangeError("Heartbeat initial delay must be between 0 and 10000ms");

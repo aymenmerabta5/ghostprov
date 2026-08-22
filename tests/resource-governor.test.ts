@@ -110,4 +110,24 @@ describe("ResourceGovernor", () => {
     expect(governor.tryAcquireCpu()).not.toBeNull();
     permits.slice(1).forEach(permit => permit.release());
   });
+
+  it("advertises a bounded V2 capacity from remaining byte reservations", () => {
+    const probe = new MutableProbe(sample(32, 19.19));
+    const governor = new ResourceGovernor({ probe });
+    const perRequest = 16 * MiB;
+    expect(governor.capacityHint(perRequest, 128)).toBe(128);
+
+    const leases = Array.from({ length: 100 }, () => governor.tryAcquire(workload(perRequest))!);
+    const remaining = governor.snapshot().reservationCapacityBytes -
+      governor.snapshot().reservedBytes;
+    expect(governor.capacityHint(perRequest, 128)).toBe(
+      Math.min(128, Math.floor(remaining / perRequest)),
+    );
+
+    probe.value.freeBytes = gib(2);
+    expect(governor.capacityHint(perRequest, 128)).toBe(0);
+    leases.forEach(lease => lease.release());
+    expect(() => governor.capacityHint(0, 128)).toThrow(RangeError);
+    expect(() => governor.capacityHint(perRequest, -1)).toThrow(RangeError);
+  });
 });
