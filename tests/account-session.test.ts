@@ -52,6 +52,7 @@ describe("PrismAccountSession", () => {
     }));
     expect(JSON.stringify(session.snapshot())).not.toContain("old");
     expect(JSON.stringify(session.snapshot())).not.toContain("new");
+    if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
   });
 
   it("hot reloads a newer serialized cookie jar", async () => {

@@ -143,6 +143,7 @@ The isolated suite includes:
 - `tests/cpu-transform-pool.test.ts`
 - `tests/daemon-controller.test.ts`
 - `tests/documentation.test.ts`
+- `tests/file-lease.test.ts`
 - `tests/heartbeat.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
@@ -164,6 +165,7 @@ The isolated suite includes:
 - `tests/sandbox-runtime.test.ts`
 - `tests/sandbox-ydoc.test.ts`
 - `tests/scheduler.test.ts`
+- `tests/session-manager.test.ts`
 - `tests/segments.test.ts`
 - `tests/slot-runner.test.ts`
 - `tests/sse.test.ts`

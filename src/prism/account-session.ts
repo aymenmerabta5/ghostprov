@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { CookieJar } from "tough-cookie";
 import type { FetchLike } from "../core/ports";
@@ -182,8 +182,9 @@ export class PrismAccountSession {
         );
         const serialized = this.#jar.serializeSync();
         if (!serialized) throw new Error("Cookie jar serialization failed");
-        await writeFile(temporary, JSON.stringify(serialized, null, 2));
+        await writeFile(temporary, JSON.stringify(serialized, null, 2), { mode: 0o600 });
         await rename(temporary, file);
+        if (process.platform !== "win32") await chmod(file, 0o600);
         const metadata = await stat(file);
         this.#fileMtimeMs = metadata.mtimeMs;
         this.#persistedAtMs = Date.now();
