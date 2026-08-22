@@ -100,6 +100,22 @@ export class MultiSandboxRouter {
     });
   }
 
+  acquireIncomingBody(bytes: number, signal?: AbortSignal): Promise<ReleasableLease> {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+      return Promise.reject(new RangeError("Incoming body reservation must be non-negative"));
+    }
+    const MiB = 1024 ** 2;
+    const workload: WorkloadDescriptor = {
+      class: bytes > 512 * 1024 ? "text-large" : "text-small",
+      requestBytes: bytes,
+      reservedBytes: Math.max(8 * MiB, bytes * 2 + 2 * MiB),
+      cpuPermits: 0,
+      stream: false,
+      serializedBody: "",
+    };
+    return this.#governor.acquire(workload, signal);
+  }
+
   snapshot(): MultiSandboxRouterSnapshot {
     const runtimes = this.#registry.snapshots();
     const capacity = runtimes

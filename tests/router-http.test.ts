@@ -1,0 +1,160 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { WebSocket } from "ws";
+import type { Server } from "node:http";
+import type { RunHandle } from "../src/relay/pipeline";
+import { createGhostProvApp } from "../src/server/app";
+import { createGhostProvServer } from "../src/server/runtime";
+
+const servers: Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+});
+
+function final(id: string, output: unknown[] = []) {
+  return { id, object: "response", status: "completed", model: "gpt-5.6-sol", output };
+}
+
+function handle(value: any, frames: Array<{ event: string; data: string }> = []): RunHandle {
+  return {
+    async *events() { for (const frame of frames) yield frame; },
+    final: Promise.resolve(value),
+    stats: { bytes: 0, firstByteMs: null, frames: frames.length },
+  };
+}
+
+class FakeRouter {
+  workloads: Array<{ body: Record<string, unknown>; source?: string; clientId?: string }> = [];
+  bodyReservations: number[] = [];
+  bodyReservationActive = 0;
+  bodyReservationReleases = 0;
+  async acquireIncomingBody(bytes: number) {
+    this.bodyReservations.push(bytes);
+    this.bodyReservationActive++;
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.bodyReservationActive--;
+        this.bodyReservationReleases++;
+      },
+    };
+  }
+  async startRelay(body: Record<string, unknown>, options: { source?: string; clientId?: string } = {}): Promise<RunHandle> {
+    expect(this.bodyReservationActive).toBeGreaterThanOrEqual(0);
+    this.workloads.push({ body, ...options });
+    if (Array.isArray(body.tools) && (body.tools as any[])[0]?.type === "image_generation") {
+      return handle(final(`resp_image_${this.workloads.length}`, [{
+        type: "image_generation_call",
+        status: "completed",
+        result: `PNG-${this.workloads.length}`,
+        background: "opaque",
+        output_format: "png",
+        quality: "low",
+        size: "1024x1024",
+      }]));
+    }
+    const response = final(`resp_${this.workloads.length}`);
+    return handle(response, [{
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response }),
+    }]);
+  }
+  snapshot() {
+    return { capacity: 120, active: 7, available: 113, queued: 2, runtimes: [], resources: {} };
+  }
+}
+
+describe("router HTTP composition", () => {
+  it("routes HTTP and image fan-out through one router with source metadata", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({
+      router,
+      imageOptions: { responsesModel: "gpt-5.6-sol", maxEditInputBytes: 40 * 1024 ** 2 },
+    });
+
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello" }),
+    });
+    const image = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-image-2", prompt: "circle", n: 2, quality: "low" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(image.status).toBe(200);
+    expect(router.workloads.map(workload => workload.source)).toEqual(["http", "image", "image"]);
+  });
+
+  it("reports aggregate capacity and sanitized runtime snapshots", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const health = await (await app.request("/health")).json();
+    const sandboxes = await (await app.request("/__sandboxes")).json();
+    expect(health).toMatchObject({ ok: true, capacity: 120, active: 7, available: 113, queued: 2 });
+    expect(JSON.stringify(sandboxes)).not.toMatch(/token|cookie/i);
+  });
+
+  it("refuses candidate mode on protected port 8787", () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    expect(() => createGhostProvServer({ app, router, candidate: true, port: 8787 })).toThrow("protected");
+  });
+
+  it("routes Codex WebSocket work through the same router", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const completed = new Promise<any>((resolve, reject) => {
+      socket.on("message", data => {
+        const event = JSON.parse(data.toString());
+        if (event.type === "response.completed") resolve(event);
+        if (event.type === "error") reject(new Error(JSON.stringify(event)));
+      });
+    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "candidate",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "hello websocket",
+    }));
+    await completed;
+    expect(router.workloads.at(-1)?.source).toBe("websocket");
+    socket.close();
+  });
+
+  it("reserves HTTP body memory before buffering and releases it after parsing", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0, maxBodyBytes: 64 * 1024 ** 2 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const body = JSON.stringify({ model: "gpt-5.6-sol", input: "large-enough".repeat(1000) });
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(router.bodyReservations).toEqual([Buffer.byteLength(body)]);
+    expect(router.bodyReservationReleases).toBe(1);
+    expect(router.bodyReservationActive).toBe(0);
+  });
+});
