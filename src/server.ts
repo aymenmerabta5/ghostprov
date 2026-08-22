@@ -16,9 +16,10 @@ import "dotenv/config";
 import { Hono } from "hono";
 import { createServer as createHttpServer } from "node:http";
 import { config } from "./config";
-import { runRelay, RelayError } from "./relay/pipeline";
+import { runRelay } from "./relay/pipeline";
 import { sseFrame, SSE_HEADERS } from "./relay/sse";
 import { writeFetchResponse } from "./http/adapter";
+import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "./http/errors";
 import { ResponseScheduler, scheduleRelay } from "./relay/scheduler";
 import { attachResponsesWebSocket } from "./ws/server";
 
@@ -199,7 +200,7 @@ app.post("/v1/responses", async (c) => {
             push(sseFrame("response.completed", { type: "response.completed", response: final }));
           }
         } catch (e: any) {
-          push(sseFrame("error", { type: "error", code: e instanceof RelayError ? e.kind : "internal", message: String(e?.message ?? e) }));
+          push(sseFrame("error", apiErrorEvent(e)));
         } finally {
           clearInterval(ka);
           closed = true;
@@ -209,10 +210,9 @@ app.post("/v1/responses", async (c) => {
     });
     return new Response(stream, { headers: SSE_HEADERS });
   } catch (e: any) {
-    const kind = e instanceof RelayError ? e.kind : "internal";
-    console.error(`[responses] ${kind}:`, String(e?.message ?? e).slice(0, 300));
-    const status = kind === "no-bridge" || kind === "sync" ? 503 : kind === "timeout" ? 504 : 500;
-    return c.json({ error: { type: kind, message: String(e?.message ?? e) } }, status as any);
+    const normalized = normalizeApiError(e);
+    console.error(`[responses] ${normalized.error.type}:`, normalized.error.message.slice(0, 300));
+    return apiErrorResponse(e);
   }
 });
 

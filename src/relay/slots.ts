@@ -47,7 +47,11 @@ function sha12(text: string): string {
 }
 
 export class SlotError extends Error {
-  constructor(message: string, readonly kind: "sync" | "timeout" | "no-bridge" | "upstream" | "exhausted") {
+  constructor(
+    message: string,
+    readonly kind: "sync" | "timeout" | "no-bridge" | "upstream" | "exhausted",
+    readonly details?: unknown,
+  ) {
     super(message);
   }
 }
@@ -463,9 +467,9 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   let sawTerminal = false;
   let requestPublished = false;
   let releaseCause = "pending";
-  function fail(kind: SlotError["kind"], message: string): void {
+  function fail(kind: SlotError["kind"], message: string, details?: unknown): void {
     console.error(`[slots ${tag}] FAILED (${kind}): ${message.slice(0, 240)}`);
-    if (!settled) { settled = true; releaseCause = `error:${kind}`; settleError(new SlotError(message, kind)); }
+    if (!settled) { settled = true; releaseCause = `error:${kind}`; settleError(new SlotError(message, kind, details)); }
   }
   function succeed(value: any, reason: string): void {
     if (!settled) { settled = true; releaseCause = reason; settleFinal(value); }
@@ -691,7 +695,11 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             if (j.status === "failed") {
               sawTerminal = true;
               console.error(`[slots ${tag}] UPSTREAM FAILED slot=${slot.n}: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`);
-              throw new SlotError(`upstream failed: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`, "upstream");
+              throw new SlotError(
+                `upstream failed: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`,
+                "upstream",
+                j.error,
+              );
             }
             const fin = j.gp_final ?? j;
             // CRITICAL: flush any SSE the polls missed between the last
@@ -776,6 +784,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
             throw new SlotError(
               `upstream failed: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`,
               "upstream",
+              j.error,
             );
           }
           if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
@@ -845,7 +854,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
     result => succeed(result.value, result.reason),
     (e: any) => {
       const kind = typeof e?.kind === "string" ? e.kind : "internal";
-      fail(kind, String(e?.message ?? e));
+      fail(kind, String(e?.message ?? e), e?.details);
     },
   ).finally(async () => {
     closed = true;

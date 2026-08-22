@@ -21,7 +21,11 @@ import { TerminalBackedSseExtractor, sanitizeFinal, type SseFrame } from "./sse"
 import { LATEXMKRC_SLOTS as LATEXMKRC } from "./slots";
 
 export class RelayError extends Error {
-  constructor(message: string, readonly kind: "sync" | "render" | "timeout" | "no-bridge" | "upstream") {
+  constructor(
+    message: string,
+    readonly kind: "sync" | "render" | "timeout" | "no-bridge" | "upstream",
+    readonly details?: unknown,
+  ) {
     super(message);
   }
 }
@@ -240,7 +244,11 @@ export async function runRelayLegacy(body: Record<string, unknown>): Promise<Run
         if (fin.final.status === "failed") {
           invalidateCache();
           console.error(`[relay ${tag}] UPSTREAM FAILED: ${JSON.stringify(fin.final.error ?? {}).slice(0, 400)}`);
-          throw new RelayError(`upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`, "upstream");
+          throw new RelayError(
+            `upstream failed: ${JSON.stringify(fin.final.error ?? {}).slice(0, 300)}`,
+            "upstream",
+            fin.final.error,
+          );
         }
         if (typeof fin.final.gp_sse === "string" && fin.final.gp_sse.length > 0) {
           const missed = extractor.replayTerminal(
