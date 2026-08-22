@@ -144,6 +144,7 @@ The isolated suite includes:
 - `tests/daemon-controller.test.ts`
 - `tests/documentation.test.ts`
 - `tests/file-lease.test.ts`
+- `tests/fleet-manifest.test.ts`
 - `tests/heartbeat.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
@@ -157,6 +158,7 @@ The isolated suite includes:
 - `tests/no-playwright.test.ts`
 - `tests/prism-protocol.test.ts`
 - `tests/provisioning-client.test.ts`
+- `tests/projects-client.test.ts`
 - `tests/resource-governor.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/router-http.test.ts`
