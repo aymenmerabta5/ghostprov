@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
 const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const liveMultiSandbox = fs.readFileSync(path.join(root, "scripts", "live_multi_sandbox.ts"), "utf8");
@@ -60,6 +61,7 @@ describe("project documentation", () => {
       "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
       "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
       "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
+      "monitor:v2": "bun scripts/monitor_v2.ts",
     });
     expect(pkg.dependencies).not.toHaveProperty("playwright");
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
@@ -73,6 +75,26 @@ describe("project documentation", () => {
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_single.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_fleet.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "smoke_v2_candidate.ts"))).toBe(true);
+  });
+
+  it("documents privacy-safe performance tracing and its diagnosis order", () => {
+    for (const value of [
+      "bun run monitor:v2",
+      "GP_LOG_DIR",
+      "request.accepted",
+      "transport.committed",
+      "response.first_event",
+      "fleet.sample",
+      "monitor.sample",
+      "admission_wait_ms",
+      "commit_ack_ms",
+      "post_commit_first_event_ms",
+    ]) expect(readme).toContain(value);
+    expect(readme).toContain("manual restart");
+    expect(readme).toContain("never logs prompts");
+    expect(readme).toContain("64 MiB");
+    expect(envExample).toContain("GP_LOG_ROTATE_BYTES=67108864");
+    expect(envExample).toContain("GP_MONITOR_ROOT=http://127.0.0.1:18787");
   });
 
   it("keeps live multi-sandbox state out of version control", () => {

@@ -16,7 +16,7 @@ $env:GP_PRISM_SESSION = "authenticated"
 $env:GP_TARGET_CONCURRENCY = "512"
 $env:GP_CANDIDATE = "1"
 $env:PORT = "18787"
-bun run dev:candidate
+bun run dev
 ```
 
 `PRISM_COOKIE` accepts an initial Cookie header when a persisted cookie jar is unavailable. `PRISM_DOC_ID` remains a single-project compatibility fallback. The account session consumes `Set-Cookie`, persists rotations atomically, and hot-reloads a newer cookie file.
@@ -117,12 +117,40 @@ supports_websockets = true
 
 `gpt-image-2` and its pinned snapshot are supported. Native `n=1..10` fans children across independent sandbox runtimes. GPT Image responses return `b64_json`. Image streaming, URL emulation, audio, and DALL-E variation routes return explicit unsupported-capability errors.
 
-## Monitoring
+## Performance observability
 
 - `GET /health` returns aggregate capacity, active, available, queued, and runtime count; zero routable capacity returns HTTP 503 with `ok:false`.
 - `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, and resource snapshots.
 
-No endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
+Start the read-only external monitor against an already-running router without restarting it:
+
+```powershell
+bun run monitor:v2
+```
+
+It polls only `GET /health` and `GET /__sandboxes`, retries failures with capped exponential jitter, and writes `monitor.sample` or sanitized `monitor.error` JSONL events. The default target is `http://127.0.0.1:18787`; non-loopback roots and roots containing paths, credentials, queries, or fragments are rejected. Ctrl+C stops only the monitor and flushes its log.
+
+Built-in tracing starts with the upgraded router after the operator's next manual restart. It records `request.accepted`, `admission.acquired`, `request.queued`, `route.selected`, `transport.committed`, `response.first_event`, and exactly one `request.completed` or `request.failed`. A periodic `fleet.sample` adds host memory, CPU, event-loop delay, logger pressure, aggregate capacity, and per-runtime health. The external monitor provides immediate fleet visibility, but only built-in tracing can attribute per-request queue, commit, first-event, and total latency.
+
+Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous queue preserves terminal events ahead of progress and sample events. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
+
+Inspect the latest records in PowerShell:
+
+```powershell
+$latest = Get-ChildItem -LiteralPath $env:GP_LOG_DIR -Filter 'ghostprov-v2*.jsonl' |
+  Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+Get-Content -LiteralPath $latest.FullName -Tail 50
+```
+
+Diagnose a slow multi-agent run in this order:
+
+1. High `admission_wait_ms` or `memory_paused=true` means host memory pressure.
+2. High queue wait with zero available capacity means the fleet is saturated; queueing with available capacity points to scheduling or stale capacity.
+3. High `commit_ack_ms` points to Y-Sweet/Awareness or sandbox event-loop latency.
+4. Normal commit ACK with high `post_commit_first_event_ms` points to upstream model latency.
+5. Normal first-event latency with high total duration means long reasoning or generation.
+6. One runtime with worse RTT, completion EWMA, failures, or quarantine indicates sandbox imbalance.
+7. High event-loop p95/max points to local CPU or synchronous work.
 
 ## Lifecycle and recovery
 
@@ -168,6 +196,19 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | WebSocket named lanes | `32` | Per-connection named-lane ceiling |
 | `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Raw multipart edit-input budget |
 | `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart envelope ceiling |
+| `GP_LOG_LEVEL` | `info` | `off`, `error`, `info`, or `debug` bounded JSONL tracing |
+| `GP_LOG_DIR` | `.ghostprov/logs` | Absolute or working-directory-relative log directory |
+| `GP_LOG_ROTATE_BYTES` | `67108864` | Active-file rotation threshold (64 MiB) |
+| `GP_LOG_RETAIN_FILES` | `5` | Rotated files retained per process/prefix |
+| `GP_LOG_QUEUE_MAX_EVENTS` | `10000` | Maximum queued observability events |
+| `GP_LOG_QUEUE_MAX_BYTES` | `8388608` | Maximum encoded observability queue bytes |
+| `GP_LOG_FLUSH_MS` | `250` | Maximum normal batch delay |
+| `GP_METRICS_INTERVAL_MS` | `5000` | Built-in `fleet.sample` interval |
+| `GP_SLOW_REQUEST_MS` | `10000` | Slow terminal threshold |
+| `GP_SLOW_FIRST_EVENT_MS` | `5000` | Slow first-event threshold |
+| `GP_MONITOR_ROOT` | `http://127.0.0.1:18787` | Loopback router origin for the external monitor |
+| `GP_MONITOR_INTERVAL_MS` | `2000` | Successful external polling interval |
+| `GP_MONITOR_TIMEOUT_MS` | `5000` | Per-poll timeout |
 
 ## Tests
 
@@ -204,6 +245,12 @@ The isolated suite includes:
 - `tests/multi-sandbox-integration.test.ts`
 - `tests/multi-sandbox-router.test.ts`
 - `tests/no-playwright.test.ts`
+- `tests/observability-config.test.ts`
+- `tests/observability-logger.test.ts`
+- `tests/observability-redaction.test.ts`
+- `tests/observability-rotation.test.ts`
+- `tests/observability-run-handle.test.ts`
+- `tests/observability-sampler.test.ts`
 - `tests/prism-protocol.test.ts`
 - `tests/project-inspector.test.ts`
 - `tests/provisioning-client.test.ts`
@@ -211,6 +258,7 @@ The isolated suite includes:
 - `tests/resource-governor.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/router-http.test.ts`
+- `tests/router-observability.test.ts`
 - `tests/router-policy.test.ts`
 - `tests/sandbox-gateway.test.ts`
 - `tests/sandbox-runtime.test.ts`
@@ -239,6 +287,7 @@ The isolated suite includes:
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
 - `tests/v2-live-guards.test.ts`
+- `tests/v2-monitor.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
 - `tests/v2-run-handle.test.ts`
