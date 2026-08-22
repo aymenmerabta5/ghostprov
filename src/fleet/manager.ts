@@ -114,6 +114,8 @@ export class ProjectFleetManager {
   readonly #random: RandomSource;
   #snapshot: FleetSnapshot = emptySnapshot();
   #chain: Promise<void> = Promise.resolve();
+  #activeReconcile: AbortController | null = null;
+  #shuttingDown = false;
 
   constructor(options: ProjectFleetManagerOptions) {
     this.#config = options.config;
@@ -128,9 +130,15 @@ export class ProjectFleetManager {
   }
 
   reconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
+    if (this.#shuttingDown) {
+      return Promise.reject(new FleetReconciliationError(
+        "Fleet manager is shutting down",
+        "runtime",
+      ));
+    }
     const pending = this.#chain.then(
-      () => this.#reconcile(signal),
-      () => this.#reconcile(signal),
+      () => this.#runReconcile(signal),
+      () => this.#runReconcile(signal),
     );
     this.#chain = pending.then(() => undefined, () => undefined);
     return pending;
@@ -166,6 +174,8 @@ export class ProjectFleetManager {
   }
 
   async shutdown(reason: string): Promise<void> {
+    this.#shuttingDown = true;
+    this.#activeReconcile?.abort();
     await this.#chain;
     const runtimes = [...this.#registry.runtimes()];
     await Promise.allSettled(runtimes.map(async runtime => {
@@ -183,7 +193,13 @@ export class ProjectFleetManager {
   async #reconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
     if (signal?.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
     let manifest = await this.#manifest.initialize(this.#identity.kind);
+    if (signal?.aborted || this.#shuttingDown) {
+      throw new DOMException("Fleet reconciliation aborted", "AbortError");
+    }
     const remote = (await this.#projects.list(signal)).filter(project => !project.deleted);
+    if (signal?.aborted || this.#shuttingDown) {
+      throw new DOMException("Fleet reconciliation aborted", "AbortError");
+    }
     const remoteById = new Map(remote.map(project => [project.projectId, project]));
     const desired = this.#identity.kind === "anonymous"
       ? Math.min(this.#config.desiredSandboxes, this.#config.guestMaxProjects)
@@ -198,6 +214,9 @@ export class ProjectFleetManager {
     };
 
     for (const id of this.#config.projectIds) {
+      if (signal?.aborted || this.#shuttingDown) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
       if (selected.length >= desired) break;
       const project = remoteById.get(id);
       if (!project) {
@@ -223,6 +242,9 @@ export class ProjectFleetManager {
     }
 
     for (const current of [...manifest.workers].sort((left, right) => left.index - right.index)) {
+      if (signal?.aborted || this.#shuttingDown) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
       if (selected.length >= desired || selectedIds.has(current.projectId)) continue;
       if (!current.managed) continue;
       let project = remoteById.get(current.projectId);
@@ -247,6 +269,9 @@ export class ProjectFleetManager {
     }
 
     for (const project of remote) {
+      if (signal?.aborted || this.#shuttingDown) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
       if (selected.length >= desired) break;
       if (selectedIds.has(project.projectId)) continue;
       const titleMatch = /^GhostProv Worker (\d+)$/.exec(project.title);
@@ -273,6 +298,9 @@ export class ProjectFleetManager {
 
     if (this.#config.projectReuse === "eligible-owned") {
       for (const project of remote) {
+        if (signal?.aborted || this.#shuttingDown) {
+          throw new DOMException("Fleet reconciliation aborted", "AbortError");
+        }
         if (selected.length >= desired) break;
         if (selectedIds.has(project.projectId)) continue;
         const inspection = await this.#inspector.inspect(project.projectId, signal);
@@ -290,6 +318,9 @@ export class ProjectFleetManager {
     }
 
     while (selected.length < desired && this.#config.autoCreateProjects) {
+      if (signal?.aborted || this.#shuttingDown) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
       const index = nextWorkerIndex(manifest.workers);
       const id = projectId(this.#random.uuid());
       const title = `GhostProv Worker ${index}`;
@@ -314,6 +345,9 @@ export class ProjectFleetManager {
     await this.#drainExcess(selectedIds);
     const missing = selected.filter(worker => !this.#registry.get(worker.record.projectId));
     await mapLimit(missing, this.#config.provisionConcurrency, async selectedWorker => {
+      if (signal?.aborted || this.#shuttingDown) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
       const generation = await this.#manifest.nextLeaderGeneration(
         selectedWorker.record.projectId,
       );
@@ -345,6 +379,23 @@ export class ProjectFleetManager {
       selected.map(worker => worker.record.projectId),
     );
     return this.#snapshot;
+  }
+
+  async #runReconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
+    if (this.#shuttingDown) {
+      throw new FleetReconciliationError("Fleet manager is shutting down", "runtime");
+    }
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
+    this.#activeReconcile = controller;
+    try {
+      return await this.#reconcile(controller.signal);
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      if (this.#activeReconcile === controller) this.#activeReconcile = null;
+    }
   }
 
   async #drainExcess(selected: ReadonlySet<ProjectId>): Promise<void> {

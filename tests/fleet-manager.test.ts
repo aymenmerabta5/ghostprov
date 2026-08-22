@@ -296,4 +296,21 @@ describe("ProjectFleetManager", () => {
     expect(projects.created).toHaveLength(1);
     expect(harness.registry.runtimes()).toHaveLength(1);
   });
+
+  it("rejects reconciliation after shutdown without creating projects", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    const harness = manager({
+      config: config(files.cookieFile, { desired: 1 }),
+      manifest: files.manifest,
+      projects,
+      randomIds: [A],
+    });
+
+    await harness.value.shutdown("test-shutdown");
+
+    await expect(harness.value.reconcile()).rejects.toThrow("shutting down");
+    expect(projects.created).toEqual([]);
+    expect(harness.registry.runtimes()).toEqual([]);
+  });
 });

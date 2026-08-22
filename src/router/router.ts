@@ -38,6 +38,16 @@ export interface MultiSandboxRouterSnapshot {
   resources: ReturnType<ResourceGovernor["snapshot"]>;
 }
 
+export class RouterShutdownError extends Error {
+  readonly name = "RouterShutdownError";
+  readonly status = 503;
+  readonly code = "router_shutting_down";
+
+  constructor(message = "GhostProv is shutting down") {
+    super(message);
+  }
+}
+
 function abortError(): DOMException {
   return new DOMException("Relay request aborted while queued", "AbortError");
 }
@@ -53,6 +63,7 @@ export class MultiSandboxRouter {
   readonly #clientOrder: string[] = [];
   #clientCursor = 0;
   #drainScheduled = false;
+  #shuttingDown = false;
   #closed = false;
 
   constructor(options: {
@@ -72,13 +83,13 @@ export class MultiSandboxRouter {
     body: Record<string, unknown>,
     options: StartRelayOptions = {},
   ): Promise<RunHandle> {
-    if (this.#closed) throw new Error("Multi-sandbox router is closed");
+    if (this.#closed || this.#shuttingDown) throw new RouterShutdownError();
     const workload = classifyWorkload(body);
     const memoryLease = await this.#governor.acquire(workload, options.signal);
-    if (options.signal?.aborted || this.#closed) {
+    if (options.signal?.aborted || this.#closed || this.#shuttingDown) {
       memoryLease.release();
       if (options.signal?.aborted) throw abortError();
-      throw new Error("Multi-sandbox router is closed");
+      throw new RouterShutdownError();
     }
     return new Promise<RunHandle>((resolve, reject) => {
       const clientId = options.clientId ?? "default";
@@ -106,7 +117,9 @@ export class MultiSandboxRouter {
   }
 
   acquireIncomingBody(bytes: number, signal?: AbortSignal): Promise<ReleasableLease> {
-    if (this.#closed) return Promise.reject(new Error("Multi-sandbox router is closed"));
+    if (this.#closed || this.#shuttingDown) {
+      return Promise.reject(new RouterShutdownError());
+    }
     if (!Number.isFinite(bytes) || bytes < 0) {
       return Promise.reject(new RangeError("Incoming body reservation must be non-negative"));
     }
@@ -139,20 +152,43 @@ export class MultiSandboxRouter {
     };
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#registryUnsubscribe();
+  beginShutdown(): void {
+    if (this.#shuttingDown) return;
+    this.#shuttingDown = true;
+    const error = new RouterShutdownError();
     for (const queue of this.#queues.values()) {
       for (const job of queue) {
         job.signal?.removeEventListener("abort", job.onAbort!);
         job.memoryLease.release();
-        job.reject(new Error("Multi-sandbox router is closed"));
+        job.reject(error);
       }
     }
     this.#queues.clear();
     this.#clientOrder.length = 0;
     this.#clientCursor = 0;
+  }
+
+  async awaitIdle(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
+      throw new RangeError("Router idle timeout must be positive");
+    }
+    const deadline = this.#clock.now() + timeoutMs;
+    for (;;) {
+      if (signal?.aborted) throw new DOMException("Router idle wait aborted", "AbortError");
+      const snapshot = this.snapshot();
+      if (snapshot.active === 0 && snapshot.queued === 0) return;
+      if (this.#clock.now() >= deadline) {
+        throw new RouterShutdownError("Router idle wait timed out with active work");
+      }
+      await this.#clock.sleep(Math.min(10, deadline - this.#clock.now()), signal);
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.beginShutdown();
+    this.#closed = true;
+    this.#registryUnsubscribe();
   }
 
   #enqueue(job: QueuedJob, front = false): void {
@@ -202,7 +238,7 @@ export class MultiSandboxRouter {
   }
 
   #scheduleDrain(): void {
-    if (this.#closed || this.#drainScheduled) return;
+    if (this.#closed || this.#shuttingDown || this.#drainScheduled) return;
     this.#drainScheduled = true;
     queueMicrotask(() => {
       this.#drainScheduled = false;
@@ -262,7 +298,7 @@ export class MultiSandboxRouter {
       this.#scheduleDrain();
     } catch (error) {
       this.#decrementReserved(runtime.projectId);
-      if (job.attempts < 1 && !job.signal?.aborted) {
+      if (job.attempts < 1 && !job.signal?.aborted && !this.#shuttingDown) {
         job.attempts++;
         job.excluded.add(runtime.projectId);
         this.#enqueue(job, true);

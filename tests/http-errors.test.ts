@@ -2,8 +2,21 @@ import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
 import { RelayError } from "../src/relay/run-handle";
 import { SlotRunnerError } from "../src/relay/slot-runner";
+import { RouterShutdownError } from "../src/router/router";
 
 describe("OpenAI-compatible HTTP errors", () => {
+  it("maps router shutdown admission to a typed service-unavailable response", () => {
+    expect(normalizeApiError(new RouterShutdownError())).toEqual({
+      status: 503,
+      error: {
+        message: "GhostProv is shutting down",
+        type: "service_unavailable_error",
+        param: null,
+        code: "router_shutting_down",
+      },
+    });
+  });
+
   it("preserves typed validation status and fields", async () => {
     const response = apiErrorResponse(new ApiError(400, "prompt is required", {
       param: "prompt",

@@ -142,10 +142,13 @@ The isolated suite includes:
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`
 - `tests/daemon-controller.test.ts`
+- `tests/decommission-script.test.ts`
+- `tests/decommission.test.ts`
 - `tests/documentation.test.ts`
 - `tests/file-lease.test.ts`
 - `tests/fleet-manifest.test.ts`
 - `tests/fleet-manager.test.ts`
+- `tests/graceful-shutdown.test.ts`
 - `tests/heartbeat.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
@@ -173,6 +176,7 @@ The isolated suite includes:
 - `tests/segments.test.ts`
 - `tests/slot-runner.test.ts`
 - `tests/sse.test.ts`
+- `tests/system-v2.test.ts`
 - `tests/terminal-rescue.test.ts`
 - `tests/transport-selector.test.ts`
 - `tests/unlatch-recovery.test.ts`
