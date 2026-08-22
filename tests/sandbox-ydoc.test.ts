@@ -143,6 +143,23 @@ describe("SandboxYDoc", () => {
     expect(await doc.tombstonePath("same/same")).toBe(true);
   });
 
+  it("recursively tombstones an obsolete managed asset directory", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    await doc.writePath(".ghostprov-v2/src/main.ts", "main");
+    await doc.writePath(".ghostprov-v2/src/nested/helper.ts", "helper");
+
+    expect(await doc.tombstonePath(".ghostprov-v2/src")).toBe(true);
+
+    expect(await doc.readPath(".ghostprov-v2/src/main.ts")).toBeNull();
+    expect(await doc.readPath(".ghostprov-v2/src/nested/helper.ts")).toBeNull();
+    const entries = [...factory.docs[0].getMap<Y.Map<any>>("content").values()];
+    for (const name of ["src", "main.ts", "nested", "helper.ts"]) {
+      expect(entries.find(entry => entry.get("filename") === name)?.get("deleted")).toBe(true);
+    }
+  });
+
   it("rejects path traversal, absolute paths, empty components, and node collisions", async () => {
     const { doc } = createDoc(A);
     await doc.connect();

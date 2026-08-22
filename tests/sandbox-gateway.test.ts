@@ -4,6 +4,7 @@ import { SandboxGateway } from "../src/sandbox/gateway";
 import { parseProvisionedSandbox } from "../src/prism/protocol";
 import { projectId } from "../src/sandbox/types";
 import type { AccountRequestClient } from "../src/prism/provisioning-client";
+import type { Clock } from "../src/core/ports";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const SANDBOX = parseProvisionedSandbox({
@@ -36,6 +37,14 @@ class FakeAccount implements AccountRequestClient {
     }
     return this.handler(url.pathname, init);
   }
+}
+
+class FakeClock implements Clock {
+  value = 1_787_400_000_000;
+  readonly sleeps: number[] = [];
+  now(): number { return this.value; }
+  async sleep(ms: number): Promise<void> { this.sleeps.push(ms); this.value += ms; }
+  async waitUntil(deadlineMs: number): Promise<void> { await this.sleep(Math.max(0, deadlineMs - this.value)); }
 }
 
 describe("SandboxGateway", () => {
@@ -115,6 +124,33 @@ describe("SandboxGateway", () => {
     await Promise.all(Array.from({ length: 20 }, () => gateway.syncWorkspace()));
 
     expect(account.calls.filter(call => call.path.endsWith("/wait-for-sync"))).toHaveLength(1);
+  });
+
+  it("retries transient workspace-sync proxy failures within the barrier deadline", async () => {
+    let attempts = 0;
+    const clock = new FakeClock();
+    const account = new FakeAccount(path => {
+      if (!path.endsWith("/wait-for-sync")) return new Response("not found", { status: 404 });
+      attempts++;
+      if (attempts === 1) return new Response("temporary proxy failure", { status: 502 });
+      return Response.json({
+        status: "synced",
+        readinessCapabilities: ["current_y_sweet_provider"],
+        tokens: { hasCurrentYSweetToken: true, hasSyncedYSweetProvider: true },
+      });
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      syncBatchMs: 0,
+      clock,
+    });
+
+    await gateway.syncWorkspace();
+
+    expect(attempts).toBe(2);
+    expect(clock.sleeps.some(ms => ms > 0)).toBe(true);
   });
 
   it("runs another workspace barrier for a write arriving mid-flight", async () => {

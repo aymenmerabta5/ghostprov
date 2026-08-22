@@ -1,6 +1,5 @@
-import * as Y from "npm:yjs@13.6.27";
-import { YSweetProvider } from "npm:@y-sweet/client@0.9.1";
 import type { BootstrapBinding } from "../../src/v2/bootstrap/crypto.ts";
+import { protocolBindingFromBootstrap } from "../../src/v2/bootstrap/binding.ts";
 import { RequestAssembler } from "../../src/v2/sidecar/assembler.ts";
 import { ClaimJournal } from "../../src/v2/sidecar/journal.ts";
 import { AdmissionController } from "../../src/v2/sidecar/admission.ts";
@@ -9,11 +8,6 @@ import { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 import { phaseZeroBootstrap } from "./bootstrap.ts";
 import { DenoAwarenessPeer } from "./awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
-
-// Keep the pinned vendored imports visible to asset validation even though
-// their runtime values are consumed by awareness-peer.ts.
-void Y;
-void YSweetProvider;
 
 interface StaticSidecarConfig {
   version: 1;
@@ -57,6 +51,7 @@ async function run(): Promise<void> {
     binding: config.binding,
     encryptedPath: "/workspace/.ghostprov-v2/bootstrap.enc.json",
   });
+  const binding = protocolBindingFromBootstrap(config.binding);
   const baseUrl = Deno.env.get("OPENAI_BASE_URL");
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
@@ -84,7 +79,7 @@ async function run(): Promise<void> {
   let awarenessDrainRequested = false;
   let peer: DenoAwarenessPeer | null = null;
   const engine = new SidecarEngine({
-    binding: config.binding,
+    binding,
     assembler: new RequestAssembler({
       maxReservedBytes: config.memoryBudgetBytes,
     }),
@@ -102,7 +97,7 @@ async function run(): Promise<void> {
   });
   peer = new DenoAwarenessPeer({
     credential: bootstrap.credential,
-    binding: config.binding,
+    binding,
     instanceId: bootstrap.instanceId,
     engine,
   });

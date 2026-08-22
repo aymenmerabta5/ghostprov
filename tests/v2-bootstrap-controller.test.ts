@@ -39,6 +39,8 @@ type Fault =
   | "wrong-build"
   | "wrong-generation"
   | "stale-instance"
+  | "sidecar-log"
+  | "sidecar-log-secret"
   | "timeout"
   | "first-wrong-nonce";
 
@@ -123,6 +125,8 @@ class FakeAwareness implements V2BootstrapAwareness {
 class FakeGateway implements V2BootstrapGateway {
   readonly calls: string[] = [];
   readonly nonces: string[] = [];
+  readonly launchers: string[] = [];
+  readonly mainDocuments: string[] = [];
   logs = "";
   renders = 0;
   current: {
@@ -137,9 +141,11 @@ class FakeGateway implements V2BootstrapGateway {
   ) {}
 
   async syncWorkspace(): Promise<void> { this.calls.push("wait-for-sync"); }
-  async triggerRender(): Promise<void> {
+  async triggerRender(request?: { mainDocument: string }): Promise<void> {
     this.calls.push("render");
     this.renders++;
+    this.mainDocuments.push(request?.mainDocument ?? "");
+    this.launchers.push(this.ydoc.files.get(".latexmkrc") ?? "");
     const config = JSON.parse(this.ydoc.files.get(".ghostprov-v2/static.json")!) as {
       binding: BootstrapBinding;
     };
@@ -153,12 +159,21 @@ class FakeGateway implements V2BootstrapGateway {
     const keys = await createBootstrapKeyPair(helloBinding);
     const instanceId = `sidecar-instance-${this.renders}`;
     this.current = { binding: helloBinding, instanceId, keys };
-    this.logs = `render starting\nGPV2_BOOTSTRAP ${base64UrlEncode(utf8Bytes(canonicalJson({
+    if (this.fault === "sidecar-log" || this.fault === "sidecar-log-secret") {
+      const message = this.fault === "sidecar-log-secret"
+        ? "Authorization: Bearer sk-bootstrap-secret-123456789012345678901234"
+        : "Can't exec /code/crixet/deno: No such file or directory";
+      const wrapped = Buffer.from(message).toString("hex").match(/.{1,48}/g)!.join("\n");
+      this.logs = `render starting\nGPV2_SIDECAR_HEX ${wrapped}\n) render continues\n`;
+      return;
+    }
+    const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
       version: 1,
       binding: helloBinding,
       instanceId,
       publicJwk: keys.publicJwk,
-    })))}\n`;
+    })));
+    this.logs = `render starting\nGPV2_BOOTSTRAP ${encoded.match(/.{1,60}/g)!.join("\n")}\n) render continues\n`;
   }
   async fetchText(suffix: string): Promise<{ status: number; text: string; headers: Headers }> {
     this.calls.push(suffix);
@@ -169,6 +184,11 @@ class FakeGateway implements V2BootstrapGateway {
 const ASSETS: V2SidecarAssets = {
   buildHash: BUILD_HASH,
   schemaHash: SCHEMA_HASH,
+  obsoletePaths: Object.freeze([
+    ".ghostprov-v2/deno.json",
+    ".ghostprov-v2/sandbox",
+    ".ghostprov-v2/src",
+  ]),
   files: Object.freeze([
     {
       path: ".ghostprov-v2/deno.json",
@@ -284,6 +304,11 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
     expect(harness.ydoc.writes.every(write => !write.content.includes(TOKEN))).toBe(true);
     expect(harness.ydoc.deleted).toContain(".ghostprov-v2/bootstrap.enc.json");
+    expect(harness.ydoc.deleted).toEqual(expect.arrayContaining([
+      ".ghostprov-v2/deno.json",
+      ".ghostprov-v2/sandbox",
+      ".ghostprov-v2/src",
+    ]));
     expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
     expect(harness.awareness.connects).toBe(1);
   });
@@ -297,6 +322,80 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.nonces).toHaveLength(2);
     expect(new Set(harness.gateway.nonces).size).toBe(2);
     expect(harness.ydoc.deleted.filter(path => path.endsWith("bootstrap.enc.json"))).toHaveLength(2);
+  });
+
+  it("atomically advances the build marker for the same V2 worker identity", async () => {
+    const harness = bootstrapHarness();
+    harness.ydoc.files.set(".ghostprov-v2/worker.json", canonicalJson({
+      protocol: "gp-awareness-v2",
+      workerIndex: 7,
+      buildHash: "0".repeat(64),
+      createdAtMs: 1_787_300_000_000,
+    }));
+
+    await harness.controller.ensureReady();
+
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/worker.json")!)).toEqual({
+      protocol: "gp-awareness-v2",
+      workerIndex: 7,
+      buildHash: BUILD_HASH,
+      createdAtMs: 1_787_300_000_000,
+    });
+  });
+
+  it("replaces a legacy root main file with the V2 bootstrap log bridge", async () => {
+    const harness = bootstrapHarness();
+    harness.ydoc.files.set("main.tex", "legacy V1 document\n");
+
+    await harness.controller.ensureReady();
+
+    expect(harness.gateway.mainDocuments).toEqual(["main.tex"]);
+    expect(harness.ydoc.files.get("main.tex")).not.toBe("legacy V1 document\n");
+    expect(harness.ydoc.files.get("main.tex"))
+      .toContain("\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}");
+  });
+
+  it("publishes the bootstrap hello and bounded child diagnostics through the TeX log", async () => {
+    const harness = bootstrapHarness("timeout");
+
+    await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
+
+    expect(harness.gateway.launchers[0]).toContain("bootstrap-output.tex");
+    expect(harness.gateway.launchers[0]).toContain("typeout{$gp_marker}");
+    expect(harness.gateway.launchers[0]).toContain("GPV2_SIDECAR_HEX ");
+    expect(harness.gateway.launchers[0]).toContain("/tmp/ghostprov-v2/sidecar.log");
+    expect(harness.gateway.launchers[0]).toContain("command -v deno");
+    expect(harness.gateway.launchers[0]).toContain("/usr/local/bin/deno");
+    expect(harness.gateway.launchers[0]).toContain("$gp_deno");
+    expect(harness.gateway.launchers[0]).not.toContain("exec 'setsid', '/code/crixet/deno'");
+    expect(harness.gateway.launchers[0]).toContain("/workspace/.ghostprov-v2/sidecar.bundle.js");
+    expect(harness.gateway.launchers[0]).not.toContain("--config=/workspace/.ghostprov-v2/deno.json");
+    expect(harness.gateway.launchers[0]).toContain("NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM");
+    expect(harness.ydoc.writes.find(write => write.path === "main.tex")?.content)
+      .toContain("\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}");
+  });
+
+  it("surfaces a sanitized sidecar launch failure instead of a generic hello timeout", async () => {
+    const harness = bootstrapHarness("sidecar-log");
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "hello",
+      message: "V2 sidecar failed before bootstrap hello: Can't exec /code/crixet/deno: No such file or directory",
+    });
+  });
+
+  it("redacts credential-shaped values from sidecar launch diagnostics", async () => {
+    const harness = bootstrapHarness("sidecar-log-secret");
+
+    const error = await harness.controller.ensureReady().catch(value => value);
+
+    expect(error).toMatchObject({
+      name: "V2BootstrapError",
+      kind: "hello",
+    });
+    expect(error.message).toContain("Authorization: Bearer [REDACTED]");
+    expect(error.message).not.toContain("sk-bootstrap-secret");
   });
 
   it("requests a proven drain before clearing sidecar presence", async () => {

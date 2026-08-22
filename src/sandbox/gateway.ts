@@ -225,9 +225,20 @@ export class SandboxGateway {
 
   async #syncWorkspaceOnce(): Promise<void> {
     const deadline = this.#clock.now() + 30_000;
+    let transientFailures = 0;
     for (;;) {
       const { response, body } = await this.waitForSync();
       if (!response.ok) {
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && this.#clock.now() < deadline) {
+          transientFailures++;
+          await this.#clock.sleep(Math.min(
+            2_000,
+            100 * 2 ** Math.min(5, transientFailures - 1),
+            deadline - this.#clock.now(),
+          ));
+          continue;
+        }
         throw new SandboxGatewayError(
           `Workspace synchronization returned ${response.status}`,
           response.status,

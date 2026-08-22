@@ -14,6 +14,16 @@ import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
 
 const PROTECTED_ROOT = "http://127.0.0.1:8787";
 
+export function sanitizeV2BootstrapRenderLog(value: string): string {
+  const sanitized = value
+    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk-|gAAAA|eyJ)[A-Za-z0-9._=-]{16,}/g, "[REDACTED]")
+    .replace(/((?:token|key|secret|authorization)\s*[=:]\s*)[^\s,"']+/gi, "$1[REDACTED]")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "?");
+  if (sanitized.length <= 8_192) return sanitized;
+  return `${sanitized.slice(0, 4_000)}\n...[truncated]...\n${sanitized.slice(-4_000)}`;
+}
+
 export interface V2BootstrapProbeOptions {
   projectId: ProjectId;
   cookieFile: string;
@@ -206,6 +216,21 @@ export async function main(
     };
   } catch (error) {
     failure = error;
+    if (live.gateway) {
+      try {
+        const logs = await live.gateway.fetchText("logs", { method: "GET" });
+        console.error(JSON.stringify({
+          v2BootstrapRenderStatus: logs.status,
+          v2BootstrapRenderLog: sanitizeV2BootstrapRenderLog(logs.text),
+        }));
+      } catch (diagnosticError) {
+        console.error(JSON.stringify({
+          v2BootstrapDiagnosticError: diagnosticError instanceof Error
+            ? diagnosticError.message.slice(0, 512)
+            : "unknown diagnostic failure",
+        }));
+      }
+    }
   } finally {
     if (controller) {
       await controller.drainAndStop("live-bootstrap-probe-cleanup").catch(() => undefined);

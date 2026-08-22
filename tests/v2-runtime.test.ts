@@ -37,6 +37,7 @@ const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS: V2SidecarAssets = {
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
+  obsoletePaths: Object.freeze([]),
   files: [],
 };
 

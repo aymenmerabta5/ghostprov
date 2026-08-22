@@ -28,6 +28,7 @@ const CIPHERTEXT_PATH = ".ghostprov-v2/bootstrap.enc.json";
 const LAUNCHER_PATH = ".latexmkrc";
 const MAIN_PATH = "main.tex";
 const HELLO_PREFIX = "GPV2_BOOTSTRAP ";
+const SIDECAR_HEX_PREFIX = "GPV2_SIDECAR_HEX ";
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 const INERT_LAUNCHER = [
@@ -40,6 +41,7 @@ const INERT_LAUNCHER = [
 const MAIN_SOURCE = [
   "\\documentclass{article}",
   "\\begin{document}",
+  "\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}",
   "GhostProv V2 sidecar bootstrap.",
   "\\end{document}",
   "",
@@ -139,27 +141,110 @@ function temporaryLauncher(): string {
     "$pdf_mode = 1;",
     "my $gp_dir = '/tmp/ghostprov-v2';",
     "my $gp_hello = '/tmp/ghostprov-v2/bootstrap-hello';",
+    "my $gp_log = '/tmp/ghostprov-v2/sidecar.log';",
+    "my $gp_tex = '/workspace/.ghostprov-v2/bootstrap-output.tex';",
+    "my $gp_hello_seen = 0;",
+    "my $gp_marker = '';",
     "mkdir $gp_dir, 0700 unless -d $gp_dir;",
     "unlink $gp_hello if -e $gp_hello;",
-    "my $gp_pid = fork();",
-    "die 'GhostProv V2 fork failed' unless defined $gp_pid;",
-    "if ($gp_pid == 0) {",
-    "  open STDOUT, '>>', '/tmp/ghostprov-v2/sidecar.log' or die 'stdout';",
-    "  open STDERR, '>&STDOUT' or die 'stderr';",
-    "  exec 'setsid', '/code/crixet/deno', 'run', '--cached-only', '--unstable-sloppy-imports', '--config=/workspace/.ghostprov-v2/deno.json', \"--cert=$ENV{PROXY_CA_CERT_PATH}\", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '/workspace/.ghostprov-v2/sandbox/v2/main.ts';",
-    "  exit 127;",
+    "unlink $gp_log if -e $gp_log;",
+    "unlink $gp_tex if -e $gp_tex;",
+    "my $gp_deno = '';",
+    "for my $gp_candidate (grep { defined $_ && length $_ } ($ENV{DENO_BIN}, '/usr/local/bin/deno', '/usr/bin/deno', '/root/.deno/bin/deno', '/code/crixet/deno')) { if (-x $gp_candidate) { $gp_deno = $gp_candidate; last; } }",
+    "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
+    "if (!$gp_deno) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
+    "if ($gp_deno) {",
+    "  my $gp_pid = fork();",
+    "  die 'GhostProv V2 fork failed' unless defined $gp_pid;",
+    "  if ($gp_pid == 0) {",
+    "    open STDOUT, '>', $gp_log or die 'stdout';",
+    "    open STDERR, '>&STDOUT' or die 'stderr';",
+    "    exec 'setsid', $gp_deno, 'run', '--cached-only', \"--cert=$ENV{PROXY_CA_CERT_PATH}\", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '/workspace/.ghostprov-v2/sidecar.bundle.js';",
+    "    exit 127;",
+    "  }",
     "}",
-    "for (my $gp_try = 0; $gp_try < 900; $gp_try++) {",
+    "for (my $gp_try = 0; $gp_deno && $gp_try < 900; $gp_try++) {",
     "  if (open my $gp_fh, '<', $gp_hello) {",
-    "    while (my $gp_line = <$gp_fh>) { print $gp_line if $gp_line =~ /^GPV2_BOOTSTRAP /; }",
+    "    while (my $gp_line = <$gp_fh>) { if ($gp_line =~ /^(GPV2_BOOTSTRAP [A-Za-z0-9_-]+)/) { $gp_marker = $1; $gp_hello_seen = 1; } }",
     "    close $gp_fh;",
     "    last;",
     "  }",
     "  select undef, undef, undef, 0.05;",
     "}",
+    "if (!$gp_hello_seen) {",
+    "  my $gp_diag = 'sidecar log is missing';",
+    "  if (open my $gp_log_fh, '<', $gp_log) { local $/; $gp_diag = <$gp_log_fh>; close $gp_log_fh; }",
+    "  $gp_diag = substr($gp_diag // '', 0, 4096);",
+    "  $gp_marker = 'GPV2_SIDECAR_HEX ' . unpack('H*', $gp_diag);",
+    "}",
+    "open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 bootstrap output';",
+    "print $gp_tex_fh \"\\\\typeout{$gp_marker}\\n\";",
+    "close $gp_tex_fh;",
     "$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';",
     "",
   ].join("\n");
+}
+
+function sanitizeSidecarDiagnostic(value: string): string {
+  const sanitized = value
+    .replace(/\bBearer\s+[^\s]+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk-|gAAAA|eyJ)[A-Za-z0-9._=-]{16,}/g, "[REDACTED]")
+    .replace(/([?&](?:token|key|secret|authorization)=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 512);
+  return sanitized || "unknown sidecar launch failure";
+}
+
+function decodeSidecarDiagnostic(value: string): string {
+  if (value.length < 2 || value.length > 8192 || value.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(value)) {
+    return "malformed sidecar launch diagnostic";
+  }
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return sanitizeSidecarDiagnostic(utf8Text(bytes));
+}
+
+function renderLogText(value: string): string {
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const logs = [parsed.pdfTexLog, parsed.latexmkLog, parsed.bibTexLog]
+      .filter((entry): entry is string => typeof entry === "string");
+    if (logs.length) return logs.join("\n");
+  } catch {
+    // Test doubles and legacy proxies may return the log body directly.
+  }
+  return value;
+}
+
+function extractWrappedMarker(
+  log: string,
+  prefix: string,
+  alphabet: RegExp,
+  maximumLength: number,
+): string | null {
+  const marker = log.lastIndexOf(prefix);
+  if (marker < 0) return null;
+  const lines = log.slice(marker + prefix.length).split(/\r?\n/);
+  let value = "";
+  let complete = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const match = alphabet.exec(trimmed);
+    if (!match) {
+      complete = value.length > 0;
+      break;
+    }
+    value += match[0];
+    if (value.length > maximumLength) return null;
+    if (match[0].length !== trimmed.length) {
+      complete = true;
+      break;
+    }
+  }
+  return complete && value ? value : null;
 }
 
 function parseHelloCandidate(
@@ -247,21 +332,31 @@ function matchesBoundInstance(
     envelope.peerId === "sidecar";
 }
 
-function validWorkerMarker(
+interface WorkerMarker {
+  protocol: "gp-awareness-v2";
+  workerIndex: number;
+  buildHash: string;
+  createdAtMs: number;
+}
+
+function parseWorkerMarker(
   content: string,
   workerIndex: number,
-  buildHash: string,
-): boolean {
+): WorkerMarker | null {
   try {
     const value = JSON.parse(content) as Record<string, unknown>;
-    return exactKeys(value, ["protocol", "workerIndex", "buildHash", "createdAtMs"]) &&
+    if (!(
+      exactKeys(value, ["protocol", "workerIndex", "buildHash", "createdAtMs"]) &&
       value.protocol === "gp-awareness-v2" &&
       value.workerIndex === workerIndex &&
-      value.buildHash === buildHash &&
+      typeof value.buildHash === "string" &&
+      /^[a-f0-9]{64}$/.test(value.buildHash) &&
       Number.isSafeInteger(value.createdAtMs) &&
-      (value.createdAtMs as number) >= 0;
+      (value.createdAtMs as number) >= 0
+    )) return null;
+    return value as unknown as WorkerMarker;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -528,6 +623,9 @@ export class V2BootstrapController {
   }
 
   async #deployAssets(): Promise<void> {
+    for (const obsoletePath of this.#assets.obsoletePaths) {
+      await this.#ydoc.tombstonePath(obsoletePath);
+    }
     for (const asset of this.#assets.files) {
       if (await this.#ydoc.readPath(asset.path) !== asset.content) {
         await this.#ydoc.writePath(asset.path, asset.content);
@@ -541,10 +639,19 @@ export class V2BootstrapController {
         buildHash: this.#assets.buildHash,
         createdAtMs: Math.floor(this.#clock.now()),
       }));
-    } else if (!validWorkerMarker(existingMarker, this.#workerIndex, this.#assets.buildHash)) {
-      throw new V2BootstrapError("Existing GhostProv worker marker does not match", "deploy", 1);
+    } else {
+      const marker = parseWorkerMarker(existingMarker, this.#workerIndex);
+      if (!marker) {
+        throw new V2BootstrapError("Existing GhostProv worker marker does not match", "deploy", 1);
+      }
+      if (marker.buildHash !== this.#assets.buildHash) {
+        await this.#ydoc.writePath(WORKER_PATH, canonicalJson({
+          ...marker,
+          buildHash: this.#assets.buildHash,
+        }));
+      }
     }
-    if (await this.#ydoc.readPath(MAIN_PATH) === null) {
+    if (await this.#ydoc.readPath(MAIN_PATH) !== MAIN_SOURCE) {
       await this.#ydoc.writePath(MAIN_PATH, MAIN_SOURCE);
     }
   }
@@ -637,15 +744,22 @@ export class V2BootstrapController {
         response = { status: 0, text: "", headers: new Headers() };
       }
       if (response.status >= 200 && response.status < 300) {
-        for (const line of response.text.split(/\r?\n/)) {
-          const index = line.indexOf(HELLO_PREFIX);
-          if (index < 0) continue;
-          const encoded = line.slice(index + HELLO_PREFIX.length).trim().split(/\s/, 1)[0]!;
+        const log = renderLogText(response.text);
+        const hello = extractWrappedMarker(log, HELLO_PREFIX, /^[A-Za-z0-9_-]+/, 8_192);
+        if (hello) {
           try {
-            return parseHelloCandidate(encoded, binding, attempt);
+            return parseHelloCandidate(hello, binding, attempt);
           } catch (cause) {
             lastError = cause as V2BootstrapError;
           }
+        }
+        const diagnostic = extractWrappedMarker(log, SIDECAR_HEX_PREFIX, /^[0-9a-fA-F]+/, 8_192);
+        if (diagnostic) {
+          throw new V2BootstrapError(
+            `V2 sidecar failed before bootstrap hello: ${decodeSidecarDiagnostic(diagnostic)}`,
+            "hello",
+            attempt,
+          );
         }
       }
       if (this.#clock.now() >= deadline) {

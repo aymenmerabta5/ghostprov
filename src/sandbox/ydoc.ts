@@ -186,6 +186,40 @@ export function tombstoneYDocEntry(doc: Y.Doc, map: Y.Map<any>): void {
   });
 }
 
+function tombstoneYDocTree(
+  doc: Y.Doc,
+  content: Y.Map<any>,
+  uuid: string,
+  map: Y.Map<any>,
+): Y.Map<any>[] {
+  const targets: Y.Map<any>[] = [];
+  const seen = new Set<string>();
+  const visit = (entryUuid: string, entry: Y.Map<any>): void => {
+    if (seen.has(entryUuid)) return;
+    seen.add(entryUuid);
+    if (entry.get("type") === "folder") {
+      const folderId = String(entry.get("id") ?? entryUuid);
+      for (const [childUuid, value] of content.entries()) {
+        const child = value as Y.Map<any>;
+        if (child.get("deleted") !== true && child.get("inFolder") === folderId) {
+          visit(childUuid, child);
+        }
+      }
+    }
+    targets.push(entry);
+  };
+  visit(uuid, map);
+  doc.transact(() => {
+    for (const target of targets) {
+      const value = target.get("content");
+      if (value instanceof Y.Text) value.delete(0, value.length);
+      else if (value != null) target.set("content", "");
+      target.set("deleted", true);
+    }
+  });
+  return targets;
+}
+
 export class SandboxYDoc {
   readonly projectId: ProjectId;
   readonly #mintYSweet: () => Promise<YSweetEnvelope>;
@@ -336,8 +370,16 @@ export class SandboxYDoc {
           parentId = String(child.map.get("id") ?? child.uuid);
           continue;
         }
-        if (child.map.get("type") === "folder") return false;
-        tombstoneYDocEntry(connection.doc, child.map);
+        const targets = tombstoneYDocTree(
+          connection.doc,
+          connection.content,
+          child.uuid,
+          child.map,
+        );
+        for (const target of targets) {
+          const filename = target.get("filename");
+          if (typeof filename === "string") connection.index.delete(filename);
+        }
         return true;
       }
       return false;

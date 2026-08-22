@@ -7,6 +7,7 @@ import {
   type CredentialRotationBinding,
   type RotatableCredentialPayload,
 } from "../src/v2/bootstrap/crypto";
+import { base64UrlDecode, base64UrlEncode } from "../src/v2/protocol/shared";
 
 const BINDING: CredentialRotationBinding = {
   projectId: "e631d12c-d917-4434-b360-41b4715d6679",
@@ -51,11 +52,20 @@ describe("V2 credential rotation cryptography", () => {
       binding: BINDING,
       credential: CREDENTIAL,
     });
+    const tamperedCiphertext = base64UrlDecode(sealed.ciphertext);
+    tamperedCiphertext[Math.floor(tamperedCiphertext.length / 2)] ^= 1;
     const mutations = [
       { key: createCredentialRotationKey(), sealed, binding: BINDING },
       { key, sealed, binding: { ...BINDING, instanceId: "sidecar-instance-2" } },
       { key, sealed, binding: { ...BINDING, rotationId: "rotation-2" } },
-      { key, sealed: { ...sealed, ciphertext: `${sealed.ciphertext.slice(0, -1)}A` }, binding: BINDING },
+      {
+        key,
+        sealed: {
+          ...sealed,
+          ciphertext: base64UrlEncode(tamperedCiphertext),
+        },
+        binding: BINDING,
+      },
     ];
 
     for (const mutation of mutations) {

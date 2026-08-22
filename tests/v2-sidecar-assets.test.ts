@@ -16,36 +16,31 @@ describe("V2 sidecar assets", () => {
     expect(first.files.map(file => file.path)).toEqual(
       [...first.files.map(file => file.path)].sort(),
     );
-    expect(first.files.map(file => file.path)).toContain(
-      ".ghostprov-v2/sandbox/v2/main.ts",
-    );
-    expect(first.files.map(file => file.path)).toContain(
+    expect(first.files.map(file => file.path)).toEqual([
+      ".ghostprov-v2/sidecar.bundle.js",
+    ]);
+    expect((first as any).obsoletePaths).toEqual([
+      ".ghostprov-v2/bootstrap.tex",
       ".ghostprov-v2/deno.json",
-    );
+      ".ghostprov-v2/sandbox",
+      ".ghostprov-v2/src",
+    ]);
   });
 
-  it("maps every relative import to another tracked asset", async () => {
+  it("produces one executable bundle with no runtime package resolution", async () => {
     const assets = await loadV2SidecarAssets();
-    const paths = new Set(assets.files.map(file => file.path));
-    for (const asset of assets.files.filter(file => file.path.endsWith(".ts"))) {
-      const imports = [...asset.content.matchAll(/from\s+["'](\.{1,2}\/[^"']+)["']/g)];
-      for (const match of imports) {
-        const resolved = new URL(match[1], `file:///${asset.path}`).pathname.slice(1);
-        const candidates = [resolved, `${resolved}.ts`, `${resolved}/index.ts`];
-        expect(candidates.some(candidate => paths.has(candidate))).toBe(true);
-      }
-    }
+    const bundle = assets.files[0]!.content;
+
+    expect(bundle.length).toBeGreaterThan(1_000);
+    expect(bundle).toContain("Deno.");
+    expect(bundle).not.toMatch(/\b(?:from|import)\s*\(?["'](?:npm:|https:)/);
+    expect(bundle).not.toContain("registry.npmjs.org");
   });
 
-  it("pins offline dependencies and contains no credential literals", async () => {
+  it("contains no credential literals or ZIP transport", async () => {
     const assets = await loadV2SidecarAssets();
     const serialized = JSON.stringify(assets);
-    const denoConfig = assets.files.find(file => file.path.endsWith("deno.json"))!;
-    const main = assets.files.find(file => file.path.endsWith("sandbox/v2/main.ts"))!;
 
-    expect(denoConfig.content).toContain('"fflate": "npm:fflate@0.8.2"');
-    expect(main.content).toContain('npm:@y-sweet/client@0.9.1');
-    expect(main.content).toContain('npm:yjs@13.6.27');
     expect(serialized).not.toMatch(
       /sk-[A-Za-z0-9_-]{24,}|gAAAA[A-Za-z0-9_-]{24,}|eyJ[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{24,}/,
     );

@@ -30,7 +30,7 @@ Project-less automatic creation is available only when explicitly enabled with `
 Each V2 project owns an isolated `V2SandboxRuntime`:
 
 - Direct Prism provisioning and token synchronization
-- A scoped Node Yjs connection used only for non-secret sidecar assets and bootstrap ciphertext
+- A scoped Node Yjs connection used only for one offline sidecar bundle and bootstrap ciphertext
 - A dedicated Y-Sweet Awareness channel for bounded request/response frames
 - A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
 - Append-only claims and terminal spools under `/tmp/ghostprov-v2`
@@ -228,11 +228,13 @@ The isolated suite includes:
 - `tests/v2-admission.test.ts`
 - `tests/v2-assembler.test.ts`
 - `tests/v2-bootstrap-crypto.test.ts`
+- `tests/v2-bootstrap-binding.test.ts`
 - `tests/v2-bootstrap-controller.test.ts`
 - `tests/v2-bootstrap-probe.test.ts`
 - `tests/v2-concurrency.test.ts`
 - `tests/v2-credential-rotation.test.ts`
 - `tests/v2-dynamic-fleet.test.ts`
+- `tests/v2-deno-awareness-peer.test.ts`
 - `tests/v2-faults.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`

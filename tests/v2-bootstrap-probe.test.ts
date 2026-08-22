@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFile } from "node:fs/promises";
 import {
   resolveV2BootstrapProbeOptions,
+  sanitizeV2BootstrapRenderLog,
 } from "../scripts/probe_v2_bootstrap";
 
 const VALID = {
@@ -54,5 +55,16 @@ describe("V2 live bootstrap probe guards", () => {
     expect(source).not.toContain("/zip");
     expect(source).not.toMatch(/deleteProject|projects\.delete|server\.close/);
     expect(source).toContain("http://127.0.0.1:8787");
+  });
+
+  it("redacts credentials and bounds live render diagnostics", () => {
+    const secret = "sk-bootstrap-secret-123456789012345678901234";
+    const diagnostic = sanitizeV2BootstrapRenderLog(
+      `Authorization: Bearer ${secret}\ntoken=${secret}\n${"x".repeat(20_000)}`,
+    );
+
+    expect(diagnostic).not.toContain(secret);
+    expect(diagnostic).toContain("[REDACTED]");
+    expect(diagnostic.length).toBeLessThanOrEqual(8_192);
   });
 });

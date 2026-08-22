@@ -1,5 +1,6 @@
-import * as Y from "npm:yjs@13.6.27";
-import { YSweetProvider } from "npm:@y-sweet/client@0.9.1";
+import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+import type { Awareness } from "y-protocols/awareness";
 import type { BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
 import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
@@ -28,6 +29,50 @@ export interface DenoAwarenessPeerOptions {
   instanceId: string;
   engine: SidecarEngine;
   retransmitMs?: number;
+  connectTimeoutMs?: number;
+  providerFactory?: (
+    doc: Y.Doc,
+    credential: () => BootstrapCredentialPayload,
+  ) => DenoAwarenessProviderLike;
+}
+
+export interface DenoAwarenessProviderLike {
+  readonly awareness: Pick<Awareness,
+    | "getStates"
+    | "getLocalState"
+    | "setLocalState"
+    | "setLocalStateField"
+    | "on"
+    | "off"
+  >;
+  on(event: string, listener: (...args: any[]) => void): void;
+  off(event: string, listener: (...args: any[]) => void): void;
+  connect(): void;
+  disconnect(): void;
+  destroy(): void;
+}
+
+function defaultProviderFactory(
+  doc: Y.Doc,
+  credential: () => BootstrapCredentialPayload,
+): DenoAwarenessProviderLike {
+  class AuthenticatedWebSocket extends WebSocket {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      const target = new URL(String(url));
+      target.searchParams.set("token", credential().token);
+      super(target, protocols);
+    }
+  }
+  return new WebsocketProvider(
+    credential().url,
+    credential().docId,
+    doc,
+    {
+      connect: false,
+      disableBc: true,
+      WebSocketPolyfill: AuthenticatedWebSocket,
+    } as any,
+  ) as DenoAwarenessProviderLike;
 }
 
 export class DenoAwarenessPeer {
@@ -36,11 +81,12 @@ export class DenoAwarenessPeer {
   readonly #engine: SidecarEngine;
   readonly #rotator: SidecarCredentialRotator;
   readonly #doc: Y.Doc;
-  readonly #provider: YSweetProvider;
+  readonly #provider: DenoAwarenessProviderLike;
   readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
   readonly #retransmitMs: number;
+  readonly #connectTimeoutMs: number;
   #revision = 0;
   #hostPeerId: string | null = null;
   #hostClientId: number | null = null;
@@ -59,24 +105,40 @@ export class DenoAwarenessPeer {
       instanceId: options.instanceId,
     });
     this.#retransmitMs = options.retransmitMs ?? 250;
+    this.#connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    if (!Number.isFinite(this.#connectTimeoutMs) || this.#connectTimeoutMs < 1) {
+      throw new RangeError("connectTimeoutMs must be positive");
+    }
     this.#doc = new Y.Doc({ guid: options.credential.docId });
-    this.#provider = new YSweetProvider(
-      async () => this.#clientToken(this.#rotator.current()),
-      options.credential.docId,
+    this.#provider = (options.providerFactory ?? defaultProviderFactory)(
       this.#doc,
-      {
-        connect: false,
-        initialClientToken: this.#clientToken(options.credential),
-        offlineSupport: false,
-        showDebuggerLink: false,
-      },
+      () => this.#rotator.current(),
     );
     this.#provider.awareness.on("change", this.#onAwarenessChange);
   }
 
   async connect(): Promise<void> {
     if (this.#closed) throw new Error("Awareness peer is closed");
-    await this.#provider.connect();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#provider.off("sync", onSync);
+        this.#provider.off("connection-error", onError);
+        error ? reject(error) : resolve();
+      };
+      const onSync = (synced: boolean) => { if (synced) finish(); };
+      const onError = () => finish(new Error("Y-Sweet sidecar connection failed"));
+      const timer = setTimeout(
+        () => finish(new Error("Y-Sweet sidecar synchronization timed out")),
+        this.#connectTimeoutMs,
+      );
+      this.#provider.on("sync", onSync);
+      this.#provider.on("connection-error", onError);
+      this.#provider.connect();
+    });
     this.#publish();
     this.#timer = setInterval(() => {
       if (this.#outbound.snapshot().frames.length) this.#publish();
@@ -194,8 +256,7 @@ export class DenoAwarenessPeer {
       await this.#engine.accept(frame);
       return;
     }
-    const credential = await this.#rotator.accept(frame.rotationId, frame.sealedJson);
-    this.#provider.clientToken = this.#clientToken(credential);
+    await this.#rotator.accept(frame.rotationId, frame.sealedJson);
     this.enqueue(
       { kind: "credential_ack", rotationId: frame.rotationId },
       "control",
@@ -203,8 +264,4 @@ export class DenoAwarenessPeer {
     );
   }
 
-  #clientToken(credential: BootstrapCredentialPayload): any {
-    const { rotationKey: _rotationKey, ...clientToken } = credential;
-    return clientToken;
-  }
 }
