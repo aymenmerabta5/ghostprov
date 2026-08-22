@@ -17,7 +17,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "fleet.sample": new Set(["capacity", "active", "available", "queued", "rss_bytes", "heap_bytes", "external_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes"]),
   "monitor.sample": new Set(["poll_ms", "health_status", "sandboxes_status", "capacity", "active", "available", "queued", "resources", "runtimes"]),
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
-  "logger.dropped": new Set(["samples", "progress", "queued_events", "queued_bytes"]),
+  "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
   "logger.error": new Set(["sink", "error_name", "error_message", "count"]),
 };
 
