@@ -3,6 +3,7 @@ node_modules/
 # secrets — never commit
 .env
 .pw/
+.ghostprov/
 
 # logs & session artifacts
 *.log

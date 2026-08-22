@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 
 describe("project documentation", () => {
@@ -60,5 +61,9 @@ describe("project documentation", () => {
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "probe_browserless_prism.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_multi_sandbox.ts"))).toBe(true);
+  });
+
+  it("keeps live multi-sandbox state out of version control", () => {
+    expect(gitignore.split(/\r?\n/)).toContain(".ghostprov/");
   });
 });
