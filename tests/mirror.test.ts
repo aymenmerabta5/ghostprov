@@ -113,7 +113,8 @@ describe("POST /v1/responses (non-stream)", () => {
     });
     expect(res.status).toBe(503);
     const j = await res.json();
-    expect(j.error.type).toBe("sync");
+    expect(j.error.type).toBe("service_unavailable_error");
+    expect(j.error.code).toBe("sync");
   });
 
   it("maps stall timeouts to 504", async () => {

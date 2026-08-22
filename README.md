@@ -1,6 +1,6 @@
 # GhostProv
 
-GhostProv is a local OpenAI Responses API mirror backed by an authenticated Prism sandbox. It supports non-streaming HTTP, true incremental SSE, Codex-compatible Responses WebSockets, file transfer, concurrent sandbox slots, and `store:false` continuation through connection-local response graphs.
+GhostProv is a local OpenAI Responses API mirror backed by an authenticated Prism sandbox. It supports non-streaming HTTP, true incremental SSE, Codex-compatible Responses WebSockets, native-shaped GPT Image generation/edit routes, concurrent sandbox slots, and `store:false` continuation through connection-local response graphs.
 
 The project is pinned to Bun 1.4.0, uses Bun's isolated native test runner, and typechecks with the native TypeScript 7.0.2 compiler.
 
@@ -35,6 +35,44 @@ curl.exe -N -X POST http://127.0.0.1:8787/v1/responses `
 ```
 
 The Node adapter forwards each `ReadableStream` chunk with backpressure. It does not buffer the response before sending it to the client.
+
+Reasoning fields are forwarded verbatim, including `effort: "max"`, `mode: "pro"`, `context`, and `summary`. `service_tier: "fast"` is also preserved.
+
+## Images compatibility
+
+The sandbox upstream exposes only the Responses API, so GhostProv implements native-shaped image routes locally and translates them into live-proven `gpt-image-2` Responses tool calls:
+
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+
+Generate an image:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8787/v1/images/generations `
+  -H "content-type: application/json" `
+  -d '{"model":"gpt-image-2","prompt":"a minimal red circle","quality":"low","size":"1024x1024","n":1}'
+```
+
+Edit one or more reference images, optionally with a PNG mask:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8787/v1/images/edits `
+  -F "model=gpt-image-2" `
+  -F "prompt=make the subject blue" `
+  -F "image=@input.png" `
+  -F "mask=@mask.png"
+```
+
+Compatibility behavior:
+
+- `gpt-image-2` and `gpt-image-2-2026-04-21` are supported.
+- `n=1..10` is implemented as concurrent Responses calls through the same global FIFO scheduler used by HTTP and WebSocket requests. Results retain submission order.
+- GPT Image data is returned as `b64_json`; URL emulation is intentionally unsupported.
+- PNG, JPEG, and WebP edit inputs are validated by MIME type, filename, and magic bytes. Up to 16 references are accepted, subject to the aggregate input limit below.
+- Masks must be PNG and no larger than 4 MiB.
+- Image streaming is intentionally deferred and returns an explicit compatibility error.
+- `/v1/images/variations` returns HTTP 501; use `/v1/images/edits` for GPT Image workflows.
+- Audio input is unavailable through the configured Responses-only upstream. `/v1/audio/speech`, `/v1/audio/transcriptions`, and `/v1/audio/translations` return HTTP 501 instead of pretending the capability exists.
 
 ## Responses WebSocket mode
 
@@ -87,6 +125,7 @@ One global FIFO scheduler owns all end-to-end relay capacity across HTTP and Web
 
 The slot daemon executes one upstream request per physical lane. Large requests use segmented transport:
 
+- segmented transport is enabled by default for request bodies above 512 KiB; `GP_SEGMENT=0` is the emergency opt-out;
 - v6.3 is selected only when `gp_status.json` advertises `segmented-v6.3-embedded-commit`;
 - parts `1..K-1` are published first and embedded-header part zero commits last;
 - `job_sN.json` is not rewritten by v6.3;
@@ -101,6 +140,9 @@ Concurrent response/status reads are coalesced by `ZipPollCoordinator`: filename
 | `GP_ZIP_BATCH_MS` | `10` | Archive-read coalescing window |
 | WebSocket active responses | `16` | Per-connection active response ceiling (`GP_WS_ACTIVE_RESPONSES`) |
 | WebSocket named lanes | `32` | Per-connection distinct named-lane ceiling (`GP_WS_NAMED_STREAMS`) |
+| `GP_IMAGE_RESPONSES_MODEL` | `gpt-5.6-sol` | Responses orchestrator used by Images compatibility routes |
+| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Aggregate raw bytes across edit references and mask |
+| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart request envelope limit applied before buffering |
 | `GP_WS_CACHE_NODES` | `256` | Cached response nodes per WebSocket |
 | `GP_WS_CACHE_BYTES` | `67108864` | Cached response bytes per WebSocket |
 | `GP_WS_CACHE_TOTAL_BYTES` | `536870912` | Process-wide WebSocket graph byte budget |
@@ -135,6 +177,11 @@ Image/audio data URLs and Responses fields such as `tools`, `tool_choice`, `reas
 ```text
 src/server.ts                 HTTP routes and server startup
 src/http/adapter.ts           Fetch-to-Node incremental response adapter
+src/http/body.ts              bounded multipart request collection
+src/http/errors.ts            OpenAI-shaped validation/upstream errors
+src/images/compat.ts          Images request validation and Responses mapping
+src/images/service.ts         concurrent image execution and aggregation
+src/images/routes.ts          Images/audio capability HTTP routes
 src/ws/server.ts              WebSocket upgrade boundary
 src/ws/session.ts             lanes, limits, event forwarding, disconnect cleanup
 src/ws/response-graph.ts      bounded store:false continuation/fork state
@@ -169,7 +216,12 @@ The default suite is isolated from live credentials and includes:
 - `tests/concurrency.test.ts`
 - `tests/documentation.test.ts`
 - `tests/files.test.ts`
+- `tests/http-body.test.ts`
+- `tests/http-errors.test.ts`
 - `tests/http-streaming.test.ts`
+- `tests/images-compat.test.ts`
+- `tests/images-http.test.ts`
+- `tests/images-service.test.ts`
 - `tests/mirror.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/scheduler.test.ts`
@@ -191,4 +243,14 @@ $env:GP_LIVE_VERIFY = "1"
 bun run verify:live
 ```
 
-It checks health, first-event streaming, a multi-turn WebSocket continuation, and concurrent named lanes against the running server. Start GhostProv separately before running it.
+It checks health, max/pro reasoning over first-event HTTP streaming, a multi-turn WebSocket continuation, and concurrent named lanes against the running server. Start GhostProv separately before running it.
+
+Image generation is opt-in because it incurs image-generation usage. Set `GP_LIVE_IMAGE=1` together with the main live-verification flag:
+
+```powershell
+$env:GP_LIVE_VERIFY = "1"
+$env:GP_LIVE_IMAGE = "1"
+bun run verify:live
+```
+
+The image probe uses the production compatibility translator and sends the resulting body through the existing `/v1/responses` endpoint, so it can verify source changes without restarting the live GhostProv process that the current Codex session depends on.

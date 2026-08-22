@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { buildGenerationBodies, parseGenerationRequest } from "../src/images/compat";
 
 if (process.env.GP_LIVE_VERIFY !== "1") {
   throw new Error("Live verification mutates Prism state. Set GP_LIVE_VERIFY=1 explicitly.");
@@ -30,7 +31,14 @@ async function verifyHttpStreaming(): Promise<void> {
   const response = await fetch(`${base}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer live-verify" },
-    body: JSON.stringify({ model, store: false, stream: true, input: "Reply with exactly LIVE_HTTP_OK" }),
+    body: JSON.stringify({
+      model,
+      store: false,
+      stream: true,
+      input: "Reply with exactly LIVE_HTTP_OK",
+      reasoning: { effort: "max", mode: "pro", summary: "concise" },
+      service_tier: "fast",
+    }),
   });
   if (!response.ok || !response.body) throw new Error(`stream request failed: ${response.status} ${await response.text()}`);
   const reader = response.body.getReader();
@@ -45,6 +53,35 @@ async function verifyHttpStreaming(): Promise<void> {
   }
   if (firstByteMs === null || !text.includes("response.completed")) throw new Error("HTTP stream produced no completed event");
   console.log(`[live] HTTP first event ${Math.round(firstByteMs)}ms`);
+}
+
+async function verifyImageGeneration(): Promise<void> {
+  if (process.env.GP_LIVE_IMAGE !== "1") return;
+  const [body] = buildGenerationBodies(parseGenerationRequest({
+    model: "gpt-image-2",
+    prompt: "A minimal solid red circle centered on a white background.",
+    quality: "low",
+    size: "1024x1024",
+    output_format: "png",
+    background: "opaque",
+  }, {
+    responsesModel: model,
+    maxEditInputBytes: 40 * 1024 * 1024,
+  }));
+  const started = performance.now();
+  const response = await fetch(`${base}/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer live-verify" },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`image request failed: ${response.status} ${text}`);
+  const final = JSON.parse(text);
+  const call = final.output?.find((item: any) => item?.type === "image_generation_call");
+  if (call?.status !== "completed" || typeof call.result !== "string" || call.result.length === 0) {
+    throw new Error(`image result missing: ${JSON.stringify({ status: final.status, outputTypes: final.output?.map((item: any) => item?.type) })}`);
+  }
+  console.log(`[live] gpt-image-2 returned ${call.result.length} base64 chars in ${Math.round(performance.now() - started)}ms`);
 }
 
 interface WsHarness {
@@ -151,6 +188,7 @@ await withTimeout((async () => {
   await verifyHealth();
   await verifyHttpStreaming();
   await verifyWebSocket();
+  await verifyImageGeneration();
 })(), "live verification");
 
 console.log("[live] verification passed");

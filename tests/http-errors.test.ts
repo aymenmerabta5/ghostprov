@@ -77,7 +77,7 @@ describe("OpenAI-compatible HTTP errors", () => {
       ["exhausted", 429],
       ["no-bridge", 503],
       ["timeout", 504],
-      ["sync", 502],
+      ["sync", 503],
       ["render", 502],
       ["upstream", 502],
     ] as const;

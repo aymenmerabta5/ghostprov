@@ -20,9 +20,21 @@ describe("project documentation", () => {
     expect(readme).toContain(`| \`GP_ZIP_BATCH_MS\` | \`${CONFIG_DEFAULTS.zipBatchMs}\``);
     expect(readme).toContain(`| WebSocket active responses | \`${CONFIG_DEFAULTS.wsActiveResponses}\``);
     expect(readme).toContain(`| WebSocket named lanes | \`${CONFIG_DEFAULTS.wsNamedStreams}\``);
+    expect(readme).toContain(`| \`GP_IMAGE_EDIT_MAX_INPUT_BYTES\` | \`${CONFIG_DEFAULTS.imageEditMaxInputBytes}\``);
+    expect(readme).toContain(`| \`GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES\` | \`${CONFIG_DEFAULTS.imageEditHttpMaxBodyBytes}\``);
+  });
+
+  it("documents the Images compatibility surface and honest capability boundaries", () => {
+    expect(readme).toContain("POST /v1/images/generations");
+    expect(readme).toContain("POST /v1/images/edits");
+    expect(readme).toContain("Audio input is unavailable through the configured Responses-only upstream");
+    expect(readme).toContain("GP_SEGMENT=0");
+    expect(readme).toContain("GP_LIVE_IMAGE=1");
   });
 
   it("provides stable verification scripts", () => {
+    const unitScript = String(pkg.scripts["test:unit"]);
+    const integrationScript = String(pkg.scripts["test:integration"]);
     expect(pkg.packageManager).toBe("bun@1.4.0");
     expect(pkg.engines.bun).toBe("^1.4.0");
     expect(pkg.devDependencies.typescript).toBe("7.0.2");
@@ -36,6 +48,10 @@ describe("project documentation", () => {
       "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
       "verify:live": expect.any(String),
     });
+    expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
+    expect(unitScript.includes("tests/images-service.test.ts")).toBe(true);
+    expect(unitScript.includes("tests/http-errors.test.ts")).toBe(true);
+    expect(integrationScript.includes("tests/images-http.test.ts")).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);
   });
 });

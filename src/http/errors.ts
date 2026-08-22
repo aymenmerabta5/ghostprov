@@ -132,6 +132,7 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     case "timeout":
       return { status: 504, error: { message, type: "timeout_error", param: null, code: "upstream_timeout" } };
     case "sync":
+      return { status: 503, error: { message, type: "service_unavailable_error", param: null, code: "sync" } };
     case "render":
       return { status: 502, error: { message, type: "upstream_error", param: null, code: kind } };
     case "upstream":
