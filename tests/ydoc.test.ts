@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as Y from "yjs";
-import { tombstoneDocEntry } from "../src/prism/ydoc";
+import { tombstoneYDocEntry } from "../src/sandbox/ydoc";
 
 describe("Yjs tracked-file cleanup", () => {
   it("tombstones an entry and clears its content atomically", () => {
@@ -12,7 +12,7 @@ describe("Yjs tracked-file cleanup", () => {
     entry.set("deleted", false);
     entry.set("content", content);
 
-    tombstoneDocEntry(doc, entry);
+    tombstoneYDocEntry(doc, entry);
 
     expect(entry.get("deleted")).toBe(true);
     expect((entry.get("content") as Y.Text).toString()).toBe("");

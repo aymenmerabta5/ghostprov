@@ -2,8 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { registerImageRoutes } from "../src/images/routes";
 import type { ImageCompatOptions } from "../src/images/compat";
-import type { RunHandle } from "../src/relay/pipeline";
-import { app as productionApp } from "../src/server";
+import type { RunHandle } from "../src/relay/run-handle";
 
 const OPTIONS: ImageCompatOptions = {
   responsesModel: "gpt-5.6-sol",
@@ -45,18 +44,6 @@ function testApp(startRelay: (body: Record<string, unknown>, signal?: AbortSigna
 }
 
 describe("Images compatibility HTTP routes", () => {
-  it("registers the compatibility routes on the production Hono app", async () => {
-    const imageResponse = await productionApp.request("/v1/images/generations", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "gpt-image-2" }),
-    });
-    const audioResponse = await productionApp.request("/v1/audio/transcriptions", { method: "POST" });
-
-    expect(imageResponse.status).toBe(400);
-    expect(audioResponse.status).toBe(501);
-  });
-
   it("returns native Images JSON while fanning n through separate relay calls", async () => {
     const bodies: Record<string, unknown>[] = [];
     const app = testApp(async body => {

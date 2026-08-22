@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
 import type { Server } from "node:http";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 

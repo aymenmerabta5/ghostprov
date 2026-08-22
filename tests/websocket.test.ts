@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import { attachResponsesWebSocket, type WebSocketRelayStarter } from "../src/ws/server";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];

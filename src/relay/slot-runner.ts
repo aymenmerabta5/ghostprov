@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
-import type { RunHandle } from "./pipeline";
+import type { RunHandle } from "./run-handle";
 import {
   planV63Job,
   type PlannedV63Job,

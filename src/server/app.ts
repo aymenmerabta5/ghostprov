@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { RunHandle } from "../relay/pipeline";
+import type { RunHandle } from "../relay/run-handle";
 import { sseFrame, SSE_HEADERS } from "../relay/sse";
 import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";

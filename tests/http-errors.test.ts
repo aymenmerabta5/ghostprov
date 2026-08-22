@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
-import { RelayError } from "../src/relay/pipeline";
-import { SlotError } from "../src/relay/slots";
+import { RelayError } from "../src/relay/run-handle";
+import { SlotRunnerError } from "../src/relay/slot-runner";
 
 describe("OpenAI-compatible HTTP errors", () => {
   it("preserves typed validation status and fields", async () => {
@@ -140,6 +140,6 @@ describe("OpenAI-compatible HTTP errors", () => {
   it("keeps structured upstream details on both relay error implementations", () => {
     const details = { code: "http_400", message: "{}" };
     expect(new RelayError("failed", "upstream", details).details).toBe(details);
-    expect(new SlotError("failed", "upstream", details).details).toBe(details);
+    expect(new SlotRunnerError("failed", "upstream", details).details).toBe(details);
   });
 });

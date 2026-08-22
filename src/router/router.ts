@@ -1,5 +1,5 @@
 import { SYSTEM_CLOCK, SYSTEM_RANDOM, type Clock, type RandomSource } from "../core/ports";
-import type { RunHandle } from "../relay/pipeline";
+import type { RunHandle } from "../relay/run-handle";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
 import type { ProjectId } from "../sandbox/types";
 import { chooseRuntime, type RouteCandidate } from "./policy";

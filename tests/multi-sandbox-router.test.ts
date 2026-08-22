@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { RunHandle } from "../src/relay/pipeline";
+import type { RunHandle } from "../src/relay/run-handle";
 import { MultiSandboxRouter } from "../src/router/router";
 import { ResourceGovernor } from "../src/router/resource-governor";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";

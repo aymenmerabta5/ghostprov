@@ -1,4 +1,4 @@
-import type { RunHandle } from "./pipeline";
+import type { RunHandle } from "./run-handle";
 
 export interface SchedulerStats {
   capacity: number;

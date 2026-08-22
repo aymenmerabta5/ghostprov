@@ -1,5 +1,5 @@
 import type { WebSocket } from "ws";
-import type { RunHandle } from "../relay/pipeline";
+import type { RunHandle } from "../relay/run-handle";
 import { config } from "../config";
 import {
   PreviousResponseNotFoundError,

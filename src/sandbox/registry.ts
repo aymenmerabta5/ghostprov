@@ -1,4 +1,4 @@
-import type { RunHandle } from "../relay/pipeline";
+import type { RunHandle } from "../relay/run-handle";
 import type { ProjectId } from "./types";
 
 export interface RoutableSandboxSnapshot {
