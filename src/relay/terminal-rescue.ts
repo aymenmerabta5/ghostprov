@@ -7,6 +7,13 @@ export class TerminalNotProvenError extends Error {
   }
 }
 
+export function canReleaseLane(options: {
+  requestPublished: boolean;
+  terminalProven: boolean;
+}): boolean {
+  return !options.requestPublished || options.terminalProven;
+}
+
 export function matchesTerminalEnvelope(
   envelope: any,
   expectedAck: string,
@@ -32,6 +39,7 @@ export async function settleWithTerminalRescue<T>(
   try {
     value = await run;
   } catch (error) {
+    if (options.hasTerminal()) throw error;
     const recovered = await options.rescue();
     if (recovered !== null) {
       return { value: recovered, reason: `recovered-after-error:${errorKind(error)}` };

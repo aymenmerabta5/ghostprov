@@ -34,7 +34,11 @@ import {
   type PlannedV63Job,
 } from "./segments";
 import { TerminalBackedSseExtractor, sanitizeFinal, type SseFrame } from "./sse";
-import { matchesTerminalEnvelope, settleWithTerminalRescue } from "./terminal-rescue";
+import {
+  canReleaseLane,
+  matchesTerminalEnvelope,
+  settleWithTerminalRescue,
+} from "./terminal-rescue";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -685,6 +689,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
               continue;
             }
             if (j.status === "failed") {
+              sawTerminal = true;
               console.error(`[slots ${tag}] UPSTREAM FAILED slot=${slot.n}: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`);
               throw new SlotError(`upstream failed: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`, "upstream");
             }
@@ -748,6 +753,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
    */
   async function rescueTerminal(): Promise<any | null> {
     const deadline = Date.now() + 30_000;
+    let warnedMismatch = false;
     while (Date.now() < deadline) {
       try {
         const files = await fetchZipFiles([respName]).catch(() => null);
@@ -757,12 +763,20 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
         if (txt && txt.length > 2) { try { j = JSON.parse(txt); } catch { /* partial */ } }
         if (j && (j.gp_final !== undefined || j.status === "failed")) {
           if (!matchesTerminalEnvelope(j, ack, activeReqid)) {
-            console.warn(`[slots ${tag}] rescue aborted: response belongs to another request (gp_ack=${j.gp_ack ?? j.ack})`);
-            return null;
+            if (!warnedMismatch) {
+              warnedMismatch = true;
+              console.warn(`[slots ${tag}] rescue waiting: response belongs to another request (gp_ack=${j.gp_ack ?? j.ack})`);
+            }
+            await sleep(500);
+            continue;
           }
           if (j.status === "failed") {
+            sawTerminal = true;
             console.error(`[slots ${tag}] rescue: upstream failed ${JSON.stringify(j.error ?? {}).slice(0, 200)}`);
-            return null;
+            throw new SlotError(
+              `upstream failed: ${JSON.stringify(j.error ?? {}).slice(0, 300)}`,
+              "upstream",
+            );
           }
           if (typeof j.gp_sse === "string" && j.gp_sse.length > 0) {
             const missed = extractor.replayTerminal(
@@ -780,10 +794,47 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
           sawTerminal = true;
           return sanitizeFinal(j.gp_final ?? j);
         }
-      } catch { /* transient zip/parse issues — keep polling */ }
+      } catch (error) {
+        if (sawTerminal) throw error;
+        // Transient zip/parse issues are recoverable while the deadline holds.
+      }
       await sleep(500);
     }
     return null;
+  }
+
+  async function releaseLane(): Promise<void> {
+    // Clear before releasing so the next occupant never races the cleanup;
+    // cap the wait — an uncleared file is cosmetic once terminal ownership is
+    // proven, while retaining the lane would unnecessarily reduce capacity.
+    await Promise.race([clearLane(), sleep(5000)]).catch(() => undefined);
+    pool.release(slot);
+    console.log(`[slots ${tag}] released slot ${slot.n} (reason=${releaseCause}, frames=${stats.frames})`);
+  }
+
+  async function recoverQuarantinedLane(): Promise<void> {
+    releaseCause = `quarantined-after-${releaseCause}`;
+    console.error(
+      `[slots ${tag}] QUARANTINED slot ${slot.n}: published request has no proven terminal; ` +
+      "lane will remain unavailable until authoritative recovery succeeds",
+    );
+    while (!sawTerminal) {
+      try {
+        const recovered = await rescueTerminal();
+        if (recovered !== null) {
+          releaseCause = "quarantine-recovered-terminal";
+          break;
+        }
+      } catch (error: any) {
+        if (sawTerminal) {
+          const kind = typeof error?.kind === "string" ? error.kind : "internal";
+          releaseCause = `quarantine-recovered-error:${kind}`;
+          break;
+        }
+      }
+      console.warn(`[slots ${tag}] slot ${slot.n} remains quarantined; terminal not yet visible`);
+    }
+    await releaseLane();
   }
 
   const settlement = settleWithTerminalRescue(runLoop, {
@@ -799,12 +850,11 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   ).finally(async () => {
     closed = true;
     notify?.();
-    // Clear before releasing so the next occupant never races the cleanup;
-    // cap the wait — an uncleared file is cosmetic, a blocked lane is not.
-    void Promise.race([clearLane(), sleep(5000)]).catch(() => undefined).then(() => {
-      pool.release(slot);
-      console.log(`[slots ${tag}] released slot ${slot.n} (reason=${releaseCause}, frames=${stats.frames})`);
-    });
+    if (canReleaseLane({ requestPublished, terminalProven: sawTerminal })) {
+      void releaseLane();
+    } else {
+      void recoverQuarantinedLane();
+    }
   });
 
   async function* eventStream(): AsyncGenerator<SseFrame> {
