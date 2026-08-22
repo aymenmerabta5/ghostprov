@@ -27,6 +27,7 @@ import { triggerRender, fetchZipFiles, pageFetch, bust } from "../prism/gateway"
 import { deleteDocFile, readDocFile, writeDocFile, writeDocFileAppended, ensureDocFolder } from "../prism/ydoc";
 import {
   chooseSegmentProtocol,
+  isSegmentTransportEnabled,
   planJob,
   planV63Job,
   creationSlot,
@@ -413,7 +414,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   let activeReqid: string | null = null;
 
   // --- job write plan -------------------------------------------------------
-  // Segmented jobs (GP_SEGMENT=1): payloads >512KiB are split into small
+  // Segmented jobs (default; GP_SEGMENT=0 opts out): payloads >512KiB are split into small
   // write-once entries under the shared "gp" folder. An advertised v6.3
   // daemon commits by publishing embedded-header part zero last, avoiding the
   // shared job_sN cursor; older daemons receive a v6.2 cursor manifest.
@@ -422,7 +423,7 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
   // windowed/terminal protocol. This removes the single-Yjs-update size
   // ceiling entirely (backend silently truncated monolithic updates at a
   // moving ~2.4-3.5MB limit — deterministic, unfixable by retry).
-  const SEGMENT = process.env.GP_SEGMENT === "1";
+  const SEGMENT = isSegmentTransportEnabled();
   let segPlan: PlannedJob | null = null;
   let v63Plan: PlannedV63Job | null = null;
   if (SEGMENT && jobText.length > 512 * 1024) {

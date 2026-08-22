@@ -74,7 +74,19 @@ describe("Responses WebSocket server", () => {
     };
     const socket = await startServer(startRelay);
     const messages = collect(socket);
-    socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", store: false, input: "default" }));
+    socket.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "default",
+      reasoning: {
+        effort: "max",
+        mode: "pro",
+        context: "all_turns",
+        summary: "concise",
+      },
+      service_tier: "fast",
+    }));
     socket.send(JSON.stringify({ type: "response.create", stream_id: "agent-1", model: "gpt-5.6-sol", store: false, input: "named" }));
 
     await waitFor(() => messages.filter(message => message.type === "response.completed").length === 2);
@@ -83,7 +95,17 @@ describe("Responses WebSocket server", () => {
     expect(defaultEvents.some(message => !("stream_id" in message))).toBe(true);
     expect(messages.filter(message => message.stream_id === "agent-1").length).toBeGreaterThan(0);
     expect(bodies).toHaveLength(2);
-    expect(bodies[0]).toMatchObject({ stream: true, store: false });
+    expect(bodies[0]).toMatchObject({
+      stream: true,
+      store: false,
+      reasoning: {
+        effort: "max",
+        mode: "pro",
+        context: "all_turns",
+        summary: "concise",
+      },
+      service_tier: "fast",
+    });
     expect(bodies[0]).not.toHaveProperty("stream_id");
     expect(bodies[1]).not.toHaveProperty("stream_id");
   });

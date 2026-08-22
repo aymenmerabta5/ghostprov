@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
-import { chooseSegmentProtocol, planV63Job } from "../src/relay/segments";
+import { chooseSegmentProtocol, isSegmentTransportEnabled, planV63Job } from "../src/relay/segments";
 
 function decode(plan: ReturnType<typeof planV63Job>): string {
   const ordered = [...plan.parts].sort((left, right) => left.index - right.index);
@@ -52,5 +52,12 @@ describe("v6.3 immutable segment planning", () => {
   it("selects v6.3 only when the daemon advertises it", () => {
     expect(chooseSegmentProtocol(["single-v5", "segmented-v6.3-embedded-commit"])).toBe(6.3);
     expect(chooseSegmentProtocol(["single-v5", "segmented-v6.2"])).toBe(6.2);
+  });
+
+  it("enables segmented transport by default with an explicit zero opt-out", () => {
+    expect(isSegmentTransportEnabled(undefined)).toBe(true);
+    expect(isSegmentTransportEnabled("1")).toBe(true);
+    expect(isSegmentTransportEnabled("true")).toBe(true);
+    expect(isSegmentTransportEnabled("0")).toBe(false);
   });
 });

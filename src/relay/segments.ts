@@ -161,6 +161,12 @@ export function chooseSegmentProtocol(protocols: Iterable<string>): 6.2 | 6.3 {
   return new Set(protocols).has("segmented-v6.3-embedded-commit") ? 6.3 : 6.2;
 }
 
+/** Large requests use segmented transport by default. GP_SEGMENT=0 is the
+ * explicit emergency compatibility opt-out. */
+export function isSegmentTransportEnabled(value = process.env.GP_SEGMENT): boolean {
+  return value !== "0";
+}
+
 function splitUtf8WithCaps(text: string, firstMaxBytes: number, nextMaxBytes: number): string[] {
   const bytes = Buffer.from(text, "utf8");
   if (!bytes.length) return [""];
