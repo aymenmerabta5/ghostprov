@@ -189,7 +189,13 @@ function splitUtf8WithCaps(text: string, firstMaxBytes: number, nextMaxBytes: nu
 export function planV63Job(
   jobName: string,
   jobText: string,
-  options: { gzip?: boolean; dir?: string; partBytes?: number; maxPartBytes?: number } = {},
+  options: {
+    gzip?: boolean;
+    gzipBytes?: Uint8Array;
+    dir?: string;
+    partBytes?: number;
+    maxPartBytes?: number;
+  } = {},
 ): PlannedV63Job {
   const dir = options.dir ?? "gp";
   const maxPartBytes = Math.trunc(options.maxPartBytes ?? 256 * 1024);
@@ -206,8 +212,11 @@ export function planV63Job(
   const rawParts = splitUtf8WithCaps(jobText, firstPayloadCap, subsequentCap);
   let payloadParts = rawParts;
   let enc: "raw" | "gz+b64" = "raw";
-  if (options.gzip) {
-    const encoded = zlib.gzipSync(original, { level: 1 }).toString("base64");
+  if (options.gzip || options.gzipBytes) {
+    const compressed = options.gzipBytes
+      ? Buffer.from(options.gzipBytes)
+      : zlib.gzipSync(original, { level: 1 });
+    const encoded = compressed.toString("base64");
     const gzipParts: string[] = [];
     gzipParts.push(encoded.slice(0, firstPayloadCap));
     for (let offset = firstPayloadCap; offset < encoded.length; offset += subsequentCap) {
