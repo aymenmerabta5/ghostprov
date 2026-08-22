@@ -131,7 +131,15 @@ export class PrismProjectsClient {
         file_uuids: [],
       }),
     });
-    return parseProject(await responseJson(response, "creation"));
+    const created = parseProject(await responseJson(response, "creation"));
+    if (created.projectId !== input.projectId) {
+      throw new PrismProjectError(
+        "Prism project creation returned a different UUID",
+        "protocol",
+        response.status,
+      );
+    }
+    return created;
   }
 
   async deleteManaged(

@@ -70,8 +70,8 @@ function parseWorker(value: unknown): FleetWorkerRecord {
   if (typeof raw.state !== "string" || !STATES.has(raw.state as FleetWorkerState)) {
     throw new FleetManifestError("Fleet worker state is invalid", "protocol");
   }
-  if (raw.managed !== true) {
-    throw new FleetManifestError("Fleet worker is not managed", "protocol");
+  if (typeof raw.managed !== "boolean") {
+    throw new FleetManifestError("Fleet worker management flag is invalid", "protocol");
   }
   if (!Number.isInteger(raw.leaderGeneration) || (raw.leaderGeneration as number) < 0) {
     throw new FleetManifestError("Fleet worker leader generation is invalid", "protocol");
@@ -84,7 +84,7 @@ function parseWorker(value: unknown): FleetWorkerRecord {
     createdAtMs: finiteNonnegative(raw.createdAtMs, "Fleet worker creation time"),
     updatedAtMs: finiteNonnegative(raw.updatedAtMs, "Fleet worker update time"),
     leaderGeneration: raw.leaderGeneration as number,
-    managed: true,
+    managed: raw.managed,
   });
 }
 
@@ -194,6 +194,7 @@ export class FleetManifestStore {
     projectId: ProjectId;
     title: string;
     nowMs: number;
+    managed?: boolean;
   }): Promise<FleetManifest> {
     if (!Number.isInteger(input.index) || input.index < 1) {
       return Promise.reject(new FleetManifestError("Worker index must be positive", "protocol"));
@@ -207,7 +208,11 @@ export class FleetManifestStore {
     return this.#mutate(current => {
       const sameProject = current.workers.find(worker => worker.projectId === input.projectId);
       if (sameProject) {
-        if (sameProject.index === input.index && sameProject.title === input.title) return current;
+        if (
+          sameProject.index === input.index &&
+          sameProject.title === input.title &&
+          sameProject.managed === (input.managed ?? true)
+        ) return current;
         throw new FleetManifestError("Worker project reservation conflicts", "conflict");
       }
       if (current.workers.some(worker => worker.index === input.index)) {
@@ -221,7 +226,7 @@ export class FleetManifestStore {
         createdAtMs: input.nowMs,
         updatedAtMs: input.nowMs,
         leaderGeneration: 0,
-        managed: true,
+        managed: input.managed ?? true,
       });
       return { ...current, workers: Object.freeze([...current.workers, worker]) };
     });
@@ -274,6 +279,13 @@ export class FleetManifestStore {
 
   removeManaged(id: ProjectId): Promise<FleetManifest> {
     return this.#mutate(current => {
+      const selected = current.workers.find(worker => worker.projectId === id);
+      if (selected && !selected.managed) {
+        throw new FleetManifestError(
+          "Explicit project is not eligible for managed deletion",
+          "conflict",
+        );
+      }
       const workers = current.workers.filter(worker => worker.projectId !== id);
       if (workers.length === current.workers.length) {
         throw new FleetManifestError("Managed worker was not found", "missing_worker");

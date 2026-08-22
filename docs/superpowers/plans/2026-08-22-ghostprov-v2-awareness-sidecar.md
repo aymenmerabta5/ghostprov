@@ -509,7 +509,7 @@ export interface FleetWorkerRecord {
   createdAtMs: number;
   updatedAtMs: number;
   leaderGeneration: number;
-  managed: true;
+  managed: boolean;
 }
 
 export interface FleetManifest {
@@ -523,7 +523,7 @@ export class FleetManifestStore {
   constructor(options: { file: string; identityFingerprint: string });
   initialize(kind: PrismIdentityKind): Promise<FleetManifest>;
   load(): Promise<FleetManifest>;
-  reserveWorker(input: { index: number; projectId: ProjectId; title: string; nowMs: number }): Promise<FleetManifest>;
+  reserveWorker(input: { index: number; projectId: ProjectId; title: string; nowMs: number; managed?: boolean }): Promise<FleetManifest>;
   markCreated(projectId: ProjectId, nowMs: number): Promise<FleetManifest>;
   markState(projectId: ProjectId, state: FleetWorkerState, nowMs: number): Promise<FleetManifest>;
   nextLeaderGeneration(projectId: ProjectId): Promise<number>;
@@ -726,7 +726,7 @@ export class ProjectFleetManager {
 Reconciliation algorithm:
 
 1. Load remote inventory and manifest under the identity lease.
-2. Select deduplicated explicit IDs, then valid manifest IDs, then titled projects whose Yjs marker is valid, then writable/proven-empty owned projects only when configured. A title alone never authorizes modification.
+2. Select deduplicated explicit IDs, then valid managed manifest IDs, then titled projects whose Yjs marker is valid, then writable/proven-empty owned projects only when configured. Persist explicit IDs with `managed:false`; removing one from `PRISM_PROJECT_IDS` removes its reuse authority. A title alone never authorizes modification.
 3. Clamp the effective desired count by `guestMaxProjects` when the resolved identity is anonymous, including `GP_PRISM_SESSION=auto` that resolved to a guest.
 4. For every deficit, persist a `creating` record with stable index/UUID before `POST /api/projects`; refetch on retry and never create a duplicate UUID.
 5. Allocate a new persisted leader generation before each runtime start.

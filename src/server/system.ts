@@ -56,6 +56,7 @@ class ManagedSandboxRuntime implements RoutableSandboxRuntime {
   #gateway: SandboxGateway | null = null;
   #runner: SandboxSlotRunner | null = null;
   #credentials: ProvisionedRuntimeCredentials | null = null;
+  #draining = false;
 
   constructor(options: {
     projectId: ProjectId;
@@ -141,14 +142,28 @@ class ManagedSandboxRuntime implements RoutableSandboxRuntime {
     });
   }
 
-  start(): Promise<void> { return this.#lifecycle.start(); }
+  start(): Promise<void> {
+    this.#draining = false;
+    return this.#lifecycle.start();
+  }
+  async drain(reason: string): Promise<void> {
+    this.#draining = true;
+    this.#lifecycle.drain(reason);
+    while (this.#runner) {
+      const snapshot = this.#runner.snapshot();
+      if (snapshot.active === 0 && snapshot.queued === 0) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await this.stop();
+  }
   async stop(): Promise<void> {
+    this.#draining = true;
     await this.#lifecycle.stop();
     this.#runner = null;
     this.#gateway = null;
   }
   run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
-    if (!this.#runner || this.#lifecycle.snapshot().state.type !== "ready") {
+    if (this.#draining || !this.#runner || this.#lifecycle.snapshot().state.type !== "ready") {
       return Promise.reject(new Error(`Sandbox ${this.projectId} is not ready`));
     }
     return this.#runner.run(body, signal);

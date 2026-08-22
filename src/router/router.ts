@@ -47,11 +47,13 @@ export class MultiSandboxRouter {
   readonly #governor: ResourceGovernor;
   readonly #random: RandomSource;
   readonly #clock: Clock;
+  readonly #registryUnsubscribe: () => void;
   readonly #reserved = new Map<ProjectId, number>();
   readonly #queues = new Map<string, QueuedJob[]>();
   readonly #clientOrder: string[] = [];
   #clientCursor = 0;
   #drainScheduled = false;
+  #closed = false;
 
   constructor(options: {
     registry: SandboxRegistry;
@@ -63,17 +65,20 @@ export class MultiSandboxRouter {
     this.#governor = options.governor;
     this.#random = options.random ?? SYSTEM_RANDOM;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#registryUnsubscribe = this.#registry.subscribe(() => this.#scheduleDrain());
   }
 
   async startRelay(
     body: Record<string, unknown>,
     options: StartRelayOptions = {},
   ): Promise<RunHandle> {
+    if (this.#closed) throw new Error("Multi-sandbox router is closed");
     const workload = classifyWorkload(body);
     const memoryLease = await this.#governor.acquire(workload, options.signal);
-    if (options.signal?.aborted) {
+    if (options.signal?.aborted || this.#closed) {
       memoryLease.release();
-      throw abortError();
+      if (options.signal?.aborted) throw abortError();
+      throw new Error("Multi-sandbox router is closed");
     }
     return new Promise<RunHandle>((resolve, reject) => {
       const clientId = options.clientId ?? "default";
@@ -101,6 +106,7 @@ export class MultiSandboxRouter {
   }
 
   acquireIncomingBody(bytes: number, signal?: AbortSignal): Promise<ReleasableLease> {
+    if (this.#closed) return Promise.reject(new Error("Multi-sandbox router is closed"));
     if (!Number.isFinite(bytes) || bytes < 0) {
       return Promise.reject(new RangeError("Incoming body reservation must be non-negative"));
     }
@@ -131,6 +137,22 @@ export class MultiSandboxRouter {
       runtimes,
       resources: this.#governor.snapshot(),
     };
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#registryUnsubscribe();
+    for (const queue of this.#queues.values()) {
+      for (const job of queue) {
+        job.signal?.removeEventListener("abort", job.onAbort!);
+        job.memoryLease.release();
+        job.reject(new Error("Multi-sandbox router is closed"));
+      }
+    }
+    this.#queues.clear();
+    this.#clientOrder.length = 0;
+    this.#clientCursor = 0;
   }
 
   #enqueue(job: QueuedJob, front = false): void {
@@ -180,7 +202,7 @@ export class MultiSandboxRouter {
   }
 
   #scheduleDrain(): void {
-    if (this.#drainScheduled) return;
+    if (this.#closed || this.#drainScheduled) return;
     this.#drainScheduled = true;
     queueMicrotask(() => {
       this.#drainScheduled = false;

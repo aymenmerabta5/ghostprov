@@ -145,6 +145,7 @@ The isolated suite includes:
 - `tests/documentation.test.ts`
 - `tests/file-lease.test.ts`
 - `tests/fleet-manifest.test.ts`
+- `tests/fleet-manager.test.ts`
 - `tests/heartbeat.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`

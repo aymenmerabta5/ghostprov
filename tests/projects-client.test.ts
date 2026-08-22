@@ -107,6 +107,18 @@ describe("PrismProjectsClient", () => {
     });
   });
 
+  it("rejects a create response belonging to another project UUID", async () => {
+    const account = new ScriptedAccount([
+      json(200, project(A, "GhostProv Worker 2")),
+    ]);
+    const client = new PrismProjectsClient(account);
+
+    await expect(client.create({
+      projectId: projectId(B),
+      title: "GhostProv Worker 2",
+    })).rejects.toMatchObject({ kind: "protocol" });
+  });
+
   it("classifies HTTP failures without exposing response secrets", async () => {
     const secret = "project-api-secret";
     const account = new ScriptedAccount([

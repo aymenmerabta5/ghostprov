@@ -15,12 +15,16 @@ function deferred<T>() {
 class FakeRuntime implements RoutableSandboxRuntime {
   active = 0;
   executions = 0;
-  state: "ready" | "draining" = "ready";
+  state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   constructor(readonly projectId: ProjectId, readonly capacity = 30) {}
   async start(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async drain(): Promise<void> {
+    this.state = "draining";
+    if (this.active === 0) this.state = "stopped";
+  }
+  async stop(): Promise<void> { this.state = "stopped"; }
   snapshot() {
     return {
       projectId: this.projectId,
@@ -89,6 +93,44 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("adds, drains, and removes runtimes without replacing the registry", async () => {
+    const registry = new SandboxRegistry();
+    const runtime = new FakeRuntime(projectId("00000000-0000-4000-8000-000000000001"));
+    const events: string[] = [];
+    const unsubscribe = registry.subscribe(event => events.push(event.type));
+
+    registry.add(runtime);
+    expect(registry.get(runtime.projectId)).toBe(runtime);
+    await registry.drain(runtime.projectId, "scale-down");
+    await registry.removeStopped(runtime.projectId);
+
+    expect(registry.get(runtime.projectId)).toBeUndefined();
+    expect(events).toEqual(["added", "changed", "removed"]);
+    unsubscribe();
+  });
+
+  it("wakes queued routing when a ready runtime is added", async () => {
+    const registry = new SandboxRegistry();
+    const governor = createSystem(0).governor;
+    const router = new MultiSandboxRouter({
+      registry,
+      governor,
+      random: { next: () => 0.5, uuid: () => "id" },
+    });
+    const pending = router.startRelay(
+      { model: "gpt-5.6-sol", input: "queued", stream: true },
+      { clientId: "queued", source: "http" },
+    );
+    await flush();
+    const runtime = new FakeRuntime(projectId("00000000-0000-4000-8000-000000000001"), 1);
+    registry.add(runtime);
+
+    const handle = await pending;
+    runtime.completeOne();
+    await handle.final;
+    await router.close();
+  });
+
   it("admits exactly 120 simultaneous jobs across four 30-slot runtimes", async () => {
     const system = createSystem();
     const jobs = Array.from({ length: 121 }, (_, index) => system.router.startRelay(

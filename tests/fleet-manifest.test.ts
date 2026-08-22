@@ -117,6 +117,22 @@ describe("FleetManifestStore", () => {
     await expect(store.removeManaged(A)).rejects.toMatchObject({ kind: "missing_worker" });
   });
 
+  it("tracks explicit projects without making them decommissionable", async () => {
+    const file = await manifestPath();
+    const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await store.initialize("authenticated");
+    await store.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "User explicit project",
+      nowMs: 1_000,
+      managed: false,
+    });
+
+    expect((await store.load()).workers[0].managed).toBe(false);
+    await expect(store.removeManaged(A)).rejects.toMatchObject({ kind: "conflict" });
+  });
+
   it("never persists credential-shaped fields", async () => {
     const file = await manifestPath();
     const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });

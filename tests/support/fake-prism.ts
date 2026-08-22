@@ -124,7 +124,14 @@ export class FakePrismRuntime implements RoutableSandboxRuntime {
   }
 
   async start(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async drain(): Promise<void> {
+    this.state = "draining";
+    while (this.runner.snapshot().active > 0 || this.runner.snapshot().queued > 0) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    this.state = "stopped";
+  }
+  async stop(): Promise<void> { this.state = "stopped"; }
   run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
     return this.runner.run(body, signal);
   }
