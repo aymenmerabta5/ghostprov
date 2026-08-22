@@ -40,6 +40,7 @@ import {
   matchesTerminalEnvelope,
   settleWithTerminalRescue,
 } from "./terminal-rescue";
+import { recoverUnlatchedPublication } from "./unlatch-recovery";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -604,25 +605,44 @@ export async function runSlotJob(body: Record<string, unknown>): Promise<RunHand
         throw new SlotError(`stream stalled ${Math.round(config.stallTimeoutMs / 1000)}s with no data`, "timeout");
       }
       if (!latched && Date.now() > unlatchDeadline) {
-        if (unlatchAttempts < 2) {
-          unlatchAttempts++;
+        const recoveryNumber = unlatchAttempts + 1;
+        const recovery = await recoverUnlatchedPublication({
+          attempt: unlatchAttempts,
+          maxAttempts: 2,
+          ensureDaemonReady: async () => {
+            console.warn(
+              `[slots ${tag}] no ack within ${config.unlatchTimeoutMs}ms — ` +
+              `revalidating daemon before recovery #${recoveryNumber}`,
+            );
+            const readySlots = await ensureReady();
+            if (readySlots < slot.n) {
+              throw new SlotError(
+                `daemon capacity shrank to ${readySlots}; slot ${slot.n} is unavailable`,
+                "sync",
+              );
+            }
+          },
+          republish: async () => {
+            // Segmented: republish ONLY the manifest/commit. Parts are
+            // immutable and already verified on disk; a fresh mtime triggers
+            // the revived daemon's scanner without changing request identity.
+            if (v63Plan) {
+              const fid = await segmentFolder(v63Plan.dir);
+              await writeDocFile(v63Plan.parts[0].base, v63Plan.parts[0].text, { folderId: fid });
+              return;
+            }
+            const rewrite = segPlan ? segPlan.manifestText : (indexText ?? jobText);
+            if (!segPlan && rewrite.length > 512 * 1024 && process.env.GP_APPEND_JOBS !== "0") {
+              await writeDocFileAppended(jobName, rewrite);
+            } else {
+              await writeDocFile(jobName, rewrite);
+            }
+          },
+        });
+        if (recovery.recovered) {
+          unlatchAttempts = recovery.nextAttempt;
           unlatchDeadline = Date.now() + config.unlatchTimeoutMs;
-          console.warn(`[slots ${tag}] no ack within ${config.unlatchTimeoutMs}ms — republishing commit (recovery #${unlatchAttempts})`);
-          // Segmented: republish ONLY the manifest (parts are immutable and
-          // already verified on disk; a fresh manifest mtime triggers rescan).
-          if (v63Plan) {
-            // Republish the commit part INTO THE gp FOLDER — without folderId
-            // this created a root-level stray the daemon could never see.
-            const fid = await segmentFolder(v63Plan.dir);
-            await writeDocFile(v63Plan.parts[0].base, v63Plan.parts[0].text, { folderId: fid }).catch(() => undefined);
-            continue;
-          }
-          const rewrite = segPlan ? segPlan.manifestText : (indexText ?? jobText);
-          if (!segPlan && rewrite.length > 512 * 1024 && process.env.GP_APPEND_JOBS !== "0") {
-            await writeDocFileAppended(jobName, rewrite).catch(() => undefined);
-          } else {
-            await writeDocFile(jobName, rewrite).catch(() => undefined);
-          }
+          console.warn(`[slots ${tag}] commit republished after daemon revalidation (recovery #${unlatchAttempts})`);
           continue;
         }
         console.error(`[slots ${tag}] UNLATCHED slot=${slot.n} — daemon never accepted the job after ${unlatchAttempts} recoveries`);
