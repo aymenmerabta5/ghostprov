@@ -355,10 +355,12 @@ The host preserves the existing idempotent SSE extractor. It rejects gaps, dupli
 - request ID;
 - request digest;
 - upstream response ID;
-- final Responses object;
+- index and SHA-256 of the segmented terminal SSE event containing the final Responses object;
 - total event count and byte count;
 - digest of the canonical complete SSE transcript;
 - terminal status (`completed`, `failed`, or `incomplete`).
+
+The host reassembles and validates the final Responses object from that terminal event. The metadata frame does not duplicate an arbitrarily large final object, so every physical frame remains below 16 KiB even for image and tool payloads.
 
 A lane is released only when terminal identity and digest match the committed request.
 
