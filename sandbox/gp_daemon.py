@@ -1,7 +1,13 @@
 # gp_daemon.py — ghostprov slot daemon (sandbox side)
 #
-# Watches /workspace/job_s<N>.json slot files; each new/changed job is picked
-# up by its own worker thread and streamed from the relay
+# Watches legacy/v6.2 job_s<N>.json cursors plus immutable v6.3 commit parts
+# under gp/. Each complete job is picked up by its own worker thread and
+# streamed from the relay. A v6.3 client writes parts 1..K-1 first, then commits
+# by writing part zero as:
+#
+#   GP63 {"v":6.3,"id":...,"parts":K,"size":T,"sha12":X,"enc":"gz+b64"}\n<payload0>
+#
+# No v6.3 request rewrites job_s<N>.json.
 # ($OPENAI_BASE_URL = https://proxy:18080/v1). Progress lands in
 # resp_s<N>.json using the v3 tail protocol so per-poll cost stays O(window):
 #
@@ -61,7 +67,15 @@ MAX_JOB_PART_BYTES = int(
 MAX_JOB_PARTS = int(os.environ.get("GP_MAX_JOB_PARTS", "4096"))
 SEGMENT_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SHA12_PATTERN = re.compile(r"^[0-9a-f]{12}$")
-DAEMON_BUILD = "v6.2.6-self-detached"
+V63_MAGIC = b"GP63 "
+MAX_V63_HEADER_BYTES = 1024
+V63_PART0_PATTERN = re.compile(
+    r"^job_s([1-9][0-9]*)\.json\.([A-Za-z0-9_-]{1,128})\.0$"
+)
+V63_SCAN_INTERVAL = float(os.environ.get("GP_V63_SCAN_INTERVAL", "0.5"))
+V63_RECENT_TTL = float(os.environ.get("GP_V63_RECENT_TTL", "300"))
+V63_RECENT_MAX = int(os.environ.get("GP_V63_RECENT_MAX", "512"))
+DAEMON_BUILD = "v6.3.1-bounded"
 
 _lock = threading.Lock()
 _active = {}          # slot -> ack currently processing (legacy status field)
@@ -208,17 +222,7 @@ def ensure_slot_files():
                 pass
 
 
-def parse_segment_manifest(job_text: str):
-    """Return a normalized v6.2 job manifest, or None for a legacy v5 job."""
-    try:
-        value = json.loads(job_text)
-    except Exception:
-        return None
-    if not isinstance(value, dict):
-        return None
-    if str(value.get("v")) not in ("6", "6.0", "6.2"):
-        return None
-
+def _normalize_segment_manifest(value: dict, version: float):
     request_id = value.get("id")
     parts = value.get("parts")
     size = value.get("size")
@@ -237,13 +241,77 @@ def parse_segment_manifest(job_text: str):
     if encoding is not None and encoding != "gz+b64":
         raise SegmentManifestError(f"unsupported v6 encoding {encoding!r}")
     return {
-        "v": 6.2,
+        "v": version,
         "id": request_id,
         "parts": parts,
         "size": size,
         "sha12": ack,
         "encoding": encoding,
     }
+
+
+def parse_segment_manifest(job_text: str):
+    """Return a normalized v6.2 cursor manifest, or None for a legacy job."""
+    try:
+        value = json.loads(job_text)
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("v")) not in ("6", "6.0", "6.2"):
+        return None
+    return _normalize_segment_manifest(value, 6.2)
+
+
+def parse_v63_part0(value: bytes, expected_id: str | None = None):
+    """Parse a write-once v6.3 commit header and return (manifest, payload).
+
+    Wire format for canonical part zero:
+
+        GP63 {compact manifest JSON}\n<first encoded payload slice>
+
+    Parts 1..K-1 remain unchanged. Clients publish part zero last; its creation
+    commits the job without rewriting the churn-prone job_sN.json cursor.
+    """
+    if not value.startswith(V63_MAGIC):
+        return None
+    newline = value.find(b"\n", len(V63_MAGIC))
+    if newline < 0 or newline - len(V63_MAGIC) > MAX_V63_HEADER_BYTES:
+        raise SegmentManifestError("v6.3 part 0 has a missing or oversized header")
+    try:
+        header = json.loads(value[len(V63_MAGIC):newline].decode("utf-8"))
+    except Exception as ex:
+        raise SegmentManifestError(f"v6.3 part 0 header is invalid JSON: {ex}") from ex
+    if not isinstance(header, dict) or str(header.get("v")) != "6.3":
+        raise SegmentManifestError("v6.3 part 0 header must declare v=6.3")
+    manifest = _normalize_segment_manifest(header, 6.3)
+    if expected_id is not None and manifest["id"] != expected_id:
+        raise SegmentManifestError(
+            f"v6.3 filename id {expected_id!r} does not match header id {manifest['id']!r}"
+        )
+    manifest["embedded_header"] = True
+    return manifest, value[newline + 1:]
+
+
+def format_v63_part0(manifest: dict, first_payload: bytes) -> bytes:
+    """Build canonical part zero; shared by tests and client implementers."""
+    header = {
+        "v": 6.3,
+        "id": manifest["id"],
+        "parts": manifest["parts"],
+        "size": manifest["size"],
+        "sha12": manifest["sha12"],
+    }
+    encoding = manifest.get("encoding") or manifest.get("enc")
+    if encoding is not None:
+        header["enc"] = encoding
+    normalized = _normalize_segment_manifest(header, 6.3)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_V63_HEADER_BYTES:
+        raise SegmentManifestError("v6.3 header exceeds maximum size")
+    # Keep validation and the emitted dictionary in lockstep.
+    assert normalized["id"] == manifest["id"]
+    return V63_MAGIC + encoded + b"\n" + first_payload
 
 
 def segmented_part_path(slot: int, request_id: str, index: int) -> pathlib.Path:
@@ -257,6 +325,67 @@ def legacy_segmented_part_path(slot: int, request_id: str, index: int) -> pathli
 def resolve_segmented_part_path(slot: int, request_id: str, index: int) -> pathlib.Path:
     canonical = segmented_part_path(slot, request_id, index)
     return canonical if canonical.exists() else legacy_segmented_part_path(slot, request_id, index)
+
+
+def cleanup_v63_parts(slot: int, request_id: str):
+    """Delete every canonical/rollout part belonging to one processed request."""
+    if not SEGMENT_REQUEST_ID.fullmatch(request_id):
+        return []
+    gp_dir = WORKSPACE / "gp"
+    paths = list(gp_dir.glob(f"job_s{slot}.json.{request_id}.*"))
+    paths.extend(gp_dir.glob(f"job_s{slot}.{request_id}.*"))
+    removed = []
+    for path in paths:
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            pass
+        except OSError as ex:
+            print(f"[gp_daemon] cleanup failed path={path}: {ex}", flush=True)
+    return removed
+
+
+def mark_v63_seen(seen: dict, key, now=None):
+    seen[key] = time.monotonic() if now is None else now
+
+
+def prune_v63_metadata(known: dict, seen: dict, now=None):
+    """Bound recent request IDs and discard scan entries for deleted files."""
+    current = time.monotonic() if now is None else now
+    for path in list(known):
+        if not pathlib.Path(path).exists():
+            known.pop(path, None)
+    cutoff = current - V63_RECENT_TTL
+    for key, timestamp in list(seen.items()):
+        if timestamp < cutoff:
+            seen.pop(key, None)
+    overflow = len(seen) - V63_RECENT_MAX
+    if overflow > 0:
+        for key, _ in sorted(seen.items(), key=lambda item: item[1])[:overflow]:
+            seen.pop(key, None)
+
+
+def retire_v63_event(event: dict, known: dict, seen: dict, now=None):
+    removed = cleanup_v63_parts(event["slot"], event["request_id"])
+    for path in removed:
+        known.pop(str(path), None)
+    mark_v63_seen(seen, event["key"], now=now)
+
+
+def publish_v63_failure_if_idle(event: dict, worker, known: dict, seen: dict, now=None):
+    """Publish a malformed-commit terminal only after the lane worker exits."""
+    if worker is not None and worker.is_alive():
+        return False
+    write_slot_failed(
+        event["slot"],
+        event["ack"],
+        event["code"],
+        event["message"],
+        transport=event["transport"],
+    )
+    retire_v63_event(event, known, seen, now=now)
+    return True
 
 
 def read_bytes_snapshot(path: pathlib.Path):
@@ -295,6 +424,17 @@ def assemble_segmented_job(slot: int, manifest: dict):
         if value is None:
             return None
         parts.append(value)
+    if manifest.get("embedded_header"):
+        parsed = parse_v63_part0(parts[0], expected_id=manifest["id"])
+        if parsed is None:
+            raise SegmentAssemblyError("v6.3 part 0 lost its embedded commit header")
+        header_manifest, first_payload = parsed
+        for key in ("parts", "size", "sha12", "encoding"):
+            if header_manifest.get(key) != manifest.get(key):
+                raise SegmentAssemblyError(
+                    f"v6.3 part 0 header changed field {key!r} during assembly"
+                )
+        parts[0] = first_payload
     raw = b"".join(parts)
     if manifest.get("encoding") == "gz+b64":
         try:
@@ -396,6 +536,7 @@ def manifest_ack_hint(job_text: str) -> str:
 def set_assembling(slot: int, manifest: dict):
     with _lock:
         _assembling_requests[slot] = {
+            "v": manifest.get("v"),
             "id": manifest["id"],
             "ack": manifest["sha12"],
             "parts": manifest["parts"],
@@ -513,7 +654,13 @@ def write_status():
             "version": 5,
             "protocol": "tail-v3-terminal-sse",
             "daemon_build": DAEMON_BUILD,
-            "job_protocols": ["single-v5", "segmented-v6.2", "segmented-v6.2-gz+b64"],
+            "job_protocols": [
+                "single-v5",
+                "segmented-v6.2",
+                "segmented-v6.2-gz+b64",
+                "segmented-v6.3-embedded-commit",
+                "segmented-v6.3.1-bounded",
+            ],
             "response_protocol": "single-v5-tail-terminal",
             "pid": os.getpid(),
             "ppid": os.getppid(),
@@ -817,7 +964,103 @@ def read_job_snapshot(path: pathlib.Path):
     return None
 
 
-def scan_startup_slots():
+def _v63_ack_hint(value: bytes) -> str:
+    try:
+        newline = value.find(b"\n", len(V63_MAGIC))
+        header = json.loads(value[len(V63_MAGIC):newline].decode("utf-8"))
+        ack = header.get("sha12") if isinstance(header, dict) else None
+    except Exception:
+        ack = None
+    return ack if isinstance(ack, str) and SHA12_PATTERN.fullmatch(ack) else sha12_bytes(value)
+
+
+def scan_v63_commits(known: dict):
+    """Discover changed write-once part-zero commits under gp/.
+
+    Stable non-v6.3 and empty files are remembered so the scanner does not
+    repeatedly read the accumulated v6.2/cleaned artifact set.
+    """
+    discovered = []
+    failures = []
+    gp_dir = WORKSPACE / "gp"
+    try:
+        paths = list(gp_dir.glob("job_s*.json.*.0"))
+    except OSError:
+        return discovered, failures
+    live_paths = set()
+    for path in paths:
+        match = V63_PART0_PATTERN.fullmatch(path.name)
+        if match is None:
+            continue
+        slot = int(match.group(1))
+        request_id = match.group(2)
+        if slot > NUM_SLOTS:
+            continue
+        key = str(path)
+        live_paths.add(key)
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            continue
+        if known.get(key) == signature:
+            continue
+        value = read_bytes_snapshot(path)
+        if value is None:
+            continue
+        known[key] = signature
+        if not value or not value.startswith(V63_MAGIC):
+            continue
+        try:
+            parsed = parse_v63_part0(value, expected_id=request_id)
+        except SegmentManifestError as ex:
+            transport = {"v": 6.3, "id": request_id, "embedded_header": True}
+            failures.append({
+                "kind": "failure",
+                "slot": slot,
+                "key": (slot, request_id),
+                "request_id": request_id,
+                "order": (signature[0], request_id),
+                "signature": signature,
+                "commit_path": path,
+                "ack": _v63_ack_hint(value),
+                "code": "bad_v63_commit",
+                "message": str(ex),
+                "transport": transport,
+            })
+            continue
+        manifest, _ = parsed
+        discovered.append({
+            "kind": "commit",
+            "slot": slot,
+            "key": (slot, request_id),
+            "request_id": request_id,
+            "order": (signature[0], request_id),
+            "signature": signature,
+            "commit_path": path,
+            "manifest": manifest,
+        })
+    for key in set(known) - live_paths:
+        known.pop(key, None)
+    return discovered, failures
+
+
+def select_newest_v63_events(events):
+    """Return ({slot: newest}, losers) ordered by (mtime_ns, request_id)."""
+    newest = {}
+    losers = []
+    for event in events:
+        previous = newest.get(event["slot"])
+        if previous is None or event["order"] > previous["order"]:
+            if previous is not None:
+                losers.append(previous)
+            newest[event["slot"]] = event
+        else:
+            losers.append(event)
+    return newest, losers
+
+
+def scan_startup_slots(skip_slots=None):
     """Baseline slots and recover legacy or segmented jobs not proven terminal.
 
     The old startup path blindly marked every existing job as known.  A client
@@ -825,6 +1068,7 @@ def scan_startup_slots():
     response acknowledgement is the durable completion record: only a matching
     terminal response is safe to baseline without replaying the job.
     """
+    skip_slots = set(skip_slots or ())
     known = {}
     ready = []
     assembling = {}
@@ -836,6 +1080,8 @@ def scan_startup_slots():
             continue
         signature, job_text = snapshot
         known[slot] = signature
+        if slot in skip_slots:
+            continue
         if not job_text.strip():
             continue
         response_path = WORKSPACE / f"resp_s{slot}.json"
@@ -893,13 +1139,36 @@ def main():
     print(f"[gp_daemon] provisioned {NUM_SLOTS} transport lanes", flush=True)
     threading.Thread(target=status_loop, daemon=True, name="gp-status").start()
 
-    known, startup_jobs, segmented_pending, startup_failures = scan_startup_slots()
+    v63_known = {}
+    v63_queue = {}
+    v63_seen = {}
+    v63_inflight = {}
+    next_v63_scan = 0.0
+    initial_v63, initial_v63_failures = scan_v63_commits(v63_known)
+    v63_queue, initial_losers = select_newest_v63_events(
+        [*initial_v63, *initial_v63_failures]
+    )
+    for loser in initial_losers:
+        cleanup_v63_parts(loser["slot"], loser["request_id"])
+        mark_v63_seen(v63_seen, loser["key"])
+    v63_startup_slots = set(v63_queue)
+    known, startup_jobs, segmented_pending, startup_failures = scan_startup_slots(
+        skip_slots=v63_startup_slots
+    )
     workers: dict = {}
     source_signature = _source_signature()
     restart_pending = False
     for slot, ack, code, message in startup_failures:
         write_slot_failed(slot, ack, code, message)
         print(f"[gp_daemon] slot {slot} rejected at startup: {code}", flush=True)
+    for event in v63_queue.values():
+        if event["kind"] == "commit":
+            set_assembling(event["slot"], event["manifest"])
+        print(
+            f"[gp_daemon] slot {event['slot']} recovered v6.3 {event['kind']} "
+            f"id={event['request_id']}",
+            flush=True,
+        )
     for slot, pending in segmented_pending.items():
         set_assembling(slot, pending["manifest"])
         print(
@@ -930,9 +1199,151 @@ def main():
                 pidfile_handle.close()
                 os.execv(sys.executable, [sys.executable, str(SOURCE_PATH)])
 
+            now = time.monotonic()
+            # Workers publish terminal response state before exiting. Retire
+            # their immutable request files only after the thread is dead.
+            for slot, event in list(v63_inflight.items()):
+                worker = workers.get(slot)
+                if worker is not None and worker.is_alive():
+                    continue
+                v63_inflight.pop(slot, None)
+                manifest = event["manifest"]
+                response_path = WORKSPACE / f"resp_s{slot}.json"
+                if response_is_terminal_for_ack(
+                    response_path,
+                    manifest["sha12"],
+                    request_id=manifest["id"],
+                ):
+                    retire_v63_event(event, v63_known, v63_seen, now=now)
+                else:
+                    # A terminal file write can fail independently of the
+                    # upstream request. Replay it unless a newer generation
+                    # already owns the lane; deterministic newest-wins ordering
+                    # also bounds orphaned part files in this edge case.
+                    v63_seen.pop(event["key"], None)
+                    queued = v63_queue.get(slot)
+                    if queued is None:
+                        v63_queue[slot] = event
+                    elif event["order"] > queued["order"]:
+                        retire_v63_event(queued, v63_known, v63_seen, now=now)
+                        v63_queue[slot] = event
+                    else:
+                        retire_v63_event(event, v63_known, v63_seen, now=now)
+
+            prune_v63_metadata(v63_known, v63_seen, now=now)
+            if now >= next_v63_scan:
+                discoveries, v63_failures = scan_v63_commits(v63_known)
+                candidates = [
+                    event
+                    for event in [*discoveries, *v63_failures]
+                    if event["key"] not in v63_seen
+                    and not (
+                        event["slot"] in v63_inflight
+                        and v63_inflight[event["slot"]]["key"] == event["key"]
+                    )
+                ]
+                newest, losers = select_newest_v63_events(candidates)
+                for loser in losers:
+                    retire_v63_event(loser, v63_known, v63_seen, now=now)
+                for slot, event in newest.items():
+                    queued = v63_queue.get(slot)
+                    if queued is not None and queued["order"] >= event["order"]:
+                        retire_v63_event(event, v63_known, v63_seen, now=now)
+                        continue
+                    if queued is not None:
+                        retire_v63_event(queued, v63_known, v63_seen, now=now)
+                    v63_queue[slot] = event
+                    print(
+                        f"[gp_daemon] slot {slot} queued v6.3 {event['kind']} "
+                        f"id={event['request_id']}",
+                        flush=True,
+                    )
+                next_v63_scan = now + V63_SCAN_INTERVAL
+
+            for slot, event in sorted(
+                list(v63_queue.items()),
+                key=lambda item: item[1]["order"],
+            ):
+                worker = workers.get(slot)
+                if worker is not None and worker.is_alive():
+                    continue
+                try:
+                    stat = event["commit_path"].stat()
+                    current_signature = (stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    v63_queue.pop(slot, None)
+                    clear_assembling(slot)
+                    continue
+                if current_signature != event["signature"]:
+                    v63_queue.pop(slot, None)
+                    clear_assembling(slot)
+                    continue
+                if event["kind"] == "failure":
+                    if not publish_v63_failure_if_idle(
+                        event,
+                        worker,
+                        v63_known,
+                        v63_seen,
+                        now=now,
+                    ):
+                        continue
+                    v63_queue.pop(slot, None)
+                    print(
+                        f"[gp_daemon] slot {slot} published queued "
+                        f"{event['code']} id={event['request_id']}",
+                        flush=True,
+                    )
+                    continue
+                manifest = event["manifest"]
+                response_path = WORKSPACE / f"resp_s{slot}.json"
+                if response_is_terminal_for_ack(
+                    response_path,
+                    manifest["sha12"],
+                    request_id=manifest["id"],
+                ):
+                    v63_queue.pop(slot, None)
+                    retire_v63_event(event, v63_known, v63_seen, now=now)
+                    clear_assembling(slot)
+                    continue
+                try:
+                    assembled = assemble_segmented_job(slot, manifest)
+                except (SegmentAssemblyError, SegmentManifestError) as ex:
+                    v63_queue.pop(slot, None)
+                    write_slot_failed(
+                        slot,
+                        manifest["sha12"],
+                        "bad_v63_parts",
+                        str(ex),
+                        transport=manifest,
+                    )
+                    retire_v63_event(event, v63_known, v63_seen, now=now)
+                    continue
+                if assembled is None:
+                    set_assembling(slot, manifest)
+                    continue
+                v63_queue.pop(slot, None)
+                clear_assembling(slot)
+                worker = SlotWorker(
+                    slot,
+                    event["commit_path"],
+                    assembled,
+                    manifest,
+                )
+                workers[slot] = worker
+                v63_inflight[slot] = event
+                mark_v63_seen(v63_seen, event["key"], now=now)
+                worker.start()
+                print(
+                    f"[gp_daemon] slot {slot} v6.3 assembled and dispatched "
+                    f"id={manifest['id']}",
+                    flush=True,
+                )
+
             for slot, pending in list(segmented_pending.items()):
                 worker = workers.get(slot)
                 if worker is not None and worker.is_alive():
+                    if worker.transport.get("id") == pending["manifest"]["id"]:
+                        segmented_pending.pop(slot, None)
                     continue
                 try:
                     stat = pending["job_path"].stat()
@@ -942,6 +1353,15 @@ def main():
                     clear_assembling(slot)
                     continue
                 if current_signature != pending["signature"]:
+                    segmented_pending.pop(slot, None)
+                    clear_assembling(slot)
+                    continue
+                response_path = WORKSPACE / f"resp_s{slot}.json"
+                if response_is_terminal_for_ack(
+                    response_path,
+                    pending["manifest"]["sha12"],
+                    request_id=pending["manifest"]["id"],
+                ):
                     segmented_pending.pop(slot, None)
                     clear_assembling(slot)
                     continue
@@ -970,7 +1390,20 @@ def main():
                 worker.start()
                 print(f"[gp_daemon] slot {slot} v6.2 assembled and dispatched", flush=True)
 
+            v63_owned_slots = set(v63_queue) | set(v63_inflight)
+            v63_owned_slots.update(
+                slot
+                for slot, worker in workers.items()
+                if worker.is_alive() and worker.transport.get("v") == 6.3
+            )
             for slot, p in scan_slots(known):
+                if slot in v63_owned_slots:
+                    # Baseline doc echoes or stale v6.2 cursor content while
+                    # the immutable v6.3 generation owns this physical lane.
+                    snapshot = read_job_snapshot(p)
+                    if snapshot is not None:
+                        known[slot] = snapshot[0]
+                    continue
                 w = workers.get(slot)
                 if w is not None and w.is_alive():
                     # Client watchdogs rewrite the same envelope when an ACK is
