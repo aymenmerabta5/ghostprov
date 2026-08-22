@@ -3,11 +3,15 @@
 **Status:** Proposed, empirically validated prototype
 **Date:** 2026-08-22
 **Branch:** `br/v2-awareness-sidecar`
-**Supersedes:** Only the v1 sandbox file/ZIP hot path. The v1 transport remains a recovery fallback.
+**Supersedes:** The v1 sandbox file/ZIP hot path. V1 remains a signed-in, pre-commit migration fallback only.
 
 ## 1. Decision
 
 GhostProv v2 will preserve the existing host API, router, Codex WebSocket behavior, image compatibility, project provisioning, resource governor, terminal validation, and quarantine rules.
+
+Prism sessions may be signed-in or backend-owned anonymous guest sessions. Signed-in sessions remain the preferred production mode during migration. Guest sessions are an explicit, capability-gated V2 mode; they are not described as an authentication bypass and never scrape browser cookies or storage.
+
+Fleet size is dynamic. Four sandboxes remain the live-tested default, not an architectural limit. The desired fleet is derived from configured target concurrency or an explicit sandbox count, and the control plane may reconcile any operator-approved number of projects within a configurable safety ceiling.
 
 It will replace the request-time transport:
 
@@ -21,6 +25,8 @@ v2: host Y-Sweet Awareness frames -> sandbox sidecar -> direct Responses API str
 The v2 sandbox sidecar requires no public port. It connects to the same authenticated Y-Sweet project document as the host, but carries request traffic through the ephemeral Awareness protocol rather than persistent Yjs document structures.
 
 The supervised Crixet Deno process remains alive on port 8080. GhostProv never patches or restarts it.
+
+V2 does not use either Prism's project-export archive endpoint or the sandbox proxy `/zip` endpoint. ZIP remains only inside the legacy v1 implementation. An anonymous worker is V2-only: if its sidecar is unavailable before commitment, that worker is unavailable rather than falling back to v1.
 
 ## 2. Proven constraints
 
@@ -39,6 +45,11 @@ Read-only sandbox diagnostics established:
 - Existing sandbox code can call the configured internal OpenAI proxy successfully.
 - Crixet vendors Deno, Yjs 13.6.27, `@y-sweet/client` 0.9.1, and all required transitive modules.
 - `/api/y` rejects arbitrary non-project document UUIDs with HTTP 404, so disposable Y-Sweet documents cannot be minted.
+- Prism exposes a backend-owned guest bootstrap at `POST /api/auth/anonymous-session` and persists the identity in HttpOnly cookies.
+- One clean guest session created and listed four distinct projects, provisioned a sandbox, minted project-resource and Y-Sweet credentials, reached `wait-for-sync=syncing -> synced`, and completed a heartbeat.
+- Guest-owned binary upload and Yjs text-file creation were accepted, and a fresh Y-Sweet client observed the newly created project files.
+- Chrome deliberately disables its Create/Upload File controls for guest users. Guest multi-file automation is therefore an internal capability, not a stable public UI contract, and must be startup-probed before use.
+- The sandbox proxy `/zip` returned HTTP 500 for a newly automated guest project even after a render was accepted. This does not block V2 because ZIP is absent from its bootstrap and request paths, but it prohibits v1 fallback for guest workers.
 
 The sidecar must therefore:
 
@@ -47,6 +58,7 @@ The sidecar must therefore:
 3. use only vendored dependencies;
 4. use ephemeral Awareness frames to avoid persistent CRDT growth;
 5. call the configured OpenAI proxy through the provided environment and CA.
+6. avoid every ZIP/export dependency in V2.
 
 ## 3. Prototype evidence
 
@@ -96,6 +108,24 @@ The prototype placed all completed results in one growing Awareness state. Under
 
 Production v2 will not publish a growing result array. It will use bounded, acknowledged frames and credit-based flow control.
 
+### 3.5 Anonymous control-plane proof
+
+A clean cookie jar reproduced Prism's backend-owned anonymous-session flow without browser state:
+
+| Proof | Result |
+| --- | --- |
+| Guest bootstrap | HTTP 200; anonymous user; HttpOnly device/session cookies |
+| Four projects under one guest identity | 4/4 created, listed, and matched by UUID |
+| Binary object upload | HTTP 200 with a project-scoped file object |
+| Sandbox allocation | HTTP 200; approximately 0.5 seconds in the observed run |
+| Resource and Y-Sweet credentials | HTTP 200; project and document identity matched |
+| Sandbox credential installation | both resource and Y-Sweet token pushes returned HTTP 200 |
+| Workspace readiness | `syncing -> synced` in approximately 1.15 seconds |
+| Heartbeat | HTTP 200 with a sandbox session identifier |
+| Yjs text tree | a second fresh client observed `main.tex` and the probe file |
+
+Every probe used a dedicated guest identity and exact probe project UUIDs; the created probe projects were deleted after the test. Production reconciliation never deletes managed projects automatically.
+
 ## 4. System architecture
 
 ```text
@@ -115,12 +145,22 @@ Production v2 will not publish a growing result array. It will use bounded, ackn
 
 ### 4.1 Host components
 
+#### `PrismSessionManager`
+
+- Loads one durable Prism cookie jar and refreshes it under an exclusive account lock.
+- Reuses a valid signed-in or anonymous session before creating any identity.
+- In anonymous mode, calls only the backend-owned `POST /api/auth/anonymous-session` flow and resolves an existing-session conflict through `/auth/session`.
+- Persists the cookie jar atomically with owner-only permissions; losing this jar means losing access to its guest-owned project fleet.
+- Never reads Chrome cookies, local storage, profiles, or passwords.
+- Runs a bounded startup capability probe before guest workers enter the registry.
+
 #### `AwarenessTransportSession`
 
 - Owns one host Y-Sweet provider per sandbox runtime.
 - Identifies the current sidecar instance and protocol build.
 - Publishes bounded frames and consumes sidecar frames.
 - Maintains epochs, sequence numbers, acknowledgements, retransmission timers, and credits.
+- Enforces a host-issued, manifest-persisted leader generation so a stale sidecar cannot accept or emit traffic.
 - Never stores complete traffic in persistent Yjs types.
 
 #### `V2SlotRunner`
@@ -138,7 +178,27 @@ Production v2 will not publish a growing result array. It will use bounded, ackn
 - Retries launch up to three times with condition-based readiness.
 - Mints and installs a fresh Y-Sweet token before replacement.
 - Drains the old sidecar before planned rotation.
-- Falls back to v1 before request commitment when v2 cannot become ready.
+- Falls back to v1 before request commitment only for signed-in workers in `auto` transport mode.
+- Marks an anonymous worker unavailable when V2 cannot become ready; it never invokes a ZIP-based path.
+
+#### `ProjectFleetManager`
+
+- Inventories Prism projects through the current persisted signed-in or guest session.
+- Reuses explicit project IDs first.
+- Reuses previously managed GhostProv worker projects next.
+- May reuse an unmarked owned project only when it is empty, writable, and not leased by another runtime.
+- Creates exactly the missing number of Prism projects when automatic creation is enabled.
+- Persists creation intents and project IDs atomically so reconciliation is idempotent after crashes.
+- Scaffolds and starts runtimes independently with bounded provisioning concurrency.
+- Adds ready runtimes to the registry without restarting the HTTP server.
+- Drains removed/excess runtimes but never deletes a Prism project automatically.
+- Continuously reconciles desired, provisioning, ready, draining, and failed fleet state.
+
+#### Shared protocol package
+
+- Defines the frame schema, protocol version, state-machine transitions, limits, and canonical digest rules once for the host and generated Deno sidecar.
+- Produces a deterministic build hash embedded in both peers.
+- Rejects readiness, claims, or frames when protocol version, schema hash, build hash, project, session, or leader generation does not match.
 
 #### Existing host layers retained
 
@@ -170,6 +230,7 @@ Production v2 will not publish a growing result array. It will use bounded, ackn
 - Sends `POST {OPENAI_BASE_URL}/responses` according to the official Responses API contract.
 - Forces upstream HTTP streaming for incremental delivery.
 - Preserves model, reasoning, tools, service tier, input, metadata, and all supported fields.
+- Persists `FETCH_STARTING` before calling upstream. Once `fetch()` may have started, no automatic retry or reroute is permitted, even when no response headers arrived.
 - Never logs credentials or complete sensitive request bodies.
 
 #### `AdmissionController`
@@ -177,14 +238,17 @@ Production v2 will not publish a growing result array. It will use bounded, ackn
 - Defaults to 128 active upstream calls per sandbox.
 - Queues additional accepted requests in bounded FIFO/fair queues.
 - Exposes credits to the host.
+- Accepts a live capacity ceiling from the host `ResourceGovernor`; 128 is a physical upper bound, not a promise to oversubscribe a constrained machine.
 - Reduces capacity temporarily after connection-reset bursts.
 - Never attempts the rejected unbounded 256-active mode.
 
 #### `ClaimJournal`
 
-- Stores a small local-disk record under `/workspace` for committed requests.
-- Records request ID, digest, claim state, upstream response ID when known, and terminal digest.
+- Stores append-only records under `/tmp/ghostprov-v2`; it never pollutes the synchronized `/workspace` project tree.
+- Group-commits bounded batches and acknowledges commitment only after the relevant journal boundary is durable.
+- Records request ID, digest, host leader generation, claim state, `FETCH_STARTING`, upstream response ID when known, and terminal digest.
 - Does not carry request/response payloads in the hot path.
+- Stores a completed terminal transcript in a separate bounded recovery spool only until the host acknowledges it.
 - Allows sidecar-process recovery inside the same sandbox.
 - Treats a crash after upstream commitment without a terminal as ambiguous; it does not silently replay.
 
@@ -197,9 +261,12 @@ Every local Awareness state contains one bounded transport envelope:
 ```text
 {
   protocol: "gp-awareness-v2",
+  schemaHash,
+  buildHash,
   sessionId,
   peerId,
   instanceId,
+  leaderGeneration,
   epoch,
   ackEpoch,
   credits,
@@ -234,8 +301,8 @@ Sidecar to host:
 
 ### 5.3 Bounds
 
-- Maximum encoded frame: 64 KiB.
-- Maximum unacknowledged frames per peer: 32 initially, adaptive within a fixed hard ceiling.
+- Hard maximum encoded frame: 16 KiB, including envelope overhead; payload sizing reserves space for JSON fields.
+- Maximum unacknowledged state per peer: 32 frames and 512 KiB total; both limits must pass before publication.
 - Maximum request body: 64 MiB, matching the daemon transport bound.
 - Maximum response assembly: configurable and reservation-backed.
 - Request segments use `gzip+base64` when it reduces segment count.
@@ -244,19 +311,33 @@ Sidecar to host:
 
 Although a raw 4 MiB Awareness message passed, production uses segmentation for bounded memory, retransmission, cancellation, and predictable latency.
 
-### 5.4 Commitment and rerouting
+### 5.4 Frame scheduling
+
+Each peer uses weighted fair scheduling rather than draining one large request or response at a time:
+
+1. terminal, rejection, cancellation, and ACK control frames;
+2. one frame from each active response stream in round-robin order;
+3. request commit/control frames;
+4. request and response data frames weighted by reserved workload cost.
+
+No stream may consume the complete 32-frame window while another ready stream is waiting. Retransmissions retain their original sequence identity and do not create a second logical frame.
+
+### 5.5 Commitment and rerouting
 
 The sidecar sends `REQUEST_ACK(committed=true)` only after:
 
 1. all request segments are present;
 2. decoded size and SHA-256 match;
-3. a claim journal entry is durably written;
-4. an upstream concurrency permit is reserved.
+3. the host leader generation matches the active sidecar fence;
+4. a claim journal entry is durably group-committed;
+5. an upstream concurrency permit is reserved.
 
 Rules:
 
 - Failure before committed ACK: host may reroute once.
 - Failure after committed ACK: request stays pinned to the sandbox.
+- The sidecar appends `FETCH_STARTING` before invoking upstream `fetch()`.
+- Any failure after `FETCH_STARTING` is ambiguous unless a matching terminal is recovered; neither peer retries it automatically.
 - Missing terminal after commitment: lane is quarantined.
 - A sidecar crash does not automatically replay an ambiguous upstream call.
 - A proven terminal may be replayed from the local journal/recovery artifact.
@@ -283,14 +364,17 @@ A lane is released only when terminal identity and digest match the committed re
 
 ### 7.1 Bootstrap
 
-1. Provision the Prism sandbox and resource/Y-Sweet credentials.
-2. Synchronize two tracked bootstrap files: sidecar source and sidecar config.
-3. Write a temporary `.latexmkrc` launcher with a unique build marker.
-4. Remove LaTeX result artifacts so the launch command is guaranteed to run.
-5. Trigger render.
-6. Restore the normal launcher immediately.
-7. Wait for an Awareness readiness announcement matching session, instance, and build.
-8. Retry up to three times before marking v2 unavailable.
+1. Resolve one persisted signed-in or guest Prism session and acquire its single-writer account lock.
+2. Provision the Prism sandbox and resource/Y-Sweet credentials.
+3. Synchronize the tracked text bootstrap files through Yjs: sidecar source, sidecar config, and launcher.
+4. Write a temporary `.latexmkrc` launcher with a unique build marker.
+5. Remove LaTeX result artifacts so the launch command is guaranteed to run.
+6. Trigger render.
+7. Restore the normal launcher immediately.
+8. Wait for an Awareness readiness announcement matching project, session, leader generation, instance, schema, and build.
+9. Retry up to three times before marking V2 unavailable.
+
+No bootstrap step downloads a project export or calls the sandbox `/zip` endpoint.
 
 ### 7.2 Token refresh
 
@@ -302,7 +386,16 @@ A lane is released only when terminal identity and digest match the committed re
 
 The crash prototype proved that a fresh token plus forced render launch can restore a replacement sidecar and recover uncommitted work.
 
-### 7.3 Sandbox loss
+### 7.3 Guest-session lifecycle
+
+- One durable anonymous cookie jar owns the complete guest fleet; workers do not create independent guest identities.
+- The jar and fleet manifest are written atomically under an exclusive process lock and use owner-only filesystem permissions.
+- Startup reuses `/auth/session` when the jar is valid and calls `POST /api/auth/anonymous-session` only when no session exists.
+- Guest capability gating proves project create/list, Y-Sweet mint, resource mint, sandbox allocation, credential installation, workspace readiness, Yjs text synchronization, and V2 sidecar readiness.
+- Capability gating does not require ZIP and does not delete an existing Prism project.
+- A lost or rejected guest session drains its workers and requires recovery of the same cookie jar; GhostProv does not silently create a replacement identity and orphan the old fleet.
+
+### 7.4 Sandbox loss
 
 If the complete Prism sandbox is reprovisioned, local claim/terminal journals disappear. The host treats committed requests without received terminal proof as ambiguous and quarantines them. It never guesses that an upstream call did not happen.
 
@@ -314,6 +407,78 @@ Defaults:
 - Four sandboxes advertise up to 512 physical active calls.
 - Additional requests queue through existing per-client fairness and resource admission.
 - RAM/CPU governor remains authoritative and may advertise less than the physical ceiling.
+
+Four is only the default produced by `ceil(512 / 128)`. No router, registry, monitoring structure, or protocol field may use a fixed four-element array or assume four project IDs.
+
+### 8.1 Fleet sizing
+
+Configuration:
+
+```text
+GP_TARGET_CONCURRENCY=512       desired aggregate active capacity
+GP_TARGET_SANDBOXES=<optional>  explicit desired worker count; overrides derived count
+GP_V2_SANDBOX_CAPACITY=128      advertised active capacity per healthy v2 sidecar
+GP_MAX_PROJECTS=32              operator safety ceiling, not a protocol/architecture limit
+GP_AUTO_CREATE_PROJECTS=1       create missing managed Prism projects
+GP_PROJECT_REUSE=managed        managed | eligible-owned | explicit
+GP_PROVISION_CONCURRENCY=4      maximum simultaneous sandbox bootstraps
+GP_PRISM_SESSION=auto           auto | authenticated | anonymous
+GP_PRISM_COOKIE_FILE=<path>     durable owner-only signed-in or guest cookie jar
+```
+
+Desired count:
+
+```text
+desired = GP_TARGET_SANDBOXES
+       ?? ceil(GP_TARGET_CONCURRENCY / GP_V2_SANDBOX_CAPACITY)
+```
+
+The desired count must be positive and no greater than the operator's `GP_MAX_PROJECTS`. Increasing `GP_MAX_PROJECTS` requires no code change.
+
+`auto` reuses whichever valid identity is already stored in `GP_PRISM_COOKIE_FILE`; when the file is absent it creates one backend-owned guest session. `authenticated` fails if that jar is not signed in. `anonymous` rejects a signed-in jar and creates or reuses only a guest identity. A single configuration never mixes identities inside one fleet manager.
+
+### 8.2 Project discovery and reuse
+
+Reconciliation order within the current Prism identity:
+
+1. deduplicated `PRISM_PROJECT_IDS` supplied explicitly;
+2. IDs already recorded in `.ghostprov/fleet.json`;
+3. owned, non-deleted Prism projects carrying the GhostProv worker title/marker;
+4. when `GP_PROJECT_REUSE=eligible-owned`, session-owned writable projects proven empty;
+5. newly created managed projects until `desired` is reached.
+
+Non-empty unmarked projects are never modified automatically. They are used only when explicitly listed in `PRISM_PROJECT_IDS`.
+
+Managed project identity:
+
+- title: `GhostProv Worker <stable-index>`;
+- locally persisted UUID and creation state;
+- tracked project marker containing protocol version, stable worker index, and creation timestamp;
+- no credentials or account tokens in the marker.
+
+### 8.3 Idempotent automatic creation
+
+For every missing worker, the fleet manager:
+
+1. reserves a stable worker index under an exclusive local fleet lock;
+2. atomically persists a `creating` intent and project UUID;
+3. refetches project inventory to avoid duplicate creation after a crash;
+4. creates the project only when the UUID/title is absent;
+5. atomically records the returned project ID;
+6. initializes the Prism Yjs root/settings schema when absent;
+7. writes the GhostProv worker marker and text bootstrap assets through Yjs without ZIP;
+8. provisions resource/Y-Sweet credentials and launches the sidecar;
+9. registers capacity only after matching build/readiness proof.
+
+Creation failures affect only the missing worker. Healthy existing runtimes remain routable, and reconciliation retries with bounded backoff. GhostProv never deletes newly created or reused projects during automatic scale-down; it stops local ownership and leaves them available for later reuse.
+
+The live proof established four projects under one guest identity. Larger guest fleets remain governed by the same `GP_MAX_PROJECTS`, provisioning concurrency, backoff, and runtime-capacity controls; deterministic tests cover 1, 4, 8, 16, and 32 without claiming an unmeasured Prism account quota.
+
+### 8.4 Dynamic registry and routing
+
+`SandboxRegistry` becomes a mutable, concurrency-safe runtime registry with explicit `add`, `drain`, `removeStopped`, and snapshot operations. Router decisions always consume a point-in-time iterable and remain O(number of healthy runtimes). Project bootstrap runs outside the routing lock.
+
+Heartbeats retain independent ten-second schedules with deterministic per-project phase offsets, preventing a large fleet from generating one synchronized burst.
 
 The host router continues selecting the lowest predicted completion time. Runtime metrics become real v2 measurements rather than constants:
 
@@ -348,14 +513,19 @@ Official upstream contract: [Create a response](https://developers.openai.com/ap
 
 | Failure | Required behavior |
 | --- | --- |
-| Sidecar not ready | Three launch attempts, then v1 fallback before commitment |
+| Signed-in sidecar not ready in `auto` | Three launch attempts, then v1 fallback before commitment |
+| Anonymous sidecar not ready | Three launch attempts, mark worker unavailable; never use v1/ZIP |
 | Y-Sweet disconnect before commitment | Reconnect/retransmit or reroute once |
 | Y-Sweet disconnect after commitment | Stay pinned; resume frames; quarantine if terminal remains unproven |
 | Sidecar crash with queued/uncommitted request | Replacement may reclaim from host Awareness state |
 | Sidecar crash after committed ACK | Consult journal; never blind replay |
-| Proxy connection reset | Retry only before committed upstream response; reduce advertised capacity |
+| Failure before `FETCH_STARTING` | Safe local failure or one pre-commit reroute according to state |
+| Failure at/after `FETCH_STARTING` | Treat as ambiguous without matching terminal; never automatic retry |
+| Proxy connection reset | Apply the same fetch boundary and reduce advertised capacity |
 | Token expiry | Drain, refresh config, replace sidecar |
 | Complete sandbox loss | Mark committed in-flight requests ambiguous and quarantine |
+| Stale sidecar/host generation | Reject every frame and claim; only the current host-issued leader may commit |
+| Lost guest cookie jar | Drain guest workers and require recovery; never create a replacement identity silently |
 | Oversized frame/body | Reject with typed validation error before upstream call |
 | Host disconnect | Cancel queued/uncommitted work; preserve committed terminal recovery |
 
@@ -366,17 +536,22 @@ The rollout is opt-in:
 ```text
 GP_TRANSPORT=v1          existing file/ZIP transport
 GP_TRANSPORT=v2          Awareness sidecar only; fail closed after commitment
-GP_TRANSPORT=auto        prefer v2, use v1 only before request commitment
+GP_TRANSPORT=auto        prefer v2; signed-in workers may use v1 only before commitment
 ```
+
+Automatic project creation is authorized only when `GP_AUTO_CREATE_PROJECTS=1`; v2's standard managed deployment enables it. Explicit project IDs and discovered managed projects are always reused before creation.
+
+`GP_PRISM_SESSION=anonymous` requires `GP_TRANSPORT=v2`; `auto` resolves to V2-only for a guest identity. Configuration validation rejects `anonymous + v1`. The public HTTP/WebSocket API remains available while at least one V2 guest worker is ready; otherwise readiness fails without touching a different Prism identity.
 
 Rollout order:
 
-1. deterministic in-memory protocol tests;
-2. one test project in `v2` mode;
-3. one production project in `auto` mode;
-4. four-project mixed canary;
-5. default `auto` after sustained metrics pass;
-6. retain v1 recovery for at least one release cycle.
+1. deterministic in-memory protocol and guest-session tests;
+2. one signed-in test project in `v2` mode;
+3. one signed-in production project in `auto` mode;
+4. one isolated guest project in V2-only mode;
+5. a four-project canary for the selected identity mode, never sharing identities inside one manager;
+6. default `auto` after sustained metrics pass;
+7. retain v1 recovery for signed-in fleets for at least one release cycle.
 
 There is no dual execution of the same request.
 
@@ -388,11 +563,15 @@ There is no dual execution of the same request.
 - segmentation across every byte boundary;
 - gzip integrity and decompression bounds;
 - sequence/epoch wrap and stale-frame rejection;
+- stale leader-generation and build/schema rejection;
 - ACK window advancement;
+- 16 KiB frame and 32-frame/512 KiB window enforcement;
 - credit enforcement;
+- weighted-fair scheduling without stream starvation;
 - duplicate and conflicting frame handling;
 - terminal digest validation;
-- journal state transitions;
+- append-only group-commit journal state transitions;
+- `FETCH_STARTING` ambiguity and no-retry enforcement;
 - cancellation before/after commitment;
 - capacity reduction after proxy resets.
 
@@ -405,6 +584,15 @@ There is no dual execution of the same request.
 - sidecar replacement with queued work;
 - ambiguous committed crash quarantines instead of replaying;
 - v2 bootstrap failure falls back to v1 only before commitment.
+- guest bootstrap persists and reuses one anonymous identity without browser storage access;
+- guest configuration never invokes ZIP or v1;
+- losing a guest jar does not create a replacement identity silently;
+- project inventory reuses existing managed IDs before creating anything;
+- partial inventories create exactly the missing workers;
+- repeated reconciliation is idempotent after failures at every creation checkpoint;
+- dynamic fake fleets of 1, 4, 8, 16, and 32 runtimes route without fixed-size assumptions;
+- runtime addition/removal never pauses healthy routing;
+- automatic scale-down drains but never deletes cloud projects.
 
 ### Live gates
 
@@ -415,9 +603,12 @@ There is no dual execution of the same request.
 - repeated lifecycle launch/replacement cycles;
 - sidecar crash with queued and committed cases;
 - token rotation during idle and active periods;
+- anonymous session bootstrap, four-project inventory, V2 sidecar readiness, and restart reuse;
 - HTTP SSE, Codex WebSocket continuation, and named lanes;
 - GPT Image generation and multipart editing;
 - production port 8787 health before and after every candidate run.
+
+Live fleet testing remains capped at the four projects already authorized and proven in this phase. Support for larger fleets is verified deterministically now; additional live projects require a later explicit load-test decision, not a code change.
 
 ## 13. Acceptance criteria
 
@@ -439,6 +630,9 @@ Performance:
 - small Awareness transport p95 below 1 second at 512 accepted / 128 active;
 - queueing occurs only at configured credits/resource limits;
 - no request-time ZIP polling or workspace synchronization in healthy v2 mode.
+- zero ZIP/export calls during V2 bootstrap, steady state, recovery, and anonymous operation;
+- fleet reconciliation does not hold the router hot-path lock;
+- routing remains below the 2 ms p95 budget at the configured safety ceiling.
 
 Lifecycle:
 
@@ -446,6 +640,10 @@ Lifecycle:
 - three-attempt launch success 100% in the same soak;
 - token replacement produces a new ready instance before traffic switches;
 - Crixet PID 1 and its supervised Deno child remain untouched.
+- restart reconciliation reuses the same project fleet without duplicate creation;
+- a partial fleet becomes available incrementally instead of waiting for every project;
+- no automatic workflow deletes a Prism project.
+- a restarted anonymous fleet reuses the same cookie jar and project IDs.
 
 ## 14. Explicit non-goals
 
@@ -455,9 +653,15 @@ Lifecycle:
 - Replacing the host API/router with the sidecar.
 - Realtime audio support in this phase.
 - Removing v1 recovery before v2 has completed its canary period.
+- Treating guest-only internal Prism endpoints as a guaranteed public API.
+- Scraping or importing credentials from Chrome.
 
 ## 15. Conclusion
 
 The prototype proves that the Awareness sidecar is materially more scalable than v1: 128 active calls per sandbox and 512 across four sandboxes, compared with 30 and 120 respectively.
 
-The production design must not copy the prototype's growing result array. Its bounded acknowledged frame protocol, strict commitment boundary, local claim journal, and v1 pre-commit fallback are required to preserve GhostProv's strongest property: no lane is released or rerouted after an unproven committed request.
+The implementation is not limited to four sandboxes. Four is the default live-proven fleet; desired capacity, project discovery, idempotent creation, and the dynamic runtime registry allow larger fleets without changing transport or routing code.
+
+The supported backend-owned guest flow can remove manual sign-in for an isolated V2 fleet, but it does not change the transport safety model. Guest capability probes, durable identity storage, and fail-closed V2-only behavior contain the risk of Prism's guest UI restrictions changing.
+
+The production design must not copy the prototype's growing result array. Its bounded acknowledged frame protocol, host-issued leader fence, strict `FETCH_STARTING` boundary, and append-only local claim journal preserve GhostProv's strongest property: no lane is released, rerouted, or retried after an unproven committed request. Signed-in `auto` fleets alone retain v1 as a pre-commit migration fallback.
