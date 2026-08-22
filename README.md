@@ -183,11 +183,13 @@ The isolated suite includes:
 - `tests/v2-bootstrap-probe.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-protocol.test.ts`
+- `tests/v2-run-handle.test.ts`
 - `tests/v2-scheduler.test.ts`
 - `tests/v2-sidecar-assets.test.ts`
 - `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-transcript.test.ts`
+- `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`
 - `tests/v2-window.test.ts`
 - `tests/websocket.test.ts`

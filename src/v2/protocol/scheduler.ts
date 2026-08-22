@@ -32,7 +32,7 @@ function encodedBytes(value: unknown): number {
   }
 }
 
-export class WeightedFrameScheduler<T extends { requestId?: string }> {
+export class WeightedFrameScheduler<T extends object> {
   readonly #queues = new Map<FramePriority, Map<string, StreamQueue<T>>>(
     PRIORITIES.map(priority => [priority, new Map()]),
   );
