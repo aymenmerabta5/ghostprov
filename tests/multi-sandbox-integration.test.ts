@@ -3,6 +3,7 @@ import { SandboxRegistry } from "../src/sandbox/registry";
 import { ResourceGovernor } from "../src/router/resource-governor";
 import { MultiSandboxRouter } from "../src/router/router";
 import { FakePrismRuntime } from "./support/fake-prism";
+import { percentile, validateProofResponse } from "../scripts/live_multi_sandbox";
 
 function system() {
   const runtimes = [1, 2, 3, 4].map(index => new FakePrismRuntime(index));
@@ -28,6 +29,17 @@ function system() {
 }
 
 describe("four-project router integration", () => {
+  it("validates live terminal identity, exact output markers, and percentiles", () => {
+    const raw = JSON.stringify({
+      id: "resp_unique",
+      status: "completed",
+      output: [{ type: "message", content: [{ type: "output_text", text: "RAMP_16_0" }] }],
+    });
+    expect(validateProofResponse(raw, "RAMP_16_0")).toEqual({ id: "resp_unique", status: "completed" });
+    expect(() => validateProofResponse(raw, "wrong")).toThrow("expected wrong");
+    expect(percentile([1, 2, 3, 4, 100], 0.95)).toBe(100);
+  });
+
   it("publishes and terminally settles 120 requests without duplicates or oversubscription", async () => {
     const value = system();
     const started = Array.from({ length: 120 }, (_, index) => value.router.startRelay(

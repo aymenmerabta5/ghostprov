@@ -1,5 +1,5 @@
 import { WebSocket } from "ws";
-import { buildGenerationBodies, parseGenerationRequest } from "../src/images/compat";
+import { Buffer } from "node:buffer";
 
 if (process.env.GP_LIVE_VERIFY !== "1") {
   throw new Error("Live verification mutates Prism state. Set GP_LIVE_VERIFY=1 explicitly.");
@@ -57,31 +57,53 @@ async function verifyHttpStreaming(): Promise<void> {
 
 async function verifyImageGeneration(): Promise<void> {
   if (process.env.GP_LIVE_IMAGE !== "1") return;
-  const [body] = buildGenerationBodies(parseGenerationRequest({
-    model: "gpt-image-2",
-    prompt: "A minimal solid red circle centered on a white background.",
-    quality: "low",
-    size: "1024x1024",
-    output_format: "png",
-    background: "opaque",
-  }, {
-    responsesModel: model,
-    maxEditInputBytes: 40 * 1024 * 1024,
-  }));
   const started = performance.now();
-  const response = await fetch(`${base}/responses`, {
+  const response = await fetch(`${base}/images/generations`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer live-verify" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: "gpt-image-2",
+      prompt: "A minimal solid red circle centered on a white background.",
+      quality: "low",
+      size: "1024x1024",
+      output_format: "png",
+      background: "opaque",
+      n: 1,
+    }),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`image request failed: ${response.status} ${text}`);
-  const final = JSON.parse(text);
-  const call = final.output?.find((item: any) => item?.type === "image_generation_call");
-  if (call?.status !== "completed" || typeof call.result !== "string" || call.result.length === 0) {
-    throw new Error(`image result missing: ${JSON.stringify({ status: final.status, outputTypes: final.output?.map((item: any) => item?.type) })}`);
+  const image = JSON.parse(text);
+  const encoded = image.data?.[0]?.b64_json;
+  if (typeof encoded !== "string" || encoded.length === 0) {
+    throw new Error(`native image result missing: ${JSON.stringify({ data: image.data?.length, outputFormat: image.output_format })}`);
   }
-  console.log(`[live] gpt-image-2 returned ${call.result.length} base64 chars in ${Math.round(performance.now() - started)}ms`);
+  const png = Uint8Array.from(Buffer.from(encoded, "base64"));
+  if (png.length < 8 || png[0] !== 0x89 || png[1] !== 0x50 || png[2] !== 0x4e || png[3] !== 0x47) {
+    throw new Error("native image generation did not return PNG bytes");
+  }
+  console.log(`[live] native gpt-image-2 generation returned ${encoded.length} base64 chars in ${Math.round(performance.now() - started)}ms`);
+
+  if (process.env.GP_LIVE_IMAGE_EDIT !== "1") return;
+  const editStarted = performance.now();
+  const form = new FormData();
+  form.append("model", "gpt-image-2");
+  form.append("prompt", "Keep the red circle and add a thin blue border around it.");
+  form.append("quality", "low");
+  form.append("size", "1024x1024");
+  form.append("output_format", "png");
+  form.append("image", new File([png], "generated.png", { type: "image/png" }));
+  const editResponse = await fetch(`${base}/images/edits`, {
+    method: "POST",
+    headers: { authorization: "Bearer live-verify" },
+    body: form,
+  });
+  const editText = await editResponse.text();
+  if (!editResponse.ok) throw new Error(`image edit failed: ${editResponse.status} ${editText}`);
+  const edit = JSON.parse(editText);
+  const edited = edit.data?.[0]?.b64_json;
+  if (typeof edited !== "string" || edited.length === 0) throw new Error("native image edit result missing");
+  console.log(`[live] native gpt-image-2 edit returned ${edited.length} base64 chars in ${Math.round(performance.now() - editStarted)}ms`);
 }
 
 interface WsHarness {

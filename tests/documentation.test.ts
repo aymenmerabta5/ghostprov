@@ -6,6 +6,8 @@ const root = path.resolve(import.meta.dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const liveMultiSandbox = fs.readFileSync(path.join(root, "scripts", "live_multi_sandbox.ts"), "utf8");
+const liveVerify = fs.readFileSync(path.join(root, "scripts", "live_verify.ts"), "utf8");
 
 describe("project documentation", () => {
   it("lists every executable test file that exists", () => {
@@ -65,5 +67,19 @@ describe("project documentation", () => {
 
   it("keeps live multi-sandbox state out of version control", () => {
     expect(gitignore.split(/\r?\n/)).toContain(".ghostprov/");
+  });
+
+  it("makes the live ramp import-safe and verifies terminal identity plus peak capacity", () => {
+    expect(liveMultiSandbox).toContain("if (import.meta.main)");
+    expect(liveMultiSandbox).toContain("validateProofResponse");
+    expect(liveMultiSandbox).toContain("peakPhysicalActive");
+    expect(liveMultiSandbox).toContain("uniqueResponseIds");
+    expect(liveMultiSandbox).toContain("quarantinePeak");
+  });
+
+  it("exercises native image generation and multipart edit routes in live verification", () => {
+    expect(liveVerify).toContain("/images/generations");
+    expect(liveVerify).toContain("/images/edits");
+    expect(liveVerify).toContain("GP_LIVE_IMAGE_EDIT");
   });
 });

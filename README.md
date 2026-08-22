@@ -27,6 +27,7 @@ Each project owns an isolated `SandboxRuntime`:
 - Direct Prism provisioning and token synchronization
 - One Node Yjs WebSocket and filename index
 - One direct sandbox gateway and ZIP coordinator
+- One epoch-based workspace-sync coordinator that coalesces concurrent publications
 - One daemon controller and daemon build check
 - One physical slot pool and terminal-recovery state
 - One independent heartbeat every 10 seconds
@@ -62,6 +63,8 @@ CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
 Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers. ZIP downloads are coalesced and limited to one active archive per sandbox while different sandboxes operate in parallel.
+
+Fresh projects are initialized with Prism's current Yjs root/settings schema. Daemon status and lane files are tracked before launch, render requests use live Yjs state vectors, and each publication crosses a coalesced `wait-for-sync` barrier before polling. Writes arriving during an active barrier receive the next epoch, so batching never weakens publication ordering.
 
 Latency acceptance targets:
 
@@ -103,7 +106,7 @@ supports_websockets = true
 
 ## Monitoring
 
-- `GET /health` returns aggregate capacity, active, available, queued, and runtime count.
+- `GET /health` returns aggregate capacity, active, available, queued, and runtime count; zero routable capacity returns HTTP 503 with `ok:false`.
 - `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, and resource snapshots.
 
 No endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
@@ -113,7 +116,7 @@ No endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
-| `GP_SLOTS` | `30` | Maximum lanes used per daemon project |
+| `GP_SLOTS` | `30` | Per-project lanes; configurable from 1 through the daemon maximum of 30 |
 | `GP_MAX_PROJECTS` | `4` minimum | Maximum allowlisted projects |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
 | `GP_ZIP_BATCH_MS` | `10` | Same-runtime ZIP coalescing window |
@@ -198,11 +201,29 @@ $env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
 bun run verify:multi-sandbox
 ```
 
-The load script verifies port 8787 health before and after the candidate run.
+The load script verifies exact output markers, unique response IDs, peak physical occupancy, per-runtime occupancy, zero under-capacity queueing, zero quarantines, and port 8787 health before and after the candidate run.
+
+Run Codex-compatible HTTP streaming, `store:false` WebSocket tool continuation, and eight concurrent named lanes:
+
+```powershell
+$env:GP_LIVE_VERIFY = "1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
+bun run verify:live
+```
+
+Native GPT Image generation and multipart editing are separately opt-in because they incur image usage:
+
+```powershell
+$env:GP_LIVE_VERIFY = "1"
+$env:GP_LIVE_IMAGE = "1"
+$env:GP_LIVE_IMAGE_EDIT = "1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
+bun run verify:live
+```
 
 ## ScriptC evaluation
 
-Bun remains the production runtime. ScriptC 0.0.35 currently reports unsupported type-surface sites in GhostProv and its dynamic npm tier uses QuickJS with copied boundaries. Optional coverage can be rerun after browserless cleanup:
+Bun remains the production runtime. After Playwright removal, ScriptC 0.0.35 still reports 16 unsupported type-surface sites (web/worker globals, URL/Headers overloads, and crypto typing), so no native binary is produced for a meaningful A/B test. Its dynamic npm tier also uses QuickJS with copied boundaries. Optional coverage can be rerun as ScriptC matures:
 
 ```powershell
 $env:GP_BENCHMARK_SCRIPTC = "1"
