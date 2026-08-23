@@ -4,14 +4,18 @@ import type { Awareness } from "y-protocols/awareness";
 import type { BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
 import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
+  GP_V2_FLIGHT_MAX_BYTES,
+  GP_V2_FLIGHT_MAX_FRAMES,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
+  type AwarenessLane,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
   type ReliableFrame,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared.ts";
+import { AckClockedFlight } from "../../src/v2/protocol/flight.ts";
 import {
   InboundFrameCursor,
   OutboundFrameWindow,
@@ -41,6 +45,7 @@ export interface DenoAwarenessPeerOptions {
   providerFactory?: (
     doc: Y.Doc,
     credential: () => BootstrapCredentialPayload,
+    lane: AwarenessLane,
   ) => DenoAwarenessProviderLike;
   diagnostics?: SidecarDiagnosticsObserver;
   outputBackpressure?: OutputBackpressure;
@@ -66,6 +71,7 @@ export interface DenoAwarenessProviderLike {
 function defaultProviderFactory(
   doc: Y.Doc,
   credential: () => BootstrapCredentialPayload,
+  _lane: AwarenessLane,
 ): DenoAwarenessProviderLike {
   class AuthenticatedWebSocket extends WebSocket {
     constructor(url: string | URL, protocols?: string | string[]) {
@@ -107,21 +113,32 @@ export class DenoAwarenessPeer {
   readonly #instanceId: string;
   readonly #engine: SidecarEngine;
   readonly #rotator: SidecarCredentialRotator;
-  readonly #doc: Y.Doc;
-  readonly #provider: DenoAwarenessProviderLike;
+  readonly #dataDoc: Y.Doc;
+  readonly #controlDoc: Y.Doc;
+  readonly #dataProvider: DenoAwarenessProviderLike;
+  readonly #controlProvider: DenoAwarenessProviderLike;
   readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
+  readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #retransmitMs: number;
   readonly #connectTimeoutMs: number;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #outputBackpressure?: OutputBackpressure;
   readonly #delivery: ReliableDeliveryTiming;
   readonly #pacer: PublicationPacer;
-  #revision = 0;
+  #dataRevision = 0;
+  #controlRevision = 0;
+  #dataDirty = false;
   #hostPeerId: string | null = null;
-  #hostClientId: number | null = null;
-  #hostRevision = -1;
+  readonly #hostClientId: Record<AwarenessLane, number | null> = {
+    data: null,
+    control: null,
+  };
+  readonly #hostRevision: Record<AwarenessLane, number> = {
+    data: -1,
+    control: -1,
+  };
   #hostCredits = -1;
   #timer: number | null = null;
   #retransmissions = 0;
@@ -157,11 +174,12 @@ export class DenoAwarenessPeer {
     if (!Number.isFinite(this.#connectTimeoutMs) || this.#connectTimeoutMs < 1) {
       throw new RangeError("connectTimeoutMs must be positive");
     }
-    this.#doc = new Y.Doc({ guid: options.credential.docId });
-    this.#provider = (options.providerFactory ?? defaultProviderFactory)(
-      this.#doc,
-      () => this.#rotator.current(),
-    );
+    this.#dataDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:data` });
+    this.#controlDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:control` });
+    const providerFactory = options.providerFactory ?? defaultProviderFactory;
+    const credential = () => this.#rotator.current();
+    this.#dataProvider = providerFactory(this.#dataDoc, credential, "data");
+    this.#controlProvider = providerFactory(this.#controlDoc, credential, "control");
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
       minimumMs: this.#retransmitMs,
@@ -170,32 +188,48 @@ export class DenoAwarenessPeer {
       intervalMs: options.publicationIntervalMs,
       publish: reason => this.#publish(reason),
     });
-    this.#provider.awareness.on("change", this.#onAwarenessChange);
+    this.#dataProvider.awareness.on("change", this.#onDataAwarenessChange);
+    this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
   }
 
   async connect(): Promise<void> {
     if (this.#closed) throw new Error("Awareness peer is closed");
+    try {
+      await Promise.all([
+        this.#connectProvider(this.#dataProvider, "data"),
+        this.#connectProvider(this.#controlProvider, "control"),
+      ]);
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
+    this.#pacer.flushNow("initial");
+  }
+
+  async #connectProvider(
+    provider: DenoAwarenessProviderLike,
+    lane: AwarenessLane,
+  ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        this.#provider.off("sync", onSync);
-        this.#provider.off("connection-error", onError);
+        provider.off("sync", onSync);
+        provider.off("connection-error", onError);
         error ? reject(error) : resolve();
       };
       const onSync = (synced: boolean) => { if (synced) finish(); };
-      const onError = () => finish(new Error("Y-Sweet sidecar connection failed"));
+      const onError = () => finish(new Error(`Y-Sweet sidecar ${lane} connection failed`));
       const timer = setTimeout(
-        () => finish(new Error("Y-Sweet sidecar synchronization timed out")),
+        () => finish(new Error(`Y-Sweet sidecar ${lane} synchronization timed out`)),
         this.#connectTimeoutMs,
       );
-      this.#provider.on("sync", onSync);
-      this.#provider.on("connection-error", onError);
-      this.#provider.connect();
+      provider.on("sync", onSync);
+      provider.on("connection-error", onError);
+      provider.connect();
     });
-    this.#pacer.flushNow("initial");
   }
 
   enqueue(
@@ -226,27 +260,60 @@ export class DenoAwarenessPeer {
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
     await this.#acceptChain.catch(() => undefined);
-    this.#provider.awareness.off("change", this.#onAwarenessChange);
-    this.#provider.awareness.setLocalState(null);
-    this.#provider.disconnect();
-    this.#provider.destroy();
-    this.#doc.destroy();
+    this.#dataProvider.awareness.off("change", this.#onDataAwarenessChange);
+    this.#controlProvider.awareness.off("change", this.#onControlAwarenessChange);
+    for (const provider of [this.#dataProvider, this.#controlProvider]) {
+      provider.awareness.setLocalState(null);
+      provider.disconnect();
+      provider.destroy();
+    }
+    this.#dataDoc.destroy();
+    this.#controlDoc.destroy();
   }
 
-  readonly #onAwarenessChange = (
+  readonly #onDataAwarenessChange = (
     change: { added: number[]; updated: number[]; removed: number[] },
-  ): void => {
+  ): void => this.#onAwarenessChange(
+    "data",
+    this.#dataProvider,
+    "ghostprovV2Data",
+    change,
+  );
+
+  readonly #onControlAwarenessChange = (
+    change: { added: number[]; updated: number[]; removed: number[] },
+  ): void => this.#onAwarenessChange(
+    "control",
+    this.#controlProvider,
+    "ghostprovV2Control",
+    change,
+  );
+
+  #onAwarenessChange(
+    lane: AwarenessLane,
+    provider: DenoAwarenessProviderLike,
+    field: "ghostprovV2Data" | "ghostprovV2Control",
+    change: { added: number[]; updated: number[]; removed: number[] },
+  ): void {
     for (const clientId of change.removed) {
-      if (clientId === this.#hostClientId) {
-        this.#hostPeerId = null;
-        this.#hostClientId = null;
-        this.#hostRevision = -1;
+      if (clientId === this.#hostClientId[lane]) {
+        this.#hostClientId[lane] = null;
+        this.#hostRevision[lane] = -1;
+        if (this.#hostClientId.data === null && this.#hostClientId.control === null) {
+          this.#hostPeerId = null;
+        }
       }
     }
     for (const clientId of [...change.added, ...change.updated]) {
-      if (clientId === this.#doc.clientID) continue;
-      const raw = this.#provider.awareness.getStates().get(clientId)?.ghostprovV2;
-      if (raw == null) continue;
+      if (clientId === this.#dataDoc.clientID || clientId === this.#controlDoc.clientID) continue;
+      const raw = provider.awareness.getStates().get(clientId)?.[field];
+      if (raw == null) {
+        if (clientId === this.#hostClientId[lane]) {
+          this.#hostClientId[lane] = null;
+          this.#hostRevision[lane] = -1;
+        }
+        continue;
+      }
       let envelope: AwarenessEnvelope<HostFrame>;
       try {
         const parsed = parseAwarenessEnvelopeWithDiagnostics(raw, this.#binding, "host");
@@ -255,32 +322,48 @@ export class DenoAwarenessPeer {
       } catch {
         continue;
       }
+      if (envelope.lane !== undefined && envelope.lane !== lane) continue;
       if (this.#hostPeerId && envelope.peerId !== this.#hostPeerId) continue;
-      if (envelope.revision <= this.#hostRevision) continue;
+      if (envelope.revision <= this.#hostRevision[lane]) continue;
       this.#hostPeerId = envelope.peerId;
-      this.#hostClientId = clientId;
-      this.#hostRevision = envelope.revision;
+      this.#hostClientId[lane] = clientId;
+      this.#hostRevision[lane] = envelope.revision;
       try {
-        const ceilingChanged = envelope.credits !== this.#hostCredits;
-        this.#hostCredits = envelope.credits;
-        this.#engine.setHostCeiling(envelope.credits);
+        if (lane === "control" && envelope.frames.length > 0) {
+          throw new Error("host control Awareness state contains reliable frames");
+        }
+        const ceilingChanged = lane === "control" && envelope.credits !== this.#hostCredits;
+        if (lane === "control") {
+          this.#hostCredits = envelope.credits;
+          this.#engine.setHostCeiling(envelope.credits);
+        }
         this.#outbound.acknowledge(envelope.ack);
+        const flightCompleted = this.#flight.acknowledged(envelope.ack);
         const now = performance.now();
         const acknowledgementAdvanced = this.#delivery.acknowledged(
           envelope.ack,
           this.#outbound.snapshot().frames.length > 0,
           now,
         );
-        if (acknowledgementAdvanced) this.#lastAckAt = now;
-        const currentEpoch = this.#inbound.ack().epoch;
-        if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
-        const frames = this.#inbound.accept(envelope.frames);
+        if (acknowledgementAdvanced) {
+          this.#lastAckAt = now;
+          this.#armRetransmission();
+        }
+        let frames: readonly ReliableFrame<HostFrame>[] = [];
+        if (lane === "data") {
+          const currentEpoch = this.#inbound.ack().epoch;
+          if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
+          frames = this.#inbound.accept(envelope.frames);
+        }
         for (const frame of frames) {
           this.#acceptChain = this.#acceptChain
             .then(() => this.#acceptHostFrame(frame))
             .catch(() => undefined);
         }
         const urgency = this.#pump();
+        if (flightCompleted && urgency === null) {
+          this.#dataProvider.awareness.setLocalStateField("ghostprovV2Data", null);
+        }
         this.#updateBackpressure();
         const congestionChanged=this.#updateCongestion();
         this.#requestPublication(
@@ -288,24 +371,31 @@ export class DenoAwarenessPeer {
             ? "urgent"
             : urgency,
         );
-        if (acknowledgementAdvanced) this.#armRetransmission();
       } catch {
         // Invalid ACK/window transitions are ignored; a valid current host
         // envelope must re-establish contiguous state.
       }
     }
-  };
+  }
 
   #pump(): PublicationUrgency | null {
+    if (this.#flight.active) return null;
     let urgency: PublicationUrgency | null = null;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
-      const remainingFrames = GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length;
-      const remainingBytes = GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes;
+      const remainingFrames = Math.min(
+        GP_V2_FLIGHT_MAX_FRAMES - snapshot.frames.length,
+        GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length,
+      );
+      const remainingBytes = Math.min(
+        GP_V2_FLIGHT_MAX_BYTES - snapshot.encodedBytes,
+        GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes,
+      );
       if (remainingFrames < 1 || remainingBytes < 512) break;
       const next = this.#scheduler.take(1, Math.min(15 * 1024, remainingBytes - 256));
       if (!next.length) break;
       const reliable = this.#outbound.push(next[0]);
+      this.#dataDirty = true;
       urgency = strongestUrgency(urgency, sidecarFrameUrgency(reliable));
     }
     return urgency;
@@ -321,10 +411,28 @@ export class DenoAwarenessPeer {
 
   #publish(reason: PublicationReason): void {
     if (this.#closed) return;
+    const outbound = this.#outbound.snapshot();
+    const publishData = reason === "retransmission" || this.#dataDirty;
+    if (publishData) {
+      this.#flight.published(outbound.frames);
+      this.#delivery.published(outbound.frames, performance.now());
+      this.#publishLane("data", outbound.frames, reason);
+      this.#dataDirty = false;
+    }
+    if (reason !== "retransmission" || !publishData) {
+      this.#publishLane("control", [], reason);
+    }
+    this.#armRetransmission();
+  }
+
+  #publishLane(
+    lane: AwarenessLane,
+    frames: readonly ReliableFrame<SidecarFrame>[],
+    reason: PublicationReason,
+  ): void {
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
     const scheduled = this.#scheduler.snapshot();
-    this.#delivery.published(outbound.frames, performance.now());
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
@@ -340,25 +448,30 @@ export class DenoAwarenessPeer {
       instanceId: this.#instanceId,
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: outbound.epoch,
-      revision: this.#revision++,
+      revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#inbound.ack(),
       credits: this.#congestion.congested ? 0 : transport.credits,
       active: transport.active,
       queued: transport.queued,
       draining: transport.draining,
-      frames: outbound.frames,
-      ...(this.#diagnostics?.enabled ? { diagnostics: this.#diagnostics.envelope() } : {}),
+      frames,
+      lane,
+      ...(lane === "control" && this.#diagnostics?.enabled
+        ? { diagnostics: this.#diagnostics.envelope() }
+        : {}),
     };
     this.#publishedBytes += new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
-    this.#provider.awareness.setLocalStateField("ghostprovV2", envelope);
-    this.#armRetransmission();
+    const provider = lane === "data" ? this.#dataProvider : this.#controlProvider;
+    const field = lane === "data" ? "ghostprovV2Data" : "ghostprovV2Control";
+    provider.awareness.setLocalStateField(field, envelope);
   }
 
   #armRetransmission(): void {
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
     if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
-    const jitterSeed = ((this.#revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
+    const revision = this.#dataRevision + this.#controlRevision;
+    const jitterSeed = ((revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
     const delay = this.#delivery.nextDelayMs(performance.now(), jitterSeed);
     if (delay === null) return;
     this.#timer = setTimeout(() => {

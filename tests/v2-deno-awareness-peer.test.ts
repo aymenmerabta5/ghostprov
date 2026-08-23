@@ -29,6 +29,7 @@ class FakeProvider {
   readonly awareness: Awareness;
   readonly listeners = new Map<string, Set<(...args: any[]) => void>>();
   destroyed = false;
+  failConnect = false;
 
   constructor(doc: Y.Doc) {
     this.awareness = new Awareness(doc);
@@ -45,7 +46,10 @@ class FakeProvider {
   }
 
   connect(): void {
-    queueMicrotask(() => this.emit("sync", true));
+    queueMicrotask(() => {
+      if (this.failConnect) this.emit("connection-error", new Error("failed"));
+      else this.emit("sync", true);
+    });
   }
 
   disconnect(): void {}
@@ -96,8 +100,112 @@ function hostEnvelope(ackSequence: number, revision = 0): AwarenessEnvelope<Host
 }
 
 describe("DenoAwarenessPeer", () => {
+  it("closes both split providers when either lane cannot connect", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        provider.failConnect = lane === "control";
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+
+    await expect(peer.connect()).rejects.toThrow("control connection failed");
+    expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
+  });
+
+  it("keeps response flights separate from frame-free host ACK control", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const engine = {
+      snapshot: () => ({ credits: 128, active: 16, queued: 0, draining: false }),
+      setHostCeiling: () => undefined,
+      accept: async () => undefined,
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: (doc, _credential, lane: "data" | "control") => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+
+    try {
+      await peer.connect();
+      expect([...providers.keys()].sort()).toEqual(["control", "data"]);
+      const data = providers.get("data")!;
+      const control = providers.get("control")!;
+      expect(control.awareness.getLocalState()?.ghostprovV2Control)
+        .toMatchObject({ lane: "control", frames: [] });
+      expect(data.awareness.getLocalState()?.ghostprovV2Data).toBeUndefined();
+
+      for (let index = 0; index < 64; index++) {
+        peer.enqueue(responseEvent(index), "data", `req-${index % 16}`);
+      }
+      await Bun.sleep(10);
+      const first = data.awareness.getLocalState()?.ghostprovV2Data;
+      expect(first.frames).toHaveLength(32);
+      expect(first.lane).toBe("data");
+      const firstRevision = first.revision;
+      await Bun.sleep(10);
+      expect(data.awareness.getLocalState()?.ghostprovV2Data.revision).toBe(firstRevision);
+
+      const high = first.frames.at(-1).sequence;
+      const remoteDoc = new Y.Doc();
+      const remote = new Awareness(remoteDoc);
+      remote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(high, 1),
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        control.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host-control",
+      );
+      await Bun.sleep(10);
+
+      expect(data.awareness.getLocalState()?.ghostprovV2Data.revision)
+        .toBeGreaterThan(firstRevision);
+      expect(control.awareness.getLocalState()?.ghostprovV2Control.frames).toEqual([]);
+      remote.destroy();
+      remoteDoc.destroy();
+    } finally {
+      await peer.close();
+    }
+  });
+
   it("waits for Y-Sweet sync before publishing sidecar readiness", async () => {
-    let provider: FakeProvider | null = null;
+    const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
       snapshot: () => ({ credits: 128, active: 0, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
@@ -115,8 +223,9 @@ describe("DenoAwarenessPeer", () => {
       binding: BINDING,
       instanceId: "sidecar-instance-1",
       engine: engine as any,
-      providerFactory: doc => {
-        provider = new FakeProvider(doc);
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
         return provider;
       },
       connectTimeoutMs: 100,
@@ -124,17 +233,18 @@ describe("DenoAwarenessPeer", () => {
 
     await peer.connect();
 
-    expect(provider!.awareness.getLocalState()?.ghostprovV2).toMatchObject({
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control).toMatchObject({
       peerId: "sidecar",
       instanceId: "sidecar-instance-1",
       credits: 128,
+      lane: "control",
     });
     await peer.close();
-    expect(provider!.destroyed).toBe(true);
+    expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
   });
 
   it("coalesces burst frames and never republishes an unchanged full window", async () => {
-    let provider: FakeProvider | null = null;
+    const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
       snapshot: () => ({ credits: 128, active: 16, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
@@ -152,8 +262,9 @@ describe("DenoAwarenessPeer", () => {
       binding: BINDING,
       instanceId: "sidecar-instance-1",
       engine: engine as any,
-      providerFactory: doc => {
-        provider = new FakeProvider(doc);
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
         return provider;
       },
       retransmitMs: 60_000,
@@ -161,7 +272,7 @@ describe("DenoAwarenessPeer", () => {
     });
     await peer.connect();
     let publications = 0;
-    provider!.awareness.on("update", () => { publications++; });
+    providers.get("data")!.awareness.on("update", () => { publications++; });
 
     for (let eventIndex = 0; eventIndex < 64; eventIndex++) {
       peer.enqueue({
@@ -177,14 +288,14 @@ describe("DenoAwarenessPeer", () => {
     }
     await Bun.sleep(30);
 
-    const envelope = provider!.awareness.getLocalState()?.ghostprovV2;
-    expect(envelope.frames).toHaveLength(64);
+    const envelope = providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data;
+    expect(envelope.frames).toHaveLength(32);
     expect(publications).toBe(1);
     await peer.close();
   });
 
-  it("paces spaced data from every request on one peer-wide cadence", async () => {
-    let provider: FakeProvider | null = null;
+  it("does not overlap spaced data while one peer-wide flight is active", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
       snapshot: () => ({ credits: 128, active: 16, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
@@ -202,8 +313,9 @@ describe("DenoAwarenessPeer", () => {
       binding: BINDING,
       instanceId: "sidecar-instance-1",
       engine: engine as any,
-      providerFactory: doc => {
-        provider = new FakeProvider(doc);
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
         return provider;
       },
       publicationIntervalMs: 25,
@@ -212,7 +324,7 @@ describe("DenoAwarenessPeer", () => {
     });
     await peer.connect();
     let publications = 0;
-    provider!.awareness.on("update", () => { publications++; });
+    providers.get("data")!.awareness.on("update", () => { publications++; });
 
     for (let eventIndex = 0; eventIndex < 16; eventIndex++) {
       peer.enqueue(responseEvent(eventIndex), "data", `req-${eventIndex}`);
@@ -220,14 +332,14 @@ describe("DenoAwarenessPeer", () => {
     }
     await Bun.sleep(30);
 
-    expect(publications).toBeGreaterThanOrEqual(3);
-    expect(publications).toBeLessThanOrEqual(5);
-    expect(provider!.awareness.getLocalState()?.ghostprovV2.frames).toHaveLength(16);
+    expect(publications).toBe(1);
+    expect(providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data.frames.length)
+      .toBeGreaterThan(0);
     await peer.close();
   });
 
   it("measures sidecar RTT from the first send of an acknowledged sequence", async () => {
-    let provider: FakeProvider | null = null;
+    const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
       snapshot: () => ({ credits: 128, active: 1, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
@@ -247,8 +359,9 @@ describe("DenoAwarenessPeer", () => {
       binding: BINDING,
       instanceId: "sidecar-instance-1",
       engine: engine as any,
-      providerFactory: doc => {
-        provider = new FakeProvider(doc);
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
         return provider;
       },
       diagnostics,
@@ -267,26 +380,30 @@ describe("DenoAwarenessPeer", () => {
       })),
     }, "data", "req-rtt");
     await Bun.sleep(15);
-    expect(provider!.awareness.getLocalState()?.ghostprovV2.frames).toHaveLength(1);
+    expect(providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data.frames)
+      .toHaveLength(1);
 
     const remoteDoc = new Y.Doc();
     const remote = new Awareness(remoteDoc);
-    remote.setLocalStateField("ghostprovV2", hostEnvelope(0));
+    remote.setLocalStateField("ghostprovV2Control", {
+      ...hostEnvelope(0),
+      lane: "control",
+    });
     await Bun.sleep(10);
     applyAwarenessUpdate(
-      provider!.awareness,
+      providers.get("control")!.awareness,
       encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
       "test-host",
     );
     await Bun.sleep(0);
 
-    const rtt = provider!.awareness.getLocalState()?.ghostprovV2
+    const rtt = providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control
       .diagnostics?.transport?.roundTripEwmaMs;
     expect(rtt).toBeNumber();
     expect(rtt).toBeGreaterThan(0);
-    expect(provider!.awareness.getLocalState()?.ghostprovV2.diagnostics?.transport)
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.diagnostics?.transport)
       .toMatchObject({
-        pacedPublicationsTotal: 1,
+        pacedPublicationsTotal: 2,
         urgentPublicationsTotal: 1,
         logicalEventsTotal: 3,
         responseBatchFramesTotal: 1,
@@ -298,7 +415,7 @@ describe("DenoAwarenessPeer", () => {
   });
 
   it("backs off repeated full-window publication until ACK progress resumes", async () => {
-    let provider: FakeProvider | null = null;
+    const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
       snapshot: () => ({ credits: 128, active: 1, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
@@ -316,8 +433,9 @@ describe("DenoAwarenessPeer", () => {
       binding: BINDING,
       instanceId: "sidecar-instance-1",
       engine: engine as any,
-      providerFactory: doc => {
-        provider = new FakeProvider(doc);
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
         return provider;
       },
       publicationIntervalMs: 5,
@@ -326,7 +444,7 @@ describe("DenoAwarenessPeer", () => {
     });
     await peer.connect();
     let publications = 0;
-    provider!.awareness.on("update", () => { publications++; });
+    providers.get("data")!.awareness.on("update", () => { publications++; });
     peer.enqueue(responseEvent(0, "req-1"), "data", "req-1");
     await Bun.sleep(10);
     expect(publications).toBe(1);
