@@ -5,6 +5,8 @@ export const GP_V2_SCHEMA_VERSION = 1 as const;
 export const GP_V2_FRAME_MAX_BYTES = 16 * 1024;
 export const GP_V2_WINDOW_MAX_FRAMES = 128;
 export const GP_V2_WINDOW_MAX_BYTES = 512 * 1024;
+export const GP_V2_FLIGHT_MAX_FRAMES = 32;
+export const GP_V2_FLIGHT_MAX_BYTES = 128 * 1024;
 export const GP_V2_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
 
 export type AwarenessLane = "data" | "control";
@@ -137,6 +139,8 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
   frameMaxBytes: GP_V2_FRAME_MAX_BYTES,
   windowMaxFrames: GP_V2_WINDOW_MAX_FRAMES,
   windowMaxBytes: GP_V2_WINDOW_MAX_BYTES,
+  flightMaxFrames: GP_V2_FLIGHT_MAX_FRAMES,
+  flightMaxBytes: GP_V2_FLIGHT_MAX_BYTES,
   requestMaxBytes: GP_V2_REQUEST_MAX_BYTES,
   envelopeFields: [
     "protocol",
