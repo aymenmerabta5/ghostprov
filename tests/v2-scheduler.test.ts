@@ -16,6 +16,14 @@ function frame(kind: string, requestId: string, value: number, payload?: string)
 }
 
 describe("WeightedFrameScheduler", () => {
+  it("reports queued bytes and oldest frame age without changing selection", () => {
+    let now = 0;
+    const scheduler = new WeightedFrameScheduler<any>({ now: () => now });
+    scheduler.enqueue("data", "a", { value: "hello" });
+    now = 25;
+    expect(scheduler.snapshot()).toMatchObject({ queuedFrames: 1, streams: 1, queuedEncodedBytes: expect.any(Number), oldestQueuedFrameMs: 25 });
+    expect(scheduler.take(1)).toEqual([{ value: "hello" }]);
+  });
   it("prioritizes terminal and control traffic then round-robins data streams", () => {
     const scheduler = new WeightedFrameScheduler<TestFrame>();
     scheduler.enqueue("data", "large", frame("response_event", "large", 0));
@@ -57,7 +65,7 @@ describe("WeightedFrameScheduler", () => {
     expect(scheduler.take(10, oneFrameBytes)).toHaveLength(1);
     expect(scheduler.snapshot().queuedFrames).toBe(1);
     expect(scheduler.take(1)).toHaveLength(1);
-    expect(scheduler.snapshot()).toEqual({ queuedFrames: 0, streams: 0 });
+    expect(scheduler.snapshot()).toEqual({ queuedFrames: 0, streams: 0, queuedEncodedBytes: 0, oldestQueuedFrameMs: 0 });
   });
 
   it("removes one stream from every priority without affecting others", () => {

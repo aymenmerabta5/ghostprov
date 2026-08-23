@@ -9,6 +9,7 @@ import { phaseZeroBootstrap } from "./bootstrap.ts";
 import { DenoAwarenessPeer } from "./awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
+import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 
 interface StaticSidecarConfig {
   version: 1;
@@ -66,6 +67,7 @@ async function run(): Promise<void> {
   const storage = new DenoJournalStorage();
   const diagnostics = new SidecarResourceSampler(config.diagnostics);
   diagnostics.start();
+  const diagnosticObserver = new SidecarDiagnosticsObserver({ enabled: config.diagnostics.enabled, sampler: diagnostics });
   const journal = new ClaimJournal({
     storage,
     flushIntervalMs: 2,
@@ -100,6 +102,7 @@ async function run(): Promise<void> {
       awarenessDrainRequested = true;
       resolveAwarenessDrain(`awareness:${reason}`);
     },
+    diagnostics: diagnosticObserver,
     emit: (frame, priority, streamId) => {
       peer?.enqueue(frame, priority, streamId);
     },
@@ -109,6 +112,7 @@ async function run(): Promise<void> {
     binding,
     instanceId: bootstrap.instanceId,
     engine,
+    diagnostics: diagnosticObserver,
   });
 
   await engine.start();

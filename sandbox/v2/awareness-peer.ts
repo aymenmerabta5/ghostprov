@@ -12,7 +12,6 @@ import {
   type ReliableFrame,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared.ts";
-import { parseAwarenessEnvelope } from "../../src/v2/protocol/validate.ts";
 import {
   InboundFrameCursor,
   OutboundFrameWindow,
@@ -23,6 +22,8 @@ import {
 } from "../../src/v2/protocol/scheduler.ts";
 import { computeV2RetransmitDelayMs } from "../../src/v2/protocol/retransmit.ts";
 import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
+import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
+import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -35,6 +36,7 @@ export interface DenoAwarenessPeerOptions {
     doc: Y.Doc,
     credential: () => BootstrapCredentialPayload,
   ) => DenoAwarenessProviderLike;
+  diagnostics?: SidecarDiagnosticsObserver;
 }
 
 export interface DenoAwarenessProviderLike {
@@ -88,6 +90,7 @@ export class DenoAwarenessPeer {
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
   readonly #retransmitMs: number;
   readonly #connectTimeoutMs: number;
+  readonly #diagnostics?: SidecarDiagnosticsObserver;
   #revision = 0;
   #hostPeerId: string | null = null;
   #hostClientId: number | null = null;
@@ -96,6 +99,7 @@ export class DenoAwarenessPeer {
   #timer: number | null = null;
   #retransmissionAttempt = 0;
   #publishScheduled = false;
+  #retransmissions = 0; #publications = 0; #publishedBytes = 0; #peakAttempt = 0; #lastAckAt = performance.now();
   #closed = false;
   #acceptChain: Promise<void> = Promise.resolve();
 
@@ -110,6 +114,7 @@ export class DenoAwarenessPeer {
     });
     this.#retransmitMs = options.retransmitMs ?? 250;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.#diagnostics = options.diagnostics;
     if (!Number.isFinite(this.#connectTimeoutMs) || this.#connectTimeoutMs < 1) {
       throw new RangeError("connectTimeoutMs must be positive");
     }
@@ -186,7 +191,9 @@ export class DenoAwarenessPeer {
       if (raw == null) continue;
       let envelope: AwarenessEnvelope<HostFrame>;
       try {
-        envelope = parseAwarenessEnvelope(raw, this.#binding, "host");
+        const parsed = parseAwarenessEnvelopeWithDiagnostics(raw, this.#binding, "host");
+        envelope = parsed.envelope as AwarenessEnvelope<HostFrame>;
+        if (parsed.malformed) this.#diagnostics?.malformed();
       } catch {
         continue;
       }
@@ -204,6 +211,7 @@ export class DenoAwarenessPeer {
         const acknowledgementAdvanced =
           this.#outbound.snapshot().frames.length < previousOutstanding;
         if (acknowledgementAdvanced) this.#retransmissionAttempt = 0;
+        if (acknowledgementAdvanced) this.#lastAckAt = performance.now();
         const currentEpoch = this.#inbound.ack().epoch;
         if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
         const frames = this.#inbound.accept(envelope.frames);
@@ -253,6 +261,9 @@ export class DenoAwarenessPeer {
     if (this.#closed) return;
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
+    const scheduled = this.#scheduler.snapshot();
+    this.#publications++;
+    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#retransmissionAttempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: null });
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
@@ -271,7 +282,9 @@ export class DenoAwarenessPeer {
       queued: transport.queued,
       draining: transport.draining,
       frames: outbound.frames,
+      ...(this.#diagnostics?.enabled ? { diagnostics: this.#diagnostics.envelope() } : {}),
     };
+    this.#publishedBytes += new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
     this.#provider.awareness.setLocalStateField("ghostprovV2", envelope);
     this.#armRetransmission();
   }
@@ -291,6 +304,7 @@ export class DenoAwarenessPeer {
       this.#timer = null;
       if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
       this.#retransmissionAttempt++;
+      this.#retransmissions++; this.#peakAttempt = Math.max(this.#peakAttempt, this.#retransmissionAttempt);
       this.#publish();
     }, delay) as unknown as number;
   }

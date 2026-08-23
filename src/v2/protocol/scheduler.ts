@@ -15,6 +15,8 @@ interface StreamQueue<T> {
   weight: number;
   current: number;
   frames: T[];
+  bytes: number[];
+  enqueuedAt: number[];
 }
 
 const PRIORITIES: readonly FramePriority[] = [
@@ -33,9 +35,12 @@ function encodedBytes(value: unknown): number {
 }
 
 export class WeightedFrameScheduler<T extends object> {
+  readonly #now: () => number;
   readonly #queues = new Map<FramePriority, Map<string, StreamQueue<T>>>(
     PRIORITIES.map(priority => [priority, new Map()]),
   );
+
+  constructor(options: { now?: () => number } = {}) { this.#now = options.now ?? (() => performance.now()); }
 
   enqueue(
     priority: FramePriority,
@@ -53,12 +58,12 @@ export class WeightedFrameScheduler<T extends object> {
     }
     let queue = queues.get(streamId);
     if (!queue) {
-      queue = { streamId, weight, current: 0, frames: [] };
+      queue = { streamId, weight, current: 0, frames: [], bytes: [], enqueuedAt: [] };
       queues.set(streamId, queue);
     } else if (queue.weight !== weight) {
       throw new V2SchedulerError("stream weight cannot change while frames are queued", "weight");
     }
-    queue.frames.push(frame);
+    queue.frames.push(frame); queue.bytes.push(encodedBytes(frame)); queue.enqueuedAt.push(this.#now());
   }
 
   take(
@@ -80,9 +85,10 @@ export class WeightedFrameScheduler<T extends object> {
       const selected = this.#selectHighestPriority();
       if (!selected) break;
       const frame = selected.frames[0];
-      const bytes = encodedBytes(frame);
+      const bytes = selected.bytes[0]!;
       if (totalBytes + bytes > maxEncodedBytes) break;
       selected.frames.shift();
+      selected.bytes.shift(); selected.enqueuedAt.shift();
       result.push(frame);
       totalBytes += bytes;
       if (selected.frames.length === 0) {
@@ -98,16 +104,19 @@ export class WeightedFrameScheduler<T extends object> {
     for (const queues of this.#queues.values()) queues.delete(streamId);
   }
 
-  snapshot(): { queuedFrames: number; streams: number } {
+  snapshot(): { queuedFrames: number; streams: number; queuedEncodedBytes: number; oldestQueuedFrameMs: number } {
     let queuedFrames = 0;
+    let queuedEncodedBytes = 0; let oldest = Number.POSITIVE_INFINITY;
     const streams = new Set<string>();
     for (const queues of this.#queues.values()) {
       for (const queue of queues.values()) {
         queuedFrames += queue.frames.length;
+        queuedEncodedBytes += queue.bytes.reduce((sum, value) => sum + value, 0);
+        if (queue.enqueuedAt.length) oldest = Math.min(oldest, queue.enqueuedAt[0]!);
         streams.add(queue.streamId);
       }
     }
-    return { queuedFrames, streams: streams.size };
+    return { queuedFrames, streams: streams.size, queuedEncodedBytes, oldestQueuedFrameMs: Number.isFinite(oldest) ? Math.max(0, this.#now() - oldest) : 0 };
   }
 
   #selectHighestPriority(): StreamQueue<T> | null {

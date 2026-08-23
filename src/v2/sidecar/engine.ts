@@ -12,6 +12,7 @@ import {
 } from "../protocol/shared";
 import { TranscriptProof } from "../protocol/transcript";
 import type { FramePriority } from "../protocol/scheduler";
+import type { SidecarDiagnosticsObserver } from "../diagnostics/sidecar-observer";
 import { RequestAssembler } from "./assembler";
 import { ClaimJournal } from "./journal";
 import {
@@ -71,6 +72,7 @@ export class SidecarEngine {
     streamId: string,
   ) => void;
   readonly #onDrainRequested?: (reason: string) => void;
+  readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #active = new Map<string, ActiveRequest>();
   readonly #ambiguous = new Set<string>();
   readonly #terminalDigests = new Map<string, string>();
@@ -89,6 +91,7 @@ export class SidecarEngine {
     admission: SidecarAdmission;
     upstream: SidecarUpstream;
     onDrainRequested?: (reason: string) => void;
+    diagnostics?: SidecarDiagnosticsObserver;
     emit(
       frame: SidecarFrame,
       priority: FramePriority,
@@ -101,6 +104,7 @@ export class SidecarEngine {
     this.#admission = options.admission;
     this.#upstream = options.upstream;
     this.#onDrainRequested = options.onDrainRequested;
+    this.#diagnostics = options.diagnostics;
     this.#emitFrame = options.emit;
   }
 
@@ -132,10 +136,12 @@ export class SidecarEngine {
     if (!this.#started) throw new Error("Sidecar engine is not started");
     switch (frame.kind) {
       case "request_open":
+        this.#diagnostics?.requestOpened(frame.requestId);
       case "request_data":
         this.#assembler.accept(frame);
         return;
       case "request_commit":
+        this.#diagnostics?.commitReceived(frame.requestId);
         this.#committing++;
         try {
           await this.#commit(frame.requestId, signal);
@@ -218,6 +224,7 @@ export class SidecarEngine {
         requestId,
         requestDigest: active.requestDigest,
         committed: true,
+        ...(this.#diagnostics?.requestAck(requestId) ? { diagnostics: this.#diagnostics.requestAck(requestId) } : {}),
       }, "terminal", requestId);
       return;
     }
@@ -225,6 +232,7 @@ export class SidecarEngine {
     let body: Uint8Array;
     try {
       body = await this.#assembler.commit(requestId);
+      this.#diagnostics?.assemblyCompleted(requestId);
     } catch (error) {
       this.#reject(
         requestId,
@@ -235,11 +243,13 @@ export class SidecarEngine {
     }
     try {
       const digest = await sha256Hex(body);
+      const claimStarted = performance.now();
       await this.#journal.claim({
         requestId,
         requestDigest: digest,
         leaderGeneration: this.#binding.leaderGeneration,
       });
+      this.#diagnostics?.claimCompleted(requestId, performance.now() - claimStarted);
       const state = this.#journal.status(requestId);
       if (state === "fetch_starting") {
         body.fill(0);
@@ -265,10 +275,12 @@ export class SidecarEngine {
 
       let lease: { release(): void };
       try {
+        const admissionStarted = performance.now();
         lease = await this.#admission.acquire(
           Math.max(4 * MiB, body.byteLength * 2),
           signal,
         );
+        this.#diagnostics?.admissionCompleted(requestId, performance.now() - admissionStarted);
       } catch {
         body.fill(0);
         this.#reject(requestId, "capacity", "Sidecar admission capacity is unavailable");
@@ -287,11 +299,13 @@ export class SidecarEngine {
       };
       this.#active.set(requestId, request);
       try {
+        const diagnostics = this.#diagnostics?.requestAck(requestId);
         this.#emit({
           kind: "request_ack",
           requestId,
           requestDigest: digest,
           committed: true,
+          ...(diagnostics ? { diagnostics } : {}),
         }, "terminal", requestId);
       } catch (error) {
         this.#active.delete(requestId);
@@ -315,9 +329,10 @@ export class SidecarEngine {
       const terminal = await this.#upstream.execute({
         body: request.body,
         signal: request.controller.signal,
-        beforeFetch: () => this.#journal.markFetchStarting(request.requestId),
+        beforeFetch: async () => { await this.#journal.markFetchStarting(request.requestId); this.#diagnostics?.fetchStarted(request.requestId); },
         onEvent: async event => {
-          this.#emitEvent(request.requestId, request.eventIndex++, event);
+          const eventIndex = request.eventIndex++;
+          this.#emitEvent(request.requestId, eventIndex, event, this.#diagnostics?.upstreamEvent(request.requestId, eventIndex));
         },
       });
       await this.#journal.markTerminal(
@@ -327,6 +342,7 @@ export class SidecarEngine {
         terminal.transcriptBytes,
       );
       this.#terminalDigests.set(request.requestId, terminal.transcriptSha256);
+      const diagnostics = this.#diagnostics?.requestTerminal(request.requestId);
       this.#emit({
         kind: "response_terminal",
         requestId: request.requestId,
@@ -338,6 +354,7 @@ export class SidecarEngine {
         terminalStatus: terminal.status,
         finalEventIndex: terminal.finalEventIndex,
         finalSha256: terminal.finalSha256,
+        ...(diagnostics ? { diagnostics } : {}),
       }, "terminal", request.requestId);
     } catch (error) {
       const upstream = error instanceof UpstreamExecutionError ? error : null;
@@ -357,7 +374,7 @@ export class SidecarEngine {
     }
   }
 
-  #emitEvent(requestId: string, eventIndex: number, event: SseFrame): void {
+  #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics): void {
     const bytes = utf8Bytes(event.data);
     const partCount = Math.max(1, Math.ceil(bytes.byteLength / RESPONSE_PART_BYTES));
     for (let partIndex = 0, offset = 0; partIndex < partCount; partIndex++) {
@@ -371,6 +388,7 @@ export class SidecarEngine {
         partCount,
         offset,
         dataBase64Url: base64UrlEncode(part),
+        ...(partIndex === 0 && diagnostics ? { diagnostics } : {}),
       };
       if (utf8Bytes(JSON.stringify(frame)).byteLength > GP_V2_FRAME_MAX_BYTES) {
         throw new Error("Segmented response event exceeds physical frame limit");
@@ -417,6 +435,7 @@ export class SidecarEngine {
     await this.#journal.acknowledgeTerminal(requestId);
     this.#terminalDigests.delete(requestId);
     this.#ambiguous.delete(requestId);
+    this.#diagnostics?.removeRequest(requestId);
   }
 
   #reject(requestId: string, code: string, message: string): void {
