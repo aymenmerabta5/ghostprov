@@ -8,7 +8,11 @@ import {
 } from "../src/anthropic/errors";
 import { resolveAnthropicModel } from "../src/anthropic/model";
 import { decodeReasoningItem, encodeReasoningItem } from "../src/anthropic/reasoning";
-import type { AnthropicMessage, AnthropicMessageRequest } from "../src/anthropic/types";
+import type {
+  AnthropicMessage,
+  AnthropicMessageRequest,
+  AnthropicUsage,
+} from "../src/anthropic/types";
 
 const models = {
   opus: "gpt-5.6-sol",
@@ -38,6 +42,7 @@ describe("Anthropic foundations", () => {
     expect(decodeReasoningItem(signature)).toEqual(item);
     expect(decodeReasoningItem("anthropic-native-signature")).toBeNull();
     expect(decodeReasoningItem("ghostprov-r1.not-base64")).toBeNull();
+    expect(decodeReasoningItem("ghostprov-r1.%%%")).toBeNull();
   });
 
   it("strips extra reasoning fields and rejects malformed or oversized envelopes", () => {
@@ -90,6 +95,7 @@ describe("Anthropic foundations", () => {
       [402, "billing_error"],
       [403, "permission_error"],
       [404, "not_found_error"],
+      [409, "conflict_error"],
       [413, "request_too_large"],
       [429, "rate_limit_error"],
       [504, "timeout_error"],
@@ -119,6 +125,31 @@ describe("Anthropic foundations", () => {
   });
 
   it("exposes permissive current request and response wire types", () => {
+    const usage: AnthropicUsage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_creation_input_tokens: 3,
+      cache_read_input_tokens: 2,
+      cache_creation: {
+        ephemeral_1h_input_tokens: 1,
+        ephemeral_5m_input_tokens: 2,
+      },
+      inference_geo: "global",
+      output_tokens_details: { thinking_tokens: 3 },
+      server_tool_use: { web_fetch_requests: 1, web_search_requests: 2 },
+      service_tier: "priority",
+      speed: "fast",
+      iterations: [{
+        type: "message",
+        model: "claude-sonnet-4-6",
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 3,
+        cache_read_input_tokens: 2,
+        cache_creation: null,
+      }],
+      future_usage_field: { accepted: true },
+    };
     const request: AnthropicMessageRequest = {
       model: "claude-sonnet-4-6",
       max_tokens: 128,
@@ -133,15 +164,13 @@ describe("Anthropic foundations", () => {
       content: [{ type: "text", text: "hi" }],
       stop_reason: "end_turn",
       stop_sequence: null,
-      usage: {
-        input_tokens: 1,
-        output_tokens: 1,
-        cache_creation_input_tokens: null,
-        cache_read_input_tokens: null,
-      },
+      usage,
       additive_beta_field: true,
     };
 
     expect(message.model).toBe(request.model);
+    expect(usage.cache_creation?.ephemeral_1h_input_tokens).toBe(1);
+    expect(usage.iterations?.[0]?.type).toBe("message");
+    expect(usage.future_usage_field).toEqual({ accepted: true });
   });
 });
