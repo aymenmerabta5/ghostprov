@@ -36,6 +36,11 @@ export function safeDiagnostics(): V2EnvelopeDiagnostics {
       publishedBytesTotal: 400,
       admittedUncommitted: 1,
       roundTripEwmaMs: 6,
+      pacedPublicationsTotal: 7,
+      urgentPublicationsTotal: 3,
+      logicalEventsTotal: 40,
+      responseBatchFramesTotal: 8,
+      batchedEventsTotal: 32,
     },
     malformedCount: 0,
   };

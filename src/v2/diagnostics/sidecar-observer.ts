@@ -3,7 +3,7 @@ import type { V2EnvelopeDiagnostics, V2FirstEventDiagnostics, V2RequestAckDiagno
 
 interface RequestTiming { opened: number; commit?: number; assembly?: number; claimMs: number; admissionMs: number; fetch?: number; upstreamStart?: number; schedulerPeakFrames: number; schedulerPeakBytes: number; ackAgePeak: number }
 
-const emptyTransport = (): V2TransportDiagnostics => ({ windowFrames: 0, windowBytes: 0, schedulerFrames: 0, schedulerBytes: 0, schedulerStreams: 0, oldestQueuedFrameMs: 0, ackProgressAgeMs: 0, retransmissionAttempt: 0, peakRetransmissionAttempt: 0, retransmissionsTotal: 0, publicationsTotal: 0, publishedBytesTotal: 0, admittedUncommitted: 0, roundTripEwmaMs: null });
+const emptyTransport = (): V2TransportDiagnostics => ({ windowFrames: 0, windowBytes: 0, schedulerFrames: 0, schedulerBytes: 0, schedulerStreams: 0, oldestQueuedFrameMs: 0, ackProgressAgeMs: 0, retransmissionAttempt: 0, peakRetransmissionAttempt: 0, retransmissionsTotal: 0, publicationsTotal: 0, publishedBytesTotal: 0, admittedUncommitted: 0, roundTripEwmaMs: null, pacedPublicationsTotal: 0, urgentPublicationsTotal: 0, logicalEventsTotal: 0, responseBatchFramesTotal: 0, batchedEventsTotal: 0 });
 
 export class SidecarDiagnosticsObserver {
   readonly #enabled: boolean; readonly #now: () => number; readonly #sampler: SidecarResourceSampler;

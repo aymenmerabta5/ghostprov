@@ -8,7 +8,41 @@ import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../v2/diagnostics/types";
 
-function transportJson(value: V2TransportDiagnostics): JsonValue { return { window_frames:value.windowFrames,window_bytes:value.windowBytes,scheduler_frames:value.schedulerFrames,scheduler_bytes:value.schedulerBytes,scheduler_streams:value.schedulerStreams,oldest_queued_frame_ms:value.oldestQueuedFrameMs,ack_progress_age_ms:value.ackProgressAgeMs,retransmission_attempt:value.retransmissionAttempt,peak_retransmission_attempt:value.peakRetransmissionAttempt,retransmissions_total:value.retransmissionsTotal,publications_total:value.publicationsTotal,published_bytes_total:value.publishedBytesTotal,admitted_uncommitted:value.admittedUncommitted,round_trip_ewma_ms:value.roundTripEwmaMs }; }
+function ratio(numerator: number, denominator: number): number {
+  return denominator > 0 ? Math.round((numerator / denominator) * 1_000) / 1_000 : 0;
+}
+
+function transportJson(value: V2TransportDiagnostics): JsonValue {
+  return {
+    window_frames: value.windowFrames,
+    window_bytes: value.windowBytes,
+    scheduler_frames: value.schedulerFrames,
+    scheduler_bytes: value.schedulerBytes,
+    scheduler_streams: value.schedulerStreams,
+    oldest_queued_frame_ms: value.oldestQueuedFrameMs,
+    ack_progress_age_ms: value.ackProgressAgeMs,
+    retransmission_attempt: value.retransmissionAttempt,
+    peak_retransmission_attempt: value.peakRetransmissionAttempt,
+    retransmissions_total: value.retransmissionsTotal,
+    publications_total: value.publicationsTotal,
+    published_bytes_total: value.publishedBytesTotal,
+    admitted_uncommitted: value.admittedUncommitted,
+    round_trip_ewma_ms: value.roundTripEwmaMs,
+    paced_publications_total: value.pacedPublicationsTotal,
+    urgent_publications_total: value.urgentPublicationsTotal,
+    logical_events_total: value.logicalEventsTotal,
+    response_batch_frames_total: value.responseBatchFramesTotal,
+    batched_events_total: value.batchedEventsTotal,
+    logical_events_per_batch: ratio(
+      value.batchedEventsTotal,
+      value.responseBatchFramesTotal,
+    ),
+    logical_events_per_publication: ratio(
+      value.logicalEventsTotal,
+      value.publicationsTotal,
+    ),
+  };
+}
 function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue { if(!value)return null;const r=value.resource;return { version:value.version,malformed_count:value.malformedCount,resource:r?{process_rss_bytes:r.processRssBytes,heap_used_bytes:r.heapUsedBytes,heap_total_bytes:r.heapTotalBytes,external_bytes:r.externalBytes,system_total_bytes:r.systemTotalBytes,system_free_bytes:r.systemFreeBytes,process_cpu_percent:r.processCpuPercent,normalized_load_1:r.normalizedLoad1,event_loop_p50_ms:r.eventLoopP50Ms,event_loop_p95_ms:r.eventLoopP95Ms,event_loop_max_ms:r.eventLoopMaxMs}:null,transport:transportJson(value.transport) }; }
 
 interface EventLoopDelayLike {

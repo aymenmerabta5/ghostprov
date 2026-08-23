@@ -239,6 +239,13 @@ describe("V2TransportSession", () => {
     expect(harness.hostEnvelopes[0]!.frames.filter(
       frame => frame.kind === "request_open",
     )).toHaveLength(4);
+    expect(harness.session.snapshot().diagnostics?.host).toMatchObject({
+      pacedPublicationsTotal: 1,
+      urgentPublicationsTotal: 0,
+      logicalEventsTotal: 0,
+      responseBatchFramesTotal: 0,
+      batchedEventsTotal: 0,
+    });
     await harness.close();
     await Promise.allSettled(pending);
   });

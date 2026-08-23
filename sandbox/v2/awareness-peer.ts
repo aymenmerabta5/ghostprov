@@ -124,7 +124,16 @@ export class DenoAwarenessPeer {
   #hostRevision = -1;
   #hostCredits = -1;
   #timer: number | null = null;
-  #retransmissions = 0; #publications = 0; #publishedBytes = 0; #peakAttempt = 0; #lastAckAt = performance.now();
+  #retransmissions = 0;
+  #publications = 0;
+  #pacedPublications = 0;
+  #urgentPublications = 0;
+  #publishedBytes = 0;
+  #peakAttempt = 0;
+  #lastAckAt = performance.now();
+  #logicalEvents = 0;
+  #responseBatchFrames = 0;
+  #batchedEvents = 0;
   readonly #congestion = new TransportCongestion();
   #closed = false;
   #acceptChain: Promise<void> = Promise.resolve();
@@ -196,6 +205,13 @@ export class DenoAwarenessPeer {
     weight = 1,
   ): void {
     if (this.#closed) return;
+    if (frame.kind === "response_batch") {
+      this.#responseBatchFrames++;
+      this.#logicalEvents += frame.items.length;
+      this.#batchedEvents += frame.items.length;
+    } else if (frame.kind === "response_event" && frame.partIndex === 0) {
+      this.#logicalEvents++;
+    }
     this.#scheduler.enqueue(priority, streamId, frame, weight);
     const urgency = this.#pump();
     const congestionChanged = this.#updateCongestion();
@@ -303,14 +319,16 @@ export class DenoAwarenessPeer {
     else if (urgency === "paced") this.#pacer.requestPaced();
   }
 
-  #publish(_reason: PublicationReason): void {
+  #publish(reason: PublicationReason): void {
     if (this.#closed) return;
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
     const scheduled = this.#scheduler.snapshot();
     this.#delivery.published(outbound.frames, performance.now());
     this.#publications++;
-    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs });
+    if (reason === "paced") this.#pacedPublications++;
+    else if (reason === "urgent") this.#urgentPublications++;
+    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents });
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,

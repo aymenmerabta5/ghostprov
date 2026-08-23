@@ -213,7 +213,10 @@ export class V2TransportSession {
   #drainReject: ((error: unknown) => void) | null = null;
   #sidecarDiagnostics: V2EnvelopeDiagnostics | null = null;
   #publications = 0;
+  #pacedPublications = 0;
+  #urgentPublications = 0;
   #publishedBytes = 0;
+  #peakRetransmissionAttempt = 0;
   #lastAckAtMs: number;
 
   constructor(options: V2TransportSessionOptions) {
@@ -910,7 +913,7 @@ export class V2TransportSession {
     else if (urgency === "paced") this.#pacer.requestPaced();
   }
 
-  #publish(_reason: PublicationReason): void {
+  #publish(reason: PublicationReason): void {
     if (!this.#connected || this.#closed) return;
     const outbound = this.#outbound.snapshot();
     this.#delivery.published(outbound.frames, this.#clock.now());
@@ -935,6 +938,8 @@ export class V2TransportSession {
       frames: outbound.frames,
     };
     this.#publications++;
+    if (reason === "paced") this.#pacedPublications++;
+    else if (reason === "urgent") this.#urgentPublications++;
     this.#publishedBytes += utf8Bytes(JSON.stringify(envelope)).byteLength;
     const diagnostics = this.#hostTransportDiagnostics();
     for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
@@ -943,8 +948,30 @@ export class V2TransportSession {
   }
 
   #hostTransportDiagnostics(): V2TransportDiagnostics {
-    const window=this.#outbound.snapshot(); const scheduler=this.#scheduler.snapshot();
-    return { windowFrames:window.frames.length, windowBytes:window.encodedBytes, schedulerFrames:scheduler.queuedFrames, schedulerBytes:scheduler.queuedEncodedBytes, schedulerStreams:scheduler.streams, oldestQueuedFrameMs:scheduler.oldestQueuedFrameMs, ackProgressAgeMs:Math.max(0,this.#clock.now()-this.#lastAckAtMs), retransmissionAttempt:this.#delivery.attempt, peakRetransmissionAttempt:this.#delivery.attempt, retransmissionsTotal:this.#retransmissions, publicationsTotal:this.#publications, publishedBytesTotal:this.#publishedBytes, admittedUncommitted:[...this.#requests.values()].filter(value=>value.admitted&&!value.committed).length, roundTripEwmaMs:this.#delivery.roundTripEwmaMs };
+    const window = this.#outbound.snapshot();
+    const scheduler = this.#scheduler.snapshot();
+    return {
+      windowFrames: window.frames.length,
+      windowBytes: window.encodedBytes,
+      schedulerFrames: scheduler.queuedFrames,
+      schedulerBytes: scheduler.queuedEncodedBytes,
+      schedulerStreams: scheduler.streams,
+      oldestQueuedFrameMs: scheduler.oldestQueuedFrameMs,
+      ackProgressAgeMs: Math.max(0, this.#clock.now() - this.#lastAckAtMs),
+      retransmissionAttempt: this.#delivery.attempt,
+      peakRetransmissionAttempt: this.#peakRetransmissionAttempt,
+      retransmissionsTotal: this.#retransmissions,
+      publicationsTotal: this.#publications,
+      publishedBytesTotal: this.#publishedBytes,
+      admittedUncommitted: [...this.#requests.values()]
+        .filter(value => value.admitted && !value.committed).length,
+      roundTripEwmaMs: this.#delivery.roundTripEwmaMs,
+      pacedPublicationsTotal: this.#pacedPublications,
+      urgentPublicationsTotal: this.#urgentPublications,
+      logicalEventsTotal: 0,
+      responseBatchFramesTotal: 0,
+      batchedEventsTotal: 0,
+    };
   }
 
   #armRetransmission(): void {
@@ -964,6 +991,10 @@ export class V2TransportSession {
       if (this.#outbound.snapshot().frames.length === 0) return;
       this.#delivery.retransmitted(this.#clock.now());
       this.#retransmissions++;
+      this.#peakRetransmissionAttempt = Math.max(
+        this.#peakRetransmissionAttempt,
+        this.#delivery.attempt,
+      );
       this.#pacer.flushNow("retransmission");
     }, delay);
   }

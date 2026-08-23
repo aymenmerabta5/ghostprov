@@ -31,6 +31,11 @@ export interface V2TransportDiagnostics {
   publishedBytesTotal: number;
   admittedUncommitted: number;
   roundTripEwmaMs: number | null;
+  pacedPublicationsTotal: number;
+  urgentPublicationsTotal: number;
+  logicalEventsTotal: number;
+  responseBatchFramesTotal: number;
+  batchedEventsTotal: number;
 }
 
 export interface V2EnvelopeDiagnostics {
@@ -129,6 +134,8 @@ function parseTransport(value: unknown): V2TransportDiagnostics | null {
     "oldestQueuedFrameMs", "ackProgressAgeMs", "retransmissionAttempt",
     "peakRetransmissionAttempt", "retransmissionsTotal", "publicationsTotal",
     "publishedBytesTotal", "admittedUncommitted", "roundTripEwmaMs",
+    "pacedPublicationsTotal", "urgentPublicationsTotal", "logicalEventsTotal",
+    "responseBatchFramesTotal", "batchedEventsTotal",
   ] as const;
   if (!raw || !exact(raw, keys)) return null;
   const roundTripEwmaMs = nullableNumber(raw.roundTripEwmaMs);
@@ -137,8 +144,12 @@ function parseTransport(value: unknown): V2TransportDiagnostics | null {
     "windowFrames", "windowBytes", "schedulerFrames", "schedulerBytes", "schedulerStreams",
     "retransmissionAttempt", "peakRetransmissionAttempt", "retransmissionsTotal",
     "publicationsTotal", "publishedBytesTotal", "admittedUncommitted",
+    "pacedPublicationsTotal", "urgentPublicationsTotal", "logicalEventsTotal",
+    "responseBatchFramesTotal", "batchedEventsTotal",
   ]);
-  const parsed = Object.fromEntries(keys.slice(0, -1).map(key => [key, number(raw[key], counters.has(key))]));
+  const parsed = Object.fromEntries(keys
+    .filter(key => key !== "roundTripEwmaMs")
+    .map(key => [key, number(raw[key], counters.has(key))]));
   if (Object.values(parsed).some(value => value === null)) return null;
   return { ...(parsed as unknown as Omit<V2TransportDiagnostics, "roundTripEwmaMs">), roundTripEwmaMs };
 }

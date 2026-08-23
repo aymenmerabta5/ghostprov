@@ -257,7 +257,15 @@ describe("DenoAwarenessPeer", () => {
       connectTimeoutMs: 100,
     });
     await peer.connect();
-    peer.enqueue(responseEvent(0, "req-rtt"), "data", "req-rtt");
+    peer.enqueue({
+      kind: "response_batch",
+      requestId: "req-rtt",
+      firstEventIndex: 0,
+      items: ["a", "b", "c"].map(value => ({
+        event: "response.output_text.delta",
+        dataBase64Url: value,
+      })),
+    }, "data", "req-rtt");
     await Bun.sleep(15);
     expect(provider!.awareness.getLocalState()?.ghostprovV2.frames).toHaveLength(1);
 
@@ -276,6 +284,14 @@ describe("DenoAwarenessPeer", () => {
       .diagnostics?.transport?.roundTripEwmaMs;
     expect(rtt).toBeNumber();
     expect(rtt).toBeGreaterThan(0);
+    expect(provider!.awareness.getLocalState()?.ghostprovV2.diagnostics?.transport)
+      .toMatchObject({
+        pacedPublicationsTotal: 1,
+        urgentPublicationsTotal: 1,
+        logicalEventsTotal: 3,
+        responseBatchFramesTotal: 1,
+        batchedEventsTotal: 3,
+      });
     remote.destroy();
     remoteDoc.destroy();
     await peer.close();

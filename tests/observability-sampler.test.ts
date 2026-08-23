@@ -4,6 +4,7 @@ import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { FleetSampler } from "../src/observability/sampler";
 import { projectId } from "../src/sandbox/types";
+import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
 
 class MemoryLogger implements LoggerLike {
   readonly events: ObservabilityEvent[] = [];
@@ -42,6 +43,27 @@ describe("FleetSampler", () => {
       reset() {},
     };
     let cpu = { user: 0, system: 0 };
+    const transport: V2TransportDiagnostics = {
+      windowFrames: 1,
+      windowBytes: 100,
+      schedulerFrames: 2,
+      schedulerBytes: 200,
+      schedulerStreams: 1,
+      oldestQueuedFrameMs: 4,
+      ackProgressAgeMs: 5,
+      retransmissionAttempt: 0,
+      peakRetransmissionAttempt: 1,
+      retransmissionsTotal: 2,
+      publicationsTotal: 10,
+      publishedBytesTotal: 400,
+      admittedUncommitted: 1,
+      roundTripEwmaMs: 6,
+      pacedPublicationsTotal: 7,
+      urgentPublicationsTotal: 3,
+      logicalEventsTotal: 40,
+      responseBatchFramesTotal: 8,
+      batchedEventsTotal: 32,
+    };
     const sampler = new FleetSampler({
       logger,
       clock,
@@ -83,6 +105,10 @@ describe("FleetSampler", () => {
           queueDepth: 0,
           memoryPressure: 0.1,
           failure: null,
+          diagnostics: {
+            host: { ...transport, logicalEventsTotal: 0, responseBatchFramesTotal: 0, batchedEventsTotal: 0 },
+            sidecar: { version: 1, resource: null, transport, malformedCount: 0 },
+          },
         }],
       }),
       cpuPoolSnapshot: () => ({ workers: 6, active: 1, queued: 0, maxActive: 2, closed: false }),
@@ -109,6 +135,16 @@ describe("FleetSampler", () => {
       project_id: "00000000-0000-4000-8000-000000000001",
       awareness_rtt_ms: 15,
       completion_ewma_ms: 2_000,
+      diagnostics: {
+        sidecar: {
+          transport: {
+            logical_events_total: 40,
+            response_batch_frames_total: 8,
+            logical_events_per_batch: 4,
+            logical_events_per_publication: 4,
+          },
+        },
+      },
     });
     expect(JSON.stringify(event)).not.toMatch(/token|cookie|prompt|output|url/i);
   });
