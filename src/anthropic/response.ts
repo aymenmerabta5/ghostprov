@@ -14,6 +14,7 @@ import {
 } from "./response-stop";
 import type {
   ResponsesFinalFunctionCallItem,
+  ResponsesFinalItemStatus,
   ResponsesFinalMessageItem,
   ResponsesFinalReasoningItem,
 } from "./response-types";
@@ -39,10 +40,13 @@ export type {
   ResponsesFinalReasoningItem,
   ResponsesFinalResponse,
   ResponsesIncompleteReason,
+  ResponsesLogprob,
   ResponsesOutputRefusal,
   ResponsesOutputText,
+  ResponsesReasoningSummary,
+  ResponsesUsage,
 } from "./response-types";
-export type { AnthropicStopReason } from "./types";
+export type { AnthropicAdapterStopReason, AnthropicStopReason } from "./types";
 export { stopReasonFromResponses, usageFromResponses };
 
 export type AnthropicResponseContext = Pick<
@@ -154,9 +158,6 @@ export function responseToAnthropic(
   context: AnthropicResponseContext,
 ): AnthropicMessage {
   const terminal = terminalResponse(finalValue);
-  if (!context.maxTokensZero && (terminal.record.usage === undefined || terminal.record.usage === null)) {
-    malformedFinal();
-  }
   const usage = usageFromResponses(
     terminal.record.usage,
     context.estimatedInputTokens,

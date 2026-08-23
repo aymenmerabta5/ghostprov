@@ -251,6 +251,10 @@ The isolated suite includes:
 - `tests/anthropic-foundations.test.ts`
 - `tests/anthropic-request-contract.test.ts`
 - `tests/anthropic-request.test.ts`
+- `tests/anthropic-response-stop.test.ts`
+- `tests/anthropic-response-tool.test.ts`
+- `tests/anthropic-response-usage.test.ts`
+- `tests/anthropic-response-validation.test.ts`
 - `tests/anthropic-response.test.ts`
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`

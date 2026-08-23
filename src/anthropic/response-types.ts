@@ -15,7 +15,7 @@ export type ResponsesOutputText = {
   type: "output_text";
   text: string;
   annotations: readonly unknown[];
-  logprobs?: ResponsesLogprob[];
+  logprobs: ResponsesLogprob[];
   [key: string]: unknown;
 };
 
@@ -70,12 +70,30 @@ export type ResponsesFinalOutputItem =
 
 export type ResponsesIncompleteReason = "max_output_tokens" | "content_filter";
 
+export type ResponsesUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  input_tokens_details: {
+    cached_tokens: number;
+    cache_write_tokens: number;
+    [key: string]: unknown;
+  };
+  output_tokens_details: {
+    reasoning_tokens: number;
+    [key: string]: unknown;
+  };
+  total_tokens: number;
+  [key: string]: unknown;
+};
+
 type ResponsesFinalBase = {
   id: string;
   object: "response";
+  created_at: number;
+  model: string;
   error: null;
   output: ResponsesFinalOutputItem[];
-  usage?: unknown;
+  usage: ResponsesUsage;
   service_tier?: unknown;
   [key: string]: unknown;
 };
@@ -83,10 +101,10 @@ type ResponsesFinalBase = {
 export type ResponsesFinalResponse = ResponsesFinalBase & (
   | {
     status: "completed";
-    incomplete_details?: null;
+    incomplete_details: null;
   }
   | {
     status: "incomplete";
-    incomplete_details?: { reason?: ResponsesIncompleteReason } | null;
+    incomplete_details: { reason?: ResponsesIncompleteReason } | null;
   }
 );

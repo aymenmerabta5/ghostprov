@@ -3,9 +3,9 @@ import {
   MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH,
 } from "./request-options";
 import type {
+  AnthropicAdapterStopReason,
   AnthropicContentBlock,
   AnthropicResponseContentBlock,
-  AnthropicStopReason,
 } from "./types";
 import {
   finalContainsRefusal,
@@ -100,7 +100,7 @@ export function resolveStopReason(
   blocks: readonly AnthropicContentBlock[],
   matchedStop: string | null,
   sawRefusal: boolean,
-): AnthropicStopReason {
+): AnthropicAdapterStopReason {
   if (sawRefusal || terminal.incompleteReason === "content_filter") return "refusal";
   if (matchedStop !== null) return hasToolUse(blocks) ? "tool_use" : "stop_sequence";
   if (terminal.status === "incomplete") return "max_tokens";
@@ -112,7 +112,7 @@ export function stopReasonFromResponses(
   finalValue: unknown,
   blocks: readonly AnthropicContentBlock[],
   matchedStop: string | null,
-): AnthropicStopReason {
+): AnthropicAdapterStopReason {
   const terminal = terminalResponse(finalValue);
   return resolveStopReason(
     terminal,

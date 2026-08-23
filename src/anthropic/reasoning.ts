@@ -1,3 +1,8 @@
+import {
+  DEFAULT_ANTHROPIC_REQUEST_LIMITS,
+  measureBoundedJson,
+} from "./request-validation";
+
 const PREFIX = "ghostprov-r1.";
 const MAX_DECODED_LENGTH = 8 * 1024 * 1024;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
@@ -20,13 +25,21 @@ export function encodeReasoningItem(item: ResponsesReasoningItem): string {
     typeof item.encrypted_content !== "string" || !item.encrypted_content) {
     throw new TypeError("reasoning continuity requires nonempty id and encrypted content");
   }
-  const json = JSON.stringify({
+  const source = {
     id: item.id,
     encrypted_content: item.encrypted_content,
-  });
-  if (Buffer.byteLength(json, "utf8") > MAX_DECODED_LENGTH) {
+  };
+  try {
+    measureBoundedJson(
+      source,
+      "reasoning continuity envelope",
+      MAX_DECODED_LENGTH,
+      { ...DEFAULT_ANTHROPIC_REQUEST_LIMITS },
+    );
+  } catch {
     throw new RangeError("reasoning continuity envelope is too large");
   }
+  const json = JSON.stringify(source);
   return PREFIX + Buffer.from(json, "utf8").toString("base64url");
 }
 

@@ -33,14 +33,22 @@ export function terminalResponse(value: unknown): TerminalResponse {
   if (!final) malformedFinal();
   if (typeof final.id !== "string" || final.id.length === 0) malformedFinal();
   if (final.object !== "response" || final.error !== null) malformedFinal();
+  if (typeof final.created_at !== "number" || !Number.isFinite(final.created_at) ||
+    final.created_at < 0 || typeof final.model !== "string" || !final.model.trim()) {
+    malformedFinal();
+  }
   if (final.status !== "completed" && final.status !== "incomplete") {
     throw invalidUpstream("Responses relay did not return a successful terminal response.");
   }
   if (!Array.isArray(final.output)) malformedFinal();
+  if (!Object.prototype.hasOwnProperty.call(final, "incomplete_details") ||
+    !record(final.usage)) {
+    malformedFinal();
+  }
 
   let incompleteReason: ResponsesIncompleteReason | null = null;
   if (final.status === "incomplete") {
-    if (final.incomplete_details !== undefined && final.incomplete_details !== null) {
+    if (final.incomplete_details !== null) {
       const details = record(final.incomplete_details);
       if (!details) malformedFinal();
       if (details.reason !== undefined) {
@@ -50,7 +58,7 @@ export function terminalResponse(value: unknown): TerminalResponse {
         incompleteReason = details.reason;
       }
     }
-  } else if (final.incomplete_details !== undefined && final.incomplete_details !== null) {
+  } else if (final.incomplete_details !== null) {
     malformedFinal();
   }
 
@@ -122,8 +130,8 @@ function validOutputTextKnownFields(part: Record<string, unknown>): boolean {
     !part.annotations.every(validAnnotation)) {
     return false;
   }
-  return part.logprobs === undefined ||
-    (Array.isArray(part.logprobs) && part.logprobs.every(value => validLogprob(value, true)));
+  return Array.isArray(part.logprobs) &&
+    part.logprobs.every(value => validLogprob(value, true));
 }
 
 export function finalOutputItem(

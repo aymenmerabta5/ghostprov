@@ -9,10 +9,44 @@ import {
 import { resolveAnthropicModel } from "../src/anthropic/model";
 import { decodeReasoningItem, encodeReasoningItem } from "../src/anthropic/reasoning";
 import type {
+  AnthropicAdapterStopReason,
   AnthropicMessage,
   AnthropicMessageRequest,
+  AnthropicStopReason,
   AnthropicUsage,
 } from "../src/anthropic/types";
+
+const currentStopReasons: AnthropicStopReason[] = [
+  "end_turn",
+  "max_tokens",
+  "stop_sequence",
+  "tool_use",
+  "pause_turn",
+  "compaction",
+  "refusal",
+  "model_context_window_exceeded",
+];
+const adapterStopReasons: AnthropicAdapterStopReason[] = [
+  "end_turn",
+  "max_tokens",
+  "stop_sequence",
+  "tool_use",
+  "refusal",
+];
+// @ts-expect-error The adapter never emits upstream-only pause turns.
+const invalidAdapterStopReason: AnthropicAdapterStopReason = "pause_turn";
+// @ts-expect-error Current outgoing usage requires every nullable/detail field explicitly.
+const incompleteOutgoingUsage: AnthropicUsage = {
+  input_tokens: 1,
+  output_tokens: 1,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+};
+
+void currentStopReasons;
+void adapterStopReasons;
+void invalidAdapterStopReason;
+void incompleteOutgoingUsage;
 
 const models = {
   opus: "gpt-5.6-sol",
@@ -118,6 +152,37 @@ describe("Anthropic foundations", () => {
     });
     const oversized = `ghostprov-r1.${Buffer.from(oversizedJson, "utf8").toString("base64url")}`;
     expect(decodeReasoningItem(oversized)).toBeNull();
+  });
+
+  it("measures the reasoning source envelope before JSON serialization", () => {
+    const originalStringify = JSON.stringify;
+    let stringifyCalled = false;
+    let thrown: unknown;
+    Object.defineProperty(JSON, "stringify", {
+      configurable: true,
+      value: (...args: Parameters<typeof JSON.stringify>) => {
+        stringifyCalled = true;
+        return originalStringify(...args);
+      },
+    });
+    try {
+      encodeReasoningItem({
+        type: "reasoning",
+        id: "rs_source_bound",
+        encrypted_content: "x".repeat(8 * 1024 * 1024),
+        summary: [],
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Object.defineProperty(JSON, "stringify", {
+        configurable: true,
+        value: originalStringify,
+      });
+    }
+
+    expect(thrown).toBeInstanceOf(RangeError);
+    expect(stringifyCalled).toBe(false);
   });
 
   it("returns current Anthropic error envelopes", async () => {

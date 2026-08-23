@@ -36,7 +36,15 @@ export type AnthropicStopReason =
   | "max_tokens"
   | "stop_sequence"
   | "tool_use"
-  | "refusal";
+  | "pause_turn"
+  | "compaction"
+  | "refusal"
+  | "model_context_window_exceeded";
+
+export type AnthropicAdapterStopReason = Extract<
+  AnthropicStopReason,
+  "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | "refusal"
+>;
 
 export type AnthropicMessageParam = {
   role: "user" | "assistant";
@@ -89,13 +97,13 @@ export type AnthropicUsage = {
   output_tokens: number;
   cache_creation_input_tokens: number | null;
   cache_read_input_tokens: number | null;
-  cache_creation?: AnthropicCacheCreation | null;
-  inference_geo?: string | null;
-  output_tokens_details?: AnthropicOutputTokensDetails | null;
-  server_tool_use?: AnthropicServerToolUse | null;
-  service_tier?: "standard" | "priority" | "batch" | (string & {}) | null;
-  speed?: "standard" | "fast" | (string & {}) | null;
-  iterations?: AnthropicUsageIteration[] | null;
+  cache_creation: AnthropicCacheCreation | null;
+  inference_geo: string | null;
+  output_tokens_details: AnthropicOutputTokensDetails | null;
+  server_tool_use: AnthropicServerToolUse | null;
+  service_tier: "standard" | "priority" | "batch" | (string & {}) | null;
+  speed: "standard" | "fast" | (string & {}) | null;
+  iterations: AnthropicUsageIteration[] | null;
   [key: string]: unknown;
 };
 

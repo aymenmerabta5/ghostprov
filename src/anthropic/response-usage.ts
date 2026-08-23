@@ -63,7 +63,7 @@ export function usageFromResponses(
   if (reasoningTokens > outputTokens) {
     throw invalidUpstream("Responses relay returned malformed usage.");
   }
-  if (usage.total_tokens !== undefined &&
+  if (usage.total_tokens === undefined ||
     tokenCount(usage.total_tokens) !== inputTokens + outputTokens) {
     throw invalidUpstream("Responses relay returned malformed usage.");
   }
