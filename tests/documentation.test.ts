@@ -20,6 +20,8 @@ describe("project documentation", () => {
 
   it("documents runtime concurrency defaults from the same source", () => {
     expect(readme).toContain("| `GP_V2_SANDBOX_CAPACITY` | `128`");
+    expect(readme).toContain("| `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8`");
+    expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16`");
     expect(readme).toContain("| `GP_TARGET_CONCURRENCY` | `512`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
@@ -28,6 +30,11 @@ describe("project documentation", () => {
     expect(readme).toContain("| WebSocket named lanes | `32`");
     expect(readme).toContain("| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040`");
     expect(readme).toContain("| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192`");
+    expect(readme).toContain("ghostprovV2Data");
+    expect(readme).toContain("ghostprovV2Control");
+    expect(readme).toContain("128 KiB");
+    expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
+    expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=16");
   });
 
   it("documents the Images compatibility surface and honest capability boundaries", () => {

@@ -229,6 +229,11 @@ export class V2TransportSession {
   #pacedPublications = 0;
   #urgentPublications = 0;
   #publishedBytes = 0;
+  #dataPublications = 0;
+  #controlPublications = 0;
+  #dataPublishedBytes = 0;
+  #controlPublishedBytes = 0;
+  #flightCompletions = 0;
   #peakRetransmissionAttempt = 0;
   #lastAckAtMs: number;
   #unadmittedTimeouts = 0;
@@ -582,6 +587,7 @@ export class V2TransportSession {
 
     this.#outbound.acknowledge(envelope.ack);
     const flightCompleted = this.#flight.acknowledged(envelope.ack);
+    if (flightCompleted) this.#flightCompletions++;
     const now = this.#clock.now();
     const acknowledgementAdvanced = this.#delivery.acknowledged(
       envelope.ack,
@@ -1016,7 +1022,15 @@ export class V2TransportSession {
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
-    this.#publishedBytes += utf8Bytes(JSON.stringify(envelope)).byteLength;
+    const encodedBytes = utf8Bytes(JSON.stringify(envelope)).byteLength;
+    this.#publishedBytes += encodedBytes;
+    if (lane === "data") {
+      this.#dataPublications++;
+      this.#dataPublishedBytes += encodedBytes;
+    } else {
+      this.#controlPublications++;
+      this.#controlPublishedBytes += encodedBytes;
+    }
     this.#channel.publish(envelope, lane);
   }
 
@@ -1044,6 +1058,15 @@ export class V2TransportSession {
       logicalEventsTotal: 0,
       responseBatchFramesTotal: 0,
       batchedEventsTotal: 0,
+      dataPublicationsTotal: this.#dataPublications,
+      controlPublicationsTotal: this.#controlPublications,
+      dataPublishedBytesTotal: this.#dataPublishedBytes,
+      controlPublishedBytesTotal: this.#controlPublishedBytes,
+      flightCompletionsTotal: this.#flightCompletions,
+      adaptiveCapacity: 0,
+      capacityIncreasesTotal: 0,
+      capacityReductionsTotal: 0,
+      unadmittedTimeoutsTotal: this.#unadmittedTimeouts,
     };
   }
 

@@ -150,6 +150,11 @@ export class DenoAwarenessPeer {
   #pacedPublications = 0;
   #urgentPublications = 0;
   #publishedBytes = 0;
+  #dataPublications = 0;
+  #controlPublications = 0;
+  #dataPublishedBytes = 0;
+  #controlPublishedBytes = 0;
+  #flightCompletions = 0;
   #peakAttempt = 0;
   #lastAckAt = performance.now();
   #logicalEvents = 0;
@@ -347,6 +352,7 @@ export class DenoAwarenessPeer {
         }
         this.#outbound.acknowledge(envelope.ack);
         const flightCompleted = this.#flight.acknowledged(envelope.ack);
+        if (flightCompleted) this.#flightCompletions++;
         const now = performance.now();
         const acknowledgementAdvanced = this.#delivery.acknowledged(
           envelope.ack,
@@ -454,7 +460,8 @@ export class DenoAwarenessPeer {
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
-    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents });
+    const adaptive = this.#adaptiveCapacity.snapshot();
+    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0 });
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
@@ -480,7 +487,15 @@ export class DenoAwarenessPeer {
         ? { diagnostics: this.#diagnostics.envelope() }
         : {}),
     };
-    this.#publishedBytes += new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    this.#publishedBytes += encodedBytes;
+    if (lane === "data") {
+      this.#dataPublications++;
+      this.#dataPublishedBytes += encodedBytes;
+    } else {
+      this.#controlPublications++;
+      this.#controlPublishedBytes += encodedBytes;
+    }
     const provider = lane === "data" ? this.#dataProvider : this.#controlProvider;
     const field = lane === "data" ? "ghostprovV2Data" : "ghostprovV2Control";
     provider.awareness.setLocalStateField(field, envelope);

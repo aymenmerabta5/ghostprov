@@ -33,6 +33,15 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     logical_events_total: value.logicalEventsTotal,
     response_batch_frames_total: value.responseBatchFramesTotal,
     batched_events_total: value.batchedEventsTotal,
+    data_publications_total: value.dataPublicationsTotal,
+    control_publications_total: value.controlPublicationsTotal,
+    data_published_bytes_total: value.dataPublishedBytesTotal,
+    control_published_bytes_total: value.controlPublishedBytesTotal,
+    flight_completions_total: value.flightCompletionsTotal,
+    adaptive_capacity: value.adaptiveCapacity,
+    capacity_increases_total: value.capacityIncreasesTotal,
+    capacity_reductions_total: value.capacityReductionsTotal,
+    unadmitted_timeouts_total: value.unadmittedTimeoutsTotal,
     logical_events_per_batch: ratio(
       value.batchedEventsTotal,
       value.responseBatchFramesTotal,
@@ -40,6 +49,10 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     logical_events_per_publication: ratio(
       value.logicalEventsTotal,
       value.publicationsTotal,
+    ),
+    logical_events_per_data_publication: ratio(
+      value.logicalEventsTotal,
+      value.dataPublicationsTotal,
     ),
   };
 }

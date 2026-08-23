@@ -31,11 +31,11 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 
 - Direct Prism provisioning and token synchronization
 - A scoped Node Yjs connection used only for one offline sidecar bundle and bootstrap ciphertext
-- A dedicated Y-Sweet Awareness channel for bounded request/response frames
+- Independent ephemeral Y-Sweet Awareness states: `ghostprovV2Data` for reliable frames and `ghostprovV2Control` for frame-free ACK/capacity state
 - A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
 - Append-only claims and terminal spools under `/tmp/ghostprov-v2`
 - P-256 ECDH/HKDF/AES-GCM bootstrap and AES-GCM credential rotation
-- A 16 KiB frame ceiling and 128-frame/512 KiB unacknowledged window
+- ACK-clocked 32-frame/128 KiB data flights inside the 16 KiB frame and 128-frame/512 KiB hard ceilings
 - Up to 128 physical upstream calls plus fair byte-bounded admission
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
@@ -56,7 +56,7 @@ Failure rules:
 
 ## Concurrency and latency
 
-One V2 sidecar has a hard physical ceiling of 128 simultaneous upstream calls. Four projects provide 512 physical calls; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
+One V2 sidecar retains a hard physical ceiling of 128 simultaneous upstream calls, while transport admission starts at 8 and grows only through healthy RTT samples to a maximum of 16. Four projects therefore expose 32–64 transport-safe calls and still retain 512 physical safety slots; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
 
 ```text
 min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
@@ -72,7 +72,7 @@ resume above max(3 GiB, 15% total RAM) free
 CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
-Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer.
+Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent and frame-free, freezes each 128 KiB data flight until cumulative ACK, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer.
 
 Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 
@@ -197,6 +197,8 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
 | `GP_TRANSPORT` | `auto` | `v2`, `v1`, or authenticated rollout fallback; guests are V2-only |
 | `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
+| `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
+| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16` | Maximum adaptive active request limit |
 | `GP_TARGET_CONCURRENCY` | `512` | Fleet sizing target; divided by per-sandbox V2 capacity |
 | `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
@@ -287,6 +289,7 @@ The isolated suite includes:
 - `tests/transport-selector.test.ts`
 - `tests/unlatch-recovery.test.ts`
 - `tests/v2-awareness-channel.test.ts`
+- `tests/v2-adaptive-capacity.test.ts`
 - `tests/v2-batching-throughput.test.ts`
 - `tests/v2-admission.test.ts`
 - `tests/v2-assembler.test.ts`
@@ -308,6 +311,7 @@ The isolated suite includes:
 - `tests/v2-dynamic-fleet.test.ts`
 - `tests/v2-deno-awareness-peer.test.ts`
 - `tests/v2-faults.test.ts`
+- `tests/v2-flight.test.ts`
 - `tests/v2-host-observer.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
@@ -328,6 +332,7 @@ The isolated suite includes:
 - `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-sidecar-rotation.test.ts`
+- `tests/v2-split-awareness-channel.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`

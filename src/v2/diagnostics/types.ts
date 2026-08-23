@@ -36,6 +36,15 @@ export interface V2TransportDiagnostics {
   logicalEventsTotal: number;
   responseBatchFramesTotal: number;
   batchedEventsTotal: number;
+  dataPublicationsTotal: number;
+  controlPublicationsTotal: number;
+  dataPublishedBytesTotal: number;
+  controlPublishedBytesTotal: number;
+  flightCompletionsTotal: number;
+  adaptiveCapacity: number;
+  capacityIncreasesTotal: number;
+  capacityReductionsTotal: number;
+  unadmittedTimeoutsTotal: number;
 }
 
 export interface V2EnvelopeDiagnostics {
@@ -136,6 +145,9 @@ function parseTransport(value: unknown): V2TransportDiagnostics | null {
     "publishedBytesTotal", "admittedUncommitted", "roundTripEwmaMs",
     "pacedPublicationsTotal", "urgentPublicationsTotal", "logicalEventsTotal",
     "responseBatchFramesTotal", "batchedEventsTotal",
+    "dataPublicationsTotal", "controlPublicationsTotal", "dataPublishedBytesTotal",
+    "controlPublishedBytesTotal", "flightCompletionsTotal", "adaptiveCapacity",
+    "capacityIncreasesTotal", "capacityReductionsTotal", "unadmittedTimeoutsTotal",
   ] as const;
   if (!raw || !exact(raw, keys)) return null;
   const roundTripEwmaMs = nullableNumber(raw.roundTripEwmaMs);
@@ -146,6 +158,9 @@ function parseTransport(value: unknown): V2TransportDiagnostics | null {
     "publicationsTotal", "publishedBytesTotal", "admittedUncommitted",
     "pacedPublicationsTotal", "urgentPublicationsTotal", "logicalEventsTotal",
     "responseBatchFramesTotal", "batchedEventsTotal",
+    "dataPublicationsTotal", "controlPublicationsTotal", "dataPublishedBytesTotal",
+    "controlPublishedBytesTotal", "flightCompletionsTotal", "adaptiveCapacity",
+    "capacityIncreasesTotal", "capacityReductionsTotal", "unadmittedTimeoutsTotal",
   ]);
   const parsed = Object.fromEntries(keys
     .filter(key => key !== "roundTripEwmaMs")
