@@ -106,4 +106,3 @@ Tests must prove:
 - Thirteen completed client cancellations leave zero cancellation quarantines.
 - Zero-capacity simulation returns `router_capacity_timeout` within the configured bound.
 - No new protocol failures, duplicate terminals, reroutes after commitment, or resource leaks.
-

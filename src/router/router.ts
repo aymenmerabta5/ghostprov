@@ -343,11 +343,7 @@ export class MultiSandboxRouter {
     job.queueTimer = setTimeout(() => {
       job.queueTimer = undefined;
       if (!this.#removeJob(job)) return;
-      job.signal?.removeEventListener("abort", job.onAbort!);
-      job.memoryLease.release();
-      const error = new RouterCapacityTimeoutError();
-      this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
-      job.reject(error);
+      this.#expireJob(job);
       this.#scheduleDrain();
     }, remaining);
     job.queueTimer.unref?.();
@@ -371,6 +367,10 @@ export class MultiSandboxRouter {
     for (;;) {
       const job = this.#nextJob();
       if (!job) return;
+      if (this.#clock.now() >= job.queueDeadlineMs) {
+        this.#expireJob(job);
+        continue;
+      }
       if (job.signal?.aborted) {
         job.memoryLease.release();
         job.reject(abortError());
@@ -408,6 +408,14 @@ export class MultiSandboxRouter {
       this.#reserved.set(runtime.projectId, reserved);
       void this.#dispatch(job, runtime);
     }
+  }
+
+  #expireJob(job: QueuedJob): void {
+    job.signal?.removeEventListener("abort", job.onAbort!);
+    job.memoryLease.release();
+    const error = new RouterCapacityTimeoutError();
+    this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
+    job.reject(error);
   }
 
   #choose(job: QueuedJob): RouteSelection | null {

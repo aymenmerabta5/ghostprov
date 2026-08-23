@@ -141,6 +141,36 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes[0].executions).toBe(1);
   });
 
+  it("never dispatches a retry after its absolute queue deadline", async () => {
+    const system = createSystem(2, 1, 10);
+    system.runtimes[1].failStarts = 1;
+    system.runtimes[1].failDelayMs = 25;
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "expired-retry", stream: true },
+      { clientId: "expired-retry", source: "websocket" },
+    );
+    const outcome = await Promise.race([
+      pending.then(
+        handle => ({ kind: "handle" as const, handle }),
+        error => ({ kind: "error" as const, error }),
+      ),
+      Bun.sleep(75).then(() => ({ kind: "idle-timeout" as const })),
+    ]);
+    if (outcome.kind === "handle") {
+      system.runtimes[0].completeOne();
+      await outcome.handle.final;
+    }
+    await system.router.close();
+
+    expect(outcome).toMatchObject({
+      kind: "error",
+      error: { code: "router_capacity_timeout" },
+    });
+    expect(system.runtimes[1].executions).toBe(1);
+    expect(system.runtimes[0].executions).toBe(0);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+  });
+
   it("adds, drains, and removes runtimes without replacing the registry", async () => {
     const registry = new SandboxRegistry();
     const runtime = new FakeRuntime(projectId("00000000-0000-4000-8000-000000000001"));

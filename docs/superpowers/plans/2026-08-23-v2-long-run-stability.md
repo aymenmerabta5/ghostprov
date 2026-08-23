@@ -184,4 +184,3 @@ Run: `bun run verify:v2-smoke`
 - [ ] **Step 4: Review and push**
 
 Verify `git diff --check`, clean tracked status, live port 18787 ownership, and `HEAD == origin/master` after `git push origin master`. Do not restart the live router.
-
