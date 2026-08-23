@@ -35,43 +35,68 @@ describe("Anthropic foundations", () => {
     expect(resolveAnthropicModel("claude-unknown", models)).toBe("gpt-5.6-sol");
   });
 
-  it("round-trips only a bounded OpenAI reasoning item", () => {
-    const item = { type: "reasoning", id: "rs_1", encrypted_content: "cipher", summary: [] } as const;
+  it("round-trips only encrypted reasoning continuity without summary plaintext", () => {
+    const item = {
+      type: "reasoning",
+      id: "rs_1",
+      encrypted_content: "cipher",
+      summary: [{ type: "summary_text", text: "private summary" }],
+    } as const;
     const signature = encodeReasoningItem(item);
     expect(signature.startsWith("ghostprov-r1.")).toBe(true);
-    expect(decodeReasoningItem(signature)).toEqual(item);
+    const rawEnvelope = Buffer.from(signature.slice("ghostprov-r1.".length), "base64url")
+      .toString("utf8");
+    expect(JSON.parse(rawEnvelope)).toEqual({ id: "rs_1", encrypted_content: "cipher" });
+    expect(rawEnvelope).not.toContain("private summary");
+    expect(decodeReasoningItem(signature)).toEqual({
+      type: "reasoning",
+      id: "rs_1",
+      encrypted_content: "cipher",
+      summary: [],
+    });
     expect(decodeReasoningItem("anthropic-native-signature")).toBeNull();
     expect(decodeReasoningItem("ghostprov-r1.not-base64")).toBeNull();
     expect(decodeReasoningItem("ghostprov-r1.%%%")).toBeNull();
   });
 
-  it("strips extra reasoning fields and rejects malformed or oversized envelopes", () => {
+  it("rejects extra, malformed, noncanonical, or oversized reasoning envelopes", () => {
     const encoded = Buffer.from(JSON.stringify({
-      type: "reasoning",
       id: "rs_2",
       encrypted_content: "cipher-2",
-      summary: [{ type: "summary_text", text: "summary" }],
-      extra: "discarded",
     }), "utf8").toString("base64url");
 
     expect(decodeReasoningItem(`ghostprov-r1.${encoded}`)).toEqual({
       type: "reasoning",
       id: "rs_2",
       encrypted_content: "cipher-2",
-      summary: [{ type: "summary_text", text: "summary" }],
+      summary: [],
     });
 
     for (const value of [
-      { type: "message", id: "rs_1", encrypted_content: "cipher", summary: [] },
-      { type: "reasoning", id: 1, encrypted_content: "cipher", summary: [] },
-      { type: "reasoning", id: "rs_1", encrypted_content: 1, summary: [] },
-      { type: "reasoning", id: "rs_1", encrypted_content: "cipher", summary: {} },
+      { id: "rs_1", encrypted_content: "cipher", summary: [] },
+      { type: "reasoning", id: "rs_1", encrypted_content: "cipher" },
+      { id: 1, encrypted_content: "cipher" },
+      { id: "", encrypted_content: "cipher" },
+      { id: "rs_1", encrypted_content: 1 },
+      { id: "rs_1", encrypted_content: "" },
     ]) {
       const malformed = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
       expect(decodeReasoningItem(`ghostprov-r1.${malformed}`)).toBeNull();
     }
 
+    const duplicateKeys = Buffer.from(
+      '{"id":"rs_first","id":"rs_second","encrypted_content":"cipher"}',
+      "utf8",
+    ).toString("base64url");
+    expect(decodeReasoningItem(`ghostprov-r1.${duplicateKeys}`)).toBeNull();
+    expect(decodeReasoningItem(`ghostprov-r1.${encoded}=`)).toBeNull();
     expect(decodeReasoningItem(`ghostprov-r1.${"A".repeat(8 * 1024 * 1024)}`)).toBeNull();
+    expect(() => encodeReasoningItem({
+      type: "reasoning",
+      id: 1,
+      encrypted_content: "cipher",
+      summary: [],
+    } as unknown as Parameters<typeof encodeReasoningItem>[0])).toThrow();
   });
 
   it("returns current Anthropic error envelopes", async () => {

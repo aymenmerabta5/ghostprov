@@ -201,7 +201,12 @@ describe("Anthropic request translation", () => {
       role: "assistant",
       content: [{ type: "input_text", text: "before" }],
     });
-    expect(input[2]).toMatchObject({ id: "rs_order", encrypted_content: "ordered-cipher" });
+    expect(input[2]).toEqual({
+      type: "reasoning",
+      id: "rs_order",
+      encrypted_content: "ordered-cipher",
+      summary: [],
+    });
     expect(input[3]).toMatchObject({
       role: "assistant",
       content: [{ type: "input_text", text: "between" }],
@@ -552,6 +557,19 @@ describe("Anthropic request translation", () => {
     expect(first.relayBody.stream).toBe(false);
     expect(first.estimatedInputTokens).toBeGreaterThan(0);
     expect(first.estimatedInputTokens).toBe(second.estimatedInputTokens);
+  });
+
+  it("enforces current stop-sequence count and length bounds", () => {
+    const accepted = translateAnthropicRequest(request({
+      stop_sequences: ["a", "b", "c", "x".repeat(8191)],
+    }), OPTIONS);
+    expect(accepted.stopSequences).toEqual(["a", "b", "c", "x".repeat(8191)]);
+
+    expectInvalid(request({
+      stop_sequences: ["1", "2", "3", "4", "5"],
+    }), "at most 4");
+    expectInvalid(request({ stop_sequences: [""] }), "must not be empty");
+    expectInvalid(request({ stop_sequences: ["x".repeat(8192)] }), "at most 8191");
   });
 
   it("rejects malformed required request, message, block, and tool fields", () => {

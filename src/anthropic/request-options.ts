@@ -18,6 +18,9 @@ import {
 
 const OUTPUT_EFFORTS = new Set<unknown>(["low", "medium", "high", "xhigh", "max"]);
 
+export const MAX_ANTHROPIC_STOP_SEQUENCES = 4;
+export const MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH = 8191;
+
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
 export function translateTools(
@@ -277,5 +280,21 @@ export function translateStopSequences(
   if (values.some(item => typeof item !== "string")) {
     throw new AnthropicRequestError(400, "stop_sequences must contain only strings");
   }
-  return [...values] as string[];
+  if (values.length > MAX_ANTHROPIC_STOP_SEQUENCES) {
+    throw new AnthropicRequestError(
+      400,
+      `stop_sequences may contain at most ${MAX_ANTHROPIC_STOP_SEQUENCES} values`,
+    );
+  }
+  const strings = values as string[];
+  if (strings.some(item => item.length === 0)) {
+    throw new AnthropicRequestError(400, "stop_sequences values must not be empty");
+  }
+  if (strings.some(item => item.length > MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH)) {
+    throw new AnthropicRequestError(
+      400,
+      `stop_sequences values may contain at most ${MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH} characters`,
+    );
+  }
+  return [...strings];
 }

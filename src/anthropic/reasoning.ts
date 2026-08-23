@@ -10,7 +10,19 @@ export type ResponsesReasoningItem = {
 };
 
 export function encodeReasoningItem(item: ResponsesReasoningItem): string {
-  return PREFIX + Buffer.from(JSON.stringify(item), "utf8").toString("base64url");
+  if (item.type !== "reasoning" || typeof item.id !== "string" || !item.id ||
+    typeof item.encrypted_content !== "string" || !item.encrypted_content) {
+    throw new TypeError("reasoning continuity requires nonempty id and encrypted content");
+  }
+  const encoded = Buffer.from(JSON.stringify({
+    id: item.id,
+    encrypted_content: item.encrypted_content,
+  }), "utf8").toString("base64url");
+  const envelope = PREFIX + encoded;
+  if (envelope.length > MAX_ENCODED_LENGTH) {
+    throw new RangeError("reasoning continuity envelope is too large");
+  }
+  return envelope;
 }
 
 export function decodeReasoningItem(value: string): ResponsesReasoningItem | null {
@@ -20,24 +32,30 @@ export function decodeReasoningItem(value: string): ResponsesReasoningItem | nul
   if (!encoded || !BASE64URL.test(encoded)) return null;
 
   try {
-    const item: unknown = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    const bytes = Buffer.from(encoded, "base64url");
+    if (bytes.toString("base64url") !== encoded) return null;
+    const json = bytes.toString("utf8");
+    const item: unknown = JSON.parse(json);
     if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
 
     const candidate = item as Record<string, unknown>;
     if (
-      candidate.type !== "reasoning" ||
-      typeof candidate.id !== "string" ||
-      typeof candidate.encrypted_content !== "string" ||
-      !Array.isArray(candidate.summary)
+      Object.keys(candidate).length !== 2 ||
+      typeof candidate.id !== "string" || !candidate.id ||
+      typeof candidate.encrypted_content !== "string" || !candidate.encrypted_content
     ) {
       return null;
     }
+    if (json !== JSON.stringify({
+      id: candidate.id,
+      encrypted_content: candidate.encrypted_content,
+    })) return null;
 
     return {
       type: "reasoning",
       id: candidate.id,
       encrypted_content: candidate.encrypted_content,
-      summary: candidate.summary,
+      summary: [],
     };
   } catch {
     return null;
