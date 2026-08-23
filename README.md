@@ -152,6 +152,17 @@ Diagnose a slow multi-agent run in this order:
 6. One runtime with worse RTT, completion EWMA, failures, or quarantine indicates sandbox imbalance.
 7. High event-loop p95/max points to local CPU or synchronous work.
 
+For boundary-level V2 diagnostics, explicitly enable instrumentation, manually restart once so the sidecars redeploy, then run the paid controlled 1/4/8/16 WebSocket probe:
+
+```powershell
+$env:GP_V2_DIAGNOSTICS = "1"
+$env:GP_LIVE_V2_DIAGNOSTICS = "1"
+$env:GP_V2_DIAGNOSTIC_ROOT = "http://127.0.0.1:18787"
+bun run diagnose:v2-concurrency
+```
+
+The probe uses identical 256 KiB request bodies, three waves per stage, waits for fleet idle, never touches port 8787, and writes only timing/counter summaries under `.ghostprov/diagnostics`. It incurs real API usage and never records request or response content.
+
 ## Lifecycle and recovery
 
 Startup resolves and locks one persisted Prism identity, reconciles the durable fleet manifest, and binds the public listener as soon as one runtime is ready; remaining projects continue provisioning independently. Shutdown stops listener admission, rejects queued uncommitted work with HTTP 503, waits for existing terminal proofs, drains sidecars, clears Awareness, closes the identity lease, and never creates or deletes a project.
@@ -209,6 +220,8 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_MONITOR_ROOT` | `http://127.0.0.1:18787` | Loopback router origin for the external monitor |
 | `GP_MONITOR_INTERVAL_MS` | `2000` | Successful external polling interval |
 | `GP_MONITOR_TIMEOUT_MS` | `5000` | Per-poll timeout |
+| `GP_V2_DIAGNOSTICS` | `0` | Opt-in host/sidecar boundary diagnostics |
+| `GP_V2_DIAGNOSTICS_INTERVAL_MS` | `1000` | Fixed-memory sidecar sample interval |
 
 ## Tests
 
@@ -281,9 +294,17 @@ The isolated suite includes:
 - `tests/v2-bootstrap-probe.test.ts`
 - `tests/v2-concurrency.test.ts`
 - `tests/v2-credential-rotation.test.ts`
+- `tests/v2-diagnostics-classifier.test.ts`
+- `tests/v2-diagnostics-observability.test.ts`
+- `tests/v2-diagnostics-overhead.test.ts`
+- `tests/v2-diagnostics-probe.test.ts`
+- `tests/v2-diagnostics-protocol.test.ts`
+- `tests/v2-diagnostics-statistics.test.ts`
+- `tests/v2-diagnostics-types.test.ts`
 - `tests/v2-dynamic-fleet.test.ts`
 - `tests/v2-deno-awareness-peer.test.ts`
 - `tests/v2-faults.test.ts`
+- `tests/v2-host-observer.test.ts`
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
 - `tests/v2-live-guards.test.ts`
@@ -294,6 +315,8 @@ The isolated suite includes:
 - `tests/v2-runtime.test.ts`
 - `tests/v2-scheduler.test.ts`
 - `tests/v2-sidecar-assets.test.ts`
+- `tests/v2-sidecar-diagnostics.test.ts`
+- `tests/v2-sidecar-observer.test.ts`
 - `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-sidecar-rotation.test.ts`
@@ -302,6 +325,7 @@ The isolated suite includes:
 - `tests/v2-upstream.test.ts`
 - `tests/v2-window.test.ts`
 - `tests/websocket.test.ts`
+- `tests/websocket-telemetry.test.ts`
 - `tests/workload.test.ts`
 - `tests/ydoc.test.ts`
 - `tests/zip-coordinator.test.ts`

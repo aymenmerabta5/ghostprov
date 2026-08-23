@@ -62,6 +62,7 @@ describe("project documentation", () => {
       "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
       "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
       "monitor:v2": "bun scripts/monitor_v2.ts",
+      "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
     });
     expect(pkg.dependencies).not.toHaveProperty("playwright");
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);

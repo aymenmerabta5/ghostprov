@@ -22,7 +22,8 @@
     "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
     "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
     "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts",
-    "monitor:v2": "bun scripts/monitor_v2.ts"
+    "monitor:v2": "bun scripts/monitor_v2.ts",
+    "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",
