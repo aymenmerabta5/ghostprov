@@ -24,6 +24,8 @@ import {
 } from "../protocol/shared";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
 import { computeV2RetransmitDelayMs } from "../protocol/retransmit";
+import { HostRequestDiagnosticsObserver } from "../diagnostics/host-observer";
+import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnostics/types";
 import {
   TranscriptProof,
   validateTerminalProof,
@@ -51,6 +53,7 @@ export interface V2TransportSnapshot {
   credits: number;
   retransmissions: number;
   awarenessRttMs: number | null;
+  diagnostics?: { host: V2TransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
 }
 
 export interface V2TransportSessionOptions {
@@ -96,6 +99,8 @@ interface RequestState {
   assemblies: Map<number, EventAssembly>;
   completedEvents: Map<number, SseFrame>;
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
+  diagnostics: HostRequestDiagnosticsObserver;
+  firstResponseSeen: boolean;
 }
 
 interface RotationWaiter {
@@ -182,6 +187,10 @@ export class V2TransportSession {
   #awarenessRttMs: number | null = null;
   #drainResolve: (() => void) | null = null;
   #drainReject: ((error: unknown) => void) | null = null;
+  #sidecarDiagnostics: V2EnvelopeDiagnostics | null = null;
+  #publications = 0;
+  #publishedBytes = 0;
+  #lastAckAtMs: number;
 
   constructor(options: V2TransportSessionOptions) {
     if (options.channel.projectId !== options.binding.projectId) {
@@ -222,6 +231,7 @@ export class V2TransportSession {
     this.#hostCeiling = hostCeiling;
     this.#retransmitMs = retransmitMs;
     this.#rotationTimeoutMs = rotationTimeoutMs;
+    this.#lastAckAtMs = this.#clock.now();
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -254,7 +264,9 @@ export class V2TransportSession {
       throw new V2PreCommitError("V2 transport is draining", "draining");
     }
     const requestId = `req-${crypto.randomUUID()}`;
+    const diagnostics = new HostRequestDiagnosticsObserver(() => this.#clock.now());
     const prepared = await this.#prepareRequest(requestId, body);
+    diagnostics.prepared();
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
     if (this.#draining || this.#closed) {
       throw new V2PreCommitError("V2 transport stopped during request preparation", "draining");
@@ -263,6 +275,7 @@ export class V2TransportSession {
       clock: this.#clock,
       maxBufferedBytes: this.#maxBufferedResponseBytes,
     });
+    handle.stats.diagnostics = diagnostics.value();
     let resolveRun!: (handle: RunHandle) => void;
     let rejectRun!: (error: unknown) => void;
     const committed = new Promise<RunHandle>((resolve, reject) => {
@@ -291,6 +304,8 @@ export class V2TransportSession {
       assemblies: new Map(),
       completedEvents: new Map(),
       terminal: null,
+      diagnostics,
+      firstResponseSeen: false,
     };
     state.onAbort = () => this.#abortRequest(state);
     signal?.addEventListener("abort", state.onAbort, { once: true });
@@ -437,6 +452,7 @@ export class V2TransportSession {
       credits: this.#availableCredits(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#awarenessRttMs,
+      diagnostics: { host: this.#hostTransportDiagnostics(), sidecar: this.#sidecarDiagnostics },
     };
   }
 
@@ -485,10 +501,12 @@ export class V2TransportSession {
     if (envelope.revision <= this.#sidecarRevision) return;
     this.#sidecarInstanceId = envelope.instanceId;
     this.#sidecarRevision = envelope.revision;
+    this.#sidecarDiagnostics = envelope.diagnostics ?? null;
     const previousAck = this.#lastAckSequence;
     this.#outbound.acknowledge(envelope.ack);
     if (envelope.ack.epoch === 1 && envelope.ack.sequence > previousAck) {
       this.#lastAckSequence = envelope.ack.sequence;
+      this.#lastAckAtMs = this.#clock.now();
       this.#retransmissionAttempt = 0;
       if (this.#lastPublishAtMs !== null) {
         const sample = Math.max(0, this.#clock.now() - this.#lastPublishAtMs);
@@ -529,6 +547,7 @@ export class V2TransportSession {
         }
         if (state.committed) return;
         state.committed = true;
+        state.diagnostics.committed(frame.diagnostics);
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
         state.resolveRun(state.handle);
         return;
@@ -557,6 +576,7 @@ export class V2TransportSession {
           ));
           return;
         }
+        if (!state.firstResponseSeen) { state.firstResponseSeen = true; state.diagnostics.firstFrame(frame.diagnostics); }
         await this.#acceptResponsePart(state, frame);
         return;
       }
@@ -710,7 +730,7 @@ export class V2TransportSession {
       state.completedEvents.delete(state.nextEventIndex);
       state.transcript.append(event);
       state.nextEventIndex++;
-      if (!state.cancelled) await state.handle.acceptEvent(event);
+      if (!state.cancelled) { const started=this.#clock.now(); await state.handle.acceptEvent(event); state.diagnostics.assemblyDelivered(this.#clock.now()-started); }
     }
     await this.#tryFinalize(state);
   }
@@ -833,6 +853,7 @@ export class V2TransportSession {
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
         const state = this.#requests.get(reliable.requestId);
         if (state) state.published = true;
+        if (state) state.diagnostics.published();
       }
       changed = true;
     }
@@ -844,7 +865,7 @@ export class V2TransportSession {
     if (!this.#connected || this.#closed) return;
     const outbound = this.#outbound.snapshot();
     const committed = [...this.#requests.values()].filter(state => state.committed).length;
-    this.#channel.publish({
+    const envelope: AwarenessEnvelope<HostFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
       schemaHash: this.#binding.schemaHash,
@@ -862,9 +883,19 @@ export class V2TransportSession {
       queued: this.#pending.filter(state => !state.admitted).length,
       draining: this.#draining,
       frames: outbound.frames,
-    });
+    };
+    this.#publications++;
+    this.#publishedBytes += utf8Bytes(JSON.stringify(envelope)).byteLength;
+    const diagnostics = this.#hostTransportDiagnostics();
+    for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
+    this.#channel.publish(envelope);
     this.#lastPublishAtMs = this.#clock.now();
     this.#armRetransmission();
+  }
+
+  #hostTransportDiagnostics(): V2TransportDiagnostics {
+    const window=this.#outbound.snapshot(); const scheduler=this.#scheduler.snapshot();
+    return { windowFrames:window.frames.length, windowBytes:window.encodedBytes, schedulerFrames:scheduler.queuedFrames, schedulerBytes:scheduler.queuedEncodedBytes, schedulerStreams:scheduler.streams, oldestQueuedFrameMs:scheduler.oldestQueuedFrameMs, ackProgressAgeMs:Math.max(0,this.#clock.now()-this.#lastAckAtMs), retransmissionAttempt:this.#retransmissionAttempt, peakRetransmissionAttempt:this.#retransmissionAttempt, retransmissionsTotal:this.#retransmissions, publicationsTotal:this.#publications, publishedBytesTotal:this.#publishedBytes, admittedUncommitted:[...this.#requests.values()].filter(value=>value.admitted&&!value.committed).length, roundTripEwmaMs:this.#awarenessRttMs };
   }
 
   #armRetransmission(): void {

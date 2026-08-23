@@ -323,6 +323,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       queueDepth: transport?.queued ?? 0,
       memoryPressure,
       failure: this.#failure ? describeSandboxFailure(this.#failure) : null,
+      diagnostics: transport?.diagnostics,
     };
   }
 

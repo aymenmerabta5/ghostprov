@@ -1,5 +1,6 @@
 import type { RunHandle } from "../relay/run-handle";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
+import type { V2TransportSnapshot } from "../v2/transport/session";
 
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
@@ -16,6 +17,7 @@ export interface RoutableSandboxSnapshot {
   queueDepth: number;
   memoryPressure: number;
   failure: SandboxFailureSnapshot | null;
+  diagnostics?: V2TransportSnapshot["diagnostics"];
 }
 
 export interface RoutableSandboxRuntime {

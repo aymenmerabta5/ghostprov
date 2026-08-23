@@ -1,4 +1,12 @@
 import type { SseFrame } from "./sse";
+import type { V2TransportDiagnostics } from "../v2/diagnostics/types";
+
+export interface RunDiagnostics {
+  hostPrepareMs: number | null; hostSchedulerWaitMs: number | null; hostPublishToAckMs: number | null;
+  sidecarFirstFrameToCommitMs: number | null; sidecarClaimSyncMs: number | null; sidecarAdmissionWaitMs: number | null; sidecarCommitProcessingMs: number | null;
+  transportCommitResidualMs: number | null; upstreamFirstEventMs: number | null; sidecarFirstEventSchedulerMs: number | null;
+  hostAckToFirstFrameMs: number | null; hostAssemblyToDeliveryMs: number | null; peakTransport: V2TransportDiagnostics | null;
+}
 
 export interface RunHandle {
   events(): AsyncGenerator<SseFrame>;
@@ -7,6 +15,7 @@ export interface RunHandle {
     bytes: number;
     firstByteMs: number | null;
     frames: number;
+    diagnostics?: RunDiagnostics;
   };
 }
 

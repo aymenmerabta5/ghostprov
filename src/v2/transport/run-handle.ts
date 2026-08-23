@@ -37,7 +37,7 @@ export interface V2RunHandleOptions {
 
 export class V2RunHandle implements RunHandle {
   readonly final: Promise<Record<string, unknown>>;
-  readonly stats = {
+  readonly stats: RunHandle["stats"] = {
     bytes: 0,
     firstByteMs: null as number | null,
     frames: 0,
