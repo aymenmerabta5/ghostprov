@@ -199,20 +199,20 @@ describe("Anthropic request translation", () => {
     ]);
     expect(input[1]).toMatchObject({
       role: "assistant",
-      content: [{ type: "output_text", text: "before" }],
+      content: [{ type: "input_text", text: "before" }],
     });
     expect(input[2]).toMatchObject({ id: "rs_order", encrypted_content: "ordered-cipher" });
     expect(input[3]).toMatchObject({
       role: "assistant",
-      content: [{ type: "output_text", text: "between" }],
+      content: [{ type: "input_text", text: "between" }],
     });
     expect(input[5]).toMatchObject({
       role: "assistant",
-      content: [{ type: "output_text", text: "after" }],
+      content: [{ type: "input_text", text: "after" }],
     });
     expect(input[6]).toMatchObject({
       role: "assistant",
-      content: [{ type: "output_text", text: "tail" }],
+      content: [{ type: "input_text", text: "tail" }],
     });
     expect(input[7]).toMatchObject({ type: "function_call_output", call_id: "call_order" });
     expect(input[8]).toMatchObject({
@@ -305,9 +305,19 @@ describe("Anthropic request translation", () => {
 
   it("keeps tool-result media structured and prepends the documented error marker", () => {
     const translated = translateAnthropicRequest(request({
-      messages: [{
-        role: "user",
-        content: [
+      messages: [
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "call_error",
+            name: "Read",
+            input: {},
+          }],
+        },
+        {
+          role: "user",
+          content: [
           {
             type: "tool_result",
             tool_use_id: "call_error",
@@ -322,11 +332,18 @@ describe("Anthropic request translation", () => {
             ],
           },
           { type: "text", text: "recover" },
-        ],
-      }],
+          ],
+        },
+      ],
     }), OPTIONS);
 
     expect(translated.relayBody.input).toEqual([
+      {
+        type: "function_call",
+        call_id: "call_error",
+        name: "Read",
+        arguments: "{}",
+      },
       {
         type: "function_call_output",
         call_id: "call_error",
@@ -347,13 +364,24 @@ describe("Anthropic request translation", () => {
 
   it("requires all tool results to precede ordinary user content", () => {
     expectInvalid(request({
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: "ordinary" },
-          { type: "tool_result", tool_use_id: "call_late", content: "late" },
-        ],
-      }],
+      messages: [
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "call_late",
+            name: "Read",
+            input: {},
+          }],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "ordinary" },
+            { type: "tool_result", tool_use_id: "call_late", content: "late" },
+          ],
+        },
+      ],
     }), "tool_result blocks must precede");
   });
 
@@ -394,7 +422,7 @@ describe("Anthropic request translation", () => {
     ] as const;
 
     for (const [thinking, effort] of cases) {
-      const translated = translateAnthropicRequest(request({ thinking }), OPTIONS);
+      const translated = translateAnthropicRequest(request({ max_tokens: 64000, thinking }), OPTIONS);
       expect(translated.relayBody.reasoning).toEqual({ effort, summary: "auto" });
     }
 
@@ -537,8 +565,8 @@ describe("Anthropic request translation", () => {
       [null, "request must be an object"],
       [{}, "model is required"],
       [request({ model: "" }), "model is required"],
-      [request({ max_tokens: 0 }), "max_tokens must be a positive integer"],
-      [request({ max_tokens: 1.5 }), "max_tokens must be a positive integer"],
+      [request({ max_tokens: -1 }), "max_tokens must be a nonnegative integer"],
+      [request({ max_tokens: 1.5 }), "max_tokens must be a nonnegative integer"],
       [request({ messages: "hello" }), "messages is required"],
       [request({ messages: [null] }), "messages[0] must be an object"],
       [request({ messages: [{ role: "system", content: "no" }] }), "messages[0].role"],
@@ -598,16 +626,22 @@ describe("Anthropic request translation", () => {
       ],
       [
         request({
-          messages: [{
-            role: "user",
-            content: [{
-              type: "tool_result",
-              tool_use_id: "call_1",
-              content: [{ type: "search_result", content: [] }],
-            }],
-          }],
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }],
+            },
+            {
+              role: "user",
+              content: [{
+                type: "tool_result",
+                tool_use_id: "call_1",
+                content: [{ type: "future_result", content: [] }],
+              }],
+            },
+          ],
         }),
-        "unsupported tool_result content block type: search_result",
+        "unsupported tool_result content block type: future_result",
       ],
       [
         request({ tools: [{ type: "computer_20250124", name: "computer" }] }),
