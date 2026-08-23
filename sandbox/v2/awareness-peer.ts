@@ -361,14 +361,12 @@ export class DenoAwarenessPeer {
         );
         let capacityChanged = false;
         if (acknowledgementAdvanced) {
-          const ackStalled = now - this.#lastAckAt >= 2_000;
           this.#lastAckAt = now;
           const rttMs = this.#delivery.roundTripEwmaMs;
           if (rttMs !== null) {
             capacityChanged = this.#adaptiveCapacity.observe({
               rttMs,
               congested: this.#congestion.congested,
-              ackStalled,
             });
           }
           this.#armRetransmission();

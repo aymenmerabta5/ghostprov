@@ -1,7 +1,6 @@
 export interface TransportHealthSample {
   rttMs: number;
   congested: boolean;
-  ackStalled: boolean;
 }
 
 export interface AdaptiveTransportCapacitySnapshot {
@@ -12,6 +11,7 @@ export interface AdaptiveTransportCapacitySnapshot {
 }
 
 export class AdaptiveTransportCapacity {
+  readonly #minimum: number;
   readonly #maximum: number;
   readonly #severeRttMs: number;
   readonly #healthyRttMs: number;
@@ -47,6 +47,7 @@ export class AdaptiveTransportCapacity {
       throw new RangeError("healthySamples must be a positive safe integer");
     }
     this.#limit = options.initial;
+    this.#minimum = options.initial;
     this.#maximum = options.maximum;
   }
 
@@ -58,9 +59,9 @@ export class AdaptiveTransportCapacity {
     if (!Number.isFinite(sample.rttMs) || sample.rttMs < 0) {
       throw new RangeError("rttMs must be finite and non-negative");
     }
-    if (sample.congested || sample.ackStalled || sample.rttMs >= this.#severeRttMs) {
+    if (sample.congested || sample.rttMs >= this.#severeRttMs) {
       this.#healthyStreak = 0;
-      const next = Math.max(1, Math.ceil(this.#limit / 2));
+      const next = Math.max(this.#minimum, Math.ceil(this.#limit / 2));
       if (next === this.#limit) return false;
       this.#limit = next;
       this.#reductions++;
