@@ -63,6 +63,16 @@ function reasoning(id: string, summary: string): Record<string, unknown> {
   };
 }
 
+function reasoningParts(id: string, summaries: string[]): Record<string, unknown> {
+  return {
+    type: "reasoning",
+    id,
+    status: "completed",
+    encrypted_content: `${id}-cipher`,
+    summary: summaries.map(text => ({ type: "summary_text", text })),
+  };
+}
+
 function textDeltas(events: readonly AnthropicSseEvent[]): string[] {
   return events.flatMap(event => event.type === "content_block_delta" &&
     event.delta.type === "text_delta" ? [event.delta.text] : []);
@@ -162,6 +172,130 @@ describe("Anthropic stream reasoning privacy", () => {
     expect(translator.snapshot().retainedReasoningCodePoints).toBe(0);
   });
 
+  it("reconciles multiple reasoning summary parts independently in summary order", () => {
+    const item = reasoningParts("rs_multi_summary", ["first!", "second!"]);
+    const final = finalResponse([item]);
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    const events: AnthropicSseEvent[] = [...translator.start()];
+
+    for (const value of [
+      frame(0, "response.output_item.added", {
+        output_index: 0,
+        item: {
+          type: "reasoning",
+          id: "rs_multi_summary",
+          status: "in_progress",
+          summary: [],
+        },
+      }),
+      frame(1, "response.reasoning_summary_text.delta", {
+        item_id: "rs_multi_summary",
+        output_index: 0,
+        summary_index: 0,
+        delta: "first",
+      }),
+      frame(2, "response.reasoning_summary_text.done", {
+        item_id: "rs_multi_summary",
+        output_index: 0,
+        summary_index: 0,
+        text: "first!",
+      }),
+      frame(3, "response.reasoning_summary_text.delta", {
+        item_id: "rs_multi_summary",
+        output_index: 0,
+        summary_index: 1,
+        delta: "second",
+      }),
+      frame(4, "response.reasoning_summary_text.done", {
+        item_id: "rs_multi_summary",
+        output_index: 0,
+        summary_index: 1,
+        text: "second!",
+      }),
+      frame(5, "response.output_item.done", { output_index: 0, item }),
+      frame(6, "response.completed", { response: final }),
+    ]) events.push(...translator.push(value));
+
+    expect(thinkingDeltas(events)).toEqual(["first", "!", "second", "!"]);
+    expect(events.some(event => event.type === "error")).toBe(false);
+    expect(events.at(-1)).toEqual({ type: "message_stop" });
+  });
+
+  it("keeps split Unicode scalar accumulators isolated by summary index", () => {
+    const item = reasoningParts("rs_multi_scalar", ["🚀", "🌟"]);
+    const final = finalResponse([item]);
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    const events: AnthropicSseEvent[] = [...translator.start()];
+
+    events.push(...translator.push(frame(0, "response.reasoning_summary_text.delta", {
+      item_id: "rs_multi_scalar",
+      output_index: 0,
+      summary_index: 0,
+      delta: "\ud83d",
+    })));
+    events.push(...translator.push(frame(1, "response.reasoning_summary_text.delta", {
+      item_id: "rs_multi_scalar",
+      output_index: 0,
+      summary_index: 1,
+      delta: "\ud83c",
+    })));
+    expect(translator.snapshot().retainedReasoningCodePoints).toBe(2);
+
+    for (const value of [
+      frame(2, "response.reasoning_summary_text.delta", {
+        item_id: "rs_multi_scalar",
+        output_index: 0,
+        summary_index: 0,
+        delta: "\ude80",
+      }),
+      frame(3, "response.reasoning_summary_text.done", {
+        item_id: "rs_multi_scalar",
+        output_index: 0,
+        summary_index: 0,
+        text: "🚀",
+      }),
+      frame(4, "response.reasoning_summary_text.delta", {
+        item_id: "rs_multi_scalar",
+        output_index: 0,
+        summary_index: 1,
+        delta: "\udf1f",
+      }),
+      frame(5, "response.reasoning_summary_text.done", {
+        item_id: "rs_multi_scalar",
+        output_index: 0,
+        summary_index: 1,
+        text: "🌟",
+      }),
+      frame(6, "response.output_item.done", { output_index: 0, item }),
+      frame(7, "response.completed", { response: final }),
+    ]) events.push(...translator.push(value));
+
+    expect(thinkingDeltas(events)).toEqual(["🚀", "🌟"]);
+    expect(events.some(event => event.type === "error")).toBe(false);
+    expect(translator.snapshot().retainedReasoningCodePoints).toBe(0);
+  });
+
+  it("rejects final reasoning summaries that move streamed units across part boundaries", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(0, "response.reasoning_summary_text.delta", {
+      item_id: "rs_shifted_summary",
+      output_index: 0,
+      summary_index: 0,
+      delta: "ab",
+    }));
+    translator.push(frame(1, "response.reasoning_summary_text.delta", {
+      item_id: "rs_shifted_summary",
+      output_index: 0,
+      summary_index: 1,
+      delta: "",
+    }));
+
+    expect(translator.finish(finalResponse([
+      reasoningParts("rs_shifted_summary", ["a", "b"]),
+    ]))).toMatchObject([{ type: "error", error: { type: "api_error" } }]);
+  });
+
   it("rejects invalid reasoning-summary surrogates before thinking emission", () => {
     const low = new AnthropicStreamTranslator(CONTEXT);
     low.start();
@@ -248,7 +382,7 @@ describe("Anthropic stream Unicode-safe stop filtering", () => {
       item_id: "msg_stop_zero",
       output_index: 0,
       content_index: 0,
-      part: { type: "output_text", text: "", annotations: [] },
+      part: { type: "output_text", text: "", annotations: [], logprobs: [] },
     })));
     events.push(...translator.push(frame(2, "response.output_text.delta", {
       item_id: "msg_stop_zero",

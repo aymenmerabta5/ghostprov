@@ -259,3 +259,77 @@ Per controller instruction, no broad suite was run during this closure; the cont
 ### Final Concerns
 
 None.
+
+---
+
+## Final Reasoning/Event-Schema Closure — 2026-08-24
+
+### Status
+
+Implemented all four requested reasoning and event-schema fixes in pure stream/final helpers. No route, HTTP pull-loop, cancellation, process, listener, or port code changed.
+
+### Closure Changes
+
+1. Reasoning-summary UTF-16 unit counters and Unicode-scalar accumulators are now retained per `summary_index`, while each thinking block keeps an aggregate unit total. Summary parts reconcile independently against text-done, output-item-done, and authoritative-final data in summary order.
+2. `ResponsesStreamProtocol.validateItem` now traverses known message content and reasoning summary arrays, validating `output_text`, `refusal`, and `summary_text` members even when zero-token prewarm suppresses translation. Known output-text arrays include current required `annotations` and `logprobs` members.
+3. Output-item status checks are item-kind-specific: reasoning status may be omitted, but a present status must match the added/done lifecycle; message and function-call statuses remain required and lifecycle-correct.
+4. Current `error` events accept `code: null` or a nonempty string and continue rejecting missing or empty codes.
+5. Removed only the official-docs download created for this closure: `.tmp/task4-reasoning-event-schema-docs-20260824.md`.
+
+### Strict TDD Evidence
+
+The initial focused regressions failed for the six requested behavior groups:
+
+```text
+bun test --isolate tests/anthropic-stream-protocol.test.ts tests/anthropic-stream-safety.test.ts
+25 pass, 6 fail, 104 expect() calls
+
+Failures:
+- nullable error event code
+- optional reasoning item status
+- recursive prewarm item validation
+- independent multi-part summary reconciliation
+- per-summary Unicode scalar accumulation
+- per-summary authoritative-final boundary reconciliation
+```
+
+The current required `output_text.logprobs` regression was also observed RED independently:
+
+```text
+bun test --isolate tests/anthropic-stream-protocol.test.ts -t "requires known output_text members"
+0 pass, 1 fail, 1 expect() call
+```
+
+Focused GREEN after implementation/refactor:
+
+```text
+bun test --isolate tests/anthropic-stream-protocol.test.ts tests/anthropic-stream-safety.test.ts
+32 pass, 0 fail, 117 expect() calls
+```
+
+### Final Verification
+
+```text
+All Anthropic tests:
+213 pass, 0 fail, 1208 expect() calls
+12 files
+
+bun run typecheck
+exit 0
+
+git diff --check
+exit 0
+```
+
+Per controller instruction, no broad suite was run during this closure.
+
+### Self-Review
+
+- Confirmed per-summary state retains only bounded counters and at most one pending surrogate per summary index; terminal success/error clears it.
+- Confirmed aggregate reasoning byte accounting counts only unseen suffixes and does not duplicate text-done, output-item-done, or final reconciliation.
+- Confirmed known nested payload validation runs before prewarm suppression and errors remain canonical/redacted.
+- Confirmed message/function terminal status safety and unknown additive event tolerance remain intact.
+
+### Final Concerns
+
+None.

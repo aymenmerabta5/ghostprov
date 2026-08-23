@@ -20,6 +20,7 @@ export type FinalStreamDescriptor = {
   contentIndex: number | null;
   block: AnthropicResponseContentBlock;
   arguments: string | null;
+  reasoningSummary: readonly string[] | null;
 };
 
 function isCompletedTool(item: ResponsesFinalFunctionCallItem): boolean {
@@ -59,6 +60,7 @@ export function finalStreamDescriptors(
           outputIndex,
           contentIndex: null,
           arguments: null,
+          reasoningSummary: item.summary.map(part => part.text),
         });
       }
       continue;
@@ -71,6 +73,7 @@ export function finalStreamDescriptors(
           outputIndex,
           contentIndex,
           arguments: null,
+          reasoningSummary: null,
         });
       }
       continue;
@@ -82,6 +85,7 @@ export function finalStreamDescriptors(
         outputIndex,
         contentIndex: null,
         arguments: item.arguments.trim().length > 0 ? item.arguments : "{}",
+        reasoningSummary: null,
       });
     }
   }

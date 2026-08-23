@@ -67,7 +67,7 @@ describe("Responses to Anthropic stream translation", () => {
         item_id: "msg_1",
         output_index: 1,
         content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
+        part: { type: "output_text", text: "", annotations: [], logprobs: [] },
       }),
       frame("response.output_text.delta", {
         item_id: "msg_1",

@@ -53,6 +53,11 @@ export type { AnthropicStreamLimits, AnthropicStreamSnapshot } from "./stream-li
 const MALFORMED_EVENT_MESSAGE = "Responses stream returned a malformed event.";
 const FAILED_EVENT_MESSAGE = "Responses stream failed.";
 
+type ReasoningSummaryStreamState = {
+  seenUnits: number;
+  scalar: UnicodeStopFilter<StreamBlock>;
+};
+
 function malformedEvent(): never {
   throw invalidUpstream(MALFORMED_EVENT_MESSAGE);
 }
@@ -66,11 +71,6 @@ function indexField(value: Record<string, unknown>, key: string): number {
   const candidate = value[key];
   if (!Number.isSafeInteger(candidate) || Number(candidate) < 0) malformedEvent();
   return Number(candidate);
-}
-
-function optionalIndexField(value: Record<string, unknown>, key: string): number | null {
-  if (value[key] === undefined) return null;
-  return indexField(value, key);
 }
 
 function outputItemId(item: Record<string, unknown>): string | null {
@@ -91,7 +91,10 @@ export class AnthropicStreamTranslator {
   readonly #stopSequences: string[];
   readonly #protocol: ResponsesStreamProtocol;
   readonly #textFilter: UnicodeStopFilter<StreamBlock>;
-  readonly #reasoningFilters = new Map<StreamBlock, UnicodeStopFilter<StreamBlock>>();
+  readonly #reasoningSummaries = new Map<
+    StreamBlock,
+    Map<number, ReasoningSummaryStreamState>
+  >();
   readonly #budget: AnthropicStreamBudget;
   readonly #blocksByIdentity = new Map<string, StreamBlock>();
   readonly #blocksByPosition = new Map<string, StreamBlock>();
@@ -197,8 +200,10 @@ export class AnthropicStreamTranslator {
       retainedBlocks: this.#blocks.length,
       retainedIdentities: protocol.retainedIdentities,
       retainedTextCodePoints: this.#textFilter.retainedCodePoints(),
-      retainedReasoningCodePoints: Array.from(this.#reasoningFilters.values())
-        .reduce((total, filter) => total + filter.retainedCodePoints(), 0),
+      retainedReasoningCodePoints: Array.from(this.#reasoningSummaries.values())
+        .reduce((total, summaries) => total + Array.from(summaries.values())
+          .reduce((summaryTotal, summary) =>
+            summaryTotal + summary.scalar.retainedCodePoints(), 0), 0),
     };
   }
 
@@ -290,11 +295,12 @@ export class AnthropicStreamTranslator {
     events: AnthropicSseEvent[],
   ): void {
     const outputIndex = indexField(event, "output_index");
-    optionalIndexField(event, "summary_index");
+    const summaryIndex = indexField(event, "summary_index");
     const itemId = stringField(event, "item_id");
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("thinking", itemId, outputIndex, null);
+    this.#reasoningSummary(block, summaryIndex);
     block.forceStart = true;
     this.#drain(events);
   }
@@ -304,15 +310,14 @@ export class AnthropicStreamTranslator {
     events: AnthropicSseEvent[],
   ): void {
     const outputIndex = indexField(event, "output_index");
-    optionalIndexField(event, "summary_index");
+    const summaryIndex = indexField(event, "summary_index");
     const itemId = stringField(event, "item_id");
     const delta = stringField(event, "delta");
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("thinking", itemId, outputIndex, null);
     block.forceStart = true;
-    block.seenUnits = this.#addUnits(block.seenUnits, delta.length);
-    this.#appendReasoningScalar(block, delta);
+    this.#appendReasoningSummary(block, summaryIndex, delta);
     this.#drain(events);
   }
 
@@ -388,16 +393,13 @@ export class AnthropicStreamTranslator {
     events: AnthropicSseEvent[],
   ): void {
     const outputIndex = indexField(event, "output_index");
-    optionalIndexField(event, "summary_index");
+    const summaryIndex = indexField(event, "summary_index");
     const itemId = stringField(event, "item_id");
     const text = stringField(event, "text");
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("thinking", itemId, outputIndex, null);
-    if (text.length < block.seenUnits) malformedEvent();
-    if (text.length > block.seenUnits) this.#appendReasoningScalar(block, text.slice(block.seenUnits));
-    this.#endReasoningScalar(block);
-    block.seenUnits = text.length;
+    this.#reconcileReasoningSummary(block, summaryIndex, text, false);
     this.#drain(events);
   }
 
@@ -426,17 +428,11 @@ export class AnthropicStreamTranslator {
         summaryParts.push(part.text);
       }
       const summary = summaryParts.join("");
-      if (summary.length < block.seenUnits) malformedEvent();
+      this.#reconcileReasoningSummaries(block, summaryParts, true);
       this.#assertStreamedPrefix(
         block,
         this.#context.thinkingDisplay === "omitted" ? "" : summary,
       );
-      if (summary.length > block.seenUnits) {
-        this.#budget.countPayload("reasoning", summary.slice(block.seenUnits));
-        this.#appendReasoningScalar(block, summary.slice(block.seenUnits));
-      }
-      this.#endReasoningScalar(block);
-      block.seenUnits = summary.length;
       const encryptedContent = item.encrypted_content;
       if (typeof encryptedContent !== "string" || encryptedContent.length === 0) return;
       const converted = responseToAnthropic(terminalForStreamItem(item), this.#context);
@@ -538,6 +534,11 @@ export class AnthropicStreamTranslator {
         }
       } else if (descriptor.kind === "thinking") {
         const thinking = descriptor.block as AnthropicThinkingBlock;
+        this.#reconcileReasoningSummaries(
+          block,
+          descriptor.reasoningSummary ?? [],
+          true,
+        );
         assertUnicodeWellFormed(thinking.thinking);
         if (thinking.thinking.length > block.seenUnits) {
           this.#budget.countPayload("reasoning", thinking.thinking.slice(block.seenUnits));
@@ -623,7 +624,7 @@ export class AnthropicStreamTranslator {
     this.#blocksByIdentity.clear();
     this.#blocksByPosition.clear();
     this.#textFilter.clear();
-    this.#reasoningFilters.clear();
+    this.#reasoningSummaries.clear();
     this.#budget.clearRetained();
     this.#matchedStop = null;
     this.#drainCursor = 0;
@@ -775,26 +776,75 @@ export class AnthropicStreamTranslator {
     if (result.matchedSequence !== null) this.#matchedStop = result.matchedSequence;
   }
 
-  #appendReasoningScalar(block: StreamBlock, value: string): void {
-    let filter = this.#reasoningFilters.get(block);
-    if (!filter) {
-      filter = new UnicodeStopFilter<StreamBlock>([]);
-      this.#reasoningFilters.set(block, filter);
+  #reasoningSummary(
+    block: StreamBlock,
+    summaryIndex: number,
+  ): ReasoningSummaryStreamState {
+    let summaries = this.#reasoningSummaries.get(block);
+    if (!summaries) {
+      summaries = new Map();
+      this.#reasoningSummaries.set(block, summaries);
     }
-    const result = filter.append(block, value);
+    let summary = summaries.get(summaryIndex);
+    if (!summary) {
+      summary = {
+        seenUnits: 0,
+        scalar: new UnicodeStopFilter<StreamBlock>([]),
+      };
+      summaries.set(summaryIndex, summary);
+    }
+    return summary;
+  }
+
+  #appendReasoningSummary(
+    block: StreamBlock,
+    summaryIndex: number,
+    value: string,
+  ): void {
+    const summary = this.#reasoningSummary(block, summaryIndex);
+    summary.seenUnits = this.#addUnits(summary.seenUnits, value.length);
+    block.seenUnits = this.#addUnits(block.seenUnits, value.length);
+    const result = summary.scalar.append(block, value);
     if (this.#context.thinkingDisplay !== "omitted") {
       for (const chunk of result.chunks) this.#appendPending(chunk.owner, chunk.text);
     }
   }
 
-  #endReasoningScalar(block: StreamBlock): void {
-    const filter = this.#reasoningFilters.get(block);
-    if (!filter) return;
-    const chunks = filter.endSegment();
+  #reconcileReasoningSummary(
+    block: StreamBlock,
+    summaryIndex: number,
+    text: string,
+    countSuffix: boolean,
+  ): void {
+    const summary = this.#reasoningSummary(block, summaryIndex);
+    if (text.length < summary.seenUnits) malformedEvent();
+    if (text.length > summary.seenUnits) {
+      const suffix = text.slice(summary.seenUnits);
+      if (countSuffix) this.#budget.countPayload("reasoning", suffix);
+      this.#appendReasoningSummary(block, summaryIndex, suffix);
+    }
+    const chunks = summary.scalar.endSegment();
     if (this.#context.thinkingDisplay !== "omitted") {
       for (const chunk of chunks) this.#appendPending(chunk.owner, chunk.text);
     }
-    this.#reasoningFilters.delete(block);
+  }
+
+  #reconcileReasoningSummaries(
+    block: StreamBlock,
+    texts: readonly string[],
+    countSuffix: boolean,
+  ): void {
+    const summaries = this.#reasoningSummaries.get(block);
+    if (summaries && Array.from(summaries.keys()).some(index => index >= texts.length)) {
+      malformedEvent();
+    }
+    let aggregateUnits = 0;
+    for (let summaryIndex = 0; summaryIndex < texts.length; summaryIndex += 1) {
+      const text = texts[summaryIndex];
+      this.#reconcileReasoningSummary(block, summaryIndex, text, countSuffix);
+      aggregateUnits = this.#addUnits(aggregateUnits, text.length);
+    }
+    if (block.seenUnits !== aggregateUnits) malformedEvent();
   }
 
   #endOrdinarySegment(events: AnthropicSseEvent[]): void {

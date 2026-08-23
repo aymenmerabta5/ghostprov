@@ -177,6 +177,70 @@ describe("Anthropic stream known event envelopes", () => {
       message: "failed",
       param: null,
     })).not.toThrow();
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "error",
+      sequence_number: 0,
+      code: null,
+      message: "failed",
+      param: null,
+    })).not.toThrow();
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "error",
+      sequence_number: 0,
+      code: "",
+      message: "failed",
+      param: null,
+    })).toThrow();
+  });
+
+  it("makes output item status requirements specific to the item kind", () => {
+    const limits = {
+      maxEvents: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxEvents,
+      maxIdentities: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxIdentities,
+    };
+    const reasoningProtocol = new ResponsesStreamProtocol(limits);
+    expect(() => reasoningProtocol.accept({
+      type: "response.output_item.added",
+      sequence_number: 0,
+      output_index: 0,
+      item: { type: "reasoning", id: "rs_optional_status", summary: [] },
+    })).not.toThrow();
+    expect(() => reasoningProtocol.accept({
+      type: "response.output_item.done",
+      sequence_number: 1,
+      output_index: 0,
+      item: { type: "reasoning", id: "rs_optional_status", summary: [] },
+    })).not.toThrow();
+
+    for (const item of [
+      { type: "message", id: "msg_status", role: "assistant", content: [] },
+      {
+        type: "function_call",
+        id: "fc_status",
+        call_id: "call_status",
+        name: "Read",
+        arguments: "{}",
+      },
+    ]) {
+      expect(() => new ResponsesStreamProtocol(limits).accept({
+        type: "response.output_item.done",
+        sequence_number: 0,
+        output_index: 0,
+        item,
+      })).toThrow();
+    }
+
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "response.output_item.added",
+      sequence_number: 0,
+      output_index: 0,
+      item: {
+        type: "reasoning",
+        id: "rs_wrong_status",
+        status: "completed",
+        summary: [],
+      },
+    })).toThrow();
   });
 });
 
@@ -537,6 +601,55 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
         call_id: "call_missing_status",
         name: "Read",
         arguments: "",
+      },
+    })));
+  });
+
+  it("recursively validates known output item members during prewarm", () => {
+    const malformedItems: Record<string, unknown>[] = [
+      {
+        type: "message",
+        id: "msg_bad_nested_text",
+        status: "in_progress",
+        role: "assistant",
+        content: [{ type: "output_text", text: 42, annotations: [], logprobs: [] }],
+      },
+      {
+        type: "message",
+        id: "msg_bad_nested_refusal",
+        status: "in_progress",
+        role: "assistant",
+        content: [{ type: "refusal", refusal: 42 }],
+      },
+      {
+        type: "reasoning",
+        id: "rs_bad_nested_summary",
+        status: "in_progress",
+        summary: [{ type: "summary_text", text: 42 }],
+      },
+    ];
+
+    for (const item of malformedItems) {
+      const translator = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
+      translator.start();
+      expectError(translator.push(frame(0, "response.output_item.added", {
+        output_index: 0,
+        item,
+      })));
+    }
+  });
+
+  it("requires known output_text members in nested prewarm items", () => {
+    const translator = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
+    translator.start();
+    expectError(translator.push(frame(0, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "msg_bad_nested_logprobs",
+        status: "in_progress",
+        role: "assistant",
+        content: [{ type: "output_text", text: "text", annotations: [] }],
       },
     })));
   });

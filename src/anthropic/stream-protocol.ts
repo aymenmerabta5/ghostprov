@@ -65,8 +65,18 @@ function partRecord(event: Record<string, unknown>): Record<string, unknown> {
 function validateItem(item: Record<string, unknown>): void {
   if (item.type === "message") {
     if (item.role !== "assistant" || !Array.isArray(item.content)) fail();
+    for (const value of item.content) {
+      const part = record(value);
+      if (!part) fail();
+      validateContentPart(part);
+    }
   } else if (item.type === "reasoning") {
     if (!Array.isArray(item.summary)) fail();
+    for (const value of item.summary) {
+      const part = record(value);
+      if (!part || part.type !== "summary_text") fail();
+      requiredText(part, "text");
+    }
   } else if (item.type === "function_call") {
     requiredString(item, "call_id");
     requiredString(item, "name");
@@ -77,10 +87,25 @@ function validateItem(item: Record<string, unknown>): void {
 function validateContentPart(part: Record<string, unknown>): void {
   if (part.type === "output_text") {
     requiredText(part, "text");
-    if (!Array.isArray(part.annotations)) fail();
+    if (!Array.isArray(part.annotations) || !Array.isArray(part.logprobs)) fail();
   } else if (part.type === "refusal") {
     requiredText(part, "refusal");
   } else {
+    fail();
+  }
+}
+
+function validateItemStatus(
+  item: Record<string, unknown>,
+  phase: "added" | "done",
+): void {
+  if (item.type === "reasoning" && item.status === undefined) return;
+  if (item.type !== "message" && item.type !== "reasoning" && item.type !== "function_call") {
+    return;
+  }
+  if (phase === "added") {
+    if (item.status !== "in_progress") fail();
+  } else if (item.status !== "completed" && item.status !== "incomplete") {
     fail();
   }
 }
@@ -109,7 +134,7 @@ function validateFailedResponse(event: Record<string, unknown>): void {
 }
 
 function validateErrorEvent(event: Record<string, unknown>): void {
-  requiredString(event, "code");
+  if (event.code !== null) requiredString(event, "code");
   requiredString(event, "message");
   if (event.param !== null && typeof event.param !== "string") fail();
 }
@@ -205,24 +230,7 @@ export class ResponsesStreamProtocol {
       const state = this.#item(outputIndex, itemId, item.type);
       state.done = true;
       this.#advanceCompletedPrefix();
-
-      if (item.type === "message") {
-        if (!Array.isArray(item.content)) fail();
-        if (state.content.size > item.content.length) fail();
-        for (let contentIndex = 0; contentIndex < item.content.length; contentIndex += 1) {
-          const part = record(item.content[contentIndex]);
-          if (!part || typeof part.type !== "string" || !part.type) fail();
-          this.#part(state, "content", contentIndex, part.type);
-        }
-      } else if (item.type === "reasoning") {
-        if (!Array.isArray(item.summary)) fail();
-        if (state.summary.size > item.summary.length) fail();
-        for (let summaryIndex = 0; summaryIndex < item.summary.length; summaryIndex += 1) {
-          const part = record(item.summary[summaryIndex]);
-          if (!part || part.type !== "summary_text") fail();
-          this.#part(state, "summary", summaryIndex, "summary_text");
-        }
-      }
+      this.#observeItemParts(state, item);
     }
   }
 
@@ -245,9 +253,10 @@ export class ResponsesStreamProtocol {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
     validateItem(item);
-    if (item.status !== "in_progress") fail();
+    validateItemStatus(item, "added");
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.added || state.done) fail();
+    this.#observeItemParts(state, item);
     state.added = true;
   }
 
@@ -255,9 +264,10 @@ export class ResponsesStreamProtocol {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
     validateItem(item);
-    if (item.status !== "completed" && item.status !== "incomplete") fail();
+    validateItemStatus(item, "done");
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.done) fail();
+    this.#observeItemParts(state, item);
     state.done = true;
     this.#advanceCompletedPrefix();
   }
@@ -415,6 +425,24 @@ export class ResponsesStreamProtocol {
     parts.set(index, state);
     this.#recordIdentity();
     return state;
+  }
+
+  #observeItemParts(item: ItemState, value: Record<string, unknown>): void {
+    if (value.type === "message") {
+      const content = value.content as unknown[];
+      if (item.content.size > content.length) fail();
+      for (let contentIndex = 0; contentIndex < content.length; contentIndex += 1) {
+        const part = record(content[contentIndex]);
+        if (!part || typeof part.type !== "string" || !part.type) fail();
+        this.#part(item, "content", contentIndex, part.type);
+      }
+    } else if (value.type === "reasoning") {
+      const summary = value.summary as unknown[];
+      if (item.summary.size > summary.length) fail();
+      for (let summaryIndex = 0; summaryIndex < summary.length; summaryIndex += 1) {
+        this.#part(item, "summary", summaryIndex, "summary_text");
+      }
+    }
   }
 
   #recordIdentity(): void {
