@@ -341,9 +341,8 @@ export class SidecarEngine {
         signal: request.controller.signal,
         beforeFetch: async () => { await this.#journal.markFetchStarting(request.requestId); this.#diagnostics?.fetchStarted(request.requestId); },
         onEvent: async event => {
-          await this.#outputBackpressure?.wait(request.controller.signal);
           const eventIndex = request.eventIndex++;
-          this.#emitEvent(request.requestId, eventIndex, event, this.#diagnostics?.upstreamEvent(request.requestId, eventIndex));
+          await this.#emitEvent(request.requestId, eventIndex, event, this.#diagnostics?.upstreamEvent(request.requestId, eventIndex), request.controller.signal);
         },
       });
       await this.#journal.markTerminal(
@@ -386,11 +385,12 @@ export class SidecarEngine {
     }
   }
 
-  #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics): void {
+  async #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics, signal?: AbortSignal): Promise<void> {
     if (!diagnostics && this.#batcher?.push(requestId, eventIndex, event)) return;
     const bytes = utf8Bytes(event.data);
     const partCount = Math.max(1, Math.ceil(bytes.byteLength / RESPONSE_PART_BYTES));
     for (let partIndex = 0, offset = 0; partIndex < partCount; partIndex++) {
+      await this.#outputBackpressure?.wait(signal);
       const part = bytes.subarray(offset, offset + RESPONSE_PART_BYTES);
       const frame: SidecarFrame = {
         kind: "response_event",
@@ -422,7 +422,7 @@ export class SidecarEngine {
       let eventIndex = 0;
       for (const event of parsed.frames) {
         transcript.append(event);
-        this.#emitEvent(requestId, eventIndex++, event);
+        await this.#emitEvent(requestId, eventIndex++, event);
       }
       const terminal = await transcript.createTerminal();
       if (
