@@ -10,7 +10,7 @@ The OpenAI surface, router fairness, sandbox transports, terminal proof, backpre
 
 ## Evidence and Protocol Baseline
 
-The compatibility target is the wire contract used by the local Claude Code source at `D:\MyWork\claude-code` (rebuilt 2.1.87 with `@anthropic-ai/sdk` 0.81.0) and the installed Claude Code executable used for final live verification.
+The compatibility target is the current official Anthropic contract first, then the wire contract used by the local Claude Code source at `D:\MyWork\claude-code` (rebuilt 2.1.87 with `@anthropic-ai/sdk` 0.81.0), and finally the installed Claude Code 2.1.220 executable used for live verification. When the older source or SDK differs from current documentation, current documentation is authoritative; legacy shapes remain compatibility inputs rather than defining the API.
 
 The SDK sends Claude Code traffic to:
 
@@ -25,8 +25,9 @@ The selected OpenAI Responses stateless pattern is documented by the official Op
 
 Official references:
 
-- Anthropic Messages: <https://platform.claude.com/docs/en/api/messages>
-- Anthropic streaming: <https://platform.claude.com/docs/en/api/messages-streaming>
+- Anthropic Messages: <https://platform.claude.com/docs/en/api/messages/create>
+- Anthropic streaming: <https://platform.claude.com/docs/en/build-with-claude/streaming>
+- Anthropic token counting: <https://platform.claude.com/docs/en/api/messages/count_tokens>
 - Anthropic errors: <https://platform.claude.com/docs/en/api/errors>
 - OpenAI Responses create: <https://developers.openai.com/api/reference/resources/responses/methods/create>
 - OpenAI function calling: <https://developers.openai.com/api/docs/guides/function-calling>
@@ -93,23 +94,24 @@ Every Messages generation becomes a Responses request with:
 - client tools mapped to Responses function tools;
 - Anthropic tool choice mapped to `auto`, `required`, `none`, or a named function choice;
 - `disable_parallel_tool_use` mapped to `parallel_tool_calls:false`;
-- adaptive/enabled thinking and `output_config.effort` mapped to Responses reasoning effort with a summary request;
+- adaptive/enabled thinking and current `output_config.effort` values through `xhigh` mapped to Responses reasoning effort with a summary request;
 - disabled thinking mapped to `reasoning.effort:"none"`;
 - `speed:"fast"` mapped to `service_tier:"fast"`;
 - JSON-schema output format mapped to Responses `text.format`;
 - compatible `temperature`, `top_p`, and metadata forwarded when present.
 
-Unsupported beta hints such as context-edit policies, Anthropic server tools, `top_k`, and exact thinking token budgets are ignored rather than rejected when they do not affect Claude Code's client-tool loop. Unknown client content blocks or tool definitions receive a clear `invalid_request_error`; they are never silently stringified into misleading prompts.
+Unsupported legacy/private beta hints such as context-edit policies, Anthropic server tools, `top_k`, and exact thinking token budgets are ignored rather than rejected when they do not affect Claude Code's client-tool loop. Unknown optional top-level fields, headers, beta names, response events, and additive object properties are tolerated for forward compatibility. Unknown content-block or tool types that cannot be represented safely receive a clear `invalid_request_error`; they are never silently stringified into misleading prompts.
 
 ### Message content
 
 - User text becomes `input_text`.
 - Assistant text becomes a completed assistant message with `output_text`.
-- Base64 and URL images become `input_image` data/HTTP URLs.
-- Plain-text and PDF documents become `input_text` or `input_file`.
+- Base64, URL, and current stable file-ID images become `input_image` data/HTTP URLs or file IDs.
+- Plain-text, PDF, content-composed, URL, and current stable file-ID documents become `input_text` or `input_file`.
 - Assistant `tool_use` becomes a Responses `function_call` with the same Anthropic ID as `call_id`.
 - User `tool_result` becomes `function_call_output`; text, image, and document result content remains structured where Responses accepts it.
-- Prompt-cache annotations are accepted and removed from the wire conversion. Exact repeated prefixes still receive the upstream's normal automatic prompt caching.
+- Stable top-level and block-level `cache_control` annotations are accepted and removed from the wire conversion. Exact repeated prefixes still receive the upstream's normal automatic prompt caching.
+- A user message containing tool results must place every `tool_result` before ordinary text, matching the documented tool-result ordering rule.
 
 ## Reasoning and Tool-Loop Continuity
 
@@ -125,11 +127,12 @@ Tool-use IDs are the upstream `call_id`, so Claude Code's `tool_result.tool_use_
 
 The final Anthropic object contains:
 
-- `id`, `type:"message"`, `role:"assistant"`, and the requested `model`;
+- `id`, `type:"message"`, `role:"assistant"`, the requested `model`, and `container:null`;
 - ordered `thinking`, `text`, and `tool_use` content blocks;
 - `stop_reason` mapped to `tool_use`, `max_tokens`, `stop_sequence`, or `end_turn`;
 - `stop_sequence:null` unless a proven sequence is available;
-- Anthropic usage derived from Responses usage, including cached-input fields when available.
+- text blocks with `citations:null` and thinking blocks that preserve the opaque signature contract, including empty thinking text when display is omitted;
+- Anthropic usage derived from Responses usage, including explicit nullable/zero cache-creation and cache-read fields.
 
 ### Streaming
 
@@ -149,9 +152,11 @@ Mappings include:
 - completed function calls -> `tool_use` blocks;
 - `response.completed` -> final usage/stop events.
 
-The state machine tolerates event variants that omit `response.output_item.added` by opening blocks lazily from the first delta or final output. It emits every Anthropic block index once, never duplicates terminal events, and falls back to the authoritative final Responses object when an incremental event was absent.
+The state machine tolerates event variants that omit `response.output_item.added` by opening blocks lazily from the first delta or final output. It ignores unknown additive Responses events, emits every Anthropic block index once, never duplicates terminal events, and falls back to the authoritative final Responses object when an incremental event was absent.
 
-SSE comments provide keepalives and are not exposed as data events. Client disconnects abort the same router request. Backpressure remains the existing `ReadableStream` plus Node response-adapter behavior.
+SSE comments provide keepalives and are not exposed as data events. The Anthropic stream is pull-driven rather than consuming the entire `RunHandle` from `ReadableStream.start()`, so downstream Node drain pressure reaches the bounded V2 handle. Client disconnects cancel the event iterator and abort the same router request.
+
+V2 always uses an internal Responses stream, even for a non-streaming Anthropic request. The non-streaming route therefore drains `handle.events()` concurrently while awaiting the authoritative `handle.final`; this prevents responses larger than the V2 handle buffer from deadlocking.
 
 ## Token Counting
 
@@ -161,7 +166,7 @@ The implementation keeps the estimator behind one interface so a future transpor
 
 ## Headers, Authentication, and Errors
 
-For local compatibility, the adapter requires no secret by default, matching existing GhostProv routes. Claude Code still needs a non-empty `ANTHROPIC_API_KEY` so its SDK initializes; any value is accepted unless `GP_API_KEY` is configured by a future shared authentication layer.
+For local compatibility, the adapter requires no secret by default, matching existing GhostProv routes. Claude Code still needs a non-empty `ANTHROPIC_API_KEY` so its SDK initializes; any value is accepted unless `GP_API_KEY` is configured by a future shared authentication layer. The route tolerates `x-api-key`, bearer authorization, or both, plus unknown Claude Code, Stainless, and custom headers.
 
 `anthropic-version` is accepted, and both stable and `?beta=true` paths work. Unknown beta names are tolerated. Responses include a `request-id` header and propagate it into Anthropic error envelopes where applicable.
 
@@ -171,20 +176,20 @@ Before streaming, failures use Anthropic's shape:
 {"type":"error","error":{"type":"invalid_request_error","message":"..."},"request_id":"req_..."}
 ```
 
-Status mapping preserves 400 validation, 401 authentication if configured, 404 route/model errors, 413 request size, 429 rate/capacity, 500 internal, 503 unavailable, and 529 overloaded semantics. After streaming begins, errors are emitted as Anthropic `error` SSE events and the stream closes.
+Status mapping preserves the current documented 400 validation, 401 authentication, 402 billing, 403 permission, 404 route/model, 409 conflict, 413 request-size, 429 rate-limit, 500 API, 504 timeout, and 529 overloaded semantics. Internal GhostProv 503 capacity failures become documented `api_error` 500 or `overloaded_error` 529 according to retryability rather than leaking an undocumented wire type. After streaming begins, errors are emitted as Anthropic `error` SSE events and the stream closes. Existing `retry-after` and `x-should-retry` headers are preserved when available.
 
 ## Testing and Live Verification
 
 Test-first coverage includes:
 
-- model aliases and environment overrides;
+- model aliases, environment overrides, and current effort values through `xhigh`;
 - system, text, assistant history, image, document, tool-use, and tool-result request conversion;
 - thinking effort and encrypted-signature round trips;
 - tool choice, parallel-tool control, JSON schema, speed, metadata, and cache-marker tolerance;
 - deterministic token counts and malformed-body errors;
 - non-streaming text/reasoning/tool output and usage conversion;
 - exact streaming event order for text, thinking, one tool, parallel tools, lazy/missing incremental events, upstream errors, and cancellation;
-- stable and `?beta=true` route behavior plus Anthropic headers and error envelopes;
+- stable and `?beta=true` route behavior plus API-key/bearer headers, unknown beta/header tolerance, request IDs, and current Anthropic error envelopes;
 - unchanged OpenAI Responses, WebSocket, image, router, V1, and V2 suites.
 
 Live verification uses a disposable forwarding harness on a port other than `18787`. The harness uses the production Hono app and Anthropic adapter, but its `RouterLike` forwards translated Responses requests to the already-running `http://127.0.0.1:18787/v1/responses`. Therefore it exercises a real model and the complete adapter while neither restarting nor competing with the protected GhostProv process.
@@ -202,11 +207,10 @@ The installed Claude Code executable runs in `--bare --print` mode against the d
 ## Completion Criteria
 
 - OpenAI and Anthropic routes coexist in one app and share one router.
-- Claude Code 2.1.87 request shapes and the installed Claude Code executable are supported.
+- Current official Messages shapes, Claude Code 2.1.87 compatibility inputs, and the installed Claude Code 2.1.220 executable are supported.
 - Streaming text, thinking, client tool calls/results, parallel tools, images/documents, token counting, cancellation, and errors have automated coverage.
 - Encrypted reasoning and tool IDs survive stateless multi-turn tool loops.
 - Tiered default model mapping is implemented and documented.
 - A real Claude Code tool-use run succeeds through a non-`18787` verification listener backed by the protected live GhostProv instance.
 - Port `18787` is never stopped, restarted, rebound, or killed.
 - Full tests, daemon tests, typecheck, production audit, and `git diff --check` pass.
-
