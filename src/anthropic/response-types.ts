@@ -1,9 +1,21 @@
-export type ResponsesFinalItemStatus = "completed" | "incomplete";
+export type ResponsesFinalItemStatus = "in_progress" | "completed" | "incomplete";
+
+export type ResponsesLogprob = {
+  token: string;
+  bytes: number[];
+  logprob: number;
+  top_logprobs: Array<{
+    token: string;
+    bytes: number[];
+    logprob: number;
+  }>;
+};
 
 export type ResponsesOutputText = {
   type: "output_text";
   text: string;
   annotations: readonly unknown[];
+  logprobs?: ResponsesLogprob[];
   [key: string]: unknown;
 };
 
@@ -19,6 +31,7 @@ export type ResponsesFinalMessageItem = {
   status: ResponsesFinalItemStatus;
   role: "assistant";
   content: Array<ResponsesOutputText | ResponsesOutputRefusal>;
+  phase?: "commentary" | "final_answer" | null;
   [key: string]: unknown;
 };
 
@@ -31,19 +44,22 @@ export type ResponsesReasoningSummary = {
 export type ResponsesFinalReasoningItem = {
   type: "reasoning";
   id: string;
-  status: ResponsesFinalItemStatus;
-  encrypted_content: string;
+  status?: ResponsesFinalItemStatus;
+  encrypted_content?: string | null;
   summary: ResponsesReasoningSummary[];
+  content?: Array<{ type: "reasoning_text"; text: string }>;
   [key: string]: unknown;
 };
 
 export type ResponsesFinalFunctionCallItem = {
   type: "function_call";
-  id: string;
-  status: ResponsesFinalItemStatus;
+  id?: string;
+  status?: ResponsesFinalItemStatus;
   call_id: string;
   name: string;
   arguments: string;
+  caller?: { type: "direct" } | { type: "program"; caller_id: string } | null;
+  namespace?: string;
   [key: string]: unknown;
 };
 
@@ -56,6 +72,8 @@ export type ResponsesIncompleteReason = "max_output_tokens" | "content_filter";
 
 type ResponsesFinalBase = {
   id: string;
+  object: "response";
+  error: null;
   output: ResponsesFinalOutputItem[];
   usage?: unknown;
   service_tier?: unknown;
@@ -69,6 +87,6 @@ export type ResponsesFinalResponse = ResponsesFinalBase & (
   }
   | {
     status: "incomplete";
-    incomplete_details: { reason: ResponsesIncompleteReason };
+    incomplete_details?: { reason?: ResponsesIncompleteReason } | null;
   }
 );

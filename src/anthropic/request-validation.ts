@@ -2,6 +2,7 @@ import { AnthropicRequestError } from "./errors";
 
 export type AnthropicRequestLimits = {
   inboundBytes: number;
+  outputBytes: number;
   relayBytes: number;
   mediaBytes: number;
   maxJsonDepth: number;
@@ -11,6 +12,7 @@ export type AnthropicRequestLimits = {
 
 export const DEFAULT_ANTHROPIC_REQUEST_LIMITS: Readonly<AnthropicRequestLimits> = Object.freeze({
   inboundBytes: 32 * 1024 * 1024,
+  outputBytes: 32 * 1024 * 1024,
   relayBytes: 64 * 1024 * 1024,
   mediaBytes: 32 * 1024 * 1024,
   maxJsonDepth: 64,
@@ -24,6 +26,7 @@ export function resolveAnthropicRequestLimits(
   const resolved = { ...DEFAULT_ANTHROPIC_REQUEST_LIMITS, ...overrides };
   for (const key of [
     "inboundBytes",
+    "outputBytes",
     "relayBytes",
     "mediaBytes",
     "maxArrayItems",

@@ -2,8 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { AnthropicRequestError } from "../src/anthropic/errors";
 import { decodeReasoningItem } from "../src/anthropic/reasoning";
 import type { AnthropicRequestLimits } from "../src/anthropic/request";
+import type { AnthropicResponseContentBlock } from "../src/anthropic/types";
 import {
-  responseToAnthropic,
+  responseToAnthropic as convertResponseToAnthropic,
   stopReasonFromResponses,
   usageFromResponses,
   type AnthropicResponseContext,
@@ -29,6 +30,14 @@ const NULLABLE_USAGE_FIELDS = {
   output_tokens_details: null,
 } as const;
 
+const DEFAULT_RESPONSES_USAGE = {
+  input_tokens: 17,
+  output_tokens: 0,
+  input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+  output_tokens_details: { reasoning_tokens: 0 },
+  total_tokens: 17,
+} as const;
+
 const typedFinalOutput: ResponsesFinalOutputItem = {
   type: "message",
   id: "msg_typed",
@@ -37,24 +46,80 @@ const typedFinalOutput: ResponsesFinalOutputItem = {
   content: [{ type: "output_text", text: "typed", annotations: [] }],
 };
 
-// @ts-expect-error Current final output items require a terminal item status.
-const invalidTypedFinalOutput: ResponsesFinalOutputItem = {
+const typedOptionalFunctionOutput: ResponsesFinalOutputItem = {
   type: "function_call",
-  id: "fc_typed",
-  call_id: "call_typed",
+  status: "completed",
+  call_id: "call_optional_id",
   name: "Read",
   arguments: "{}",
 };
 
+const typedOptionalReasoningStatus: ResponsesFinalOutputItem = {
+  type: "reasoning",
+  id: "rs_optional_status",
+  encrypted_content: "cipher",
+  summary: [],
+};
+
+// @ts-expect-error Output messages require their documented status.
+const invalidTypedFinalOutput: ResponsesFinalOutputItem = {
+  type: "message",
+  id: "msg_typed_invalid",
+  role: "assistant",
+  content: [],
+};
+
 void typedFinalOutput;
+void typedOptionalFunctionOutput;
+void typedOptionalReasoningStatus;
 void invalidTypedFinalOutput;
 
-type ResponseTestContext = AnthropicResponseContext & {
-  limits?: Partial<AnthropicRequestLimits>;
+const typedAnthropicOutput: AnthropicResponseContentBlock[] = [
+  { type: "thinking", thinking: "thought", signature: "opaque" },
+  { type: "text", text: "answer", citations: null },
+  {
+    type: "tool_use",
+    id: "call_typed",
+    name: "Read",
+    input: {},
+    caller: { type: "direct" },
+  },
+];
+
+// @ts-expect-error Outgoing text blocks require explicit citations.
+const invalidAnthropicOutput: AnthropicResponseContentBlock = {
+  type: "text",
+  text: "missing citations",
+};
+
+void typedAnthropicOutput;
+void invalidAnthropicOutput;
+
+type ResponseTestLimits = Partial<AnthropicRequestLimits> & {
+  outputBytes?: number;
+};
+
+type ResponseTestContext = Omit<AnthropicResponseContext, "limits"> & {
+  limits?: ResponseTestLimits;
 };
 
 function context(overrides: Partial<ResponseTestContext> = {}): ResponseTestContext {
   return { ...CONTEXT, ...overrides };
+}
+
+function responseToAnthropic(
+  finalValue: unknown,
+  responseContext: ResponseTestContext,
+) {
+  if (finalValue !== null && typeof finalValue === "object" && !Array.isArray(finalValue)) {
+    return convertResponseToAnthropic({
+      object: "response",
+      error: null,
+      usage: DEFAULT_RESPONSES_USAGE,
+      ...(finalValue as Record<string, unknown>),
+    }, responseContext);
+  }
+  return convertResponseToAnthropic(finalValue, responseContext);
 }
 
 function captureAnthropicError(run: () => unknown): AnthropicRequestError {
@@ -348,7 +413,10 @@ describe("Anthropic final response conversion", () => {
       ...NULLABLE_USAGE_FIELDS,
       service_tier: "standard",
     });
-    expect(usageFromResponses(undefined, 3, "flex").service_tier).toBe("batch");
+    expect(usageFromResponses(undefined, 3, "flex").service_tier).toBeNull();
+    expect(usageFromResponses(undefined, 3, "batch").service_tier).toBe("batch");
+    expect(usageFromResponses(undefined, 3, "scale").service_tier).toBeNull();
+    expect(usageFromResponses(undefined, 3, "ultrafast").service_tier).toBeNull();
     expect(usageFromResponses(undefined, 3, "future-tier").service_tier).toBeNull();
   });
 
@@ -381,6 +449,37 @@ describe("Anthropic final response conversion", () => {
         output_tokens: 1,
         input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
         output_tokens_details: { reasoning_tokens: 2 },
+      },
+      {
+        input_tokens: 10.5,
+        output_tokens: 1,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+      {
+        input_tokens: Number.MAX_SAFE_INTEGER + 1,
+        output_tokens: 1,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+      {
+        input_tokens: 10,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+      {
+        input_tokens: 10,
+        output_tokens: 1,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 12,
+      },
+      {
+        input_tokens: 10,
+        output_tokens: 1,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 11.5,
       },
     ];
 
@@ -467,6 +566,112 @@ describe("Anthropic final response conversion", () => {
     ]);
     expect(message.stop_reason).toBe("tool_use");
     expect(message.stop_sequence).toBeNull();
+  });
+
+  it("suppresses incomplete function calls under an incomplete terminal", () => {
+    const message = responseToAnthropic({
+      id: "resp_incomplete_tool",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [
+        {
+          type: "function_call",
+          id: "fc_incomplete",
+          status: "incomplete",
+          call_id: "call_incomplete",
+          name: "Write",
+          arguments: "{\"unsafe\":true}",
+        },
+        {
+          type: "message",
+          id: "msg_incomplete_tool",
+          status: "incomplete",
+          role: "assistant",
+          content: [{ type: "output_text", text: "partial", annotations: [] }],
+        },
+      ],
+    }, CONTEXT);
+
+    expect(message.content).toEqual([
+      { type: "text", text: "partial", citations: null },
+    ]);
+    expect(message.stop_reason).toBe("max_tokens");
+    expect(JSON.stringify(message)).not.toContain("call_incomplete");
+    expect(JSON.stringify(message)).not.toContain("unsafe");
+  });
+
+  it("rejects incomplete function calls under a completed terminal", () => {
+    const error = captureAnthropicError(() => responseToAnthropic({
+      id: "resp_completed_incomplete_tool",
+      status: "completed",
+      output: [{
+        type: "function_call",
+        id: "fc_incomplete_completed",
+        status: "incomplete",
+        call_id: "call_incomplete_completed",
+        name: "Write",
+        arguments: "{}",
+      }],
+    }, CONTEXT));
+
+    expect(error.status).toBe(500);
+    expect(error.errorType).toBe("api_error");
+    expect(error.message).toBe("Responses relay returned a malformed final response.");
+    expect(error.message).not.toContain("call_incomplete_completed");
+  });
+
+  it("suppresses completed tools when refusal content or content-filter provenance exists", () => {
+    for (const final of [
+      {
+        id: "resp_mixed_refusal",
+        status: "completed",
+        output: [
+          {
+            type: "function_call",
+            id: "fc_mixed_refusal",
+            status: "completed",
+            call_id: "call_mixed_refusal",
+            name: "Delete",
+            arguments: "{\"dangerous\":true}",
+          },
+          {
+            type: "message",
+            id: "msg_mixed_refusal",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "refusal", refusal: "I cannot do that." }],
+          },
+        ],
+      },
+      {
+        id: "resp_filtered_tool",
+        status: "incomplete",
+        incomplete_details: { reason: "content_filter" },
+        output: [
+          {
+            type: "function_call",
+            id: "fc_filtered",
+            status: "completed",
+            call_id: "call_filtered",
+            name: "Delete",
+            arguments: "{\"dangerous\":true}",
+          },
+          {
+            type: "message",
+            id: "msg_filtered_tool",
+            status: "incomplete",
+            role: "assistant",
+            content: [{ type: "output_text", text: "filtered", annotations: [] }],
+          },
+        ],
+      },
+    ]) {
+      const message = responseToAnthropic(final, CONTEXT);
+      expect(message.stop_reason).toBe("refusal");
+      expect(message.content.some(block => block.type === "tool_use")).toBe(false);
+      expect(JSON.stringify(message)).not.toContain("dangerous");
+      expect(JSON.stringify(message)).not.toContain("call_");
+    }
   });
 
   it("does not match a stop sequence across reasoning or tool boundaries", () => {
@@ -719,10 +924,10 @@ describe("Anthropic final response conversion", () => {
   it("rejects non-finite, deeply nested, oversized, or over-itemized function arguments", () => {
     let deepValue = "0";
     for (let index = 0; index < 66; index += 1) deepValue = `{\"next\":${deepValue}}`;
-    const cases: Array<[string, Partial<AnthropicRequestLimits> | undefined]> = [
+    const cases: Array<[string, ResponseTestLimits | undefined]> = [
       ["{\"value\":1e400}", undefined],
       [deepValue, undefined],
-      [JSON.stringify({ secret_payload: "x".repeat(256) }), { inboundBytes: 128 }],
+      [JSON.stringify({ secret_payload: "x".repeat(256) }), { outputBytes: 128 }],
       [JSON.stringify({ items: [1, 2, 3] }), { maxArrayItems: 2 }],
     ];
 
@@ -748,11 +953,101 @@ describe("Anthropic final response conversion", () => {
     }
   });
 
-  it("requires current final IDs and exact incomplete details", () => {
+  it("rejects oversized raw UTF-8 function arguments before parsing", () => {
+    const rawArguments = JSON.stringify({ value: "🚀".repeat(40) });
+    expect(rawArguments.length).toBeLessThan(128);
+    expect(Buffer.byteLength(rawArguments, "utf8")).toBeGreaterThan(128);
+
+    const error = captureAnthropicError(() => responseToAnthropic({
+      id: "resp_raw_args",
+      status: "completed",
+      output: [{
+        type: "function_call",
+        id: "fc_raw_args",
+        status: "completed",
+        call_id: "call_raw_args",
+        name: "Read",
+        arguments: rawArguments,
+      }],
+    }, context({ limits: { outputBytes: 128 } })));
+
+    expect(error.status).toBe(500);
+    expect(error.errorType).toBe("api_error");
+    expect(error.message).toBe("Responses relay returned invalid function call arguments.");
+    expect(error.message).not.toContain("🚀");
+    expect(error.message).not.toContain(rawArguments);
+  });
+
+  it("requires current top-level response, error, and ordinary terminal usage fields", () => {
+    const valid = {
+      id: "resp_top_level",
+      object: "response",
+      status: "completed",
+      error: null,
+      output: [],
+      usage: DEFAULT_RESPONSES_USAGE,
+    };
+    const malformedFinals: unknown[] = [
+      { ...valid, object: undefined },
+      { ...valid, object: "future_object" },
+      { ...valid, error: undefined },
+      { ...valid, error: { message: "secret-upstream-error" } },
+      { ...valid, usage: undefined },
+      { ...valid, usage: null },
+    ];
+
+    for (const final of malformedFinals) {
+      const error = captureAnthropicError(() => convertResponseToAnthropic(final, CONTEXT));
+      expect(error.status).toBe(500);
+      expect(error.errorType).toBe("api_error");
+      expect(error.message).toBe("Responses relay returned a malformed final response.");
+      expect(error.message).not.toContain("secret-upstream-error");
+    }
+
+    const prewarm = convertResponseToAnthropic({
+      id: "resp_preflight_without_usage",
+      object: "response",
+      status: "completed",
+      error: null,
+      output: [{ type: "future_output" }],
+    }, context({ maxTokensZero: true }));
+    expect(prewarm).toMatchObject({
+      content: [],
+      stop_reason: "max_tokens",
+      usage: { input_tokens: CONTEXT.estimatedInputTokens, output_tokens: 0 },
+    });
+  });
+
+  it("accepts optional incomplete details while rejecting unknown present reasons", () => {
+    for (const details of [undefined, null, {}]) {
+      const final: Record<string, unknown> = {
+        id: "resp_optional_incomplete",
+        status: "incomplete",
+        output: [],
+      };
+      if (details !== undefined) final.incomplete_details = details;
+      const message = responseToAnthropic(final, CONTEXT);
+      expect(message.stop_reason).toBe("max_tokens");
+      expect(message.stop_sequence).toBeNull();
+    }
+
+    for (const reason of [null, "future_reason"]) {
+      const error = captureAnthropicError(() => responseToAnthropic({
+        id: "resp_bad_optional_reason",
+        status: "incomplete",
+        incomplete_details: { reason },
+        output: [],
+      }, CONTEXT));
+      expect(error.status).toBe(500);
+      expect(error.errorType).toBe("api_error");
+      expect(error.message).toBe("Responses relay returned a malformed final response.");
+    }
+  });
+
+  it("requires current final IDs and rejects completed-only incomplete details", () => {
     const malformedFinals: unknown[] = [
       { status: "completed", output: [] },
       { id: "", status: "completed", output: [] },
-      { id: "resp_missing_details", status: "incomplete", output: [] },
       {
         id: "resp_unknown_incomplete",
         status: "incomplete",
@@ -804,11 +1099,42 @@ describe("Anthropic final response conversion", () => {
         content: [{ type: "output_text", text: "text" }],
       },
       {
-        type: "function_call",
+        type: "message",
+        id: "msg_bad_annotations",
         status: "completed",
-        call_id: "call_missing_id",
-        name: "Read",
-        arguments: "{}",
+        role: "assistant",
+        content: [{ type: "output_text", text: "text", annotations: [null] }],
+      },
+      {
+        type: "message",
+        id: "msg_bad_known_annotation",
+        status: "completed",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: "text",
+          annotations: [{ type: "url_citation" }],
+        }],
+      },
+      {
+        type: "message",
+        id: "msg_bad_logprobs",
+        status: "completed",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: "text",
+          annotations: [],
+          logprobs: [{ token: 1, bytes: [], logprob: 0, top_logprobs: [] }],
+        }],
+      },
+      {
+        type: "message",
+        id: "msg_bad_phase",
+        status: "completed",
+        role: "assistant",
+        phase: "future_phase",
+        content: [],
       },
       {
         type: "function_call",
@@ -819,7 +1145,23 @@ describe("Anthropic final response conversion", () => {
       },
       {
         type: "reasoning",
-        id: "rs_missing_status",
+        id: "rs_bad_content",
+        status: "completed",
+        encrypted_content: "cipher-must-not-leak",
+        summary: [],
+        content: [{ type: "reasoning_text", text: 1 }],
+      },
+      {
+        type: "message",
+        id: "msg_incomplete_completed_terminal",
+        status: "incomplete",
+        role: "assistant",
+        content: [],
+      },
+      {
+        type: "reasoning",
+        id: "rs_incomplete_completed_terminal",
+        status: "incomplete",
         encrypted_content: "cipher-must-not-leak",
         summary: [],
       },
@@ -837,6 +1179,80 @@ describe("Anthropic final response conversion", () => {
       expect(error.message).toBe("Responses relay returned a malformed final response.");
       expect(error.message).not.toContain("cipher-must-not-leak");
     }
+  });
+
+  it("accepts documented optional and additive terminal output fields", () => {
+    const message = responseToAnthropic({
+      id: "resp_optional_output_fields",
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          id: "rs_optional_output",
+          encrypted_content: "optional-cipher",
+          summary: [{ type: "summary_text", text: "thinking" }],
+          content: [{ type: "reasoning_text", text: "opaque reasoning" }],
+          additive_reasoning_field: true,
+        },
+        {
+          type: "message",
+          id: "msg_optional_output",
+          status: "completed",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{
+            type: "output_text",
+            text: "answer",
+            annotations: [{ type: "future_annotation", additive: true }],
+            logprobs: [{
+              token: "answer",
+              bytes: [97],
+              logprob: -0.1,
+              top_logprobs: [{ token: "answer", bytes: [97], logprob: -0.1 }],
+            }],
+          }],
+        },
+        {
+          type: "function_call",
+          status: "completed",
+          call_id: "call_optional_output",
+          name: "Read",
+          arguments: "{}",
+          caller: { type: "direct" },
+          namespace: "tools",
+        },
+      ],
+    }, CONTEXT);
+
+    expect(message.content.map(block => block.type)).toEqual([
+      "thinking",
+      "text",
+      "tool_use",
+    ]);
+    expect(message.stop_reason).toBe("tool_use");
+
+    const incomplete = responseToAnthropic({
+      id: "resp_optional_incomplete_items",
+      status: "incomplete",
+      output: [
+        {
+          type: "reasoning",
+          id: "rs_optional_incomplete",
+          status: "incomplete",
+          encrypted_content: "incomplete-cipher",
+          summary: [],
+        },
+        {
+          type: "message",
+          id: "msg_optional_incomplete",
+          status: "incomplete",
+          role: "assistant",
+          content: [{ type: "output_text", text: "partial", annotations: [] }],
+        },
+      ],
+    }, CONTEXT);
+    expect(incomplete.content.map(block => block.type)).toEqual(["thinking", "text"]);
+    expect(incomplete.stop_reason).toBe("max_tokens");
   });
 
   it("rejects malformed upstream final shapes without echoing encrypted content", () => {
@@ -924,14 +1340,22 @@ describe("Anthropic final response conversion", () => {
 
     const tool = [{ type: "tool_use", id: "call_1", name: "Read", input: {} }];
     expect(stopReasonFromResponses(
-      { id: "resp_stop_helper", status: "completed", output: [] },
+      {
+        id: "resp_stop_helper",
+        object: "response",
+        status: "completed",
+        error: null,
+        output: [],
+      },
       tool,
       null,
     )).toBe("tool_use");
     expect(stopReasonFromResponses(
       {
         id: "resp_stop_helper_incomplete",
+        object: "response",
         status: "incomplete",
+        error: null,
         incomplete_details: { reason: "max_output_tokens" },
         output: [],
       },
@@ -939,7 +1363,13 @@ describe("Anthropic final response conversion", () => {
       null,
     )).toBe("max_tokens");
     expect(stopReasonFromResponses(
-      { id: "resp_stop_helper_match", status: "completed", output: [] },
+      {
+        id: "resp_stop_helper_match",
+        object: "response",
+        status: "completed",
+        error: null,
+        output: [],
+      },
       [],
       "END",
     )).toBe("stop_sequence");

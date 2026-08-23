@@ -649,6 +649,7 @@ describe("Anthropic request current contracts", () => {
     }).DEFAULT_ANTHROPIC_REQUEST_LIMITS;
     expect(defaults).toMatchObject({
       inboundBytes: 32 * 1024 * 1024,
+      outputBytes: 32 * 1024 * 1024,
       relayBytes: 64 * 1024 * 1024,
       mediaBytes: 32 * 1024 * 1024,
       maxJsonDepth: 64,

@@ -1,6 +1,12 @@
 const PREFIX = "ghostprov-r1.";
-const MAX_ENCODED_LENGTH = 8 * 1024 * 1024;
+const MAX_DECODED_LENGTH = 8 * 1024 * 1024;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+function decodedBase64UrlLength(encodedLength: number): number | null {
+  const remainder = encodedLength % 4;
+  if (remainder === 1) return null;
+  return Math.floor(encodedLength / 4) * 3 + (remainder === 2 ? 1 : remainder === 3 ? 2 : 0);
+}
 
 export type ResponsesReasoningItem = {
   type: "reasoning";
@@ -14,19 +20,22 @@ export function encodeReasoningItem(item: ResponsesReasoningItem): string {
     typeof item.encrypted_content !== "string" || !item.encrypted_content) {
     throw new TypeError("reasoning continuity requires nonempty id and encrypted content");
   }
-  const encoded = Buffer.from(JSON.stringify({
+  const json = JSON.stringify({
     id: item.id,
     encrypted_content: item.encrypted_content,
-  }), "utf8").toString("base64url");
-  const envelope = PREFIX + encoded;
-  if (envelope.length > MAX_ENCODED_LENGTH) {
+  });
+  if (Buffer.byteLength(json, "utf8") > MAX_DECODED_LENGTH) {
     throw new RangeError("reasoning continuity envelope is too large");
   }
-  return envelope;
+  return PREFIX + Buffer.from(json, "utf8").toString("base64url");
 }
 
 export function decodeReasoningItem(value: string): ResponsesReasoningItem | null {
-  if (!value.startsWith(PREFIX) || value.length > MAX_ENCODED_LENGTH) return null;
+  if (!value.startsWith(PREFIX)) return null;
+
+  const encodedLength = value.length - PREFIX.length;
+  const decodedLength = decodedBase64UrlLength(encodedLength);
+  if (decodedLength === null || decodedLength > MAX_DECODED_LENGTH) return null;
 
   const encoded = value.slice(PREFIX.length);
   if (!encoded || !BASE64URL.test(encoded)) return null;

@@ -3,6 +3,41 @@ export type AnthropicContentBlock = {
   [key: string]: unknown;
 };
 
+export type AnthropicTextBlock = {
+  type: "text";
+  text: string;
+  citations: null;
+  [key: string]: unknown;
+};
+
+export type AnthropicThinkingBlock = {
+  type: "thinking";
+  thinking: string;
+  signature: string;
+  [key: string]: unknown;
+};
+
+export type AnthropicToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+  caller: { type: "direct" };
+  [key: string]: unknown;
+};
+
+export type AnthropicResponseContentBlock =
+  | AnthropicTextBlock
+  | AnthropicThinkingBlock
+  | AnthropicToolUseBlock;
+
+export type AnthropicStopReason =
+  | "end_turn"
+  | "max_tokens"
+  | "stop_sequence"
+  | "tool_use"
+  | "refusal";
+
 export type AnthropicMessageParam = {
   role: "user" | "assistant";
   content: string | AnthropicContentBlock[];
@@ -69,8 +104,10 @@ export type AnthropicMessage = {
   type: "message";
   role: "assistant";
   model: string;
-  content: AnthropicContentBlock[];
-  stop_reason: string | null;
+  content: AnthropicResponseContentBlock[];
+  container: null;
+  stop_details: null;
+  stop_reason: AnthropicStopReason;
   stop_sequence: string | null;
   usage: AnthropicUsage;
   [key: string]: unknown;

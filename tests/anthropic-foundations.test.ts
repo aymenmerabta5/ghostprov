@@ -99,6 +99,27 @@ describe("Anthropic foundations", () => {
     } as unknown as Parameters<typeof encodeReasoningItem>[0])).toThrow();
   });
 
+  it("preflights reasoning envelopes by decoded bytes rather than encoded characters", () => {
+    const encryptedContent = "x".repeat(6 * 1024 * 1024);
+    const item = {
+      type: "reasoning",
+      id: "rs_large_valid",
+      encrypted_content: encryptedContent,
+      summary: [],
+    } as const;
+
+    const signature = encodeReasoningItem(item);
+    expect(signature.length).toBeGreaterThan(8 * 1024 * 1024);
+    expect(decodeReasoningItem(signature)).toEqual(item);
+
+    const oversizedJson = JSON.stringify({
+      id: "rs_too_large",
+      encrypted_content: "x".repeat(8 * 1024 * 1024),
+    });
+    const oversized = `ghostprov-r1.${Buffer.from(oversizedJson, "utf8").toString("base64url")}`;
+    expect(decodeReasoningItem(oversized)).toBeNull();
+  });
+
   it("returns current Anthropic error envelopes", async () => {
     const response = anthropicErrorResponse(
       new AnthropicRequestError(400, "messages is required"),
@@ -186,7 +207,9 @@ describe("Anthropic foundations", () => {
       type: "message",
       role: "assistant",
       model: request.model,
-      content: [{ type: "text", text: "hi" }],
+      content: [{ type: "text", text: "hi", citations: null }],
+      container: null,
+      stop_details: null,
       stop_reason: "end_turn",
       stop_sequence: null,
       usage,
