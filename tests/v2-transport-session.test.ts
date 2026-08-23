@@ -55,6 +55,7 @@ class TransportHarness {
   nextHostSequence = 0;
   hostAck = -1;
   credits = 128;
+  readonly publicationIntervalMs: number;
 
   constructor(options: {
     drop?: readonly number[];
@@ -63,7 +64,9 @@ class TransportHarness {
     maxBufferedResponseBytes?: number;
     gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
     rotationTimeoutMs?: number;
+    publicationIntervalMs?: number;
   } = {}) {
+    this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.network = new FakeAwarenessNetwork({ drop: options.drop });
     this.host = this.network.connectHost("host", PROJECT);
     this.sidecar = this.network.connectSidecar("sidecar", PROJECT);
@@ -89,6 +92,7 @@ class TransportHarness {
       gzip: options.gzip,
       rotationTimeoutMs: options.rotationTimeoutMs,
       retransmitMs: options.retransmitMs ?? 250,
+      publicationIntervalMs: this.publicationIntervalMs,
     });
   }
 
@@ -137,6 +141,7 @@ class TransportHarness {
   }
 
   async settle(rounds = 12): Promise<void> {
+    await Bun.sleep(this.publicationIntervalMs + 1);
     for (let index = 0; index < rounds; index++) {
       await this.network.flushAll();
       await Bun.sleep(0);
@@ -219,6 +224,44 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("coalesces concurrent request data into one peer-wide publication", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 25 });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+
+    const pending = Array.from({ length: 4 }, (_, index) => harness.session.run({
+      ...BODY,
+      input: `paced-${index}`,
+    }));
+    await harness.settle();
+
+    expect(harness.hostEnvelopes).toHaveLength(1);
+    expect(harness.hostEnvelopes[0]!.frames.filter(
+      frame => frame.kind === "request_open",
+    )).toHaveLength(4);
+    await harness.close();
+    await Promise.allSettled(pending);
+  });
+
+  it("measures ACK RTT from first sequence send instead of a later cumulative publish", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 1 });
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    await harness.settle();
+    await Bun.sleep(30);
+    harness.session.setHostCeiling(127);
+    await Bun.sleep(10);
+
+    const identity = harness.requestIdentity();
+    harness.credits = 127;
+    harness.publish([{ kind: "request_ack", ...identity, committed: true }]);
+    await harness.settle();
+
+    expect(harness.session.snapshot().awarenessRttMs).toBeGreaterThan(30);
+    await pending;
+    await harness.close();
+  });
+
   it("expands response batches into the exact logical SSE transcript", async () => {
     const harness=new TransportHarness();await harness.start();const handle=await harness.commit(harness.session.run(BODY));const id=harness.requestIdentity();
     const final={id:"resp_batch",object:"response",status:"completed",output:[]};const events=[{event:"response.created",data:JSON.stringify({type:"response.created",response:{id:"resp_batch"}})},{event:"response.output_text.delta",data:JSON.stringify({type:"response.output_text.delta",delta:"hello"})},{event:"response.completed",data:JSON.stringify({type:"response.completed",response:final})}];const proof=new TranscriptProof(id.requestId,id.requestDigest);for(const event of events)proof.append(event);const terminal=await proof.createTerminal();

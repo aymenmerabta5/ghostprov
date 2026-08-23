@@ -23,7 +23,11 @@ import {
   type SidecarFrame,
 } from "../protocol/shared";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
-import { computeV2RetransmitDelayMs } from "../protocol/retransmit";
+import { ReliableDeliveryTiming } from "../protocol/delivery-timing";
+import {
+  PublicationPacer,
+  type PublicationReason,
+} from "../protocol/publication-pacer";
 import { HostRequestDiagnosticsObserver } from "../diagnostics/host-observer";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnostics/types";
 import {
@@ -67,6 +71,7 @@ export interface V2TransportSessionOptions {
   hostCeiling?: number;
   retransmitMs?: number;
   rotationTimeoutMs?: number;
+  publicationIntervalMs?: number;
 }
 
 interface EventPart {
@@ -149,6 +154,27 @@ function validBinding(
     envelope.peerId === "sidecar";
 }
 
+type PublicationUrgency = "paced" | "urgent";
+
+function hostFrameUrgency(frame: HostFrame): PublicationUrgency {
+  switch (frame.kind) {
+    case "request_open":
+    case "request_data":
+    case "request_commit":
+      return "paced";
+    default:
+      return "urgent";
+  }
+}
+
+function strongestUrgency(
+  left: PublicationUrgency | null,
+  right: PublicationUrgency | null,
+): PublicationUrgency | null {
+  if (left === "urgent" || right === "urgent") return "urgent";
+  return left ?? right;
+}
+
 export class V2TransportSession {
   readonly #binding: ProtocolBinding;
   readonly #channel: AwarenessChannel<HostFrame, SidecarFrame>;
@@ -157,12 +183,13 @@ export class V2TransportSession {
   readonly #maxResponseBytes: number;
   readonly #maxBufferedResponseBytes: number;
   #hostCeiling: number;
-  readonly #retransmitMs: number;
   readonly #rotationTimeoutMs: number;
   readonly #hostInstanceId = `host-${crypto.randomUUID()}`;
   readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
+  readonly #delivery: ReliableDeliveryTiming;
+  readonly #pacer: PublicationPacer;
   readonly #requests = new Map<string, RequestState>();
   readonly #rotations = new Map<string, RotationWaiter>();
   readonly #pending: RequestState[] = [];
@@ -182,10 +209,6 @@ export class V2TransportSession {
   #creditReservations = 0;
   #quarantined = 0;
   #retransmissions = 0;
-  #retransmissionAttempt = 0;
-  #lastAckSequence = -1;
-  #lastPublishAtMs: number | null = null;
-  #awarenessRttMs: number | null = null;
   #drainResolve: (() => void) | null = null;
   #drainReject: ((error: unknown) => void) | null = null;
   #sidecarDiagnostics: V2EnvelopeDiagnostics | null = null;
@@ -230,9 +253,16 @@ export class V2TransportSession {
     this.#maxResponseBytes = options.maxResponseBytes;
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
     this.#hostCeiling = hostCeiling;
-    this.#retransmitMs = retransmitMs;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#lastAckAtMs = this.#clock.now();
+    this.#delivery = new ReliableDeliveryTiming({
+      epoch: 1,
+      minimumMs: retransmitMs,
+    });
+    this.#pacer = new PublicationPacer({
+      intervalMs: options.publicationIntervalMs,
+      publish: reason => this.#publish(reason),
+    });
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -245,7 +275,7 @@ export class V2TransportSession {
       await this.#channel.connect(signal);
       if (this.#closed) throw new Error("V2 transport session closed while connecting");
       this.#connected = true;
-      this.#publish(false);
+      this.#pacer.flushNow("initial");
     })().finally(() => {
       if (this.#connecting === connecting) this.#connecting = null;
     });
@@ -313,7 +343,7 @@ export class V2TransportSession {
     this.#requests.set(requestId, state);
     this.#pending.push(state);
     this.#admitPending();
-    if (this.#pump()) this.#publish(false);
+    this.#requestPublication(this.#pump());
     return committed;
   }
 
@@ -339,7 +369,7 @@ export class V2TransportSession {
       kind: "drain",
       reason: reason.replace(/[\r\n\0]/g, " ").trim().slice(0, 256) || "shutdown",
     });
-    if (this.#pump()) this.#publish(false);
+    this.#requestPublication(this.#pump());
     if (!signal) await drained;
     else {
       let onAbort!: () => void;
@@ -400,7 +430,7 @@ export class V2TransportSession {
       rotationId,
       sealedJson,
     });
-    if (this.#pump()) this.#publish(false);
+    this.#requestPublication(this.#pump());
     return pending;
   }
 
@@ -409,6 +439,7 @@ export class V2TransportSession {
     this.#closed = true;
     this.#connected = false;
     this.#draining = true;
+    this.#pacer.close();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
     this.#unsubscribe?.();
@@ -453,7 +484,7 @@ export class V2TransportSession {
       credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
       admissionCredits: this.#availableCredits(),
       retransmissions: this.#retransmissions,
-      awarenessRttMs: this.#awarenessRttMs,
+      awarenessRttMs: this.#delivery.roundTripEwmaMs,
       diagnostics: { host: this.#hostTransportDiagnostics(), sidecar: this.#sidecarDiagnostics },
     };
   }
@@ -464,7 +495,7 @@ export class V2TransportSession {
     }
     if (value === this.#hostCeiling) return;
     this.#hostCeiling = value;
-    if (this.#connected && !this.#closed) this.#publish(false);
+    if (this.#connected && !this.#closed) this.#pacer.requestUrgent();
   }
 
   readonly #onAwarenessUpdate = (
@@ -495,8 +526,9 @@ export class V2TransportSession {
           this.#failPreCommit(state, new V2PreCommitError(message, "instance_changed"));
         }
       }
-      this.#outbound.reset(this.#outbound.snapshot().epoch + 1);
-      this.#lastAckSequence = -1;
+      const nextEpoch = this.#outbound.snapshot().epoch + 1;
+      this.#outbound.reset(nextEpoch);
+      this.#delivery.reset(nextEpoch);
       this.#sidecarRevision = -1;
       replaced = true;
     }
@@ -504,18 +536,16 @@ export class V2TransportSession {
     this.#sidecarInstanceId = envelope.instanceId;
     this.#sidecarRevision = envelope.revision;
     this.#sidecarDiagnostics = envelope.diagnostics ?? null;
-    const previousAck = this.#lastAckSequence;
     this.#outbound.acknowledge(envelope.ack);
-    if (envelope.ack.epoch === 1 && envelope.ack.sequence > previousAck) {
-      this.#lastAckSequence = envelope.ack.sequence;
-      this.#lastAckAtMs = this.#clock.now();
-      this.#retransmissionAttempt = 0;
-      if (this.#lastPublishAtMs !== null) {
-        const sample = Math.max(0, this.#clock.now() - this.#lastPublishAtMs);
-        this.#awarenessRttMs = this.#awarenessRttMs === null
-          ? sample
-          : this.#awarenessRttMs * 0.8 + sample * 0.2;
-      }
+    const now = this.#clock.now();
+    const acknowledgementAdvanced = this.#delivery.acknowledged(
+      envelope.ack,
+      this.#outbound.snapshot().frames.length > 0,
+      now,
+    );
+    if (acknowledgementAdvanced) {
+      this.#lastAckAtMs = now;
+      this.#armRetransmission();
     }
     this.#remoteCredits = Math.max(0, Math.min(128, envelope.credits));
     const currentEpoch = this.#inbound.ack().epoch;
@@ -523,8 +553,10 @@ export class V2TransportSession {
     const delivered = this.#inbound.accept(envelope.frames);
     for (const frame of delivered) await this.#processFrame(frame);
     this.#admitPending();
-    const pumped = this.#pump();
-    if (replaced || delivered.length > 0 || pumped) this.#publish(false);
+    const urgency = this.#pump();
+    this.#requestPublication(
+      replaced || delivered.length > 0 ? "urgent" : urgency,
+    );
   }
 
   async #processFrame(frame: ReliableFrame<SidecarFrame>): Promise<void> {
@@ -784,7 +816,7 @@ export class V2TransportSession {
       requestId: state.requestId,
       terminalDigest: terminal.transcriptSha256,
     });
-    if (this.#pump()) this.#publish(false);
+    this.#requestPublication(this.#pump());
   }
 
   async #prepareRequest(
@@ -852,10 +884,9 @@ export class V2TransportSession {
     return Math.max(0, Math.min(this.#remoteCredits - this.#creditReservations, 4 - this.#creditReservations));
   }
 
-  #pump(): boolean {
-    if (!this.#connected || this.#closed) return false;
-    const wasEmpty = this.#outbound.snapshot().frames.length === 0;
-    let changed = false;
+  #pump(): PublicationUrgency | null {
+    if (!this.#connected || this.#closed) return null;
+    let urgency: PublicationUrgency | null = null;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const frameBudget = GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length;
@@ -864,20 +895,25 @@ export class V2TransportSession {
       const next = this.#scheduler.take(1, Math.max(1, byteBudget - 256));
       if (next.length === 0) break;
       const reliable = this.#outbound.push(next[0]!);
+      urgency = strongestUrgency(urgency, hostFrameUrgency(reliable));
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
         const state = this.#requests.get(reliable.requestId);
         if (state) state.published = true;
         if (state) state.diagnostics.published();
       }
-      changed = true;
     }
-    if (changed && wasEmpty) this.#retransmissionAttempt = 0;
-    return changed;
+    return urgency;
   }
 
-  #publish(_retransmission: boolean): void {
+  #requestPublication(urgency: PublicationUrgency | null): void {
+    if (urgency === "urgent") this.#pacer.requestUrgent();
+    else if (urgency === "paced") this.#pacer.requestPaced();
+  }
+
+  #publish(_reason: PublicationReason): void {
     if (!this.#connected || this.#closed) return;
     const outbound = this.#outbound.snapshot();
+    this.#delivery.published(outbound.frames, this.#clock.now());
     const committed = [...this.#requests.values()].filter(state => state.committed).length;
     const envelope: AwarenessEnvelope<HostFrame> = {
       protocol: "gp-awareness-v2",
@@ -903,13 +939,12 @@ export class V2TransportSession {
     const diagnostics = this.#hostTransportDiagnostics();
     for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
     this.#channel.publish(envelope);
-    this.#lastPublishAtMs = this.#clock.now();
     this.#armRetransmission();
   }
 
   #hostTransportDiagnostics(): V2TransportDiagnostics {
     const window=this.#outbound.snapshot(); const scheduler=this.#scheduler.snapshot();
-    return { windowFrames:window.frames.length, windowBytes:window.encodedBytes, schedulerFrames:scheduler.queuedFrames, schedulerBytes:scheduler.queuedEncodedBytes, schedulerStreams:scheduler.streams, oldestQueuedFrameMs:scheduler.oldestQueuedFrameMs, ackProgressAgeMs:Math.max(0,this.#clock.now()-this.#lastAckAtMs), retransmissionAttempt:this.#retransmissionAttempt, peakRetransmissionAttempt:this.#retransmissionAttempt, retransmissionsTotal:this.#retransmissions, publicationsTotal:this.#publications, publishedBytesTotal:this.#publishedBytes, admittedUncommitted:[...this.#requests.values()].filter(value=>value.admitted&&!value.committed).length, roundTripEwmaMs:this.#awarenessRttMs };
+    return { windowFrames:window.frames.length, windowBytes:window.encodedBytes, schedulerFrames:scheduler.queuedFrames, schedulerBytes:scheduler.queuedEncodedBytes, schedulerStreams:scheduler.streams, oldestQueuedFrameMs:scheduler.oldestQueuedFrameMs, ackProgressAgeMs:Math.max(0,this.#clock.now()-this.#lastAckAtMs), retransmissionAttempt:this.#delivery.attempt, peakRetransmissionAttempt:this.#delivery.attempt, retransmissionsTotal:this.#retransmissions, publicationsTotal:this.#publications, publishedBytesTotal:this.#publishedBytes, admittedUncommitted:[...this.#requests.values()].filter(value=>value.admitted&&!value.committed).length, roundTripEwmaMs:this.#delivery.roundTripEwmaMs };
   }
 
   #armRetransmission(): void {
@@ -921,19 +956,15 @@ export class V2TransportSession {
       this.#outbound.snapshot().frames.length === 0
     ) return;
     const jitterSeed = ((this.#revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
-    const delay = computeV2RetransmitDelayMs(
-      this.#awarenessRttMs,
-      jitterSeed,
-      this.#retransmitMs,
-      this.#retransmissionAttempt,
-    );
+    const delay = this.#delivery.nextDelayMs(this.#clock.now(), jitterSeed);
+    if (delay === null) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
       if (!this.#connected || this.#closed) return;
       if (this.#outbound.snapshot().frames.length === 0) return;
+      this.#delivery.retransmitted(this.#clock.now());
       this.#retransmissions++;
-      this.#retransmissionAttempt++;
-      this.#publish(true);
+      this.#pacer.flushNow("retransmission");
     }, delay);
   }
 
@@ -969,7 +1000,7 @@ export class V2TransportSession {
         });
       }
     }
-    if (this.#pump()) this.#publish(false);
+    this.#requestPublication(this.#pump());
   }
 
   #failPreCommit(state: RequestState, error: Error): void {

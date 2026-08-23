@@ -304,6 +304,7 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       maxResponseBytes: 16 * MiB,
       hostCeiling: options.physical,
       retransmitMs: 25,
+      publicationIntervalMs: 1,
     });
     this.upstream = new FakeScaleUpstream(options.index, options.gate);
     const timeline: string[] = [];
