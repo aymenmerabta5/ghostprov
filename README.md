@@ -35,7 +35,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
 - Append-only claims and terminal spools under `/tmp/ghostprov-v2`
 - P-256 ECDH/HKDF/AES-GCM bootstrap and AES-GCM credential rotation
-- A 16 KiB frame ceiling and 32-frame/512 KiB unacknowledged window
+- A 16 KiB frame ceiling and 128-frame/512 KiB unacknowledged window
 - Up to 128 physical upstream calls plus fair byte-bounded admission
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
@@ -72,7 +72,7 @@ resume above max(3 GiB, 15% total RAM) free
 CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
-Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory.
+Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer.
 
 Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 
@@ -297,6 +297,7 @@ The isolated suite includes:
 - `tests/v2-concurrency.test.ts`
 - `tests/v2-congestion.test.ts`
 - `tests/v2-credential-rotation.test.ts`
+- `tests/v2-delivery-timing.test.ts`
 - `tests/v2-diagnostics-classifier.test.ts`
 - `tests/v2-diagnostics-observability.test.ts`
 - `tests/v2-diagnostics-overhead.test.ts`
@@ -315,6 +316,7 @@ The isolated suite includes:
 - `tests/v2-output-sink.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
+- `tests/v2-publication-pacer.test.ts`
 - `tests/v2-response-batch.test.ts`
 - `tests/v2-response-batcher.test.ts`
 - `tests/v2-run-handle.test.ts`
