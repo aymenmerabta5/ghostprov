@@ -45,8 +45,27 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2TransportReservationBytes).toBe(16 * 1024 * 1024);
     expect(config.v2YSweetRefreshMs).toBe(45 * 60 * 1000);
     expect(config.v2SidecarMemoryBudgetBytes).toBe(512 * 1024 * 1024);
+    expect(config.v2DiagnosticsEnabled).toBe(false);
+    expect(config.v2DiagnosticsIntervalMs).toBe(1_000);
     expect(config.desiredSandboxes).toBe(4);
     expect(config.heartbeatMs).toBe(10_000);
+  });
+
+  it("parses bounded opt-in V2 diagnostics", () => {
+    const config = resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_CANDIDATE: "1",
+      GP_V2_DIAGNOSTICS: "1",
+      GP_V2_DIAGNOSTICS_INTERVAL_MS: "500",
+    }, MACHINE);
+    expect(config.v2DiagnosticsEnabled).toBe(true);
+    expect(config.v2DiagnosticsIntervalMs).toBe(500);
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_DIAGNOSTICS: "yes",
+    }, MACHINE)).toThrow("GP_V2_DIAGNOSTICS");
   });
 
   it("allows a project-less managed V2 fleet and derives its size", () => {

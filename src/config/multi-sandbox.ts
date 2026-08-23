@@ -30,6 +30,8 @@ export interface MultiSandboxConfig {
   v2TransportReservationBytes: number;
   v2YSweetRefreshMs: number;
   v2SidecarMemoryBudgetBytes: number;
+  v2DiagnosticsEnabled: boolean;
+  v2DiagnosticsIntervalMs: number;
   desiredSandboxes: number;
   provisionConcurrency: number;
   fleetManifestFile: string;
@@ -45,6 +47,12 @@ function positiveInteger(value: string | undefined, fallback: number, name: stri
 function optionalPositiveInteger(value: string | undefined, name: string): number | null {
   if (value === undefined || value.trim() === "") return null;
   return positiveInteger(value, 1, name);
+}
+
+function boundedPositiveInteger(value: string | undefined, fallback: number, name: string, minimum: number, maximum: number): number {
+  const parsed = positiveInteger(value, fallback, name);
+  if (parsed < minimum || parsed > maximum) throw new RangeError(`${name} must be from ${minimum} through ${maximum}`);
+  return parsed;
 }
 
 function enumValue<T extends string>(
@@ -206,6 +214,10 @@ export function resolveMultiSandboxConfig(
   if (v2SidecarMemoryBudgetBytes < 64 * 1024 * 1024) {
     throw new RangeError("GP_V2_SIDECAR_MEMORY_BUDGET_BYTES must be at least 64 MiB");
   }
+  const v2DiagnosticsEnabled = binaryFlag(env.GP_V2_DIAGNOSTICS, "GP_V2_DIAGNOSTICS");
+  const v2DiagnosticsIntervalMs = boundedPositiveInteger(
+    env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
+  );
   const desiredSandboxes = resolveDesiredSandboxCount({
     targetConcurrency,
     targetSandboxes,
@@ -243,6 +255,8 @@ export function resolveMultiSandboxConfig(
     v2TransportReservationBytes,
     v2YSweetRefreshMs,
     v2SidecarMemoryBudgetBytes,
+    v2DiagnosticsEnabled,
+    v2DiagnosticsIntervalMs,
     desiredSandboxes,
     provisionConcurrency,
     fleetManifestFile: path.resolve(
