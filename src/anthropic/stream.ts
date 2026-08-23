@@ -1,5 +1,5 @@
 import type { SseFrame } from "../relay/sse";
-import { ApiError, normalizeApiError } from "../http/errors";
+import { normalizeApiError } from "../http/errors";
 import { createHash } from "node:crypto";
 import {
   AnthropicRequestError,
@@ -28,7 +28,7 @@ import {
   type AnthropicStreamSnapshot,
 } from "./stream-limits";
 import { ResponsesStreamProtocol } from "./stream-protocol";
-import { UnicodeStopFilter } from "./stream-stop-filter";
+import { assertUnicodeWellFormed, UnicodeStopFilter } from "./stream-stop-filter";
 import type { AnthropicContentBlockDelta, AnthropicSseEvent } from "./stream-types";
 import type {
   AnthropicResponseContentBlock,
@@ -93,6 +93,7 @@ export class AnthropicStreamTranslator {
   readonly #textFilter: UnicodeStopFilter<StreamBlock>;
   readonly #budget: AnthropicStreamBudget;
   readonly #blocksByIdentity = new Map<string, StreamBlock>();
+  readonly #blocksByPosition = new Map<string, StreamBlock>();
   #blocks: StreamBlock[] = [];
   #matchedStop: string | null = null;
   #started = false;
@@ -137,11 +138,13 @@ export class AnthropicStreamTranslator {
   }
 
   push(frame: SseFrame): AnthropicSseEvent[] {
+    if (this.#terminal) return [];
     const events = this.#started ? [] : this.start();
     try {
       if (!frame || typeof frame.event !== "string" || typeof frame.data !== "string") {
         malformedEvent();
       }
+      this.#budget.countWire(frame.data);
       let parsed: unknown;
       try {
         parsed = JSON.parse(frame.data);
@@ -152,8 +155,11 @@ export class AnthropicStreamTranslator {
       if (!event || typeof event.type !== "string" || event.type !== frame.event) {
         malformedEvent();
       }
-      this.#protocol.accept(event);
+      const acceptedSuffix = this.#protocol.accept(event);
       this.#countStreamedPayload(event.type, event);
+      if (acceptedSuffix !== null && acceptedSuffix.value.length > 0) {
+        this.#budget.countPayload(acceptedSuffix.category, acceptedSuffix.value);
+      }
       events.push(...this.#translate(event.type, event));
       return events;
     } catch (error) {
@@ -224,6 +230,8 @@ export class AnthropicStreamTranslator {
       this.#onReasoningPartAdded(event, events);
     } else if (type === "response.reasoning_summary_text.delta") {
       this.#onReasoningDelta(event, events);
+    } else if (type === "response.reasoning_summary_text.done") {
+      this.#onReasoningSummaryDone(event, events);
     } else if (type === "response.output_text.delta") {
       this.#onTextDelta(event, events);
     } else if (type === "response.output_text.done") {
@@ -345,6 +353,7 @@ export class AnthropicStreamTranslator {
     const block = this.#block("tool_use", itemId, outputIndex, null);
     this.#setToolMetadata(block, event);
     block.argumentDeltaSeen = true;
+    block.argumentUnits = this.#addUnits(block.argumentUnits, delta.length);
     block.argumentBytes = this.#addArgumentBytes(block.argumentBytes, delta);
     this.#appendPending(block, delta);
     this.#drain(events);
@@ -360,16 +369,33 @@ export class AnthropicStreamTranslator {
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("tool_use", itemId, outputIndex, null);
-    if (!block.argumentDeltaSeen) {
-      this.#assertArgumentBytes(args);
-      this.#appendPending(block, args.trim().length > 0 ? args : "{}");
-    }
+    this.#setToolMetadata(block, event);
+    this.#reconcileArguments(block, args, args.trim().length === 0);
     // Validate completed JSON now, but wait for authoritative refusal provenance
     // before exposing the tool block.
     if (block.toolId !== null && block.toolName !== null) {
       this.#validateToolArguments(block, itemId, args);
       block.done = true;
     }
+    this.#drain(events);
+  }
+
+  #onReasoningSummaryDone(
+    event: Record<string, unknown>,
+    events: AnthropicSseEvent[],
+  ): void {
+    const outputIndex = indexField(event, "output_index");
+    optionalIndexField(event, "summary_index");
+    const itemId = stringField(event, "item_id");
+    const text = stringField(event, "text");
+    this.#endOrdinarySegment(events);
+    if (this.#matchedStop) return;
+    const block = this.#block("thinking", itemId, outputIndex, null);
+    if (text.length < block.seenUnits) malformedEvent();
+    if (this.#context.thinkingDisplay !== "omitted" && text.length > block.seenUnits) {
+      this.#appendPending(block, text.slice(block.seenUnits));
+    }
+    block.seenUnits = text.length;
     this.#drain(events);
   }
 
@@ -403,8 +429,11 @@ export class AnthropicStreamTranslator {
         block,
         this.#context.thinkingDisplay === "omitted" ? "" : summary,
       );
-      if (this.#context.thinkingDisplay !== "omitted" && summary.length > block.seenUnits) {
-        this.#appendPending(block, summary.slice(block.seenUnits));
+      if (summary.length > block.seenUnits) {
+        this.#budget.countPayload("reasoning", summary.slice(block.seenUnits));
+        if (this.#context.thinkingDisplay !== "omitted") {
+          this.#appendPending(block, summary.slice(block.seenUnits));
+        }
       }
       block.seenUnits = summary.length;
       const encryptedContent = item.encrypted_content;
@@ -440,11 +469,7 @@ export class AnthropicStreamTranslator {
       }
       const args = stringField(item, "arguments");
       this.#validateToolArguments(block, itemId, args);
-      if (!block.argumentDeltaSeen) {
-        this.#assertArgumentBytes(args);
-        this.#clearPending(block);
-        this.#appendPending(block, args.trim().length > 0 ? args : "{}");
-      }
+      this.#reconcileArguments(block, args);
       block.done = true;
       this.#drain(events);
       return;
@@ -494,6 +519,11 @@ export class AnthropicStreamTranslator {
 
       if (descriptor.kind === "text") {
         const text = String(descriptor.block.text);
+        assertUnicodeWellFormed(text);
+        if (text.length > block.seenUnits) {
+          this.#budget.countPayload("text", text.slice(block.seenUnits));
+          block.seenUnits = text.length;
+        }
         this.#assertStreamedPrefix(block, text);
         if (!block.stopped) {
           this.#clearPending(block);
@@ -503,6 +533,11 @@ export class AnthropicStreamTranslator {
         }
       } else if (descriptor.kind === "thinking") {
         const thinking = descriptor.block as AnthropicThinkingBlock;
+        assertUnicodeWellFormed(thinking.thinking);
+        if (thinking.thinking.length > block.seenUnits) {
+          this.#budget.countPayload("reasoning", thinking.thinking.slice(block.seenUnits));
+          block.seenUnits = thinking.thinking.length;
+        }
         this.#assertStreamedPrefix(block, thinking.thinking);
         if (!block.stopped) {
           this.#clearPending(block);
@@ -517,6 +552,8 @@ export class AnthropicStreamTranslator {
         block.toolName = toolBlock.name;
         if (!block.stopped) {
           const args = descriptor.arguments ?? "{}";
+          assertUnicodeWellFormed(args);
+          this.#reconcileArguments(block, args);
           this.#assertStreamedPrefix(block, args);
           const remaining = args.slice(block.emittedUnits);
           const pendingPrefix = block.pending.join("");
@@ -579,6 +616,7 @@ export class AnthropicStreamTranslator {
   #clearRetainedState(): void {
     this.#blocks = [];
     this.#blocksByIdentity.clear();
+    this.#blocksByPosition.clear();
     this.#textFilter.clear();
     this.#budget.clearRetained();
     this.#matchedStop = null;
@@ -593,6 +631,7 @@ export class AnthropicStreamTranslator {
     contentIndex: number | null,
   ): StreamBlock {
     const identity = streamBlockIdentity(kind, itemId, outputIndex, contentIndex);
+    const position = `${kind}:${outputIndex}:${contentIndex ?? "-"}`;
     const exact = this.#blocksByIdentity.get(identity);
     if (exact) {
       if (exact.kind !== kind || exact.outputIndex !== outputIndex ||
@@ -603,8 +642,7 @@ export class AnthropicStreamTranslator {
       return exact;
     }
 
-    const byPosition = this.#blocks.find(block => block.kind === kind &&
-      block.outputIndex === outputIndex && block.contentIndex === contentIndex);
+    const byPosition = this.#blocksByPosition.get(position);
     if (byPosition) {
       if (itemId !== null) {
         if (byPosition.itemId !== null && byPosition.itemId !== itemId) malformedEvent();
@@ -616,13 +654,21 @@ export class AnthropicStreamTranslator {
 
     this.#budget.reserveOutputBlock();
     const block = createStreamBlock(kind, itemId, outputIndex, contentIndex);
-    let insertAt = this.#blocks.length;
-    while (insertAt > this.#drainCursor &&
-      this.#compareBlocks(block, this.#blocks[insertAt - 1]) < 0) {
-      insertAt -= 1;
+    const last = this.#blocks.at(-1);
+    if (last === undefined || this.#compareBlocks(last, block) <= 0) {
+      this.#blocks.push(block);
+    } else {
+      let low = this.#drainCursor;
+      let high = this.#blocks.length;
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (this.#compareBlocks(this.#blocks[middle], block) <= 0) low = middle + 1;
+        else high = middle;
+      }
+      this.#blocks.splice(low, 0, block);
     }
-    this.#blocks.splice(insertAt, 0, block);
     this.#blocksByIdentity.set(identity, block);
+    this.#blocksByPosition.set(position, block);
     return block;
   }
 
@@ -654,6 +700,20 @@ export class AnthropicStreamTranslator {
       name: block.toolName,
       arguments: args,
     }), this.#context);
+  }
+
+  #reconcileArguments(block: StreamBlock, value: string, countSuffix = true): void {
+    const args = value.trim().length > 0 ? value : "{}";
+    assertUnicodeWellFormed(args);
+    if (args.length < block.argumentUnits) malformedEvent();
+    this.#assertArgumentBytes(args);
+    if (args.length > block.argumentUnits) {
+      const suffix = args.slice(block.argumentUnits);
+      if (countSuffix) this.#budget.countPayload("function", suffix);
+      block.argumentBytes = this.#addArgumentBytes(block.argumentBytes, suffix);
+      this.#appendPending(block, suffix);
+      block.argumentUnits = args.length;
+    }
   }
 
   #assertStreamedPrefix(block: StreamBlock, value: string): void {
@@ -717,6 +777,7 @@ export class AnthropicStreamTranslator {
   }
 
   #reconcileStreamedText(block: StreamBlock, text: string): void {
+    assertUnicodeWellFormed(text);
     if (text.length < block.seenUnits) malformedEvent();
     this.#assertStreamedPrefix(block, text);
     if (!this.#matchedStop && text.length > block.seenUnits) {
@@ -834,26 +895,18 @@ export class AnthropicStreamTranslator {
   }
 
   #emitError(error: unknown): AnthropicSseEvent[] {
-    if (this.#terminal) {
-      return [anthropicErrorEvent(
-        invalidUpstream(FAILED_EVENT_MESSAGE),
-        this.#context.requestId,
-      )];
-    }
+    if (this.#terminal) return [];
     this.#protocol.markTerminal();
     this.#terminal = true;
-    const trustedClientError = (error instanceof AnthropicRequestError || error instanceof ApiError) &&
-      (error.status === 400 || error.status === 413);
-    let safeError: unknown = error;
-    if (!trustedClientError) {
-      const normalized = normalizeApiError(error);
-      const status = normalized.status === 503 ? 529 : normalized.status;
-      safeError = new AnthropicRequestError(
-        status,
-        FAILED_EVENT_MESSAGE,
-        anthropicErrorType(status),
-      );
-    }
+    const normalized = error instanceof AnthropicRequestError
+      ? { status: error.status }
+      : normalizeApiError(error);
+    const status = normalized.status === 503 ? 529 : normalized.status;
+    const safeError = new AnthropicRequestError(
+      status,
+      FAILED_EVENT_MESSAGE,
+      anthropicErrorType(status),
+    );
     const event = anthropicErrorEvent(safeError, this.#context.requestId);
     this.#clearRetainedState();
     return [event];

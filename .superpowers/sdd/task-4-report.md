@@ -150,3 +150,67 @@ The full suite used `--max-concurrency=4` (down from Bun's default 20) to avoid 
 ### Final Concerns
 
 None.
+
+---
+
+## Final Lifecycle and Accounting Closure — 2026-08-24
+
+### Status
+
+All requirements in `.superpowers/sdd/task-4-findings-2.md` are implemented in pure stream/final helpers. No HTTP route, pull loop, process, listener, or port code changed.
+
+### Closure Changes
+
+1. Sequence numbers now anchor on the first nonnegative safe integer (including 0 or 1) and require exact `+1` progression thereafter.
+2. Every accepted `frame.data` is UTF-8 byte-counted before JSON parsing under a new cumulative wire-byte limit, including unknown, done, terminal, failed, and error frames.
+3. Category and total output accounting now counts only unseen suffixes from done events and authoritative final fallback, including final-only text, reasoning, and function JSON; snapshots expose wire/category totals.
+4. Authoritative final validation now requires every observed output item to remain present with the same index, ID, and type while still allowing additional final-only items.
+5. Every `push`, `finish`, or `fail` after terminal success/error is an idempotent `[]`; no post-terminal error event can be emitted.
+6. `fail()` now redacts every externally supplied error message, including typed 400/413 errors, while retaining only the safe Anthropic error category.
+7. Known current events validate required fields even during prewarm suppression; `response.function_call_arguments.done` requires item/output identity, name, and arguments.
+8. Lone surrogate data is rejected before final/fallback text, thinking, refusal, or function JSON can be emitted.
+9. The production block cap is now 4,096. Block lookup uses identity/position maps, canonical arrivals append directly, exceptional earlier insertion uses binary positioning, and lower-output readiness is tracked with a monotonic completed prefix.
+10. Removed only the two docs downloaded for this review:
+    - `.tmp/task4-findings2-openai-streaming.html`
+    - `.tmp/task4-findings2-openai-responses-create.html`
+
+### Strict TDD Evidence
+
+Representative RED runs observed before implementation:
+
+```text
+Sequence anchor/idempotence: 0 pass, 2 fail
+External 400/413 fail redaction: 0 pass, 1 fail
+Wire/done/final accounting: 0 pass, 4 fail
+Disappearing final item + prewarm shape validation: 0 pass, 2 fail
+Practical production block cap: 0 pass, 1 fail
+Lone-surrogate fallback: 0 pass, 1 fail
+Blank canonical tool accounting: 0 pass, 1 fail
+```
+
+Every regression was rerun GREEN immediately after its focused fix.
+
+### Final Verification
+
+```text
+All Anthropic focused tests:
+202 pass, 0 fail, 1160 expect() calls
+
+bun run typecheck
+exit 0
+
+bun test --isolate
+748 pass, 0 fail, 4376 expect() calls
+119 files, 33.15s
+
+bun test --isolate --max-concurrency=4
+748 pass, 0 fail, 4376 expect() calls
+119 files, 45.90s
+
+git diff --check
+exit 0
+```
+
+### Final Concerns
+
+None.

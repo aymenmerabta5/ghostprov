@@ -7,6 +7,7 @@ import {
 import {
   CONTEXT,
   DEFAULT_RESPONSES_USAGE,
+  context,
 } from "./support/anthropic-response";
 
 function frame(
@@ -81,8 +82,15 @@ function eventTypes(events: AnthropicSseEvent[]): string[] {
 }
 
 describe("Anthropic stream sequence integrity", () => {
-  it("requires sequence one first and exact increments for ignored events", () => {
-    for (const first of [undefined, 0, 2]) {
+  it("accepts any nonnegative safe first sequence as the exact progression anchor", () => {
+    for (const first of [0, 1, 7]) {
+      const translator = new AnthropicStreamTranslator(CONTEXT);
+      translator.start();
+      expect(translator.push(frame(first, "response.future_anchor"))).toEqual([]);
+      expect(translator.push(frame(first + 1, "response.future_next"))).toEqual([]);
+    }
+
+    for (const first of [undefined, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
       const translator = new AnthropicStreamTranslator(CONTEXT);
       translator.start();
       expectError(translator.push(frame(first, "response.created", {
@@ -90,23 +98,33 @@ describe("Anthropic stream sequence integrity", () => {
       })));
     }
 
-    for (const [second, label] of [[1, "duplicate"], [3, "gap"], [0, "regression"]] as const) {
+    for (const [second, label] of [[4, "duplicate"], [6, "gap"], [3, "regression"]] as const) {
       const translator = new AnthropicStreamTranslator(CONTEXT);
       translator.start();
-      expect(translator.push(frame(1, "response.future_ignored", { label }))).toEqual([]);
+      expect(translator.push(frame(4, "response.future_ignored", { label }))).toEqual([]);
       expectError(translator.push(frame(second, "response.another_ignored", { label })));
     }
   });
 
-  it("rejects a second completion instead of silently accepting post-terminal input", () => {
+  it("returns no output for every push or finish after message_stop", () => {
     const translator = new AnthropicStreamTranslator(CONTEXT);
     translator.start();
     expect(eventTypes(translator.push(frame(1, "response.completed", {
       response: finalResponse(),
     })))).toEqual(["message_delta", "message_stop"]);
-    expectError(translator.push(frame(2, "response.completed", {
+    expect(translator.push(frame(2, "response.completed", {
       response: finalResponse(),
-    })));
+    }))).toEqual([]);
+    expect(translator.push({ event: "malformed", data: "not-json" })).toEqual([]);
+    expect(translator.finish(finalResponse())).toEqual([]);
+
+    const failed = new AnthropicStreamTranslator(CONTEXT);
+    failed.start();
+    expect(failed.push(frame(0, "response.failed", {
+      response: { error: { message: "private" } },
+    }))).toMatchObject([{ type: "error" }]);
+    expect(failed.push(frame(1, "response.future_after_error"))).toEqual([]);
+    expect(failed.finish(finalResponse())).toEqual([]);
   });
 });
 
@@ -219,6 +237,18 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       name: "Read",
       arguments: "{}",
     }])));
+  });
+
+  it("rejects an observed zero-byte item that disappears from authoritative final", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(0, "response.output_text.delta", {
+      item_id: "msg_disappears",
+      output_index: 0,
+      content_index: 0,
+      delta: "",
+    }));
+    expectError(translator.finish(finalResponse([])));
   });
 
   it("rejects reverse/gapped content and summary index creation", () => {
@@ -391,5 +421,24 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       }
     }
     expect(open).toBe(false);
+  });
+
+  it("validates known event payloads even when prewarm suppresses content", () => {
+    const translator = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
+    translator.start();
+    expectError(translator.push(frame(0, "response.content_part.added", {
+      item_id: "msg_bad_prewarm",
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text" },
+    })));
+
+    const functionDone = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
+    functionDone.start();
+    expectError(functionDone.push(frame(5, "response.function_call_arguments.done", {
+      item_id: "fc_bad_done",
+      output_index: 0,
+      arguments: "{}",
+    })));
   });
 });

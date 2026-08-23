@@ -7,6 +7,7 @@ type PartState = {
   added: boolean;
   textDone: boolean;
   partDone: boolean;
+  seenUnits: number;
 };
 
 type ItemState = {
@@ -16,6 +17,7 @@ type ItemState = {
   added: boolean;
   done: boolean;
   argumentsDone: boolean;
+  argumentUnits: number;
   nextContentIndex: number;
   nextSummaryIndex: number;
   nextRawReasoningIndex: number;
@@ -60,6 +62,29 @@ function partRecord(event: Record<string, unknown>): Record<string, unknown> {
   return part;
 }
 
+function validateItem(item: Record<string, unknown>): void {
+  if (item.type === "message") {
+    if (item.role !== "assistant" || !Array.isArray(item.content)) fail();
+  } else if (item.type === "reasoning") {
+    if (!Array.isArray(item.summary)) fail();
+  } else if (item.type === "function_call") {
+    requiredString(item, "call_id");
+    requiredString(item, "name");
+    requiredText(item, "arguments");
+  }
+}
+
+function validateContentPart(part: Record<string, unknown>): void {
+  if (part.type === "output_text") {
+    requiredText(part, "text");
+    if (!Array.isArray(part.annotations)) fail();
+  } else if (part.type === "refusal") {
+    requiredText(part, "refusal");
+  } else {
+    fail();
+  }
+}
+
 export type ResponsesStreamProtocolSnapshot = {
   events: number;
   identities: number;
@@ -67,23 +92,32 @@ export type ResponsesStreamProtocolSnapshot = {
   retainedIdentities: number;
 };
 
+export type ResponsesStreamAcceptedSuffix = {
+  category: "text" | "reasoning" | "function";
+  value: string;
+};
+
 /** Validates official Responses event sequencing, aliases, and item/part lifecycles. */
 export class ResponsesStreamProtocol {
   readonly #itemsByIndex = new Map<number, ItemState>();
   readonly #itemsById = new Map<string, ItemState>();
-  #lastSequence = 0;
+  #lastSequence: number | null = null;
   #nextOutputIndex = 0;
+  #completedOutputPrefix = -1;
   #eventCount = 0;
   #identityCount = 0;
   #retainedIdentityCount = 0;
   #terminal = false;
+  #acceptedSuffix: ResponsesStreamAcceptedSuffix | null = null;
 
   constructor(private readonly limits: { maxEvents: number; maxIdentities: number }) {}
 
-  accept(event: Record<string, unknown>): void {
+  accept(event: Record<string, unknown>): ResponsesStreamAcceptedSuffix | null {
     if (this.#terminal) fail();
+    this.#acceptedSuffix = null;
     const sequence = event.sequence_number;
-    if (!Number.isSafeInteger(sequence) || Number(sequence) !== this.#lastSequence + 1) fail();
+    if (!Number.isSafeInteger(sequence) || Number(sequence) < 0 ||
+      (this.#lastSequence !== null && Number(sequence) !== this.#lastSequence + 1)) fail();
     if (this.#eventCount >= this.limits.maxEvents) fail();
     this.#lastSequence = Number(sequence);
     this.#eventCount += 1;
@@ -106,6 +140,7 @@ export class ResponsesStreamProtocol {
       case "response.function_call_arguments.delta": this.#argumentsDelta(event); break;
       case "response.function_call_arguments.done": this.#argumentsDone(event); break;
     }
+    return this.#acceptedSuffix;
   }
 
   markTerminal(): void {
@@ -113,18 +148,19 @@ export class ResponsesStreamProtocol {
   }
 
   canExpose(outputIndex: number): boolean {
-    for (let index = 0; index < outputIndex; index += 1) {
-      if (this.#itemsByIndex.get(index)?.done !== true) return false;
-    }
-    return true;
+    return outputIndex <= this.#completedOutputPrefix + 1;
   }
 
   validateFinal(value: unknown): void {
     const response = record(value);
     if (!response || !Array.isArray(response.output)) fail();
+    for (const outputIndex of this.#itemsByIndex.keys()) {
+      if (outputIndex >= response.output.length) fail();
+    }
     for (let outputIndex = 0; outputIndex < response.output.length; outputIndex += 1) {
       const item = record(response.output[outputIndex]);
       if (!item || typeof item.type !== "string" || !item.type) fail();
+      validateItem(item);
       const existing = this.#itemsByIndex.get(outputIndex);
       const itemId = typeof item.id === "string" && item.id
         ? item.id
@@ -133,6 +169,7 @@ export class ResponsesStreamProtocol {
           : requiredString(item, "id");
       const state = this.#item(outputIndex, itemId, item.type);
       state.done = true;
+      this.#advanceCompletedPrefix();
 
       if (item.type === "message") {
         if (!Array.isArray(item.content)) fail();
@@ -170,6 +207,7 @@ export class ResponsesStreamProtocol {
   #outputItemAdded(event: Record<string, unknown>): void {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
+    validateItem(item);
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.added || state.done) fail();
     state.added = true;
@@ -178,23 +216,29 @@ export class ResponsesStreamProtocol {
   #outputItemDone(event: Record<string, unknown>): void {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
+    validateItem(item);
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.done) fail();
     state.done = true;
+    this.#advanceCompletedPrefix();
   }
 
   #contentPartAdded(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "message");
+    const part = partRecord(event);
+    validateContentPart(part);
     const state = this.#part(item, "content", requiredIndex(event, "content_index"),
-      partRecord(event).type as string);
+      part.type as string);
     if (state.added || state.partDone || item.done) fail();
     state.added = true;
   }
 
   #contentPartDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "message");
+    const part = partRecord(event);
+    validateContentPart(part);
     const state = this.#part(item, "content", requiredIndex(event, "content_index"),
-      partRecord(event).type as string);
+      part.type as string);
     if (state.partDone || item.done) fail();
     state.partDone = true;
   }
@@ -203,18 +247,22 @@ export class ResponsesStreamProtocol {
     const item = this.#eventItem(event, "message");
     const state = this.#part(item, "content", requiredIndex(event, "content_index"), "output_text");
     if (state.textDone || state.partDone || item.done) fail();
+    state.seenUnits += requiredText(event, "delta").length;
   }
 
   #outputTextDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "message");
     const state = this.#part(item, "content", requiredIndex(event, "content_index"), "output_text");
     if (state.textDone || state.partDone || item.done) fail();
+    this.#recordDoneSuffix("text", state, requiredText(event, "text"));
     state.textDone = true;
   }
 
   #summaryPartAdded(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "reasoning");
-    if (partRecord(event).type !== "summary_text") fail();
+    const part = partRecord(event);
+    if (part.type !== "summary_text") fail();
+    requiredText(part, "text");
     const state = this.#part(item, "summary", requiredIndex(event, "summary_index"), "summary_text");
     if (state.added || state.partDone || item.done) fail();
     state.added = true;
@@ -222,7 +270,9 @@ export class ResponsesStreamProtocol {
 
   #summaryPartDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "reasoning");
-    if (partRecord(event).type !== "summary_text") fail();
+    const part = partRecord(event);
+    if (part.type !== "summary_text") fail();
+    requiredText(part, "text");
     const state = this.#part(item, "summary", requiredIndex(event, "summary_index"), "summary_text");
     if (state.partDone || item.done) fail();
     state.partDone = true;
@@ -232,13 +282,14 @@ export class ResponsesStreamProtocol {
     const item = this.#eventItem(event, "reasoning");
     const state = this.#part(item, "summary", requiredIndex(event, "summary_index"), "summary_text");
     if (state.textDone || state.partDone || item.done) fail();
+    state.seenUnits += requiredText(event, "delta").length;
   }
 
   #summaryTextDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "reasoning");
     const state = this.#part(item, "summary", requiredIndex(event, "summary_index"), "summary_text");
     if (state.textDone || state.partDone || item.done) fail();
-    requiredText(event, "text");
+    this.#recordDoneSuffix("reasoning", state, requiredText(event, "text"));
     state.textDone = true;
   }
 
@@ -246,24 +297,31 @@ export class ResponsesStreamProtocol {
     const item = this.#eventItem(event, "reasoning");
     const state = this.#part(item, "rawReasoning", requiredIndex(event, "content_index"), "reasoning_text");
     if (state.textDone || state.partDone || item.done) fail();
+    state.seenUnits += requiredText(event, "delta").length;
   }
 
   #rawReasoningDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "reasoning");
     const state = this.#part(item, "rawReasoning", requiredIndex(event, "content_index"), "reasoning_text");
     if (state.textDone || state.partDone || item.done) fail();
-    requiredText(event, "text");
+    this.#recordDoneSuffix("reasoning", state, requiredText(event, "text"));
     state.textDone = true;
   }
 
   #argumentsDelta(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "function_call");
     if (item.argumentsDone || item.done) fail();
+    item.argumentUnits += requiredText(event, "delta").length;
   }
 
   #argumentsDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "function_call");
     if (item.argumentsDone || item.done) fail();
+    requiredString(event, "name");
+    const args = requiredText(event, "arguments");
+    if (args.length < item.argumentUnits) fail();
+    this.#acceptedSuffix = { category: "function", value: args.slice(item.argumentUnits) };
+    item.argumentUnits = args.length;
     item.argumentsDone = true;
   }
 
@@ -281,7 +339,7 @@ export class ResponsesStreamProtocol {
     if (outputIndex !== this.#nextOutputIndex) fail();
     const state: ItemState = {
       outputIndex, itemId, type,
-      added: false, done: false, argumentsDone: false,
+      added: false, done: false, argumentsDone: false, argumentUnits: 0,
       nextContentIndex: 0, nextSummaryIndex: 0, nextRawReasoningIndex: 0,
       content: new Map(), summary: new Map(), rawReasoning: new Map(),
     };
@@ -308,7 +366,13 @@ export class ResponsesStreamProtocol {
       : collection === "summary" ? "nextSummaryIndex" : "nextRawReasoningIndex";
     if (index !== item[nextKey]) fail();
     item[nextKey] += 1;
-    const state: PartState = { type, added: false, textDone: false, partDone: false };
+    const state: PartState = {
+      type,
+      added: false,
+      textDone: false,
+      partDone: false,
+      seenUnits: 0,
+    };
     parts.set(index, state);
     this.#recordIdentity();
     return state;
@@ -318,5 +382,21 @@ export class ResponsesStreamProtocol {
     if (this.#identityCount >= this.limits.maxIdentities) fail();
     this.#identityCount += 1;
     this.#retainedIdentityCount += 1;
+  }
+
+  #advanceCompletedPrefix(): void {
+    while (this.#itemsByIndex.get(this.#completedOutputPrefix + 1)?.done === true) {
+      this.#completedOutputPrefix += 1;
+    }
+  }
+
+  #recordDoneSuffix(
+    category: "text" | "reasoning",
+    state: PartState,
+    value: string,
+  ): void {
+    if (value.length < state.seenUnits) fail();
+    this.#acceptedSuffix = { category, value: value.slice(state.seenUnits) };
+    state.seenUnits = value.length;
   }
 }

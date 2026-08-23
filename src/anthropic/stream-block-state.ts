@@ -23,6 +23,7 @@ export type StreamBlock = {
   toolId: string | null;
   toolName: string | null;
   argumentDeltaSeen: boolean;
+  argumentUnits: number;
   argumentBytes: number;
 };
 
@@ -62,6 +63,7 @@ export function createStreamBlock(
     toolId: null,
     toolName: null,
     argumentDeltaSeen: false,
+    argumentUnits: 0,
     argumentBytes: 0,
   };
 }

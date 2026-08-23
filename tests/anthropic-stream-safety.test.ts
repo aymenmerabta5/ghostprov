@@ -206,6 +206,21 @@ describe("Anthropic stream Unicode-safe stop filtering", () => {
       delta: { stop_reason: "stop_sequence", stop_sequence: "X" },
     });
   });
+
+  it("rejects lone surrogate data in authoritative final fallback", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    const events = translator.finish(finalResponse([
+      message("msg_bad_fallback_unicode", "\ud800"),
+    ]));
+
+    expect(events).toEqual([{
+      type: "error",
+      error: { type: "api_error", message: "Responses stream failed." },
+      request_id: CONTEXT.requestId,
+    }]);
+    expect(events.some(event => event.type === "message_stop")).toBe(false);
+  });
 });
 
 describe("Anthropic stream error privacy", () => {
@@ -236,14 +251,21 @@ describe("Anthropic stream error privacy", () => {
     expect(JSON.stringify(rateEvents)).not.toContain("secret");
   });
 
-  it("preserves only trusted client validation messages", () => {
-    const translator = new AnthropicStreamTranslator(CONTEXT);
-    translator.start();
-    expect(translator.fail(new ApiError(400, "client field is invalid"))).toEqual([{
-      type: "error",
-      error: { type: "invalid_request_error", message: "client field is invalid" },
-      request_id: CONTEXT.requestId,
-    }]);
+  it("redacts every externally supplied fail error, including 400 and 413", () => {
+    for (const [error, type] of [
+      [new ApiError(400, "secret client field"), "invalid_request_error"],
+      [new AnthropicRequestError(413, "secret oversized body", "request_too_large"), "request_too_large"],
+    ] as const) {
+      const translator = new AnthropicStreamTranslator(CONTEXT);
+      translator.start();
+      const events = translator.fail(error);
+      expect(events).toEqual([{
+        type: "error",
+        error: { type, message: "Responses stream failed." },
+        request_id: CONTEXT.requestId,
+      }]);
+      expect(JSON.stringify(events)).not.toContain("secret");
+    }
   });
 });
 

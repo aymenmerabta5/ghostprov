@@ -6,6 +6,7 @@ type StreamByteCategory = "text" | "reasoning" | "function";
 type BudgetSnapshot = Pick<
   AnthropicStreamSnapshot,
   | "outputBlocks"
+  | "wireBytes"
   | "streamedBytes"
   | "functionBytes"
   | "reasoningBytes"
@@ -17,6 +18,7 @@ type BudgetSnapshot = Pick<
 
 export class AnthropicStreamBudget {
   #outputBlocks = 0;
+  #wireBytes = 0;
   #pendingChunks = 0;
   #retainedPendingChunks = 0;
   #retainedPendingBytes = 0;
@@ -26,6 +28,14 @@ export class AnthropicStreamBudget {
   #textBytes = 0;
 
   constructor(private readonly limits: AnthropicStreamLimits) {}
+
+  countWire(value: string): void {
+    const total = this.#safeAdd(this.#wireBytes, Buffer.byteLength(value, "utf8"));
+    if (total > this.limits.maxWireBytes) {
+      throw invalidUpstream("Responses stream exceeded its cumulative wire byte limit.");
+    }
+    this.#wireBytes = total;
+  }
 
   countPayload(category: StreamByteCategory, value: string): void {
     const bytes = Buffer.byteLength(value, "utf8");
@@ -78,6 +88,7 @@ export class AnthropicStreamBudget {
   snapshot(): BudgetSnapshot {
     return {
       outputBlocks: this.#outputBlocks,
+      wireBytes: this.#wireBytes,
       streamedBytes: this.#streamedBytes,
       functionBytes: this.#functionBytes,
       reasoningBytes: this.#reasoningBytes,

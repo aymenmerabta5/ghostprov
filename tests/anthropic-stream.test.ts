@@ -118,12 +118,14 @@ describe("Responses to Anthropic stream translation", () => {
       frame("response.function_call_arguments.done", {
         item_id: "fc_1",
         output_index: 2,
+        name: "Read",
         arguments: "{\"file_path\":\"a\"}",
       }),
       frame("response.output_item.done", { output_index: 2, item: final.output[2] }),
       frame("response.function_call_arguments.done", {
         item_id: "fc_2",
         output_index: 3,
+        name: "Read",
         arguments: "{\"file_path\":\"b\"}",
       }),
       frame("response.output_item.done", { output_index: 3, item: final.output[3] }),
@@ -254,7 +256,7 @@ describe("Responses to Anthropic stream translation", () => {
     expect(events.filter(event => event.type === "message_stop")).toHaveLength(1);
     expect(translator.finish(final)).toEqual([]);
     expect(translator.push(frame("response.completed", { response: final })))
-      .toMatchObject([{ type: "error" }]);
+      .toEqual([]);
   });
 
   it("rejects an authoritative final whose text diverges from the streamed prefix", () => {

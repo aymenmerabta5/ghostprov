@@ -21,6 +21,20 @@ function isLowSurrogate(code: number): boolean {
   return code >= 0xdc00 && code <= 0xdfff;
 }
 
+export function assertUnicodeWellFormed(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (isHighSurrogate(code)) {
+      if (index + 1 >= value.length || !isLowSurrogate(value.charCodeAt(index + 1))) {
+        throw new TypeError("Responses data contains an invalid Unicode scalar value");
+      }
+      index += 1;
+    } else if (isLowSurrogate(code)) {
+      throw new TypeError("Responses data contains an invalid Unicode scalar value");
+    }
+  }
+}
+
 /** Retains only a bounded Unicode-code-point suffix needed for stop matching. */
 export class UnicodeStopFilter<T> {
   readonly #sequences: Array<{ source: string; points: string[]; failure: number[] }>;

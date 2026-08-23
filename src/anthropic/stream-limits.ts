@@ -1,5 +1,6 @@
 export type AnthropicStreamLimits = {
   maxEvents: number;
+  maxWireBytes: number;
   maxOutputBlocks: number;
   maxIdentities: number;
   maxStreamedBytes: number;
@@ -11,7 +12,8 @@ export type AnthropicStreamLimits = {
 
 export const DEFAULT_ANTHROPIC_STREAM_LIMITS: Readonly<AnthropicStreamLimits> = Object.freeze({
   maxEvents: 1_000_000,
-  maxOutputBlocks: 100_000,
+  maxWireBytes: 128 * 1024 * 1024,
+  maxOutputBlocks: 4_096,
   maxIdentities: 200_000,
   maxStreamedBytes: 64 * 1024 * 1024,
   maxFunctionBytes: 32 * 1024 * 1024,
@@ -34,6 +36,7 @@ export function resolveAnthropicStreamLimits(
 
 export type AnthropicStreamSnapshot = {
   events: number;
+  wireBytes: number;
   outputBlocks: number;
   identities: number;
   streamedBytes: number;

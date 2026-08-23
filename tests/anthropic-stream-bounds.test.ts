@@ -63,6 +63,7 @@ describe("Anthropic stream cumulative production bounds", () => {
   it("publishes finite positive production defaults", () => {
     expect(DEFAULT_ANTHROPIC_STREAM_LIMITS).toEqual({
       maxEvents: expect.any(Number),
+      maxWireBytes: expect.any(Number),
       maxOutputBlocks: expect.any(Number),
       maxIdentities: expect.any(Number),
       maxStreamedBytes: expect.any(Number),
@@ -75,6 +76,7 @@ describe("Anthropic stream cumulative production bounds", () => {
       expect(Number.isSafeInteger(value)).toBe(true);
       expect(value).toBeGreaterThan(0);
     }
+    expect(DEFAULT_ANTHROPIC_STREAM_LIMITS.maxOutputBlocks).toBeLessThanOrEqual(4_096);
   });
 
   it("bounds zero-byte event, block, and identity cardinality", () => {
@@ -163,6 +165,153 @@ describe("Anthropic stream cumulative production bounds", () => {
       output_index: 0,
       delta: "1234",
     })));
+  });
+
+  it("counts every raw wire frame, including unknown and terminal error frames", () => {
+    const unknown = frame(0, "response.future_wire", { payload: "abc" });
+    const failed = frame(1, "response.failed", {
+      response: { error: { message: "private" } },
+    });
+    const expectedBytes = Buffer.byteLength(unknown.data, "utf8") +
+      Buffer.byteLength(failed.data, "utf8");
+    const translator = new AnthropicStreamTranslator(streamContext({
+      maxWireBytes: expectedBytes,
+    }));
+    translator.start();
+    expect(translator.push(unknown)).toEqual([]);
+    expect(translator.push(failed)).toMatchObject([{ type: "error" }]);
+    expect(translator.snapshot().wireBytes).toBe(expectedBytes);
+
+    const bounded = new AnthropicStreamTranslator(streamContext({
+      maxWireBytes: Buffer.byteLength(unknown.data, "utf8"),
+    }));
+    bounded.start();
+    bounded.push(unknown);
+    expectError(bounded.push(failed));
+  });
+
+  it("counts only unseen done-event suffix bytes and never double-counts deltas", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(0, "response.output_text.delta", {
+      item_id: "msg_bounds",
+      output_index: 0,
+      content_index: 0,
+      delta: "ab",
+    }));
+    translator.push(frame(1, "response.output_text.done", {
+      item_id: "msg_bounds",
+      output_index: 0,
+      content_index: 0,
+      text: "abcd",
+    }));
+    expect(translator.snapshot()).toMatchObject({
+      textBytes: 4,
+      streamedBytes: 4,
+    });
+    translator.finish(finalText("abcd"));
+    expect(translator.snapshot()).toMatchObject({
+      textBytes: 4,
+      streamedBytes: 4,
+    });
+
+    for (const [deltaType, doneType] of [
+      ["response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"],
+      ["response.reasoning_text.delta", "response.reasoning_text.done"],
+    ] as const) {
+      const reasoning = new AnthropicStreamTranslator(CONTEXT);
+      reasoning.start();
+      reasoning.push(frame(0, deltaType, {
+        item_id: "rs_done_bytes",
+        output_index: 0,
+        ...(deltaType.includes("summary") ? { summary_index: 0 } : { content_index: 0 }),
+        delta: "ab",
+      }));
+      reasoning.push(frame(1, doneType, {
+        item_id: "rs_done_bytes",
+        output_index: 0,
+        ...(doneType.includes("summary") ? { summary_index: 0 } : { content_index: 0 }),
+        text: "abcd",
+      }));
+      expect(reasoning.snapshot()).toMatchObject({
+        reasoningBytes: 4,
+        streamedBytes: 4,
+      });
+    }
+
+    const blankTool = new AnthropicStreamTranslator(CONTEXT);
+    blankTool.start();
+    blankTool.push(frame(0, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_blank_bytes",
+        status: "in_progress",
+        call_id: "call_blank_bytes",
+        name: "Read",
+        arguments: "",
+      },
+    }));
+    blankTool.push(frame(1, "response.function_call_arguments.done", {
+      item_id: "fc_blank_bytes",
+      output_index: 0,
+      name: "Read",
+      arguments: "",
+    }));
+    expect(blankTool.snapshot()).toMatchObject({
+      functionBytes: 2,
+      streamedBytes: 2,
+    });
+  });
+
+  it("accounts final-only text, reasoning, and function data", () => {
+    const final = {
+      ...finalText("text"),
+      output: [
+        {
+          type: "reasoning",
+          id: "rs_final_bytes",
+          status: "completed",
+          encrypted_content: "cipher",
+          summary: [{ type: "summary_text", text: "think" }],
+        },
+        {
+          type: "message",
+          id: "msg_bounds",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "text", annotations: [], logprobs: [] }],
+        },
+        {
+          type: "function_call",
+          id: "fc_final_bytes",
+          status: "completed",
+          call_id: "call_final_bytes",
+          name: "Read",
+          arguments: "{\"x\":1}",
+        },
+      ],
+    };
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.finish(final);
+    expect(translator.snapshot()).toMatchObject({
+      textBytes: 4,
+      reasoningBytes: 5,
+      functionBytes: 7,
+      streamedBytes: 16,
+    });
+  });
+
+  it("enforces category limits for authoritative terminal-only output", () => {
+    const translator = new AnthropicStreamTranslator(streamContext({
+      maxTextBytes: 3,
+      maxStreamedBytes: 3,
+    }));
+    translator.start();
+    const events = translator.finish(finalText("four"));
+    expectError(events);
+    expect(events.some(event => event.type === "message_stop")).toBe(false);
   });
 
   it("bounds cumulative pending chunk history even after chunks are emitted", () => {
@@ -273,6 +422,7 @@ describe("Anthropic stream sanitized snapshots", () => {
       outputBlocks: 1,
       identities: 2,
       streamedBytes: 1,
+      wireBytes: expect.any(Number),
       textBytes: 1,
       reasoningBytes: 0,
       functionBytes: 0,

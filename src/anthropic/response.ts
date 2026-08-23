@@ -26,6 +26,7 @@ import {
 } from "./response-validation";
 import { usageFromResponses } from "./response-usage";
 import type { AnthropicStreamLimits } from "./stream-limits";
+import { assertUnicodeWellFormed } from "./stream-stop-filter";
 import type {
   AnthropicAdapterMessage,
   AnthropicResponseContentBlock,
@@ -78,6 +79,7 @@ function reasoningBlock(
     if (!summary || summary.type !== "summary_text" || typeof summary.text !== "string") {
       malformedFinal();
     }
+    assertUnicodeWellFormed(summary.text as string);
     summaryText.push(summary.text);
   }
 
@@ -109,10 +111,12 @@ function appendMessageBlocks(
   let sawRefusal = false;
   for (const part of item.content) {
     if (part.type === "output_text") {
+      assertUnicodeWellFormed(part.text);
       blocks.push({ type: "text", text: part.text, citations: null });
       ordinaryText.push(part.text);
       stopBlockIndexes.push(blocks.length - 1);
     } else {
+      assertUnicodeWellFormed(part.refusal);
       blocks.push({ type: "text", text: part.refusal, citations: null });
       ordinaryText.push(null);
       stopBlockIndexes.push(blocks.length - 1);
@@ -126,6 +130,7 @@ function functionCallBlock(
   item: ResponsesFinalFunctionCallItem,
   limits: AnthropicRequestLimits,
 ): AnthropicToolUseBlock {
+  assertUnicodeWellFormed(item.arguments);
   if (Buffer.byteLength(item.arguments, "utf8") > limits.outputBytes) {
     throw invalidUpstream("Responses relay returned invalid function call arguments.");
   }
