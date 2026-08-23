@@ -114,6 +114,13 @@ describe("project documentation", () => {
     expect(readme).toContain("sixty-second decaying sandbox health score");
   });
 
+  it("documents active-flight credits and bounded completion recovery", () => {
+    expect(readme).toContain("ACK-stall age starts with the active reliable flight");
+    expect(readme).toContain("a fully drained transport restores credits immediately");
+    expect(readme).toContain("completion estimates cap extreme model durations");
+    expect(readme).toContain("neutral ten-second baseline every idle minute");
+  });
+
   it("keeps live multi-sandbox state out of version control", () => {
     expect(gitignore.split(/\r?\n/)).toContain(".ghostprov/");
   });

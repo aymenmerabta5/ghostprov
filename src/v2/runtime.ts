@@ -29,6 +29,7 @@ import {
   DecayingRuntimeFailureScore,
   classifyRuntimeError,
 } from "./runtime-health";
+import { DecayingRuntimeCompletionEstimate } from "./runtime-completion";
 
 export interface V2RuntimeProvisioning {
   provision(
@@ -154,6 +155,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   readonly #options: V2SandboxRuntimeOptions;
   readonly #clock: Clock;
   readonly #runtimeHealth: DecayingRuntimeFailureScore;
+  readonly #completionEstimate: DecayingRuntimeCompletionEstimate;
   readonly #listeners = new Set<() => void>();
   readonly #resourceRefreshLeadMs: number;
   readonly #ySweetRefreshMs: number;
@@ -172,7 +174,6 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #credentials: ProvisionedRuntimeCredentials | null = null;
   #descriptor: V2ReadyDescriptor | null = null;
   #failure: unknown = null;
-  #completionEwmaMs: number | null = null;
 
   constructor(options: V2SandboxRuntimeOptions) {
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
@@ -205,6 +206,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#options = options;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#runtimeHealth = new DecayingRuntimeFailureScore({ clock: this.#clock });
+    this.#completionEstimate = new DecayingRuntimeCompletionEstimate({ clock: this.#clock });
     this.#resourceRefreshLeadMs = refreshLead;
     this.#ySweetRefreshMs = ySweetRefreshMs;
   }
@@ -268,9 +270,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           this.#clock.now() - startedAt,
           handle.stats.firstByteMs ?? 0,
         );
-        this.#completionEwmaMs = this.#completionEwmaMs === null
-          ? sample
-          : this.#completionEwmaMs * 0.8 + sample * 0.2;
+        this.#completionEstimate.observe(sample);
         this.#runtimeHealth.record("healthy");
         this.#emit();
         return value;
@@ -323,7 +323,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         ? Math.max(0, this.#credentials.resource.expiresAtMs - this.#clock.now())
         : null,
       ackEwmaMs: transport?.awarenessRttMs ?? 0,
-      completionEwmaMs: this.#completionEwmaMs ?? 0,
+      completionEwmaMs: this.#completionEstimate.value(),
       recentFailureRate: this.#runtimeHealth.value(),
       queueDepth: transport?.queued ?? 0,
       memoryPressure,

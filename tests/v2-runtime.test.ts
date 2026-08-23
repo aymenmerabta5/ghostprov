@@ -357,6 +357,34 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("caps extreme completion duration and recovers its routing estimate while idle", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    expect(harness.runtime.snapshot().completionEwmaMs).toBe(10_000);
+
+    const extreme = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "extreme-duration",
+    });
+    await harness.clock.advanceBy(553_855);
+    harness.transport.pending[0]!.resolve({ id: "resp_extreme", status: "completed" });
+    await expect(extreme.final).resolves.toMatchObject({ id: "resp_extreme" });
+    expect(harness.runtime.snapshot().completionEwmaMs).toBe(20_000);
+
+    await harness.clock.advanceBy(60_000);
+    expect(harness.runtime.snapshot().completionEwmaMs).toBe(15_000);
+
+    const ordinary = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "ordinary-duration",
+    });
+    await harness.clock.advanceBy(6_000);
+    harness.transport.pending[1]!.resolve({ id: "resp_ordinary", status: "completed" });
+    await expect(ordinary.final).resolves.toMatchObject({ id: "resp_ordinary" });
+    expect(harness.runtime.snapshot().completionEwmaMs).toBeCloseTo(12_932.13, 1);
+    await harness.runtime.stop();
+  });
+
   it("keeps one hundred cancellations and definitive upstream errors health-neutral", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();

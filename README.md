@@ -55,6 +55,7 @@ Failure rules:
 - One failed project never stops healthy projects.
 - Global zero-capacity queueing fails with a typed 503 after 30 seconds instead of waiting for a client WebSocket idle timeout.
 - Client cancellations and definitive upstream errors are routing-neutral; only transport-attributable failures feed a sixty-second decaying sandbox health score.
+- ACK-stall age starts with the active reliable flight; idle time never suppresses credits, and a fully drained transport restores credits immediately.
 
 ## Concurrency and latency
 
@@ -77,6 +78,8 @@ CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent and frame-free, freezes each 128 KiB data flight until cumulative ACK, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer.
 
 WebSocket `store:false` continuation caches retain only byte-budgeted deltas; full histories are materialized per request and never cached quadratically.
+
+Per-runtime completion estimates cap extreme model durations and decay halfway toward a neutral ten-second baseline every idle minute.
 
 Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 
@@ -330,6 +333,7 @@ The isolated suite includes:
 - `tests/v2-response-batch.test.ts`
 - `tests/v2-response-batcher.test.ts`
 - `tests/v2-run-handle.test.ts`
+- `tests/v2-runtime-completion.test.ts`
 - `tests/v2-runtime.test.ts`
 - `tests/v2-runtime-health.test.ts`
 - `tests/v2-scheduler.test.ts`
