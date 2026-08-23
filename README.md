@@ -333,6 +333,7 @@ The isolated suite includes:
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-sidecar-rotation.test.ts`
 - `tests/v2-split-awareness-channel.test.ts`
+- `tests/v2-split-flight-integration.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`
