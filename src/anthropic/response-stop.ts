@@ -10,8 +10,8 @@ import type {
 import {
   finalContainsRefusal,
   invalidUpstream,
-  terminalResponse,
-  type TerminalResponse,
+  validateTerminalResponseProjection,
+  type ValidatedTerminalResponseProjection,
 } from "./response-validation";
 
 export type StopMatch = {
@@ -96,7 +96,7 @@ function hasToolUse(blocks: readonly AnthropicContentBlock[]): boolean {
 }
 
 export function resolveStopReason(
-  terminal: Pick<TerminalResponse, "status" | "incompleteReason">,
+  terminal: Pick<ValidatedTerminalResponseProjection, "status" | "incompleteReason">,
   blocks: readonly AnthropicContentBlock[],
   matchedStop: string | null,
   sawRefusal: boolean,
@@ -113,7 +113,7 @@ export function stopReasonFromResponses(
   blocks: readonly AnthropicContentBlock[],
   matchedStop: string | null,
 ): AnthropicAdapterStopReason {
-  const terminal = terminalResponse(finalValue);
+  const terminal = validateTerminalResponseProjection(finalValue);
   return resolveStopReason(
     terminal,
     blocks,

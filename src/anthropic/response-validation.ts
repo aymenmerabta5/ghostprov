@@ -7,7 +7,7 @@ import type {
   ResponsesIncompleteReason,
 } from "./response-types";
 
-export type TerminalResponse = {
+export type ValidatedTerminalResponseProjection = {
   record: Record<string, unknown>;
   output: unknown[];
   status: "completed" | "incomplete";
@@ -28,7 +28,9 @@ export function malformedFinal(): never {
   throw invalidUpstream("Responses relay returned a malformed final response.");
 }
 
-export function terminalResponse(value: unknown): TerminalResponse {
+export function validateTerminalResponseProjection(
+  value: unknown,
+): ValidatedTerminalResponseProjection {
   const final = record(value);
   if (!final) malformedFinal();
   if (typeof final.id !== "string" || final.id.length === 0) malformedFinal();
@@ -72,7 +74,7 @@ export function terminalResponse(value: unknown): TerminalResponse {
 
 function validTerminalItemStatus(
   status: unknown,
-  terminalStatus: TerminalResponse["status"],
+  terminalStatus: ValidatedTerminalResponseProjection["status"],
   required: boolean,
 ): boolean {
   if (status === undefined) return !required;
@@ -134,9 +136,9 @@ function validOutputTextKnownFields(part: Record<string, unknown>): boolean {
     part.logprobs.every(value => validLogprob(value, true));
 }
 
-export function finalOutputItem(
+export function validateTerminalOutputItemProjection(
   value: unknown,
-  terminalStatus: TerminalResponse["status"],
+  terminalStatus: ValidatedTerminalResponseProjection["status"],
 ): ResponsesFinalOutputItem {
   const item = record(value);
   if (!item) malformedFinal();
@@ -215,10 +217,10 @@ export function finalOutputItem(
 
 export function finalContainsRefusal(
   output: readonly unknown[],
-  terminalStatus: TerminalResponse["status"],
+  terminalStatus: ValidatedTerminalResponseProjection["status"],
 ): boolean {
   for (const itemValue of output) {
-    const item = finalOutputItem(itemValue, terminalStatus);
+    const item = validateTerminalOutputItemProjection(itemValue, terminalStatus);
     if (item.type === "message" && item.content.some(part => part.type === "refusal")) {
       return true;
     }

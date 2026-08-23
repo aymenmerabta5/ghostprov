@@ -1,9 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import type { AnthropicResponseContentBlock } from "../src/anthropic/types";
-import type {
-  ResponsesFinalOutputItem,
-  ResponsesFinalResponse,
-  ResponsesLogprob,
+import {
+  responseToAnthropic as publicResponseToAnthropic,
+  type AnthropicAdapterMessage,
+  type AnthropicResponseContext,
+  type ResponsesFinalOutputItem,
+  type ResponsesFinalItemStatus,
+  type ResponsesLogprob,
+  type TerminalResponseProjection,
 } from "../src/anthropic/response";
 import {
   CONTEXT,
@@ -58,7 +62,7 @@ void invalidTypedFinalOutput;
 void typedAnthropicOutput;
 void invalidAnthropicOutput;
 
-const typedFinalResponse: ResponsesFinalResponse = {
+const typedFinalResponse: TerminalResponseProjection = {
   id: "resp_typed",
   object: "response",
   created_at: 1,
@@ -68,8 +72,9 @@ const typedFinalResponse: ResponsesFinalResponse = {
   incomplete_details: null,
   output: [],
   usage: DEFAULT_RESPONSES_USAGE,
+  irrelevant_additive_field: { ignored: true },
 };
-const invalidTypedFinalResponse: ResponsesFinalResponse = {
+const invalidTypedFinalResponse: TerminalResponseProjection = {
   ...typedFinalResponse,
   // @ts-expect-error Current final usage requires total_tokens.
   usage: {
@@ -81,6 +86,14 @@ const invalidTypedFinalResponse: ResponsesFinalResponse = {
 };
 void typedFinalResponse;
 void invalidTypedFinalResponse;
+
+const typedItemStatuses: ResponsesFinalItemStatus[] = ["in_progress", "completed", "incomplete"];
+const typedAdapterConverter: (
+  finalValue: unknown,
+  context: AnthropicResponseContext,
+) => AnthropicAdapterMessage = publicResponseToAnthropic;
+void typedItemStatuses;
+void typedAdapterConverter;
 
 const typedLogprob: ResponsesLogprob = {
   token: "a",
@@ -347,6 +360,10 @@ describe("Anthropic response terminal validation", () => {
     const message = responseToAnthropic({
       id: "resp_optional_output_fields",
       status: "completed",
+      metadata: { irrelevant: "metadata-marker" },
+      temperature: 0.75,
+      tools: [{ type: "future_tool", marker: "tool-marker" }],
+      future_top_level_field: { ignored: true },
       output: [
         {
           type: "reasoning",
@@ -392,6 +409,10 @@ describe("Anthropic response terminal validation", () => {
       "tool_use",
     ]);
     expect(message.stop_reason).toBe("tool_use");
+    expect(JSON.stringify(message)).not.toContain("metadata-marker");
+    expect(JSON.stringify(message)).not.toContain("tool-marker");
+    expect(message).not.toHaveProperty("temperature");
+    expect(message).not.toHaveProperty("future_top_level_field");
 
     const incomplete = responseToAnthropic({
       id: "resp_optional_incomplete_items",

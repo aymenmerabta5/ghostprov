@@ -14,20 +14,19 @@ import {
 } from "./response-stop";
 import type {
   ResponsesFinalFunctionCallItem,
-  ResponsesFinalItemStatus,
   ResponsesFinalMessageItem,
   ResponsesFinalReasoningItem,
 } from "./response-types";
 import {
-  finalOutputItem,
   invalidUpstream,
   malformedFinal,
   record,
-  terminalResponse,
+  validateTerminalOutputItemProjection,
+  validateTerminalResponseProjection,
 } from "./response-validation";
 import { usageFromResponses } from "./response-usage";
 import type {
-  AnthropicMessage,
+  AnthropicAdapterMessage,
   AnthropicResponseContentBlock,
   AnthropicThinkingBlock,
   AnthropicToolUseBlock,
@@ -35,18 +34,23 @@ import type {
 
 export type {
   ResponsesFinalFunctionCallItem,
+  ResponsesFinalItemStatus,
   ResponsesFinalMessageItem,
   ResponsesFinalOutputItem,
   ResponsesFinalReasoningItem,
-  ResponsesFinalResponse,
   ResponsesIncompleteReason,
   ResponsesLogprob,
   ResponsesOutputRefusal,
   ResponsesOutputText,
   ResponsesReasoningSummary,
   ResponsesUsage,
+  TerminalResponseProjection,
 } from "./response-types";
-export type { AnthropicAdapterStopReason, AnthropicStopReason } from "./types";
+export type {
+  AnthropicAdapterMessage,
+  AnthropicAdapterStopReason,
+  AnthropicStopReason,
+} from "./types";
 export { stopReasonFromResponses, usageFromResponses };
 
 export type AnthropicResponseContext = Pick<
@@ -156,8 +160,8 @@ function functionCallBlock(
 export function responseToAnthropic(
   finalValue: unknown,
   context: AnthropicResponseContext,
-): AnthropicMessage {
-  const terminal = terminalResponse(finalValue);
+): AnthropicAdapterMessage {
+  const terminal = validateTerminalResponseProjection(finalValue);
   const usage = usageFromResponses(
     terminal.record.usage,
     context.estimatedInputTokens,
@@ -193,7 +197,9 @@ export function responseToAnthropic(
     throw invalidUpstream("Anthropic response context is malformed.");
   }
   const stopSequences = responseStopSequences(context.stopSequences);
-  const items = terminal.output.map(item => finalOutputItem(item, terminal.status));
+  const items = terminal.output.map(
+    item => validateTerminalOutputItemProjection(item, terminal.status),
+  );
   const suppressTools = terminal.incompleteReason === "content_filter" || items.some(item =>
     item.type === "message" && item.content.some(part => part.type === "refusal")
   );

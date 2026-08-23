@@ -86,7 +86,7 @@ export type ResponsesUsage = {
   [key: string]: unknown;
 };
 
-type ResponsesFinalBase = {
+type TerminalResponseProjectionBase = {
   id: string;
   object: "response";
   created_at: number;
@@ -98,7 +98,7 @@ type ResponsesFinalBase = {
   [key: string]: unknown;
 };
 
-export type ResponsesFinalResponse = ResponsesFinalBase & (
+export type TerminalResponseProjection = TerminalResponseProjectionBase & (
   | {
     status: "completed";
     incomplete_details: null;

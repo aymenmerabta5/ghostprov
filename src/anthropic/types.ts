@@ -120,3 +120,7 @@ export type AnthropicMessage = {
   usage: AnthropicUsage;
   [key: string]: unknown;
 };
+
+export type AnthropicAdapterMessage = AnthropicMessage & {
+  stop_reason: AnthropicAdapterStopReason;
+};
