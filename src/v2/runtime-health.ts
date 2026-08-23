@@ -4,9 +4,11 @@ export type RuntimeHealthOutcome = "healthy" | "neutral" | "unhealthy";
 
 const NEUTRAL_CODES = new Set([
   "cancelled",
+  "capacity",
   "capacity_changed",
   "draining",
   "request_too_large",
+  "response_too_large",
 ]);
 
 function errorRecord(value: unknown): Record<string, unknown> {

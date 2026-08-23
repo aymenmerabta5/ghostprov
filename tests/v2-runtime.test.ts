@@ -24,6 +24,7 @@ import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import type {
   V2TransportSnapshot,
 } from "../src/v2/transport/session";
+import { V2CommittedError } from "../src/v2/transport/run-handle";
 import {
   V2SandboxRuntime,
   type V2RuntimeBootstrap,
@@ -353,6 +354,69 @@ describe("V2SandboxRuntime", () => {
     harness.transport.pending[0]!.resolve({ id: "resp_1", status: "completed" });
     await expect(handle.final).resolves.toMatchObject({ id: "resp_1" });
     expect(harness.runtime.snapshot().completionEwmaMs).toBeGreaterThan(0);
+    await harness.runtime.stop();
+  });
+
+  it("keeps one hundred cancellations and definitive upstream errors health-neutral", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    for (let index = 0; index < 100; index++) {
+      const handle = await harness.runtime.run({
+        model: "gpt-5.6-sol",
+        input: `cancel-${index}`,
+      });
+      harness.transport.pending[index]!.reject(new V2CommittedError(
+        "V2 request was cancelled after commitment",
+        "cancelled",
+        true,
+      ));
+      await expect(handle.final).rejects.toMatchObject({ code: "cancelled" });
+    }
+    expect(harness.runtime.snapshot().recentFailureRate).toBe(0);
+
+    const definitive = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "definitive-upstream-error",
+    });
+    harness.transport.pending[100]!.reject(new V2CommittedError(
+      "Missing required parameter: 'model'.",
+      "missing_required_parameter",
+      false,
+    ));
+    await expect(definitive.final).rejects.toMatchObject({
+      code: "missing_required_parameter",
+    });
+    expect(harness.runtime.snapshot().recentFailureRate).toBe(0);
+    await harness.runtime.stop();
+  });
+
+  it("penalizes ambiguous transport failure temporarily and heals on success", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    const failed = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "ambiguous",
+    });
+    harness.transport.pending[0]!.reject(new V2CommittedError(
+      "Transport lost terminal proof",
+      "transport",
+      true,
+    ));
+    await expect(failed.final).rejects.toMatchObject({ code: "transport" });
+    expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.20);
+
+    await harness.clock.advanceBy(60_000);
+    expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.10);
+
+    const healthy = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "healthy",
+    });
+    harness.transport.pending[1]!.resolve({ id: "resp_healthy", status: "completed" });
+    await expect(healthy.final).resolves.toMatchObject({ id: "resp_healthy" });
+    expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.08);
     await harness.runtime.stop();
   });
 });

@@ -25,6 +25,10 @@ import type {
   V2TransportSession,
   V2TransportSnapshot,
 } from "./transport/session";
+import {
+  DecayingRuntimeFailureScore,
+  classifyRuntimeError,
+} from "./runtime-health";
 
 export interface V2RuntimeProvisioning {
   provision(
@@ -149,6 +153,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   readonly projectId: ProjectId;
   readonly #options: V2SandboxRuntimeOptions;
   readonly #clock: Clock;
+  readonly #runtimeHealth: DecayingRuntimeFailureScore;
   readonly #listeners = new Set<() => void>();
   readonly #resourceRefreshLeadMs: number;
   readonly #ySweetRefreshMs: number;
@@ -168,8 +173,6 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #descriptor: V2ReadyDescriptor | null = null;
   #failure: unknown = null;
   #completionEwmaMs: number | null = null;
-  #attempts = 0;
-  #failures = 0;
 
   constructor(options: V2SandboxRuntimeOptions) {
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
@@ -201,6 +204,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.projectId = options.projectId;
     this.#options = options;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#runtimeHealth = new DecayingRuntimeFailureScore({ clock: this.#clock });
     this.#resourceRefreshLeadMs = refreshLead;
     this.#ySweetRefreshMs = ySweetRefreshMs;
   }
@@ -249,12 +253,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const ceiling = this.#hostCeiling(this.#descriptor.capacity);
     this.#transport.setHostCeiling?.(ceiling);
     const startedAt = this.#clock.now();
-    this.#attempts++;
     let handle: RunHandle;
     try {
       handle = await this.#transport.run(body, signal);
     } catch (error) {
-      this.#failures++;
+      this.#runtimeHealth.record(classifyRuntimeError(error));
+      this.#emit();
       throw error;
     }
     const final = handle.final.then(
@@ -267,11 +271,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#completionEwmaMs = this.#completionEwmaMs === null
           ? sample
           : this.#completionEwmaMs * 0.8 + sample * 0.2;
+        this.#runtimeHealth.record("healthy");
         this.#emit();
         return value;
       },
       error => {
-        this.#failures++;
+        this.#runtimeHealth.record(classifyRuntimeError(error));
         this.#emit();
         throw error;
       },
@@ -319,7 +324,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         : null,
       ackEwmaMs: transport?.awarenessRttMs ?? 0,
       completionEwmaMs: this.#completionEwmaMs ?? 0,
-      recentFailureRate: this.#attempts > 0 ? this.#failures / this.#attempts : 0,
+      recentFailureRate: this.#runtimeHealth.value(),
       queueDepth: transport?.queued ?? 0,
       memoryPressure,
       failure: this.#failure ? describeSandboxFailure(this.#failure) : null,
@@ -341,7 +346,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           if (generation === this.#generation) void this.drain(`heartbeat-expired:${status}`);
         },
         onTransientFailure: () => {
-          this.#failures++;
+          this.#runtimeHealth.record("unhealthy");
           this.#emit();
         },
       });
@@ -454,7 +459,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#emit();
       } catch (error) {
         if (signal.aborted) return;
-        this.#failures++;
+        this.#runtimeHealth.record("unhealthy");
         if (this.#clock.now() >= credentials.resource.expiresAtMs) throw error;
         await this.#clock.sleep(30_000, signal);
       }
@@ -500,7 +505,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         deadline = this.#clock.now() + this.#ySweetRefreshMs;
       } catch (error) {
         if (signal.aborted) return;
-        this.#failures++;
+        this.#runtimeHealth.record("unhealthy");
         await this.#clock.sleep(30_000, signal);
         deadline = this.#clock.now();
       }

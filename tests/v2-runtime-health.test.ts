@@ -29,8 +29,10 @@ describe("V2 runtime health classification", () => {
       { committed: true, code: "missing_required_parameter", ambiguous: false },
       { committed: true, code: "http_429", ambiguous: false },
       { committed: false, code: "capacity_changed" },
+      { committed: false, code: "capacity" },
       { committed: false, code: "draining" },
       { committed: false, code: "request_too_large" },
+      { committed: true, code: "response_too_large", ambiguous: true },
     ];
 
     for (const error of neutral) {

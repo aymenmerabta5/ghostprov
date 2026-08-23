@@ -107,6 +107,13 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_MONITOR_ROOT=http://127.0.0.1:18787");
   });
 
+  it("documents bounded continuations and outcome-aware sandbox health", () => {
+    expect(readme).toContain("retain only byte-budgeted deltas");
+    expect(readme).toContain("never cached quadratically");
+    expect(readme).toContain("Client cancellations and definitive upstream errors are routing-neutral");
+    expect(readme).toContain("sixty-second decaying sandbox health score");
+  });
+
   it("keeps live multi-sandbox state out of version control", () => {
     expect(gitignore.split(/\r?\n/)).toContain(".ghostprov/");
   });
