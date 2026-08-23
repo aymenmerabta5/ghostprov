@@ -20,11 +20,11 @@ describe("SidecarEngine", () => {
     const harness = new SidecarHarness({
       behavior: async input => {
         await input.beforeFetch();
-        if (input.signal.aborted) {
+        if (input.signal?.aborted) {
           throw new UpstreamExecutionError("cancelled", "cancelled", true);
         }
         return new Promise<UpstreamTerminal>((_resolve, reject) => {
-          input.signal.addEventListener("abort", () => reject(
+          input.signal?.addEventListener("abort", () => reject(
             new UpstreamExecutionError("cancelled", "cancelled", true),
           ), { once: true });
         });

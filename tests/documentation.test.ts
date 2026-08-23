@@ -24,6 +24,7 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16`");
     expect(readme).toContain("| `GP_TARGET_CONCURRENCY` | `512`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
+    expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
     expect(readme).toContain("| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912`");
     expect(readme).toContain("| WebSocket active responses | `16`");
@@ -35,6 +36,7 @@ describe("project documentation", () => {
     expect(readme).toContain("128 KiB");
     expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=16");
+    expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
   });
 
   it("documents the Images compatibility surface and honest capability boundaries", () => {

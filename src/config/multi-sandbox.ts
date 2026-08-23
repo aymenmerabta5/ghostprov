@@ -14,6 +14,7 @@ export interface MultiSandboxConfig {
   port: number;
   candidate: boolean;
   heartbeatMs: 10_000;
+  routerQueueTimeoutMs: number;
   maxProjects: number;
   slotsPerProject: number;
   machine: MachineSample;
@@ -167,6 +168,13 @@ export function resolveMultiSandboxConfig(
 
   const heartbeatMs = positiveInteger(env.GP_HEARTBEAT_MS, 10_000, "GP_HEARTBEAT_MS");
   if (heartbeatMs !== 10_000) throw new RangeError("GP_HEARTBEAT_MS must remain exactly 10000");
+  const routerQueueTimeoutMs = boundedPositiveInteger(
+    env.GP_ROUTER_QUEUE_TIMEOUT_MS,
+    30_000,
+    "GP_ROUTER_QUEUE_TIMEOUT_MS",
+    1_000,
+    300_000,
+  );
 
   const targetConcurrency = positiveInteger(
     env.GP_TARGET_CONCURRENCY,
@@ -262,6 +270,7 @@ export function resolveMultiSandboxConfig(
     port,
     candidate,
     heartbeatMs: 10_000,
+    routerQueueTimeoutMs,
     maxProjects,
     slotsPerProject,
     machine,

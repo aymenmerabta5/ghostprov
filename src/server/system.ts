@@ -317,6 +317,7 @@ export async function createBrowserlessSystem(
     registry,
     governor,
     logger,
+    queueTimeoutMs: config.routerQueueTimeoutMs,
     observability: {
       slowRequestMs: observabilityConfig.slowRequestMs,
       transport: config.transport,

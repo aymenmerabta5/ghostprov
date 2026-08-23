@@ -144,6 +144,23 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
       },
     };
   }
+  if (
+    structured?.name === "RouterCapacityTimeoutError" &&
+    structured.status === 503 &&
+    structured.code === "router_capacity_timeout"
+  ) {
+    return {
+      status: 503,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "No sandbox capacity became available before the routing deadline",
+        type: "service_unavailable_error",
+        param: null,
+        code: "router_capacity_timeout",
+      },
+    };
+  }
 
   const daemon = normalizeDaemonError(error);
   if (daemon) return daemon;

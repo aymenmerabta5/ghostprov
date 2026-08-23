@@ -52,6 +52,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2BatchingEnabled).toBe(false);
     expect(config.desiredSandboxes).toBe(1);
     expect(config.heartbeatMs).toBe(10_000);
+    expect(config.routerQueueTimeoutMs).toBe(30_000);
   });
 
   it("parses bounded opt-in V2 diagnostics", () => {

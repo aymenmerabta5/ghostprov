@@ -53,6 +53,7 @@ Failure rules:
 - Proven terminal spools replay after restart without another upstream call.
 - Unproven requests remain quarantined and reduce advertised capacity.
 - One failed project never stops healthy projects.
+- Global zero-capacity queueing fails with a typed 503 after 30 seconds instead of waiting for a client WebSocket idle timeout.
 
 ## Concurrency and latency
 
@@ -202,6 +203,7 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_TARGET_CONCURRENCY` | `512` | Fleet sizing target; divided by per-sandbox V2 capacity |
 | `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
+| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000` | Maximum global wait for any sandbox capacity |
 | `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216` | Host capacity estimate per active V2 stream |
 | `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912` | Sidecar request/queue admission budget |
 | `GP_V2_YSWEET_REFRESH_MS` | `2700000` | Encrypted reconnect-credential rotation horizon |

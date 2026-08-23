@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
 import { RelayError } from "../src/relay/run-handle";
 import { SlotRunnerError } from "../src/relay/slot-runner";
-import { RouterShutdownError } from "../src/router/router";
+import { RouterCapacityTimeoutError, RouterShutdownError } from "../src/router/router";
 
 describe("OpenAI-compatible HTTP errors", () => {
   it("maps router shutdown admission to a typed service-unavailable response", () => {
@@ -13,6 +13,18 @@ describe("OpenAI-compatible HTTP errors", () => {
         type: "service_unavailable_error",
         param: null,
         code: "router_shutting_down",
+      },
+    });
+  });
+
+  it("maps router capacity timeout to an explicit retryable service error", () => {
+    expect(normalizeApiError(new RouterCapacityTimeoutError())).toEqual({
+      status: 503,
+      error: {
+        message: "No sandbox capacity became available before the routing deadline",
+        type: "service_unavailable_error",
+        param: null,
+        code: "router_capacity_timeout",
       },
     });
   });

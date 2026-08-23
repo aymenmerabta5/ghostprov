@@ -36,6 +36,8 @@ interface QueuedJob {
   admittedAtMs: number;
   queuedAtMs: number;
   queueWaitMs: number;
+  queueDeadlineMs: number;
+  queueTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface RouteSelection {
@@ -63,6 +65,18 @@ export class RouterShutdownError extends Error {
   }
 }
 
+export class RouterCapacityTimeoutError extends Error {
+  readonly name = "RouterCapacityTimeoutError";
+  readonly status = 503;
+  readonly code = "router_capacity_timeout";
+
+  constructor(
+    message = "No sandbox capacity became available before the routing deadline",
+  ) {
+    super(message);
+  }
+}
+
 function abortError(): DOMException {
   return new DOMException("Relay request aborted while queued", "AbortError");
 }
@@ -75,6 +89,7 @@ export class MultiSandboxRouter {
   readonly #logger?: LoggerLike;
   readonly #slowRequestMs: number;
   readonly #transport: string;
+  readonly #queueTimeoutMs: number;
   readonly #registryUnsubscribe: () => void;
   readonly #reserved = new Map<ProjectId, number>();
   readonly #queues = new Map<string, QueuedJob[]>();
@@ -90,6 +105,7 @@ export class MultiSandboxRouter {
     random?: RandomSource;
     clock?: Clock;
     logger?: LoggerLike;
+    queueTimeoutMs?: number;
     observability?: { slowRequestMs?: number; transport?: string };
   }) {
     this.#registry = options.registry;
@@ -99,6 +115,10 @@ export class MultiSandboxRouter {
     this.#logger = options.logger;
     this.#slowRequestMs = options.observability?.slowRequestMs ?? 10_000;
     this.#transport = options.observability?.transport ?? "unknown";
+    this.#queueTimeoutMs = options.queueTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.#queueTimeoutMs) || this.#queueTimeoutMs < 1) {
+      throw new RangeError("queueTimeoutMs must be a positive safe integer");
+    }
     this.#registryUnsubscribe = this.#registry.subscribe(() => this.#scheduleDrain());
   }
 
@@ -168,6 +188,7 @@ export class MultiSandboxRouter {
         admittedAtMs,
         queuedAtMs: this.#clock.now(),
         queueWaitMs: 0,
+        queueDeadlineMs: this.#clock.now() + this.#queueTimeoutMs,
       };
       job.onAbort = () => {
         if (!this.#removeJob(job)) return;
@@ -232,6 +253,7 @@ export class MultiSandboxRouter {
     const error = new RouterShutdownError();
     for (const queue of this.#queues.values()) {
       for (const job of queue) {
+        this.#clearQueueTimer(job);
         job.signal?.removeEventListener("abort", job.onAbort!);
         job.memoryLease.release();
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
@@ -275,6 +297,7 @@ export class MultiSandboxRouter {
     }
     if (front) queue.unshift(job);
     else queue.push(job);
+    this.#armQueueTimer(job);
   }
 
   #removeJob(job: QueuedJob): boolean {
@@ -283,6 +306,7 @@ export class MultiSandboxRouter {
     const index = queue.indexOf(job);
     if (index < 0) return false;
     queue.splice(index, 1);
+    this.#clearQueueTimer(job);
     this.#removeEmptyClient(job.clientId);
     return true;
   }
@@ -305,11 +329,33 @@ export class MultiSandboxRouter {
       const queue = this.#queues.get(clientId);
       if (!queue?.length) continue;
       const job = queue.shift()!;
+      this.#clearQueueTimer(job);
       this.#clientCursor = this.#clientOrder.length ? (index + 1) % this.#clientOrder.length : 0;
       this.#removeEmptyClient(clientId);
       return job;
     }
     return null;
+  }
+
+  #armQueueTimer(job: QueuedJob): void {
+    this.#clearQueueTimer(job);
+    const remaining = Math.max(0, job.queueDeadlineMs - this.#clock.now());
+    job.queueTimer = setTimeout(() => {
+      job.queueTimer = undefined;
+      if (!this.#removeJob(job)) return;
+      job.signal?.removeEventListener("abort", job.onAbort!);
+      job.memoryLease.release();
+      const error = new RouterCapacityTimeoutError();
+      this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
+      job.reject(error);
+      this.#scheduleDrain();
+    }, remaining);
+    job.queueTimer.unref?.();
+  }
+
+  #clearQueueTimer(job: QueuedJob): void {
+    if (job.queueTimer) clearTimeout(job.queueTimer);
+    job.queueTimer = undefined;
   }
 
   #scheduleDrain(): void {

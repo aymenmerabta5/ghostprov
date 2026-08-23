@@ -17,6 +17,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   executions = 0;
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
+  failDelayMs = 0;
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
   constructor(readonly projectId: ProjectId, readonly capacity = 30) {}
@@ -49,6 +50,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.bodies.push(body);
     if (this.failStarts > 0) {
       this.failStarts--;
+      if (this.failDelayMs > 0) await Bun.sleep(this.failDelayMs);
       throw new Error("pre-publication failure");
     }
     this.active++;
@@ -68,7 +70,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
 }
 
-function createSystem(projects = 4, slots = 30) {
+function createSystem(projects = 4, slots = 30, queueTimeoutMs?: number) {
   const runtimes = Array.from({ length: projects }, (_, index) => new FakeRuntime(
     projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
     slots,
@@ -86,7 +88,12 @@ function createSystem(projects = 4, slots = 30) {
       }),
     },
   });
-  const router = new MultiSandboxRouter({ registry, governor, random: { next: () => 0.5, uuid: () => "id" } });
+  const router = new MultiSandboxRouter({
+    registry,
+    governor,
+    random: { next: () => 0.5, uuid: () => "id" },
+    queueTimeoutMs,
+  });
   return { runtimes, registry, governor, router };
 }
 
@@ -95,6 +102,45 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("expires zero-capacity queueing with a typed service-unavailable error", async () => {
+    const system = createSystem(0, 1, 10);
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "no-capacity", stream: true },
+      { clientId: "timeout", source: "websocket" },
+    );
+    const result = await Promise.race([
+      pending.then(() => "resolved", error => error),
+      Bun.sleep(50).then(() => "client-idle-timeout"),
+    ]);
+    await system.router.close();
+    expect(result).toMatchObject({
+      status: 503,
+      code: "router_capacity_timeout",
+    });
+    expect(system.router.snapshot().queued).toBe(0);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("retains one absolute queue deadline across a safe startup retry", async () => {
+    const system = createSystem(1, 1, 20);
+    system.runtimes[0].failStarts = 1;
+    system.runtimes[0].failDelayMs = 15;
+    const started = performance.now();
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "retry-timeout", stream: true },
+      { clientId: "retry-timeout", source: "websocket" },
+    );
+    const result = await Promise.race([
+      pending.then(() => "resolved", error => error),
+      Bun.sleep(50).then(() => "client-idle-timeout"),
+    ]);
+    const elapsed = performance.now() - started;
+    await system.router.close();
+    expect(result).toMatchObject({ code: "router_capacity_timeout" });
+    expect(elapsed).toBeLessThan(32);
+    expect(system.runtimes[0].executions).toBe(1);
+  });
+
   it("adds, drains, and removes runtimes without replacing the registry", async () => {
     const registry = new SandboxRegistry();
     const runtime = new FakeRuntime(projectId("00000000-0000-4000-8000-000000000001"));
