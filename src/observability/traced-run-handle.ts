@@ -89,6 +89,12 @@ export function traceRunHandle(
             project_id: context.projectId,
             first_event_ms: Math.max(0, firstEventAtMs - context.acceptedAtMs),
             post_commit_first_event_ms: Math.max(0, firstEventAtMs - context.committedAtMs),
+            ...(handle.stats.diagnostics ? {
+              upstream_first_event_ms: handle.stats.diagnostics.upstreamFirstEventMs,
+              sidecar_scheduler_ms: handle.stats.diagnostics.sidecarFirstEventSchedulerMs,
+              host_ack_to_first_frame_ms: handle.stats.diagnostics.hostAckToFirstFrameMs,
+              host_assembly_to_delivery_ms: handle.stats.diagnostics.hostAssemblyToDeliveryMs,
+            } : {}),
           }), "progress");
         }
         yield frame;

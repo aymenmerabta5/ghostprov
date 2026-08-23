@@ -308,15 +308,16 @@ export async function createBrowserlessSystem(
       transport: config.transport,
     },
   });
+  const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const sampler = dependencies.sampler ?? new FleetSampler({
     logger,
     routerSnapshot: () => router.snapshot(),
     machineProbe,
     intervalMs: observabilityConfig.metricsIntervalMs,
     cpuPoolSnapshot: cpuPool.snapshot ? () => cpuPool.snapshot!() : undefined,
+    webSocketSnapshot: webSocketTelemetry ? () => webSocketTelemetry.snapshotAndReset() : undefined,
   });
   const app = createGhostProvApp({ router });
-  const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const server = dependencies.server ?? createGhostProvServer({
     app,
     router,

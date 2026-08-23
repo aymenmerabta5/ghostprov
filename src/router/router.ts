@@ -398,6 +398,16 @@ export class MultiSandboxRouter {
         queue_wait_ms: job.queueWaitMs,
         commit_ack_ms: commitAckMs,
         retry_count: job.attempts,
+        ...(handle.stats.diagnostics ? {
+          host_prepare_ms: handle.stats.diagnostics.hostPrepareMs,
+          host_scheduler_wait_ms: handle.stats.diagnostics.hostSchedulerWaitMs,
+          host_publish_to_ack_ms: handle.stats.diagnostics.hostPublishToAckMs,
+          sidecar_first_frame_to_commit_ms: handle.stats.diagnostics.sidecarFirstFrameToCommitMs,
+          sidecar_claim_sync_ms: handle.stats.diagnostics.sidecarClaimSyncMs,
+          sidecar_admission_wait_ms: handle.stats.diagnostics.sidecarAdmissionWaitMs,
+          sidecar_commit_processing_ms: handle.stats.diagnostics.sidecarCommitProcessingMs,
+          transport_commit_residual_ms: handle.stats.diagnostics.transportCommitResidualMs,
+        } : {}),
       });
       const traced = this.#logger
         ? traceRunHandle(handle, {

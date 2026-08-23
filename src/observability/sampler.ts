@@ -5,6 +5,11 @@ import type { CpuTransformPoolSnapshot } from "../router/cpu-transform-pool";
 import type { MultiSandboxRouterSnapshot } from "../router/router";
 import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
+import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
+import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../v2/diagnostics/types";
+
+function transportJson(value: V2TransportDiagnostics): JsonValue { return { window_frames:value.windowFrames,window_bytes:value.windowBytes,scheduler_frames:value.schedulerFrames,scheduler_bytes:value.schedulerBytes,scheduler_streams:value.schedulerStreams,oldest_queued_frame_ms:value.oldestQueuedFrameMs,ack_progress_age_ms:value.ackProgressAgeMs,retransmission_attempt:value.retransmissionAttempt,peak_retransmission_attempt:value.peakRetransmissionAttempt,retransmissions_total:value.retransmissionsTotal,publications_total:value.publicationsTotal,published_bytes_total:value.publishedBytesTotal,admitted_uncommitted:value.admittedUncommitted,round_trip_ewma_ms:value.roundTripEwmaMs }; }
+function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue { if(!value)return null;const r=value.resource;return { version:value.version,malformed_count:value.malformedCount,resource:r?{process_rss_bytes:r.processRssBytes,heap_used_bytes:r.heapUsedBytes,heap_total_bytes:r.heapTotalBytes,external_bytes:r.externalBytes,system_total_bytes:r.systemTotalBytes,system_free_bytes:r.systemFreeBytes,process_cpu_percent:r.processCpuPercent,normalized_load_1:r.normalizedLoad1,event_loop_p50_ms:r.eventLoopP50Ms,event_loop_p95_ms:r.eventLoopP95Ms,event_loop_max_ms:r.eventLoopMaxMs}:null,transport:transportJson(value.transport) }; }
 
 interface EventLoopDelayLike {
   min: number | bigint;
@@ -36,6 +41,7 @@ export interface FleetSamplerOptions {
   eventLoop?: EventLoopDelayLike;
   memoryUsage?: () => NodeJS.MemoryUsage;
   cpuUsage?: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
+  webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
 }
 
 export class FleetSampler {
@@ -48,6 +54,7 @@ export class FleetSampler {
   readonly #eventLoop: EventLoopDelayLike;
   readonly #memoryUsage: () => NodeJS.MemoryUsage;
   readonly #cpuUsage: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
+  readonly #webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
   #lastCpu: NodeJS.CpuUsage;
   #lastSampleAtMs: number;
   #timer: ReturnType<typeof setInterval> | null = null;
@@ -67,6 +74,7 @@ export class FleetSampler {
     this.#eventLoop = options.eventLoop ?? monitorEventLoopDelay({ resolution: 20 });
     this.#memoryUsage = options.memoryUsage ?? process.memoryUsage;
     this.#cpuUsage = options.cpuUsage ?? process.cpuUsage;
+    this.#webSocketSnapshot = options.webSocketSnapshot;
     this.#lastCpu = this.#cpuUsage();
     this.#lastSampleAtMs = this.#clock.now();
   }
@@ -120,6 +128,10 @@ export class FleetSampler {
         credential_expires_in_ms: runtime.credentialExpiresInMs,
         memory_pressure: runtime.memoryPressure,
         error_kind: runtime.failure?.kind ?? null,
+        diagnostics: runtime.diagnostics ? {
+          host: transportJson(runtime.diagnostics.host),
+          sidecar: sidecarJson(runtime.diagnostics.sidecar),
+        } : null,
       }));
       this.#logger.emit(observabilityEvent("fleet.sample", {
         capacity: router.capacity,
@@ -138,6 +150,7 @@ export class FleetSampler {
         resources,
         logger: this.#logger.snapshot() as unknown as JsonValue,
         runtimes,
+        websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
       }), "sample");
       this.#eventLoop.reset();
     } finally {

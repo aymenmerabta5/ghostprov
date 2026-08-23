@@ -29,7 +29,7 @@ class MemoryLogger implements LoggerLike {
 describe("traceRunHandle", () => {
   it("logs first consumption and one terminal without changing the handle", async () => {
     const final = deferred<any>();
-    const stats = { bytes: 25, firstByteMs: 8, frames: 1 };
+    const stats: RunHandle["stats"] = { bytes: 25, firstByteMs: 8, frames: 1, diagnostics: { hostPrepareMs:10,hostSchedulerWaitMs:5,hostPublishToAckMs:20,sidecarFirstFrameToCommitMs:4,sidecarClaimSyncMs:2,sidecarAdmissionWaitMs:1,sidecarCommitProcessingMs:3,transportCommitResidualMs:17,upstreamFirstEventMs:100,sidecarFirstEventSchedulerMs:4,hostAckToFirstFrameMs:25,hostAssemblyToDeliveryMs:1,peakTransport:null } };
     const original: RunHandle = {
       async *events() { yield { event: "response.output_text.delta", data: "{}" }; },
       final: final.promise,
@@ -62,7 +62,7 @@ describe("traceRunHandle", () => {
       "response.first_event",
       "request.completed",
     ]);
-    expect(logger.events[0]).toMatchObject({ first_event_ms: 10, post_commit_first_event_ms: 2 });
+    expect(logger.events[0]).toMatchObject({ first_event_ms: 10, post_commit_first_event_ms: 2, upstream_first_event_ms:100, sidecar_scheduler_ms:4, host_ack_to_first_frame_ms:25 });
     expect(logger.events[1]).toMatchObject({ total_ms: 30, response_bytes: 25, frames: 1 });
   });
 
