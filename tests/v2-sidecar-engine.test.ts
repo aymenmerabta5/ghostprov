@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { HostFrame, ReliableFrame, SidecarFrame } from "../src/v2/protocol/shared";
 import type { JournalRecord } from "../src/v2/sidecar/journal";
+import { OutputBackpressure } from "../src/v2/sidecar/output-sink";
 import {
   UpstreamExecutionError,
   type DirectResponsesExecution,
@@ -15,6 +16,46 @@ import {
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
 describe("SidecarEngine", () => {
+  it("backpressures small batched events before reading more upstream data", async () => {
+    const backpressure = new OutputBackpressure({
+      highFrames: 1,
+      highBytes: 100,
+      lowFrames: 0,
+      lowBytes: 0,
+      hardFrames: 2,
+      hardBytes: 200,
+    });
+    backpressure.update({ frames: 1, bytes: 0 });
+    let signalEventAttempt!: () => void;
+    const eventAttempted = new Promise<void>(resolve => { signalEventAttempt = resolve; });
+    let eventAccepted = false;
+    const harness = new SidecarHarness({
+      batching: true,
+      outputBackpressure: backpressure,
+      behavior: async input => {
+        await input.beforeFetch();
+        signalEventAttempt();
+        await input.onEvent({
+          event: "response.output_text.delta",
+          data: JSON.stringify({ type: "response.output_text.delta", delta: "held" }),
+        });
+        eventAccepted = true;
+        throw new UpstreamExecutionError("test stop", "test_stop", true);
+      },
+    });
+
+    await harness.sendRequest(BODY);
+    await eventAttempted;
+    await Bun.sleep(0);
+    expect(eventAccepted).toBe(false);
+    expect(harness.engine.snapshot().active).toBe(1);
+
+    backpressure.update({ frames: 0, bytes: 0 });
+    await harness.settle();
+    expect(eventAccepted).toBe(true);
+    backpressure.close();
+  });
+
   it("flushes batched response events before terminal proof", async () => {
     const harness = new SidecarHarness({ batching: true });
     await harness.sendRequest({ model: "gpt-5.6-sol", input: "batch" });

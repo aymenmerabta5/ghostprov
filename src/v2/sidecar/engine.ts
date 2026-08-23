@@ -386,7 +386,10 @@ export class SidecarEngine {
   }
 
   async #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics, signal?: AbortSignal): Promise<void> {
-    if (!diagnostics && this.#batcher?.push(requestId, eventIndex, event)) return;
+    if (!diagnostics && this.#batcher) {
+      await this.#outputBackpressure?.wait(signal);
+      if (this.#batcher.push(requestId, eventIndex, event)) return;
+    }
     const bytes = utf8Bytes(event.data);
     const partCount = Math.max(1, Math.ceil(bytes.byteLength / RESPONSE_PART_BYTES));
     for (let partIndex = 0, offset = 0; partIndex < partCount; partIndex++) {

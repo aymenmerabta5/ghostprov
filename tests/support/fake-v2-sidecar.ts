@@ -24,6 +24,7 @@ import {
   type DirectResponsesExecution,
   type UpstreamTerminal,
 } from "../../src/v2/sidecar/upstream";
+import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink";
 
 export const TEST_BINDING: ProtocolBinding = {
   projectId: "e631d12c-d917-4434-b360-41b4715d6679",
@@ -162,6 +163,7 @@ export interface SidecarHarnessOptions {
   terminals?: Map<string, Uint8Array>;
   onDrainRequested?: (reason: string) => void;
   batching?: boolean;
+  outputBackpressure?: OutputBackpressure;
 }
 
 export class SidecarHarness {
@@ -199,6 +201,7 @@ export class SidecarHarness {
       upstream: this.upstream,
       onDrainRequested: options.onDrainRequested,
       batching: options.batching,
+      outputBackpressure: options.outputBackpressure,
       emit: frame => {
         this.frames.push(frame);
         this.timeline.push(`emit:${frame.kind}`);
