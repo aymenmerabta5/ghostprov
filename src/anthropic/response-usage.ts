@@ -19,8 +19,10 @@ export function usageFromResponses(
   usageValue: unknown,
   estimatedInputTokens: number,
   serviceTierValue?: unknown,
+  estimatedOutputTokens = 0,
 ): AnthropicUsage {
   const estimate = tokenCount(estimatedInputTokens);
+  const outputEstimate = tokenCount(estimatedOutputTokens);
   const currentDetails = {
     cache_creation: null,
     inference_geo: null,
@@ -32,7 +34,7 @@ export function usageFromResponses(
   if (usageValue === undefined || usageValue === null) {
     return {
       input_tokens: estimate,
-      output_tokens: 0,
+      output_tokens: outputEstimate,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
       ...currentDetails,

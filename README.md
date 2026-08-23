@@ -256,6 +256,9 @@ The isolated suite includes:
 - `tests/anthropic-response-usage.test.ts`
 - `tests/anthropic-response-validation.test.ts`
 - `tests/anthropic-response.test.ts`
+- `tests/anthropic-stream-bounds.test.ts`
+- `tests/anthropic-stream-protocol.test.ts`
+- `tests/anthropic-stream-safety.test.ts`
 - `tests/anthropic-stream.test.ts`
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`

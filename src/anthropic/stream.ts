@@ -1,6 +1,6 @@
 import type { SseFrame } from "../relay/sse";
 import { ApiError, normalizeApiError } from "../http/errors";
-import { createHash, type Hash } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   AnthropicRequestError,
   anthropicErrorEvent,
@@ -14,7 +14,21 @@ import { responseToAnthropic, type AnthropicResponseContext } from "./response";
 import { responseStopSequences } from "./response-stop";
 import { invalidUpstream, record } from "./response-validation";
 import { usageFromResponses } from "./response-usage";
+import {
+  createStreamBlock,
+  streamBlockIdentity,
+  type StreamBlock,
+  type StreamBlockKind,
+} from "./stream-block-state";
+import { AnthropicStreamBudget } from "./stream-budget";
 import { finalStreamDescriptors, terminalForStreamItem } from "./stream-final";
+import {
+  resolveAnthropicStreamLimits,
+  type AnthropicStreamLimits,
+  type AnthropicStreamSnapshot,
+} from "./stream-limits";
+import { ResponsesStreamProtocol } from "./stream-protocol";
+import { UnicodeStopFilter } from "./stream-stop-filter";
 import type { AnthropicContentBlockDelta, AnthropicSseEvent } from "./stream-types";
 import type {
   AnthropicResponseContentBlock,
@@ -23,6 +37,7 @@ import type {
 } from "./types";
 
 export { anthropicSseFrame } from "./stream-types";
+export { DEFAULT_ANTHROPIC_STREAM_LIMITS } from "./stream-limits";
 export type {
   AnthropicContentBlockDelta,
   AnthropicContentBlockDeltaEvent,
@@ -33,37 +48,7 @@ export type {
   AnthropicMessageStopEvent,
   AnthropicSseEvent,
 } from "./stream-types";
-
-type BlockKind = "thinking" | "text" | "tool_use";
-
-type StreamBlock = {
-  kind: BlockKind;
-  itemId: string | null;
-  outputIndex: number;
-  contentIndex: number | null;
-  started: boolean;
-  stopped: boolean;
-  done: boolean;
-  suppressed: boolean;
-  forceStart: boolean;
-  index: number | null;
-  pending: string[];
-  pendingBytes: number;
-  emittedUnits: number;
-  fingerprint: Hash;
-  seenUnits: number;
-  signature: string | null;
-  signatureEmitted: boolean;
-  toolId: string | null;
-  toolName: string | null;
-  argumentDeltaSeen: boolean;
-  argumentBytes: number;
-};
-
-type BufferedText = {
-  block: StreamBlock;
-  text: string;
-};
+export type { AnthropicStreamLimits, AnthropicStreamSnapshot } from "./stream-limits";
 
 const MALFORMED_EVENT_MESSAGE = "Responses stream returned a malformed event.";
 const FAILED_EVENT_MESSAGE = "Responses stream failed.";
@@ -75,11 +60,6 @@ function malformedEvent(): never {
 function stringField(value: Record<string, unknown>, key: string): string {
   if (typeof value[key] !== "string") malformedEvent();
   return value[key] as string;
-}
-
-function optionalStringField(value: Record<string, unknown>, key: string): string | null {
-  if (value[key] === undefined) return null;
-  return stringField(value, key);
 }
 
 function indexField(value: Record<string, unknown>, key: string): number {
@@ -97,46 +77,6 @@ function outputItemId(item: Record<string, unknown>): string | null {
   return typeof item.id === "string" && item.id.length > 0 ? item.id : null;
 }
 
-function blockIdentity(
-  kind: BlockKind,
-  itemId: string | null,
-  outputIndex: number,
-  contentIndex: number | null,
-): string {
-  return `${kind}:${itemId ?? `@${outputIndex}`}:${contentIndex ?? "-"}`;
-}
-
-function initialBlock(
-  kind: BlockKind,
-  itemId: string | null,
-  outputIndex: number,
-  contentIndex: number | null,
-): StreamBlock {
-  return {
-    kind,
-    itemId,
-    outputIndex,
-    contentIndex,
-    started: false,
-    stopped: false,
-    done: false,
-    suppressed: false,
-    forceStart: false,
-    index: null,
-    pending: [],
-    pendingBytes: 0,
-    emittedUnits: 0,
-    fingerprint: createHash("sha256"),
-    seenUnits: 0,
-    signature: null,
-    signatureEmitted: false,
-    toolId: null,
-    toolName: null,
-    argumentDeltaSeen: false,
-    argumentBytes: 0,
-  };
-}
-
 /**
  * Pure, pull-safe Responses-frame translator.
  *
@@ -147,14 +87,13 @@ function initialBlock(
 export class AnthropicStreamTranslator {
   readonly #context: AnthropicResponseContext;
   readonly #limits: AnthropicRequestLimits;
+  readonly #streamLimits: AnthropicStreamLimits;
   readonly #stopSequences: string[];
-  readonly #maxStopSuffix: number;
+  readonly #protocol: ResponsesStreamProtocol;
+  readonly #textFilter: UnicodeStopFilter<StreamBlock>;
+  readonly #budget: AnthropicStreamBudget;
   readonly #blocksByIdentity = new Map<string, StreamBlock>();
   #blocks: StreamBlock[] = [];
-  #bufferedText: BufferedText[] = [];
-  #bufferedTextUnits = 0;
-  #pendingBytes = 0;
-  #pendingChunks = 0;
   #matchedStop: string | null = null;
   #started = false;
   #terminal = false;
@@ -166,14 +105,14 @@ export class AnthropicStreamTranslator {
     this.#stopSequences = [...responseStopSequences(context.stopSequences)];
     try {
       this.#limits = resolveAnthropicRequestLimits(context.limits);
+      this.#streamLimits = resolveAnthropicStreamLimits(context.streamLimits);
     } catch {
       throw invalidUpstream("Anthropic response context is malformed.");
     }
+    this.#protocol = new ResponsesStreamProtocol(this.#streamLimits);
+    this.#budget = new AnthropicStreamBudget(this.#streamLimits);
     this.#context = { ...context, stopSequences: this.#stopSequences };
-    this.#maxStopSuffix = Math.max(
-      0,
-      ...this.#stopSequences.map(sequence => sequence.length - 1),
-    );
+    this.#textFilter = new UnicodeStopFilter(this.#stopSequences);
   }
 
   start(): AnthropicSseEvent[] {
@@ -198,7 +137,6 @@ export class AnthropicStreamTranslator {
   }
 
   push(frame: SseFrame): AnthropicSseEvent[] {
-    if (this.#terminal) return [];
     const events = this.#started ? [] : this.start();
     try {
       if (!frame || typeof frame.event !== "string" || typeof frame.data !== "string") {
@@ -214,6 +152,8 @@ export class AnthropicStreamTranslator {
       if (!event || typeof event.type !== "string" || event.type !== frame.event) {
         malformedEvent();
       }
+      this.#protocol.accept(event);
+      this.#countStreamedPayload(event.type, event);
       events.push(...this.#translate(event.type, event));
       return events;
     } catch (error) {
@@ -241,6 +181,29 @@ export class AnthropicStreamTranslator {
     return events;
   }
 
+  snapshot(): AnthropicStreamSnapshot {
+    const protocol = this.#protocol.snapshot();
+    return {
+      ...this.#budget.snapshot(),
+      events: protocol.events,
+      identities: protocol.identities,
+      retainedBlocks: this.#blocks.length,
+      retainedIdentities: protocol.retainedIdentities,
+      retainedTextCodePoints: this.#textFilter.retainedCodePoints(),
+    };
+  }
+
+  #countStreamedPayload(type: string, event: Record<string, unknown>): void {
+    let category: "text" | "reasoning" | "function" | null = null;
+    if (type === "response.output_text.delta") category = "text";
+    else if (type === "response.reasoning_summary_text.delta" ||
+      type === "response.reasoning_text.delta") category = "reasoning";
+    else if (type === "response.function_call_arguments.delta") category = "function";
+    if (category === null) return;
+
+    this.#budget.countPayload(category, stringField(event, "delta"));
+  }
+
   #translate(type: string, event: Record<string, unknown>): AnthropicSseEvent[] {
     const events: AnthropicSseEvent[] = [];
     if (type === "response.created") return events;
@@ -259,8 +222,7 @@ export class AnthropicStreamTranslator {
       this.#onContentPartAdded(event, events);
     } else if (type === "response.reasoning_summary_part.added") {
       this.#onReasoningPartAdded(event, events);
-    } else if (type === "response.reasoning_summary_text.delta" ||
-      type === "response.reasoning_text.delta") {
+    } else if (type === "response.reasoning_summary_text.delta") {
       this.#onReasoningDelta(event, events);
     } else if (type === "response.output_text.delta") {
       this.#onTextDelta(event, events);
@@ -309,9 +271,7 @@ export class AnthropicStreamTranslator {
     const part = record(event.part);
     if (!part || typeof part.type !== "string") malformedEvent();
     if (part.type !== "output_text" || this.#matchedStop) return;
-    const block = this.#block("text", itemId, outputIndex, contentIndex);
-    if (this.#maxStopSuffix === 0) block.forceStart = true;
-    this.#drain(events);
+    this.#block("text", itemId, outputIndex, contentIndex);
   }
 
   #onReasoningPartAdded(
@@ -383,10 +343,7 @@ export class AnthropicStreamTranslator {
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("tool_use", itemId, outputIndex, null);
-    const callId = optionalStringField(event, "call_id");
-    const name = optionalStringField(event, "name");
-    if (callId !== null) block.toolId = callId;
-    if (name !== null) block.toolName = name;
+    this.#setToolMetadata(block, event);
     block.argumentDeltaSeen = true;
     block.argumentBytes = this.#addArgumentBytes(block.argumentBytes, delta);
     this.#appendPending(block, delta);
@@ -509,6 +466,7 @@ export class AnthropicStreamTranslator {
   }
 
   #complete(finalValue: unknown): AnthropicSseEvent[] {
+    this.#protocol.validateFinal(finalValue);
     const converted = responseToAnthropic(finalValue, this.#context);
     const descriptors = finalStreamDescriptors(
       finalValue,
@@ -516,8 +474,7 @@ export class AnthropicStreamTranslator {
       this.#context.maxTokensZero,
     );
     this.#finishing = true;
-    this.#bufferedText = [];
-    this.#bufferedTextUnits = 0;
+    this.#textFilter.clear();
 
     const represented = new Set<StreamBlock>();
     const ranks = new Map<StreamBlock, number>();
@@ -613,37 +570,78 @@ export class AnthropicStreamTranslator {
       usage: converted.usage,
     });
     events.push({ type: "message_stop" });
+    this.#protocol.markTerminal();
     this.#terminal = true;
+    this.#clearRetainedState();
     return events;
   }
 
+  #clearRetainedState(): void {
+    this.#blocks = [];
+    this.#blocksByIdentity.clear();
+    this.#textFilter.clear();
+    this.#budget.clearRetained();
+    this.#matchedStop = null;
+    this.#drainCursor = 0;
+    this.#protocol.clearRetained();
+  }
+
   #block(
-    kind: BlockKind,
+    kind: StreamBlockKind,
     itemId: string | null,
     outputIndex: number,
     contentIndex: number | null,
   ): StreamBlock {
-    const identity = blockIdentity(kind, itemId, outputIndex, contentIndex);
+    const identity = streamBlockIdentity(kind, itemId, outputIndex, contentIndex);
     const exact = this.#blocksByIdentity.get(identity);
-    if (exact) return exact;
+    if (exact) {
+      if (exact.kind !== kind || exact.outputIndex !== outputIndex ||
+        exact.contentIndex !== contentIndex ||
+        (itemId !== null && exact.itemId !== null && exact.itemId !== itemId)) {
+        malformedEvent();
+      }
+      return exact;
+    }
 
     const byPosition = this.#blocks.find(block => block.kind === kind &&
       block.outputIndex === outputIndex && block.contentIndex === contentIndex);
     if (byPosition) {
-      if (itemId !== null && byPosition.itemId === null) byPosition.itemId = itemId;
+      if (itemId !== null) {
+        if (byPosition.itemId !== null && byPosition.itemId !== itemId) malformedEvent();
+        byPosition.itemId = itemId;
+      }
       this.#blocksByIdentity.set(identity, byPosition);
       return byPosition;
     }
 
-    const block = initialBlock(kind, itemId, outputIndex, contentIndex);
-    this.#blocks.push(block);
+    this.#budget.reserveOutputBlock();
+    const block = createStreamBlock(kind, itemId, outputIndex, contentIndex);
+    let insertAt = this.#blocks.length;
+    while (insertAt > this.#drainCursor &&
+      this.#compareBlocks(block, this.#blocks[insertAt - 1]) < 0) {
+      insertAt -= 1;
+    }
+    this.#blocks.splice(insertAt, 0, block);
     this.#blocksByIdentity.set(identity, block);
     return block;
   }
 
   #setToolMetadata(block: StreamBlock, item: Record<string, unknown>): void {
-    if (item.call_id !== undefined) block.toolId = stringField(item, "call_id");
-    if (item.name !== undefined) block.toolName = stringField(item, "name");
+    if (item.call_id !== undefined) {
+      const toolId = stringField(item, "call_id");
+      if (block.toolId !== null && block.toolId !== toolId) malformedEvent();
+      block.toolId = toolId;
+    }
+    if (item.name !== undefined) {
+      const toolName = stringField(item, "name");
+      if (block.toolName !== null && block.toolName !== toolName) malformedEvent();
+      block.toolName = toolName;
+    }
+  }
+
+  #compareBlocks(left: StreamBlock, right: StreamBlock): number {
+    if (left.outputIndex !== right.outputIndex) return left.outputIndex - right.outputIndex;
+    return (left.contentIndex ?? 0) - (right.contentIndex ?? 0);
   }
 
   #validateToolArguments(block: StreamBlock, itemId: string | null, args: string): void {
@@ -678,21 +676,20 @@ export class AnthropicStreamTranslator {
     if (!value || block.suppressed || block.stopped) return;
     const bytes = Buffer.byteLength(value, "utf8");
     const blockBytes = this.#addUnits(block.pendingBytes, bytes);
-    const totalBytes = this.#addUnits(this.#pendingBytes, bytes);
-    const totalChunks = this.#addUnits(this.#pendingChunks, 1);
-    if (blockBytes > this.#limits.outputBytes || totalBytes > this.#limits.relayBytes ||
-      totalChunks > this.#limits.maxTotalJsonItems) {
+    if (blockBytes > this.#limits.outputBytes) {
       throw invalidUpstream("Responses stream exceeded its bounded pending output.");
     }
+    this.#budget.reservePendingChunk(
+      bytes,
+      this.#limits.relayBytes,
+      this.#limits.maxTotalJsonItems,
+    );
     block.pending.push(value);
     block.pendingBytes = blockBytes;
-    this.#pendingBytes = totalBytes;
-    this.#pendingChunks = totalChunks;
   }
 
   #clearPending(block: StreamBlock): void {
-    this.#pendingBytes -= block.pendingBytes;
-    this.#pendingChunks -= block.pending.length;
+    this.#budget.releasePending(block.pendingBytes, block.pending.length);
     block.pending = [];
     block.pendingBytes = 0;
   }
@@ -702,62 +699,20 @@ export class AnthropicStreamTranslator {
     if (value === undefined) malformedEvent();
     const bytes = Buffer.byteLength(value, "utf8");
     block.pendingBytes -= bytes;
-    this.#pendingBytes -= bytes;
-    this.#pendingChunks -= 1;
+    this.#budget.releasePending(bytes, 1);
     return value;
   }
 
   #appendOrdinaryText(block: StreamBlock, value: string): void {
-    if (!value) return;
-    this.#appendBufferedText(block, value);
-    const joined = this.#bufferedText.map(part => part.text).join("");
-    const match = this.#findStop(joined);
-    if (match) {
-      this.#emitBufferedPrefix(match.offset);
-      this.#bufferedText = [];
-      this.#bufferedTextUnits = 0;
-      this.#matchedStop = match.sequence;
-      return;
-    }
-    const safeUnits = Math.max(0, this.#bufferedTextUnits - this.#maxStopSuffix);
-    this.#emitBufferedPrefix(safeUnits);
-  }
-
-  #appendBufferedText(block: StreamBlock, value: string): void {
-    const previous = this.#bufferedText.at(-1);
-    if (previous?.block === block) previous.text += value;
-    else this.#bufferedText.push({ block, text: value });
-    this.#bufferedTextUnits = this.#addUnits(this.#bufferedTextUnits, value.length);
-  }
-
-  #findStop(value: string): { sequence: string; offset: number } | null {
-    let selected: { sequence: string; offset: number } | null = null;
-    for (const sequence of this.#stopSequences) {
-      const offset = value.indexOf(sequence);
-      if (offset >= 0 && (!selected || offset < selected.offset)) {
-        selected = { sequence, offset };
-      }
-    }
-    return selected;
-  }
-
-  #emitBufferedPrefix(units: number): void {
-    let remaining = units;
-    while (remaining > 0 && this.#bufferedText.length > 0) {
-      const first = this.#bufferedText[0];
-      const count = Math.min(remaining, first.text.length);
-      this.#appendPending(first.block, first.text.slice(0, count));
-      if (count === first.text.length) this.#bufferedText.shift();
-      else first.text = first.text.slice(count);
-      remaining -= count;
-      this.#bufferedTextUnits -= count;
-    }
+    const result = this.#textFilter.append(block, value);
+    for (const chunk of result.chunks) this.#appendPending(chunk.owner, chunk.text);
+    if (result.matchedSequence !== null) this.#matchedStop = result.matchedSequence;
   }
 
   #endOrdinarySegment(events: AnthropicSseEvent[]): void {
-    if (!this.#matchedStop) this.#emitBufferedPrefix(this.#bufferedTextUnits);
-    this.#bufferedText = [];
-    this.#bufferedTextUnits = 0;
+    for (const chunk of this.#textFilter.endSegment()) {
+      this.#appendPending(chunk.owner, chunk.text);
+    }
     this.#drain(events);
   }
 
@@ -783,6 +738,7 @@ export class AnthropicStreamTranslator {
       }
 
       if (!block.started) {
+        if (!this.#finishing && !this.#protocol.canExpose(block.outputIndex)) return;
         const ready = block.kind === "tool_use"
           ? block.forceStart
           : block.forceStart || block.pending.length > 0;
@@ -821,8 +777,7 @@ export class AnthropicStreamTranslator {
         block.signatureEmitted = true;
       }
 
-      const hasBufferedText = block.kind === "text" &&
-        this.#bufferedText.some(value => value.block === block);
+      const hasBufferedText = block.kind === "text" && this.#textFilter.hasPending(block);
       const canStop = block.done && block.pending.length === 0 && !hasBufferedText &&
         (block.kind !== "thinking" || block.signature !== null) &&
         (this.#finishing || this.#matchedStop === null);
@@ -879,10 +834,18 @@ export class AnthropicStreamTranslator {
   }
 
   #emitError(error: unknown): AnthropicSseEvent[] {
-    if (this.#terminal) return [];
+    if (this.#terminal) {
+      return [anthropicErrorEvent(
+        invalidUpstream(FAILED_EVENT_MESSAGE),
+        this.#context.requestId,
+      )];
+    }
+    this.#protocol.markTerminal();
     this.#terminal = true;
+    const trustedClientError = (error instanceof AnthropicRequestError || error instanceof ApiError) &&
+      (error.status === 400 || error.status === 413);
     let safeError: unknown = error;
-    if (!(error instanceof AnthropicRequestError) && !(error instanceof ApiError)) {
+    if (!trustedClientError) {
       const normalized = normalizeApiError(error);
       const status = normalized.status === 503 ? 529 : normalized.status;
       safeError = new AnthropicRequestError(
@@ -891,6 +854,8 @@ export class AnthropicStreamTranslator {
         anthropicErrorType(status),
       );
     }
-    return [anthropicErrorEvent(safeError, this.#context.requestId)];
+    const event = anthropicErrorEvent(safeError, this.#context.requestId);
+    this.#clearRetainedState();
+    return [event];
   }
 }

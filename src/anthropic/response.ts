@@ -25,6 +25,7 @@ import {
   validateTerminalResponseProjection,
 } from "./response-validation";
 import { usageFromResponses } from "./response-usage";
+import type { AnthropicStreamLimits } from "./stream-limits";
 import type {
   AnthropicAdapterMessage,
   AnthropicResponseContentBlock,
@@ -63,6 +64,7 @@ export type AnthropicResponseContext = Pick<
 > & {
   requestId: string;
   limits?: Partial<AnthropicRequestLimits>;
+  streamLimits?: Partial<AnthropicStreamLimits>;
 };
 
 function reasoningBlock(
@@ -157,19 +159,48 @@ function functionCallBlock(
   };
 }
 
+function estimatedOutputTokens(
+  blocks: readonly AnthropicResponseContentBlock[],
+  limits: AnthropicRequestLimits,
+): number {
+  let bytes = 0;
+  const add = (value: string): void => {
+    bytes += Buffer.byteLength(value, "utf8");
+    if (!Number.isSafeInteger(bytes) || bytes > limits.relayBytes) {
+      throw invalidUpstream("Responses relay returned malformed usage.");
+    }
+  };
+  for (const block of blocks) {
+    if (block.type === "text") add(block.text);
+    else if (block.type === "thinking") add(block.thinking);
+    else {
+      add(block.name);
+      try {
+        add(JSON.stringify(block.input));
+      } catch {
+        throw invalidUpstream("Responses relay returned malformed usage.");
+      }
+    }
+  }
+  return Math.ceil(bytes / 4);
+}
+
 export function responseToAnthropic(
   finalValue: unknown,
   context: AnthropicResponseContext,
 ): AnthropicAdapterMessage {
   const terminal = validateTerminalResponseProjection(finalValue);
-  const usage = usageFromResponses(
-    terminal.record.usage,
-    context.estimatedInputTokens,
-    terminal.record.service_tier,
-  );
   const id = terminal.record.id as string;
 
   if (context.maxTokensZero) {
+    if (terminal.record.usage === null) {
+      throw invalidUpstream("Responses relay returned malformed usage.");
+    }
+    const usage = usageFromResponses(
+      terminal.record.usage,
+      context.estimatedInputTokens,
+      terminal.record.service_tier,
+    );
     return {
       id: `msg_${id}`,
       type: "message",
@@ -253,6 +284,12 @@ export function responseToAnthropic(
     content,
     match?.sequence ?? null,
     sawRefusal,
+  );
+  const usage = usageFromResponses(
+    terminal.record.usage,
+    context.estimatedInputTokens,
+    terminal.record.service_tier,
+    estimatedOutputTokens(content, limits),
   );
   return {
     id: `msg_${id}`,

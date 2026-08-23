@@ -44,7 +44,8 @@ export function validateTerminalResponseProjection(
   }
   if (!Array.isArray(final.output)) malformedFinal();
   if (!Object.prototype.hasOwnProperty.call(final, "incomplete_details") ||
-    !record(final.usage)) {
+    !Object.prototype.hasOwnProperty.call(final, "usage") ||
+    (final.usage !== null && !record(final.usage))) {
     malformedFinal();
   }
 

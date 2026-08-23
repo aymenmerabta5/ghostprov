@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import type { SseFrame } from "../src/relay/sse";
 import { RelayError } from "../src/relay/run-handle";
 import {
   AnthropicStreamTranslator,
@@ -9,114 +8,19 @@ import {
 import { ApiError } from "../src/http/errors";
 import {
   CONTEXT,
-  DEFAULT_RESPONSES_USAGE,
   context,
 } from "./support/anthropic-response";
-
-type FinalOutput = Record<string, unknown>;
-type FinalResponse = Record<string, unknown> & { output: FinalOutput[] };
-
-function frame(type: string, fields: Record<string, unknown> = {}): SseFrame {
-  return {
-    event: type,
-    data: JSON.stringify({ type, ...fields }),
-  };
-}
-
-function finalResponse(
-  id: string,
-  output: FinalOutput[],
-  overrides: Record<string, unknown> = {},
-): FinalResponse {
-  return {
-    id,
-    object: "response",
-    created_at: 1,
-    model: "gpt-5.6-terra",
-    status: "completed",
-    error: null,
-    incomplete_details: null,
-    output,
-    usage: DEFAULT_RESPONSES_USAGE,
-    ...overrides,
-  } as FinalResponse;
-}
-
-function reasoning(
-  id: string,
-  text: string,
-  encryptedContent = `${id}-cipher`,
-): FinalOutput {
-  return {
-    type: "reasoning",
-    id,
-    status: "completed",
-    encrypted_content: encryptedContent,
-    summary: text ? [{ type: "summary_text", text }] : [],
-  };
-}
-
-function message(
-  id: string,
-  parts: Array<Record<string, unknown>>,
-  status: "completed" | "incomplete" = "completed",
-): FinalOutput {
-  return {
-    type: "message",
-    id,
-    status,
-    role: "assistant",
-    content: parts.map(part => part.type === "output_text"
-      ? { annotations: [], logprobs: [], ...part }
-      : part),
-  };
-}
-
-function textPart(text: string): Record<string, unknown> {
-  return { type: "output_text", text };
-}
-
-function refusalPart(refusal: string): Record<string, unknown> {
-  return { type: "refusal", refusal };
-}
-
-function tool(
-  outputId: string,
-  callId: string,
-  name: string,
-  args: string,
-  status: "completed" | "incomplete" = "completed",
-): FinalOutput {
-  return {
-    type: "function_call",
-    id: outputId,
-    status,
-    call_id: callId,
-    name,
-    arguments: args,
-  };
-}
-
-function collect(
-  translator: AnthropicStreamTranslator,
-  frames: SseFrame[],
-): AnthropicSseEvent[] {
-  const events = [...translator.start()];
-  for (const value of frames) events.push(...translator.push(value));
-  return events;
-}
-
-function deltas(
-  events: readonly AnthropicSseEvent[],
-  type: string,
-  field: string,
-): string[] {
-  return events.flatMap(event => {
-    if (event.type !== "content_block_delta" || event.delta.type !== type) return [];
-    const value = (event.delta as Record<string, unknown>)[field];
-    return typeof value === "string" ? [value] : [];
-  });
-}
+import {
+  collectStreamEvents as collect,
+  finalResponse,
+  messageOutput as message,
+  reasoningOutput as reasoning,
+  refusalPart,
+  streamDeltas as deltas,
+  streamFrame as frame,
+  textPart,
+  toolOutput as tool,
+} from "./support/anthropic-stream";
 
 describe("Responses to Anthropic stream translation", () => {
   it("emits canonical ordered thinking, text, and interleaved parallel tool blocks", () => {
@@ -349,7 +253,8 @@ describe("Responses to Anthropic stream translation", () => {
     expect(events.filter(event => event.type === "message_delta")).toHaveLength(1);
     expect(events.filter(event => event.type === "message_stop")).toHaveLength(1);
     expect(translator.finish(final)).toEqual([]);
-    expect(translator.push(frame("response.completed", { response: final }))).toEqual([]);
+    expect(translator.push(frame("response.completed", { response: final })))
+      .toMatchObject([{ type: "error" }]);
   });
 
   it("rejects an authoritative final whose text diverges from the streamed prefix", () => {
@@ -840,7 +745,7 @@ describe("Responses to Anthropic stream translation", () => {
     expect(events[1]).toMatchObject({
       error: {
         type: "api_error",
-        message: "Responses relay returned invalid function call arguments.",
+        message: "Responses stream failed.",
       },
     });
   });
@@ -863,6 +768,10 @@ describe("Responses to Anthropic stream translation", () => {
     });
     const translator = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
     const events = collect(translator, [
+      frame("response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_warm", status: "in_progress", summary: [] },
+      }),
       frame("response.output_text.delta", {
         item_id: "msg_warm",
         output_index: 1,
@@ -934,91 +843,11 @@ describe("Responses to Anthropic stream translation", () => {
     expect(typed.fail(new ApiError(429, "Rate limited", { type: "rate_limit_error" })))
       .toEqual([{
         type: "error",
-        error: { type: "rate_limit_error", message: "Rate limited" },
+        error: { type: "rate_limit_error", message: "Responses stream failed." },
         request_id: CONTEXT.requestId,
       }]);
   });
 
-  it("does not retain a 10,000-delta transcript or duplicate it at final fallback", () => {
-    const translator = new AnthropicStreamTranslator(CONTEXT);
-    expect(translator.start()).toHaveLength(1);
-    let emittedCharacters = 0;
-    for (let index = 0; index < 10_000; index += 1) {
-      const events = translator.push(frame("response.output_text.delta", {
-        item_id: "msg_tiny",
-        output_index: 0,
-        content_index: 0,
-        delta: "x",
-      }));
-      emittedCharacters += deltas(events, "text_delta", "text").join("").length;
-    }
-    expect(emittedCharacters).toBe(10_000);
-    expect(JSON.stringify(translator).length).toBeLessThan(1_024);
-
-    const terminal = translator.finish(finalResponse("resp_tiny", [
-      message("msg_tiny", [textPart("x".repeat(10_000))]),
-    ]));
-    expect(deltas(terminal, "text_delta", "text")).toEqual([]);
-    expect(terminal.map(event => event.type).slice(-2)).toEqual(["message_delta", "message_stop"]);
-  });
-
-  it("bounds aggregate pending data across interleaved blocks", () => {
-    const translator = new AnthropicStreamTranslator(context({
-      limits: { outputBytes: 32, relayBytes: 10 },
-    }));
-    translator.start();
-    translator.push(frame("response.output_item.added", {
-      output_index: 0,
-      item: {
-        type: "function_call",
-        id: "fc_pending_1",
-        status: "in_progress",
-        call_id: "call_pending_1",
-        name: "One",
-        arguments: "",
-      },
-    }));
-    translator.push(frame("response.function_call_arguments.delta", {
-      item_id: "fc_pending_1",
-      output_index: 0,
-      delta: "123456",
-    }));
-    translator.push(frame("response.output_item.added", {
-      output_index: 1,
-      item: {
-        type: "function_call",
-        id: "fc_pending_2",
-        status: "in_progress",
-        call_id: "call_pending_2",
-        name: "Two",
-        arguments: "",
-      },
-    }));
-    const events = translator.push(frame("response.function_call_arguments.delta", {
-      item_id: "fc_pending_2",
-      output_index: 1,
-      delta: "abcdef",
-    }));
-
-    expect(events).toMatchObject([{
-      type: "error",
-      error: { type: "api_error", message: expect.any(String) },
-      request_id: CONTEXT.requestId,
-    }]);
-    expect(JSON.stringify(events)).not.toContain("abcdef");
-  });
-
-  it("emits each terminal once and ignores unknown additive events", () => {
-    const final = finalResponse("resp_once", []);
-    const translator = new AnthropicStreamTranslator(CONTEXT);
-    expect(translator.start()).toHaveLength(1);
-    expect(translator.start()).toEqual([]);
-    expect(translator.push(frame("response.some_future_event", { value: 1 }))).toEqual([]);
-    expect(translator.push(frame("response.completed", { response: final }))
-      .map(event => event.type)).toEqual(["message_delta", "message_stop"]);
-    expect(translator.push(frame("response.completed", { response: final }))).toEqual([]);
-    expect(translator.finish(final)).toEqual([]);
-  });
 });
 
 describe("Anthropic SSE formatting", () => {

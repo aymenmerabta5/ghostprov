@@ -10,6 +10,45 @@ import {
 } from "./support/anthropic-response";
 
 describe("Anthropic response usage and prewarm", () => {
+  it("estimates bounded ordinary usage when an incomplete terminal has null usage", () => {
+    const message = responseToAnthropic({
+      id: "resp_null_usage",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [{
+        type: "message",
+        id: "msg_null_usage",
+        status: "incomplete",
+        role: "assistant",
+        content: [{ type: "output_text", text: "12345678", annotations: [] }],
+      }],
+      usage: null,
+    }, CONTEXT);
+
+    expect(message.stop_reason).toBe("max_tokens");
+    expect(message.usage).toMatchObject({
+      input_tokens: CONTEXT.estimatedInputTokens,
+      output_tokens: 2,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens_details: null,
+    });
+  });
+
+  it("still requires authoritative usage for zero-token prewarm", () => {
+    const error = captureAnthropicError(() => responseToAnthropic({
+      id: "resp_null_prewarm_usage",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [],
+      usage: null,
+    }, context({ maxTokensZero: true })));
+
+    expect(error.status).toBe(500);
+    expect(error.errorType).toBe("api_error");
+    expect(error.message).toBe("Responses relay returned malformed usage.");
+  });
+
   it("maps max-output incompletion, refusals, and an empty terminal response", () => {
     const incomplete = responseToAnthropic({
       id: "resp_incomplete",

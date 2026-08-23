@@ -104,7 +104,7 @@ const typedLogprob: ResponsesLogprob = {
 void typedLogprob;
 
 describe("Anthropic response terminal validation", () => {
-  it("requires current top-level response, error, and ordinary terminal usage fields", () => {
+  it("requires current top-level response and error fields while allowing null usage", () => {
     const valid = {
       id: "resp_top_level",
       object: "response",
@@ -130,7 +130,6 @@ describe("Anthropic response terminal validation", () => {
       { ...valid, incomplete_details: undefined },
       { ...valid, incomplete_details: {} },
       { ...valid, usage: undefined },
-      { ...valid, usage: null },
     ];
 
     for (const final of malformedFinals) {

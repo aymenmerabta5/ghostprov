@@ -93,7 +93,7 @@ type TerminalResponseProjectionBase = {
   model: string;
   error: null;
   output: ResponsesFinalOutputItem[];
-  usage: ResponsesUsage;
+  usage: ResponsesUsage | null;
   service_tier?: unknown;
   [key: string]: unknown;
 };

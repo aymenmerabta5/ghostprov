@@ -79,3 +79,74 @@ No production process, listener, or port was inspected or changed.
 ## Concern
 
 The repository-wide parallel suite remains subject to unrelated Windows filesystem/timer contention as recorded above; all Task 4 tests, typecheck, diff checks, and each isolated failed full-suite case pass.
+
+---
+
+## Dual Shared-Context Review Remediation — 2026-08-23
+
+### Status
+
+All requirements in `.superpowers/sdd/task-4-findings.md` are implemented within pure stream/final helpers. No HTTP route, pull-loop, process, listener, or port code was touched.
+
+### Fixes
+
+1. Enforced required `sequence_number` beginning at 1 and exact increments across every event, including ignored additive events.
+2. Added strict output/item/part identity and lifecycle tracking: canonical output/content/summary order, ID↔index↔type stability, alias stability, duplicate/gap/reverse rejection, no deltas after done, duplicate terminal rejection, and final identity validation.
+3. Added configurable production stream limits for events, output blocks, identities, cumulative UTF-8/category bytes, and cumulative pending chunks.
+4. Added numeric-only `snapshot()` history/retained counters and terminal cleanup of blocks, maps, hashes, Unicode suffixes, and pending buffers on success or failure.
+5. Separated raw `reasoning_text` lifecycle from visible reasoning summaries; raw reasoning is shape/sequence validated, byte-accounted, and never emitted or reconciled as thinking.
+6. Enforced canonical visible block ordering with one open block, including later-output buffering until lower output items are complete and completed-tool safety before chunk exposure.
+7. Replaced UTF-16 stop buffering/slicing with a bounded Unicode-code-point filter, including split-surrogate handling and code-point stop-length validation.
+8. Removed eager empty text block creation, so a one-code-point stop at offset zero terminates cleanly with no divergent block.
+9. Redacted all non-validation and upstream 4xx/5xx messages while preserving only trusted local 400/413 validation text.
+10. Allowed current terminal `usage:null` for ordinary responses and emit bounded estimated input/output usage; zero-token prewarm still requires authoritative cache usage.
+11. Split protocol, Unicode stop filtering, limits, cumulative budget, block state, and test fixtures into focused modules.
+12. Removed only the two downloaded review docs created under `.tmp`:
+    - `.tmp/task4-review-openai-streaming.html`
+    - `.tmp/task4-review-openai-responses-create.html`
+
+### Strict TDD Evidence
+
+Each defect was captured failing before its production fix. Representative RED evidence:
+
+```text
+bun test --isolate tests/anthropic-stream-protocol.test.ts
+0 pass, 6 fail
+
+bun test --isolate tests/anthropic-stream-bounds.test.ts
+0 pass, 1 fail, 1 error
+Export named 'DEFAULT_ANTHROPIC_STREAM_LIMITS' not found
+
+bun test --isolate tests/anthropic-stream-safety.test.ts
+3 pass, 3 fail
+split astral emitted a lone surrogate; retained suffix was 2 UTF-16 units; 5xx secret leaked
+
+bun test --isolate tests/anthropic-response-usage.test.ts -t "null usage|prewarm"
+6 pass, 2 fail
+usage:null rejected as malformed final
+```
+
+Additional individual RED→GREEN cycles covered conflicting function aliases, final ID/type collisions, malformed raw reasoning completion, 429 redaction, code-point stop limits, and partial/final lifecycle ordering.
+
+### Final Verification
+
+```text
+All Anthropic focused tests:
+195 pass, 0 fail
+
+bun run typecheck
+exit 0
+
+bun test --isolate --max-concurrency=4
+741 pass, 0 fail, 4335 expect() calls
+119 files, 35.04s
+
+git diff --check
+exit 0
+```
+
+The full suite used `--max-concurrency=4` (down from Bun's default 20) to avoid the previously documented Windows filesystem/timer contention. The final full gate is completely green.
+
+### Final Concerns
+
+None.

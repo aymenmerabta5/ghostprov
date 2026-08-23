@@ -85,7 +85,7 @@ export function truncateAtStop(
 export function responseStopSequences(value: unknown): string[] {
   if (!Array.isArray(value) || value.length > MAX_ANTHROPIC_STOP_SEQUENCES ||
     value.some(sequence => typeof sequence !== "string" || sequence.length === 0 ||
-      sequence.length > MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH)) {
+      Array.from(sequence).length > MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH)) {
     throw invalidUpstream("Anthropic response context is malformed.");
   }
   return value as string[];

@@ -290,7 +290,7 @@ export function translateStopSequences(
   if (strings.some(item => item.length === 0)) {
     throw new AnthropicRequestError(400, "stop_sequences values must not be empty");
   }
-  if (strings.some(item => item.length > MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH)) {
+  if (strings.some(item => Array.from(item).length > MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH)) {
     throw new AnthropicRequestError(
       400,
       `stop_sequences values may contain at most ${MAX_ANTHROPIC_STOP_SEQUENCE_LENGTH} characters`,

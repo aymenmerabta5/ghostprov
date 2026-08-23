@@ -1,0 +1,395 @@
+import { describe, expect, it } from "bun:test";
+import type { SseFrame } from "../src/relay/sse";
+import {
+  AnthropicStreamTranslator,
+  type AnthropicSseEvent,
+} from "../src/anthropic/stream";
+import {
+  CONTEXT,
+  DEFAULT_RESPONSES_USAGE,
+} from "./support/anthropic-response";
+
+function frame(
+  sequenceNumber: number | undefined,
+  type: string,
+  fields: Record<string, unknown> = {},
+): SseFrame {
+  return {
+    event: type,
+    data: JSON.stringify({
+      type,
+      ...(sequenceNumber === undefined ? {} : { sequence_number: sequenceNumber }),
+      ...fields,
+    }),
+  };
+}
+
+type FinalResponse = Record<string, unknown> & { output: Record<string, unknown>[] };
+
+function finalResponse(output: Record<string, unknown>[] = []): FinalResponse {
+  return {
+    id: "resp_protocol",
+    object: "response",
+    created_at: 1,
+    model: "gpt-5.6-terra",
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    output,
+    usage: DEFAULT_RESPONSES_USAGE,
+  } as FinalResponse;
+}
+
+function message(
+  id: string,
+  texts: string[],
+): Record<string, unknown> {
+  return {
+    type: "message",
+    id,
+    status: "completed",
+    role: "assistant",
+    content: texts.map(text => ({
+      type: "output_text",
+      text,
+      annotations: [],
+      logprobs: [],
+    })),
+  };
+}
+
+function reasoning(id: string, text: string): Record<string, unknown> {
+  return {
+    type: "reasoning",
+    id,
+    status: "completed",
+    encrypted_content: `${id}-cipher`,
+    summary: [{ type: "summary_text", text }],
+  };
+}
+
+function expectError(events: AnthropicSseEvent[]): void {
+  expect(events).toMatchObject([{
+    type: "error",
+    error: { type: "api_error", message: expect.any(String) },
+    request_id: CONTEXT.requestId,
+  }]);
+}
+
+function eventTypes(events: AnthropicSseEvent[]): string[] {
+  return events.map(event => event.type);
+}
+
+describe("Anthropic stream sequence integrity", () => {
+  it("requires sequence one first and exact increments for ignored events", () => {
+    for (const first of [undefined, 0, 2]) {
+      const translator = new AnthropicStreamTranslator(CONTEXT);
+      translator.start();
+      expectError(translator.push(frame(first, "response.created", {
+        response: { id: "resp_sequence", status: "in_progress" },
+      })));
+    }
+
+    for (const [second, label] of [[1, "duplicate"], [3, "gap"], [0, "regression"]] as const) {
+      const translator = new AnthropicStreamTranslator(CONTEXT);
+      translator.start();
+      expect(translator.push(frame(1, "response.future_ignored", { label }))).toEqual([]);
+      expectError(translator.push(frame(second, "response.another_ignored", { label })));
+    }
+  });
+
+  it("rejects a second completion instead of silently accepting post-terminal input", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    expect(eventTypes(translator.push(frame(1, "response.completed", {
+      response: finalResponse(),
+    })))).toEqual(["message_delta", "message_stop"]);
+    expectError(translator.push(frame(2, "response.completed", {
+      response: finalResponse(),
+    })));
+  });
+});
+
+describe("Anthropic stream identity and lifecycle integrity", () => {
+  it("rejects reverse output creation and item ID/index/type collisions", () => {
+    const reversed = new AnthropicStreamTranslator(CONTEXT);
+    reversed.start();
+    expectError(reversed.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_reverse",
+      output_index: 1,
+      content_index: 0,
+      delta: "x",
+    })));
+
+    const reusedId = new AnthropicStreamTranslator(CONTEXT);
+    reusedId.start();
+    reusedId.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_collision",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    expectError(reusedId.push(frame(2, "response.output_text.delta", {
+      item_id: "msg_collision",
+      output_index: 1,
+      content_index: 0,
+      delta: "b",
+    })));
+
+    const conflictingId = new AnthropicStreamTranslator(CONTEXT);
+    conflictingId.start();
+    conflictingId.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_a",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    expectError(conflictingId.push(frame(2, "response.output_text.delta", {
+      item_id: "msg_b",
+      output_index: 0,
+      content_index: 0,
+      delta: "b",
+    })));
+
+    const conflictingType = new AnthropicStreamTranslator(CONTEXT);
+    conflictingType.start();
+    conflictingType.push(frame(1, "response.output_text.delta", {
+      item_id: "item_type",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    expectError(conflictingType.push(frame(2, "response.function_call_arguments.delta", {
+      item_id: "item_type",
+      output_index: 0,
+      delta: "{}",
+    })));
+  });
+
+  it("rejects conflicting function call aliases", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(1, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_alias",
+        status: "in_progress",
+        call_id: "call_original",
+        name: "Read",
+        arguments: "",
+      },
+    }));
+    expectError(translator.push(frame(2, "response.function_call_arguments.delta", {
+      item_id: "fc_alias",
+      output_index: 0,
+      call_id: "call_conflict",
+      name: "Write",
+      delta: "{}",
+    })));
+  });
+
+  it("rejects an authoritative final that renames a streamed output position", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_original",
+      output_index: 0,
+      content_index: 0,
+      delta: "same",
+    }));
+    const events = translator.finish(finalResponse([message("msg_conflict", ["same"])]));
+    expectError(events);
+  });
+
+  it("rejects an authoritative final that changes a zero-byte streamed item type", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    translator.push(frame(1, "response.output_text.delta", {
+      item_id: "item_zero_type",
+      output_index: 0,
+      content_index: 0,
+      delta: "",
+    }));
+    expectError(translator.finish(finalResponse([{
+      type: "function_call",
+      id: "item_zero_type",
+      status: "completed",
+      call_id: "call_zero_type",
+      name: "Read",
+      arguments: "{}",
+    }])));
+  });
+
+  it("rejects reverse/gapped content and summary index creation", () => {
+    for (const contentIndex of [1, 2]) {
+      const translator = new AnthropicStreamTranslator(CONTEXT);
+      translator.start();
+      expectError(translator.push(frame(1, "response.output_text.delta", {
+        item_id: "msg_content",
+        output_index: 0,
+        content_index: contentIndex,
+        delta: "x",
+      })));
+    }
+
+    const contentGap = new AnthropicStreamTranslator(CONTEXT);
+    contentGap.start();
+    contentGap.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_gap",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    expectError(contentGap.push(frame(2, "response.output_text.delta", {
+      item_id: "msg_gap",
+      output_index: 0,
+      content_index: 2,
+      delta: "b",
+    })));
+
+    const summary = new AnthropicStreamTranslator(CONTEXT);
+    summary.start();
+    expectError(summary.push(frame(1, "response.reasoning_summary_text.delta", {
+      item_id: "rs_reverse",
+      output_index: 0,
+      summary_index: 1,
+      delta: "hidden",
+    })));
+
+    const summaryType = new AnthropicStreamTranslator(CONTEXT);
+    summaryType.start();
+    expectError(summaryType.push(frame(1, "response.reasoning_summary_part.added", {
+      item_id: "rs_type",
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "future_summary", text: "" },
+    })));
+  });
+
+  it("rejects deltas and duplicate done events after content/item completion", () => {
+    const text = new AnthropicStreamTranslator(CONTEXT);
+    text.start();
+    text.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_done",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    text.push(frame(2, "response.output_text.done", {
+      item_id: "msg_done",
+      output_index: 0,
+      content_index: 0,
+      text: "a",
+    }));
+    expectError(text.push(frame(3, "response.output_text.delta", {
+      item_id: "msg_done",
+      output_index: 0,
+      content_index: 0,
+      delta: "late",
+    })));
+
+    const duplicateDone = new AnthropicStreamTranslator(CONTEXT);
+    duplicateDone.start();
+    duplicateDone.push(frame(1, "response.output_text.done", {
+      item_id: "msg_duplicate_done",
+      output_index: 0,
+      content_index: 0,
+      text: "a",
+    }));
+    expectError(duplicateDone.push(frame(2, "response.output_text.done", {
+      item_id: "msg_duplicate_done",
+      output_index: 0,
+      content_index: 0,
+      text: "a",
+    })));
+
+    const itemDone = new AnthropicStreamTranslator(CONTEXT);
+    itemDone.start();
+    itemDone.push(frame(1, "response.output_item.done", {
+      output_index: 0,
+      item: message("msg_item_done", ["done"]),
+    }));
+    expectError(itemDone.push(frame(2, "response.output_text.delta", {
+      item_id: "msg_item_done",
+      output_index: 0,
+      content_index: 0,
+      delta: "late",
+    })));
+  });
+
+  it("buffers later output until every lower output item is canonically complete", () => {
+    const final = finalResponse([
+      message("msg_order", ["first", "second"]),
+      reasoning("rs_order", "thought"),
+    ]);
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    const emitted: AnthropicSseEvent[] = [...translator.start()];
+    const push = (value: SseFrame): void => { emitted.push(...translator.push(value)); };
+
+    push(frame(1, "response.output_item.added", {
+      output_index: 0,
+      item: { type: "message", id: "msg_order", status: "in_progress", role: "assistant", content: [] },
+    }));
+    push(frame(2, "response.output_text.delta", {
+      item_id: "msg_order",
+      output_index: 0,
+      content_index: 0,
+      delta: "first",
+    }));
+    push(frame(3, "response.output_text.done", {
+      item_id: "msg_order",
+      output_index: 0,
+      content_index: 0,
+      text: "first",
+    }));
+    push(frame(4, "response.output_item.added", {
+      output_index: 1,
+      item: { type: "reasoning", id: "rs_order", status: "in_progress", summary: [] },
+    }));
+    expect(emitted.some(event =>
+      event.type === "content_block_start" && event.content_block.type === "thinking"
+    )).toBe(false);
+    push(frame(5, "response.output_text.delta", {
+      item_id: "msg_order",
+      output_index: 0,
+      content_index: 1,
+      delta: "second",
+    }));
+    push(frame(6, "response.output_text.done", {
+      item_id: "msg_order",
+      output_index: 0,
+      content_index: 1,
+      text: "second",
+    }));
+    push(frame(7, "response.output_item.done", {
+      output_index: 0,
+      item: final.output[0],
+    }));
+    push(frame(8, "response.reasoning_summary_text.delta", {
+      item_id: "rs_order",
+      output_index: 1,
+      summary_index: 0,
+      delta: "thought",
+    }));
+    push(frame(9, "response.output_item.done", {
+      output_index: 1,
+      item: final.output[1],
+    }));
+    push(frame(10, "response.completed", { response: final }));
+
+    expect(emitted.filter(event => event.type === "content_block_start")
+      .map(event => event.content_block.type)).toEqual(["text", "text", "thinking"]);
+    let open = false;
+    for (const event of emitted) {
+      if (event.type === "content_block_start") {
+        expect(open).toBe(false);
+        open = true;
+      } else if (event.type === "content_block_stop") {
+        expect(open).toBe(true);
+        open = false;
+      }
+    }
+    expect(open).toBe(false);
+  });
+});
