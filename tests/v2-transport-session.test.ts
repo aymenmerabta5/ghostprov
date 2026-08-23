@@ -103,7 +103,14 @@ class TransportHarness {
     await this.settle();
   }
 
-  publish(frames: readonly SidecarFrame[]): void {
+  publish(
+    frames: readonly SidecarFrame[],
+    options: {
+      lane?: "data" | "control";
+      ackSequence?: number;
+      revision?: number;
+    } = {},
+  ): void {
     for (const frame of frames) {
       this.sidecarOutstanding.push({
         ...frame,
@@ -122,13 +129,14 @@ class TransportHarness {
       instanceId: this.sidecarInstanceId,
       leaderGeneration: BINDING.leaderGeneration,
       epoch: this.sidecarEpoch,
-      revision: this.revision++,
-      ack: { epoch: 1, sequence: this.hostAck },
+      revision: options.revision ?? this.revision++,
+      ack: { epoch: 1, sequence: options.ackSequence ?? this.hostAck },
       credits: this.credits,
       active: 128 - this.credits,
       queued: 0,
       draining: false,
-      frames: [...this.sidecarOutstanding],
+      frames: options.lane === "control" ? [] : [...this.sidecarOutstanding],
+      ...(options.lane ? { lane: options.lane } : {}),
     });
   }
 
@@ -224,6 +232,89 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("publishes ACK control state without repeating an active request flight", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 1 });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    const pending = harness.session.run({
+      ...BODY,
+      input: "control-split-".repeat(20_000),
+    });
+    try {
+      await harness.settle();
+      const requestFlight = harness.hostEnvelopes.find(value => value.lane === "data");
+      expect(requestFlight?.frames.length).toBeGreaterThan(0);
+
+      harness.publish([{
+        kind: "pong",
+        sentAtMs: 1,
+      }], { lane: "data", ackSequence: -1 });
+      await harness.settle();
+
+      const control = harness.hostEnvelopes.find(value => value.lane === "control");
+      expect(control?.frames).toEqual([]);
+      expect(JSON.stringify(control).length * 4).toBeLessThan(JSON.stringify(requestFlight).length);
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("freezes a bounded request flight until its high sequence is acknowledged", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 1 });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    const pending = harness.session.run({ ...BODY, input: "large-flight-".repeat(40_000) });
+    try {
+      await harness.settle();
+
+      const first = harness.hostEnvelopes.filter(value => value.lane === "data");
+      expect(first).toHaveLength(1);
+      expect(first[0]!.frames.length).toBeLessThanOrEqual(32);
+      const flightBytes = first[0]!.frames.reduce(
+        (sum, frame) => sum + utf8Bytes(JSON.stringify(frame)).byteLength,
+        0,
+      );
+      expect(flightBytes).toBeLessThanOrEqual(128 * 1024);
+      await Bun.sleep(10);
+      await harness.settle();
+      expect(harness.hostEnvelopes.filter(value => value.lane === "data")).toHaveLength(1);
+
+      const high = first[0]!.frames.at(-1)!.sequence;
+      harness.publish([], { lane: "control", ackSequence: high });
+      await harness.settle();
+      expect(harness.hostEnvelopes.filter(value => value.lane === "data").length)
+        .toBeGreaterThan(1);
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("tracks control and data revisions independently", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 1 });
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    await harness.settle();
+    const identity = harness.requestIdentity();
+    harness.credits = 127;
+    try {
+      harness.publish([], { lane: "control", revision: 100 });
+      harness.publish([{
+        kind: "request_ack",
+        ...identity,
+        committed: true,
+      }], { lane: "data", revision: 1 });
+      await harness.settle();
+
+      expect(await promiseState(pending)).toBe("settled");
+      await pending;
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
   it("coalesces concurrent request data into one peer-wide publication", async () => {
     const harness = new TransportHarness({ publicationIntervalMs: 25 });
     await harness.start();

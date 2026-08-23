@@ -6,6 +6,8 @@ import type {
   AwarenessPeerUpdate,
 } from "../awareness/channel";
 import {
+  GP_V2_FLIGHT_MAX_BYTES,
+  GP_V2_FLIGHT_MAX_FRAMES,
   GP_V2_REQUEST_MAX_BYTES,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
@@ -16,12 +18,14 @@ import {
   utf8Bytes,
   utf8Text,
   type AwarenessEnvelope,
+  type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
   type ReliableFrame,
   type RequestEncoding,
   type SidecarFrame,
 } from "../protocol/shared";
+import { AckClockedFlight } from "../protocol/flight";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
 import { ReliableDeliveryTiming } from "../protocol/delivery-timing";
 import {
@@ -189,6 +193,7 @@ export class V2TransportSession {
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
   readonly #delivery: ReliableDeliveryTiming;
+  readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #pacer: PublicationPacer;
   readonly #requests = new Map<string, RequestState>();
   readonly #rotations = new Map<string, RotationWaiter>();
@@ -202,9 +207,14 @@ export class V2TransportSession {
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #processing: Promise<void> = Promise.resolve();
-  #revision = 0;
+  #dataRevision = 0;
+  #controlRevision = 0;
+  #dataDirty = false;
   #sidecarInstanceId: string | null = null;
-  #sidecarRevision = -1;
+  readonly #sidecarRevision: Record<AwarenessLane, number> = {
+    data: -1,
+    control: -1,
+  };
   #remoteCredits = 0;
   #creditReservations = 0;
   #quarantined = 0;
@@ -516,10 +526,15 @@ export class V2TransportSession {
     if (!validBinding(envelope, this.#binding)) {
       throw new Error("Sidecar Awareness binding is invalid");
     }
+    const lane: AwarenessLane = envelope.lane ?? "data";
+    const legacy = envelope.lane === undefined;
+    if (lane === "control" && envelope.frames.length > 0) {
+      throw new Error("Sidecar control Awareness state contains reliable frames");
+    }
     let replaced = false;
     if (this.#sidecarInstanceId && envelope.instanceId !== this.#sidecarInstanceId) {
       if (this.#retiredSidecarInstances.has(envelope.instanceId)) return;
-      if (envelope.epoch <= this.#inbound.ack().epoch) return;
+      if (lane === "data" && envelope.epoch <= this.#inbound.ack().epoch) return;
       this.#retiredSidecarInstances.add(this.#sidecarInstanceId);
       const message = "Sidecar instance changed while transport state was active";
       for (const state of [...this.#requests.values()]) {
@@ -532,14 +547,23 @@ export class V2TransportSession {
       const nextEpoch = this.#outbound.snapshot().epoch + 1;
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
-      this.#sidecarRevision = -1;
+      this.#flight.reset(nextEpoch);
+      this.#channel.clear("data");
+      this.#dataDirty = false;
+      this.#sidecarRevision.data = -1;
+      this.#sidecarRevision.control = -1;
       replaced = true;
     }
-    if (envelope.revision <= this.#sidecarRevision) return;
+    if (envelope.revision <= this.#sidecarRevision[lane]) return;
     this.#sidecarInstanceId = envelope.instanceId;
-    this.#sidecarRevision = envelope.revision;
-    this.#sidecarDiagnostics = envelope.diagnostics ?? null;
+    this.#sidecarRevision[lane] = envelope.revision;
+    if (lane === "control" || legacy) {
+      this.#sidecarDiagnostics = envelope.diagnostics ?? null;
+      this.#remoteCredits = Math.max(0, Math.min(128, envelope.credits));
+    }
+
     this.#outbound.acknowledge(envelope.ack);
+    const flightCompleted = this.#flight.acknowledged(envelope.ack);
     const now = this.#clock.now();
     const acknowledgementAdvanced = this.#delivery.acknowledged(
       envelope.ack,
@@ -550,13 +574,16 @@ export class V2TransportSession {
       this.#lastAckAtMs = now;
       this.#armRetransmission();
     }
-    this.#remoteCredits = Math.max(0, Math.min(128, envelope.credits));
-    const currentEpoch = this.#inbound.ack().epoch;
-    if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
-    const delivered = this.#inbound.accept(envelope.frames);
-    for (const frame of delivered) await this.#processFrame(frame);
+    let delivered: readonly ReliableFrame<SidecarFrame>[] = [];
+    if (lane === "data") {
+      const currentEpoch = this.#inbound.ack().epoch;
+      if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
+      delivered = this.#inbound.accept(envelope.frames);
+      for (const frame of delivered) await this.#processFrame(frame);
+    }
     this.#admitPending();
     const urgency = this.#pump();
+    if (flightCompleted && urgency === null) this.#channel.clear("data");
     this.#requestPublication(
       replaced || delivered.length > 0 ? "urgent" : urgency,
     );
@@ -889,15 +916,23 @@ export class V2TransportSession {
 
   #pump(): PublicationUrgency | null {
     if (!this.#connected || this.#closed) return null;
+    if (this.#flight.active) return null;
     let urgency: PublicationUrgency | null = null;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
-      const frameBudget = GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length;
-      const byteBudget = GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes;
+      const frameBudget = Math.min(
+        GP_V2_FLIGHT_MAX_FRAMES - snapshot.frames.length,
+        GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length,
+      );
+      const byteBudget = Math.min(
+        GP_V2_FLIGHT_MAX_BYTES - snapshot.encodedBytes,
+        GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes,
+      );
       if (frameBudget < 1 || byteBudget < 512) break;
       const next = this.#scheduler.take(1, Math.max(1, byteBudget - 256));
       if (next.length === 0) break;
       const reliable = this.#outbound.push(next[0]!);
+      this.#dataDirty = true;
       urgency = strongestUrgency(urgency, hostFrameUrgency(reliable));
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
         const state = this.#requests.get(reliable.requestId);
@@ -916,7 +951,27 @@ export class V2TransportSession {
   #publish(reason: PublicationReason): void {
     if (!this.#connected || this.#closed) return;
     const outbound = this.#outbound.snapshot();
-    this.#delivery.published(outbound.frames, this.#clock.now());
+    const publishData = reason === "retransmission" || this.#dataDirty;
+    if (publishData) {
+      this.#flight.published(outbound.frames);
+      this.#delivery.published(outbound.frames, this.#clock.now());
+      this.#publishLane("data", outbound.frames, reason);
+      this.#dataDirty = false;
+    }
+    if (reason === "initial" || reason === "urgent" || !publishData) {
+      this.#publishLane("control", [], reason);
+    }
+    const diagnostics = this.#hostTransportDiagnostics();
+    for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
+    this.#armRetransmission();
+  }
+
+  #publishLane(
+    lane: AwarenessLane,
+    frames: readonly ReliableFrame<HostFrame>[],
+    reason: PublicationReason,
+  ): void {
+    const outbound = this.#outbound.snapshot();
     const committed = [...this.#requests.values()].filter(state => state.committed).length;
     const envelope: AwarenessEnvelope<HostFrame> = {
       protocol: "gp-awareness-v2",
@@ -929,22 +984,20 @@ export class V2TransportSession {
       instanceId: this.#hostInstanceId,
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: outbound.epoch,
-      revision: this.#revision++,
+      revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#inbound.ack(),
       credits: this.#hostCeiling,
       active: committed,
       queued: this.#pending.filter(state => !state.admitted).length,
       draining: this.#draining,
-      frames: outbound.frames,
+      frames,
+      lane,
     };
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
     this.#publishedBytes += utf8Bytes(JSON.stringify(envelope)).byteLength;
-    const diagnostics = this.#hostTransportDiagnostics();
-    for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
-    this.#channel.publish(envelope);
-    this.#armRetransmission();
+    this.#channel.publish(envelope, lane);
   }
 
   #hostTransportDiagnostics(): V2TransportDiagnostics {
@@ -982,7 +1035,8 @@ export class V2TransportSession {
       this.#closed ||
       this.#outbound.snapshot().frames.length === 0
     ) return;
-    const jitterSeed = ((this.#revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
+    const revision = this.#dataRevision + this.#controlRevision;
+    const jitterSeed = ((revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
     const delay = this.#delivery.nextDelayMs(this.#clock.now(), jitterSeed);
     if (delay === null) return;
     this.#timer = setTimeout(() => {

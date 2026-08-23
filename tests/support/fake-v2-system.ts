@@ -16,6 +16,7 @@ import {
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
   type AwarenessEnvelope,
+  type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
   type SidecarFrame,
@@ -166,7 +167,10 @@ class FakeSidecarPeer {
   #unsubscribe: (() => void) | null = null;
   #processing: Promise<void> = Promise.resolve();
   #revision = 0;
-  #hostRevision = -1;
+  readonly #hostRevision: Record<AwarenessLane, number> = {
+    data: -1,
+    control: -1,
+  };
   #closed = false;
 
   constructor(options: {
@@ -206,19 +210,26 @@ class FakeSidecarPeer {
   }
 
   readonly #onHost = (update: AwarenessPeerUpdate<HostFrame>): void => {
-    if (update.envelope.revision <= this.#hostRevision) return;
-    this.#hostRevision = update.envelope.revision;
+    const lane = update.envelope.lane ?? "data";
+    if (update.envelope.revision <= this.#hostRevision[lane]) return;
+    this.#hostRevision[lane] = update.envelope.revision;
     this.#processing = this.#processing
       .then(() => this.#acceptEnvelope(update.envelope))
       .catch(() => undefined);
   };
 
   async #acceptEnvelope(envelope: AwarenessEnvelope<HostFrame>): Promise<void> {
+    const lane = envelope.lane ?? "data";
     const before = this.#outbound.snapshot().frames.length;
-    this.#engine.setHostCeiling(envelope.credits);
+    if (lane === "control" || envelope.lane === undefined) {
+      this.#engine.setHostCeiling(envelope.credits);
+    }
     this.#outbound.acknowledge(envelope.ack);
     const ackProgress = this.#outbound.snapshot().frames.length < before;
-    const frames = this.#inbound.accept(envelope.frames);
+    if (lane === "control" && envelope.frames.length > 0) {
+      throw new Error("fake sidecar received framed control state");
+    }
+    const frames = lane === "data" ? this.#inbound.accept(envelope.frames) : [];
     for (const frame of frames) await this.#engine.accept(frame);
     const pumped = this.#pump();
     if (frames.length > 0 || ackProgress || pumped) this.#publish();
