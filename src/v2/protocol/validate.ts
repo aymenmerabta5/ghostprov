@@ -280,6 +280,12 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         ...identity,
       };
     }
+    case "response_batch": {
+      exactKeys(raw,["kind","requestId","firstEventIndex","items","epoch","sequence"],"response_batch frame");
+      if(!Array.isArray(raw.items)||raw.items.length<1||raw.items.length>32) fail("response_batch must contain 1 through 32 items","batch_items");
+      const items=raw.items.map((value,index)=>{const item=object(value,`batch item ${index}`);exactKeys(item,["event","dataBase64Url"],"response_batch item");const event=string(item.event,"event",128);if(!SAFE_EVENT.test(event))fail("event is invalid","event");return {event,dataBase64Url:base64url(item.dataBase64Url,"dataBase64Url")};});
+      return {kind,requestId:safeId(raw.requestId,"requestId"),firstEventIndex:integer(raw.firstEventIndex,"firstEventIndex"),items,...identity};
+    }
     case "response_terminal": {
       exactKeys(raw, [
         "kind", "requestId", "requestDigest", "responseId", "eventCount", "byteCount",

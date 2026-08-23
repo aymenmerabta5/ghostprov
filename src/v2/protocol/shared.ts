@@ -54,6 +54,10 @@ export type HostFrame =
 
 export type SidecarFrame =
   | {
+    kind: "response_batch"; requestId: string; firstEventIndex: number;
+    items: readonly { event: string; dataBase64Url: string }[];
+  }
+  | {
     kind: "request_ack";
     requestId: string;
     requestDigest: string;
@@ -165,6 +169,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "request_ack",
     "request_reject",
     "response_event",
+    "response_batch",
     "response_terminal",
     "response_error",
     "credential_ack",
@@ -187,6 +192,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     response_event: [
       "requestId", "eventIndex", "event", "partIndex", "partCount", "offset", "dataBase64Url", "diagnostics?",
     ],
+    response_batch: ["requestId", "firstEventIndex", "items"],
     response_terminal: [
       "requestId", "requestDigest", "responseId", "eventCount", "byteCount",
       "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256", "diagnostics?",
