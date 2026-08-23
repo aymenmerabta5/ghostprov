@@ -120,6 +120,9 @@ export function translateAnthropicRequest(
   if (maxTokensZero && (toolChoice === "required" || typeof toolChoice === "object")) {
     throw new AnthropicRequestError(400, "max_tokens 0 does not support forced tool choice");
   }
+  if (thinking.manual && (toolChoice === "required" || typeof toolChoice === "object")) {
+    throw new AnthropicRequestError(400, "manual thinking does not support forced tool choice");
+  }
 
   const relayBody: ResponsesRequestBody = {
     model: resolveAnthropicModel(requestedModel, options.models),

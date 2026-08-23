@@ -463,6 +463,21 @@ describe("Anthropic request current contracts", () => {
     }
   });
 
+  it("accepts null eager_input_streaming as omitted", () => {
+    const body = translate(request({
+      tools: [{
+        name: "Read",
+        input_schema: { type: "object" },
+        eager_input_streaming: null,
+      }],
+    })).relayBody;
+    expect(body.tools).toEqual([{
+      type: "function",
+      name: "Read",
+      parameters: { type: "object" },
+    }]);
+  });
+
   it("rejects duplicate declared tool names", () => {
     expectInvalid(request({
       tools: [
@@ -477,6 +492,51 @@ describe("Anthropic request current contracts", () => {
       tools: [{ name: "Read", input_schema: { type: "object" } }],
       tool_choice: { type: "tool", name: "Write" },
     }), "not declared");
+  });
+
+  it("rejects tool_choice any when no tools are declared", () => {
+    expectInvalid(request({ tool_choice: { type: "any" } }), "requires at least one declared tool");
+  });
+
+  for (const [name, toolChoice] of [
+    ["any", { type: "any" }],
+    ["named", { type: "tool", name: "Read" }],
+  ] as const) {
+    it(`rejects ${name} tool choice with manual extended thinking`, () => {
+      expectInvalid(request({
+        max_tokens: 4096,
+        tools: [{ name: "Read", input_schema: { type: "object" } }],
+        tool_choice: toolChoice,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      }), "manual thinking");
+    });
+  }
+
+  it("allows auto and none tool choice with manual extended thinking", () => {
+    for (const toolChoice of [{ type: "auto" }, { type: "none" }] as const) {
+      const translated = translate(request({
+        max_tokens: 4096,
+        tools: [{ name: "Read", input_schema: { type: "object" } }],
+        tool_choice: toolChoice,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      }));
+      expect(translated.relayBody.tool_choice).toBe(toolChoice.type);
+    }
+  });
+
+  it("allows forced choices with adaptive thinking", () => {
+    const required = translate(request({
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      tool_choice: { type: "any" },
+      thinking: { type: "adaptive" },
+    })).relayBody;
+    const named = translate(request({
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      tool_choice: { type: "tool", name: "Read" },
+      thinking: { type: "adaptive" },
+    })).relayBody;
+    expect(required.tool_choice).toBe("required");
+    expect(named.tool_choice).toEqual({ type: "function", name: "Read" });
   });
 
   const invalidMediaCases: Array<[string, Record<string, unknown>]> = [

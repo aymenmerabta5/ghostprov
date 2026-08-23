@@ -48,7 +48,9 @@ export function translateTools(
     }
     const strict = requireOptionalBoolean(tool, "strict", `${name} strict`);
     requireOptionalBoolean(tool, "defer_loading", `${name} defer_loading`);
-    requireOptionalBoolean(tool, "eager_input_streaming", `${name} eager_input_streaming`);
+    if (tool.eager_input_streaming !== null) {
+      requireOptionalBoolean(tool, "eager_input_streaming", `${name} eager_input_streaming`);
+    }
 
     const translated: ResponsesFunctionTool = {
       type: "function",
@@ -85,7 +87,12 @@ export function translateToolChoice(
 
   let toolChoice: ResponsesToolChoice;
   if (type === "auto") toolChoice = "auto";
-  else if (type === "any") toolChoice = "required";
+  else if (type === "any") {
+    if (!declaredToolNames.size) {
+      throw new AnthropicRequestError(400, "tool_choice any requires at least one declared tool");
+    }
+    toolChoice = "required";
+  }
   else if (type === "none") toolChoice = "none";
   else if (type === "tool") {
     const name = requireString(choice, "name", "tool_choice tool name");
@@ -155,6 +162,7 @@ export function translateThinking(
 ): {
   reasoning?: ResponsesReasoning;
   display: AnthropicThinkingDisplay;
+  manual: boolean;
 } {
   if (value === undefined) {
     return {
@@ -162,6 +170,7 @@ export function translateThinking(
         ? { reasoning: { effort: explicitEffort, summary: "auto" as const } }
         : {}),
       display: "summarized",
+      manual: false,
     };
   }
   if (value === null) throw new AnthropicRequestError(400, "thinking must not be null");
@@ -176,11 +185,12 @@ export function translateThinking(
     display = thinking.display;
   }
 
-  if (type === "disabled") return { reasoning: { effort: "none" }, display };
+  if (type === "disabled") return { reasoning: { effort: "none" }, display, manual: false };
   if (type === "adaptive") {
     return {
       reasoning: { effort: explicitEffort ?? "high", summary: "auto" },
       display,
+      manual: false,
     };
   }
   if (type === "enabled") {
@@ -197,6 +207,7 @@ export function translateThinking(
         summary: "auto",
       },
       display,
+      manual: true,
     };
   }
   throw new AnthropicRequestError(400, `unsupported thinking type: ${type}`);
