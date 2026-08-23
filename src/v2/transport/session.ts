@@ -716,6 +716,16 @@ export class V2TransportSession {
         }
         return;
       }
+      case "request_cancelled": {
+        const state = this.#requests.get(frame.requestId);
+        if (!state?.cancelled) return;
+        const releaseQuarantine = state.quarantined;
+        this.#removeState(state);
+        if (releaseQuarantine) {
+          this.#quarantined = Math.max(0, this.#quarantined - 1);
+        }
+        return;
+      }
       case "drained":
         if (frame.active === 0 && frame.queued === 0) {
           this.#drainResolve?.();

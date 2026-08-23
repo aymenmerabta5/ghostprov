@@ -16,6 +16,39 @@ import {
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
 describe("SidecarEngine", () => {
+  it("acknowledges cancellation only after releasing the active execution lease", async () => {
+    const harness = new SidecarHarness({
+      behavior: async input => {
+        await input.beforeFetch();
+        if (input.signal.aborted) {
+          throw new UpstreamExecutionError("cancelled", "cancelled", true);
+        }
+        return new Promise<UpstreamTerminal>((_resolve, reject) => {
+          input.signal.addEventListener("abort", () => reject(
+            new UpstreamExecutionError("cancelled", "cancelled", true),
+          ), { once: true });
+        });
+      },
+    });
+    await harness.sendRequest(BODY);
+    expect(harness.engine.snapshot().active).toBe(1);
+
+    await harness.engine.accept({
+      kind: "request_cancel",
+      requestId: harness.requestId,
+      reason: "client aborted",
+      epoch: 1,
+      sequence: 3,
+    });
+    await harness.settle();
+
+    const release = harness.timeline.lastIndexOf("release");
+    const acknowledgement = harness.timeline.lastIndexOf("emit:request_cancelled");
+    expect(release).toBeGreaterThanOrEqual(0);
+    expect(acknowledgement).toBeGreaterThan(release);
+    expect(harness.frames.some(frame => frame.kind === "response_error")).toBe(false);
+  });
+
   it("backpressures small batched events before reading more upstream data", async () => {
     const backpressure = new OutputBackpressure({
       highFrames: 1,

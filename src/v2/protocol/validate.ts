@@ -327,6 +327,9 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         ambiguous: raw.ambiguous,
         ...identity,
       };
+    case "request_cancelled":
+      exactKeys(raw, ["kind", "requestId", "epoch", "sequence"], "request_cancelled frame");
+      return { kind, requestId: safeId(raw.requestId, "requestId"), ...identity };
     case "credential_ack":
       exactKeys(raw, ["kind", "rotationId", "epoch", "sequence"], "credential_ack frame");
       return { kind, rotationId: safeId(raw.rotationId, "rotationId"), ...identity };

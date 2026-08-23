@@ -105,6 +105,7 @@ export type SidecarFrame =
     message: string;
     ambiguous: boolean;
   }
+  | { kind: "request_cancelled"; requestId: string }
   | { kind: "credential_ack"; rotationId: string }
   | { kind: "drained"; active: number; queued: number }
   | { kind: "pong"; sentAtMs: number };
@@ -180,6 +181,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "response_batch",
     "response_terminal",
     "response_error",
+    "request_cancelled",
     "credential_ack",
     "drained",
     "pong",
@@ -206,6 +208,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
       "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256", "diagnostics?",
     ],
     response_error: ["requestId", "code", "message", "ambiguous"],
+    request_cancelled: ["requestId"],
     credential_ack: ["rotationId"],
     drained: ["active", "queued"],
     pong: ["sentAtMs"],

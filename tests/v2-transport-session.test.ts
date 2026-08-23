@@ -732,10 +732,24 @@ describe("V2TransportSession", () => {
     const handle = await committed.commit(committed.session.run(BODY, abortCommitted.signal));
     abortCommitted.abort();
     await committed.settle();
+    const cancelledRequest = committed.requestIdentity().requestId;
     expect([...committed.hostFrames.values()]).toContainEqual(expect.objectContaining({
       kind: "request_cancel",
     }));
     await expect(handle.final).rejects.toMatchObject({ committed: true });
+    expect(committed.session.snapshot().quarantined).toBe(1);
+    committed.publish([{
+      kind: "request_cancelled",
+      requestId: cancelledRequest,
+    }]);
+    await committed.settle();
+    expect(committed.session.snapshot().quarantined).toBe(0);
+    committed.publish([
+      { kind: "request_cancelled", requestId: cancelledRequest },
+      { kind: "request_cancelled", requestId: "req-unrelated" },
+    ]);
+    await committed.settle();
+    expect(committed.session.snapshot().quarantined).toBe(0);
     await committed.close();
   });
 

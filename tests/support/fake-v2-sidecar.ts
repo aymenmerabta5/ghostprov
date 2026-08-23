@@ -84,6 +84,7 @@ class FakeAdmission implements SidecarAdmission {
         if (released) return;
         released = true;
         this.active--;
+        this.timeline.push("release");
       },
     };
   }

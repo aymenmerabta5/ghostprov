@@ -142,6 +142,18 @@ describe("V2 shared protocol", () => {
     expect(() => parseFrame({ ...frame, extra: 1 }, "host")).toThrow("unknown field");
   });
 
+  it("accepts only a bound reliable cancellation-complete frame from the sidecar", () => {
+    const frame = {
+      kind: "request_cancelled",
+      requestId: "req-cancelled-1",
+      epoch: 3,
+      sequence: 0,
+    } as const;
+    expect(parseFrame(frame, "sidecar")).toEqual(frame);
+    expect(() => parseFrame({ ...frame, unexpected: true }, "sidecar"))
+      .toThrow("unknown field");
+  });
+
   it("canonicalizes object keys recursively without changing array order", () => {
     expect(canonicalJson({ z: 1, a: { y: 2, x: [3, 1] } })).toBe(
       '{"a":{"x":[3,1],"y":2},"z":1}',

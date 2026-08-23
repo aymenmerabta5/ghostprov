@@ -60,6 +60,7 @@ interface ActiveRequest {
   controller: AbortController;
   lease: { release(): void };
   eventIndex: number;
+  cancelRequested: boolean;
 }
 
 export class SidecarEngine {
@@ -161,7 +162,13 @@ export class SidecarEngine {
       case "request_cancel": {
         this.#batcher?.flush(frame.requestId,"control");
         this.#assembler.cancel(frame.requestId);
-        this.#active.get(frame.requestId)?.controller.abort();
+        const active = this.#active.get(frame.requestId);
+        if (active) {
+          active.cancelRequested = true;
+          active.controller.abort();
+        } else {
+          this.#emit({ kind: "request_cancelled", requestId: frame.requestId }, "control", frame.requestId);
+        }
         return;
       }
       case "response_ack":
@@ -306,6 +313,7 @@ export class SidecarEngine {
         controller,
         lease,
         eventIndex: 0,
+        cancelRequested: false,
       };
       this.#active.set(requestId, request);
       try {
@@ -368,6 +376,7 @@ export class SidecarEngine {
         ...(diagnostics ? { diagnostics } : {}),
       }, "terminal", request.requestId);
     } catch (error) {
+      if (request.cancelRequested && request.controller.signal.aborted) return;
       const upstream = error instanceof UpstreamExecutionError ? error : null;
       const ambiguous = upstream?.ambiguous ?? true;
       if (ambiguous) this.#ambiguous.add(request.requestId);
@@ -381,6 +390,12 @@ export class SidecarEngine {
       request.body.fill(0);
       request.lease.release();
       this.#active.delete(request.requestId);
+      if (request.cancelRequested) {
+        this.#emit({
+          kind: "request_cancelled",
+          requestId: request.requestId,
+        }, "control", request.requestId);
+      }
       this.#finishDrainIfIdle();
     }
   }
