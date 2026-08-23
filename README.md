@@ -222,6 +222,7 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_MONITOR_TIMEOUT_MS` | `5000` | Per-poll timeout |
 | `GP_V2_DIAGNOSTICS` | `0` | Opt-in host/sidecar boundary diagnostics |
 | `GP_V2_DIAGNOSTICS_INTERVAL_MS` | `1000` | Fixed-memory sidecar sample interval |
+| `GP_V2_BATCHING` | `0` | Opt-in bounded response batching during live acceptance |
 
 ## Tests
 
@@ -286,6 +287,7 @@ The isolated suite includes:
 - `tests/transport-selector.test.ts`
 - `tests/unlatch-recovery.test.ts`
 - `tests/v2-awareness-channel.test.ts`
+- `tests/v2-batching-throughput.test.ts`
 - `tests/v2-admission.test.ts`
 - `tests/v2-assembler.test.ts`
 - `tests/v2-bootstrap-crypto.test.ts`
@@ -293,6 +295,7 @@ The isolated suite includes:
 - `tests/v2-bootstrap-controller.test.ts`
 - `tests/v2-bootstrap-probe.test.ts`
 - `tests/v2-concurrency.test.ts`
+- `tests/v2-congestion.test.ts`
 - `tests/v2-credential-rotation.test.ts`
 - `tests/v2-diagnostics-classifier.test.ts`
 - `tests/v2-diagnostics-observability.test.ts`
@@ -309,8 +312,11 @@ The isolated suite includes:
 - `tests/v2-large-payload.test.ts`
 - `tests/v2-live-guards.test.ts`
 - `tests/v2-monitor.test.ts`
+- `tests/v2-output-sink.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
+- `tests/v2-response-batch.test.ts`
+- `tests/v2-response-batcher.test.ts`
 - `tests/v2-run-handle.test.ts`
 - `tests/v2-runtime.test.ts`
 - `tests/v2-scheduler.test.ts`

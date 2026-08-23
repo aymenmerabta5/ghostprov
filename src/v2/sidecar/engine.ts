@@ -112,7 +112,7 @@ export class SidecarEngine {
     this.#onDrainRequested = options.onDrainRequested;
     this.#diagnostics = options.diagnostics;
     this.#emitFrame = options.emit;
-    this.#batcher = options.batching ? new ResponseBatcher({ emit: frame => this.#emitFrame(frame, "data", frame.requestId) }) : null;
+    this.#batcher = options.batching ? new ResponseBatcher({ emit: (frame, priority) => this.#emitFrame(frame, priority, frame.requestId) }) : null;
     this.#outputBackpressure = options.outputBackpressure;
   }
 
@@ -159,7 +159,7 @@ export class SidecarEngine {
         }
         return;
       case "request_cancel": {
-        this.#batcher?.flush(frame.requestId);
+        this.#batcher?.flush(frame.requestId,"control");
         this.#assembler.cancel(frame.requestId);
         this.#active.get(frame.requestId)?.controller.abort();
         return;
@@ -354,7 +354,7 @@ export class SidecarEngine {
       );
       this.#terminalDigests.set(request.requestId, terminal.transcriptSha256);
       const diagnostics = this.#diagnostics?.requestTerminal(request.requestId);
-      this.#batcher?.flush(request.requestId);
+      this.#batcher?.flush(request.requestId,"terminal");
       this.#emit({
         kind: "response_terminal",
         requestId: request.requestId,
@@ -430,7 +430,7 @@ export class SidecarEngine {
         terminal.transcriptSha256 !== recovered.terminalDigest
       ) throw new Error("terminal spool identity mismatch");
       this.#terminalDigests.set(requestId, terminal.transcriptSha256);
-      this.#batcher?.flush(requestId);
+      this.#batcher?.flush(requestId,"terminal");
       this.#emit({ ...terminal, requestId, requestDigest: recovered.requestDigest }, "terminal", requestId);
     } catch {
       this.#ambiguous.add(requestId);
@@ -467,7 +467,7 @@ export class SidecarEngine {
     message: string,
     ambiguous: boolean,
   ): void {
-    this.#batcher?.flush(requestId);
+    this.#batcher?.flush(requestId,"terminal");
     this.#emit({
       kind: "response_error",
       requestId,

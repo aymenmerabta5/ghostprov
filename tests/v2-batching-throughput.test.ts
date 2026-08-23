@@ -1,0 +1,4 @@
+import { describe,expect,it } from "bun:test";
+import { ResponseBatcher } from "../src/v2/sidecar/response-batcher";
+import { utf8Bytes,type SidecarFrame } from "../src/v2/protocol/shared";
+describe("V2 batching throughput gate",()=>{it("packs 512 logical deltas at least fourfold within physical limits",()=>{const physical:SidecarFrame[]=[];const batcher=new ResponseBatcher({emit:f=>physical.push(f),flushMs:60_000});for(let i=0;i<512;i++)expect(batcher.push(`r-${i%16}`,Math.floor(i/16),{event:"response.output_text.delta",data:JSON.stringify({delta:`token-${i}`})})).toBe(true);batcher.flushAll();const logical=physical.reduce((sum,frame)=>sum+(frame.kind==="response_batch"?frame.items.length:1),0);expect(logical).toBe(512);expect(512/physical.length).toBeGreaterThanOrEqual(4);expect(Math.max(...physical.map(frame=>utf8Bytes(JSON.stringify({...frame,epoch:1,sequence:1})).byteLength))).toBeLessThanOrEqual(16*1024);});});
