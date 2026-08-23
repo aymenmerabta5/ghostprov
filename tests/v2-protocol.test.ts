@@ -69,7 +69,7 @@ describe("V2 shared protocol", () => {
     expect(await protocolSchemaHash()).toMatch(/^[a-f0-9]{64}$/);
     expect(await protocolSchemaHash()).toBe(await protocolSchemaHash());
     expect(canonicalJson(GP_V2_SCHEMA_DESCRIPTOR)).toContain(
-      '"response_event":["requestId","eventIndex","event","partIndex","partCount","offset","dataBase64Url"]',
+      '"response_event":["requestId","eventIndex","event","partIndex","partCount","offset","dataBase64Url","diagnostics?"]',
     );
   });
 

@@ -1,3 +1,5 @@
+import type { V2EnvelopeDiagnostics, V2FirstEventDiagnostics, V2RequestAckDiagnostics, V2TerminalDiagnostics } from "../diagnostics/types";
+
 export const GP_V2_PROTOCOL = "gp-awareness-v2" as const;
 export const GP_V2_SCHEMA_VERSION = 1 as const;
 export const GP_V2_FRAME_MAX_BYTES = 16 * 1024;
@@ -56,6 +58,7 @@ export type SidecarFrame =
     requestId: string;
     requestDigest: string;
     committed: true;
+    diagnostics?: V2RequestAckDiagnostics;
   }
   | {
     kind: "request_reject";
@@ -72,6 +75,7 @@ export type SidecarFrame =
     partCount: number;
     offset: number;
     dataBase64Url: string;
+    diagnostics?: V2FirstEventDiagnostics;
   }
   | {
     kind: "response_terminal";
@@ -84,6 +88,7 @@ export type SidecarFrame =
     terminalStatus: TerminalStatus;
     finalEventIndex: number;
     finalSha256: string;
+    diagnostics?: V2TerminalDiagnostics;
   }
   | {
     kind: "response_error";
@@ -116,6 +121,7 @@ export interface AwarenessEnvelope<T> {
   queued: number;
   draining: boolean;
   frames: readonly ReliableFrame<T>[];
+  diagnostics?: V2EnvelopeDiagnostics;
 }
 
 export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
@@ -143,6 +149,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "queued",
     "draining",
     "frames",
+    "diagnostics?",
   ],
   hostFrameKinds: [
     "request_open",
@@ -175,14 +182,14 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     credential_rotate: ["rotationId", "sealedJson"],
     drain: ["reason"],
     ping: ["sentAtMs"],
-    request_ack: ["requestId", "requestDigest", "committed"],
+    request_ack: ["requestId", "requestDigest", "committed", "diagnostics?"],
     request_reject: ["requestId", "code", "message"],
     response_event: [
-      "requestId", "eventIndex", "event", "partIndex", "partCount", "offset", "dataBase64Url",
+      "requestId", "eventIndex", "event", "partIndex", "partCount", "offset", "dataBase64Url", "diagnostics?",
     ],
     response_terminal: [
       "requestId", "requestDigest", "responseId", "eventCount", "byteCount",
-      "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256",
+      "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256", "diagnostics?",
     ],
     response_error: ["requestId", "code", "message", "ambiguous"],
     credential_ack: ["rotationId"],

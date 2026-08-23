@@ -60,6 +60,19 @@ export interface V2TerminalDiagnostics {
   ackProgressAgePeakMs: number;
 }
 
+function parseDurations<T extends object>(value: unknown, keys: readonly string[]): T | null {
+  if (encodedDiagnosticBytes(value) > MAX_DIAGNOSTIC_BYTES) return null;
+  const raw = object(value);
+  if (!raw || !exact(raw, keys)) return null;
+  const entries = keys.map(key => [key, number(raw[key])] as const);
+  if (entries.some(([, value]) => value === null)) return null;
+  return Object.fromEntries(entries) as T;
+}
+
+export const parseRequestAckDiagnostics = (value: unknown): V2RequestAckDiagnostics | null => parseDurations<V2RequestAckDiagnostics>(value, ["firstFrameToCommitMs", "commitToAssemblyMs", "claimSyncMs", "admissionWaitMs", "commitProcessingMs"]);
+export const parseFirstEventDiagnostics = (value: unknown): V2FirstEventDiagnostics | null => parseDurations<V2FirstEventDiagnostics>(value, ["upstreamFirstEventMs", "schedulerWaitMs"]);
+export const parseTerminalDiagnostics = (value: unknown): V2TerminalDiagnostics | null => parseDurations<V2TerminalDiagnostics>(value, ["upstreamTotalMs", "schedulerPeakFrames", "schedulerPeakBytes", "ackProgressAgePeakMs"]);
+
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>

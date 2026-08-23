@@ -13,6 +13,7 @@ import {
   type ReliableFrame,
   type SidecarFrame,
 } from "./shared";
+import { parseDiagnosticObject, parseFirstEventDiagnostics, parseRequestAckDiagnostics, parseTerminalDiagnostics } from "../diagnostics/types";
 
 export type FrameDirection = "host" | "sidecar";
 
@@ -232,6 +233,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
     case "request_ack":
       exactKeys(raw, [
         "kind", "requestId", "requestDigest", "committed", "epoch", "sequence",
+        ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
       ], "request_ack frame");
       if (raw.committed !== true) fail("request_ack must prove commitment", "commitment");
       return {
@@ -239,6 +241,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         requestId: safeId(raw.requestId, "requestId"),
         requestDigest: digest(raw.requestDigest, "requestDigest"),
         committed: true,
+        ...(parseRequestAckDiagnostics(raw.diagnostics) ? { diagnostics: parseRequestAckDiagnostics(raw.diagnostics)! } : {}),
         ...identity,
       };
     case "request_reject":
@@ -256,19 +259,24 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
       exactKeys(raw, [
         "kind", "requestId", "eventIndex", "event", "partIndex", "partCount",
         "offset", "dataBase64Url", "epoch", "sequence",
+        ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
       ], "response_event frame");
       const eventName = string(raw.event, "event", 128);
       if (!SAFE_EVENT.test(eventName)) fail("event is invalid", "event");
       const partCount = integer(raw.partCount, "partCount", 1, 65_536);
+      const eventIndex = integer(raw.eventIndex, "eventIndex");
+      const partIndex = integer(raw.partIndex, "partIndex", 0, partCount - 1);
+      const diagnostics = eventIndex === 0 && partIndex === 0 ? parseFirstEventDiagnostics(raw.diagnostics) : null;
       return {
         kind,
         requestId: safeId(raw.requestId, "requestId"),
-        eventIndex: integer(raw.eventIndex, "eventIndex"),
+        eventIndex,
         event: eventName,
-        partIndex: integer(raw.partIndex, "partIndex", 0, partCount - 1),
+        partIndex,
         partCount,
         offset: integer(raw.offset, "offset"),
         dataBase64Url: base64url(raw.dataBase64Url, "dataBase64Url"),
+        ...(diagnostics ? { diagnostics } : {}),
         ...identity,
       };
     }
@@ -276,7 +284,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
       exactKeys(raw, [
         "kind", "requestId", "requestDigest", "responseId", "eventCount", "byteCount",
         "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256",
-        "epoch", "sequence",
+        "epoch", "sequence", ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
       ], "response_terminal frame");
       const terminalStatus = raw.terminalStatus;
       if (
@@ -284,6 +292,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         terminalStatus !== "failed" &&
         terminalStatus !== "incomplete"
       ) fail("terminalStatus is invalid", "terminal_status");
+      const diagnostics = parseTerminalDiagnostics(raw.diagnostics);
       return {
         kind,
         requestId: safeId(raw.requestId, "requestId"),
@@ -295,6 +304,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         terminalStatus,
         finalEventIndex: integer(raw.finalEventIndex, "finalEventIndex"),
         finalSha256: digest(raw.finalSha256, "finalSha256"),
+        ...(diagnostics ? { diagnostics } : {}),
         ...identity,
       };
     }
@@ -366,7 +376,7 @@ export function parseAwarenessEnvelope(
   exactKeys(raw, [
     "protocol", "schemaVersion", "schemaHash", "buildHash", "projectId", "sessionId",
     "peerId", "instanceId", "leaderGeneration", "epoch", "ack", "credits", "active",
-    "revision", "queued", "draining", "frames",
+    "revision", "queued", "draining", "frames", ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
   ], "Awareness envelope");
   if (raw.protocol !== GP_V2_PROTOCOL) fail("Awareness protocol is invalid", "protocol");
   if (raw.schemaVersion !== GP_V2_SCHEMA_VERSION) fail("Awareness schema version is invalid", "schema");
@@ -405,6 +415,7 @@ export function parseAwarenessEnvelope(
     fail(`Awareness state exceeds the ${GP_V2_WINDOW_MAX_BYTES}-byte window`, "window_bytes");
   }
   if (typeof raw.draining !== "boolean") fail("draining must be boolean", "boolean");
+  const diagnostics = parseDiagnosticObject(raw.diagnostics);
   return {
     protocol: GP_V2_PROTOCOL,
     schemaVersion: GP_V2_SCHEMA_VERSION,
@@ -423,5 +434,16 @@ export function parseAwarenessEnvelope(
     queued: integer(raw.queued, "queued"),
     draining: raw.draining,
     frames: Object.freeze(frames),
+    ...(diagnostics ? { diagnostics } : {}),
   };
+}
+
+export function parseAwarenessEnvelopeWithDiagnostics(
+  value: unknown,
+  expected: ProtocolBinding,
+  direction: FrameDirection,
+): { envelope: AwarenessEnvelope<HostFrame | SidecarFrame>; malformed: boolean } {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  const malformed = raw?.diagnostics !== undefined && parseDiagnosticObject(raw.diagnostics) === null;
+  return { envelope: parseAwarenessEnvelope(value, expected, direction as any) as AwarenessEnvelope<HostFrame | SidecarFrame>, malformed };
 }
