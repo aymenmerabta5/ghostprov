@@ -14,13 +14,17 @@ import {
 } from "./request-options";
 import type { ResponsesInputItem, ResponsesRequestBody } from "./request-types";
 import {
+  type AnthropicRequestLimits,
   hasOwn,
+  measureBoundedJson,
   RequestMediaBudget,
   requireArray,
   requireRecord,
-  serializeBoundedJson,
+  resolveAnthropicRequestLimits,
 } from "./request-validation";
 
+export { DEFAULT_ANTHROPIC_REQUEST_LIMITS } from "./request-validation";
+export type { AnthropicRequestLimits } from "./request-validation";
 export type { AnthropicThinkingDisplay } from "./request-options";
 export type {
   ResponsesFunctionCallInput,
@@ -37,6 +41,7 @@ export type {
 
 export type TranslateAnthropicRequestOptions = {
   models: AnthropicModelOptions;
+  limits?: Partial<AnthropicRequestLimits>;
 };
 
 export type TranslatedAnthropicRequest = {
@@ -57,7 +62,7 @@ type ValidatedRequest = {
   stream: boolean;
 };
 
-function requireRequest(value: unknown): ValidatedRequest {
+function requireRequest(value: unknown, limits: AnthropicRequestLimits): ValidatedRequest {
   const body = requireRecord(value, "request");
   if (typeof body.model !== "string" || !body.model.trim()) {
     throw new AnthropicRequestError(400, "model is required");
@@ -68,7 +73,7 @@ function requireRequest(value: unknown): ValidatedRequest {
   if (!Array.isArray(body.messages)) {
     throw new AnthropicRequestError(400, "messages is required");
   }
-  const messages = requireArray(body.messages, "messages");
+  const messages = requireArray(body.messages, "messages", limits);
   if (hasOwn(body, "stream") && typeof body.stream !== "boolean") {
     throw new AnthropicRequestError(400, "stream must be a boolean");
   }
@@ -86,29 +91,35 @@ function requireRequest(value: unknown): ValidatedRequest {
   };
 }
 
-function estimateInputTokens(value: unknown): number {
-  const serialized = serializeBoundedJson(value, "translated input");
-  return Math.max(1, Math.ceil(Buffer.byteLength(serialized, "utf8") / 4));
-}
-
 export function translateAnthropicRequest(
   value: unknown,
   options: TranslateAnthropicRequestOptions,
 ): TranslatedAnthropicRequest {
-  serializeBoundedJson(value, "request");
-  const { body, requestedModel, maxTokens, messages, stream } = requireRequest(value);
-  const mediaBudget = new RequestMediaBudget();
-  const input: ResponsesInputItem[] = translateMessages(messages, mediaBudget);
-  const instructions = translateSystem(body.system);
-  const tools = translateTools(body.tools);
-  const { toolChoice, parallelToolCalls } = translateToolChoice(body.tool_choice);
+  const limits = resolveAnthropicRequestLimits(options.limits);
+  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
+  const { body, requestedModel, maxTokens, messages, stream } = requireRequest(value, limits);
+  const mediaBudget = new RequestMediaBudget(limits.mediaBytes);
+  const input: ResponsesInputItem[] = translateMessages(messages, mediaBudget, limits);
+  const instructions = translateSystem(body.system, limits);
+  const tools = translateTools(body.tools, limits);
+  const declaredToolNames = new Set(tools.map(tool => tool.name));
+  const { toolChoice, parallelToolCalls } = translateToolChoice(
+    body.tool_choice,
+    declaredToolNames,
+  );
   const output = translateOutputConfig(body.output_config);
   const thinking = translateThinking(body.thinking, output.effort, maxTokens);
-  const stopSequences = translateStopSequences(body.stop_sequences);
+  const stopSequences = translateStopSequences(body.stop_sequences, limits);
   const serviceTier = translateServiceTier(body);
   const sampling = translateSampling(body);
   const privacy = translateMetadata(body.metadata);
   const maxTokensZero = maxTokens === 0;
+  if (maxTokensZero && output.text) {
+    throw new AnthropicRequestError(400, "max_tokens 0 does not support structured output");
+  }
+  if (maxTokensZero && (toolChoice === "required" || typeof toolChoice === "object")) {
+    throw new AnthropicRequestError(400, "max_tokens 0 does not support forced tool choice");
+  }
 
   const relayBody: ResponsesRequestBody = {
     model: resolveAnthropicModel(requestedModel, options.models),
@@ -123,13 +134,13 @@ export function translateAnthropicRequest(
     ...(parallelToolCalls !== undefined ? { parallel_tool_calls: parallelToolCalls } : {}),
     ...(thinking.reasoning ? { reasoning: thinking.reasoning } : {}),
     ...(output.text ? { text: output.text } : {}),
-    ...(serviceTier ? { service_tier: serviceTier } : {}),
+    service_tier: serviceTier,
     ...(sampling.temperature !== undefined ? { temperature: sampling.temperature } : {}),
     ...(sampling.topP !== undefined ? { top_p: sampling.topP } : {}),
     ...(privacy.safetyIdentifier ? { safety_identifier: privacy.safetyIdentifier } : {}),
     ...(privacy.metadata ? { metadata: privacy.metadata } : {}),
   };
-  serializeBoundedJson(relayBody, "relay request");
+  const relayBytes = measureBoundedJson(relayBody, "relay request", limits.relayBytes, limits);
 
   return {
     requestedModel,
@@ -137,11 +148,7 @@ export function translateAnthropicRequest(
     stream,
     thinkingDisplay: thinking.display,
     stopSequences,
-    estimatedInputTokens: estimateInputTokens({
-      ...(instructions ? { instructions } : {}),
-      input,
-      ...(tools.length ? { tools } : {}),
-    }),
+    estimatedInputTokens: Math.max(1, Math.ceil(relayBytes / 4)),
     maxTokensZero,
   };
 }

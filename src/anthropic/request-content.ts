@@ -8,6 +8,7 @@ import type {
   ResponsesUserContent,
 } from "./request-types";
 import {
+  type AnthropicRequestLimits,
   hasOwn,
   RequestMediaBudget,
   requireArray,
@@ -26,11 +27,16 @@ const IMAGE_MEDIA_TYPES = new Set([
   "image/webp",
 ]);
 
-function contentBlocks(value: unknown, name: string): Array<Record<string, unknown>> {
+function contentBlocks(
+  value: unknown,
+  name: string,
+  limits: AnthropicRequestLimits,
+): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     throw new AnthropicRequestError(400, `${name} must be a string or an array`);
   }
-  return requireArray(value, name).map((block, index) => requireRecord(block, `${name}[${index}]`));
+  return requireArray(value, name, limits)
+    .map((block, index) => requireRecord(block, `${name}[${index}]`));
 }
 
 function blockType(block: Record<string, unknown>, name: string): string {
@@ -79,9 +85,10 @@ function translateComposedDocument(
   content: unknown,
   name: string,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): ResponsesUserContent[] {
   if (typeof content === "string") return [{ type: "input_text", text: content }];
-  const blocks = requireArray(content, `${name} document content`);
+  const blocks = requireArray(content, `${name} document content`, limits);
   const translated: ResponsesUserContent[] = [];
   for (let index = 0; index < blocks.length; index += 1) {
     const nestedName = `${name} document content[${index}]`;
@@ -108,6 +115,7 @@ function translateDocument(
   block: Record<string, unknown>,
   name: string,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): ResponsesUserContent[] {
   const source = requireRecord(block.source, `${name} document source`);
   const type = requireString(source, "type", `${name} document source type`);
@@ -148,17 +156,18 @@ function translateDocument(
       text: requireString(source, "data", `${name} document data`, true),
     }];
   }
-  if (type === "content") return translateComposedDocument(source.content, name, budget);
+  if (type === "content") return translateComposedDocument(source.content, name, budget, limits);
   throw new AnthropicRequestError(400, `unsupported document source type: ${type}`);
 }
 
 function translateSearchResult(
   block: Record<string, unknown>,
   name: string,
+  limits: AnthropicRequestLimits,
 ): ResponsesInputText {
   const title = requireString(block, "title", `${name} search_result title`);
   const source = requireString(block, "source", `${name} search_result source`);
-  const content = requireArray(block.content, `${name} search_result content`);
+  const content = requireArray(block.content, `${name} search_result content`, limits);
   const excerpts: string[] = [];
   for (let index = 0; index < content.length; index += 1) {
     const nestedName = `${name} search_result content[${index}]`;
@@ -179,6 +188,7 @@ function translateOrdinaryUserBlock(
   block: Record<string, unknown>,
   name: string,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): ResponsesUserContent[] {
   const type = blockType(block, name);
   if (type === "text") {
@@ -188,8 +198,8 @@ function translateOrdinaryUserBlock(
     }];
   }
   if (type === "image") return [translateImage(block, name, budget)];
-  if (type === "document") return translateDocument(block, name, budget);
-  if (type === "search_result") return [translateSearchResult(block, name)];
+  if (type === "document") return translateDocument(block, name, budget, limits);
+  if (type === "search_result") return [translateSearchResult(block, name, limits)];
   throw new AnthropicRequestError(400, `unsupported user content block type: ${type}`);
 }
 
@@ -197,10 +207,11 @@ function translateToolResultContent(
   content: unknown,
   name: string,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): string | ResponsesUserContent[] {
   if (content === undefined) return "";
   if (typeof content === "string") return content;
-  const blocks = requireArray(content, `${name} content`);
+  const blocks = requireArray(content, `${name} content`, limits);
   const translated: ResponsesUserContent[] = [];
   for (let index = 0; index < blocks.length; index += 1) {
     const nestedName = `${name} content[${index}]`;
@@ -214,9 +225,9 @@ function translateToolResultContent(
     } else if (type === "image") {
       translated.push(translateImage(block, nestedName, budget));
     } else if (type === "document") {
-      translated.push(...translateDocument(block, nestedName, budget));
+      translated.push(...translateDocument(block, nestedName, budget, limits));
     } else if (type === "search_result") {
-      translated.push(translateSearchResult(block, nestedName));
+      translated.push(translateSearchResult(block, nestedName, limits));
     } else {
       throw new AnthropicRequestError(
         400,
@@ -232,9 +243,10 @@ function translateToolResult(
   name: string,
   callId: string,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): ResponsesFunctionCallOutput {
   const isError = requireOptionalBoolean(block, "is_error", `${name} is_error`);
-  let output = translateToolResultContent(block.content, name, budget);
+  let output = translateToolResultContent(block.content, name, budget, limits);
   if (isError === true) {
     const retained: ResponsesUserContent[] = typeof output === "string"
       ? [{ type: "input_text", text: output }]
@@ -259,6 +271,7 @@ function appendUserMessage(
   messageName: string,
   history: ToolHistory,
   budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
 ): void {
   const pendingContent: ResponsesUserContent[] = [];
   const flushUserContent = (): void => {
@@ -275,7 +288,7 @@ function appendUserMessage(
     return;
   }
 
-  const blocks = contentBlocks(content, `${messageName}.content`);
+  const blocks = contentBlocks(content, `${messageName}.content`, limits);
   const remaining = new Set(history.pending);
   const resultsInTurn = new Set<string>();
   let ordinaryContentSeen = false;
@@ -304,7 +317,7 @@ function appendUserMessage(
       resultsInTurn.add(callId);
       remaining.delete(callId);
       flushUserContent();
-      input.push(translateToolResult(block, name, callId, budget));
+      input.push(translateToolResult(block, name, callId, budget, limits));
       continue;
     }
 
@@ -315,7 +328,7 @@ function appendUserMessage(
       );
     }
     ordinaryContentSeen = true;
-    pendingContent.push(...translateOrdinaryUserBlock(block, name, budget));
+    pendingContent.push(...translateOrdinaryUserBlock(block, name, budget, limits));
   }
 
   if (remaining.size) {
@@ -333,6 +346,7 @@ function translateToolUse(
   name: string,
   history: ToolHistory,
   callsInTurn: Set<string>,
+  limits: AnthropicRequestLimits,
 ): ResponsesFunctionCallInput {
   const callId = requireString(block, "id", `${name} id`);
   if (callsInTurn.has(callId)) {
@@ -346,7 +360,12 @@ function translateToolUse(
     throw new AnthropicRequestError(400, `${name} tool_use input is required`);
   }
   const toolInput = requireRecord(block.input, `${name} tool_use input`);
-  const args = serializeBoundedJson(toolInput, `${name} tool_use input`);
+  const args = serializeBoundedJson(
+    toolInput,
+    `${name} tool_use input`,
+    limits.relayBytes,
+    limits,
+  );
   callsInTurn.add(callId);
   history.seen.add(callId);
   return { type: "function_call", call_id: callId, name: toolName, arguments: args };
@@ -357,6 +376,7 @@ function appendAssistantMessage(
   content: unknown,
   messageName: string,
   history: ToolHistory,
+  limits: AnthropicRequestLimits,
 ): string[] {
   const pendingText: ResponsesInputText[] = [];
   const callsInTurn = new Set<string>();
@@ -371,7 +391,7 @@ function appendAssistantMessage(
     return [];
   }
 
-  const blocks = contentBlocks(content, `${messageName}.content`);
+  const blocks = contentBlocks(content, `${messageName}.content`, limits);
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
     const name = `${messageName}.content[${index}]`;
@@ -392,7 +412,7 @@ function appendAssistantMessage(
       requireString(block, "data", `${name} data`, true);
     } else if (type === "tool_use") {
       flushAssistantText();
-      input.push(translateToolUse(block, name, history, callsInTurn));
+      input.push(translateToolUse(block, name, history, callsInTurn, limits));
     } else {
       throw new AnthropicRequestError(400, `unsupported assistant content block type: ${type}`);
     }
@@ -401,17 +421,17 @@ function appendAssistantMessage(
   return [...callsInTurn];
 }
 
-export function translateMessages(
-  messages: unknown[],
-  budget: RequestMediaBudget,
-): ResponsesInputItem[] {
-  const input: ResponsesInputItem[] = [];
-  const history: ToolHistory = {
-    seen: new Set(),
-    completed: new Set(),
-    pending: new Set(),
-  };
+type LogicalMessage = {
+  role: "user" | "assistant";
+  content: Record<string, unknown>[];
+  name: string;
+};
 
+function coalesceMessages(
+  messages: unknown[],
+  limits: AnthropicRequestLimits,
+): LogicalMessage[] {
+  const logical: LogicalMessage[] = [];
   for (let index = 0; index < messages.length; index += 1) {
     const name = `messages[${index}]`;
     const message = requireRecord(messages[index], name);
@@ -422,14 +442,47 @@ export function translateMessages(
     if (typeof message.content !== "string" && !Array.isArray(message.content)) {
       throw new AnthropicRequestError(400, `${name}.content must be a string or an array`);
     }
+    const blocks = typeof message.content === "string"
+      ? [{ type: "text", text: message.content }]
+      : contentBlocks(message.content, `${name}.content`, limits);
+    const previous = logical.at(-1);
+    if (previous?.role === role) {
+      previous.content.push(...blocks);
+      if (previous.content.length > limits.maxArrayItems) {
+        throw new AnthropicRequestError(
+          400,
+          `${previous.name}.content contains more than ${limits.maxArrayItems} items`,
+        );
+      }
+    } else {
+      logical.push({ role, content: [...blocks], name });
+    }
+  }
+  return logical;
+}
 
-    if (role === "user") {
-      appendUserMessage(input, message.content, name, history, budget);
+export function translateMessages(
+  messages: unknown[],
+  budget: RequestMediaBudget,
+  limits: AnthropicRequestLimits,
+): ResponsesInputItem[] {
+  const input: ResponsesInputItem[] = [];
+  const history: ToolHistory = {
+    seen: new Set(),
+    completed: new Set(),
+    pending: new Set(),
+  };
+
+  for (const message of coalesceMessages(messages, limits)) {
+    if (message.role === "user") {
+      appendUserMessage(input, message.content, message.name, history, budget, limits);
     } else {
       if (history.pending.size) {
         throw new AnthropicRequestError(400, "assistant turn intervened before pending tool_result blocks");
       }
-      history.pending = new Set(appendAssistantMessage(input, message.content, name, history));
+      history.pending = new Set(
+        appendAssistantMessage(input, message.content, message.name, history, limits),
+      );
     }
   }
 
@@ -439,10 +492,14 @@ export function translateMessages(
   return input;
 }
 
-export function translateSystem(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
+export function translateSystem(
+  value: unknown,
+  limits: AnthropicRequestLimits,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) throw new AnthropicRequestError(400, "system must not be null");
   if (typeof value === "string") return value;
-  const blocks = requireArray(value, "system");
+  const blocks = requireArray(value, "system", limits);
   return blocks.map((item, index) => {
     const name = `system[${index}]`;
     const block = requireRecord(item, name);

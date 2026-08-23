@@ -8,21 +8,26 @@ import type {
   ResponsesToolChoice,
 } from "./request-types";
 import {
+  type AnthropicRequestLimits,
   hasOwn,
   requireArray,
   requireOptionalBoolean,
   requireRecord,
   requireString,
-  serializeBoundedJson,
 } from "./request-validation";
 
 const OUTPUT_EFFORTS = new Set<unknown>(["low", "medium", "high", "xhigh", "max"]);
 
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
-export function translateTools(value: unknown): ResponsesFunctionTool[] {
-  if (value === undefined || value === null) return [];
-  const tools = requireArray(value, "tools");
+export function translateTools(
+  value: unknown,
+  limits: AnthropicRequestLimits,
+): ResponsesFunctionTool[] {
+  if (value === undefined) return [];
+  if (value === null) throw new AnthropicRequestError(400, "tools must not be null");
+  const tools = requireArray(value, "tools", limits);
+  const names = new Set<string>();
   return tools.map((item, index) => {
     const name = `tools[${index}]`;
     const tool = requireRecord(item, name);
@@ -30,6 +35,10 @@ export function translateTools(value: unknown): ResponsesFunctionTool[] {
       throw new AnthropicRequestError(400, `unsupported tool type: ${String(tool.type)}`);
     }
     const toolName = requireString(tool, "name", `${name} tool name`);
+    if (names.has(toolName)) {
+      throw new AnthropicRequestError(400, `duplicate tool name: ${toolName}`);
+    }
+    names.add(toolName);
     if (!hasOwn(tool, "input_schema") || tool.input_schema === undefined) {
       throw new AnthropicRequestError(400, `${name} tool input_schema is required`);
     }
@@ -37,8 +46,6 @@ export function translateTools(value: unknown): ResponsesFunctionTool[] {
     if (inputSchema.type !== "object") {
       throw new AnthropicRequestError(400, `${name} tool input_schema.type must be object`);
     }
-    serializeBoundedJson(inputSchema, `${name} tool input_schema`);
-
     const strict = requireOptionalBoolean(tool, "strict", `${name} strict`);
     requireOptionalBoolean(tool, "defer_loading", `${name} defer_loading`);
     requireOptionalBoolean(tool, "eager_input_streaming", `${name} eager_input_streaming`);
@@ -48,17 +55,26 @@ export function translateTools(value: unknown): ResponsesFunctionTool[] {
       name: toolName,
       parameters: inputSchema,
     };
-    if (typeof tool.description === "string") translated.description = tool.description;
+    if (hasOwn(tool, "description")) {
+      if (typeof tool.description !== "string") {
+        throw new AnthropicRequestError(400, `${name} description must be a string`);
+      }
+      translated.description = tool.description;
+    }
     if (strict !== undefined) translated.strict = strict;
     return translated;
   });
 }
 
-export function translateToolChoice(value: unknown): {
+export function translateToolChoice(
+  value: unknown,
+  declaredToolNames: ReadonlySet<string>,
+): {
   toolChoice?: ResponsesToolChoice;
   parallelToolCalls?: false;
 } {
-  if (value === undefined || value === null) return {};
+  if (value === undefined) return {};
+  if (value === null) throw new AnthropicRequestError(400, "tool_choice must not be null");
   const choice = requireRecord(value, "tool_choice");
   const type = requireString(choice, "type", "tool_choice type");
   const disableParallel = requireOptionalBoolean(
@@ -72,9 +88,13 @@ export function translateToolChoice(value: unknown): {
   else if (type === "any") toolChoice = "required";
   else if (type === "none") toolChoice = "none";
   else if (type === "tool") {
+    const name = requireString(choice, "name", "tool_choice tool name");
+    if (!declaredToolNames.has(name)) {
+      throw new AnthropicRequestError(400, `tool_choice tool is not declared: ${name}`);
+    }
     toolChoice = {
       type: "function",
-      name: requireString(choice, "name", "tool_choice tool name"),
+      name,
     };
   } else {
     throw new AnthropicRequestError(400, `unsupported tool_choice type: ${type}`);
@@ -90,7 +110,8 @@ export function translateOutputConfig(value: unknown): {
   effort?: ResponsesReasoningEffort;
   text?: ResponsesTextConfig;
 } {
-  if (value === undefined || value === null) return {};
+  if (value === undefined) return {};
+  if (value === null) throw new AnthropicRequestError(400, "output_config must not be null");
   const config = requireRecord(value, "output_config");
   let effort: ResponsesReasoningEffort | undefined;
   if (hasOwn(config, "effort") && config.effort !== null) {
@@ -108,7 +129,6 @@ export function translateOutputConfig(value: unknown): {
       throw new AnthropicRequestError(400, `unsupported output_config.format type: ${type}`);
     }
     const schema = requireRecord(format.schema, "output_config.format schema");
-    serializeBoundedJson(schema, "output_config.format schema");
     text = {
       format: {
         type: "json_schema",
@@ -136,7 +156,7 @@ export function translateThinking(
   reasoning?: ResponsesReasoning;
   display: AnthropicThinkingDisplay;
 } {
-  if (value === undefined || value === null) {
+  if (value === undefined) {
     return {
       ...(explicitEffort
         ? { reasoning: { effort: explicitEffort, summary: "auto" as const } }
@@ -144,6 +164,7 @@ export function translateThinking(
       display: "summarized",
     };
   }
+  if (value === null) throw new AnthropicRequestError(400, "thinking must not be null");
 
   const thinking = requireRecord(value, "thinking");
   const type = requireString(thinking, "type", "thinking type");
@@ -181,8 +202,8 @@ export function translateThinking(
   throw new AnthropicRequestError(400, `unsupported thinking type: ${type}`);
 }
 
-export function translateServiceTier(body: Record<string, unknown>): "auto" | "default" | "fast" | undefined {
-  let serviceTier: "auto" | "default" | undefined;
+export function translateServiceTier(body: Record<string, unknown>): "auto" | "default" | "fast" {
+  let serviceTier: "auto" | "default" = "auto";
   if (hasOwn(body, "service_tier")) {
     if (body.service_tier === "auto") serviceTier = "auto";
     else if (body.service_tier === "standard_only") serviceTier = "default";
@@ -191,7 +212,7 @@ export function translateServiceTier(body: Record<string, unknown>): "auto" | "d
 
   if (hasOwn(body, "speed")) {
     if (body.speed === "fast") return "fast";
-    if (body.speed === "standard") return serviceTier ?? "default";
+    if (body.speed === "standard") return serviceTier;
     throw new AnthropicRequestError(400, "speed must be standard or fast");
   }
   return serviceTier;
@@ -235,9 +256,13 @@ export function translateSampling(body: Record<string, unknown>): {
   return { temperature, topP };
 }
 
-export function translateStopSequences(value: unknown): string[] {
-  if (value === undefined || value === null) return [];
-  const values = requireArray(value, "stop_sequences");
+export function translateStopSequences(
+  value: unknown,
+  limits: AnthropicRequestLimits,
+): string[] {
+  if (value === undefined) return [];
+  if (value === null) throw new AnthropicRequestError(400, "stop_sequences must not be null");
+  const values = requireArray(value, "stop_sequences", limits);
   if (values.some(item => typeof item !== "string")) {
     throw new AnthropicRequestError(400, "stop_sequences must contain only strings");
   }

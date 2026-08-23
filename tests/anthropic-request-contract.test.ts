@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { AnthropicRequestError } from "../src/anthropic/errors";
+import * as requestModule from "../src/anthropic/request";
 import {
   translateAnthropicRequest,
+  type AnthropicRequestLimits,
   type ResponsesInputItem,
 } from "../src/anthropic/request";
 
@@ -41,17 +43,31 @@ function request(overrides: Record<string, unknown> = {}): Record<string, unknow
   };
 }
 
-function translate(value: unknown) {
-  return translateAnthropicRequest(value, OPTIONS);
+function translate(value: unknown, limits?: Partial<AnthropicRequestLimits>) {
+  return translateAnthropicRequest(value, {
+    ...OPTIONS,
+    ...(limits ? { limits } : {}),
+  });
 }
 
-function expectInvalid(value: unknown, message?: string): void {
+function expectInvalid(
+  value: unknown,
+  message?: string,
+  expectation: {
+    status?: number;
+    errorType?: string;
+    limits?: Partial<AnthropicRequestLimits>;
+  } = {},
+): void {
   try {
-    translate(value);
+    translate(value, expectation.limits);
     throw new Error("expected translateAnthropicRequest to throw");
   } catch (error) {
     expect(error).toBeInstanceOf(AnthropicRequestError);
-    expect((error as AnthropicRequestError).status).toBe(400);
+    expect((error as AnthropicRequestError).status).toBe(expectation.status ?? 400);
+    if (expectation.errorType) {
+      expect((error as AnthropicRequestError).errorType).toBe(expectation.errorType);
+    }
     if (message) expect((error as Error).message).toContain(message);
   }
 }
@@ -120,6 +136,68 @@ describe("Anthropic request current contracts", () => {
       "call_b",
       "call_b",
       "call_a",
+    ]);
+  });
+
+  it("coalesces split same-role tool calls and results into logical turns", () => {
+    const input = translate(request({
+      messages: [
+        { role: "user", content: "read both" },
+        { role: "assistant", content: [toolUse("call_a")] },
+        { role: "assistant", content: [toolUse("call_b")] },
+        { role: "user", content: [toolResult("call_a", "A")] },
+        { role: "user", content: [toolResult("call_b", "B")] },
+      ],
+    })).relayBody.input as Array<Record<string, unknown>>;
+
+    expect(input.map(item => item.type)).toEqual([
+      "message",
+      "function_call",
+      "function_call",
+      "function_call_output",
+      "function_call_output",
+    ]);
+    expect(input.slice(1).map(item => item.call_id)).toEqual([
+      "call_a",
+      "call_b",
+      "call_a",
+      "call_b",
+    ]);
+  });
+
+  it("coalesces consecutive ordinary same-role messages in order", () => {
+    const input = translate(request({
+      messages: [
+        { role: "user", content: "one" },
+        { role: "user", content: [{ type: "text", text: "two" }] },
+        { role: "assistant", content: "three" },
+        { role: "assistant", content: [{ type: "text", text: "four" }] },
+        { role: "user", content: "five" },
+      ],
+    })).relayBody.input;
+
+    expect(input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "one" },
+          { type: "input_text", text: "two" },
+        ],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "input_text", text: "three" },
+          { type: "input_text", text: "four" },
+        ],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "five" }],
+      },
     ]);
   });
 
@@ -257,6 +335,18 @@ describe("Anthropic request current contracts", () => {
   });
 
   const strictCases: Array<[string, () => unknown]> = [
+    ["null tools", () => request({ tools: null })],
+    ["null tool_choice", () => request({ tool_choice: null })],
+    ["null output_config", () => request({ output_config: null })],
+    ["null thinking", () => request({ thinking: null })],
+    ["null stop_sequences", () => request({ stop_sequences: null })],
+    ["null system", () => request({ system: null })],
+    ["null temperature", () => request({ temperature: null })],
+    ["null top_p", () => request({ top_p: null })],
+    ["null top_k", () => request({ top_k: null })],
+    ["null stream", () => request({ stream: null })],
+    ["null service_tier", () => request({ service_tier: null })],
+    ["null speed", () => request({ speed: null })],
     ["null tool_use input", () => request({
       messages: [
         { role: "assistant", content: [toolUse("call_a", null)] },
@@ -283,6 +373,9 @@ describe("Anthropic request current contracts", () => {
     })],
     ["non-boolean tool strict", () => request({
       tools: [{ name: "Read", input_schema: { type: "object" }, strict: 1 }],
+    })],
+    ["non-string tool description", () => request({
+      tools: [{ name: "Read", input_schema: { type: "object" }, description: 1 }],
     })],
     ["non-boolean defer_loading", () => request({
       tools: [{ name: "Read", input_schema: { type: "object" }, defer_loading: null }],
@@ -370,6 +463,22 @@ describe("Anthropic request current contracts", () => {
     }
   });
 
+  it("rejects duplicate declared tool names", () => {
+    expectInvalid(request({
+      tools: [
+        { name: "Read", input_schema: { type: "object" } },
+        { name: "Read", input_schema: { type: "object" } },
+      ],
+    }), "duplicate tool name");
+  });
+
+  it("rejects a named choice absent from declared tools", () => {
+    expectInvalid(request({
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      tool_choice: { type: "tool", name: "Write" },
+    }), "not declared");
+  });
+
   const invalidMediaCases: Array<[string, Record<string, unknown>]> = [
     ["unsupported image MIME", {
       type: "image",
@@ -431,13 +540,14 @@ describe("Anthropic request current contracts", () => {
   });
 
   it("maps current Anthropic service tiers and lets fast speed override", () => {
+    expect(translate(request()).relayBody.service_tier).toBe("auto");
     expect(translate(request({ service_tier: "auto" })).relayBody.service_tier).toBe("auto");
     expect(translate(request({ service_tier: "standard_only" })).relayBody.service_tier).toBe("default");
     expect(translate(request({
       service_tier: "standard_only",
       speed: "fast",
     })).relayBody.service_tier).toBe("fast");
-    expect(translate(request({ speed: "standard" })).relayBody.service_tier).toBe("default");
+    expect(translate(request({ speed: "standard" })).relayBody.service_tier).toBe("auto");
   });
 
   for (const [name, fields] of [
@@ -473,29 +583,42 @@ describe("Anthropic request current contracts", () => {
     it(`rejects ${name}`, () => expectInvalid(request({ metadata })));
   }
 
-  it("rejects more than the documented 100000 messages", () => {
-    expectInvalid(request({
-      messages: Array.from({ length: 100_001 }, () => ({ role: "user", content: "x" })),
-    }), "100000");
+  it("publishes current inbound and internal relay byte defaults", () => {
+    const defaults = (requestModule as unknown as {
+      DEFAULT_ANTHROPIC_REQUEST_LIMITS?: AnthropicRequestLimits;
+    }).DEFAULT_ANTHROPIC_REQUEST_LIMITS;
+    expect(defaults).toMatchObject({
+      inboundBytes: 32 * 1024 * 1024,
+      relayBytes: 64 * 1024 * 1024,
+      mediaBytes: 32 * 1024 * 1024,
+      maxJsonDepth: 64,
+      maxArrayItems: 100_000,
+    });
   });
 
-  it("rejects more than 100000 content items", () => {
+  it("rejects messages beyond an injected item limit without large allocations", () => {
+    expectInvalid(request({
+      messages: Array.from({ length: 3 }, () => ({ role: "user", content: "x" })),
+    }), "2 items", { limits: { maxArrayItems: 2 } });
+  });
+
+  it("rejects content beyond an injected item limit without large allocations", () => {
     expectInvalid(request({
       messages: [{
         role: "user",
-        content: Array.from({ length: 100_001 }, () => ({ type: "text", text: "x" })),
+        content: Array.from({ length: 3 }, () => ({ type: "text", text: "x" })),
       }],
-    }), "items");
+    }), "2 items", { limits: { maxArrayItems: 2 } });
   });
 
   it("rejects JSON nesting beyond the bounded depth", () => {
     let nested: Record<string, unknown> = { type: "string" };
-    for (let index = 0; index < 70; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       nested = { type: "object", properties: { nested } };
     }
     expectInvalid(request({
       tools: [{ name: "Deep", input_schema: nested }],
-    }), "depth");
+    }), "depth", { limits: { maxJsonDepth: 4 } });
   });
 
   it("rejects cyclic and non-JSON-serializable values", () => {
@@ -512,17 +635,38 @@ describe("Anthropic request current contracts", () => {
     }), "JSON-compatible");
   });
 
-  it("rejects a relay body beyond the 64 MiB transport bound", () => {
-    const data = "A".repeat(64 * 1024 * 1024 + 4);
+  it("rejects an inbound request beyond an injected byte bound with HTTP 413", () => {
+    expectInvalid(request({
+      messages: [{ role: "user", content: "x".repeat(256) }],
+    }), "inbound request", {
+      status: 413,
+      errorType: "request_too_large",
+      limits: { inboundBytes: 128 },
+    });
+  });
+
+  it("rejects relay growth beyond its separate injected byte bound with HTTP 413", () => {
+    expectInvalid(request(), "relay request", {
+      status: 413,
+      errorType: "request_too_large",
+      limits: { inboundBytes: 4096, relayBytes: 64 },
+    });
+  });
+
+  it("rejects cumulative media beyond an injected byte bound with HTTP 413", () => {
     expectInvalid(request({
       messages: [{
         role: "user",
         content: [{
           type: "image",
-          source: { type: "base64", media_type: "image/png", data },
+          source: { type: "base64", media_type: "image/png", data: "AAAA" },
         }],
       }],
-    }), "64 MiB");
+    }), "media", {
+      status: 413,
+      errorType: "request_too_large",
+      limits: { inboundBytes: 4096, relayBytes: 4096, mediaBytes: 2 },
+    });
   });
 
   it("supports non-streaming max_tokens zero prewarming with adapter context", () => {
@@ -534,6 +678,40 @@ describe("Anthropic request current contracts", () => {
     const positive = translate(request({ max_tokens: 1 }));
     expect(positive.maxTokensZero).toBe(false);
     expect(positive.relayBody.max_output_tokens).toBe(1);
+  });
+
+  it("allows only automatic or disabled tool choice during zero-token prewarming", () => {
+    for (const toolChoice of [{ type: "auto" }, { type: "none" }]) {
+      const translated = translate(request({
+        max_tokens: 0,
+        tools: [{ name: "Read", input_schema: { type: "object" } }],
+        tool_choice: toolChoice,
+      }));
+      expect(translated.maxTokensZero).toBe(true);
+      expect(translated.relayBody.max_output_tokens).toBe(1);
+    }
+  });
+
+  it("rejects structured output during zero-token prewarming", () => {
+    expectInvalid(request({
+      max_tokens: 0,
+      output_config: {
+        format: { type: "json_schema", schema: { type: "object" } },
+      },
+    }), "max_tokens 0");
+  });
+
+  it("rejects forced tool choice during zero-token prewarming", () => {
+    expectInvalid(request({
+      max_tokens: 0,
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      tool_choice: { type: "any" },
+    }), "max_tokens 0");
+    expectInvalid(request({
+      max_tokens: 0,
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      tool_choice: { type: "tool", name: "Read" },
+    }), "max_tokens 0");
   });
 
   it("rejects streaming max_tokens zero", () => {

@@ -282,12 +282,6 @@ describe("Anthropic request translation", () => {
       content: [
         { type: "input_image", image_url: "data:image/png;base64,AA==" },
         { type: "input_image", file_id: "file_image" },
-      ],
-    }));
-    expect(body.input).toContainEqual(expect.objectContaining({
-      type: "message",
-      role: "user",
-      content: [
         { type: "input_image", image_url: "https://example.com/cat.webp" },
         {
           type: "input_file",
