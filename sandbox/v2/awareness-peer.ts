@@ -20,7 +20,11 @@ import {
   WeightedFrameScheduler,
   type FramePriority,
 } from "../../src/v2/protocol/scheduler.ts";
-import { computeV2RetransmitDelayMs } from "../../src/v2/protocol/retransmit.ts";
+import { ReliableDeliveryTiming } from "../../src/v2/protocol/delivery-timing.ts";
+import {
+  PublicationPacer,
+  type PublicationReason,
+} from "../../src/v2/protocol/publication-pacer.ts";
 import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
@@ -40,6 +44,7 @@ export interface DenoAwarenessPeerOptions {
   ) => DenoAwarenessProviderLike;
   diagnostics?: SidecarDiagnosticsObserver;
   outputBackpressure?: OutputBackpressure;
+  publicationIntervalMs?: number;
 }
 
 export interface DenoAwarenessProviderLike {
@@ -81,6 +86,22 @@ function defaultProviderFactory(
   ) as DenoAwarenessProviderLike;
 }
 
+type PublicationUrgency = "paced" | "urgent";
+
+function sidecarFrameUrgency(frame: SidecarFrame): PublicationUrgency {
+  return frame.kind === "response_event" || frame.kind === "response_batch"
+    ? "paced"
+    : "urgent";
+}
+
+function strongestUrgency(
+  left: PublicationUrgency | null,
+  right: PublicationUrgency | null,
+): PublicationUrgency | null {
+  if (left === "urgent" || right === "urgent") return "urgent";
+  return left ?? right;
+}
+
 export class DenoAwarenessPeer {
   readonly #binding: ProtocolBinding;
   readonly #instanceId: string;
@@ -95,14 +116,14 @@ export class DenoAwarenessPeer {
   readonly #connectTimeoutMs: number;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #outputBackpressure?: OutputBackpressure;
+  readonly #delivery: ReliableDeliveryTiming;
+  readonly #pacer: PublicationPacer;
   #revision = 0;
   #hostPeerId: string | null = null;
   #hostClientId: number | null = null;
   #hostRevision = -1;
   #hostCredits = -1;
   #timer: number | null = null;
-  #retransmissionAttempt = 0;
-  #publishScheduled = false;
   #retransmissions = 0; #publications = 0; #publishedBytes = 0; #peakAttempt = 0; #lastAckAt = performance.now();
   readonly #congestion = new TransportCongestion();
   #closed = false;
@@ -118,6 +139,9 @@ export class DenoAwarenessPeer {
       instanceId: options.instanceId,
     });
     this.#retransmitMs = options.retransmitMs ?? 250;
+    if (!Number.isFinite(this.#retransmitMs) || this.#retransmitMs < 1) {
+      throw new RangeError("retransmitMs must be positive");
+    }
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.#diagnostics = options.diagnostics;
     this.#outputBackpressure = options.outputBackpressure;
@@ -129,6 +153,14 @@ export class DenoAwarenessPeer {
       this.#doc,
       () => this.#rotator.current(),
     );
+    this.#delivery = new ReliableDeliveryTiming({
+      epoch: 1,
+      minimumMs: this.#retransmitMs,
+    });
+    this.#pacer = new PublicationPacer({
+      intervalMs: options.publicationIntervalMs,
+      publish: reason => this.#publish(reason),
+    });
     this.#provider.awareness.on("change", this.#onAwarenessChange);
   }
 
@@ -154,7 +186,7 @@ export class DenoAwarenessPeer {
       this.#provider.on("connection-error", onError);
       this.#provider.connect();
     });
-    this.#publish();
+    this.#pacer.flushNow("initial");
   }
 
   enqueue(
@@ -165,13 +197,16 @@ export class DenoAwarenessPeer {
   ): void {
     if (this.#closed) return;
     this.#scheduler.enqueue(priority, streamId, frame, weight);
-    const pumped=this.#pump();const congestionChanged=this.#updateCongestion();if(pumped||congestionChanged)this.#schedulePublish();
+    const urgency = this.#pump();
+    const congestionChanged = this.#updateCongestion();
+    this.#requestPublication(congestionChanged ? "urgent" : urgency);
     this.#updateBackpressure();
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#pacer.close();
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
     await this.#acceptChain.catch(() => undefined);
@@ -210,15 +245,17 @@ export class DenoAwarenessPeer {
       this.#hostClientId = clientId;
       this.#hostRevision = envelope.revision;
       try {
-        const previousOutstanding = this.#outbound.snapshot().frames.length;
         const ceilingChanged = envelope.credits !== this.#hostCredits;
         this.#hostCredits = envelope.credits;
         this.#engine.setHostCeiling(envelope.credits);
         this.#outbound.acknowledge(envelope.ack);
-        const acknowledgementAdvanced =
-          this.#outbound.snapshot().frames.length < previousOutstanding;
-        if (acknowledgementAdvanced) this.#retransmissionAttempt = 0;
-        if (acknowledgementAdvanced) this.#lastAckAt = performance.now();
+        const now = performance.now();
+        const acknowledgementAdvanced = this.#delivery.acknowledged(
+          envelope.ack,
+          this.#outbound.snapshot().frames.length > 0,
+          now,
+        );
+        if (acknowledgementAdvanced) this.#lastAckAt = now;
         const currentEpoch = this.#inbound.ack().epoch;
         if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
         const frames = this.#inbound.accept(envelope.frames);
@@ -227,12 +264,15 @@ export class DenoAwarenessPeer {
             .then(() => this.#acceptHostFrame(frame))
             .catch(() => undefined);
         }
-        const pumped = this.#pump();
+        const urgency = this.#pump();
         this.#updateBackpressure();
         const congestionChanged=this.#updateCongestion();
-        if (ceilingChanged || acknowledgementAdvanced || frames.length > 0 || pumped || congestionChanged) {
-          this.#schedulePublish();
-        }
+        this.#requestPublication(
+          frames.length > 0 || ceilingChanged || congestionChanged
+            ? "urgent"
+            : urgency,
+        );
+        if (acknowledgementAdvanced) this.#armRetransmission();
       } catch {
         // Invalid ACK/window transitions are ignored; a valid current host
         // envelope must re-establish contiguous state.
@@ -240,9 +280,8 @@ export class DenoAwarenessPeer {
     }
   };
 
-  #pump(): boolean {
-    const wasEmpty = this.#outbound.snapshot().frames.length === 0;
-    let changed = false;
+  #pump(): PublicationUrgency | null {
+    let urgency: PublicationUrgency | null = null;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const remainingFrames = GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length;
@@ -250,32 +289,28 @@ export class DenoAwarenessPeer {
       if (remainingFrames < 1 || remainingBytes < 512) break;
       const next = this.#scheduler.take(1, Math.min(15 * 1024, remainingBytes - 256));
       if (!next.length) break;
-      this.#outbound.push(next[0]);
-      changed = true;
+      const reliable = this.#outbound.push(next[0]);
+      urgency = strongestUrgency(urgency, sidecarFrameUrgency(reliable));
     }
-    if (changed && wasEmpty) this.#retransmissionAttempt = 0;
-    return changed;
+    return urgency;
   }
 
   #updateBackpressure():void{const value=this.#scheduler.snapshot();this.#outputBackpressure?.update({frames:value.queuedFrames,bytes:value.queuedEncodedBytes});}
   #updateCongestion():boolean{const scheduled=this.#scheduler.snapshot();const outbound=this.#outbound.snapshot();const before=this.#congestion.congested;this.#congestion.update({schedulerFrames:scheduled.queuedFrames,schedulerBytes:scheduled.queuedEncodedBytes,oldestQueuedFrameMs:scheduled.oldestQueuedFrameMs,ackProgressAgeMs:Math.max(0,performance.now()-this.#lastAckAt),windowFrames:outbound.frames.length});return before!==this.#congestion.congested;}
 
-  #schedulePublish(): void {
-    if (this.#closed || this.#publishScheduled) return;
-    this.#publishScheduled = true;
-    queueMicrotask(() => {
-      this.#publishScheduled = false;
-      if (!this.#closed) this.#publish();
-    });
+  #requestPublication(urgency: PublicationUrgency | null): void {
+    if (urgency === "urgent") this.#pacer.requestUrgent();
+    else if (urgency === "paced") this.#pacer.requestPaced();
   }
 
-  #publish(): void {
+  #publish(_reason: PublicationReason): void {
     if (this.#closed) return;
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
     const scheduled = this.#scheduler.snapshot();
+    this.#delivery.published(outbound.frames, performance.now());
     this.#publications++;
-    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#retransmissionAttempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: null });
+    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs });
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
@@ -306,18 +341,15 @@ export class DenoAwarenessPeer {
     this.#timer = null;
     if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
     const jitterSeed = ((this.#revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
-    const delay = computeV2RetransmitDelayMs(
-      null,
-      jitterSeed,
-      this.#retransmitMs,
-      this.#retransmissionAttempt,
-    );
+    const delay = this.#delivery.nextDelayMs(performance.now(), jitterSeed);
+    if (delay === null) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
       if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
-      this.#retransmissionAttempt++;
-      this.#retransmissions++; this.#peakAttempt = Math.max(this.#peakAttempt, this.#retransmissionAttempt);
-      this.#publish();
+      this.#delivery.retransmitted(performance.now());
+      this.#retransmissions++;
+      this.#peakAttempt = Math.max(this.#peakAttempt, this.#delivery.attempt);
+      this.#pacer.flushNow("retransmission");
     }, delay) as unknown as number;
   }
 
