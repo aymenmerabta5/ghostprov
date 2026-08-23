@@ -3,7 +3,7 @@ import type { V2EnvelopeDiagnostics, V2FirstEventDiagnostics, V2RequestAckDiagno
 export const GP_V2_PROTOCOL = "gp-awareness-v2" as const;
 export const GP_V2_SCHEMA_VERSION = 1 as const;
 export const GP_V2_FRAME_MAX_BYTES = 16 * 1024;
-export const GP_V2_WINDOW_MAX_FRAMES = 32;
+export const GP_V2_WINDOW_MAX_FRAMES = 128;
 export const GP_V2_WINDOW_MAX_BYTES = 512 * 1024;
 export const GP_V2_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
 

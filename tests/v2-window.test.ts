@@ -48,14 +48,14 @@ describe("V2 reliable frame windows", () => {
     expect(() => duplicate.accept([{ ...reliable(2), epoch: 8 }])).toThrow("future epoch");
 
     const gap = new InboundFrameCursor<HostFrame>({ epoch: 7 });
-    gap.accept(Array.from({ length: 32 }, (_, index) => reliable(index + 1)));
-    expect(() => gap.accept([reliable(33)])).toThrow("32-frame");
+    gap.accept(Array.from({ length: 128 }, (_, index) => reliable(index + 1)));
+    expect(() => gap.accept([reliable(129)])).toThrow("128-frame");
   });
 
   it("enforces the hard outbound frame count and physical frame size", () => {
     const window = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
-    for (let index = 0; index < 32; index++) window.push(ping(index));
-    expect(() => window.push(ping(33))).toThrow("32-frame");
+    for (let index = 0; index < 128; index++) window.push(ping(index));
+    expect(() => window.push(ping(128))).toThrow("128-frame");
 
     const oversized = new OutboundFrameWindow<any>({ epoch: 1 });
     expect(() => oversized.push({ kind: "credential_rotate", sealedJson: "x".repeat(20_000) })).toThrow("16 KiB");
@@ -78,9 +78,9 @@ describe("V2 reliable frame windows", () => {
     const inbound = new InboundFrameCursor<HostFrame>({ epoch: 7 });
     const delivered: ReliableFrame<HostFrame>[] = [];
 
-    for (let batch = 0; batch < 313; batch++) {
-      const published = Array.from({ length: 32 }, (_, offset) => outbound.push(
-        ping(batch * 32 + offset),
+    for (let batch = 0; batch < 79; batch++) {
+      const published = Array.from({ length: 128 }, (_, offset) => outbound.push(
+        ping(batch * 128 + offset),
       ));
       const network = [...published].reverse();
       network.splice(4, 0, network[4]);
@@ -89,7 +89,7 @@ describe("V2 reliable frame windows", () => {
       expect(outbound.snapshot().frames).toEqual([]);
     }
 
-    expect(delivered).toHaveLength(10_016);
+    expect(delivered).toHaveLength(10_112);
     expect(new Set(delivered.map(frame => `${frame.epoch}:${frame.sequence}`)).size).toBe(delivered.length);
     expect(delivered.map(frame => frame.sequence)).toEqual(
       [...delivered].map(frame => frame.sequence).sort((left, right) => left - right),

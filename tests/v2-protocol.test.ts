@@ -63,7 +63,7 @@ function validEnvelope(): AwarenessEnvelope<HostFrame> {
 describe("V2 shared protocol", () => {
   it("publishes the exact hard transport limits and deterministic schema hash", async () => {
     expect(GP_V2_FRAME_MAX_BYTES).toBe(16 * 1024);
-    expect(GP_V2_WINDOW_MAX_FRAMES).toBe(32);
+    expect(GP_V2_WINDOW_MAX_FRAMES).toBe(128);
     expect(GP_V2_WINDOW_MAX_BYTES).toBe(512 * 1024);
     expect(GP_V2_REQUEST_MAX_BYTES).toBe(64 * 1024 * 1024);
     expect(await protocolSchemaHash()).toMatch(/^[a-f0-9]{64}$/);
@@ -107,9 +107,9 @@ describe("V2 shared protocol", () => {
 
     const tooMany = {
       ...validEnvelope(),
-      frames: Array.from({ length: 33 }, (_, index) => ping(index)),
+      frames: Array.from({ length: 129 }, (_, index) => ping(index)),
     };
-    expect(() => parseAwarenessEnvelope(tooMany, BINDING, "host")).toThrow("32-frame");
+    expect(() => parseAwarenessEnvelope(tooMany, BINDING, "host")).toThrow("128-frame");
   });
 
   it("validates byte-part fields and rejects conflicting structural keys", () => {
