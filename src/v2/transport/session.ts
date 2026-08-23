@@ -51,6 +51,7 @@ export interface V2TransportSnapshot {
   queued: number;
   quarantined: number;
   credits: number;
+  admissionCredits?: number;
   retransmissions: number;
   awarenessRttMs: number | null;
   diagnostics?: { host: V2TransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
@@ -449,7 +450,8 @@ export class V2TransportSession {
       active: this.#requests.size - this.#pending.filter(state => !state.admitted).length,
       queued: this.#pending.filter(state => !state.admitted).length,
       quarantined: this.#quarantined,
-      credits: this.#availableCredits(),
+      credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
+      admissionCredits: this.#availableCredits(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#awarenessRttMs,
       diagnostics: { host: this.#hostTransportDiagnostics(), sidecar: this.#sidecarDiagnostics },
@@ -847,7 +849,7 @@ export class V2TransportSession {
   }
 
   #availableCredits(): number {
-    return Math.max(0, this.#remoteCredits - this.#creditReservations);
+    return Math.max(0, Math.min(this.#remoteCredits - this.#creditReservations, 4 - this.#creditReservations));
   }
 
   #pump(): boolean {

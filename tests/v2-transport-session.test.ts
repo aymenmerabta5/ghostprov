@@ -219,6 +219,12 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("admits at most four uncommitted requests per sandbox", async () => {
+    const harness=new TransportHarness();await harness.start();
+    const pending=Array.from({length:5},(_,i)=>harness.session.run({...BODY,input:`request-${i}`}));
+    await harness.settle();expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,queued:1});
+    await harness.close();await Promise.allSettled(pending);
+  });
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(250);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);

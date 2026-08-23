@@ -25,6 +25,7 @@ import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
+import { TransportCongestion } from "../../src/v2/transport/congestion.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -103,6 +104,7 @@ export class DenoAwarenessPeer {
   #retransmissionAttempt = 0;
   #publishScheduled = false;
   #retransmissions = 0; #publications = 0; #publishedBytes = 0; #peakAttempt = 0; #lastAckAt = performance.now();
+  readonly #congestion = new TransportCongestion();
   #closed = false;
   #acceptChain: Promise<void> = Promise.resolve();
 
@@ -163,7 +165,7 @@ export class DenoAwarenessPeer {
   ): void {
     if (this.#closed) return;
     this.#scheduler.enqueue(priority, streamId, frame, weight);
-    if (this.#pump()) this.#schedulePublish();
+    const pumped=this.#pump();const congestionChanged=this.#updateCongestion();if(pumped||congestionChanged)this.#schedulePublish();
     this.#updateBackpressure();
   }
 
@@ -227,7 +229,8 @@ export class DenoAwarenessPeer {
         }
         const pumped = this.#pump();
         this.#updateBackpressure();
-        if (ceilingChanged || acknowledgementAdvanced || frames.length > 0 || pumped) {
+        const congestionChanged=this.#updateCongestion();
+        if (ceilingChanged || acknowledgementAdvanced || frames.length > 0 || pumped || congestionChanged) {
           this.#schedulePublish();
         }
       } catch {
@@ -255,6 +258,7 @@ export class DenoAwarenessPeer {
   }
 
   #updateBackpressure():void{const value=this.#scheduler.snapshot();this.#outputBackpressure?.update({frames:value.queuedFrames,bytes:value.queuedEncodedBytes});}
+  #updateCongestion():boolean{const scheduled=this.#scheduler.snapshot();const outbound=this.#outbound.snapshot();const before=this.#congestion.congested;this.#congestion.update({schedulerFrames:scheduled.queuedFrames,schedulerBytes:scheduled.queuedEncodedBytes,oldestQueuedFrameMs:scheduled.oldestQueuedFrameMs,ackProgressAgeMs:Math.max(0,performance.now()-this.#lastAckAt),windowFrames:outbound.frames.length});return before!==this.#congestion.congested;}
 
   #schedulePublish(): void {
     if (this.#closed || this.#publishScheduled) return;
@@ -285,7 +289,7 @@ export class DenoAwarenessPeer {
       epoch: outbound.epoch,
       revision: this.#revision++,
       ack: this.#inbound.ack(),
-      credits: transport.credits,
+      credits: this.#congestion.congested ? 0 : transport.credits,
       active: transport.active,
       queued: transport.queued,
       draining: transport.draining,

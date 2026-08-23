@@ -310,7 +310,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       capacity,
       active,
       available: this.#state === "ready" && transport
-        ? Math.max(0, Math.min(transport.credits, capacity - active - quarantined))
+        ? Math.max(0, Math.min(transport.admissionCredits ?? transport.credits, capacity - active - quarantined))
         : 0,
       quarantined,
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
