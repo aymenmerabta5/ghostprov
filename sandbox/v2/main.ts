@@ -17,6 +17,8 @@ interface StaticSidecarConfig {
   binding: BootstrapBinding;
   physicalMax: number;
   acceptedMax: number;
+  initialActivePerSandbox: number;
+  maxActivePerSandbox: number;
   memoryBudgetBytes: number;
   diagnostics: { enabled: boolean; intervalMs: number };
   batching: boolean;
@@ -36,6 +38,11 @@ function readConfig(value: unknown): StaticSidecarConfig {
     (raw.physicalMax as number) > 128 ||
     !Number.isInteger(raw.acceptedMax) ||
     (raw.acceptedMax as number) < (raw.physicalMax as number) ||
+    !Number.isInteger(raw.initialActivePerSandbox) ||
+    (raw.initialActivePerSandbox as number) < 1 ||
+    !Number.isInteger(raw.maxActivePerSandbox) ||
+    (raw.maxActivePerSandbox as number) < (raw.initialActivePerSandbox as number) ||
+    (raw.maxActivePerSandbox as number) > (raw.physicalMax as number) ||
     !Number.isInteger(raw.memoryBudgetBytes) ||
     (raw.memoryBudgetBytes as number) < 64 * 1024 * 1024 ||
     !raw.diagnostics || typeof raw.diagnostics !== "object" ||
@@ -49,6 +56,8 @@ function readConfig(value: unknown): StaticSidecarConfig {
     binding: raw.binding as BootstrapBinding,
     physicalMax: raw.physicalMax as number,
     acceptedMax: raw.acceptedMax as number,
+    initialActivePerSandbox: raw.initialActivePerSandbox as number,
+    maxActivePerSandbox: raw.maxActivePerSandbox as number,
     memoryBudgetBytes: raw.memoryBudgetBytes as number,
     diagnostics: raw.diagnostics as StaticSidecarConfig["diagnostics"],
     batching: raw.batching as boolean,
@@ -121,6 +130,8 @@ async function run(): Promise<void> {
     engine,
     diagnostics: diagnosticObserver,
     outputBackpressure,
+    initialActivePerSandbox: config.initialActivePerSandbox,
+    maxActivePerSandbox: config.maxActivePerSandbox,
   });
 
   await engine.start();

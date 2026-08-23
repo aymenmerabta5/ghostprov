@@ -134,7 +134,7 @@ describe("DenoAwarenessPeer", () => {
   it("keeps response flights separate from frame-free host ACK control", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
-      snapshot: () => ({ credits: 128, active: 16, queued: 0, draining: false }),
+      snapshot: () => ({ credits: 128, active: 0, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
       accept: async () => undefined,
     };
@@ -166,7 +166,7 @@ describe("DenoAwarenessPeer", () => {
       const data = providers.get("data")!;
       const control = providers.get("control")!;
       expect(control.awareness.getLocalState()?.ghostprovV2Control)
-        .toMatchObject({ lane: "control", frames: [] });
+        .toMatchObject({ lane: "control", frames: [], credits: 8 });
       expect(data.awareness.getLocalState()?.ghostprovV2Data).toBeUndefined();
 
       for (let index = 0; index < 64; index++) {
@@ -236,7 +236,7 @@ describe("DenoAwarenessPeer", () => {
     expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control).toMatchObject({
       peerId: "sidecar",
       instanceId: "sidecar-instance-1",
-      credits: 128,
+      credits: 8,
       lane: "control",
     });
     await peer.close();

@@ -65,6 +65,7 @@ class TransportHarness {
     gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
     rotationTimeoutMs?: number;
     publicationIntervalMs?: number;
+    unadmittedTimeoutMs?: number;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.network = new FakeAwarenessNetwork({ drop: options.drop });
@@ -93,6 +94,7 @@ class TransportHarness {
       rotationTimeoutMs: options.rotationTimeoutMs,
       retransmitMs: options.retransmitMs ?? 250,
       publicationIntervalMs: this.publicationIntervalMs,
+      unadmittedTimeoutMs: options.unadmittedTimeoutMs,
     });
   }
 
@@ -232,6 +234,48 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("rejects only never-admitted work when sandbox capacity changes", async () => {
+    const harness = new TransportHarness({
+      publicationIntervalMs: 1,
+      unadmittedTimeoutMs: 10,
+    });
+    await harness.start();
+    harness.credits = 0;
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    harness.hostFrames.clear();
+
+    const pending = harness.session.run(BODY);
+    try {
+      const result = await Promise.race([
+        pending.then(() => "resolved", error => error),
+        Bun.sleep(50).then(() => "timed-out"),
+      ]);
+      expect(result).toMatchObject({
+        committed: false,
+        code: "capacity_changed",
+      });
+      expect(harness.hostFrames.size).toBe(0);
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("never applies the unadmitted timeout after scheduler admission", async () => {
+    const harness = new TransportHarness({
+      publicationIntervalMs: 1,
+      unadmittedTimeoutMs: 10,
+    });
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    await harness.settle();
+    await Bun.sleep(20);
+    expect(await promiseState(pending)).toBe("pending");
+    await harness.commit(pending);
+    await harness.close();
+  });
+
   it("publishes ACK control state without repeating an active request flight", async () => {
     const harness = new TransportHarness({ publicationIntervalMs: 1 });
     await harness.start();

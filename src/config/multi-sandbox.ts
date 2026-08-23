@@ -26,6 +26,8 @@ export interface MultiSandboxConfig {
   targetConcurrency: number;
   targetSandboxes: number | null;
   v2SandboxCapacity: number;
+  v2InitialActivePerSandbox: number;
+  v2MaxActivePerSandbox: number;
   v2ResponseMaxBytes: number;
   v2TransportReservationBytes: number;
   v2YSweetRefreshMs: number;
@@ -183,6 +185,22 @@ export function resolveMultiSandboxConfig(
   if (v2SandboxCapacity > 128) {
     throw new RangeError("GP_V2_SANDBOX_CAPACITY must not exceed 128");
   }
+  const v2MaxActivePerSandbox = positiveInteger(
+    env.GP_V2_MAX_ACTIVE_PER_SANDBOX,
+    16,
+    "GP_V2_MAX_ACTIVE_PER_SANDBOX",
+  );
+  if (v2MaxActivePerSandbox > v2SandboxCapacity) {
+    throw new RangeError("GP_V2_MAX_ACTIVE_PER_SANDBOX must not exceed physical V2 capacity");
+  }
+  const v2InitialActivePerSandbox = positiveInteger(
+    env.GP_V2_INITIAL_ACTIVE_PER_SANDBOX,
+    8,
+    "GP_V2_INITIAL_ACTIVE_PER_SANDBOX",
+  );
+  if (v2InitialActivePerSandbox > v2MaxActivePerSandbox) {
+    throw new RangeError("GP_V2_INITIAL_ACTIVE_PER_SANDBOX must not exceed GP_V2_MAX_ACTIVE_PER_SANDBOX");
+  }
   const v2ResponseMaxBytes = positiveInteger(
     env.GP_V2_RESPONSE_MAX_BYTES,
     64 * 1024 * 1024,
@@ -220,14 +238,17 @@ export function resolveMultiSandboxConfig(
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
-  const desiredSandboxes = resolveDesiredSandboxCount({
+  let desiredSandboxes = resolveDesiredSandboxCount({
     targetConcurrency,
     targetSandboxes,
-    v2SandboxCapacity,
+    v2SandboxCapacity: v2MaxActivePerSandbox,
     maxProjects,
     sessionMode,
     guestMaxProjects,
   });
+  if (targetSandboxes === null && !autoCreateProjects && projectIds.length > 0) {
+    desiredSandboxes = Math.min(desiredSandboxes, projectIds.length);
+  }
   const provisionConcurrency = Math.min(
     desiredSandboxes,
     positiveInteger(env.GP_PROVISION_CONCURRENCY, 4, "GP_PROVISION_CONCURRENCY"),
@@ -253,6 +274,8 @@ export function resolveMultiSandboxConfig(
     targetConcurrency,
     targetSandboxes,
     v2SandboxCapacity,
+    v2InitialActivePerSandbox,
+    v2MaxActivePerSandbox,
     v2ResponseMaxBytes,
     v2TransportReservationBytes,
     v2YSweetRefreshMs,

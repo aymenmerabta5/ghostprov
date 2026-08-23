@@ -276,6 +276,8 @@ function bootstrapHarness(fault: Fault = "none") {
     clock,
     random,
     diagnostics: { enabled: true, intervalMs: 1_000 },
+    initialActivePerSandbox: 4,
+    maxActivePerSandbox: 12,
   });
   return {
     controller,
@@ -299,7 +301,7 @@ describe("V2BootstrapController", () => {
       buildHash: BUILD_HASH,
       schemaHash: SCHEMA_HASH,
       leaderGeneration: 4,
-      capacity: 128,
+      capacity: 12,
     });
     expect(harness.decrypted).toEqual([TOKEN]);
     expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
@@ -314,6 +316,8 @@ describe("V2BootstrapController", () => {
     expect(harness.awareness.connects).toBe(1);
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!)).toMatchObject({
       diagnostics: { enabled: true, intervalMs: 1_000 },
+      initialActivePerSandbox: 4,
+      maxActivePerSandbox: 12,
     });
   });
 

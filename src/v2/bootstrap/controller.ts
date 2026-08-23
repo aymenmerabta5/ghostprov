@@ -113,6 +113,8 @@ export interface V2BootstrapControllerOptions {
   pollMs?: number;
   physicalMax?: number;
   acceptedMax?: number;
+  initialActivePerSandbox?: number;
+  maxActivePerSandbox?: number;
   memoryBudgetBytes?: number;
   diagnostics?: { enabled: boolean; intervalMs: number };
   batching?: boolean;
@@ -382,6 +384,8 @@ export class V2BootstrapController {
   readonly #pollMs: number;
   readonly #physicalMax: number;
   readonly #acceptedMax: number;
+  readonly #initialActivePerSandbox: number;
+  readonly #maxActivePerSandbox: number;
   readonly #memoryBudgetBytes: number;
   readonly #diagnostics: { enabled: boolean; intervalMs: number };
   readonly #batching: boolean;
@@ -401,6 +405,8 @@ export class V2BootstrapController {
     const pollMs = options.pollMs ?? 100;
     const physicalMax = options.physicalMax ?? 128;
     const acceptedMax = options.acceptedMax ?? 256;
+    const initialActivePerSandbox = options.initialActivePerSandbox ?? 8;
+    const maxActivePerSandbox = options.maxActivePerSandbox ?? 16;
     const memoryBudgetBytes = options.memoryBudgetBytes ?? 512 * 1024 * 1024;
     const diagnostics = options.diagnostics ?? { enabled: false, intervalMs: 1_000 };
     const batching = options.batching ?? false;
@@ -428,6 +434,16 @@ export class V2BootstrapController {
     if (!Number.isSafeInteger(acceptedMax) || acceptedMax < physicalMax) {
       throw new RangeError("acceptedMax must be at least physicalMax");
     }
+    if (
+      !Number.isSafeInteger(maxActivePerSandbox) ||
+      maxActivePerSandbox < 1 ||
+      maxActivePerSandbox > physicalMax
+    ) throw new RangeError("maxActivePerSandbox must be within physical capacity");
+    if (
+      !Number.isSafeInteger(initialActivePerSandbox) ||
+      initialActivePerSandbox < 1 ||
+      initialActivePerSandbox > maxActivePerSandbox
+    ) throw new RangeError("initialActivePerSandbox must be within the adaptive maximum");
     if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes < 64 * 1024 * 1024) {
       throw new RangeError("memoryBudgetBytes must be at least 64 MiB");
     }
@@ -455,6 +471,8 @@ export class V2BootstrapController {
     this.#pollMs = pollMs;
     this.#physicalMax = physicalMax;
     this.#acceptedMax = acceptedMax;
+    this.#initialActivePerSandbox = initialActivePerSandbox;
+    this.#maxActivePerSandbox = maxActivePerSandbox;
     this.#memoryBudgetBytes = memoryBudgetBytes;
     this.#diagnostics = { ...diagnostics };
     this.#batching = batching;
@@ -676,6 +694,8 @@ export class V2BootstrapController {
         binding,
         physicalMax: this.#physicalMax,
         acceptedMax: this.#acceptedMax,
+        initialActivePerSandbox: this.#initialActivePerSandbox,
+        maxActivePerSandbox: this.#maxActivePerSandbox,
         memoryBudgetBytes: this.#memoryBudgetBytes,
         diagnostics: this.#diagnostics,
         batching: this.#batching,
@@ -800,7 +820,7 @@ export class V2BootstrapController {
           buildHash: binding.buildHash,
           schemaHash: binding.schemaHash,
           leaderGeneration: binding.leaderGeneration,
-          capacity: envelope.credits,
+          capacity: this.#maxActivePerSandbox,
         };
       }
       if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");

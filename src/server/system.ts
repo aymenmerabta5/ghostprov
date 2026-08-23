@@ -196,6 +196,8 @@ function defaultRuntimeFactory(options: {
         assets: bootstrap.assets,
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
+        initialActivePerSandbox: config.v2InitialActivePerSandbox,
+        maxActivePerSandbox: config.v2MaxActivePerSandbox,
         memoryBudgetBytes: config.v2SidecarMemoryBudgetBytes,
         diagnostics: { enabled: config.v2DiagnosticsEnabled, intervalMs: config.v2DiagnosticsIntervalMs },
         batching: config.v2BatchingEnabled,

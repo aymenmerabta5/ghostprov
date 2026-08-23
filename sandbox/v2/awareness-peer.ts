@@ -34,6 +34,7 @@ import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sideca
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 import { TransportCongestion } from "../../src/v2/transport/congestion.ts";
+import { AdaptiveTransportCapacity } from "../../src/v2/transport/adaptive-capacity.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -50,6 +51,8 @@ export interface DenoAwarenessPeerOptions {
   diagnostics?: SidecarDiagnosticsObserver;
   outputBackpressure?: OutputBackpressure;
   publicationIntervalMs?: number;
+  initialActivePerSandbox?: number;
+  maxActivePerSandbox?: number;
 }
 
 export interface DenoAwarenessProviderLike {
@@ -127,6 +130,7 @@ export class DenoAwarenessPeer {
   readonly #outputBackpressure?: OutputBackpressure;
   readonly #delivery: ReliableDeliveryTiming;
   readonly #pacer: PublicationPacer;
+  readonly #adaptiveCapacity: AdaptiveTransportCapacity;
   #dataRevision = 0;
   #controlRevision = 0;
   #dataDirty = false;
@@ -187,6 +191,10 @@ export class DenoAwarenessPeer {
     this.#pacer = new PublicationPacer({
       intervalMs: options.publicationIntervalMs,
       publish: reason => this.#publish(reason),
+    });
+    this.#adaptiveCapacity = new AdaptiveTransportCapacity({
+      initial: options.initialActivePerSandbox ?? 8,
+      maximum: options.maxActivePerSandbox ?? 16,
     });
     this.#dataProvider.awareness.on("change", this.#onDataAwarenessChange);
     this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
@@ -345,8 +353,18 @@ export class DenoAwarenessPeer {
           this.#outbound.snapshot().frames.length > 0,
           now,
         );
+        let capacityChanged = false;
         if (acknowledgementAdvanced) {
+          const ackStalled = now - this.#lastAckAt >= 2_000;
           this.#lastAckAt = now;
+          const rttMs = this.#delivery.roundTripEwmaMs;
+          if (rttMs !== null) {
+            capacityChanged = this.#adaptiveCapacity.observe({
+              rttMs,
+              congested: this.#congestion.congested,
+              ackStalled,
+            });
+          }
           this.#armRetransmission();
         }
         let frames: readonly ReliableFrame<HostFrame>[] = [];
@@ -367,7 +385,7 @@ export class DenoAwarenessPeer {
         this.#updateBackpressure();
         const congestionChanged=this.#updateCongestion();
         this.#requestPublication(
-          frames.length > 0 || ceilingChanged || congestionChanged
+          frames.length > 0 || ceilingChanged || congestionChanged || capacityChanged
             ? "urgent"
             : urgency,
         );
@@ -450,7 +468,9 @@ export class DenoAwarenessPeer {
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#inbound.ack(),
-      credits: this.#congestion.congested ? 0 : transport.credits,
+      credits: this.#congestion.congested
+        ? 0
+        : this.#adaptiveCapacity.available(transport.active, transport.credits),
       active: transport.active,
       queued: transport.queued,
       draining: transport.draining,

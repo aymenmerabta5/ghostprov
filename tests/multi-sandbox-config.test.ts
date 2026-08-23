@@ -41,6 +41,8 @@ describe("multi-sandbox configuration", () => {
     expect(config.allowAnonymous).toBe(false);
     expect(config.guestMaxProjects).toBe(1);
     expect(config.v2SandboxCapacity).toBe(128);
+    expect(config.v2InitialActivePerSandbox).toBe(8);
+    expect(config.v2MaxActivePerSandbox).toBe(16);
     expect(config.v2ResponseMaxBytes).toBe(64 * 1024 * 1024);
     expect(config.v2TransportReservationBytes).toBe(16 * 1024 * 1024);
     expect(config.v2YSweetRefreshMs).toBe(45 * 60 * 1000);
@@ -48,7 +50,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2DiagnosticsEnabled).toBe(false);
     expect(config.v2DiagnosticsIntervalMs).toBe(1_000);
     expect(config.v2BatchingEnabled).toBe(false);
-    expect(config.desiredSandboxes).toBe(4);
+    expect(config.desiredSandboxes).toBe(1);
     expect(config.heartbeatMs).toBe(10_000);
   });
 
@@ -82,7 +84,31 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE);
 
     expect(config.projectIds).toEqual([]);
-    expect(config.desiredSandboxes).toBe(8);
+    expect(config.desiredSandboxes).toBe(16);
+  });
+
+  it("bounds transport-active capacity below the physical engine ceiling", () => {
+    const config = resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: `${A},${B}`,
+      GP_TARGET_SANDBOXES: "2",
+      GP_V2_INITIAL_ACTIVE_PER_SANDBOX: "4",
+      GP_V2_MAX_ACTIVE_PER_SANDBOX: "12",
+    }, MACHINE);
+    expect(config.v2InitialActivePerSandbox).toBe(4);
+    expect(config.v2MaxActivePerSandbox).toBe(12);
+    expect(config.desiredSandboxes).toBe(2);
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_INITIAL_ACTIVE_PER_SANDBOX: "9",
+      GP_V2_MAX_ACTIVE_PER_SANDBOX: "8",
+    }, MACHINE)).toThrow("INITIAL_ACTIVE");
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_MAX_ACTIVE_PER_SANDBOX: "129",
+    }, MACHINE)).toThrow("physical");
   });
 
   it("requires explicit guest mode and caps it independently", () => {

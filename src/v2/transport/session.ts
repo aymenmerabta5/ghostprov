@@ -76,6 +76,7 @@ export interface V2TransportSessionOptions {
   retransmitMs?: number;
   rotationTimeoutMs?: number;
   publicationIntervalMs?: number;
+  unadmittedTimeoutMs?: number;
 }
 
 interface EventPart {
@@ -111,6 +112,7 @@ interface RequestState {
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
   diagnostics: HostRequestDiagnosticsObserver;
   firstResponseSeen: boolean;
+  admissionTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface RotationWaiter {
@@ -188,6 +190,7 @@ export class V2TransportSession {
   readonly #maxBufferedResponseBytes: number;
   #hostCeiling: number;
   readonly #rotationTimeoutMs: number;
+  readonly #unadmittedTimeoutMs: number;
   readonly #hostInstanceId = `host-${crypto.randomUUID()}`;
   readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
@@ -228,6 +231,7 @@ export class V2TransportSession {
   #publishedBytes = 0;
   #peakRetransmissionAttempt = 0;
   #lastAckAtMs: number;
+  #unadmittedTimeouts = 0;
 
   constructor(options: V2TransportSessionOptions) {
     if (options.channel.projectId !== options.binding.projectId) {
@@ -259,6 +263,10 @@ export class V2TransportSession {
     if (!Number.isSafeInteger(rotationTimeoutMs) || rotationTimeoutMs < 1) {
       throw new RangeError("rotationTimeoutMs must be a positive safe integer");
     }
+    const unadmittedTimeoutMs = options.unadmittedTimeoutMs ?? 1_000;
+    if (!Number.isSafeInteger(unadmittedTimeoutMs) || unadmittedTimeoutMs < 1) {
+      throw new RangeError("unadmittedTimeoutMs must be a positive safe integer");
+    }
     this.#binding = options.binding;
     this.#channel = options.channel;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -267,6 +275,7 @@ export class V2TransportSession {
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
+    this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
     this.#lastAckAtMs = this.#clock.now();
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
@@ -355,6 +364,15 @@ export class V2TransportSession {
     signal?.addEventListener("abort", state.onAbort, { once: true });
     this.#requests.set(requestId, state);
     this.#pending.push(state);
+    state.admissionTimer = setTimeout(() => {
+      if (!this.#requests.has(state.requestId) || state.admitted) return;
+      this.#unadmittedTimeouts++;
+      this.#failPreCommit(state, new V2PreCommitError(
+        "Sandbox capacity changed before admission",
+        "capacity_changed",
+      ));
+    }, this.#unadmittedTimeoutMs);
+    state.admissionTimer.unref?.();
     this.#admitPending();
     this.#requestPublication(this.#pump());
     return committed;
@@ -902,6 +920,8 @@ export class V2TransportSession {
       const state = this.#pending.find(candidate => !candidate.admitted);
       if (!state) return;
       state.admitted = true;
+      if (state.admissionTimer) clearTimeout(state.admissionTimer);
+      state.admissionTimer = undefined;
       this.#creditReservations++;
       for (const frame of state.frames) {
         // Request frames share one priority queue so commit can never overtake data.
@@ -1114,6 +1134,8 @@ export class V2TransportSession {
       this.#creditReservations = Math.max(0, this.#creditReservations - 1);
     }
     state.signal?.removeEventListener("abort", state.onAbort!);
+    if (state.admissionTimer) clearTimeout(state.admissionTimer);
+    state.admissionTimer = undefined;
     if (this.#requests.size === 0) {
       for (const resolve of this.#idleWaiters) resolve();
       this.#idleWaiters.clear();
