@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { createDiagnosticEvent, resolveDiagnosticProbeOptions } from "../scripts/diagnose_v2_concurrency";
+import { createDiagnosticEvent, metricsFromSnapshot, resolveDiagnosticProbeOptions } from "../scripts/diagnose_v2_concurrency";
 
 describe("V2 concurrency diagnostic probe guards",()=>{
  it("requires explicit opt-in and refuses protected/non-loopback roots",()=>{
@@ -13,5 +13,9 @@ describe("V2 concurrency diagnostic probe guards",()=>{
   expect(left).not.toHaveProperty("stream");
   expect(Object.isFrozen(left)).toBe(true);
   expect(JSON.stringify(left).length).toBeGreaterThan(256*1024);
+ });
+ it("extracts sandbox resource and ACK pressure without copying payload data",()=>{
+  const value=metricsFromSnapshot({runtimes:[{diagnostics:{host:{ackProgressAgeMs:250},sidecar:{resource:{processCpuPercent:80,normalizedLoad1:0.5,eventLoopP95Ms:12,systemTotalBytes:1000,systemFreeBytes:200,processRssBytes:100},transport:{ackProgressAgeMs:300}}}}]}, {firstEventMs:{p95:400},maxGapMs:{p95:50}} as any);
+  expect(value).toMatchObject({sidecarCpuP95:80,sidecarEventLoopP95Ms:12,sidecarFreeMemoryRatio:0.2,ackProgressAgeP95Ms:300,transportResidualP95Ms:400});
  });
 });
