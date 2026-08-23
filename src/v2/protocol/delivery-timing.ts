@@ -37,6 +37,7 @@ export class ReliableDeliveryTiming {
   #roundTripEwmaMs: number | null = null;
   #attempt = 0;
   #deadlineBaseMs: number | null = null;
+  #lastProgressAtMs: number | null = null;
 
   constructor(options: {
     epoch: number;
@@ -69,6 +70,15 @@ export class ReliableDeliveryTiming {
     return this.#firstSentAt.size;
   }
 
+  ackProgressAgeMs(nowMs: number): number {
+    assertTime(nowMs);
+    if (this.#lastProgressAtMs === null) return 0;
+    if (nowMs < this.#lastProgressAtMs) {
+      throw new RangeError("delivery progress clock moved backwards");
+    }
+    return nowMs - this.#lastProgressAtMs;
+  }
+
   published(frames: readonly FrameIdentity[], nowMs: number): void {
     assertTime(nowMs);
     const unseen = new Set<number>();
@@ -89,6 +99,9 @@ export class ReliableDeliveryTiming {
     for (const sequence of unseen) this.#firstSentAt.set(sequence, nowMs);
     if (this.#firstSentAt.size > 0 && this.#deadlineBaseMs === null) {
       this.#deadlineBaseMs = nowMs;
+    }
+    if (this.#firstSentAt.size > 0 && this.#lastProgressAtMs === null) {
+      this.#lastProgressAtMs = nowMs;
     }
   }
 
@@ -126,6 +139,7 @@ export class ReliableDeliveryTiming {
     }
     this.#attempt = 0;
     this.#deadlineBaseMs = hasOutstanding ? nowMs : null;
+    this.#lastProgressAtMs = hasOutstanding ? nowMs : null;
     return true;
   }
 
@@ -161,5 +175,6 @@ export class ReliableDeliveryTiming {
     this.#roundTripEwmaMs = null;
     this.#attempt = 0;
     this.#deadlineBaseMs = null;
+    this.#lastProgressAtMs = null;
   }
 }

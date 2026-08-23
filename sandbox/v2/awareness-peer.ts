@@ -156,7 +156,6 @@ export class DenoAwarenessPeer {
   #controlPublishedBytes = 0;
   #flightCompletions = 0;
   #peakAttempt = 0;
-  #lastAckAt = performance.now();
   #logicalEvents = 0;
   #responseBatchFrames = 0;
   #batchedEvents = 0;
@@ -361,7 +360,6 @@ export class DenoAwarenessPeer {
         );
         let capacityChanged = false;
         if (acknowledgementAdvanced) {
-          this.#lastAckAt = now;
           const rttMs = this.#delivery.roundTripEwmaMs;
           if (rttMs !== null) {
             capacityChanged = this.#adaptiveCapacity.observe({
@@ -424,7 +422,7 @@ export class DenoAwarenessPeer {
   }
 
   #updateBackpressure():void{const value=this.#scheduler.snapshot();this.#outputBackpressure?.update({frames:value.queuedFrames,bytes:value.queuedEncodedBytes});}
-  #updateCongestion():boolean{const scheduled=this.#scheduler.snapshot();const outbound=this.#outbound.snapshot();const before=this.#congestion.congested;this.#congestion.update({schedulerFrames:scheduled.queuedFrames,schedulerBytes:scheduled.queuedEncodedBytes,oldestQueuedFrameMs:scheduled.oldestQueuedFrameMs,ackProgressAgeMs:Math.max(0,performance.now()-this.#lastAckAt),windowFrames:outbound.frames.length});return before!==this.#congestion.congested;}
+  #updateCongestion():boolean{const scheduled=this.#scheduler.snapshot();const outbound=this.#outbound.snapshot();const before=this.#congestion.congested;this.#congestion.update({schedulerFrames:scheduled.queuedFrames,schedulerBytes:scheduled.queuedEncodedBytes,oldestQueuedFrameMs:scheduled.oldestQueuedFrameMs,ackProgressAgeMs:this.#delivery.ackProgressAgeMs(performance.now()),windowFrames:outbound.frames.length});return before!==this.#congestion.congested;}
 
   #requestPublication(urgency: PublicationUrgency | null): void {
     if (urgency === "urgent") this.#pacer.requestUrgent();
@@ -459,7 +457,7 @@ export class DenoAwarenessPeer {
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
     const adaptive = this.#adaptiveCapacity.snapshot();
-    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: Math.max(0, performance.now() - this.#lastAckAt), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0 });
+    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: this.#delivery.ackProgressAgeMs(performance.now()), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0 });
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,

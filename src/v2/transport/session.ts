@@ -235,7 +235,6 @@ export class V2TransportSession {
   #controlPublishedBytes = 0;
   #flightCompletions = 0;
   #peakRetransmissionAttempt = 0;
-  #lastAckAtMs: number;
   #unadmittedTimeouts = 0;
 
   constructor(options: V2TransportSessionOptions) {
@@ -281,7 +280,6 @@ export class V2TransportSession {
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
-    this.#lastAckAtMs = this.#clock.now();
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
       minimumMs: retransmitMs,
@@ -595,7 +593,6 @@ export class V2TransportSession {
       now,
     );
     if (acknowledgementAdvanced) {
-      this.#lastAckAtMs = now;
       this.#armRetransmission();
     }
     let delivered: readonly ReliableFrame<SidecarFrame>[] = [];
@@ -1054,7 +1051,7 @@ export class V2TransportSession {
       schedulerBytes: scheduler.queuedEncodedBytes,
       schedulerStreams: scheduler.streams,
       oldestQueuedFrameMs: scheduler.oldestQueuedFrameMs,
-      ackProgressAgeMs: Math.max(0, this.#clock.now() - this.#lastAckAtMs),
+      ackProgressAgeMs: this.#delivery.ackProgressAgeMs(this.#clock.now()),
       retransmissionAttempt: this.#delivery.attempt,
       peakRetransmissionAttempt: this.#peakRetransmissionAttempt,
       retransmissionsTotal: this.#retransmissions,

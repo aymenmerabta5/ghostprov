@@ -52,6 +52,34 @@ describe("ReliableDeliveryTiming", () => {
     expect(timing.nextDelayMs(500, 0)).toBe(800);
   });
 
+  it("measures ACK age only while a reliable flight is outstanding", () => {
+    const timing = new ReliableDeliveryTiming({ epoch: 1 });
+    expect(timing.ackProgressAgeMs(50_000)).toBe(0);
+
+    timing.published([{ epoch: 1, sequence: 0 }], 50_000);
+    expect(timing.ackProgressAgeMs(50_400)).toBe(400);
+
+    timing.published([{ epoch: 1, sequence: 0 }], 50_600);
+    expect(timing.ackProgressAgeMs(50_700)).toBe(700);
+
+    timing.retransmitted(50_800);
+    expect(timing.ackProgressAgeMs(50_900)).toBe(900);
+
+    timing.published([{ epoch: 1, sequence: 1 }], 51_000);
+    timing.acknowledged({ epoch: 1, sequence: 0 }, true, 51_100);
+    expect(timing.ackProgressAgeMs(51_300)).toBe(200);
+
+    timing.acknowledged({ epoch: 1, sequence: 1 }, false, 51_400);
+    expect(timing.ackProgressAgeMs(500_000)).toBe(0);
+
+    timing.published([{ epoch: 1, sequence: 2 }], 500_000);
+    timing.reset(2);
+    expect(timing.ackProgressAgeMs(900_000)).toBe(0);
+
+    timing.published([{ epoch: 2, sequence: 0 }], 900_000);
+    expect(() => timing.ackProgressAgeMs(899_999)).toThrow("clock moved backwards");
+  });
+
   it("bounds sequence timestamps and resets cleanly on an epoch advance", () => {
     const timing = new ReliableDeliveryTiming({ epoch: 1, maxTracked: 2 });
     timing.published([
