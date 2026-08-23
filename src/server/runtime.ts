@@ -5,6 +5,7 @@ import { collectRequestBody, contentLengthExceeds } from "../http/body";
 import { ApiError, apiErrorResponse } from "../http/errors";
 import { attachResponsesWebSocket } from "../ws/server";
 import type { RouterLike } from "./app";
+import type { WebSocketTelemetry } from "../ws/telemetry";
 
 export interface GhostProvServerOptions {
   app: Hono;
@@ -12,6 +13,7 @@ export interface GhostProvServerOptions {
   port: number;
   candidate?: boolean;
   maxBodyBytes?: number;
+  webSocketTelemetry?: WebSocketTelemetry;
 }
 
 export function createGhostProvServer(options: GhostProvServerOptions): Server {
@@ -82,6 +84,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     });
   });
   attachResponsesWebSocket(server, {
+    telemetry: options.webSocketTelemetry,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {
       source: "websocket",
       clientId: "websocket",

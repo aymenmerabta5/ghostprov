@@ -6,6 +6,7 @@ import {
   ResponseGraph,
   type ResponseCreateEvent,
 } from "./response-graph";
+import type { WebSocketTelemetry } from "./telemetry";
 
 export type WebSocketRelayStarter = (
   body: Record<string, unknown>,
@@ -18,6 +19,7 @@ export interface ResponsesWebSocketSessionOptions {
   maxNamedStreams?: number;
   maxBufferedBytes?: number;
   graph?: ResponseGraph;
+  telemetry?: WebSocketTelemetry;
 }
 
 interface SemaphoreWaiter {
@@ -114,6 +116,8 @@ export class ResponsesWebSocketSession {
   private readonly controllers = new Set<AbortController>();
   private sendTail = Promise.resolve();
   private closed = false;
+  private readonly telemetry?: WebSocketTelemetry;
+  private sendDepth = 0;
 
   constructor(private readonly socket: WebSocket, options: ResponsesWebSocketSessionOptions) {
     this.startRelay = options.startRelay;
@@ -121,6 +125,8 @@ export class ResponsesWebSocketSession {
     this.maxBufferedBytes = options.maxBufferedBytes ?? 1024 * 1024;
     this.graph = options.graph ?? new ResponseGraph();
     this.semaphore = new AsyncSemaphore(options.maxActive ?? config.wsActiveResponses);
+    this.telemetry = options.telemetry;
+    this.telemetry?.sessionOpened();
   }
 
   receive(raw: string): void {
@@ -151,6 +157,7 @@ export class ResponsesWebSocketSession {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.telemetry?.sessionClosed();
     for (const controller of this.controllers) controller.abort();
     this.controllers.clear();
     this.graph.clear();
@@ -197,6 +204,7 @@ export class ResponsesWebSocketSession {
     let release: (() => void) | undefined;
     try {
       release = await this.semaphore.acquire(controller.signal);
+      this.telemetry?.responseStarted();
       if (event.generate === false) {
         this.completeWarmup(event);
         return;
@@ -235,6 +243,7 @@ export class ResponsesWebSocketSession {
       }
     } finally {
       release?.();
+      if (release) this.telemetry?.responseFinished();
       this.controllers.delete(controller);
     }
   }
@@ -260,15 +269,23 @@ export class ResponsesWebSocketSession {
   }
 
   private send(value: unknown): void {
+    const enqueuedAt = performance.now();
+    this.sendDepth++;
+    this.telemetry?.sendQueued(this.sendDepth);
     this.sendTail = this.sendTail.then(async () => {
       if (this.closed || this.socket.readyState !== this.socket.OPEN) return;
+      let delayed = false;
       while (this.socket.bufferedAmount > this.maxBufferedBytes) {
+        delayed = true;
         await new Promise(resolve => setTimeout(resolve, 5));
         if (this.closed || this.socket.readyState !== this.socket.OPEN) return;
       }
+      const queueMs = performance.now() - enqueuedAt;
+      const callbackStarted = performance.now();
       await new Promise<void>((resolve, reject) => {
         this.socket.send(JSON.stringify(value), error => error ? reject(error) : resolve());
       });
-    }).catch(() => undefined);
+      this.telemetry?.recordSend({ queueMs, callbackMs: performance.now()-callbackStarted, bufferedBytes: this.socket.bufferedAmount, delayed });
+    }).catch(() => undefined).finally(() => { this.sendDepth=Math.max(0,this.sendDepth-1); });
   }
 }

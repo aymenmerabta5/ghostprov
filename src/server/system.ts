@@ -45,6 +45,7 @@ import {
 } from "../observability/logger";
 import { observabilityEvent } from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
+import { WebSocketTelemetry } from "../ws/telemetry";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -315,11 +316,13 @@ export async function createBrowserlessSystem(
     cpuPoolSnapshot: cpuPool.snapshot ? () => cpuPool.snapshot!() : undefined,
   });
   const app = createGhostProvApp({ router });
+  const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const server = dependencies.server ?? createGhostProvServer({
     app,
     router,
     port: config.port,
     candidate: config.candidate,
+    webSocketTelemetry,
   }) as BrowserlessSystemServer;
   let reconciliation: Promise<unknown> | null = null;
   let starting: Promise<void> | null = null;
