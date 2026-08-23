@@ -30,7 +30,9 @@ import {
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
 import { SandboxYDoc } from "../sandbox/ydoc";
 import { YSweetAwarenessChannel } from "../v2/awareness/y-sweet-channel";
+import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
 import { V2BootstrapController } from "../v2/bootstrap/controller";
+import type { HostFrame, SidecarFrame } from "../v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../v2/protocol/validate";
 import { V2SandboxRuntime } from "../v2/runtime";
 import { loadV2SidecarAssets, type V2SidecarAssets } from "../v2/sidecar/assets";
@@ -167,12 +169,21 @@ function defaultRuntimeFactory(options: {
           },
         });
       },
-      createAwareness: (binding, credentials) => new YSweetAwarenessChannel({
-        envelope: credentials.ySweet,
-        localPeerId: `host-${workerIndex}`,
-        field: "ghostprovV2",
-        parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
-      }),
+      createAwareness: (binding, credentials) => {
+        const createLane = (
+          lane: "data" | "control",
+          field: "ghostprovV2Data" | "ghostprovV2Control",
+        ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+          envelope: credentials.ySweet,
+          localPeerId: `host-${workerIndex}:${lane}`,
+          field,
+          parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+        });
+        return new SplitAwarenessChannel({
+          data: createLane("data", "ghostprovV2Data"),
+          control: createLane("control", "ghostprovV2Control"),
+        });
+      },
       createBootstrap: bootstrap => new V2BootstrapController({
         projectId,
         workerIndex,

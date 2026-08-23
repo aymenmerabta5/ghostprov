@@ -382,7 +382,9 @@ export function parseAwarenessEnvelope(
   exactKeys(raw, [
     "protocol", "schemaVersion", "schemaHash", "buildHash", "projectId", "sessionId",
     "peerId", "instanceId", "leaderGeneration", "epoch", "ack", "credits", "active",
-    "revision", "queued", "draining", "frames", ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
+    "revision", "queued", "draining", "frames",
+    ...(raw.lane === undefined ? [] : ["lane"]),
+    ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
   ], "Awareness envelope");
   if (raw.protocol !== GP_V2_PROTOCOL) fail("Awareness protocol is invalid", "protocol");
   if (raw.schemaVersion !== GP_V2_SCHEMA_VERSION) fail("Awareness schema version is invalid", "schema");
@@ -421,6 +423,11 @@ export function parseAwarenessEnvelope(
     fail(`Awareness state exceeds the ${GP_V2_WINDOW_MAX_BYTES}-byte window`, "window_bytes");
   }
   if (typeof raw.draining !== "boolean") fail("draining must be boolean", "boolean");
+  const lane = raw.lane === undefined
+    ? undefined
+    : raw.lane === "data" || raw.lane === "control"
+      ? raw.lane
+      : fail("Awareness lane is invalid", "lane");
   const diagnostics = parseDiagnosticObject(raw.diagnostics);
   return {
     protocol: GP_V2_PROTOCOL,
@@ -440,6 +447,7 @@ export function parseAwarenessEnvelope(
     queued: integer(raw.queued, "queued"),
     draining: raw.draining,
     frames: Object.freeze(frames),
+    ...(lane ? { lane } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };
 }

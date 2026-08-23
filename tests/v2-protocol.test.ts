@@ -77,6 +77,21 @@ describe("V2 shared protocol", () => {
     expect(parseAwarenessEnvelope(validEnvelope(), BINDING, "host")).toEqual(validEnvelope());
   });
 
+  it("accepts only the two independent Awareness lanes", () => {
+    expect(parseAwarenessEnvelope({
+      ...validEnvelope(),
+      lane: "control",
+    }, BINDING, "host")).toMatchObject({ lane: "control" });
+    expect(parseAwarenessEnvelope({
+      ...validEnvelope(),
+      lane: "data",
+    }, BINDING, "host")).toMatchObject({ lane: "data" });
+    expect(() => parseAwarenessEnvelope({
+      ...validEnvelope(),
+      lane: "invalid",
+    }, BINDING, "host")).toThrow("lane");
+  });
+
   it("rejects wrong project, schema, build, leader, and frame kinds", () => {
     const envelope = validEnvelope();
     const mutations: unknown[] = [

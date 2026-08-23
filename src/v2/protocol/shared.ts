@@ -7,6 +7,8 @@ export const GP_V2_WINDOW_MAX_FRAMES = 128;
 export const GP_V2_WINDOW_MAX_BYTES = 512 * 1024;
 export const GP_V2_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
 
+export type AwarenessLane = "data" | "control";
+
 export interface AckCursor {
   epoch: number;
   sequence: number;
@@ -125,6 +127,7 @@ export interface AwarenessEnvelope<T> {
   queued: number;
   draining: boolean;
   frames: readonly ReliableFrame<T>[];
+  lane?: AwarenessLane;
   diagnostics?: V2EnvelopeDiagnostics;
 }
 
@@ -153,6 +156,7 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "queued",
     "draining",
     "frames",
+    "lane?",
     "diagnostics?",
   ],
   hostFrameKinds: [

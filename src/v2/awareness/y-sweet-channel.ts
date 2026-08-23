@@ -40,7 +40,7 @@ export class AwarenessChannelError extends Error {
 export interface YSweetAwarenessChannelOptions<TLocal, TRemote> {
   envelope: YSweetEnvelope;
   localPeerId: string;
-  field: "ghostprovV2";
+  field: "ghostprovV2" | "ghostprovV2Data" | "ghostprovV2Control";
   parseRemote(value: unknown): AwarenessEnvelope<TRemote>;
   providerFactory?: (
     doc: Y.Doc,
@@ -75,7 +75,7 @@ export class YSweetAwarenessChannel<TLocal, TRemote>
 implements AwarenessChannel<TLocal, TRemote> {
   readonly projectId: ProjectId;
   readonly localPeerId: string;
-  readonly #field: "ghostprovV2";
+  readonly #field: "ghostprovV2" | "ghostprovV2Data" | "ghostprovV2Control";
   readonly #parseRemote: (value: unknown) => AwarenessEnvelope<TRemote>;
   readonly #syncTimeoutMs: number;
   readonly #doc: Y.Doc;
