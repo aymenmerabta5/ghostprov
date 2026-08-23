@@ -275,6 +275,7 @@ function bootstrapHarness(fault: Fault = "none") {
     pollMs: 5,
     clock,
     random,
+    diagnostics: { enabled: true, intervalMs: 1_000 },
   });
   return {
     controller,
@@ -311,6 +312,9 @@ describe("V2BootstrapController", () => {
     ]));
     expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
     expect(harness.awareness.connects).toBe(1);
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!)).toMatchObject({
+      diagnostics: { enabled: true, intervalMs: 1_000 },
+    });
   });
 
   it("retries with a fresh nonce and succeeds after a stale hello", async () => {

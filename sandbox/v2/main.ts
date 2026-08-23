@@ -8,6 +8,7 @@ import { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 import { phaseZeroBootstrap } from "./bootstrap.ts";
 import { DenoAwarenessPeer } from "./awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
+import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
 
 interface StaticSidecarConfig {
   version: 1;
@@ -15,6 +16,7 @@ interface StaticSidecarConfig {
   physicalMax: number;
   acceptedMax: number;
   memoryBudgetBytes: number;
+  diagnostics: { enabled: boolean; intervalMs: number };
 }
 
 function readConfig(value: unknown): StaticSidecarConfig {
@@ -32,7 +34,11 @@ function readConfig(value: unknown): StaticSidecarConfig {
     !Number.isInteger(raw.acceptedMax) ||
     (raw.acceptedMax as number) < (raw.physicalMax as number) ||
     !Number.isInteger(raw.memoryBudgetBytes) ||
-    (raw.memoryBudgetBytes as number) < 64 * 1024 * 1024
+    (raw.memoryBudgetBytes as number) < 64 * 1024 * 1024 ||
+    !raw.diagnostics || typeof raw.diagnostics !== "object" ||
+    typeof (raw.diagnostics as any).enabled !== "boolean" ||
+    !Number.isInteger((raw.diagnostics as any).intervalMs) ||
+    (raw.diagnostics as any).intervalMs < 100 || (raw.diagnostics as any).intervalMs > 60_000
   ) throw new Error("Static sidecar config fields are invalid");
   return {
     version: 1,
@@ -40,6 +46,7 @@ function readConfig(value: unknown): StaticSidecarConfig {
     physicalMax: raw.physicalMax as number,
     acceptedMax: raw.acceptedMax as number,
     memoryBudgetBytes: raw.memoryBudgetBytes as number,
+    diagnostics: raw.diagnostics as StaticSidecarConfig["diagnostics"],
   };
 }
 
@@ -57,6 +64,8 @@ async function run(): Promise<void> {
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
 
   const storage = new DenoJournalStorage();
+  const diagnostics = new SidecarResourceSampler(config.diagnostics);
+  diagnostics.start();
   const journal = new ClaimJournal({
     storage,
     flushIntervalMs: 2,
@@ -118,6 +127,7 @@ async function run(): Promise<void> {
     await engine.drain(reason);
     await peer.close();
   } finally {
+    await diagnostics.close();
     Deno.removeSignalListener("SIGTERM", onTerm);
     Deno.removeSignalListener("SIGINT", onInt);
   }

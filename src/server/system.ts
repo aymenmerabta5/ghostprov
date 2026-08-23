@@ -185,6 +185,7 @@ function defaultRuntimeFactory(options: {
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
         memoryBudgetBytes: config.v2SidecarMemoryBudgetBytes,
+        diagnostics: { enabled: config.v2DiagnosticsEnabled, intervalMs: config.v2DiagnosticsIntervalMs },
       }),
       createTransport: transport => new V2TransportSession({
         binding: transport.binding,

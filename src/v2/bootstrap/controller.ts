@@ -114,6 +114,7 @@ export interface V2BootstrapControllerOptions {
   physicalMax?: number;
   acceptedMax?: number;
   memoryBudgetBytes?: number;
+  diagnostics?: { enabled: boolean; intervalMs: number };
   clock?: Clock;
   random?: RandomSource;
 }
@@ -381,6 +382,7 @@ export class V2BootstrapController {
   readonly #physicalMax: number;
   readonly #acceptedMax: number;
   readonly #memoryBudgetBytes: number;
+  readonly #diagnostics: { enabled: boolean; intervalMs: number };
   readonly #clock: Clock;
   readonly #random: RandomSource;
   #ready: V2ReadyDescriptor | null = null;
@@ -398,6 +400,7 @@ export class V2BootstrapController {
     const physicalMax = options.physicalMax ?? 128;
     const acceptedMax = options.acceptedMax ?? 256;
     const memoryBudgetBytes = options.memoryBudgetBytes ?? 512 * 1024 * 1024;
+    const diagnostics = options.diagnostics ?? { enabled: false, intervalMs: 1_000 };
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
       throw new RangeError("workerIndex must be a positive integer");
     }
@@ -425,6 +428,7 @@ export class V2BootstrapController {
     if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes < 64 * 1024 * 1024) {
       throw new RangeError("memoryBudgetBytes must be at least 64 MiB");
     }
+    if (typeof diagnostics.enabled !== "boolean" || !Number.isSafeInteger(diagnostics.intervalMs) || diagnostics.intervalMs < 100 || diagnostics.intervalMs > 60_000) throw new RangeError("diagnostics interval must be 100 through 60000");
     if (options.ySweet.docId !== options.projectId) {
       throw new TypeError("Y-Sweet credential belongs to another project");
     }
@@ -449,6 +453,7 @@ export class V2BootstrapController {
     this.#physicalMax = physicalMax;
     this.#acceptedMax = acceptedMax;
     this.#memoryBudgetBytes = memoryBudgetBytes;
+    this.#diagnostics = { ...diagnostics };
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#random = options.random ?? SYSTEM_RANDOM;
   }
@@ -668,6 +673,7 @@ export class V2BootstrapController {
         physicalMax: this.#physicalMax,
         acceptedMax: this.#acceptedMax,
         memoryBudgetBytes: this.#memoryBudgetBytes,
+        diagnostics: this.#diagnostics,
       }));
       await this.#ydoc.writePath(LAUNCHER_PATH, temporaryLauncher());
       await this.#gateway.syncWorkspace(signal);
