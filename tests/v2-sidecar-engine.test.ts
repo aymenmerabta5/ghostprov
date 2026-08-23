@@ -15,6 +15,15 @@ import {
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
 describe("SidecarEngine", () => {
+  it("flushes batched response events before terminal proof", async () => {
+    const harness = new SidecarHarness({ batching: true });
+    await harness.sendRequest({ model: "gpt-5.6-sol", input: "batch" });
+    await harness.settle();
+    const batchIndex = harness.frames.findIndex(frame => frame.kind === "response_batch");
+    const terminalIndex = harness.frames.findIndex(frame => frame.kind === "response_terminal");
+    expect(batchIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeGreaterThan(batchIndex);
+  });
   it("ACKs only after durable claim and permit, then never retries after fetch start", async () => {
     let harness!: SidecarHarness;
     const behavior = async (input: DirectResponsesExecution): Promise<UpstreamTerminal> => {

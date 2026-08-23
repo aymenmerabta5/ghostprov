@@ -161,6 +161,7 @@ export interface SidecarHarnessOptions {
   records?: JournalRecord[];
   terminals?: Map<string, Uint8Array>;
   onDrainRequested?: (reason: string) => void;
+  batching?: boolean;
 }
 
 export class SidecarHarness {
@@ -197,6 +198,7 @@ export class SidecarHarness {
       admission: this.admission,
       upstream: this.upstream,
       onDrainRequested: options.onDrainRequested,
+      batching: options.batching,
       emit: frame => {
         this.frames.push(frame);
         this.timeline.push(`emit:${frame.kind}`);

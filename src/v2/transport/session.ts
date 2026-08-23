@@ -580,6 +580,18 @@ export class V2TransportSession {
         await this.#acceptResponsePart(state, frame);
         return;
       }
+      case "response_batch": {
+        const state=this.#requests.get(frame.requestId);if(!state)return;
+        if(!state.committed){this.#failPreCommit(state,new V2PreCommitError("Sidecar emitted response data before commitment","protocol"));return;}
+        for(let offset=0;offset<frame.items.length;offset++){
+          const eventIndex=frame.firstEventIndex+offset;const item=frame.items[offset]!;let bytes:Uint8Array;let data:string;
+          try{bytes=base64UrlDecode(item.dataBase64Url);data=utf8Text(bytes);}catch{this.#failCommitted(state,new V2CommittedError("Response batch encoding is invalid","response_encoding",true));return;}
+          state.responseBytes+=bytes.byteLength;if(state.responseBytes>this.#maxResponseBytes){this.#failCommitted(state,new V2CommittedError("Response exceeds the configured byte limit","response_too_large",true));return;}
+          if(eventIndex<state.nextEventIndex||state.completedEvents.has(eventIndex)){this.#failCommitted(state,new V2CommittedError("Response batch event indexes conflict","response_conflict",true));return;}
+          state.completedEvents.set(eventIndex,{event:item.event,data});
+        }
+        await this.#drainCompletedEvents(state);return;
+      }
       case "response_terminal": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;

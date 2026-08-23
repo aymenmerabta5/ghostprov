@@ -13,6 +13,7 @@ import {
 import { TranscriptProof } from "../protocol/transcript";
 import type { FramePriority } from "../protocol/scheduler";
 import type { SidecarDiagnosticsObserver } from "../diagnostics/sidecar-observer";
+import { ResponseBatcher } from "./response-batcher";
 import { RequestAssembler } from "./assembler";
 import { ClaimJournal } from "./journal";
 import {
@@ -73,6 +74,7 @@ export class SidecarEngine {
   ) => void;
   readonly #onDrainRequested?: (reason: string) => void;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
+  readonly #batcher: ResponseBatcher | null;
   readonly #active = new Map<string, ActiveRequest>();
   readonly #ambiguous = new Set<string>();
   readonly #terminalDigests = new Map<string, string>();
@@ -92,6 +94,7 @@ export class SidecarEngine {
     upstream: SidecarUpstream;
     onDrainRequested?: (reason: string) => void;
     diagnostics?: SidecarDiagnosticsObserver;
+    batching?: boolean;
     emit(
       frame: SidecarFrame,
       priority: FramePriority,
@@ -106,6 +109,7 @@ export class SidecarEngine {
     this.#onDrainRequested = options.onDrainRequested;
     this.#diagnostics = options.diagnostics;
     this.#emitFrame = options.emit;
+    this.#batcher = options.batching ? new ResponseBatcher({ emit: frame => this.#emitFrame(frame, "data", frame.requestId) }) : null;
   }
 
   async start(): Promise<void> {
@@ -151,6 +155,7 @@ export class SidecarEngine {
         }
         return;
       case "request_cancel": {
+        this.#batcher?.flush(frame.requestId);
         this.#assembler.cancel(frame.requestId);
         this.#active.get(frame.requestId)?.controller.abort();
         return;
@@ -183,6 +188,7 @@ export class SidecarEngine {
   }
 
   async drain(_reason: string): Promise<void> {
+    this.#batcher?.flushAll();
     if (!this.#draining) {
       this.#draining = true;
       this.#admission.close();
@@ -343,6 +349,7 @@ export class SidecarEngine {
       );
       this.#terminalDigests.set(request.requestId, terminal.transcriptSha256);
       const diagnostics = this.#diagnostics?.requestTerminal(request.requestId);
+      this.#batcher?.flush(request.requestId);
       this.#emit({
         kind: "response_terminal",
         requestId: request.requestId,
@@ -375,6 +382,7 @@ export class SidecarEngine {
   }
 
   #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics): void {
+    if (!diagnostics && this.#batcher?.push(requestId, eventIndex, event)) return;
     const bytes = utf8Bytes(event.data);
     const partCount = Math.max(1, Math.ceil(bytes.byteLength / RESPONSE_PART_BYTES));
     for (let partIndex = 0, offset = 0; partIndex < partCount; partIndex++) {
@@ -417,6 +425,7 @@ export class SidecarEngine {
         terminal.transcriptSha256 !== recovered.terminalDigest
       ) throw new Error("terminal spool identity mismatch");
       this.#terminalDigests.set(requestId, terminal.transcriptSha256);
+      this.#batcher?.flush(requestId);
       this.#emit({ ...terminal, requestId, requestDigest: recovered.requestDigest }, "terminal", requestId);
     } catch {
       this.#ambiguous.add(requestId);
@@ -453,6 +462,7 @@ export class SidecarEngine {
     message: string,
     ambiguous: boolean,
   ): void {
+    this.#batcher?.flush(requestId);
     this.#emit({
       kind: "response_error",
       requestId,
