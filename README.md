@@ -248,6 +248,7 @@ bun audit --production
 The isolated suite includes:
 
 - `tests/account-session.test.ts`
+- `tests/anthropic-foundations.test.ts`
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`
 - `tests/daemon-controller.test.ts`
