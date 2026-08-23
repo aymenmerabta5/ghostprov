@@ -214,3 +214,48 @@ exit 0
 ### Final Concerns
 
 None.
+---
+
+## Final Protocol Closure — 2026-08-24
+
+### Status
+
+All requirements in `.superpowers/sdd/task-4-findings-3.md` are implemented within pure stream/final protocol helpers. No routes, pull loops, processes, listeners, or ports changed.
+
+### Protocol Fixes
+
+1. `response.output_item.done` message text now charges only unseen suffix bytes to text and total output budgets before reconciliation/emission.
+2. Authoritative final validation now requires every observed visible content part and reasoning-summary part to remain present with the same item/index/type; additional final-only parts remain valid.
+3. Known lifecycle events validate documented response/error envelopes. Output-item added/done status and known message/reasoning/function/content fields remain mandatory even during prewarm suppression.
+4. Streamed reasoning summaries use bounded stateful Unicode-scalar accumulators. Split surrogate pairs combine across adjacent frames, invalid/lone surrogates fail before `thinking_delta`, and retained scalar state is cleared terminally.
+5. Removed only `.tmp/task4-findings3-openai-streaming.html`, the documentation file downloaded for this review.
+
+### Strict TDD Evidence
+
+```text
+Message output-item done suffix accounting: 0 pass, 1 fail
+Disappearing observed content/summary parts: 0 pass, 1 fail
+Known lifecycle envelopes + prewarm required fields: 0 pass, 3 fail
+Reasoning-summary split/invalid Unicode: 0 pass, 2 fail
+```
+
+Each regression was rerun GREEN immediately after its focused implementation.
+
+### Final Verification
+
+```text
+All Anthropic focused tests:
+207 pass, 0 fail
+
+bun run typecheck
+exit 0
+
+git diff --check
+exit 0
+```
+
+Per controller instruction, no broad suite was run during this closure; the controller will run the default full suite after reviewer shutdown.
+
+### Final Concerns
+
+None.

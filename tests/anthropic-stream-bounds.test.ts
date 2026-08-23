@@ -262,6 +262,34 @@ describe("Anthropic stream cumulative production bounds", () => {
       functionBytes: 2,
       streamedBytes: 2,
     });
+
+    const messageDone = new AnthropicStreamTranslator(CONTEXT);
+    messageDone.start();
+    messageDone.push(frame(0, "response.output_text.delta", {
+      item_id: "msg_item_done_bytes",
+      output_index: 0,
+      content_index: 0,
+      delta: "ab",
+    }));
+    messageDone.push(frame(1, "response.output_item.done", {
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "msg_item_done_bytes",
+        status: "completed",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: "abcd",
+          annotations: [],
+          logprobs: [],
+        }],
+      },
+    }));
+    expect(messageDone.snapshot()).toMatchObject({
+      textBytes: 4,
+      streamedBytes: 4,
+    });
   });
 
   it("accounts final-only text, reasoning, and function data", () => {

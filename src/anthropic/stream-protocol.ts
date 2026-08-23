@@ -85,6 +85,35 @@ function validateContentPart(part: Record<string, unknown>): void {
   }
 }
 
+function responseEnvelope(event: Record<string, unknown>): Record<string, unknown> {
+  const response = record(event.response);
+  if (!response) fail();
+  requiredString(response, "id");
+  return response;
+}
+
+function validateLifecycleResponse(
+  event: Record<string, unknown>,
+  status: "in_progress" | "completed" | "incomplete",
+): void {
+  if (responseEnvelope(event).status !== status) fail();
+}
+
+function validateFailedResponse(event: Record<string, unknown>): void {
+  const response = responseEnvelope(event);
+  if (response.status !== "failed") fail();
+  const error = record(response.error);
+  if (!error) fail();
+  requiredString(error, "code");
+  requiredString(error, "message");
+}
+
+function validateErrorEvent(event: Record<string, unknown>): void {
+  requiredString(event, "code");
+  requiredString(event, "message");
+  if (event.param !== null && typeof event.param !== "string") fail();
+}
+
 export type ResponsesStreamProtocolSnapshot = {
   events: number;
   identities: number;
@@ -125,6 +154,12 @@ export class ResponsesStreamProtocol {
     const type = event.type;
     if (typeof type !== "string") fail();
     switch (type) {
+      case "response.created": validateLifecycleResponse(event, "in_progress"); break;
+      case "response.in_progress": validateLifecycleResponse(event, "in_progress"); break;
+      case "response.completed": validateLifecycleResponse(event, "completed"); break;
+      case "response.incomplete": validateLifecycleResponse(event, "incomplete"); break;
+      case "response.failed": validateFailedResponse(event); break;
+      case "error": validateErrorEvent(event); break;
       case "response.output_item.added": this.#outputItemAdded(event); break;
       case "response.output_item.done": this.#outputItemDone(event); break;
       case "response.content_part.added": this.#contentPartAdded(event); break;
@@ -173,6 +208,7 @@ export class ResponsesStreamProtocol {
 
       if (item.type === "message") {
         if (!Array.isArray(item.content)) fail();
+        if (state.content.size > item.content.length) fail();
         for (let contentIndex = 0; contentIndex < item.content.length; contentIndex += 1) {
           const part = record(item.content[contentIndex]);
           if (!part || typeof part.type !== "string" || !part.type) fail();
@@ -180,6 +216,7 @@ export class ResponsesStreamProtocol {
         }
       } else if (item.type === "reasoning") {
         if (!Array.isArray(item.summary)) fail();
+        if (state.summary.size > item.summary.length) fail();
         for (let summaryIndex = 0; summaryIndex < item.summary.length; summaryIndex += 1) {
           const part = record(item.summary[summaryIndex]);
           if (!part || part.type !== "summary_text") fail();
@@ -208,6 +245,7 @@ export class ResponsesStreamProtocol {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
     validateItem(item);
+    if (item.status !== "in_progress") fail();
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.added || state.done) fail();
     state.added = true;
@@ -217,6 +255,7 @@ export class ResponsesStreamProtocol {
     const outputIndex = requiredIndex(event, "output_index");
     const item = itemRecord(event);
     validateItem(item);
+    if (item.status !== "completed" && item.status !== "incomplete") fail();
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.done) fail();
     state.done = true;

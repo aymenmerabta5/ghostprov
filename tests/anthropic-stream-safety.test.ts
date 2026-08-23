@@ -132,6 +132,67 @@ describe("Anthropic stream reasoning privacy", () => {
       text: { private: true },
     }))).toMatchObject([{ type: "error", error: { type: "api_error" } }]);
   });
+
+  it("combines a reasoning-summary astral scalar split across delta frames", () => {
+    const final = finalResponse([reasoning("rs_split_summary", "🚀")]);
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    const events: AnthropicSseEvent[] = [...translator.start()];
+    events.push(...translator.push(frame(0, "response.reasoning_summary_text.delta", {
+      item_id: "rs_split_summary",
+      output_index: 0,
+      summary_index: 0,
+      delta: "\ud83d",
+    })));
+    expect(thinkingDeltas(events)).toEqual([]);
+    expect(translator.snapshot().retainedReasoningCodePoints).toBe(1);
+    events.push(...translator.push(frame(1, "response.reasoning_summary_text.delta", {
+      item_id: "rs_split_summary",
+      output_index: 0,
+      summary_index: 0,
+      delta: "\ude80",
+    })));
+    events.push(...translator.push(frame(2, "response.output_item.done", {
+      output_index: 0,
+      item: final.output[0],
+    })));
+    events.push(...translator.push(frame(3, "response.completed", { response: final })));
+
+    expect(thinkingDeltas(events)).toEqual(["🚀"]);
+    expect(thinkingDeltas(events).some(hasLoneSurrogate)).toBe(false);
+    expect(translator.snapshot().retainedReasoningCodePoints).toBe(0);
+  });
+
+  it("rejects invalid reasoning-summary surrogates before thinking emission", () => {
+    const low = new AnthropicStreamTranslator(CONTEXT);
+    low.start();
+    const lowEvents = low.push(frame(0, "response.reasoning_summary_text.delta", {
+      item_id: "rs_low",
+      output_index: 0,
+      summary_index: 0,
+      delta: "\udc00",
+    }));
+    expect(lowEvents).toMatchObject([{ type: "error" }]);
+    expect(thinkingDeltas(lowEvents)).toEqual([]);
+
+    const high = new AnthropicStreamTranslator(CONTEXT);
+    high.start();
+    const first = high.push(frame(5, "response.reasoning_summary_text.delta", {
+      item_id: "rs_high",
+      output_index: 0,
+      summary_index: 0,
+      delta: "\ud800",
+    }));
+    expect(thinkingDeltas(first)).toEqual([]);
+    const done = high.push(frame(6, "response.reasoning_summary_text.done", {
+      item_id: "rs_high",
+      output_index: 0,
+      summary_index: 0,
+      text: "\ud800",
+    }));
+    expect(done).toMatchObject([{ type: "error" }]);
+    expect(thinkingDeltas(done)).toEqual([]);
+    expect(high.snapshot().retainedReasoningCodePoints).toBe(0);
+  });
 });
 
 describe("Anthropic stream Unicode-safe stop filtering", () => {

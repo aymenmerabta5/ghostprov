@@ -2,8 +2,10 @@ import { describe, expect, it } from "bun:test";
 import type { SseFrame } from "../src/relay/sse";
 import {
   AnthropicStreamTranslator,
+  DEFAULT_ANTHROPIC_STREAM_LIMITS,
   type AnthropicSseEvent,
 } from "../src/anthropic/stream";
+import { ResponsesStreamProtocol } from "../src/anthropic/stream-protocol";
 import {
   CONTEXT,
   DEFAULT_RESPONSES_USAGE,
@@ -128,6 +130,56 @@ describe("Anthropic stream sequence integrity", () => {
   });
 });
 
+describe("Anthropic stream known event envelopes", () => {
+  it("validates response.created and response.in_progress envelopes", () => {
+    for (const type of ["response.created", "response.in_progress"] as const) {
+      const malformed = new AnthropicStreamTranslator(CONTEXT);
+      malformed.start();
+      expectError(malformed.push(frame(0, type)));
+
+      const valid = new AnthropicStreamTranslator(CONTEXT);
+      valid.start();
+      expect(valid.push(frame(0, type, {
+        response: { id: "resp_lifecycle", status: "in_progress" },
+      }))).toEqual([]);
+    }
+  });
+
+  it("validates documented failed-response and error-event envelopes", () => {
+    const limits = {
+      maxEvents: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxEvents,
+      maxIdentities: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxIdentities,
+    };
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "response.failed",
+      sequence_number: 0,
+      response: { error: { message: "missing lifecycle" } },
+    })).toThrow();
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "response.failed",
+      sequence_number: 0,
+      response: {
+        id: "resp_failed",
+        status: "failed",
+        error: { code: "server_error", message: "failed" },
+      },
+    })).not.toThrow();
+
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "error",
+      sequence_number: 0,
+      error: { message: "wrong envelope" },
+    })).toThrow();
+    expect(() => new ResponsesStreamProtocol(limits).accept({
+      type: "error",
+      sequence_number: 0,
+      code: "server_error",
+      message: "failed",
+      param: null,
+    })).not.toThrow();
+  });
+});
+
 describe("Anthropic stream identity and lifecycle integrity", () => {
   it("rejects reverse output creation and item ID/index/type collisions", () => {
     const reversed = new AnthropicStreamTranslator(CONTEXT);
@@ -249,6 +301,40 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       delta: "",
     }));
     expectError(translator.finish(finalResponse([])));
+  });
+
+  it("rejects observed content or summary parts that disappear from final", () => {
+    const content = new AnthropicStreamTranslator(CONTEXT);
+    content.start();
+    content.push(frame(0, "response.output_text.delta", {
+      item_id: "msg_parts_disappear",
+      output_index: 0,
+      content_index: 0,
+      delta: "a",
+    }));
+    content.push(frame(1, "response.output_text.delta", {
+      item_id: "msg_parts_disappear",
+      output_index: 0,
+      content_index: 1,
+      delta: "",
+    }));
+    expectError(content.finish(finalResponse([message("msg_parts_disappear", ["a"])])));
+
+    const summary = new AnthropicStreamTranslator(CONTEXT);
+    summary.start();
+    summary.push(frame(4, "response.reasoning_summary_text.delta", {
+      item_id: "rs_parts_disappear",
+      output_index: 0,
+      summary_index: 0,
+      delta: "a",
+    }));
+    summary.push(frame(5, "response.reasoning_summary_text.delta", {
+      item_id: "rs_parts_disappear",
+      output_index: 0,
+      summary_index: 1,
+      delta: "",
+    }));
+    expectError(summary.finish(finalResponse([reasoning("rs_parts_disappear", "a")])));
   });
 
   it("rejects reverse/gapped content and summary index creation", () => {
@@ -439,6 +525,19 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       item_id: "fc_bad_done",
       output_index: 0,
       arguments: "{}",
+    })));
+
+    const missingStatus = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
+    missingStatus.start();
+    expectError(missingStatus.push(frame(9, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_missing_status",
+        call_id: "call_missing_status",
+        name: "Read",
+        arguments: "",
+      },
     })));
   });
 });

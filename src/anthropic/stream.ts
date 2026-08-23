@@ -91,6 +91,7 @@ export class AnthropicStreamTranslator {
   readonly #stopSequences: string[];
   readonly #protocol: ResponsesStreamProtocol;
   readonly #textFilter: UnicodeStopFilter<StreamBlock>;
+  readonly #reasoningFilters = new Map<StreamBlock, UnicodeStopFilter<StreamBlock>>();
   readonly #budget: AnthropicStreamBudget;
   readonly #blocksByIdentity = new Map<string, StreamBlock>();
   readonly #blocksByPosition = new Map<string, StreamBlock>();
@@ -196,6 +197,8 @@ export class AnthropicStreamTranslator {
       retainedBlocks: this.#blocks.length,
       retainedIdentities: protocol.retainedIdentities,
       retainedTextCodePoints: this.#textFilter.retainedCodePoints(),
+      retainedReasoningCodePoints: Array.from(this.#reasoningFilters.values())
+        .reduce((total, filter) => total + filter.retainedCodePoints(), 0),
     };
   }
 
@@ -309,7 +312,7 @@ export class AnthropicStreamTranslator {
     const block = this.#block("thinking", itemId, outputIndex, null);
     block.forceStart = true;
     block.seenUnits = this.#addUnits(block.seenUnits, delta.length);
-    if (this.#context.thinkingDisplay !== "omitted") this.#appendPending(block, delta);
+    this.#appendReasoningScalar(block, delta);
     this.#drain(events);
   }
 
@@ -392,9 +395,8 @@ export class AnthropicStreamTranslator {
     if (this.#matchedStop) return;
     const block = this.#block("thinking", itemId, outputIndex, null);
     if (text.length < block.seenUnits) malformedEvent();
-    if (this.#context.thinkingDisplay !== "omitted" && text.length > block.seenUnits) {
-      this.#appendPending(block, text.slice(block.seenUnits));
-    }
+    if (text.length > block.seenUnits) this.#appendReasoningScalar(block, text.slice(block.seenUnits));
+    this.#endReasoningScalar(block);
     block.seenUnits = text.length;
     this.#drain(events);
   }
@@ -431,10 +433,9 @@ export class AnthropicStreamTranslator {
       );
       if (summary.length > block.seenUnits) {
         this.#budget.countPayload("reasoning", summary.slice(block.seenUnits));
-        if (this.#context.thinkingDisplay !== "omitted") {
-          this.#appendPending(block, summary.slice(block.seenUnits));
-        }
+        this.#appendReasoningScalar(block, summary.slice(block.seenUnits));
       }
+      this.#endReasoningScalar(block);
       block.seenUnits = summary.length;
       const encryptedContent = item.encrypted_content;
       if (typeof encryptedContent !== "string" || encryptedContent.length === 0) return;
@@ -483,7 +484,11 @@ export class AnthropicStreamTranslator {
         if (!part || typeof part.type !== "string") malformedEvent();
         if (part.type !== "output_text") continue;
         const block = this.#block("text", id, outputIndex, contentIndex);
-        this.#reconcileStreamedText(block, stringField(part, "text"));
+        const text = stringField(part, "text");
+        if (text.length > block.seenUnits) {
+          this.#budget.countPayload("text", text.slice(block.seenUnits));
+        }
+        this.#reconcileStreamedText(block, text);
         block.done = true;
       }
       this.#drain(events);
@@ -618,6 +623,7 @@ export class AnthropicStreamTranslator {
     this.#blocksByIdentity.clear();
     this.#blocksByPosition.clear();
     this.#textFilter.clear();
+    this.#reasoningFilters.clear();
     this.#budget.clearRetained();
     this.#matchedStop = null;
     this.#drainCursor = 0;
@@ -767,6 +773,28 @@ export class AnthropicStreamTranslator {
     const result = this.#textFilter.append(block, value);
     for (const chunk of result.chunks) this.#appendPending(chunk.owner, chunk.text);
     if (result.matchedSequence !== null) this.#matchedStop = result.matchedSequence;
+  }
+
+  #appendReasoningScalar(block: StreamBlock, value: string): void {
+    let filter = this.#reasoningFilters.get(block);
+    if (!filter) {
+      filter = new UnicodeStopFilter<StreamBlock>([]);
+      this.#reasoningFilters.set(block, filter);
+    }
+    const result = filter.append(block, value);
+    if (this.#context.thinkingDisplay !== "omitted") {
+      for (const chunk of result.chunks) this.#appendPending(chunk.owner, chunk.text);
+    }
+  }
+
+  #endReasoningScalar(block: StreamBlock): void {
+    const filter = this.#reasoningFilters.get(block);
+    if (!filter) return;
+    const chunks = filter.endSegment();
+    if (this.#context.thinkingDisplay !== "omitted") {
+      for (const chunk of chunks) this.#appendPending(chunk.owner, chunk.text);
+    }
+    this.#reasoningFilters.delete(block);
   }
 
   #endOrdinarySegment(events: AnthropicSseEvent[]): void {

@@ -49,4 +49,5 @@ export type AnthropicStreamSnapshot = {
   retainedPendingChunks: number;
   retainedPendingBytes: number;
   retainedTextCodePoints: number;
+  retainedReasoningCodePoints: number;
 };
