@@ -53,9 +53,9 @@ The following outcomes do not increase or decrease the score:
 - downstream `AbortError`;
 - committed cancellation with code `cancelled`;
 - definitive committed errors with `ambiguous === false`, including HTTP validation, rate-limit, and upstream service responses;
-- normal pre-commit capacity movement with code `capacity_changed`;
+- normal pre-commit admission/capacity movement with code `capacity` or `capacity_changed`;
 - requested draining with code `draining`;
-- request-bound violations such as `request_too_large`.
+- request/response-bound violations such as `request_too_large` and `response_too_large`.
 
 These outcomes describe the caller, account-wide upstream service, expected lifecycle, or current admission state rather than a faulty sandbox.
 

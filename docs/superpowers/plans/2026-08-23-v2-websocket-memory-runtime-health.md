@@ -148,7 +148,9 @@ Create `tests/v2-runtime-health.test.ts` with a manual clock and assertions equi
 expect(classifyRuntimeError(new DOMException("aborted", "AbortError"))).toBe("neutral");
 expect(classifyRuntimeError({ committed: true, code: "cancelled", ambiguous: true })).toBe("neutral");
 expect(classifyRuntimeError({ committed: true, code: "missing_required_parameter", ambiguous: false })).toBe("neutral");
+expect(classifyRuntimeError({ committed: false, code: "capacity" })).toBe("neutral");
 expect(classifyRuntimeError({ committed: false, code: "capacity_changed" })).toBe("neutral");
+expect(classifyRuntimeError({ committed: true, code: "response_too_large", ambiguous: true })).toBe("neutral");
 expect(classifyRuntimeError({ committed: true, code: "internal", ambiguous: true })).toBe("unhealthy");
 expect(classifyRuntimeError(new Error("channel failed"))).toBe("unhealthy");
 
@@ -190,9 +192,11 @@ export type RuntimeHealthOutcome = "healthy" | "neutral" | "unhealthy";
 
 const NEUTRAL_CODES = new Set([
   "cancelled",
+  "capacity",
   "capacity_changed",
   "draining",
   "request_too_large",
+  "response_too_large",
 ]);
 
 function record(value: unknown): Record<string, unknown> {
