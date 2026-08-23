@@ -2,13 +2,29 @@ import { describe, expect, it } from "bun:test";
 import { resolveLiveV2Options } from "../scripts/live_v2_options";
 import { main as singleMain } from "../scripts/live_v2_single";
 import { main as fleetMain } from "../scripts/live_v2_fleet";
-import { main as smokeMain } from "../scripts/smoke_v2_candidate";
+import {
+  main as smokeMain,
+  resolveSmokeProtectedRoot,
+} from "../scripts/smoke_v2_candidate";
 
 describe("V2 live canary guards", () => {
   it("keeps every new canary import-safe", () => {
     expect(typeof singleMain).toBe("function");
     expect(typeof fleetMain).toBe("function");
     expect(typeof smokeMain).toBe("function");
+  });
+
+  it("allows smoke protection of an explicit loopback router only", () => {
+    expect(resolveSmokeProtectedRoot({})).toBe("http://127.0.0.1:8787");
+    expect(resolveSmokeProtectedRoot({
+      GP_SMOKE_PROTECTED_ROOT: "http://127.0.0.1:18787",
+    })).toBe("http://127.0.0.1:18787");
+    expect(() => resolveSmokeProtectedRoot({
+      GP_SMOKE_PROTECTED_ROOT: "https://example.com",
+    })).toThrow("loopback");
+    expect(() => resolveSmokeProtectedRoot({
+      GP_SMOKE_PROTECTED_ROOT: "http://127.0.0.1:18787/mutate",
+    })).toThrow("origin");
   });
 
   it("refuses live execution without every transport/load opt-in", () => {

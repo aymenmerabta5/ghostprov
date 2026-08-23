@@ -4,7 +4,27 @@ import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { createFakeV2System } from "../tests/support/fake-v2-system";
 
-const PRIMARY = "http://127.0.0.1:8787";
+export function resolveSmokeProtectedRoot(
+  env: Record<string, string | undefined>,
+): string {
+  const raw = env.GP_SMOKE_PROTECTED_ROOT?.trim() || "http://127.0.0.1:8787";
+  let value: URL;
+  try {
+    value = new URL(raw);
+  } catch {
+    throw new TypeError("GP_SMOKE_PROTECTED_ROOT must be a valid loopback origin");
+  }
+  if (
+    value.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(value.hostname) ||
+    value.username ||
+    value.password
+  ) throw new TypeError("GP_SMOKE_PROTECTED_ROOT must be an HTTP loopback origin");
+  if (value.pathname !== "/" || value.search || value.hash) {
+    throw new TypeError("GP_SMOKE_PROTECTED_ROOT must contain only an origin");
+  }
+  return value.origin;
+}
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -16,14 +36,15 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-async function primaryHealthy(): Promise<void> {
-  const response = await fetch(`${PRIMARY}/health`, { signal: AbortSignal.timeout(10_000) });
+async function primaryHealthy(root: string): Promise<void> {
+  const response = await fetch(`${root}/health`, { signal: AbortSignal.timeout(10_000) });
   const body = await response.json().catch(() => null) as any;
   if (!response.ok || body?.ok !== true) throw new Error("Protected port 8787 is not healthy");
 }
 
 export async function main(): Promise<void> {
-  await primaryHealthy();
+  const protectedRoot = resolveSmokeProtectedRoot(process.env);
+  await primaryHealthy(protectedRoot);
   const system = await createFakeV2System({ runtimes: 1, physicalPerRuntime: 8 });
   const app = createGhostProvApp({ router: system.router });
   const server = createGhostProvServer({
@@ -87,7 +108,7 @@ export async function main(): Promise<void> {
     await new Promise<void>(resolve => server.close(() => resolve()));
     await system.close();
   }
-  await primaryHealthy();
+  await primaryHealthy(protectedRoot);
 }
 
 if (import.meta.main) await main();
