@@ -1,5 +1,49 @@
-export interface CongestionSample {schedulerFrames:number;schedulerBytes:number;oldestQueuedFrameMs:number;ackProgressAgeMs:number;windowFrames:number}
-export class TransportCongestion {#congested=false;#healthy=0;
- update(v:CongestionSample):boolean{const high=v.schedulerFrames>=128||v.schedulerBytes>=256*1024||v.oldestQueuedFrameMs>=2000||(v.windowFrames>0&&v.ackProgressAgeMs>=2000);if(high){this.#congested=true;this.#healthy=0;return true;}if(this.#congested){const low=v.schedulerFrames<=32&&v.schedulerBytes<=64*1024&&v.oldestQueuedFrameMs<=500&&(v.windowFrames===0||v.ackProgressAgeMs<=500);this.#healthy=low?this.#healthy+1:0;if(this.#healthy>=2){this.#congested=false;this.#healthy=0;}}return this.#congested;}
- get congested():boolean{return this.#congested;}
+export interface CongestionSample {
+  schedulerFrames: number;
+  schedulerBytes: number;
+  oldestQueuedFrameMs: number;
+  ackProgressAgeMs: number;
+  windowFrames: number;
+}
+
+export class TransportCongestion {
+  #congested = false;
+  #healthySamples = 0;
+
+  update(value: CongestionSample): boolean {
+    const drained = value.schedulerFrames === 0 &&
+      value.schedulerBytes === 0 &&
+      value.windowFrames === 0;
+    if (drained) {
+      this.#congested = false;
+      this.#healthySamples = 0;
+      return false;
+    }
+
+    const high = value.schedulerFrames >= 128 ||
+      value.schedulerBytes >= 256 * 1024 ||
+      value.oldestQueuedFrameMs >= 2_000 ||
+      (value.windowFrames > 0 && value.ackProgressAgeMs >= 2_000);
+    if (high) {
+      this.#congested = true;
+      this.#healthySamples = 0;
+      return true;
+    }
+
+    if (!this.#congested) return false;
+    const low = value.schedulerFrames <= 32 &&
+      value.schedulerBytes <= 64 * 1024 &&
+      value.oldestQueuedFrameMs <= 500 &&
+      (value.windowFrames === 0 || value.ackProgressAgeMs <= 500);
+    this.#healthySamples = low ? this.#healthySamples + 1 : 0;
+    if (this.#healthySamples >= 2) {
+      this.#congested = false;
+      this.#healthySamples = 0;
+    }
+    return this.#congested;
+  }
+
+  get congested(): boolean {
+    return this.#congested;
+  }
 }

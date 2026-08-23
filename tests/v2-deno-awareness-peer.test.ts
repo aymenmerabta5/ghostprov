@@ -414,6 +414,80 @@ describe("DenoAwarenessPeer", () => {
     await peer.close();
   });
 
+  it("restores credits on the ACK that fully drains a stalled flight", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const engine = {
+      snapshot: () => ({ credits: 128, active: 0, queued: 0, draining: false }),
+      setHostCeiling: () => undefined,
+      accept: async () => undefined,
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      peer.enqueue(responseEvent(0, "req-recover"), "data", "req-recover");
+      await Bun.sleep(10);
+
+      const first = providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data;
+      expect(first.frames).toHaveLength(1);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(8);
+
+      await Bun.sleep(2_100);
+      remote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(-1, 1),
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host-stalled",
+      );
+      await Bun.sleep(10);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(0);
+
+      remote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(first.frames[0].sequence, 2),
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host-drained",
+      );
+      await Bun.sleep(10);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(8);
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
   it("backs off repeated full-window publication until ACK progress resumes", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {
