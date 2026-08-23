@@ -135,4 +135,36 @@ describe("ResponseGraph", () => {
       PreviousResponseNotFoundError,
     );
   });
+
+  it("retains only byte-accounted deltas across a deep continuation chain", () => {
+    const MiB = 1024 * 1024;
+    Bun.gc(true);
+    const before = process.memoryUsage().heapUsed;
+    const shared = new SharedByteBudget(256 * MiB);
+    const graph = new ResponseGraph({
+      maxNodes: 256,
+      maxBytes: 256 * MiB,
+      sharedBudget: shared,
+    });
+    let previousResponseId: string | undefined;
+
+    for (let index = 0; index < 80; index++) {
+      const resolved = graph.resolve(request([
+        user(`${index}:` + "x".repeat(32 * 1024)),
+      ], previousResponseId ? { previous_response_id: previousResponseId } : {}));
+      previousResponseId = `resp_${index}`;
+      graph.record(resolved, {
+        id: previousResponseId,
+        model: "gpt-5.6-sol",
+        output: [],
+      });
+    }
+
+    Bun.gc(true);
+    const retainedHeap = Math.max(0, process.memoryUsage().heapUsed - before);
+    expect(graph.stats().bytes).toBeLessThan(3 * MiB);
+    expect(retainedHeap).toBeLessThan(25 * MiB);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
 });

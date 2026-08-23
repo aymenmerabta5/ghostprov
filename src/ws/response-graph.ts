@@ -29,7 +29,6 @@ interface ResponseNode {
   model?: string;
   bytes: number;
   lastAccess: number;
-  flattened?: unknown[];
 }
 
 export class PreviousResponseNotFoundError extends Error {
@@ -141,7 +140,9 @@ export class ResponseGraph {
       const parent = this.nodes.get(parentId);
       if (!parent) throw new PreviousResponseNotFoundError(parentId);
       parent.lastAccess = ++this.clock;
-      relayBody.input = [...this.materialize(parent), ...clone(inputDelta)];
+      const history = this.materialize(parent);
+      history.push(...clone(inputDelta));
+      relayBody.input = history;
       delete relayBody.previous_response_id;
       if (relayBody.model == null && parent.model) relayBody.model = parent.model;
     } else {
@@ -234,10 +235,25 @@ export class ResponseGraph {
   }
 
   private materialize(node: ResponseNode): unknown[] {
-    if (node.flattened) return clone(node.flattened);
-    const prefix = node.parentId ? this.materialize(this.nodes.get(node.parentId)!) : [];
-    node.flattened = [...prefix, ...clone(node.input), ...clone(node.output)];
-    return clone(node.flattened);
+    const lineage: ResponseNode[] = [];
+    let current: ResponseNode | undefined = node;
+    while (current) {
+      lineage.push(current);
+      if (lineage.length > this.maxNodes) {
+        throw new Error("Response graph lineage exceeds its node limit");
+      }
+      if (!current.parentId) break;
+      const parent = this.nodes.get(current.parentId);
+      if (!parent) throw new PreviousResponseNotFoundError(current.parentId);
+      current = parent;
+    }
+
+    const history: unknown[] = [];
+    for (let index = lineage.length - 1; index >= 0; index--) {
+      const entry = lineage[index]!;
+      history.push(...clone(entry.input), ...clone(entry.output));
+    }
+    return history;
   }
 
   private makeRoom(incomingBytes: number, protectedIds: Set<string>): boolean {
