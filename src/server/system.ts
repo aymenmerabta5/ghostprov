@@ -187,6 +187,7 @@ function defaultRuntimeFactory(options: {
         acceptedMax: config.v2SandboxCapacity * 2,
         memoryBudgetBytes: config.v2SidecarMemoryBudgetBytes,
         diagnostics: { enabled: config.v2DiagnosticsEnabled, intervalMs: config.v2DiagnosticsIntervalMs },
+        batching: config.v2BatchingEnabled,
       }),
       createTransport: transport => new V2TransportSession({
         binding: transport.binding,

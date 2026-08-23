@@ -115,6 +115,7 @@ export interface V2BootstrapControllerOptions {
   acceptedMax?: number;
   memoryBudgetBytes?: number;
   diagnostics?: { enabled: boolean; intervalMs: number };
+  batching?: boolean;
   clock?: Clock;
   random?: RandomSource;
 }
@@ -383,6 +384,7 @@ export class V2BootstrapController {
   readonly #acceptedMax: number;
   readonly #memoryBudgetBytes: number;
   readonly #diagnostics: { enabled: boolean; intervalMs: number };
+  readonly #batching: boolean;
   readonly #clock: Clock;
   readonly #random: RandomSource;
   #ready: V2ReadyDescriptor | null = null;
@@ -401,6 +403,7 @@ export class V2BootstrapController {
     const acceptedMax = options.acceptedMax ?? 256;
     const memoryBudgetBytes = options.memoryBudgetBytes ?? 512 * 1024 * 1024;
     const diagnostics = options.diagnostics ?? { enabled: false, intervalMs: 1_000 };
+    const batching = options.batching ?? false;
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
       throw new RangeError("workerIndex must be a positive integer");
     }
@@ -454,6 +457,7 @@ export class V2BootstrapController {
     this.#acceptedMax = acceptedMax;
     this.#memoryBudgetBytes = memoryBudgetBytes;
     this.#diagnostics = { ...diagnostics };
+    this.#batching = batching;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#random = options.random ?? SYSTEM_RANDOM;
   }
@@ -674,6 +678,7 @@ export class V2BootstrapController {
         acceptedMax: this.#acceptedMax,
         memoryBudgetBytes: this.#memoryBudgetBytes,
         diagnostics: this.#diagnostics,
+        batching: this.#batching,
       }));
       await this.#ydoc.writePath(LAUNCHER_PATH, temporaryLauncher());
       await this.#gateway.syncWorkspace(signal);

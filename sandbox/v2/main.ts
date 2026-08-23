@@ -10,6 +10,7 @@ import { DenoAwarenessPeer } from "./awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
 import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
+import { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 
 interface StaticSidecarConfig {
   version: 1;
@@ -18,6 +19,7 @@ interface StaticSidecarConfig {
   acceptedMax: number;
   memoryBudgetBytes: number;
   diagnostics: { enabled: boolean; intervalMs: number };
+  batching: boolean;
 }
 
 function readConfig(value: unknown): StaticSidecarConfig {
@@ -39,7 +41,8 @@ function readConfig(value: unknown): StaticSidecarConfig {
     !raw.diagnostics || typeof raw.diagnostics !== "object" ||
     typeof (raw.diagnostics as any).enabled !== "boolean" ||
     !Number.isInteger((raw.diagnostics as any).intervalMs) ||
-    (raw.diagnostics as any).intervalMs < 100 || (raw.diagnostics as any).intervalMs > 60_000
+    (raw.diagnostics as any).intervalMs < 100 || (raw.diagnostics as any).intervalMs > 60_000 ||
+    typeof raw.batching !== "boolean"
   ) throw new Error("Static sidecar config fields are invalid");
   return {
     version: 1,
@@ -48,6 +51,7 @@ function readConfig(value: unknown): StaticSidecarConfig {
     acceptedMax: raw.acceptedMax as number,
     memoryBudgetBytes: raw.memoryBudgetBytes as number,
     diagnostics: raw.diagnostics as StaticSidecarConfig["diagnostics"],
+    batching: raw.batching as boolean,
   };
 }
 
@@ -68,6 +72,7 @@ async function run(): Promise<void> {
   const diagnostics = new SidecarResourceSampler(config.diagnostics);
   diagnostics.start();
   const diagnosticObserver = new SidecarDiagnosticsObserver({ enabled: config.diagnostics.enabled, sampler: diagnostics });
+  const outputBackpressure = new OutputBackpressure({ highFrames:256,highBytes:256*1024,lowFrames:64,lowBytes:64*1024,hardFrames:1024,hardBytes:1024*1024 });
   const journal = new ClaimJournal({
     storage,
     flushIntervalMs: 2,
@@ -103,6 +108,8 @@ async function run(): Promise<void> {
       resolveAwarenessDrain(`awareness:${reason}`);
     },
     diagnostics: diagnosticObserver,
+    outputBackpressure,
+    batching: config.batching,
     emit: (frame, priority, streamId) => {
       peer?.enqueue(frame, priority, streamId);
     },
@@ -113,6 +120,7 @@ async function run(): Promise<void> {
     instanceId: bootstrap.instanceId,
     engine,
     diagnostics: diagnosticObserver,
+    outputBackpressure,
   });
 
   await engine.start();
@@ -132,6 +140,7 @@ async function run(): Promise<void> {
     await peer.close();
   } finally {
     await diagnostics.close();
+    outputBackpressure.close();
     Deno.removeSignalListener("SIGTERM", onTerm);
     Deno.removeSignalListener("SIGINT", onInt);
   }

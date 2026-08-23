@@ -47,6 +47,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2SidecarMemoryBudgetBytes).toBe(512 * 1024 * 1024);
     expect(config.v2DiagnosticsEnabled).toBe(false);
     expect(config.v2DiagnosticsIntervalMs).toBe(1_000);
+    expect(config.v2BatchingEnabled).toBe(false);
     expect(config.desiredSandboxes).toBe(4);
     expect(config.heartbeatMs).toBe(10_000);
   });
@@ -58,9 +59,11 @@ describe("multi-sandbox configuration", () => {
       GP_CANDIDATE: "1",
       GP_V2_DIAGNOSTICS: "1",
       GP_V2_DIAGNOSTICS_INTERVAL_MS: "500",
+      GP_V2_BATCHING: "1",
     }, MACHINE);
     expect(config.v2DiagnosticsEnabled).toBe(true);
     expect(config.v2DiagnosticsIntervalMs).toBe(500);
+    expect(config.v2BatchingEnabled).toBe(true);
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,

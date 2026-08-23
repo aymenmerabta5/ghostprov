@@ -24,6 +24,7 @@ import { computeV2RetransmitDelayMs } from "../../src/v2/protocol/retransmit.ts"
 import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
 import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
+import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -37,6 +38,7 @@ export interface DenoAwarenessPeerOptions {
     credential: () => BootstrapCredentialPayload,
   ) => DenoAwarenessProviderLike;
   diagnostics?: SidecarDiagnosticsObserver;
+  outputBackpressure?: OutputBackpressure;
 }
 
 export interface DenoAwarenessProviderLike {
@@ -91,6 +93,7 @@ export class DenoAwarenessPeer {
   readonly #retransmitMs: number;
   readonly #connectTimeoutMs: number;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
+  readonly #outputBackpressure?: OutputBackpressure;
   #revision = 0;
   #hostPeerId: string | null = null;
   #hostClientId: number | null = null;
@@ -115,6 +118,7 @@ export class DenoAwarenessPeer {
     this.#retransmitMs = options.retransmitMs ?? 250;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.#diagnostics = options.diagnostics;
+    this.#outputBackpressure = options.outputBackpressure;
     if (!Number.isFinite(this.#connectTimeoutMs) || this.#connectTimeoutMs < 1) {
       throw new RangeError("connectTimeoutMs must be positive");
     }
@@ -160,6 +164,7 @@ export class DenoAwarenessPeer {
     if (this.#closed) return;
     this.#scheduler.enqueue(priority, streamId, frame, weight);
     if (this.#pump()) this.#schedulePublish();
+    this.#updateBackpressure();
   }
 
   async close(): Promise<void> {
@@ -221,6 +226,7 @@ export class DenoAwarenessPeer {
             .catch(() => undefined);
         }
         const pumped = this.#pump();
+        this.#updateBackpressure();
         if (ceilingChanged || acknowledgementAdvanced || frames.length > 0 || pumped) {
           this.#schedulePublish();
         }
@@ -247,6 +253,8 @@ export class DenoAwarenessPeer {
     if (changed && wasEmpty) this.#retransmissionAttempt = 0;
     return changed;
   }
+
+  #updateBackpressure():void{const value=this.#scheduler.snapshot();this.#outputBackpressure?.update({frames:value.queuedFrames,bytes:value.queuedEncodedBytes});}
 
   #schedulePublish(): void {
     if (this.#closed || this.#publishScheduled) return;

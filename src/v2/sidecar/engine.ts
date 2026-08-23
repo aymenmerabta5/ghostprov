@@ -14,6 +14,7 @@ import { TranscriptProof } from "../protocol/transcript";
 import type { FramePriority } from "../protocol/scheduler";
 import type { SidecarDiagnosticsObserver } from "../diagnostics/sidecar-observer";
 import { ResponseBatcher } from "./response-batcher";
+import type { OutputBackpressure } from "./output-sink";
 import { RequestAssembler } from "./assembler";
 import { ClaimJournal } from "./journal";
 import {
@@ -75,6 +76,7 @@ export class SidecarEngine {
   readonly #onDrainRequested?: (reason: string) => void;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #batcher: ResponseBatcher | null;
+  readonly #outputBackpressure?: OutputBackpressure;
   readonly #active = new Map<string, ActiveRequest>();
   readonly #ambiguous = new Set<string>();
   readonly #terminalDigests = new Map<string, string>();
@@ -95,6 +97,7 @@ export class SidecarEngine {
     onDrainRequested?: (reason: string) => void;
     diagnostics?: SidecarDiagnosticsObserver;
     batching?: boolean;
+    outputBackpressure?: OutputBackpressure;
     emit(
       frame: SidecarFrame,
       priority: FramePriority,
@@ -110,6 +113,7 @@ export class SidecarEngine {
     this.#diagnostics = options.diagnostics;
     this.#emitFrame = options.emit;
     this.#batcher = options.batching ? new ResponseBatcher({ emit: frame => this.#emitFrame(frame, "data", frame.requestId) }) : null;
+    this.#outputBackpressure = options.outputBackpressure;
   }
 
   async start(): Promise<void> {
@@ -337,6 +341,7 @@ export class SidecarEngine {
         signal: request.controller.signal,
         beforeFetch: async () => { await this.#journal.markFetchStarting(request.requestId); this.#diagnostics?.fetchStarted(request.requestId); },
         onEvent: async event => {
+          await this.#outputBackpressure?.wait(request.controller.signal);
           const eventIndex = request.eventIndex++;
           this.#emitEvent(request.requestId, eventIndex, event, this.#diagnostics?.upstreamEvent(request.requestId, eventIndex));
         },

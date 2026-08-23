@@ -32,6 +32,7 @@ export interface MultiSandboxConfig {
   v2SidecarMemoryBudgetBytes: number;
   v2DiagnosticsEnabled: boolean;
   v2DiagnosticsIntervalMs: number;
+  v2BatchingEnabled: boolean;
   desiredSandboxes: number;
   provisionConcurrency: number;
   fleetManifestFile: string;
@@ -215,6 +216,7 @@ export function resolveMultiSandboxConfig(
     throw new RangeError("GP_V2_SIDECAR_MEMORY_BUDGET_BYTES must be at least 64 MiB");
   }
   const v2DiagnosticsEnabled = binaryFlag(env.GP_V2_DIAGNOSTICS, "GP_V2_DIAGNOSTICS");
+  const v2BatchingEnabled = binaryFlag(env.GP_V2_BATCHING, "GP_V2_BATCHING");
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
@@ -257,6 +259,7 @@ export function resolveMultiSandboxConfig(
     v2SidecarMemoryBudgetBytes,
     v2DiagnosticsEnabled,
     v2DiagnosticsIntervalMs,
+    v2BatchingEnabled,
     desiredSandboxes,
     provisionConcurrency,
     fleetManifestFile: path.resolve(
