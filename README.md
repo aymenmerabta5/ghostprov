@@ -318,6 +318,7 @@ The isolated suite includes:
 - `tests/v2-journal.test.ts`
 - `tests/v2-large-payload.test.ts`
 - `tests/v2-live-guards.test.ts`
+- `tests/v2-long-run-stability.test.ts`
 - `tests/v2-monitor.test.ts`
 - `tests/v2-output-sink.test.ts`
 - `tests/v2-protocol.test.ts`
