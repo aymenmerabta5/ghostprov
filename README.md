@@ -134,6 +134,8 @@ Claude model names are selected by tier, case-insensitively:
 
 Override those defaults with `GP_ANTHROPIC_OPUS_MODEL`, `GP_ANTHROPIC_SONNET_MODEL`, `GP_ANTHROPIC_HAIKU_MODEL`, and `GP_ANTHROPIC_DEFAULT_MODEL`. Responses continue to echo the Claude model name requested by the client.
 
+Current mid-conversation `system` messages are enabled for the exact normalized model IDs `claude-fable-5`, `claude-mythos-5`, `claude-opus-4-8`, and `claude-opus-5`. A system section must immediately follow a user turn and be final or immediately followed by an assistant turn. Consecutive `system` messages are coalesced into one section before placement validation. Other `claude-*` models reject message-level `system`; top-level `system` remains the ordinary instructions field. For Claude Code compatibility with GhostProv model names, message-level `system` is accepted for custom model IDs, while `developer` is accepted only for custom non-`claude-*` model IDs.
+
 Messages supports streaming and non-streaming text, client tool use/results (including parallel calls), stateless encrypted-reasoning continuity, current image/document inputs, structured output, prompt-cache annotations, local token estimates, cancellation, and Anthropic error envelopes. Token counts are conservative local estimates rather than provider billing counts. Anthropic server-hosted tools and exact manual thinking-budget enforcement are non-goals; unsupported content/tool variants return a bounded `invalid_request_error`. Legacy Completions, Message Batches, and Anthropic Files/Admin APIs are not implemented. `GET /v1/models` remains the OpenAI-compatible GhostProv route, not an Anthropic Models response.
 
 ### Separate-port forwarding verifier
@@ -155,6 +157,8 @@ claude
 ```
 
 The verifier refuses listener ports `18787` and `8787`, non-loopback upstreams, credentials, paths, queries, fragments, and self-forwarding. It never enumerates, starts, stops, restarts, or signals the upstream process. Ctrl+C closes only the verifier listener and its outbound requests. Live Claude Code calls through this verifier belong to the separate live-verification task; automated tests import it without opening a listener or contacting the upstream.
+
+Reliability defaults allow eight concurrent forwards and reserve four times the 2 MiB per SSE event parser cap, enforcing a 64 MiB aggregate parser-memory ceiling. Admission permits at most 32 forward waiters and 32 incoming-body waiters, with a 128 MiB aggregate incoming-body byte budget; excess waiters receive a typed sanitized overload. Every admitted request has a 300-second forward deadline covering response headers through stream completion, and each streamed run has a 1 MiB per-run output queue with upstream backpressure.
 
 ## Codex WebSocket mode
 
@@ -316,6 +320,7 @@ The isolated suite includes:
 - `tests/anthropic-response-usage.test.ts`
 - `tests/anthropic-response-validation.test.ts`
 - `tests/anthropic-response.test.ts`
+- `tests/anthropic-stop-filter.test.ts`
 - `tests/anthropic-stream-bounds.test.ts`
 - `tests/anthropic-stream-protocol.test.ts`
 - `tests/anthropic-stream-safety.test.ts`

@@ -11,6 +11,7 @@ import {
   ForwardingProtocolError,
   positiveSafeInteger,
   verifierClosingError,
+  verifierForwardTimeoutError,
 } from "./claude-code-verifier/shared";
 import { BoundedSseParser } from "./claude-code-verifier/sse-parser";
 import {
@@ -25,11 +26,16 @@ const DEFAULT_PORT = 18_788;
 const DEFAULT_UPSTREAM = "http://127.0.0.1:18787";
 const PROTECTED_LISTENER_PORTS = new Set([18_787, 8_787]);
 const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024;
-const DEFAULT_MAX_EVENT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_EVENT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_READ_CHUNK_BYTES = 1024 * 1024;
 const DEFAULT_INCOMING_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARSER_SEGMENTS = 1024;
-const VERIFIER_CAPACITY = 128;
+const DEFAULT_MAX_CONCURRENT_FORWARDS = 8;
+const DEFAULT_MAX_FORWARD_WAITERS = 32;
+const DEFAULT_MAX_INCOMING_BODY_WAITERS = 32;
+const DEFAULT_PARSER_MEMORY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_FORWARD_TIMEOUT_MS = 300_000;
+const PARSER_MEMORY_AMPLIFICATION_FACTOR = 4;
 const TERMINAL_STATUSES = new Map<string, "completed" | "failed" | "incomplete">([
   ["response.completed", "completed"],
   ["response.failed", "failed"],
@@ -52,6 +58,26 @@ export interface ForwardingRouterDependencies {
   maxReadChunkBytes?: number;
   maxIncomingBodyBytes?: number;
   maxParserSegments?: number;
+  maxConcurrentForwards?: number;
+  maxForwardWaiters?: number;
+  maxIncomingBodyWaiters?: number;
+  maxParserMemoryBytes?: number;
+  forwardTimeoutMs?: number;
+  scheduleDeadline?: (callback: () => void, milliseconds: number) => () => void;
+}
+
+function scheduleDeadline(callback: () => void, milliseconds: number): () => void {
+  const timer = setTimeout(callback, milliseconds);
+  (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  return () => clearTimeout(timer);
+}
+
+function safeProduct(left: number, right: number, label: string): number {
+  const product = left * right;
+  if (!Number.isSafeInteger(product) || product < 1) {
+    throw new RangeError(`${label} exceeds the safe integer range`);
+  }
+  return product;
 }
 
 function effectivePort(url: URL): number {
@@ -148,6 +174,24 @@ function linkAbortSignal(signal: AbortSignal | undefined, controller: AbortContr
     if (signal.aborted) abort();
   }
   return () => signal.removeEventListener("abort", abort);
+}
+
+async function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  error: () => Error,
+): Promise<T> {
+  if (signal.aborted) throw error();
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(error());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function upstreamFailure(message = "Verifier upstream request failed"): RelayError {
@@ -259,11 +303,45 @@ export function createForwardingRouter(
     dependencies.maxParserSegments ?? DEFAULT_MAX_PARSER_SEGMENTS,
     "maxParserSegments",
   );
+  const maxParserMemoryBytes = positiveSafeInteger(
+    dependencies.maxParserMemoryBytes ?? DEFAULT_PARSER_MEMORY_BYTES,
+    "maxParserMemoryBytes",
+  );
+  const parserMemoryReservationBytes = safeProduct(
+    maxEventBytes,
+    PARSER_MEMORY_AMPLIFICATION_FACTOR,
+    "parser memory reservation",
+  );
+  if (parserMemoryReservationBytes > maxParserMemoryBytes) {
+    throw new RangeError("maxEventBytes exceeds the aggregate parser memory budget");
+  }
+  const requestedForwardCapacity = positiveSafeInteger(
+    dependencies.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS,
+    "maxConcurrentForwards",
+  );
+  const forwardCapacity = Math.min(
+    requestedForwardCapacity,
+    Math.floor(maxParserMemoryBytes / parserMemoryReservationBytes),
+  );
+  const maxForwardWaiters = positiveSafeInteger(
+    dependencies.maxForwardWaiters ?? DEFAULT_MAX_FORWARD_WAITERS,
+    "maxForwardWaiters",
+  );
+  const maxIncomingBodyWaiters = positiveSafeInteger(
+    dependencies.maxIncomingBodyWaiters ?? DEFAULT_MAX_INCOMING_BODY_WAITERS,
+    "maxIncomingBodyWaiters",
+  );
+  const forwardTimeoutMs = positiveSafeInteger(
+    dependencies.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS,
+    "forwardTimeoutMs",
+  );
+  const deadlineScheduler = dependencies.scheduleDeadline ?? scheduleDeadline;
   const incomingBodies = new IncomingBodyBudget(
     dependencies.maxIncomingBodyBytes ?? DEFAULT_INCOMING_BODY_BUDGET_BYTES,
+    maxIncomingBodyWaiters,
   );
   const activeControllers = new Set<AbortController>();
-  const forwards = new ForwardSemaphore(VERIFIER_CAPACITY);
+  const forwards = new ForwardSemaphore(forwardCapacity, maxForwardWaiters);
   let closed = false;
 
   const router: ForwardingRouter = {
@@ -296,36 +374,56 @@ export function createForwardingRouter(
       const controller = new AbortController();
       const unlinkAbort = linkAbortSignal(options.signal, controller);
       activeControllers.add(controller);
+      let deadlineExpired = false;
+      let cancelDeadline = (): void => undefined;
       let cleaned = false;
       const cleanup = (): void => {
         if (cleaned) return;
         cleaned = true;
+        cancelDeadline();
         unlinkAbort();
         activeControllers.delete(controller);
         permit.release();
       };
+      cancelDeadline = deadlineScheduler(() => {
+        deadlineExpired = true;
+        controller.abort();
+      }, forwardTimeoutMs);
+      const cancellationError = (): Error => deadlineExpired
+        ? verifierForwardTimeoutError()
+        : abortError();
+      if (controller.signal.aborted) {
+        cleanup();
+        throw cancellationError();
+      }
 
       let response: Response;
+      const fetchPromise = Promise.resolve().then(() => fetchImpl(`${origin}/v1/responses`, {
+        method: "POST",
+        redirect: "error",
+        signal: controller.signal,
+        headers: {
+          accept: "text/event-stream",
+          "content-type": "application/json",
+        },
+        body: requestBody,
+      }));
       try {
-        response = await fetchImpl(`${origin}/v1/responses`, {
-          method: "POST",
-          redirect: "error",
-          signal: controller.signal,
-          headers: {
-            accept: "text/event-stream",
-            "content-type": "application/json",
-          },
-          body: requestBody,
-        });
+        response = await raceAbort(fetchPromise, controller.signal, cancellationError);
       } catch {
+        if (controller.signal.aborted) {
+          void fetchPromise.then(lateResponse => {
+            void lateResponse.body?.cancel().catch(() => undefined);
+          }, () => undefined);
+        }
         cleanup();
-        if (controller.signal.aborted) throw abortError();
+        if (controller.signal.aborted) throw cancellationError();
         throw upstreamFailure();
       }
       if (controller.signal.aborted) {
         void response.body?.cancel().catch(() => undefined);
         cleanup();
-        throw abortError();
+        throw cancellationError();
       }
       if (!response.ok) {
         void response.body?.cancel().catch(() => undefined);
@@ -345,7 +443,7 @@ export function createForwardingRouter(
       const run = new VerifierRunHandle(maxBufferedBytes, () => controller.abort());
       const reader = response.body.getReader();
       const cancelRun = (): void => {
-        const error = abortError();
+        const error = cancellationError();
         run.cancel(error);
         void reader.cancel().catch(() => undefined);
       };
@@ -374,7 +472,7 @@ export function createForwardingRouter(
               return;
             }
           }
-          if (controller.signal.aborted) throw abortError();
+          if (controller.signal.aborted) throw cancellationError();
           const final = await parser.finish(accept);
           if (final) {
             run.settle(final);
@@ -382,7 +480,7 @@ export function createForwardingRouter(
           }
           throw new ForwardingProtocolError("Upstream event stream ended without a terminal event");
         } catch {
-          if (controller.signal.aborted) run.fail(abortError());
+          if (controller.signal.aborted) run.fail(cancellationError());
           else run.fail(upstreamFailure("Verifier upstream event stream failed"));
           void reader.cancel().catch(() => undefined);
         } finally {
@@ -402,7 +500,7 @@ export function createForwardingRouter(
     snapshot() {
       const forwarding = forwards.snapshot();
       const incoming = incomingBodies.snapshot();
-      const capacity = closed ? 0 : VERIFIER_CAPACITY;
+      const capacity = closed ? 0 : forwarding.capacity;
       return {
         capacity,
         active: forwarding.active,
@@ -414,6 +512,14 @@ export function createForwardingRouter(
           incomingBodyCapacityBytes: incoming.capacityBytes,
           incomingBodyReservedBytes: incoming.reservedBytes,
           incomingBodyQueued: incoming.queued,
+          incomingBodyQueueCapacity: incoming.maxWaiters,
+          forwardQueueCapacity: forwarding.maxWaiters,
+          forwardDeadlineMs: forwardTimeoutMs,
+          parserEventLimitBytes: maxEventBytes,
+          parserMemoryAmplificationFactor: PARSER_MEMORY_AMPLIFICATION_FACTOR,
+          parserMemoryCapacityBytes: maxParserMemoryBytes,
+          parserMemoryReservationBytesPerForward: parserMemoryReservationBytes,
+          parserMemoryReservedBytes: forwarding.active * parserMemoryReservationBytes,
         },
       };
     },

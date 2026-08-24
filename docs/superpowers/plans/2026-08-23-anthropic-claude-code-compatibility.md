@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Serve a current Anthropic Messages API and the existing OpenAI API from one GhostProv listener, with stateless reasoning/tool continuity and verified Claude Code 2.1.220 operation.
+**Goal:** Serve a current Anthropic Messages API and the existing OpenAI API from one GhostProv listener, with stateless reasoning/tool continuity and verified Claude Code 2.1.241 operation.
 
 **Architecture:** Pure northbound adapters translate Anthropic Messages requests into canonical OpenAI Responses bodies and translate the resulting final objects/SSE back into current Anthropic shapes. Every generation remains exactly one job in the existing router; token counting stays local and side-effect free. A disposable forwarding router tests the production adapter on a non-protected port against the already-running listener at `127.0.0.1:18787`.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Current official Anthropic documentation is authoritative over the reconstructed Claude Code 2.1.87 source.
-- Installed Claude Code 2.1.220 is the final behavioral client.
+- Installed Claude Code 2.1.241 is the final behavioral client.
 - Never stop, restart, kill, or bind port `18787`; all branch runtime tests use another loopback port.
 - Preserve every existing OpenAI Responses, WebSocket, Images, router, V1, and V2 behavior.
 - One Anthropic generation creates exactly one existing-router job and uses the same client queue identity as HTTP Responses.
@@ -92,7 +92,7 @@ Expected: FAIL because `src/anthropic/*` does not exist.
 ```ts
 export type AnthropicContentBlock = { type: string; [key: string]: unknown };
 export type AnthropicMessageParam = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system" | "developer";
   content: string | AnthropicContentBlock[];
 };
 export type AnthropicMessageRequest = {
@@ -114,6 +114,8 @@ export type AnthropicUsage = {
   cache_read_input_tokens: number | null;
 };
 ```
+
+Message-level `system` follows the current exact-model placement contract, including consecutive-section coalescing. Message-level `developer` is accepted only for custom non-`claude-*` model IDs. Generation and token counting use the same validation.
 
 - [ ] **Step 4: Implement typed errors and current status mapping**
 
@@ -326,11 +328,15 @@ it("converts ordered reasoning, text, parallel tools, usage, and nullables", () 
       { type: "function_call", call_id: "call_1", name: "Read", arguments: "{\"file_path\":\"a\"}" },
       { type: "function_call", call_id: "call_2", name: "Read", arguments: "{\"file_path\":\"b\"}" },
     ],
-    usage: { input_tokens: 100, output_tokens: 20, input_tokens_details: { cached_tokens: 40 } },
+    usage: {
+      input_tokens: 100, output_tokens: 20, total_tokens: 120,
+      input_tokens_details: { cached_tokens: 40, cache_write_tokens: 10 },
+      output_tokens_details: { reasoning_tokens: 5 },
+    },
   }, CONTEXT);
   expect(message).toMatchObject({ id: "msg_resp_1", type: "message", role: "assistant", model: CONTEXT.requestedModel,
     container: null, stop_reason: "tool_use", stop_sequence: null,
-    usage: { input_tokens: 60, output_tokens: 20, cache_creation_input_tokens: null, cache_read_input_tokens: 40 },
+    usage: { input_tokens: 50, output_tokens: 20, cache_creation_input_tokens: 10, cache_read_input_tokens: 40 },
   });
   expect(message.content.map(block => block.type)).toEqual(["thinking", "text", "tool_use", "tool_use"]);
   expect(message.content[0]).toMatchObject({ thinking: "considering" });
@@ -360,7 +366,7 @@ return {
 };
 ```
 
-Cached input tokens are subtracted from Anthropic `input_tokens` and returned as `cache_read_input_tokens`; `cache_creation_input_tokens` is `null` because Responses does not distinguish a cache write in the final usage.
+Cached and cache-write input tokens are subtracted from Anthropic `input_tokens`. Responses `cached_tokens` is returned as `cache_read_input_tokens`, and `cache_write_tokens` is returned as `cache_creation_input_tokens`.
 
 - [ ] **Step 4: Implement exact stop-sequence filtering**
 
@@ -635,14 +641,14 @@ git commit -m "docs: add Claude Code setup and verifier"
 
 ---
 
-### Task 7: Verify real Claude Code 2.1.220 text, sequential tools, and parallel tools
+### Task 7: Verify real Claude Code 2.1.241 text, sequential tools, and parallel tools
 
 **Files:**
 - Create during verification only: `.tmp/claude-code-verification/*`
 - Modify only if a failure is reproduced: the smallest relevant `src/anthropic/*` file plus a failing regression test.
 
 **Interfaces:**
-- Consumes: installed `claude.exe` 2.1.220.
+- Consumes: installed `claude.exe` 2.1.241.
 - Produces: sanitized command output and filesystem proof; no prompt/response content is committed.
 
 - [ ] **Step 1: Confirm protected and test listeners before starting**
@@ -745,4 +751,3 @@ git commit -m "feat: support Claude Code through Anthropic Messages"
 ```
 
 Skip this commit only if the working tree is already clean because every adjustment was committed task-by-task.
-

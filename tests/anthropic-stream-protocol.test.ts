@@ -242,6 +242,35 @@ describe("Anthropic stream known event envelopes", () => {
       },
     })).toThrow();
   });
+
+  it("returns done suffixes without retaining their units after accept or cleanup", () => {
+    const protocol = new ResponsesStreamProtocol({
+      maxEvents: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxEvents,
+      maxIdentities: DEFAULT_ANTHROPIC_STREAM_LIMITS.maxIdentities,
+    });
+    protocol.accept({
+      type: "response.output_text.delta",
+      sequence_number: 0,
+      item_id: "msg_suffix_lifetime",
+      output_index: 0,
+      content_index: 0,
+      delta: "prefix",
+    });
+
+    const accepted = protocol.accept({
+      type: "response.output_text.done",
+      sequence_number: 1,
+      item_id: "msg_suffix_lifetime",
+      output_index: 0,
+      content_index: 0,
+      text: "prefix-sensitive-suffix",
+    });
+
+    expect(accepted).toEqual({ category: "text", value: "-sensitive-suffix" });
+    expect(protocol.snapshot()).toMatchObject({ retainedSuffixUnits: 0 });
+    protocol.clearRetained();
+    expect(protocol.snapshot()).toMatchObject({ retainedSuffixUnits: 0 });
+  });
 });
 
 describe("Anthropic stream identity and lifecycle integrity", () => {
@@ -689,6 +718,47 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       response: finalResponse([{ ...streamed, name: "Read" }]),
     })));
   });
+
+  for (const phase of ["response.output_item.done", "authoritative final"] as const) {
+    for (const alias of ["call_id", "name"] as const) {
+      it(`rejects an isolated ${alias} conflict on ${phase}`, () => {
+        const translator = new AnthropicStreamTranslator(CONTEXT);
+        translator.start();
+        const completed = {
+          type: "function_call",
+          id: `fc_${phase}_${alias}`,
+          status: "completed",
+          call_id: "call_original",
+          name: "Write",
+          arguments: "{}",
+        };
+        translator.push(frame(0, "response.output_item.added", {
+          output_index: 0,
+          item: { ...completed, status: "in_progress", arguments: "" },
+        }));
+
+        const changed = {
+          ...completed,
+          [alias]: alias === "call_id" ? "call_changed" : "Read",
+        };
+        if (phase === "response.output_item.done") {
+          expectError(translator.push(frame(1, phase, {
+            output_index: 0,
+            item: changed,
+          })));
+          return;
+        }
+
+        translator.push(frame(1, "response.output_item.done", {
+          output_index: 0,
+          item: completed,
+        }));
+        expectError(translator.push(frame(2, "response.completed", {
+          response: finalResponse([changed]),
+        })));
+      });
+    }
+  }
 
   it("recursively validates known output item members during prewarm", () => {
     const malformedItems: Record<string, unknown>[] = [

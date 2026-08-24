@@ -21,3 +21,17 @@ export function verifierClosingError(): ApiError {
     code: "verifier_shutting_down",
   });
 }
+
+export function verifierOverloadedError(): ApiError {
+  return new ApiError(503, "Claude Code verifier is overloaded", {
+    type: "overloaded_error",
+    code: "verifier_overloaded",
+  });
+}
+
+export function verifierForwardTimeoutError(): ApiError {
+  return new ApiError(504, "Claude Code verifier upstream request timed out", {
+    type: "timeout_error",
+    code: "verifier_forward_timeout",
+  });
+}

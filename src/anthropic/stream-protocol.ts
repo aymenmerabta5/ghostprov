@@ -146,6 +146,7 @@ export type ResponsesStreamProtocolSnapshot = {
   identities: number;
   retainedItems: number;
   retainedIdentities: number;
+  retainedSuffixUnits: number;
 };
 
 export type ResponsesStreamAcceptedSuffix = {
@@ -171,42 +172,47 @@ export class ResponsesStreamProtocol {
   accept(event: Record<string, unknown>): ResponsesStreamAcceptedSuffix | null {
     if (this.#terminal) fail();
     this.#acceptedSuffix = null;
-    const sequence = event.sequence_number;
-    if (!Number.isSafeInteger(sequence) || Number(sequence) < 0 ||
-      (this.#lastSequence !== null && Number(sequence) !== this.#lastSequence + 1)) fail();
-    if (this.#eventCount >= this.limits.maxEvents) fail();
-    this.#lastSequence = Number(sequence);
-    this.#eventCount += 1;
+    try {
+      const sequence = event.sequence_number;
+      if (!Number.isSafeInteger(sequence) || Number(sequence) < 0 ||
+        (this.#lastSequence !== null && Number(sequence) !== this.#lastSequence + 1)) fail();
+      if (this.#eventCount >= this.limits.maxEvents) fail();
+      this.#lastSequence = Number(sequence);
+      this.#eventCount += 1;
 
-    const type = event.type;
-    if (typeof type !== "string") fail();
-    switch (type) {
-      case "response.created": validateLifecycleResponse(event, "in_progress"); break;
-      case "response.in_progress": validateLifecycleResponse(event, "in_progress"); break;
-      case "response.completed": validateLifecycleResponse(event, "completed"); break;
-      case "response.incomplete": validateLifecycleResponse(event, "incomplete"); break;
-      case "response.failed": validateFailedResponse(event); break;
-      case "error": validateErrorEvent(event); break;
-      case "response.output_item.added": this.#outputItemAdded(event); break;
-      case "response.output_item.done": this.#outputItemDone(event); break;
-      case "response.content_part.added": this.#contentPartAdded(event); break;
-      case "response.content_part.done": this.#contentPartDone(event); break;
-      case "response.output_text.delta": this.#outputTextDelta(event); break;
-      case "response.output_text.done": this.#outputTextDone(event); break;
-      case "response.reasoning_summary_part.added": this.#summaryPartAdded(event); break;
-      case "response.reasoning_summary_part.done": this.#summaryPartDone(event); break;
-      case "response.reasoning_summary_text.delta": this.#summaryTextDelta(event); break;
-      case "response.reasoning_summary_text.done": this.#summaryTextDone(event); break;
-      case "response.reasoning_text.delta": this.#rawReasoningDelta(event); break;
-      case "response.reasoning_text.done": this.#rawReasoningDone(event); break;
-      case "response.function_call_arguments.delta": this.#argumentsDelta(event); break;
-      case "response.function_call_arguments.done": this.#argumentsDone(event); break;
+      const type = event.type;
+      if (typeof type !== "string") fail();
+      switch (type) {
+        case "response.created": validateLifecycleResponse(event, "in_progress"); break;
+        case "response.in_progress": validateLifecycleResponse(event, "in_progress"); break;
+        case "response.completed": validateLifecycleResponse(event, "completed"); break;
+        case "response.incomplete": validateLifecycleResponse(event, "incomplete"); break;
+        case "response.failed": validateFailedResponse(event); break;
+        case "error": validateErrorEvent(event); break;
+        case "response.output_item.added": this.#outputItemAdded(event); break;
+        case "response.output_item.done": this.#outputItemDone(event); break;
+        case "response.content_part.added": this.#contentPartAdded(event); break;
+        case "response.content_part.done": this.#contentPartDone(event); break;
+        case "response.output_text.delta": this.#outputTextDelta(event); break;
+        case "response.output_text.done": this.#outputTextDone(event); break;
+        case "response.reasoning_summary_part.added": this.#summaryPartAdded(event); break;
+        case "response.reasoning_summary_part.done": this.#summaryPartDone(event); break;
+        case "response.reasoning_summary_text.delta": this.#summaryTextDelta(event); break;
+        case "response.reasoning_summary_text.done": this.#summaryTextDone(event); break;
+        case "response.reasoning_text.delta": this.#rawReasoningDelta(event); break;
+        case "response.reasoning_text.done": this.#rawReasoningDone(event); break;
+        case "response.function_call_arguments.delta": this.#argumentsDelta(event); break;
+        case "response.function_call_arguments.done": this.#argumentsDone(event); break;
+      }
+      return this.#acceptedSuffix;
+    } finally {
+      this.#acceptedSuffix = null;
     }
-    return this.#acceptedSuffix;
   }
 
   markTerminal(): void {
     this.#terminal = true;
+    this.#acceptedSuffix = null;
   }
 
   canExpose(outputIndex: number): boolean {
@@ -243,6 +249,7 @@ export class ResponsesStreamProtocol {
       identities: this.#identityCount,
       retainedItems: this.#itemsByIndex.size,
       retainedIdentities: this.#retainedIdentityCount,
+      retainedSuffixUnits: this.#acceptedSuffix?.value.length ?? 0,
     };
   }
 
@@ -250,6 +257,7 @@ export class ResponsesStreamProtocol {
     this.#itemsByIndex.clear();
     this.#itemsById.clear();
     this.#retainedIdentityCount = 0;
+    this.#acceptedSuffix = null;
   }
 
   #outputItemAdded(event: Record<string, unknown>): void {

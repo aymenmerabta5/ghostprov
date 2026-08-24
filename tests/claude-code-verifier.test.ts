@@ -164,7 +164,7 @@ describe("Claude Code forwarding verifier", () => {
     })).toEqual({ port: 18_889, upstream: "http://[::1]:18787" });
   });
 
-  it("admits only 128 forwards and removes an aborted 129th waiter", async () => {
+  it("admits only eight forwards and removes an aborted ninth waiter", async () => {
     let fetches = 0;
     const forwardedInputs: string[] = [];
     const router = createForwardingRouter("http://127.0.0.1:19008", {
@@ -175,7 +175,7 @@ describe("Claude Code forwarding verifier", () => {
       },
     });
     const activeAbort = new AbortController();
-    const handles = await Promise.all(Array.from({ length: 128 }, (_, index) => (
+    const handles = await Promise.all(Array.from({ length: 8 }, (_, index) => (
       router.startRelay(
         { model: "gpt-5.6-sol", input: String(index), stream: true },
         index === 0 ? { signal: activeAbort.signal } : undefined,
@@ -188,10 +188,10 @@ describe("Claude Code forwarding verifier", () => {
     );
     try {
       await Bun.sleep(0);
-      expect(fetches).toBe(128);
+      expect(fetches).toBe(8);
       expect(router.snapshot()).toMatchObject({
-        capacity: 128,
-        active: 128,
+        capacity: 8,
+        active: 8,
         available: 0,
         queued: 1,
       });
@@ -256,7 +256,7 @@ describe("Claude Code forwarding verifier", () => {
         return pendingSseResponse(init?.signal);
       },
     });
-    const handles = await Promise.all(Array.from({ length: 128 }, (_, index) => (
+    const handles = await Promise.all(Array.from({ length: 8 }, (_, index) => (
       router.startRelay({
         model: "gpt-5.6-sol",
         input: index === 0 ? "release-active" : `active-${index}`,
@@ -340,6 +340,161 @@ describe("Claude Code forwarding verifier", () => {
     third.release();
     await expect(router.acquireIncomingBody!(11)).rejects.toMatchObject({ status: 413 });
     router.close();
+  });
+
+  it("derives parser concurrency from an exposed aggregate memory ceiling", async () => {
+    const router = createForwardingRouter("http://127.0.0.1:19022", {
+      maxConcurrentForwards: 4,
+      maxForwardWaiters: 1,
+      maxEventBytes: 128,
+      maxParserMemoryBytes: 1_024,
+      forwardTimeoutMs: 1_234,
+      fetch: async (_input, init) => pendingSseResponse(init?.signal),
+    });
+    const handles = await Promise.all([0, 1].map(index => router.startRelay({
+      model: "gpt-5.6-sol",
+      input: String(index),
+      stream: false,
+    })));
+    const queued = router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "queued",
+      stream: false,
+    });
+    try {
+      await Bun.sleep(0);
+      expect(router.snapshot()).toMatchObject({
+        capacity: 2,
+        active: 2,
+        queued: 1,
+        resources: {
+          forwardQueueCapacity: 1,
+          forwardDeadlineMs: 1_234,
+          parserEventLimitBytes: 128,
+          parserMemoryAmplificationFactor: 4,
+          parserMemoryCapacityBytes: 1_024,
+          parserMemoryReservationBytesPerForward: 512,
+          parserMemoryReservedBytes: 1_024,
+        },
+      });
+
+      const failure = await rejectedValue(router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "excess",
+        stream: false,
+      }));
+      expect(failure).toMatchObject({
+        status: 503,
+        options: { type: "overloaded_error", code: "verifier_overloaded" },
+      });
+      expect(String(failure)).not.toContain("excess");
+    } finally {
+      router.close();
+      await Promise.allSettled([...handles.map(handle => handle.final), queued]);
+    }
+  });
+
+  it("bounds incoming-body waiters with the same sanitized overload", async () => {
+    const router = createForwardingRouter("http://127.0.0.1:19023", {
+      maxIncomingBodyBytes: 1,
+      maxIncomingBodyWaiters: 1,
+      fetch: async () => { throw new Error("not used"); },
+    });
+    const first = await router.acquireIncomingBody!(1);
+    const queued = router.acquireIncomingBody!(1);
+    try {
+      await Bun.sleep(0);
+      expect(router.snapshot().resources).toMatchObject({
+        incomingBodyQueueCapacity: 1,
+        incomingBodyQueued: 1,
+      });
+      const failure = await within(rejectedValue(router.acquireIncomingBody!(1)));
+      expect(failure).toMatchObject({
+        status: 503,
+        options: { type: "overloaded_error", code: "verifier_overloaded" },
+      });
+    } finally {
+      router.close();
+      first.release();
+      await Promise.allSettled([queued]);
+    }
+  });
+
+  it("times out response headers through a deterministic internal deadline", async () => {
+    let fireDeadline: (() => void) | undefined;
+    let cleared = 0;
+    const router = createForwardingRouter("http://127.0.0.1:19024", {
+      forwardTimeoutMs: 321,
+      scheduleDeadline: (callback: () => void, milliseconds: number) => {
+        expect(milliseconds).toBe(321);
+        fireDeadline = callback;
+        return () => { cleared += 1; };
+      },
+      fetch: async () => new Promise<Response>(() => {}),
+    });
+    const pending = router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x",
+      stream: false,
+    });
+    try {
+      await Bun.sleep(0);
+      expect(fireDeadline).toBeFunction();
+      fireDeadline!();
+      const failure = await within(rejectedValue(pending));
+      expect(failure).toMatchObject({
+        status: 504,
+        message: "Claude Code verifier upstream request timed out",
+        options: { type: "timeout_error", code: "verifier_forward_timeout" },
+      });
+      expect(cleared).toBe(1);
+    } finally {
+      router.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("keeps the deadline active until stream completion and clears it", async () => {
+    let fireDeadline: (() => void) | undefined;
+    let cleared = 0;
+    let bodyCancelled = false;
+    const router = createForwardingRouter("http://127.0.0.1:19025", {
+      forwardTimeoutMs: 654,
+      scheduleDeadline: (callback: () => void) => {
+        fireDeadline = callback;
+        return () => { cleared += 1; };
+      },
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          bodyCancelled = true;
+        },
+      }, { highWaterMark: 0 }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    const handle = await router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x",
+      stream: false,
+    });
+    try {
+      expect(fireDeadline).toBeFunction();
+      fireDeadline!();
+      const failure = await within(rejectedValue(handle.final));
+      expect(failure).toMatchObject({
+        status: 504,
+        options: { type: "timeout_error", code: "verifier_forward_timeout" },
+      });
+      expect(bodyCancelled).toBe(true);
+      expect(cleared).toBe(1);
+    } finally {
+      router.close();
+      await Promise.allSettled([handle.final]);
+    }
   });
 
   it("posts a forced Responses stream and preserves frames plus authoritative final", async () => {

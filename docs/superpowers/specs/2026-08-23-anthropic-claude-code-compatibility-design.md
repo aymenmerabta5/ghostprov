@@ -10,7 +10,7 @@ The OpenAI surface, router fairness, sandbox transports, terminal proof, backpre
 
 ## Evidence and Protocol Baseline
 
-The compatibility target is the current official Anthropic contract first, then the wire contract used by the local Claude Code source at `D:\MyWork\claude-code` (rebuilt 2.1.87 with `@anthropic-ai/sdk` 0.81.0), and finally the installed Claude Code 2.1.220 executable used for live verification. When the older source or SDK differs from current documentation, current documentation is authoritative; legacy shapes remain compatibility inputs rather than defining the API.
+The compatibility target is the current official Anthropic contract first, then the wire contract used by the local Claude Code source at `D:\MyWork\claude-code` (rebuilt 2.1.87 with `@anthropic-ai/sdk` 0.81.0), and finally the installed Claude Code 2.1.241 executable used for live verification. When the older source or SDK differs from current documentation, current documentation is authoritative; legacy shapes remain compatibility inputs rather than defining the API.
 
 The SDK sends Claude Code traffic to:
 
@@ -104,6 +104,8 @@ Unsupported legacy/private beta hints such as context-edit policies, Anthropic s
 
 ### Message content
 
+Current mid-conversation `system` messages are enabled for the exact normalized model IDs `claude-fable-5`, `claude-mythos-5`, `claude-opus-4-8`, and `claude-opus-5`. A system section must immediately follow a user turn and be final or immediately followed by an assistant turn. Consecutive `system` messages are coalesced into one section before placement validation. Other `claude-*` models reject message-level `system`; top-level `system` remains the ordinary instructions field. For custom model IDs, message-level `system` is accepted and `developer` is accepted only for custom non-`claude-*` model IDs. Generation and token counting share this validation.
+
 - User text becomes `input_text`.
 - Assistant text becomes a completed assistant message with `output_text`.
 - Base64, URL, and current stable file-ID images become `input_image` data/HTTP URLs or file IDs.
@@ -132,7 +134,7 @@ The final Anthropic object contains:
 - `stop_reason` mapped to `tool_use`, `max_tokens`, `stop_sequence`, or `end_turn`;
 - `stop_sequence:null` unless a proven sequence is available;
 - text blocks with `citations:null` and thinking blocks that preserve the opaque signature contract, including empty thinking text when display is omitted;
-- Anthropic usage derived from Responses usage, including explicit nullable/zero cache-creation and cache-read fields.
+- Anthropic usage derived from Responses usage: `cached_tokens` becomes `cache_read_input_tokens`, `cache_write_tokens` becomes `cache_creation_input_tokens`, and both are subtracted from uncached `input_tokens`.
 
 ### Streaming
 
@@ -194,6 +196,8 @@ Test-first coverage includes:
 
 Live verification uses a disposable forwarding harness on a port other than `18787`. The harness uses the production Hono app and Anthropic adapter, but its `RouterLike` forwards translated Responses requests to the already-running `http://127.0.0.1:18787/v1/responses`. Therefore it exercises a real model and the complete adapter while neither restarting nor competing with the protected GhostProv process.
 
+The disposable harness defaults to eight concurrent forwards, a 2 MiB SSE-event cap, a four-times parser-memory reservation under a 64 MiB aggregate ceiling, 32 forward waiters, 32 incoming-body waiters, a 128 MiB incoming-body byte budget, a 300-second end-to-end forward deadline, and a 1 MiB per-run output queue.
+
 The installed Claude Code executable runs in `--bare --print` mode against the disposable port with a dummy key. Verification must prove:
 
 1. a streamed text-only answer completes;
@@ -207,7 +211,7 @@ The installed Claude Code executable runs in `--bare --print` mode against the d
 ## Completion Criteria
 
 - OpenAI and Anthropic routes coexist in one app and share one router.
-- Current official Messages shapes, Claude Code 2.1.87 compatibility inputs, and the installed Claude Code 2.1.220 executable are supported.
+- Current official Messages shapes, Claude Code 2.1.87 compatibility inputs, and the installed Claude Code 2.1.241 executable are supported.
 - Streaming text, thinking, client tool calls/results, parallel tools, images/documents, token counting, cancellation, and errors have automated coverage.
 - Encrypted reasoning and tool IDs survive stateless multi-turn tool loops.
 - Tiered default model mapping is implemented and documented.

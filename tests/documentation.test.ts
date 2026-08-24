@@ -9,6 +9,20 @@ const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const liveMultiSandbox = fs.readFileSync(path.join(root, "scripts", "live_multi_sandbox.ts"), "utf8");
 const liveVerify = fs.readFileSync(path.join(root, "scripts", "live_verify.ts"), "utf8");
+const anthropicDesign = fs.readFileSync(path.join(
+  root,
+  "docs",
+  "superpowers",
+  "specs",
+  "2026-08-23-anthropic-claude-code-compatibility-design.md",
+), "utf8");
+const anthropicPlan = fs.readFileSync(path.join(
+  root,
+  "docs",
+  "superpowers",
+  "plans",
+  "2026-08-23-anthropic-claude-code-compatibility.md",
+), "utf8");
 
 describe("project documentation", () => {
   it("lists every executable test file that exists", () => {
@@ -95,6 +109,50 @@ describe("project documentation", () => {
     expect(verifierBase).toBeGreaterThan(secondTerminal);
     expect(verifierKey).toBeGreaterThan(verifierBase);
     expect(verifierClaude).toBeGreaterThan(verifierKey);
+  });
+
+  it("documents current mid-conversation system and custom developer roles", () => {
+    for (const value of [
+      "claude-fable-5",
+      "claude-mythos-5",
+      "claude-opus-4-8",
+      "claude-opus-5",
+      "immediately follow a user turn",
+      "final or immediately followed by an assistant turn",
+      "Consecutive `system` messages are coalesced",
+      "`developer` is accepted only for custom non-`claude-*` model IDs",
+    ]) {
+      expect(readme).toContain(value);
+      expect(anthropicDesign).toContain(value);
+    }
+  });
+
+  it("documents verifier aggregate, queue, and deadline defaults", () => {
+    for (const value of [
+      "eight concurrent forwards",
+      "2 MiB per SSE event",
+      "64 MiB aggregate parser-memory ceiling",
+      "32 forward waiters",
+      "32 incoming-body waiters",
+      "300-second forward deadline",
+      "1 MiB per-run output queue",
+    ]) expect(readme).toContain(value);
+  });
+
+  it("tracks the installed Claude version and current cache-write wire contract", () => {
+    for (const source of [anthropicDesign, anthropicPlan]) {
+      expect(source).toContain("2.1.241");
+      expect(source).toContain("2.1.87");
+      expect(source).not.toContain("2.1.220");
+    }
+    expect(anthropicPlan).toContain(
+      'role: "user" | "assistant" | "system" | "developer";',
+    );
+    expect(anthropicPlan).toContain("cache_write_tokens: 10");
+    expect(anthropicPlan).toContain("cache_creation_input_tokens: 10");
+    expect(anthropicPlan).not.toContain(
+      "`cache_creation_input_tokens` is `null` because Responses does not distinguish a cache write",
+    );
   });
 
   it("provides stable verification scripts", () => {

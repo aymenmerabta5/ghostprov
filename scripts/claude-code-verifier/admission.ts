@@ -3,6 +3,7 @@ import {
   abortError,
   positiveSafeInteger,
   verifierClosingError,
+  verifierOverloadedError,
 } from "./shared";
 
 interface ForwardWaiter {
@@ -14,12 +15,14 @@ interface ForwardWaiter {
 
 export class ForwardSemaphore {
   readonly #capacity: number;
+  readonly #maxWaiters: number;
   readonly #waiters: ForwardWaiter[] = [];
   #active = 0;
   #closed = false;
 
-  constructor(capacity: number) {
+  constructor(capacity: number, maxWaiters: number) {
     this.#capacity = positiveSafeInteger(capacity, "forward capacity");
+    this.#maxWaiters = positiveSafeInteger(maxWaiters, "forward waiter capacity");
   }
 
   acquire(signal?: AbortSignal): Promise<{ release(): void }> {
@@ -27,6 +30,9 @@ export class ForwardSemaphore {
     if (this.#closed) return Promise.reject(verifierClosingError());
     if (this.#active < this.#capacity && this.#waiters.length === 0) {
       return Promise.resolve(this.#grant());
+    }
+    if (this.#waiters.length >= this.#maxWaiters) {
+      return Promise.reject(verifierOverloadedError());
     }
     return new Promise((resolve, reject) => {
       const waiter: ForwardWaiter = { resolve, reject, signal };
@@ -50,8 +56,13 @@ export class ForwardSemaphore {
     }
   }
 
-  snapshot(): { active: number; queued: number } {
-    return { active: this.#active, queued: this.#waiters.length };
+  snapshot(): { capacity: number; active: number; queued: number; maxWaiters: number } {
+    return {
+      capacity: this.#capacity,
+      active: this.#active,
+      queued: this.#waiters.length,
+      maxWaiters: this.#maxWaiters,
+    };
   }
 
   #grant(): { release(): void } {
@@ -92,12 +103,14 @@ interface BodyWaiter {
 
 export class IncomingBodyBudget {
   readonly #capacityBytes: number;
+  readonly #maxWaiters: number;
   readonly #waiters: BodyWaiter[] = [];
   #reservedBytes = 0;
   #closed = false;
 
-  constructor(capacityBytes: number) {
+  constructor(capacityBytes: number, maxWaiters: number) {
     this.#capacityBytes = positiveSafeInteger(capacityBytes, "incoming body budget");
+    this.#maxWaiters = positiveSafeInteger(maxWaiters, "incoming body waiter capacity");
   }
 
   acquire(bytes: number, signal?: AbortSignal): Promise<{ release(): void }> {
@@ -117,6 +130,9 @@ export class IncomingBodyBudget {
     if (this.#closed) return Promise.reject(verifierClosingError());
     if (bytes === 0 || (this.#waiters.length === 0 && this.#fits(bytes))) {
       return Promise.resolve(this.#grant(bytes));
+    }
+    if (this.#waiters.length >= this.#maxWaiters) {
+      return Promise.reject(verifierOverloadedError());
     }
     return new Promise((resolve, reject) => {
       const waiter: BodyWaiter = { bytes, resolve, reject, signal };
@@ -140,11 +156,17 @@ export class IncomingBodyBudget {
     }
   }
 
-  snapshot(): { capacityBytes: number; reservedBytes: number; queued: number } {
+  snapshot(): {
+    capacityBytes: number;
+    reservedBytes: number;
+    queued: number;
+    maxWaiters: number;
+  } {
     return {
       capacityBytes: this.#capacityBytes,
       reservedBytes: this.#reservedBytes,
       queued: this.#waiters.length,
+      maxWaiters: this.#maxWaiters,
     };
   }
 
