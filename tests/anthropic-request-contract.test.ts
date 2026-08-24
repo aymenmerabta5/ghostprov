@@ -98,6 +98,24 @@ describe("Anthropic request current contracts", () => {
     ]);
   });
 
+  it("keeps standard Claude Messages restricted to user and assistant roles", () => {
+    for (const role of ["system", "developer"]) {
+      expectInvalid(request({ messages: [{ role, content: "not a standard Messages role" }] }),
+        "role must be user or assistant");
+    }
+  });
+
+  it("does not let compatibility control roles interrupt pending tool results", () => {
+    expectInvalid(request({
+      model: "gpt-5.6-sol",
+      messages: [
+        { role: "assistant", content: [toolUse("call_pending")] },
+        { role: "system", content: "intervening control message" },
+        { role: "user", content: [toolResult("call_pending")] },
+      ],
+    }), "system turn intervened before pending tool_result blocks");
+  });
+
   it("uses exact Responses easy-input text parts for assistant history", () => {
     const body = translate(request({
       messages: [

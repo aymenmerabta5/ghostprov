@@ -128,7 +128,9 @@ function sharedRequestParts(
   validateContextManagement(body.context_management, limits);
   validatePromptCacheControls(body, limits);
   const mediaBudget = new RequestMediaBudget(limits.mediaBytes);
-  const input = translateMessages(messages, mediaBudget, limits);
+  const model = String(body.model);
+  const allowControlRoles = !model.toLowerCase().startsWith("claude-");
+  const input = translateMessages(messages, mediaBudget, limits, allowControlRoles);
   const instructions = translateSystem(body.system, limits);
   const tools = translateTools(body.tools, limits);
   const declaredToolNames = new Set(tools.map(tool => tool.name));

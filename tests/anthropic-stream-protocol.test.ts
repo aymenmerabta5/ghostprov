@@ -630,6 +630,64 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
       arguments: "{\"file_path\":\"proof.txt\"}",
     }));
     expect(done).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "error" })]));
+
+    const item = {
+      type: "function_call",
+      id: "fc_live_shape",
+      status: "completed",
+      call_id: "call_live_shape",
+      name: "Write",
+      arguments: "{\"file_path\":\"proof.txt\"}",
+    };
+    const completed = [
+      ...translator.push(frame(3, "response.output_item.done", { output_index: 0, item })),
+      ...translator.push(frame(4, "response.completed", { response: finalResponse([item]) })),
+    ];
+    expect(completed.some(event => event.type === "error")).toBe(false);
+    expect(completed).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "content_block_start",
+        content_block: expect.objectContaining({
+          type: "tool_use",
+          id: "call_live_shape",
+          name: "Write",
+        }),
+      }),
+      expect.objectContaining({ type: "message_stop" }),
+    ]));
+  });
+
+  it("rejects tool alias changes on done events or authoritative final", () => {
+    const changedDone = new AnthropicStreamTranslator(CONTEXT);
+    changedDone.start();
+    changedDone.push(frame(0, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call", id: "fc_alias", status: "in_progress",
+        call_id: "call_alias", name: "Write", arguments: "",
+      },
+    }));
+    expectError(changedDone.push(frame(1, "response.function_call_arguments.done", {
+      item_id: "fc_alias", output_index: 0, name: "Read", arguments: "{}",
+    })));
+
+    const changedFinal = new AnthropicStreamTranslator(CONTEXT);
+    changedFinal.start();
+    const streamed = {
+      type: "function_call", id: "fc_final_alias", status: "completed",
+      call_id: "call_final_alias", name: "Write", arguments: "{}",
+    };
+    changedFinal.push(frame(0, "response.output_item.added", {
+      output_index: 0,
+      item: { ...streamed, status: "in_progress", arguments: "" },
+    }));
+    changedFinal.push(frame(1, "response.function_call_arguments.done", {
+      item_id: "fc_final_alias", output_index: 0, arguments: "{}",
+    }));
+    changedFinal.push(frame(2, "response.output_item.done", { output_index: 0, item: streamed }));
+    expectError(changedFinal.push(frame(3, "response.completed", {
+      response: finalResponse([{ ...streamed, name: "Read" }]),
+    })));
   });
 
   it("recursively validates known output item members during prewarm", () => {

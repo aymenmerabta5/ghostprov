@@ -557,6 +557,16 @@ export class AnthropicStreamTranslator {
         }
       } else {
         const toolBlock = descriptor.block as AnthropicToolUseBlock;
+        if (block.toolId !== null && block.toolId !== toolBlock.id) {
+          throw invalidUpstream(
+            "Responses stream could not be reconciled with its final response.",
+          );
+        }
+        if (block.toolName !== null && block.toolName !== toolBlock.name) {
+          throw invalidUpstream(
+            "Responses stream could not be reconciled with its final response.",
+          );
+        }
         block.toolId = toolBlock.id;
         block.toolName = toolBlock.name;
         if (!block.stopped) {

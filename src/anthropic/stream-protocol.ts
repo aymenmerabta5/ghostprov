@@ -18,6 +18,8 @@ type ItemState = {
   done: boolean;
   argumentsDone: boolean;
   argumentUnits: number;
+  callId: string | null;
+  toolName: string | null;
   nextContentIndex: number;
   nextSummaryIndex: number;
   nextRawReasoningIndex: number;
@@ -228,6 +230,7 @@ export class ResponsesStreamProtocol {
           ? existing?.itemId ?? `@${outputIndex}`
           : requiredString(item, "id");
       const state = this.#item(outputIndex, itemId, item.type);
+      this.#recordFunctionAliases(state, item);
       state.done = true;
       this.#advanceCompletedPrefix();
       this.#observeItemParts(state, item);
@@ -256,6 +259,7 @@ export class ResponsesStreamProtocol {
     validateItemStatus(item, "added");
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.added || state.done) fail();
+    this.#recordFunctionAliases(state, item);
     this.#observeItemParts(state, item);
     state.added = true;
   }
@@ -267,6 +271,7 @@ export class ResponsesStreamProtocol {
     validateItemStatus(item, "done");
     const state = this.#item(outputIndex, requiredString(item, "id"), item.type as string);
     if (state.done) fail();
+    this.#recordFunctionAliases(state, item);
     this.#observeItemParts(state, item);
     state.done = true;
     this.#advanceCompletedPrefix();
@@ -368,7 +373,11 @@ export class ResponsesStreamProtocol {
     if (item.argumentsDone || item.done) fail();
     // Current GPT Responses streams omit `name` here; the authoritative alias
     // arrives on response.output_item.added/done. Validate it when repeated.
-    if (event.name !== undefined) requiredString(event, "name");
+    if (event.name !== undefined) {
+      const name = requiredString(event, "name");
+      if (item.toolName !== null && item.toolName !== name) fail();
+      item.toolName = name;
+    }
     const args = requiredText(event, "arguments");
     if (args.length < item.argumentUnits) fail();
     this.#acceptedSuffix = { category: "function", value: args.slice(item.argumentUnits) };
@@ -391,6 +400,7 @@ export class ResponsesStreamProtocol {
     const state: ItemState = {
       outputIndex, itemId, type,
       added: false, done: false, argumentsDone: false, argumentUnits: 0,
+      callId: null, toolName: null,
       nextContentIndex: 0, nextSummaryIndex: 0, nextRawReasoningIndex: 0,
       content: new Map(), summary: new Map(), rawReasoning: new Map(),
     };
@@ -399,6 +409,16 @@ export class ResponsesStreamProtocol {
     this.#itemsById.set(itemId, state);
     this.#recordIdentity();
     return state;
+  }
+
+  #recordFunctionAliases(state: ItemState, value: Record<string, unknown>): void {
+    if (state.type !== "function_call") return;
+    const callId = requiredString(value, "call_id");
+    const toolName = requiredString(value, "name");
+    if (state.callId !== null && state.callId !== callId) fail();
+    if (state.toolName !== null && state.toolName !== toolName) fail();
+    state.callId = callId;
+    state.toolName = toolName;
   }
 
   #part(

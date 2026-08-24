@@ -430,17 +430,22 @@ type LogicalMessage = {
 function coalesceMessages(
   messages: unknown[],
   limits: AnthropicRequestLimits,
+  allowControlRoles: boolean,
 ): LogicalMessage[] {
   const logical: LogicalMessage[] = [];
   for (let index = 0; index < messages.length; index += 1) {
     const name = `messages[${index}]`;
     const message = requireRecord(messages[index], name);
     const role = message.role;
-    if (role !== "user" && role !== "assistant" && role !== "system" && role !== "developer") {
+    const controlRole = role === "system" || role === "developer";
+    if (role !== "user" && role !== "assistant" && !controlRole) {
       throw new AnthropicRequestError(
         400,
         `${name}.role must be user, assistant, system, or developer`,
       );
+    }
+    if (controlRole && !allowControlRoles) {
+      throw new AnthropicRequestError(400, `${name}.role must be user or assistant`);
     }
     if (typeof message.content !== "string" && !Array.isArray(message.content)) {
       throw new AnthropicRequestError(400, `${name}.content must be a string or an array`);
@@ -468,6 +473,7 @@ export function translateMessages(
   messages: unknown[],
   budget: RequestMediaBudget,
   limits: AnthropicRequestLimits,
+  allowControlRoles = false,
 ): ResponsesInputItem[] {
   const input: ResponsesInputItem[] = [];
   const history: ToolHistory = {
@@ -476,7 +482,7 @@ export function translateMessages(
     pending: new Set(),
   };
 
-  for (const message of coalesceMessages(messages, limits)) {
+  for (const message of coalesceMessages(messages, limits, allowControlRoles)) {
     if (message.role === "user") {
       appendUserMessage(input, message.content, message.name, history, budget, limits);
     } else if (message.role === "assistant") {
