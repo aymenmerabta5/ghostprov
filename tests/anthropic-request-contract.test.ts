@@ -235,19 +235,40 @@ describe("Anthropic request current contracts", () => {
         ],
         "system message must be final or immediately followed by an assistant turn",
       ],
-      [
-        [
-          { role: "user", content: "hello" },
-          { role: "system", content: "first" },
-          { role: "system", content: "second" },
-        ],
-        "system message must be final or immediately followed by an assistant turn",
-      ],
     ];
 
     for (const [messages, error] of cases) {
       expectInvalid(request({ model: "claude-opus-5", messages }), error);
     }
+  });
+
+  it("coalesces consecutive supported system messages into one valid section", () => {
+    const input = translate(request({
+      model: "claude-opus-5",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: "first update" },
+        { role: "system", content: [{ type: "text", text: "second update" }] },
+        { role: "assistant", content: "Understood" },
+      ],
+    })).relayBody.input;
+
+    expect(input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hello" }],
+      },
+      {
+        type: "message",
+        role: "system",
+        content: [
+          { type: "input_text", text: "first update" },
+          { type: "input_text", text: "second update" },
+        ],
+      },
+      { type: "message", role: "assistant", content: "Understood" },
+    ]);
   });
 
   it("does not let compatibility control roles interrupt pending tool results", () => {

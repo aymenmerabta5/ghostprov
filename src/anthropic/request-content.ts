@@ -462,8 +462,7 @@ function coalesceMessages(
       ? [{ type: "text", text: message.content }]
       : contentBlocks(message.content, `${name}.content`, limits);
     const previous = logical.at(-1);
-    const shouldCoalesce = previous?.role === role &&
-      (role !== "system" || rolePolicy !== "mid-conversation-system");
+    const shouldCoalesce = previous?.role === role;
     if (shouldCoalesce) {
       previous.content.push(...blocks);
       if (previous.content.length > limits.maxArrayItems) {
