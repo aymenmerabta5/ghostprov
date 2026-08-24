@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import {
+  closeVerifierServer,
   createForwardingRouter,
   trackVerifierUpgrades,
   validateVerifierOptions,
@@ -53,6 +54,34 @@ function sseResponse(frames: Array<[string, unknown]>, splitEvery = 11): Respons
   }), {
     status: 200,
     headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+}
+
+function pendingSseResponse(signal?: AbortSignal | null): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      const abort = () => controller.error(new DOMException("aborted", "AbortError"));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+function rawSseResponse(raw: string, splitEvery = 11): Response {
+  const bytes = new TextEncoder().encode(raw);
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let offset = 0; offset < bytes.byteLength; offset += splitEvery) {
+        controller.enqueue(bytes.slice(offset, offset + splitEvery));
+      }
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
   });
 }
 
@@ -133,6 +162,122 @@ describe("Claude Code forwarding verifier", () => {
     })).toEqual({ port: 18_889, upstream: "http://[::1]:18787" });
   });
 
+  it("admits only 128 forwards and removes an aborted 129th waiter", async () => {
+    let fetches = 0;
+    const forwardedInputs: string[] = [];
+    const router = createForwardingRouter("http://127.0.0.1:19008", {
+      fetch: async (_input, init) => {
+        fetches += 1;
+        forwardedInputs.push(String(JSON.parse(String(init?.body)).input));
+        return pendingSseResponse(init?.signal);
+      },
+    });
+    const activeAbort = new AbortController();
+    const handles = await Promise.all(Array.from({ length: 128 }, (_, index) => (
+      router.startRelay(
+        { model: "gpt-5.6-sol", input: String(index), stream: true },
+        index === 0 ? { signal: activeAbort.signal } : undefined,
+      )
+    )));
+    const queuedAbort = new AbortController();
+    const queued = router.startRelay(
+      { model: "gpt-5.6-sol", input: "queued", stream: true },
+      { signal: queuedAbort.signal },
+    );
+    try {
+      await Bun.sleep(0);
+      expect(fetches).toBe(128);
+      expect(router.snapshot()).toMatchObject({
+        capacity: 128,
+        active: 128,
+        available: 0,
+        queued: 1,
+      });
+
+      queuedAbort.abort(new Error("token=must-not-leak"));
+      const failure = await rejectedValue(queued);
+      expect(failure).toMatchObject({ name: "AbortError" });
+      expect(String(failure)).not.toContain("must-not-leak");
+      expect(router.snapshot().queued).toBe(0);
+
+      const fifoFirst = router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "fifo-first",
+        stream: true,
+      });
+      const fifoSecond = router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "fifo-second",
+        stream: true,
+      });
+      await Bun.sleep(0);
+      expect(router.snapshot().queued).toBe(2);
+      activeAbort.abort();
+      const admitted = await within(fifoFirst);
+      handles.push(admitted);
+      expect(forwardedInputs.at(-1)).toBe("fifo-first");
+      expect(router.snapshot().queued).toBe(1);
+      router.close();
+      await expect(fifoSecond).rejects.toMatchObject({
+        status: 503,
+        options: { code: "verifier_shutting_down" },
+      });
+      const activeFailures = await Promise.all(handles.map(handle => rejectedValue(handle.final)));
+      expect(activeFailures.every(error => (
+        typeof error === "object" && error !== null && (error as { name?: string }).name === "AbortError"
+      ))).toBe(true);
+      await Bun.sleep(0);
+      expect(router.snapshot()).toMatchObject({ capacity: 0, active: 0, queued: 0 });
+    } finally {
+      router.close();
+      await Promise.allSettled(handles.map(handle => handle.final));
+    }
+  });
+
+  it("bounds aggregate incoming bodies with an abort-aware FIFO byte budget", async () => {
+    const router = createForwardingRouter("http://127.0.0.1:19009", {
+      maxIncomingBodyBytes: 10,
+      fetch: async () => { throw new Error("not used"); },
+    });
+    const first = await router.acquireIncomingBody!(6);
+    const order: string[] = [];
+    const secondPromise = router.acquireIncomingBody!(5).then(lease => {
+      order.push("second");
+      return lease;
+    });
+    const thirdPromise = router.acquireIncomingBody!(4).then(lease => {
+      order.push("third");
+      return lease;
+    });
+    await Bun.sleep(0);
+    expect(router.snapshot().resources).toMatchObject({
+      incomingBodyCapacityBytes: 10,
+      incomingBodyReservedBytes: 6,
+      incomingBodyQueued: 2,
+    });
+    expect(order).toEqual([]);
+
+    first.release();
+    const second = await within(secondPromise);
+    const third = await within(thirdPromise);
+    expect(order).toEqual(["second", "third"]);
+    expect(router.snapshot().resources).toMatchObject({
+      incomingBodyReservedBytes: 9,
+      incomingBodyQueued: 0,
+    });
+    const queuedAbort = new AbortController();
+    const queued = router.acquireIncomingBody!(2, queuedAbort.signal);
+    await Bun.sleep(0);
+    queuedAbort.abort(new Error("body-secret"));
+    const queuedFailure = await rejectedValue(queued);
+    expect(queuedFailure).toMatchObject({ name: "AbortError" });
+    expect(String(queuedFailure)).not.toContain("body-secret");
+    second.release();
+    third.release();
+    await expect(router.acquireIncomingBody!(11)).rejects.toMatchObject({ status: 413 });
+    router.close();
+  });
+
   it("posts a forced Responses stream and preserves frames plus authoritative final", async () => {
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
     const router = createForwardingRouter("http://127.0.0.1:19001", {
@@ -168,6 +313,35 @@ describe("Claude Code forwarding verifier", () => {
     router.close();
   });
 
+  it("forwards CR and mixed SSE with comments, multiline data, and split UTF-8", async () => {
+    const terminal = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: FINAL,
+    })}\n\n`;
+    const raw = ": ignored\revent: custom\r\ndata: 🚀\rdata: second\r\r\n" + terminal;
+    const router = createForwardingRouter("http://127.0.0.1:19013", {
+      fetch: async () => rawSseResponse(raw, 1),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: true,
+      });
+
+      expect(await Array.fromAsync(handle.events())).toEqual([
+        { event: "custom", data: "🚀\nsecond" },
+        { event: "response.completed", data: JSON.stringify({
+          type: "response.completed",
+          response: FINAL,
+        }) },
+      ]);
+      await expect(handle.final).resolves.toEqual(FINAL);
+    } finally {
+      router.close();
+    }
+  });
+
   it("settles a non-streaming final without requiring an event consumer", async () => {
     const router = createForwardingRouter("http://127.0.0.1:19006", {
       maxBufferedBytes: 64,
@@ -188,11 +362,23 @@ describe("Claude Code forwarding verifier", () => {
   });
 
   it("backpressures upstream pulls instead of buffering an SSE transcript", async () => {
-    const frames = completedFrames().map(([event, data]) => encodedFrame(event, data));
+    const pairs: Array<[string, unknown]> = [
+      ["response.output_text.delta", {
+        type: "response.output_text.delta",
+        delta: "a".repeat(1024),
+      }],
+      ["response.output_text.delta", {
+        type: "response.output_text.delta",
+        delta: "b".repeat(1024),
+      }],
+      completedFrames()[2]!,
+    ];
+    const frames = pairs.map(([event, data]) => encodedFrame(event, data));
+    const maxBufferedBytes = Math.max(...frames.map(frame => frame.byteLength));
     let index = 0;
     let pulls = 0;
     const router = createForwardingRouter("http://127.0.0.1:19002", {
-      maxBufferedBytes: 64,
+      maxBufferedBytes,
       fetch: async () => new Response(new ReadableStream<Uint8Array>({
         pull(controller) {
           pulls += 1;
@@ -222,6 +408,87 @@ describe("Claude Code forwarding verifier", () => {
     router.close();
   });
 
+  it("rejects a streamed event larger than the hard one MiB queue bound", async () => {
+    const oversized = ["response.output_text.delta", {
+      type: "response.output_text.delta",
+      delta: "x".repeat(1024 * 1024),
+    }] as [string, unknown];
+    const router = createForwardingRouter("http://127.0.0.1:19010", {
+      maxEventBytes: 2 * 1024 * 1024,
+      fetch: async () => sseResponse([oversized, completedFrames()[2]!], 64 * 1024),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: true,
+      });
+      const iterator = handle.events();
+      await expect(within(iterator.next())).resolves.toEqual({ value: undefined, done: true });
+      await expect(handle.final).rejects.toThrow("upstream event stream failed");
+    } finally {
+      router.close();
+    }
+  });
+
+  it("keeps an oversized completed terminal out of the queue and settles final", async () => {
+    const largeFinal = structuredClone(FINAL);
+    largeFinal.output[0]!.content[0]!.text = "z".repeat(1024 * 1024);
+    const delta: [string, unknown] = ["response.output_text.delta", {
+      type: "response.output_text.delta",
+      delta: "prefix",
+    }];
+    const router = createForwardingRouter("http://127.0.0.1:19011", {
+      maxEventBytes: 2 * 1024 * 1024,
+      fetch: async () => sseResponse([
+        delta,
+        ["response.completed", { type: "response.completed", response: largeFinal }],
+      ], 64 * 1024),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: true,
+      });
+      const events = await Array.fromAsync(handle.events());
+
+      expect(events.map(event => event.event)).toEqual(["response.output_text.delta"]);
+      await expect(handle.final).resolves.toEqual(largeFinal);
+      expect(handle.stats.frames).toBe(1);
+    } finally {
+      router.close();
+    }
+  });
+
+  it.each(["failed", "incomplete"] as const)(
+    "preserves an authoritative response.%s terminal and final",
+    async status => {
+      const final = { ...structuredClone(FINAL), status };
+      const event = `response.${status}`;
+      const router = createForwardingRouter("http://127.0.0.1:19017", {
+        fetch: async () => sseResponse([[
+          event,
+          { type: event, response: final },
+        ]]),
+      });
+      try {
+        const handle = await router.startRelay({
+          model: "gpt-5.6-sol",
+          input: "x",
+          stream: true,
+        });
+        expect(await Array.fromAsync(handle.events())).toEqual([{
+          event,
+          data: JSON.stringify({ type: event, response: final }),
+        }]);
+        await expect(handle.final).resolves.toEqual(final);
+      } finally {
+        router.close();
+      }
+    },
+  );
+
   it("rejects an oversized coalesced read chunk instead of retaining its transcript", async () => {
     const chunk = new TextEncoder().encode(completedFrames().map(([event, data]) => (
       `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -246,6 +513,44 @@ describe("Claude Code forwarding verifier", () => {
       });
       const failure = await within(rejectedValue(handle.final));
       expect(String(failure)).toContain("upstream event stream failed");
+    } finally {
+      router.close();
+    }
+  });
+
+  it("fails closed when one SSE event exceeds the parser segment cap", async () => {
+    const router = createForwardingRouter("http://127.0.0.1:19012", {
+      maxParserSegments: 4,
+      fetch: async () => sseResponse(completedFrames(), 1),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: false,
+      });
+      await expect(handle.final).rejects.toThrow("upstream event stream failed");
+    } finally {
+      router.close();
+    }
+  });
+
+  it("fails closed when one SSE event exceeds the parser total-byte cap", async () => {
+    const frame: [string, unknown] = ["response.output_text.delta", {
+      type: "response.output_text.delta",
+      delta: "x".repeat(256),
+    }];
+    const router = createForwardingRouter("http://127.0.0.1:19018", {
+      maxEventBytes: 128,
+      fetch: async () => sseResponse([frame], 32),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: false,
+      });
+      await expect(handle.final).rejects.toThrow("upstream event stream failed");
     } finally {
       router.close();
     }
@@ -286,6 +591,50 @@ describe("Claude Code forwarding verifier", () => {
     router.close();
   });
 
+  it("cancels upstream when iterator return happens before the first next", async () => {
+    const observed: { signal?: AbortSignal } = {};
+    let cancels = 0;
+    const router = createForwardingRouter("http://127.0.0.1:19014", {
+      fetch: async (_input, init) => {
+        if (init?.signal) observed.signal = init.signal;
+        return new Response(new ReadableStream<Uint8Array>({
+          pull() {
+            return new Promise<void>(() => {});
+          },
+          cancel() {
+            cancels += 1;
+          },
+        }, { highWaterMark: 0 }), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: true,
+      });
+      const iterator = handle.events();
+
+      await expect(iterator.return(undefined)).resolves.toEqual({ value: undefined, done: true });
+      await expect(iterator.return(new Error("return-secret") as never)).resolves.toEqual({
+        value: undefined,
+        done: true,
+      });
+      expect(observed.signal?.aborted).toBe(true);
+      expect(cancels).toBe(1);
+      await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+      const thrown = await rejectedValue(iterator.throw(new Error("token=must-not-leak")));
+      expect(thrown).toMatchObject({ name: "AbortError" });
+      expect(String(thrown)).not.toContain("must-not-leak");
+      await expect(handle.final).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      router.close();
+    }
+  });
+
   it("never exposes upstream transport or HTTP error details", async () => {
     const transportRouter = createForwardingRouter("http://127.0.0.1:19004", {
       fetch: async () => {
@@ -314,6 +663,56 @@ describe("Claude Code forwarding verifier", () => {
     httpRouter.close();
   });
 
+  it("cancels status bodies and preserves only safe retry headers", async () => {
+    let bodyCancels = 0;
+    let bodyPulls = 0;
+    const router = createForwardingRouter("http://127.0.0.1:19015", {
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull() {
+          bodyPulls += 1;
+        },
+        cancel() {
+          bodyCancels += 1;
+        },
+      }, { highWaterMark: 0 }), {
+        status: 429,
+        headers: {
+          "retry-after": "12",
+          "x-should-retry": "false",
+          "x-secret": "must-not-forward",
+        },
+      }),
+    });
+    try {
+      const failure = await rejectedValue(router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+      })) as { headers?: Headers };
+
+      expect(failure.headers?.get("retry-after")).toBe("12");
+      expect(failure.headers?.get("x-should-retry")).toBe("false");
+      expect(failure.headers?.get("x-secret")).toBeNull();
+      expect(bodyPulls).toBe(0);
+      expect(bodyCancels).toBe(1);
+    } finally {
+      router.close();
+    }
+
+    const unsafe = createForwardingRouter("http://127.0.0.1:19016", {
+      fetch: async () => new Response(null, {
+        status: 503,
+        headers: { "retry-after": "999999", "x-should-retry": "yes" },
+      }),
+    });
+    const unsafeFailure = await rejectedValue(unsafe.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x",
+    })) as { headers?: Headers };
+    expect(unsafeFailure.headers?.has("retry-after")).toBe(false);
+    expect(unsafeFailure.headers?.has("x-should-retry")).toBe(false);
+    unsafe.close();
+  });
+
   it("closes verifier-owned upgraded sockets without managing another listener", () => {
     const server = new EventEmitter();
     const tracker = trackVerifierUpgrades(server as never);
@@ -327,6 +726,31 @@ describe("Claude Code forwarding verifier", () => {
     server.emit("upgrade", {}, laterSocket, Buffer.alloc(0));
     expect(laterSocket.destroyed).toBe(false);
     laterSocket.destroy();
+  });
+
+  it("bounds normal-socket shutdown before destroying only verifier-owned sockets", async () => {
+    class HangingServer extends EventEmitter {
+      closeCalls = 0;
+      close(_callback?: (error?: Error) => void): this {
+        this.closeCalls += 1;
+        return this;
+      }
+    }
+    const server = new HangingServer();
+    const tracker = trackVerifierUpgrades(server as never);
+    const normalSocket = new PassThrough();
+    const upgradedSocket = new PassThrough();
+    const unrelatedSocket = new PassThrough();
+    server.emit("connection", normalSocket);
+    server.emit("upgrade", {}, upgradedSocket, Buffer.alloc(0));
+
+    await within(closeVerifierServer(server as never, tracker, 5), 100);
+
+    expect(server.closeCalls).toBe(1);
+    expect(normalSocket.destroyed).toBe(true);
+    expect(upgradedSocket.destroyed).toBe(true);
+    expect(unrelatedSocket.destroyed).toBe(false);
+    unrelatedSocket.destroy();
   });
 
   it("is import-safe and contains no process-management path", () => {

@@ -77,6 +77,26 @@ describe("project documentation", () => {
     expect(pkg.scripts["verify:claude-code"]).toBe("bun scripts/verify_claude_code.ts");
   });
 
+  it("uses a separate second-terminal Claude Code flow for the verifier", () => {
+    const verifierStart = readme.indexOf("bun run verify:claude-code");
+    const secondTerminal = readme.indexOf("In a second terminal", verifierStart);
+    const verifierBase = readme.indexOf(
+      '$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18788"',
+      secondTerminal,
+    );
+    const verifierKey = readme.indexOf(
+      '$env:ANTHROPIC_API_KEY = "ghostprov-local-verification"',
+      verifierBase,
+    );
+    const verifierClaude = readme.indexOf("claude", verifierKey);
+
+    expect(verifierStart).toBeGreaterThan(0);
+    expect(secondTerminal).toBeGreaterThan(verifierStart);
+    expect(verifierBase).toBeGreaterThan(secondTerminal);
+    expect(verifierKey).toBeGreaterThan(verifierBase);
+    expect(verifierClaude).toBeGreaterThan(verifierKey);
+  });
+
   it("provides stable verification scripts", () => {
     const unitScript = String(pkg.scripts["test:unit"]);
     const integrationScript = String(pkg.scripts["test:integration"]);

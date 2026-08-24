@@ -146,6 +146,14 @@ $env:GP_CLAUDE_VERIFY_UPSTREAM = "http://127.0.0.1:18787"
 bun run verify:claude-code
 ```
 
+In a second terminal, point Claude Code at the verifier rather than the production listener:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18788"
+$env:ANTHROPIC_API_KEY = "ghostprov-local-verification"
+claude
+```
+
 The verifier refuses listener ports `18787` and `8787`, non-loopback upstreams, credentials, paths, queries, fragments, and self-forwarding. It never enumerates, starts, stops, restarts, or signals the upstream process. Ctrl+C closes only the verifier listener and its outbound requests. Live Claude Code calls through this verifier belong to the separate live-verification task; automated tests import it without opening a listener or contacting the upstream.
 
 ## Codex WebSocket mode
