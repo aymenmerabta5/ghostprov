@@ -13,6 +13,7 @@
     "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
     "typecheck": "tsc --noEmit",
     "verify:live": "bun scripts/live_verify.ts",
+    "verify:claude-code": "bun scripts/verify_claude_code.ts",
     "verify:browserless": "bun scripts/probe_browserless_prism.ts",
     "create:test-projects": "bun scripts/create_test_projects.ts",
     "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",

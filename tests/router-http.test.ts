@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
 import { request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
+import { parseFrames } from "../src/relay/sse";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 
@@ -89,6 +90,69 @@ describe("router HTTP composition", () => {
     expect(image.status).toBe(200);
     expect(router.workloads.map(workload => workload.source)).toEqual(["http", "image", "image"]);
   });
+
+  it.each(["completed", "incomplete", "failed"] as const)(
+    "forwards one response.%s terminal without fabricating completed",
+    async status => {
+      const responseFinal = { ...final(`resp_${status}`), status };
+      const terminal = `response.${status}`;
+      const router = {
+        snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+        startRelay: async () => handle(responseFinal, [{
+          event: terminal,
+          data: JSON.stringify({
+            type: terminal,
+            sequence_number: 4,
+            response: responseFinal,
+          }),
+        }]),
+      };
+      const appResponse = await createGhostProvApp({ router }).request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+      });
+      const frames = parseFrames(await appResponse.text(), 0).frames;
+
+      expect(frames.map(frame => frame.event)).toEqual([terminal]);
+    },
+  );
+
+  it.each(["completed", "incomplete", "failed"] as const)(
+    "synthesizes a missing response.%s terminal with the next sequence",
+    async status => {
+      const responseFinal = { ...final(`resp_missing_${status}`), status };
+      const terminal = `response.${status}`;
+      const router = {
+        snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+        startRelay: async () => handle(responseFinal, [{
+          event: "response.output_text.delta",
+          data: JSON.stringify({
+            type: "response.output_text.delta",
+            sequence_number: 7,
+            delta: "x",
+          }),
+        }]),
+      };
+      const appResponse = await createGhostProvApp({ router }).request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+      });
+      const frames = parseFrames(await appResponse.text(), 0).frames;
+      const synthesized = JSON.parse(frames.at(-1)!.data);
+
+      expect(frames.map(frame => frame.event)).toEqual([
+        "response.output_text.delta",
+        terminal,
+      ]);
+      expect(synthesized).toEqual({
+        type: terminal,
+        sequence_number: 8,
+        response: responseFinal,
+      });
+    },
+  );
 
   it("reports aggregate capacity and sanitized runtime snapshots", async () => {
     const router = new FakeRouter();

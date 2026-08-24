@@ -13,38 +13,62 @@ export interface SseFrame {
   data: string;
 }
 
+function nextSseLine(region: string, start: number): {
+  line: string;
+  nextOffset: number;
+} | null {
+  for (let index = start; index < region.length; index += 1) {
+    const code = region.charCodeAt(index);
+    if (code === 0x0a) {
+      return { line: region.slice(start, index), nextOffset: index + 1 };
+    }
+    if (code === 0x0d) {
+      const crlf = region.charCodeAt(index + 1) === 0x0a;
+      return {
+        line: region.slice(start, index),
+        nextOffset: index + (crlf ? 2 : 1),
+      };
+    }
+  }
+  return null;
+}
+
 /** Split an SSE buffer region into complete frames; trailing partial frame is left unconsumed. */
 export function parseFrames(region: string, emitFrom: number): { frames: SseFrame[]; nextOffset: number } {
   const frames: SseFrame[] = [];
-  let start = emitFrom;
+  let cursor = emitFrom;
+  let nextOffset = emitFrom;
+  let event = "";
+  let dataLines: string[] = [];
   for (;;) {
-    const lf = region.indexOf("\n\n", start);
-    const crlf = region.indexOf("\r\n\r\n", start);
-    let idx = -1;
-    let delimiterLength = 0;
-    if (lf !== -1 && (crlf === -1 || lf < crlf)) {
-      idx = lf;
-      delimiterLength = 2;
-    } else if (crlf !== -1) {
-      idx = crlf;
-      delimiterLength = 4;
+    const parsed = nextSseLine(region, cursor);
+    if (!parsed) break;
+    cursor = parsed.nextOffset;
+    const line = parsed.line;
+    if (line.length === 0) {
+      if (dataLines.length > 0) {
+        frames.push({ event: event || "message", data: dataLines.join("\n") });
+      }
+      event = "";
+      dataLines = [];
+      nextOffset = cursor;
+      continue;
     }
-    if (idx === -1) break;
-    const chunk = region.slice(start, idx);
-    start = idx + delimiterLength;
-    let event = "message";
-    const dataLines: string[] = [];
-    for (const line of chunk.split(/\r?\n/)) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
-    }
-    if (dataLines.length) frames.push({ event, data: dataLines.join("\n") });
+    if (line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") dataLines.push(value);
   }
-  return { frames, nextOffset: start };
+  return { frames, nextOffset };
 }
 
 export function sseFrame(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
+  const encoded = typeof data === "string" ? data : JSON.stringify(data);
+  const lines = String(encoded).split(/\r\n|\r|\n/);
+  return `event: ${event}\n${lines.map(line => `data: ${line}\n`).join("")}\n`;
 }
 
 /**
