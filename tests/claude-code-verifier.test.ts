@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { parseFrames } from "../src/relay/sse";
+import { createGhostProvApp } from "../src/server/app";
 import {
   closeVerifierServer,
   createForwardingRouter,
@@ -234,6 +236,68 @@ describe("Claude Code forwarding verifier", () => {
     }
   });
 
+  it("rechecks a caller abort after queued permit admission before fetch", async () => {
+    let releaseController!: ReadableStreamDefaultController<Uint8Array>;
+    const fetchedInputs: string[] = [];
+    const router = createForwardingRouter("http://127.0.0.1:19019", {
+      fetch: async (_input, init) => {
+        const input = String(JSON.parse(String(init?.body)).input);
+        fetchedInputs.push(input);
+        if (input === "release-active") {
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              releaseController = controller;
+            },
+          }), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return pendingSseResponse(init?.signal);
+      },
+    });
+    const handles = await Promise.all(Array.from({ length: 128 }, (_, index) => (
+      router.startRelay({
+        model: "gpt-5.6-sol",
+        input: index === 0 ? "release-active" : `active-${index}`,
+        stream: false,
+      })
+    )));
+    const queuedAbort = new AbortController();
+    const queued = router.startRelay(
+      { model: "gpt-5.6-sol", input: "abort-during-acquire", stream: false },
+      { signal: queuedAbort.signal },
+    );
+    try {
+      await Bun.sleep(0);
+      expect(router.snapshot().queued).toBe(1);
+      releaseController.enqueue(encodedFrame("response.completed", {
+        type: "response.completed",
+        response: FINAL,
+      }));
+
+      await within(new Promise<void>(resolve => {
+        const abortOnceAdmitted = (): void => {
+          if (router.snapshot().queued === 0) {
+            queuedAbort.abort(new Error("token=must-not-leak"));
+            resolve();
+            return;
+          }
+          queueMicrotask(abortOnceAdmitted);
+        };
+        queueMicrotask(abortOnceAdmitted);
+      }));
+
+      const failure = await rejectedValue(queued);
+      expect(failure).toMatchObject({ name: "AbortError" });
+      expect(String(failure)).not.toContain("must-not-leak");
+      expect(fetchedInputs).not.toContain("abort-during-acquire");
+    } finally {
+      router.close();
+      await Promise.allSettled(handles.map(handle => handle.final));
+    }
+  });
+
   it("bounds aggregate incoming bodies with an abort-aware FIFO byte budget", async () => {
     const router = createForwardingRouter("http://127.0.0.1:19009", {
       maxIncomingBodyBytes: 10,
@@ -337,6 +401,39 @@ describe("Claude Code forwarding verifier", () => {
         }) },
       ]);
       await expect(handle.final).resolves.toEqual(FINAL);
+    } finally {
+      router.close();
+    }
+  });
+
+  it("dispatches a held-open CR-only terminal at the end of its chunk", async () => {
+    let bodyCancelled = false;
+    const raw = `event: response.completed\rdata: ${JSON.stringify({
+      type: "response.completed",
+      response: FINAL,
+    })}\r\r`;
+    const router = createForwardingRouter("http://127.0.0.1:19020", {
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(raw));
+        },
+        cancel() {
+          bodyCancelled = true;
+        },
+      }, { highWaterMark: 0 }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x",
+        stream: false,
+      });
+
+      await expect(within(handle.final)).resolves.toEqual(FINAL);
+      expect(bodyCancelled).toBe(true);
     } finally {
       router.close();
     }
@@ -456,6 +553,47 @@ describe("Claude Code forwarding verifier", () => {
       expect(events.map(event => event.event)).toEqual(["response.output_text.delta"]);
       await expect(handle.final).resolves.toEqual(largeFinal);
       expect(handle.stats.frames).toBe(1);
+    } finally {
+      router.close();
+    }
+  });
+
+  it("composes a skipped oversized terminal into the matching HTTP event", async () => {
+    const largeFinal = structuredClone(FINAL);
+    largeFinal.output[0]!.content[0]!.text = "q".repeat(1024 * 1024);
+    const router = createForwardingRouter("http://127.0.0.1:19021", {
+      maxEventBytes: 2 * 1024 * 1024,
+      fetch: async () => sseResponse([
+        ["response.output_text.delta", {
+          type: "response.output_text.delta",
+          sequence_number: 9,
+          delta: "prefix",
+        }],
+        ["response.completed", {
+          type: "response.completed",
+          sequence_number: 10,
+          response: largeFinal,
+        }],
+      ], 64 * 1024),
+    });
+    try {
+      const response = await createGhostProvApp({ router }).request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+      });
+      const frames = parseFrames(await response.text(), 0).frames;
+      const terminal = JSON.parse(frames.at(-1)!.data);
+
+      expect(frames.map(frame => frame.event)).toEqual([
+        "response.output_text.delta",
+        "response.completed",
+      ]);
+      expect(terminal).toEqual({
+        type: "response.completed",
+        sequence_number: 10,
+        response: largeFinal,
+      });
     } finally {
       router.close();
     }
@@ -754,10 +892,12 @@ describe("Claude Code forwarding verifier", () => {
   });
 
   it("is import-safe and contains no process-management path", () => {
-    const source = readFileSync(
-      resolve(import.meta.dirname, "..", "scripts", "verify_claude_code.ts"),
-      "utf8",
-    );
+    const scripts = resolve(import.meta.dirname, "..", "scripts");
+    const support = resolve(scripts, "claude-code-verifier");
+    const source = [
+      readFileSync(resolve(scripts, "verify_claude_code.ts"), "utf8"),
+      ...readdirSync(support).map(name => readFileSync(resolve(support, name), "utf8")),
+    ].join("\n");
     expect(source).toContain("if (import.meta.main)");
     expect(source).toContain('"127.0.0.1"');
     for (const forbidden of [

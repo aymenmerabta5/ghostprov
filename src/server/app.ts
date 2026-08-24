@@ -52,6 +52,40 @@ const REASONING_DESCRIPTIONS = {
   ultra: "Maximum reasoning with automatic task delegation",
 } as const;
 
+const RESPONSE_TERMINAL_EVENTS = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
+function terminalEventForFinal(final: unknown): string {
+  if (!final || typeof final !== "object" || Array.isArray(final)) {
+    throw new Error("Responses relay returned a malformed final response");
+  }
+  const status = (final as Record<string, unknown>).status;
+  if (status === "completed" || status === "incomplete" || status === "failed") {
+    return `response.${status}`;
+  }
+  throw new Error("Responses relay returned an invalid final status");
+}
+
+function nextResponseSequence(data: string, current: number | null): number | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return current;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return current;
+  const sequence = (value as Record<string, unknown>).sequence_number;
+  if (!Number.isSafeInteger(sequence) || Number(sequence) < 0 ||
+      Number(sequence) >= Number.MAX_SAFE_INTEGER) {
+    return current;
+  }
+  const next = Number(sequence) + 1;
+  return current === null ? next : Math.max(current, next);
+}
+
 function codexModel(input: {
   slug: string;
   displayName: string;
@@ -213,16 +247,23 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           const encoder = new TextEncoder();
           const push = (value: string) => controller.enqueue(encoder.encode(value));
           let closed = false;
-          let sawCompleted = false;
+          let sawTerminal = false;
+          let nextSequence: number | null = null;
           const keepAlive = setInterval(() => { if (!closed) push(": keepalive\n\n"); }, keepAliveMs);
           try {
             for await (const frame of handle.events()) {
-              if (frame.event === "response.completed") sawCompleted = true;
+              if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) sawTerminal = true;
+              nextSequence = nextResponseSequence(frame.data, nextSequence);
               push(sseFrame(frame.event, frame.data));
             }
-            if (!sawCompleted) {
+            if (!sawTerminal) {
               const final = await handle.final;
-              push(sseFrame("response.completed", { type: "response.completed", response: final }));
+              const event = terminalEventForFinal(final);
+              push(sseFrame(event, {
+                type: event,
+                ...(nextSequence === null ? {} : { sequence_number: nextSequence }),
+                response: final,
+              }));
             }
           } catch (error) {
             push(sseFrame("error", apiErrorEvent(error)));
