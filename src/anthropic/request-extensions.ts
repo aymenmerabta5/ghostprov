@@ -92,11 +92,9 @@ export function validateContextManagement(
   value: unknown,
   limits: AnthropicRequestLimits,
 ): void {
-  if (value === undefined) return;
+  if (value === undefined || value === null) return;
   const config = requireRecord(value, "context_management");
-  if (!hasOwn(config, "edits")) {
-    throw new AnthropicRequestError(400, "context_management.edits is required");
-  }
+  if (!hasOwn(config, "edits")) return;
   const edits = requireArray(config.edits, "context_management.edits", limits);
   for (let index = 0; index < edits.length; index += 1) {
     const name = `context_management.edits[${index}]`;

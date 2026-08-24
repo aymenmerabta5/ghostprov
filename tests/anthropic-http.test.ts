@@ -305,8 +305,6 @@ describe("Anthropic HTTP routes", () => {
 
   it("validates current context-management edits for generation and count", async () => {
     const invalid = [
-      null,
-      {},
       { edits: "not-an-array" },
       { edits: [{ type: "unknown_edit" }] },
       { edits: [{ type: "clear_tool_uses_20250919", clear_tool_inputs: ["Read", 7] }] },
@@ -357,6 +355,42 @@ describe("Anthropic HTTP routes", () => {
     });
     expect(response.status).toBe(200);
     expect((await response.json() as any).context_management).toEqual({ applied_edits: [] });
+  });
+
+  it("accepts omitted, null, and empty context management as no-op", async () => {
+    for (const contextManagement of [undefined, null, {}]) {
+      const messageRouter = new FakeRouter();
+      const countRouter = new FakeRouter();
+      const override = contextManagement === undefined
+        ? {}
+        : { context_management: contextManagement };
+      const message = await createGhostProvApp({ router: messageRouter }).request(
+        "/v1/messages?beta=true",
+        {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify(messageRequest(override)),
+        },
+      );
+      const count = await createGhostProvApp({ router: countRouter }).request(
+        "/v1/messages/count_tokens?beta=true",
+        {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            messages: [],
+            ...override,
+          }),
+        },
+      );
+
+      expect(message.status).toBe(200);
+      expect(count.status).toBe(200);
+      expect(messageRouter.calls).toHaveLength(1);
+      expect(countRouter.calls).toHaveLength(0);
+      expect(await count.json()).toMatchObject({ context_management: null });
+    }
   });
 
   it("validates and strips prompt cache controls for generation and count", async () => {
