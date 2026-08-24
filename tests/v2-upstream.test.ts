@@ -177,6 +177,36 @@ describe("DirectResponsesClient", () => {
     });
   });
 
+  it("converts a streamed error event into a definitive rate-limit failure", async () => {
+    const events: SseFrame[] = [];
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("api-secret"),
+      fetch: async () => sseResponse([["error", {
+        type: "error",
+        message: FULL_TPM_MESSAGE,
+        code: "rate_limit_exceeded",
+      }]]),
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onEvent: async event => { events.push(event); },
+    })).rejects.toMatchObject({
+      message: FULL_TPM_MESSAGE,
+      ambiguous: false,
+      status: 429,
+      code: "rate_limit_exceeded",
+      rateLimit: {
+        retryAfterMs: 914,
+        limitTokens: 40_000_000,
+        remainingTokens: 0,
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
   it("keeps a beforeFetch failure non-ambiguous and never calls fetch", async () => {
     let calls = 0;
     const client = new DirectResponsesClient({

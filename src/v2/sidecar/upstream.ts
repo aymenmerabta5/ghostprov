@@ -91,6 +91,50 @@ function rateLimitTransportError(
   );
 }
 
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/** OpenAI may terminate a 200 SSE response with `event: error` instead of response.failed. */
+function streamedUpstreamError(
+  frame: SseFrame,
+  headerHint?: RateLimitHint,
+): UpstreamExecutionError | null {
+  if (frame.event !== "error") return null;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(frame.data);
+  } catch {
+    return new UpstreamExecutionError(
+      "Upstream Responses stream emitted an invalid error event",
+      "upstream_error",
+      false,
+    );
+  }
+  const rateLimited = rateLimitTransportError(decoded, headerHint);
+  if (rateLimited) return rateLimited;
+  const root = record(decoded);
+  const nested = record(root?.error);
+  const candidate = nested ?? root;
+  const message = sanitizeMessage(
+    candidate?.message,
+    "Upstream Responses stream reported an error",
+  );
+  const status = typeof root?.status === "number" &&
+    Number.isInteger(root.status) && root.status >= 400 && root.status <= 599
+    ? root.status
+    : undefined;
+  return new UpstreamExecutionError(
+    message,
+    safeCode(candidate?.code ?? candidate?.type, "upstream_error"),
+    false,
+    status,
+    rateLimitHintFromError(decoded, headerHint),
+  );
+}
+
 function parseBody(bytes: Uint8Array): Record<string, unknown> {
   let decoded: unknown;
   try {
@@ -235,6 +279,8 @@ export class DirectResponsesClient {
             responseRateLimit,
           );
         }
+        const upstreamError = streamedUpstreamError(frame, responseRateLimit);
+        if (upstreamError) throw upstreamError;
         transcript.append(frame);
         await input.onEvent(frame);
       }
