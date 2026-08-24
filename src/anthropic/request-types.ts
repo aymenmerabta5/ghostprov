@@ -25,7 +25,7 @@ export type ResponsesMessageInput =
   | {
     type: "message";
     role: "assistant";
-    content: ResponsesInputText[];
+    content: string;
   }
   | {
     type: "message";

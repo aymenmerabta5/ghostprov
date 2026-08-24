@@ -378,15 +378,15 @@ function appendAssistantMessage(
   history: ToolHistory,
   limits: AnthropicRequestLimits,
 ): string[] {
-  const pendingText: ResponsesInputText[] = [];
+  const pendingText: string[] = [];
   const callsInTurn = new Set<string>();
   const flushAssistantText = (): void => {
     if (!pendingText.length) return;
-    input.push({ type: "message", role: "assistant", content: pendingText.splice(0) });
+    input.push({ type: "message", role: "assistant", content: pendingText.splice(0).join("") });
   };
 
   if (typeof content === "string") {
-    pendingText.push({ type: "input_text", text: content });
+    pendingText.push(content);
     flushAssistantText();
     return [];
   }
@@ -397,10 +397,7 @@ function appendAssistantMessage(
     const name = `${messageName}.content[${index}]`;
     const type = blockType(block, name);
     if (type === "text") {
-      pendingText.push({
-        type: "input_text",
-        text: requireString(block, "text", `${name} text`, true),
-      });
+      pendingText.push(requireString(block, "text", `${name} text`, true));
     } else if (type === "thinking") {
       flushAssistantText();
       requireString(block, "thinking", `${name} thinking`, true);

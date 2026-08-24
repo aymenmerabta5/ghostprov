@@ -21,14 +21,14 @@ const OPTIONS = {
 const typedAssistantItem: ResponsesInputItem = {
   type: "message",
   role: "assistant",
-  content: [{ type: "input_text", text: "history" }],
+  content: "history",
 };
 
 const invalidTypedAssistantItem: ResponsesInputItem = {
   type: "message",
   role: "assistant",
-  // @ts-expect-error Responses easy-input assistant history does not accept output_text.
-  content: [{ type: "output_text", text: "history" }],
+  // @ts-expect-error Live GPT Responses rejects input_text arrays for assistant easy-input history.
+  content: [{ type: "input_text", text: "history" }],
 };
 
 void typedAssistantItem;
@@ -116,7 +116,7 @@ describe("Anthropic request current contracts", () => {
     }), "system turn intervened before pending tool_result blocks");
   });
 
-  it("uses exact Responses easy-input text parts for assistant history", () => {
+  it("uses the live-compatible Responses string form for assistant history", () => {
     const body = translate(request({
       messages: [
         { role: "user", content: "hello" },
@@ -134,10 +134,7 @@ describe("Anthropic request current contracts", () => {
     expect(body.input).toContainEqual({
       type: "message",
       role: "assistant",
-      content: [
-        { type: "input_text", text: "first" },
-        { type: "input_text", text: "second" },
-      ],
+      content: "firstsecond",
     });
     expect(JSON.stringify(body.input)).not.toContain("output_text");
   });
@@ -223,10 +220,7 @@ describe("Anthropic request current contracts", () => {
       {
         type: "message",
         role: "assistant",
-        content: [
-          { type: "input_text", text: "three" },
-          { type: "input_text", text: "four" },
-        ],
+        content: "threefour",
       },
       {
         type: "message",

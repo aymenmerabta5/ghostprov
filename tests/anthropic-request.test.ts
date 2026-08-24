@@ -199,7 +199,7 @@ describe("Anthropic request translation", () => {
     ]);
     expect(input[1]).toMatchObject({
       role: "assistant",
-      content: [{ type: "input_text", text: "before" }],
+      content: "before",
     });
     expect(input[2]).toEqual({
       type: "reasoning",
@@ -209,15 +209,15 @@ describe("Anthropic request translation", () => {
     });
     expect(input[3]).toMatchObject({
       role: "assistant",
-      content: [{ type: "input_text", text: "between" }],
+      content: "between",
     });
     expect(input[5]).toMatchObject({
       role: "assistant",
-      content: [{ type: "input_text", text: "after" }],
+      content: "after",
     });
     expect(input[6]).toMatchObject({
       role: "assistant",
-      content: [{ type: "input_text", text: "tail" }],
+      content: "tail",
     });
     expect(input[7]).toMatchObject({ type: "function_call_output", call_id: "call_order" });
     expect(input[8]).toMatchObject({
