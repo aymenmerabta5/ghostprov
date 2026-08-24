@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { normalizeApiError } from "../http/errors";
 
 export type AnthropicErrorEnvelope = {
@@ -18,6 +19,10 @@ export class AnthropicRequestError extends Error {
     super(message);
     this.name = "AnthropicRequestError";
   }
+}
+
+export function newAnthropicRequestId(): string {
+  return `req_${randomUUID().replaceAll("-", "")}`;
 }
 
 export function anthropicErrorType(status: number): string {

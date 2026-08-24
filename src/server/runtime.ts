@@ -3,6 +3,12 @@ import type { Hono } from "hono";
 import { writeFetchResponse } from "../http/adapter";
 import { collectRequestBody, contentLengthExceeds } from "../http/body";
 import { ApiError, apiErrorResponse } from "../http/errors";
+import {
+  AnthropicRequestError,
+  anthropicErrorResponse,
+  newAnthropicRequestId,
+} from "../anthropic/errors";
+import { DEFAULT_ANTHROPIC_REQUEST_LIMITS } from "../anthropic/request";
 import { attachResponsesWebSocket } from "../ws/server";
 import type { RouterLike } from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
@@ -14,6 +20,40 @@ export interface GhostProvServerOptions {
   candidate?: boolean;
   maxBodyBytes?: number;
   webSocketTelemetry?: WebSocketTelemetry;
+}
+
+function requestPath(value: string | undefined): string {
+  try {
+    return new URL(value ?? "/", "http://ghostprov.local").pathname;
+  } catch {
+    return (value ?? "/").split("?", 1)[0];
+  }
+}
+
+function isAnthropicRequestPath(path: string): boolean {
+  return path === "/v1/messages" || path === "/v1/messages/count_tokens";
+}
+
+export function requestBodyLimitForUrl(value: string | undefined, sharedLimit: number): number {
+  return isAnthropicRequestPath(requestPath(value))
+    ? Math.min(sharedLimit, DEFAULT_ANTHROPIC_REQUEST_LIMITS.inboundBytes)
+    : sharedLimit;
+}
+
+function bodyTooLarge(maxBodyBytes: number): ApiError {
+  return new ApiError(
+    413,
+    `Request body exceeds the configured ${maxBodyBytes}-byte limit.`,
+    { type: "invalid_request_error", param: "body", code: "request_too_large" },
+  );
+}
+
+function requestErrorResponse(error: unknown, anthropic: boolean): Response {
+  if (!anthropic) return apiErrorResponse(error);
+  const normalized = error instanceof ApiError && error.status === 413
+    ? new AnthropicRequestError(413, error.message, "request_too_large")
+    : error;
+  return anthropicErrorResponse(normalized, newAnthropicRequestId());
 }
 
 export function createGhostProvServer(options: GhostProvServerOptions): Server {
@@ -29,6 +69,8 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     request.once("aborted", abortRelay);
     response.once("close", abortOnIncompleteClose);
     void (async () => {
+      const path = requestPath(request.url);
+      const anthropicPath = isAnthropicRequestPath(path);
       try {
         const host = request.headers.host ?? `127.0.0.1:${options.port}`;
         const headers = new Headers();
@@ -40,14 +82,13 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
         try {
           let body: Uint8Array | undefined;
           if (request.method !== "GET" && request.method !== "HEAD") {
-            const maxBodyBytes = options.maxBodyBytes ?? 64 * 1024 ** 2;
+            const maxBodyBytes = requestBodyLimitForUrl(
+              request.url,
+              options.maxBodyBytes ?? 64 * 1024 ** 2,
+            );
             if (contentLengthExceeds(request.headers["content-length"], maxBodyBytes)) {
               request.resume();
-              fetchResponse = apiErrorResponse(new ApiError(
-                413,
-                `Request body exceeds the configured ${maxBodyBytes}-byte limit.`,
-                { type: "invalid_request_error", param: "body", code: "request_too_large" },
-              ));
+              fetchResponse = requestErrorResponse(bodyTooLarge(maxBodyBytes), anthropicPath);
               await writeFetchResponse(response, fetchResponse);
               return;
             }
@@ -70,6 +111,9 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
           bodyLease?.release();
         }
         await writeFetchResponse(response, fetchResponse);
+      } catch (error) {
+        if (response.destroyed || response.headersSent) throw error;
+        await writeFetchResponse(response, requestErrorResponse(error, anthropicPath));
       } finally {
         request.off("aborted", abortRelay);
         response.off("close", abortOnIncompleteClose);

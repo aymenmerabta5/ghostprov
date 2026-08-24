@@ -249,6 +249,7 @@ The isolated suite includes:
 
 - `tests/account-session.test.ts`
 - `tests/anthropic-foundations.test.ts`
+- `tests/anthropic-http.test.ts`
 - `tests/anthropic-request-contract.test.ts`
 - `tests/anthropic-request.test.ts`
 - `tests/anthropic-response-stop.test.ts`
@@ -260,6 +261,7 @@ The isolated suite includes:
 - `tests/anthropic-stream-protocol.test.ts`
 - `tests/anthropic-stream-safety.test.ts`
 - `tests/anthropic-stream.test.ts`
+- `tests/anthropic-token-count.test.ts`
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`
 - `tests/daemon-controller.test.ts`

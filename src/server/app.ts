@@ -4,13 +4,18 @@ import { sseFrame, SSE_HEADERS } from "../relay/sse";
 import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
 import type { ImageCompatOptions } from "../images/compat";
+import { registerAnthropicRoutes } from "../anthropic/routes";
+import {
+  anthropicModelsFromEnv,
+  type AnthropicModelOptions,
+} from "../anthropic/model";
 
 export interface RouterLike {
   startRelay(
     body: Record<string, unknown>,
     options?: {
       clientId?: string;
-      source?: "http" | "websocket" | "image" | "internal";
+      source?: "http" | "websocket" | "image" | "anthropic" | "internal";
       signal?: AbortSignal;
     },
   ): Promise<RunHandle>;
@@ -28,6 +33,7 @@ export interface RouterLike {
 export interface GhostProvAppOptions {
   router: RouterLike;
   imageOptions?: ImageCompatOptions;
+  anthropicModels?: AnthropicModelOptions;
   keepAliveMs?: number;
 }
 
@@ -245,6 +251,16 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     startRelay: (body, signal) => options.router.startRelay(body, {
       source: "image",
       clientId: "images",
+      signal,
+    }),
+  });
+
+  registerAnthropicRoutes(app, {
+    keepAliveMs,
+    models: options.anthropicModels ?? anthropicModelsFromEnv(),
+    startRelay: (body, signal, clientId) => options.router.startRelay(body, {
+      source: "anthropic",
+      clientId,
       signal,
     }),
   });

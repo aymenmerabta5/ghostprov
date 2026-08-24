@@ -11,7 +11,7 @@ import { observabilityEvent, type JsonValue } from "../observability/events";
 import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 
-export type RelaySource = "http" | "websocket" | "image" | "internal";
+export type RelaySource = "http" | "websocket" | "image" | "anthropic" | "internal";
 
 export interface StartRelayOptions {
   clientId?: string;
