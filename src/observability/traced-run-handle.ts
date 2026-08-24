@@ -23,7 +23,11 @@ function errorFields(error: unknown): Record<string, JsonValue> {
     : {};
   return {
     error_name: error instanceof Error ? error.name : "Error",
-    error_kind: typeof value.kind === "string" ? value.kind : null,
+    error_kind: typeof value.kind === "string"
+      ? value.kind
+      : typeof value.code === "string"
+        ? value.code
+        : null,
     status: typeof value.status === "number" ? value.status : null,
     error_message: sanitizeDiagnosticMessage(
       error instanceof Error ? error.message : error,
@@ -70,7 +74,8 @@ export function traceRunHandle(
           stage: "terminal",
           ...errorFields(error),
           committed: true,
-          quarantined: (error as any)?.kind === "ambiguous",
+          quarantined: (error as any)?.ambiguous === true ||
+            (error as any)?.kind === "ambiguous",
           retry_count: context.retryCount,
         }), "terminal");
       }

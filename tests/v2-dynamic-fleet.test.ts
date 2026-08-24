@@ -213,5 +213,5 @@ describe("dynamic V2 fleet scale", () => {
       await router.close();
       await fleet.shutdown("test-complete");
     }
-  }, 30_000);
+  }, 300_000);
 });

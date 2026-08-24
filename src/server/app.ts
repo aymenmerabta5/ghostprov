@@ -27,6 +27,7 @@ export interface RouterLike {
     queued: number;
     runtimes: unknown[];
     resources: unknown;
+    rateLimit?: unknown;
   };
 }
 
@@ -211,6 +212,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       queued: snapshot.queued,
       runtimes: snapshot.runtimes,
       resources: snapshot.resources,
+      rateLimit: snapshot.rateLimit ?? null,
     });
   });
 
@@ -226,6 +228,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     ],
     models: CODEX_MODELS,
   }));
+
 
   app.post("/v1/responses", async c => {
     let body: Record<string, unknown>;

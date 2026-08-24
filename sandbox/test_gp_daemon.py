@@ -2,6 +2,7 @@ import base64
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -75,6 +76,19 @@ class DaemonProtocolTests(unittest.TestCase):
             original,
         )
 
+    def test_generation_fence_accepts_only_the_owning_daemon(self):
+        previous = self.daemon.GENERATION
+        try:
+            self.daemon.GENERATION = 42
+            owned = {"model": "gpt-5.6-sol", "_ghostprov_generation": 42}
+            stale = {"model": "gpt-5.6-sol", "_ghostprov_generation": 41}
+            self.assertTrue(self.daemon.consume_generation_fence(owned))
+            self.assertFalse(self.daemon.consume_generation_fence(stale))
+            self.assertNotIn("_ghostprov_generation", owned)
+            self.assertNotIn("_ghostprov_generation", stale)
+        finally:
+            self.daemon.GENERATION = previous
+
     def test_v63_raw_and_gzip_round_trip(self):
         self.publish_and_assemble("roundtrip-raw", encoded=False)
         self.publish_and_assemble("roundtrip-gzip", encoded=True)
@@ -145,6 +159,67 @@ class DaemonProtocolTests(unittest.TestCase):
             self.assertFalse(path.exists())
         finally:
             self.daemon.write_slot_failed = original_writer
+
+    def test_rate_limit_is_returned_verbatim_without_a_sandbox_retry(self):
+        message = (
+            "Rate limit reached for gpt-5.6-sol in organization org-test on "
+            "tokens per min (TPM): Limit 40000000, Used 40000000, "
+            "Requested 609930. Please try again in 914ms."
+        )
+        body = json.dumps({
+            "error": {
+                "message": message,
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+            }
+        })
+        calls = []
+        failures = []
+        original_urlopen = self.daemon.urllib.request.urlopen
+        previous_base = os.environ.get("OPENAI_BASE_URL")
+        previous_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_BASE_URL"] = "https://openai.test/v1"
+        os.environ["OPENAI_API_KEY"] = "test-key"
+
+        def limited(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise self.daemon.urllib.error.HTTPError(
+                "https://openai.test/v1/responses",
+                429,
+                "Too Many Requests",
+                {"retry-after": "0.914"},
+                io.BytesIO(body.encode("utf-8")),
+            )
+
+        try:
+            self.daemon.urllib.request.urlopen = limited
+            job_text = json.dumps({
+                "model": "gpt-5.6-sol",
+                "_ghostprov_generation": self.daemon.GENERATION,
+            })
+            worker = self.daemon.SlotWorker(
+                1,
+                pathlib.Path(self.temp.name) / "job_s1.json",
+                job_text,
+            )
+            worker.write_failed = lambda ack, code, value: failures.append(
+                (ack, code, value)
+            )
+
+            self.assertFalse(worker.process(job_text, worker.ack))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(failures, [(worker.ack, "rate_limited_429", body)])
+            self.assertIn(message, failures[0][2])
+        finally:
+            self.daemon.urllib.request.urlopen = original_urlopen
+            for key, value in (
+                ("OPENAI_BASE_URL", previous_base),
+                ("OPENAI_API_KEY", previous_key),
+            ):
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

@@ -13,6 +13,21 @@ const SANDBOX = parseProvisionedSandbox({
   sandbox_id: "sandbox-a",
 });
 
+function sandboxCredential(
+  token: string,
+  sessionId?: string,
+  sandboxId = "sandbox-a",
+  firstSeenAtMs?: number,
+) {
+  return parseProvisionedSandbox({
+    url: "/s/sandboxes/proxy",
+    token,
+    sandbox_id: sandboxId,
+    sandbox_session_id: sessionId,
+    sandbox_session_first_seen_at_ms: firstSeenAtMs,
+  });
+}
+
 class FakeAccount implements AccountRequestClient {
   calls: Array<{ path: string; method: string; headers: Headers; json: unknown }> = [];
   activeZip = 0;
@@ -59,6 +74,91 @@ describe("SandboxGateway", () => {
     expect(account.calls[0].path).toBe("/s/sandboxes/proxy/heartbeat");
     expect(account.calls[0].headers.get("x-crixet-sandbox-token")).toBe("sandbox-A");
     expect(result).toMatchObject({ ok: true, status: 200, sessionId: "session-1" });
+  });
+
+  it("learns the effective session ID from a successful heartbeat", async () => {
+    const account = new FakeAccount(() => Response.json({ ok: true }, {
+      headers: { "x-session-id": "session-from-heartbeat" },
+    }));
+    const gateway = new SandboxGateway({ projectId: PROJECT, account, sandbox: SANDBOX });
+
+    await gateway.heartbeat();
+    const rotated = gateway.rotateSameSession(sandboxCredential(
+      "sandbox-B",
+      "session-from-heartbeat",
+    ));
+    await gateway.fetchText("after-rotation");
+
+    expect(rotated).toBe(true);
+    expect(account.calls.at(-1)?.headers.get("x-crixet-sandbox-token")).toBe("sandbox-B");
+  });
+
+  it("fails closed when a successful heartbeat silently changes session", async () => {
+    const account = new FakeAccount(() => Response.json({ ok: true }, {
+      headers: { "x-session-id": "session-2" },
+    }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: sandboxCredential("sandbox-A", "session-1"),
+    });
+
+    await expect(gateway.heartbeat()).resolves.toMatchObject({
+      ok: false,
+      status: 409,
+      sessionId: "session-2",
+    });
+    expect(gateway.rotateSameSession(
+      sandboxCredential("sandbox-B", "session-2"),
+    )).toBe(false);
+  });
+
+  it("keeps an in-flight credential snapshot and uses a rotation on later requests", async () => {
+    let enterFirst!: () => void;
+    let releaseFirst!: () => void;
+    const firstEntered = new Promise<void>(resolve => { enterFirst = resolve; });
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let requests = 0;
+    const account = new FakeAccount(async () => {
+      requests++;
+      if (requests === 1) {
+        enterFirst();
+        await firstGate;
+      }
+      return new Response("ok");
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: sandboxCredential("sandbox-old", "session-1", "sandbox-a", 1_000),
+    });
+
+    const inFlight = gateway.fetchText("slow");
+    await firstEntered;
+    expect(gateway.rotateSameSession(
+      sandboxCredential("sandbox-new", "session-1", "sandbox-a", 1_000),
+    )).toBe(true);
+    releaseFirst();
+    await inFlight;
+    await gateway.fetchText("later");
+
+    expect(account.calls[0].headers.get("x-crixet-sandbox-token")).toBe("sandbox-old");
+    expect(account.calls[1].headers.get("x-crixet-sandbox-token")).toBe("sandbox-new");
+  });
+
+  it("rejects rotation when session identity is missing, mismatched, or conflicting", () => {
+    const unknown = new SandboxGateway({ projectId: PROJECT, account: new FakeAccount(() => new Response()), sandbox: SANDBOX });
+    expect(unknown.rotateSameSession(sandboxCredential("candidate", "session-1"))).toBe(false);
+
+    const known = new SandboxGateway({
+      projectId: PROJECT,
+      account: new FakeAccount(() => new Response()),
+      sandbox: sandboxCredential("current", "session-1", "sandbox-a", 1_000),
+    });
+    expect(known.rotateSameSession(sandboxCredential("candidate"))).toBe(false);
+    expect(known.rotateSameSession(sandboxCredential("candidate", "session-2"))).toBe(false);
+    expect(known.rotateSameSession(sandboxCredential("candidate", "session-1", "sandbox-b", 1_000))).toBe(false);
+    expect(known.rotateSameSession(sandboxCredential("candidate", "session-1", "sandbox-a", 2_000))).toBe(false);
   });
 
   it("coalesces named ZIP reads and extracts only requested files", async () => {

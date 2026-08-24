@@ -1,5 +1,5 @@
 import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
-import type { MachineProbe } from "../core/ports";
+import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
 import { FleetManifestStore } from "../fleet/manifest";
 import { YDocProjectInspector } from "../fleet/project-inspector";
@@ -10,6 +10,7 @@ import type {
 import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
 import { PrismProvisioningClient } from "../prism/provisioning-client";
+import { FleetRecoveryCoordinator } from "../prism/recovery-coordinator";
 import {
   PrismSessionManager,
   type ResolvedPrismIdentity,
@@ -19,6 +20,7 @@ import {
   type CpuTransformPoolSnapshot,
 } from "../router/cpu-transform-pool";
 import { ResourceGovernor, SystemMachineProbe } from "../router/resource-governor";
+import { ModelRateLimitGates } from "../router/rate-limit-gate";
 import { MultiSandboxRouter } from "../router/router";
 import { SandboxGateway } from "../sandbox/gateway";
 import { SandboxHeartbeat } from "../sandbox/heartbeat";
@@ -28,6 +30,10 @@ import {
   v1DaemonBuild,
 } from "../sandbox/managed-v1-runtime";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
+import {
+  RecoveryPermitPool,
+  SupervisedSandboxRuntime,
+} from "../sandbox/supervised-runtime";
 import { SandboxYDoc } from "../sandbox/ydoc";
 import { YSweetAwarenessChannel } from "../v2/awareness/y-sweet-channel";
 import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
@@ -45,7 +51,14 @@ import {
   createObservabilityLogger,
   type LoggerLike,
 } from "../observability/logger";
-import { observabilityEvent } from "../observability/events";
+import {
+  normalizeSandboxRecoveryCause,
+  normalizeSandboxRecoveryErrorKind,
+  normalizeSandboxRecoveryErrorName,
+  normalizeSandboxRecoveryOperation,
+  observabilityEvent,
+  recoveryObservabilityEvent,
+} from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
 import { WebSocketTelemetry } from "../ws/telemetry";
 
@@ -59,6 +72,7 @@ export interface BrowserlessSystemServer {
 
 export interface BrowserlessSessionManager {
   resolve(signal?: AbortSignal): Promise<ResolvedPrismIdentity>;
+  revalidate?(signal?: AbortSignal): Promise<ResolvedPrismIdentity>;
   close(): Promise<void>;
 }
 
@@ -105,6 +119,17 @@ export interface BrowserlessSystem {
   close(): Promise<void>;
 }
 
+function rateLimitScopeResolver(
+  groups: readonly (readonly string[])[],
+): (model: string) => string {
+  const scopes = new Map<string, string>();
+  for (const [index, group] of groups.entries()) {
+    const scope = `shared:${index + 1}`;
+    for (const model of group) scopes.set(model, scope);
+  }
+  return model => scopes.get(model) ?? model;
+}
+
 function defaultRuntimeFactory(options: {
   config: ReturnType<typeof resolveMultiSandboxConfig>;
   identity: ResolvedPrismIdentity;
@@ -112,8 +137,23 @@ function defaultRuntimeFactory(options: {
   governor: ResourceGovernor;
   cpuPool: BrowserlessCpuPool;
   assets: V2SidecarAssets | null;
+  nextLeaderGeneration(projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"]): Promise<number>;
+  recoveryCoordinator: FleetRecoveryCoordinator;
+  revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
+  logger: LoggerLike;
 }): ManagedRuntimeFactory {
-  const { config, identity, provisioning, governor, cpuPool, assets } = options;
+  const {
+    config,
+    identity,
+    provisioning,
+    governor,
+    cpuPool,
+    assets,
+    nextLeaderGeneration,
+    recoveryCoordinator,
+    revalidateAccount,
+    logger,
+  } = options;
   const needsV1 = config.transport === "v1" || (
     config.transport === "auto" && identity.kind === "authenticated"
   );
@@ -124,6 +164,7 @@ function defaultRuntimeFactory(options: {
     projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"];
     workerIndex: number;
     leaderGeneration: number;
+    initialSandbox?: import("../prism/protocol").ProvisionedSandbox;
   }): RoutableSandboxRuntime => {
     if (!assets) throw new Error("V2 sidecar assets are unavailable");
     const { projectId, workerIndex, leaderGeneration } = input;
@@ -137,6 +178,23 @@ function defaultRuntimeFactory(options: {
       transportReservationBytes: config.v2TransportReservationBytes,
       maxResponseBytes: config.v2ResponseMaxBytes,
       ySweetRefreshMs: config.v2YSweetRefreshMs,
+      initialSandbox: input.initialSandbox,
+      acquireSandboxForAuth: (status, signal) => acquireSandboxForAuth(
+        projectId,
+        status,
+        signal,
+      ),
+      onCredentialRefresh: (outcome, status) => {
+        logger.emit(recoveryObservabilityEvent("sandbox.credential_refresh", {
+          project_id: projectId,
+          worker_index: workerIndex,
+          transport: "v2",
+          cause: "credentials",
+          operation: "credential_refresh",
+          status,
+          credential_refresh_outcome: outcome,
+        }), "progress");
+      },
       gzip: bytes => cpuPool.gzip!(bytes),
       createGateway: sandbox => new SandboxGateway({
         projectId,
@@ -146,8 +204,11 @@ function defaultRuntimeFactory(options: {
       createHeartbeat: (gateway, callbacks) => new SandboxHeartbeat({
         projectId,
         gateway,
+        onSuccess: callbacks.onSuccess,
+        onAuthenticationFailure: callbacks.onAuthenticationFailure,
         onExpired: callbacks.onExpired,
         onTransientFailure: callbacks.onTransientFailure,
+        onUnreachable: callbacks.onUnreachable,
       }),
       createYDoc: credentials => {
         let first = true;
@@ -207,6 +268,7 @@ function defaultRuntimeFactory(options: {
         channel: transport.channel,
         maxResponseBytes: transport.maxResponseBytes,
         gzip: transport.gzip,
+        expectedSidecarInstanceId: transport.expectedSidecarInstanceId,
         hostCeiling: governor.capacityHint(
           config.v2TransportReservationBytes,
           config.v2SandboxCapacity,
@@ -215,29 +277,117 @@ function defaultRuntimeFactory(options: {
     });
   };
 
+  const recoveryPermits = new RecoveryPermitPool(config.provisionConcurrency);
+  const acquireSandboxForAuth = async (
+    projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"],
+    _status: number,
+    signal: AbortSignal,
+  ) => {
+    let release: (() => void) | null = null;
+    try {
+      await revalidateAccount(signal);
+      release = await recoveryPermits.acquire(signal);
+      return await provisioning.acquireSandbox(signal, { maxAttempts: 1 });
+    } finally {
+      release?.();
+    }
+  };
+  const createRuntime = (
+    input: Parameters<ManagedRuntimeFactory["create"]>[0],
+    initialSandbox?: import("../prism/protocol").ProvisionedSandbox,
+  ): RoutableSandboxRuntime => {
+    const v1 = needsV1
+      ? new ManagedV1Runtime({
+        projectId: input.projectId,
+        account: identity.account,
+        provisioning,
+        cpuPool: cpuPool as CpuTransformPool,
+        daemonSource: source!,
+        expectedBuild: v1DaemonBuild(source!),
+        requestedCapacity: config.slotsPerProject,
+        leaderGeneration: input.leaderGeneration,
+        initialSandbox,
+        acquireSandboxForAuth: (status, signal) => acquireSandboxForAuth(
+          input.projectId,
+          status,
+          signal,
+        ),
+        onCredentialRefresh: (outcome, status) => {
+          logger.emit(recoveryObservabilityEvent("sandbox.credential_refresh", {
+            project_id: input.projectId,
+            worker_index: input.workerIndex,
+            transport: "v1",
+            cause: "credentials",
+            operation: "credential_refresh",
+            status,
+            credential_refresh_outcome: outcome,
+          }), "progress");
+        },
+      })
+      : undefined;
+    if (config.transport === "v1") return v1!;
+    const v2 = createV2({ ...input, initialSandbox });
+    return config.transport === "auto"
+      ? new TransportSelectingRuntime({
+        mode: "auto",
+        identityKind: identity.kind,
+        v2,
+        v1,
+      })
+      : v2;
+  };
+
   return {
     create(input) {
-      const v1 = needsV1
-        ? new ManagedV1Runtime({
+      const initialChild = createRuntime(input);
+      return new SupervisedSandboxRuntime({
+        projectId: input.projectId,
+        initialChild,
+        // Recovery always reuses the same Prism project/worker. Only the
+        // disposable sandbox session and its fenced leader generation change.
+        createChild: async seed => createRuntime({
           projectId: input.projectId,
-          account: identity.account,
-          provisioning,
-          cpuPool: cpuPool as CpuTransformPool,
-          daemonSource: source!,
-          expectedBuild: v1DaemonBuild(source!),
-          requestedCapacity: config.slotsPerProject,
-        })
-        : undefined;
-      if (config.transport === "v1") return v1!;
-      const v2 = createV2(input);
-      return config.transport === "auto"
-        ? new TransportSelectingRuntime({
-          mode: "auto",
-          identityKind: identity.kind,
-          v2,
-          v1,
-        })
-        : v2;
+          workerIndex: input.workerIndex,
+          leaderGeneration: await nextLeaderGeneration(input.projectId),
+        }, seed),
+        acquirePermit: signal => recoveryPermits.acquire(signal),
+        recoveryCoordinator,
+        workerIndex: input.workerIndex,
+        transport: config.transport === "v1" ? "v1" : "v2",
+        onRecoveryEvent: event => {
+          const failure = event.failure;
+          const name = event.type === "started"
+            ? "sandbox.recovery.started"
+            : event.type === "retry_scheduled"
+              ? "sandbox.recovery.retry_scheduled"
+              : event.type === "completed"
+                ? "sandbox.recovery.completed"
+                : "sandbox.recovery.aborted";
+          logger.emit(recoveryObservabilityEvent(name, {
+            project_id: event.projectId,
+            worker_index: event.workerIndex,
+            transport: event.transport,
+            cause: normalizeSandboxRecoveryCause(event.reason),
+            attempt: event.attempt,
+            incarnation: event.incarnation,
+            consecutive_failures: event.consecutiveFailures,
+            ...(event.retryDelayMs === undefined
+              ? {}
+              : { retry_delay_ms: event.retryDelayMs }),
+            duration_ms: event.durationMs,
+            status: failure?.status ?? null,
+            error_name: failure
+              ? normalizeSandboxRecoveryErrorName(failure.name)
+              : null,
+            error_kind: failure
+              ? normalizeSandboxRecoveryErrorKind(failure.kind)
+              : null,
+            operation: failure
+              ? normalizeSandboxRecoveryOperation(failure.operation)
+              : null,
+          }), event.type === "retry_scheduled" ? "progress" : "terminal");
+        },
+      });
     },
   };
 }
@@ -277,6 +427,23 @@ export async function createBrowserlessSystem(
     workers: governor.snapshot().cpuTransformWorkers,
   });
   const provisioning = new PrismProvisioningClient({ account: identity.account });
+  const recoveryCoordinator = new FleetRecoveryCoordinator({
+    revalidateAccount: signal => sessionManager.revalidate
+      ? sessionManager.revalidate(signal)
+      : Promise.resolve(identity),
+    onTransition: snapshot => {
+      logger.emit(recoveryObservabilityEvent("prism.circuit.changed", {
+        cause: "circuit",
+        operation: snapshot.state === "revalidating"
+          ? "account_revalidate"
+          : "probe",
+        circuit_state: snapshot.state,
+        circuit_scope: snapshot.scope,
+        consecutive_failures: snapshot.consecutiveFailures,
+        queued: snapshot.queued,
+      }), "terminal");
+    },
+  });
   const projects = dependencies.projects ?? new PrismProjectsClient(identity.account);
   const manifest = dependencies.manifest ?? new FleetManifestStore({
     file: config.fleetManifestFile,
@@ -302,6 +469,15 @@ export async function createBrowserlessSystem(
     governor,
     cpuPool,
     assets,
+    nextLeaderGeneration: project => manifest.nextLeaderGeneration(
+      project,
+      SYSTEM_CLOCK.now(),
+    ),
+    recoveryCoordinator,
+    revalidateAccount: signal => sessionManager.revalidate
+      ? sessionManager.revalidate(signal)
+      : Promise.resolve(identity),
+    logger,
   });
   const registry = dependencies.registry ?? new SandboxRegistry();
   const fleet = new ProjectFleetManager({
@@ -313,6 +489,11 @@ export async function createBrowserlessSystem(
     registry,
     runtimeFactory,
   });
+  const rateLimitGates = !dependencies.router
+    ? new ModelRateLimitGates({
+      scopeForModel: rateLimitScopeResolver(config.rateLimitSharedModelGroups),
+    })
+    : undefined;
   const router = dependencies.router ?? new MultiSandboxRouter({
     registry,
     governor,
@@ -322,6 +503,7 @@ export async function createBrowserlessSystem(
       slowRequestMs: observabilityConfig.slowRequestMs,
       transport: config.transport,
     },
+    rateLimitGates,
   });
   const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const sampler = dependencies.sampler ?? new FleetSampler({
@@ -331,6 +513,7 @@ export async function createBrowserlessSystem(
     intervalMs: observabilityConfig.metricsIntervalMs,
     cpuPoolSnapshot: cpuPool.snapshot ? () => cpuPool.snapshot!() : undefined,
     webSocketSnapshot: webSocketTelemetry ? () => webSocketTelemetry.snapshotAndReset() : undefined,
+    recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
   });
   const app = createGhostProvApp({ router });
   const server = dependencies.server ?? createGhostProvServer({
@@ -343,6 +526,7 @@ export async function createBrowserlessSystem(
   let reconciliation: Promise<unknown> | null = null;
   let starting: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
+  const startupController = new AbortController();
 
   const system: BrowserlessSystem = {
     config,
@@ -360,11 +544,17 @@ export async function createBrowserlessSystem(
       starting = (async () => {
         reconciliation ??= fleet.reconcile();
         await Promise.race([
-          fleet.waitForReady(1),
+          fleet.waitForReady(1, startupController.signal),
           reconciliation.then(snapshot => {
-            if ((snapshot as { ready: number }).ready < 1) {
+            if (
+              (snapshot as { ready: number }).ready < 1 &&
+              registry.runtimes().length === 0
+            ) {
               throw new Error("Fleet reconciliation produced no ready runtime");
             }
+            // Registered supervisors continue retrying failed sandbox
+            // generations in the background. Keep waiting for one to recover.
+            return new Promise<never>(() => undefined);
           }),
         ]);
         sampler.start();
@@ -391,6 +581,7 @@ export async function createBrowserlessSystem(
     close() {
       if (closing) return closing;
       closing = (async () => {
+        startupController.abort();
         const before = router.snapshot();
         logger.emit(observabilityEvent("server.stopping", {
           reason: "system-shutdown",
@@ -407,6 +598,7 @@ export async function createBrowserlessSystem(
           firstError = error;
         }
         try {
+          recoveryCoordinator.close();
           await fleet.shutdown("system-shutdown");
         } catch (error) {
           firstError ??= error;

@@ -4,6 +4,7 @@ import type { WorkloadDescriptor } from "./workload";
 
 export interface RouteCandidate {
   projectId: ProjectId;
+  incarnation?: number;
   state: string;
   capacity: number;
   active: number;
@@ -23,10 +24,25 @@ export interface RouteDecision {
   predictedCompletionMs: number;
 }
 
-function eligible(candidate: RouteCandidate): boolean {
+export type RuntimeHealthCandidate = Pick<
+  RouteCandidate,
+  "state" | "heartbeatAgeMs" | "credentialExpiresInMs"
+>;
+
+/**
+ * Reports whether a runtime is alive and safe to count toward fleet capacity.
+ * This deliberately does not consider load: a full runtime is still healthy,
+ * even though it cannot accept another request immediately.
+ */
+export function isRuntimeHealthy(candidate: RuntimeHealthCandidate): boolean {
   if (candidate.state !== "ready") return false;
   if (candidate.heartbeatAgeMs === null || candidate.heartbeatAgeMs > 20_000) return false;
   if (candidate.credentialExpiresInMs !== null && candidate.credentialExpiresInMs < 30_000) return false;
+  return true;
+}
+
+function eligible(candidate: RouteCandidate): boolean {
+  if (!isRuntimeHealthy(candidate)) return false;
   const usable = candidate.capacity - candidate.quarantined;
   return usable > candidate.active + candidate.reserved;
 }

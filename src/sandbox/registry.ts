@@ -1,15 +1,19 @@
 import type { RunHandle } from "../relay/run-handle";
+import type { ProvisionedSandbox } from "../prism/protocol";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import type { V2TransportSnapshot } from "../v2/transport/session";
 
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
+  /** Changes when a stable supervisor installs a fresh runtime generation. */
+  incarnation?: number;
   state: string;
   capacity: number;
   active: number;
   available: number;
   quarantined: number;
   heartbeatAgeMs: number | null;
+  sidecarPeerAgeMs?: number | null;
   credentialExpiresInMs: number | null;
   ackEwmaMs: number;
   completionEwmaMs: number;
@@ -18,6 +22,18 @@ export interface RoutableSandboxSnapshot {
   memoryPressure: number;
   failure: SandboxFailureSnapshot | null;
   diagnostics?: V2TransportSnapshot["diagnostics"];
+  /** Learned only from a canonical upstream rate-limit response on this project. */
+  upstreamOrganization?: {
+    id: string;
+    model: string | null;
+    source: "rate_limit";
+    observedAgoMs: number;
+  } | null;
+  recovery?: {
+    attempt: number;
+    consecutiveFailures: number;
+    retryInMs: number | null;
+  };
 }
 
 export interface RoutableSandboxRuntime {
@@ -27,6 +43,8 @@ export interface RoutableSandboxRuntime {
   stop(): Promise<void>;
   snapshot(): RoutableSandboxSnapshot;
   run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle>;
+  /** One-shot pre-acquired sandbox for the next same-project generation. */
+  takeReplacementSandbox?(): ProvisionedSandbox | null;
   subscribe?(listener: () => void): () => void;
 }
 

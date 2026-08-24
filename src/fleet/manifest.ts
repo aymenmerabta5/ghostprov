@@ -259,7 +259,10 @@ export class FleetManifestStore {
     });
   }
 
-  nextLeaderGeneration(id: ProjectId): Promise<number> {
+  nextLeaderGeneration(id: ProjectId, nowMs = Date.now()): Promise<number> {
+    if (!Number.isFinite(nowMs) || nowMs < 0) {
+      return Promise.reject(new FleetManifestError("Worker timestamp is invalid", "protocol"));
+    }
     let generation = 0;
     return this.#mutate(current => {
       let found = false;
@@ -269,7 +272,7 @@ export class FleetManifestStore {
         generation = worker.leaderGeneration + 1;
         return updatedWorker(worker, {
           leaderGeneration: generation,
-          updatedAtMs: Math.max(worker.updatedAtMs, Date.now()),
+          updatedAtMs: Math.max(worker.updatedAtMs, nowMs),
         });
       });
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");

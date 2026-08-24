@@ -16,6 +16,22 @@ import {
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
 describe("SidecarEngine", () => {
+  it("retains the legacy reliable bootstrap ping without touching journal or upstream", async () => {
+    const harness = new SidecarHarness();
+    await harness.engine.start();
+
+    await harness.engine.accept({
+      kind: "ping",
+      sentAtMs: 12_345.5,
+      epoch: 1,
+      sequence: 0,
+    });
+
+    expect(harness.frames).toEqual([{ kind: "pong", sentAtMs: 12_345.5 }]);
+    expect(harness.storage.records).toEqual([]);
+    expect(harness.upstream.calls).toBe(0);
+  });
+
   it("acknowledges cancellation only after releasing the active execution lease", async () => {
     const harness = new SidecarHarness({
       behavior: async input => {

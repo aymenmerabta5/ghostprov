@@ -37,6 +37,7 @@ export interface DaemonDescriptor {
   pid: number;
   capacity: number;
   protocols: readonly string[];
+  generation?: number;
 }
 
 export class DaemonControllerError extends Error {
@@ -55,6 +56,7 @@ export interface DaemonControllerOptions {
   timeoutMs?: number;
   freshnessMs?: number;
   cacheMs?: number;
+  expectedGeneration?: number;
 }
 
 interface DaemonStatus {
@@ -63,6 +65,7 @@ interface DaemonStatus {
   ts: number;
   slots: number;
   job_protocols: string[];
+  generation?: number;
 }
 
 function isMissingBootstrapArchive(error: unknown): boolean {
@@ -80,6 +83,7 @@ export class DaemonController {
   readonly #timeoutMs: number;
   readonly #freshnessMs: number;
   readonly #cacheMs: number;
+  readonly #expectedGeneration: number;
   #cached: { descriptor: DaemonDescriptor; verifiedAtMs: number } | null = null;
   #ensuring: Promise<DaemonDescriptor> | null = null;
 
@@ -92,6 +96,10 @@ export class DaemonController {
     this.#timeoutMs = options.timeoutMs ?? 60_000;
     this.#freshnessMs = options.freshnessMs ?? 15_000;
     this.#cacheMs = options.cacheMs ?? 2_000;
+    this.#expectedGeneration = options.expectedGeneration ?? 0;
+    if (!Number.isSafeInteger(this.#expectedGeneration) || this.#expectedGeneration < 0) {
+      throw new RangeError("expectedGeneration must be a non-negative safe integer");
+    }
     if (!Number.isFinite(this.#cacheMs) || this.#cacheMs < 0 || this.#cacheMs >= this.#freshnessMs) {
       throw new RangeError("Daemon readiness cache must be non-negative and shorter than freshness");
     }
@@ -188,6 +196,7 @@ export class DaemonController {
   #descriptor(status: DaemonStatus | null): DaemonDescriptor | null {
     if (!status) return null;
     if (status.daemon_build !== this.#assets.expectedBuild) return null;
+    if ((status.generation ?? 0) !== this.#expectedGeneration) return null;
     if (this.#clock.now() - status.ts * 1000 > this.#freshnessMs) return null;
     if (!Number.isInteger(status.slots) || status.slots < 1) return null;
     if (!this.#assets.requiredProtocols.every(protocol => status.job_protocols.includes(protocol))) return null;
@@ -196,6 +205,7 @@ export class DaemonController {
       pid: status.pid,
       capacity: status.slots,
       protocols: Object.freeze([...status.job_protocols]),
+      generation: status.generation ?? 0,
     };
   }
 }

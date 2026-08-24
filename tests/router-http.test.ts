@@ -3,6 +3,14 @@ import { WebSocket } from "ws";
 import { request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
 import { parseFrames } from "../src/relay/sse";
+import { MultiSandboxRouter } from "../src/router/router";
+import { ResourceGovernor } from "../src/router/resource-governor";
+import {
+  SandboxRegistry,
+  type RoutableSandboxRuntime,
+  type RoutableSandboxSnapshot,
+} from "../src/sandbox/registry";
+import { projectId } from "../src/sandbox/types";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 
@@ -22,6 +30,51 @@ function handle(value: any, frames: Array<{ event: string; data: string }> = [])
     final: Promise.resolve(value),
     stats: { bytes: 0, firstByteMs: null, frames: frames.length },
   };
+}
+
+function healthRouter(overrides: Array<Partial<RoutableSandboxSnapshot>>): MultiSandboxRouter {
+  const runtimes = overrides.map((override, index): RoutableSandboxRuntime => {
+    const snapshot: RoutableSandboxSnapshot = {
+      projectId: projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
+      state: "ready",
+      capacity: 30,
+      active: 0,
+      available: 30,
+      quarantined: 0,
+      heartbeatAgeMs: 1_000,
+      credentialExpiresInMs: 3_600_000,
+      ackEwmaMs: 1_000,
+      completionEwmaMs: 10_000,
+      recentFailureRate: 0,
+      queueDepth: 0,
+      memoryPressure: 0,
+      failure: null,
+      ...override,
+    };
+    return {
+      projectId: snapshot.projectId,
+      async start() {},
+      async drain() {},
+      async stop() {},
+      snapshot: () => snapshot,
+      async run() { return handle(final(`resp_${index}`)); },
+    };
+  });
+  return new MultiSandboxRouter({
+    registry: new SandboxRegistry(runtimes),
+    governor: new ResourceGovernor({
+      probe: {
+        sample: () => ({
+          totalBytes: 16 * 1024 ** 3,
+          freeBytes: 12 * 1024 ** 3,
+          rssBytes: 256 * 1024 ** 2,
+          heapBytes: 64 * 1024 ** 2,
+          externalBytes: 8 * 1024 ** 2,
+          logicalProcessors: 8,
+        }),
+      },
+    }),
+  });
 }
 
 class FakeRouter {
@@ -161,6 +214,36 @@ describe("router HTTP composition", () => {
     const sandboxes = await (await app.request("/__sandboxes")).json();
     expect(health).toMatchObject({ ok: true, capacity: 120, active: 7, available: 113, queued: 2 });
     expect(JSON.stringify(sandboxes)).not.toMatch(/token|cookie/i);
+  });
+
+  it("reports 503 and zero capacity when every ready runtime heartbeat is stale", async () => {
+    const router = healthRouter([
+      { heartbeatAgeMs: null },
+      { heartbeatAgeMs: 20_001 },
+    ]);
+    try {
+      const response = await createGhostProvApp({ router }).request("/health");
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ ok: false, capacity: 0 });
+    } finally {
+      await router.close();
+    }
+  });
+
+  it("reports a healthy full runtime as capacity even without an immediately free slot", async () => {
+    const router = healthRouter([{ active: 30, available: 0 }]);
+    try {
+      const response = await createGhostProvApp({ router }).request("/health");
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        capacity: 30,
+        active: 30,
+        available: 0,
+      });
+    } finally {
+      await router.close();
+    }
   });
 
   it("serves a Codex-compatible models list without contacting a sandbox", async () => {

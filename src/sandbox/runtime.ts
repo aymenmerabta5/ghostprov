@@ -27,8 +27,30 @@ export interface RuntimeDaemonController {
 }
 
 export interface RuntimeHeartbeatCallbacks {
+  onSuccess(): void;
   onExpired(status: number): void;
   onTransientFailure(status: number | null): void;
+  onUnreachable(status: number | null): void;
+}
+
+export class SandboxLifecycleFailure extends Error {
+  readonly operation = "heartbeat";
+  readonly status: number | null;
+
+  constructor(
+    readonly kind: "heartbeat_expired" | "heartbeat_unreachable",
+    status: number | null = null,
+  ) {
+    const safeStatus = Number.isInteger(status) && status !== null && status >= 100 && status <= 599
+      ? status
+      : null;
+    const description = kind === "heartbeat_expired" ? "expired" : "became unreachable";
+    super(safeStatus === null
+      ? `Sandbox heartbeat ${description}`
+      : `Sandbox heartbeat ${description} (${safeStatus})`);
+    this.name = "SandboxLifecycleFailure";
+    this.status = safeStatus;
+  }
 }
 
 export interface SandboxRuntimeOptions {
@@ -168,10 +190,24 @@ export class SandboxRuntime {
         if (!this.#current(generation) || this.#heartbeat) return;
         this.#setState({ type: "syncing_credentials", projectId: this.projectId, generation });
         const heartbeat = this.#options.createHeartbeat(sandbox, {
-          onExpired: status => {
-            if (this.#current(generation)) this.drain(`heartbeat-expired:${status}`);
+          onSuccess: () => {
+            if (this.#current(generation)) this.#emitSnapshot();
           },
-          onTransientFailure: () => {},
+          onExpired: status => {
+            this.#failGeneration(
+              generation,
+              new SandboxLifecycleFailure("heartbeat_expired", status),
+            );
+          },
+          onTransientFailure: () => {
+            if (!this.#current(generation)) return;
+          },
+          onUnreachable: status => {
+            this.#failGeneration(
+              generation,
+              new SandboxLifecycleFailure("heartbeat_unreachable", status),
+            );
+          },
         });
         this.#heartbeat = heartbeat;
         heartbeat.start();
@@ -218,8 +254,27 @@ export class SandboxRuntime {
     return generation === this.#generation && this.#state.type !== "stopped";
   }
 
+  #failGeneration(generation: number, error: SandboxLifecycleFailure): void {
+    if (!this.#current(generation)) return;
+    if (this.#state.type === "failed") return;
+    const failedGeneration = ++this.#generation;
+    this.#capacity = 0;
+    this.#daemon = null;
+    this.#controller?.abort();
+    this.#setState({
+      type: "failed",
+      projectId: this.projectId,
+      generation: failedGeneration,
+      error,
+    });
+  }
+
   #setState(state: SandboxLifecycleState): void {
     this.#state = state;
+    this.#emitSnapshot();
+  }
+
+  #emitSnapshot(): void {
     const snapshot = this.snapshot();
     for (const listener of this.#listeners) listener(snapshot);
   }

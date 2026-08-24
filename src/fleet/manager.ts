@@ -9,6 +9,7 @@ import type { PrismIdentityKind } from "../prism/session-manager";
 import type { PrismProjectSummary } from "../prism/projects-client";
 import { SandboxRegistry } from "../sandbox/registry";
 import { projectId, type ProjectId } from "../sandbox/types";
+import { isRuntimeHealthy } from "../router/policy";
 import { FleetManifestStore } from "./manifest";
 import type {
   FleetManifest,
@@ -350,6 +351,7 @@ export class ProjectFleetManager {
       }
       const generation = await this.#manifest.nextLeaderGeneration(
         selectedWorker.record.projectId,
+        this.#clock.now(),
       );
       const runtime = this.#runtimeFactory.create({
         projectId: selectedWorker.record.projectId,
@@ -425,13 +427,16 @@ export class ProjectFleetManager {
     const snapshots = this.#registry.snapshots();
     this.#snapshot = Object.freeze({
       desired,
-      ready: snapshots.filter(value => value.state === "ready").length,
+      ready: snapshots.filter(isRuntimeHealthy).length,
       provisioning: snapshots.filter(value => [
         "configured",
         "provisioning",
         "syncing_credentials",
         "syncing_workspace",
         "deploying_daemon",
+        "bootstrapping",
+        "connecting_transport",
+        "recovering",
       ].includes(value.state)).length,
       draining: snapshots.filter(value => value.state === "draining").length,
       failed: snapshots.filter(value => value.state === "failed" || value.state === "auth_required").length,

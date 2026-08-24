@@ -38,7 +38,7 @@ describe("FleetManifestStore", () => {
       nowMs: 1_000,
     });
     await store.markCreated(A, 1_100);
-    const generation = await store.nextLeaderGeneration(A);
+    const generation = await store.nextLeaderGeneration(A, 1_200);
 
     expect(generation).toBe(1);
     expect((await store.load()).workers[0]).toMatchObject({
@@ -47,6 +47,7 @@ describe("FleetManifestStore", () => {
       state: "created",
       leaderGeneration: 1,
       createdAtMs: 1_000,
+      updatedAtMs: 1_200,
     });
     if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
   });

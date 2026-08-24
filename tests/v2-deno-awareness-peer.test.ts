@@ -131,6 +131,104 @@ describe("DenoAwarenessPeer", () => {
     expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
   });
 
+  it("answers control-lane liveness outside stalled reliable and backpressure paths", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const acceptedKinds: string[] = [];
+    let signalAccepted!: () => void;
+    const accepted = new Promise<void>(resolve => { signalAccepted = resolve; });
+    let releaseAccept!: () => void;
+    const acceptBlocker = new Promise<void>(resolve => { releaseAccept = resolve; });
+    let hostCeilingUpdates = 0;
+    let backpressureUpdates = 0;
+    const engine = {
+      snapshot: () => ({ credits: 128, active: 0, queued: 0, draining: false }),
+      setHostCeiling: () => { hostCeilingUpdates++; },
+      accept: async (frame: { kind: string }) => {
+        acceptedKinds.push(frame.kind);
+        signalAccepted();
+        await acceptBlocker;
+      },
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      outputBackpressure: {
+        update: () => { backpressureUpdates++; },
+      } as any,
+      publicationIntervalMs: 60_000,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const dataDoc = new Y.Doc();
+    const dataRemote = new Awareness(dataDoc);
+    const controlDoc = new Y.Doc();
+    const controlRemote = new Awareness(controlDoc);
+
+    try {
+      await peer.connect();
+      dataRemote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1),
+        lane: "data",
+        frames: [{
+          kind: "drain",
+          reason: "hold reliable accept chain",
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(dataRemote, [dataDoc.clientID]),
+        "test-host-data",
+      );
+      await accepted;
+      const backpressureBeforeProbe = backpressureUpdates;
+
+      controlRemote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(-1),
+        lane: "control",
+        liveness: { kind: "ping", sentAtMs: 12_345.5 },
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(controlRemote, [controlDoc.clientID]),
+        "test-host-control",
+      );
+
+      const pong = providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control;
+      expect(pong).toMatchObject({
+        lane: "control",
+        frames: [],
+        liveness: { kind: "pong", sentAtMs: 12_345.5 },
+      });
+      expect(pong.liveness).toEqual({ kind: "pong", sentAtMs: 12_345.5 });
+      expect(acceptedKinds).toEqual(["drain"]);
+      expect(hostCeilingUpdates).toBe(0);
+      expect(backpressureUpdates).toBe(backpressureBeforeProbe);
+    } finally {
+      releaseAccept();
+      dataRemote.destroy();
+      dataDoc.destroy();
+      controlRemote.destroy();
+      controlDoc.destroy();
+      await peer.close();
+    }
+  });
+
   it("keeps response flights separate from frame-free host ACK control", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     const engine = {

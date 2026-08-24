@@ -151,6 +151,40 @@ describe("OpenAI-compatible HTTP errors", () => {
     }});
   });
 
+  it("returns the full V1 organization TPM response and parsed headers", async () => {
+    const message = "Rate limit reached for gpt-5.6-sol in organization " +
+      "org-ExampleOrganization123 on tokens per min (TPM): Limit 40000000, " +
+      "Used 40000000, Requested 609930. Please try again in 914ms. Visit " +
+      "https://platform.openai.com/account/rate-limits";
+    const response = apiErrorResponse(Object.assign(
+      new Error("Upstream request failed"),
+      {
+        kind: "upstream",
+        details: {
+          code: "rate_limited_429",
+          message: JSON.stringify({
+            error: {
+              message,
+              type: "rate_limit_error",
+              code: "rate_limit_exceeded",
+            },
+          }),
+        },
+      },
+    ));
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(response.headers.get("x-ratelimit-limit-tokens")).toBe("40000000");
+    expect(response.headers.get("x-ratelimit-remaining-tokens")).toBe("0");
+    expect(await response.json()).toEqual({ error: {
+      message,
+      type: "rate_limit_error",
+      param: null,
+      code: "rate_limit_exceeded",
+    }});
+  });
+
   it("produces an SSE-safe event from the same normalized error", () => {
     expect(apiErrorEvent(new ApiError(501, "Audio input is unavailable", {
       type: "unsupported_feature",

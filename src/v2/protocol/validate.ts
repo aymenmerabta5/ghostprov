@@ -7,6 +7,7 @@ import {
   GP_V2_WINDOW_MAX_FRAMES,
   base64UrlDecode,
   utf8Bytes,
+  type AwarenessLiveness,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
@@ -14,6 +15,7 @@ import {
   type SidecarFrame,
 } from "./shared";
 import { parseDiagnosticObject, parseFirstEventDiagnostics, parseRequestAckDiagnostics, parseTerminalDiagnostics } from "../diagnostics/types";
+import { MAX_RATE_LIMIT_DELAY_MS, type RateLimitHint } from "../rate-limit";
 
 export type FrameDirection = "host" | "sidecar";
 
@@ -73,6 +75,80 @@ function finiteNumber(value: unknown, label: string): number {
     fail(`${label} must be a non-negative finite number`, "number");
   }
   return value;
+}
+
+function parseRateLimitHint(value: unknown): RateLimitHint | null {
+  if (value === undefined) return null;
+  const raw = object(value, "rateLimit");
+  exactKeys(raw, [
+    ...(raw.retryAfterMs === undefined ? [] : ["retryAfterMs"]),
+    ...(raw.resetTokensMs === undefined ? [] : ["resetTokensMs"]),
+    ...(raw.limitTokens === undefined ? [] : ["limitTokens"]),
+    ...(raw.remainingTokens === undefined ? [] : ["remainingTokens"]),
+    ...(raw.limitProjectTokens === undefined ? [] : ["limitProjectTokens"]),
+    ...(raw.remainingProjectTokens === undefined ? [] : ["remainingProjectTokens"]),
+    ...(raw.resetProjectTokensMs === undefined ? [] : ["resetProjectTokensMs"]),
+  ], "rateLimit");
+  const retryAfterMs = raw.retryAfterMs === undefined
+    ? undefined
+    : integer(raw.retryAfterMs, "rateLimit.retryAfterMs", 0, MAX_RATE_LIMIT_DELAY_MS);
+  const resetTokensMs = raw.resetTokensMs === undefined
+    ? undefined
+    : integer(raw.resetTokensMs, "rateLimit.resetTokensMs", 0, MAX_RATE_LIMIT_DELAY_MS);
+  const limitTokens = raw.limitTokens === undefined
+    ? undefined
+    : integer(raw.limitTokens, "rateLimit.limitTokens");
+  const remainingTokens = raw.remainingTokens === undefined
+    ? undefined
+    : integer(raw.remainingTokens, "rateLimit.remainingTokens");
+  const limitProjectTokens = raw.limitProjectTokens === undefined
+    ? undefined
+    : integer(raw.limitProjectTokens, "rateLimit.limitProjectTokens");
+  const remainingProjectTokens = raw.remainingProjectTokens === undefined
+    ? undefined
+    : integer(raw.remainingProjectTokens, "rateLimit.remainingProjectTokens");
+  const resetProjectTokensMs = raw.resetProjectTokensMs === undefined
+    ? undefined
+    : integer(raw.resetProjectTokensMs, "rateLimit.resetProjectTokensMs", 0, MAX_RATE_LIMIT_DELAY_MS);
+  if (
+    retryAfterMs === undefined &&
+    resetTokensMs === undefined &&
+    limitTokens === undefined &&
+    remainingTokens === undefined &&
+    limitProjectTokens === undefined &&
+    remainingProjectTokens === undefined &&
+    resetProjectTokensMs === undefined
+  ) {
+    fail("rateLimit must contain at least one known header", "rate_limit");
+  }
+  return {
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    ...(resetTokensMs === undefined ? {} : { resetTokensMs }),
+    ...(limitTokens === undefined ? {} : { limitTokens }),
+    ...(remainingTokens === undefined ? {} : { remainingTokens }),
+    ...(limitProjectTokens === undefined ? {} : { limitProjectTokens }),
+    ...(remainingProjectTokens === undefined ? {} : { remainingProjectTokens }),
+    ...(resetProjectTokensMs === undefined ? {} : { resetProjectTokensMs }),
+  };
+}
+
+function parseLiveness(
+  value: unknown,
+  direction: FrameDirection,
+): AwarenessLiveness {
+  const raw = object(value, "Awareness liveness");
+  exactKeys(raw, ["kind", "sentAtMs"], "Awareness liveness");
+  const expectedKind = direction === "host" ? "ping" : "pong";
+  if (raw.kind !== expectedKind) {
+    fail(
+      `${direction === "host" ? "Host" : "Sidecar"} Awareness liveness must be ${expectedKind}`,
+      "liveness_direction",
+    );
+  }
+  return {
+    kind: expectedKind,
+    sentAtMs: finiteNumber(raw.sentAtMs, "liveness sentAtMs"),
+  } as AwarenessLiveness;
 }
 
 function string(
@@ -291,6 +367,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         "kind", "requestId", "requestDigest", "responseId", "eventCount", "byteCount",
         "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256",
         "epoch", "sequence", ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
+        ...(raw.rateLimit === undefined ? [] : ["rateLimit"]),
       ], "response_terminal frame");
       const terminalStatus = raw.terminalStatus;
       if (
@@ -299,6 +376,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         terminalStatus !== "incomplete"
       ) fail("terminalStatus is invalid", "terminal_status");
       const diagnostics = parseTerminalDiagnostics(raw.diagnostics);
+      const rateLimit = parseRateLimitHint(raw.rateLimit);
       return {
         kind,
         requestId: safeId(raw.requestId, "requestId"),
@@ -311,20 +389,24 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         finalEventIndex: integer(raw.finalEventIndex, "finalEventIndex"),
         finalSha256: digest(raw.finalSha256, "finalSha256"),
         ...(diagnostics ? { diagnostics } : {}),
+        ...(rateLimit ? { rateLimit } : {}),
         ...identity,
       };
     }
     case "response_error":
       exactKeys(raw, [
         "kind", "requestId", "code", "message", "ambiguous", "epoch", "sequence",
+        ...(raw.rateLimit === undefined ? [] : ["rateLimit"]),
       ], "response_error frame");
       if (typeof raw.ambiguous !== "boolean") fail("ambiguous must be boolean", "boolean");
+      const rateLimit = parseRateLimitHint(raw.rateLimit);
       return {
         kind,
         requestId: safeId(raw.requestId, "requestId"),
         code: code(raw.code, "error code"),
         message: string(raw.message, "error message", 512),
         ambiguous: raw.ambiguous,
+        ...(rateLimit ? { rateLimit } : {}),
         ...identity,
       };
     case "request_cancelled":
@@ -387,6 +469,7 @@ export function parseAwarenessEnvelope(
     "peerId", "instanceId", "leaderGeneration", "epoch", "ack", "credits", "active",
     "revision", "queued", "draining", "frames",
     ...(raw.lane === undefined ? [] : ["lane"]),
+    ...(raw.liveness === undefined ? [] : ["liveness"]),
     ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
   ], "Awareness envelope");
   if (raw.protocol !== GP_V2_PROTOCOL) fail("Awareness protocol is invalid", "protocol");
@@ -431,6 +514,16 @@ export function parseAwarenessEnvelope(
     : raw.lane === "data" || raw.lane === "control"
       ? raw.lane
       : fail("Awareness lane is invalid", "lane");
+  let liveness: AwarenessLiveness | undefined;
+  if (raw.liveness !== undefined) {
+    if (lane !== "control") {
+      fail("Awareness liveness is legal only on the control lane", "liveness_lane");
+    }
+    if (frames.length !== 0) {
+      fail("Awareness liveness cannot carry reliable frames", "liveness_frames");
+    }
+    liveness = parseLiveness(raw.liveness, direction);
+  }
   const diagnostics = parseDiagnosticObject(raw.diagnostics);
   return {
     protocol: GP_V2_PROTOCOL,
@@ -451,6 +544,7 @@ export function parseAwarenessEnvelope(
     draining: raw.draining,
     frames: Object.freeze(frames),
     ...(lane ? { lane } : {}),
+    ...(liveness ? { liveness } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };
 }

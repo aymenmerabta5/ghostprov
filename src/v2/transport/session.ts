@@ -18,6 +18,7 @@ import {
   utf8Bytes,
   utf8Text,
   type AwarenessEnvelope,
+  type AwarenessLiveness,
   type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
@@ -62,7 +63,33 @@ export interface V2TransportSnapshot {
   admissionCredits?: number;
   retransmissions: number;
   awarenessRttMs: number | null;
+  /** Age of the newest valid envelope from the bootstrap-bound sidecar instance. */
+  sidecarPeerAgeMs?: number | null;
   diagnostics?: { host: V2TransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
+}
+
+export type V2TransportLivenessErrorCode =
+  | "unavailable"
+  | "probe_in_flight"
+  | "timeout"
+  | "publish"
+  | "instance_changed";
+
+export class V2TransportLivenessError extends Error {
+  readonly name = "V2TransportLivenessError";
+
+  constructor(
+    message: string,
+    readonly code: V2TransportLivenessErrorCode,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+export interface V2TransportLivenessResult {
+  rttMs: number;
+  sentAtMs: number;
 }
 
 export interface V2TransportSessionOptions {
@@ -77,6 +104,10 @@ export interface V2TransportSessionOptions {
   rotationTimeoutMs?: number;
   publicationIntervalMs?: number;
   unadmittedTimeoutMs?: number;
+  /** Sidecar instance proven by the bootstrap handshake. Required for liveness probes. */
+  expectedSidecarInstanceId?: string;
+  /** Primarily injectable for deterministic tests. Production defaults to five seconds. */
+  livenessTimeoutMs?: number;
 }
 
 interface EventPart {
@@ -102,6 +133,8 @@ interface RequestState {
   onAbort?: () => void;
   admitted: boolean;
   published: boolean;
+  commitStaged: boolean;
+  commitPublished: boolean;
   committed: boolean;
   cancelled: boolean;
   quarantined: boolean;
@@ -122,6 +155,19 @@ interface RotationWaiter {
   onAbort?: () => void;
   timer?: ReturnType<typeof setTimeout>;
 }
+
+interface LivenessProbe {
+  sentAtMs: number;
+  startedAtMs: number;
+  resolve: (result: V2TransportLivenessResult) => void;
+  reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DEFAULT_LIVENESS_TIMEOUT_MS = 5_000;
 
 function abortError(message: string): DOMException {
   return new DOMException(message, "AbortError");
@@ -191,9 +237,12 @@ export class V2TransportSession {
   #hostCeiling: number;
   readonly #rotationTimeoutMs: number;
   readonly #unadmittedTimeoutMs: number;
+  readonly #expectedSidecarInstanceId: string | null;
+  readonly #livenessTimeoutMs: number;
   readonly #hostInstanceId = `host-${crypto.randomUUID()}`;
   readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
+  #processedInboundAck = { epoch: 1, sequence: -1 };
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
   readonly #delivery: ReliableDeliveryTiming;
   readonly #flight = new AckClockedFlight({ epoch: 1 });
@@ -206,6 +255,7 @@ export class V2TransportSession {
   #connected = false;
   #closed = false;
   #draining = false;
+  #protocolFailed = false;
   #connecting: Promise<void> | null = null;
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
@@ -218,6 +268,13 @@ export class V2TransportSession {
     data: -1,
     control: -1,
   };
+  readonly #observedPeerRevision: Record<AwarenessLane, number> = {
+    data: -1,
+    control: -1,
+  };
+  #lastValidPeerAtMs: number | null = null;
+  #lastLivenessSentAtMs = -1;
+  #livenessProbe: LivenessProbe | null = null;
   #remoteCredits = 0;
   #creditReservations = 0;
   #quarantined = 0;
@@ -271,6 +328,16 @@ export class V2TransportSession {
     if (!Number.isSafeInteger(unadmittedTimeoutMs) || unadmittedTimeoutMs < 1) {
       throw new RangeError("unadmittedTimeoutMs must be a positive safe integer");
     }
+    if (
+      options.expectedSidecarInstanceId !== undefined &&
+      !SAFE_INSTANCE_ID.test(options.expectedSidecarInstanceId)
+    ) {
+      throw new TypeError("expectedSidecarInstanceId is invalid");
+    }
+    const livenessTimeoutMs = options.livenessTimeoutMs ?? DEFAULT_LIVENESS_TIMEOUT_MS;
+    if (!Number.isSafeInteger(livenessTimeoutMs) || livenessTimeoutMs < 1) {
+      throw new RangeError("livenessTimeoutMs must be a positive safe integer");
+    }
     this.#binding = options.binding;
     this.#channel = options.channel;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -280,6 +347,8 @@ export class V2TransportSession {
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
+    this.#expectedSidecarInstanceId = options.expectedSidecarInstanceId ?? null;
+    this.#livenessTimeoutMs = livenessTimeoutMs;
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
       minimumMs: retransmitMs,
@@ -292,6 +361,9 @@ export class V2TransportSession {
 
   connect(signal?: AbortSignal): Promise<void> {
     if (this.#closed) return Promise.reject(new Error("V2 transport session is closed"));
+    if (this.#protocolFailed) {
+      return Promise.reject(new Error("V2 transport session failed its protocol"));
+    }
     if (this.#connected) return Promise.resolve();
     if (this.#connecting) return this.#connecting;
     const connecting = (async () => {
@@ -306,6 +378,102 @@ export class V2TransportSession {
     });
     this.#connecting = connecting;
     return connecting;
+  }
+
+  /**
+   * Proves that the exact sidecar instance accepted during bootstrap can still
+   * execute its engine loop. The ping lives in the control Awareness state and
+   * never enters the reliable request/response window.
+   */
+  probeLiveness(signal?: AbortSignal): Promise<V2TransportLivenessResult> {
+    if (signal?.aborted) {
+      return Promise.reject(abortError("V2 sidecar liveness probe aborted"));
+    }
+    if (!this.#connected || this.#closed || this.#draining) {
+      return Promise.reject(new V2TransportLivenessError(
+        "V2 transport is unavailable for a liveness probe",
+        "unavailable",
+      ));
+    }
+    if (!this.#expectedSidecarInstanceId) {
+      return Promise.reject(new V2TransportLivenessError(
+        "V2 transport has no bootstrap-bound sidecar instance",
+        "unavailable",
+      ));
+    }
+    if (
+      (this.#sidecarInstanceId &&
+        this.#sidecarInstanceId !== this.#expectedSidecarInstanceId) ||
+      this.#retiredSidecarInstances.has(this.#expectedSidecarInstanceId)
+    ) {
+      return Promise.reject(new V2TransportLivenessError(
+        "V2 sidecar instance changed after bootstrap",
+        "instance_changed",
+      ));
+    }
+    if (this.#livenessProbe) {
+      return Promise.reject(new V2TransportLivenessError(
+        "A V2 sidecar liveness probe is already in flight",
+        "probe_in_flight",
+      ));
+    }
+
+    const startedAtMs = this.#clock.now();
+    const clockSentAtMs = Math.floor(startedAtMs);
+    const sentAtMs = Math.max(clockSentAtMs, this.#lastLivenessSentAtMs + 1);
+    if (!Number.isSafeInteger(sentAtMs) || sentAtMs < 0) {
+      return Promise.reject(new V2TransportLivenessError(
+        "V2 liveness clock is outside the supported range",
+        "unavailable",
+      ));
+    }
+    this.#lastLivenessSentAtMs = sentAtMs;
+
+    let resolve!: (result: V2TransportLivenessResult) => void;
+    let reject!: (error: unknown) => void;
+    const pending = new Promise<V2TransportLivenessResult>((resolveValue, rejectValue) => {
+      resolve = resolveValue;
+      reject = rejectValue;
+    });
+    const probe: LivenessProbe = {
+      sentAtMs,
+      startedAtMs,
+      resolve,
+      reject,
+      signal,
+    };
+    probe.onAbort = () => {
+      this.#rejectLivenessProbe(
+        probe,
+        abortError("V2 sidecar liveness probe aborted"),
+      );
+    };
+    signal?.addEventListener("abort", probe.onAbort, { once: true });
+    probe.timer = setTimeout(() => {
+      this.#rejectLivenessProbe(
+        probe,
+        new V2TransportLivenessError(
+          "V2 sidecar liveness probe timed out",
+          "timeout",
+        ),
+      );
+    }, this.#livenessTimeoutMs);
+    probe.timer.unref?.();
+    this.#livenessProbe = probe;
+
+    try {
+      this.#publishLane("control", [], "urgent");
+    } catch (cause) {
+      this.#rejectLivenessProbe(
+        probe,
+        new V2TransportLivenessError(
+          "V2 sidecar liveness probe could not be published",
+          "publish",
+          { cause },
+        ),
+      );
+    }
+    return pending;
   }
 
   async run(
@@ -352,6 +520,8 @@ export class V2TransportSession {
       signal,
       admitted: false,
       published: false,
+      commitStaged: false,
+      commitPublished: false,
       committed: false,
       cancelled: false,
       quarantined: false,
@@ -473,6 +643,16 @@ export class V2TransportSession {
     this.#closed = true;
     this.#connected = false;
     this.#draining = true;
+    if (this.#livenessProbe) {
+      this.#rejectLivenessProbe(
+        this.#livenessProbe,
+        new V2TransportLivenessError(
+          "V2 transport closed during its liveness probe",
+          "unavailable",
+        ),
+        false,
+      );
+    }
     this.#pacer.close();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
@@ -480,9 +660,9 @@ export class V2TransportSession {
     this.#unsubscribe = null;
     const error = new V2PreCommitError("V2 transport session closed", "closed");
     for (const state of [...this.#requests.values()]) {
-      if (state.committed) {
+      if (state.committed || state.commitPublished) {
         this.#failCommitted(state, new V2CommittedError(
-          "V2 transport closed after commitment",
+          "V2 transport closed after request commitment may have been published",
           "closed",
           true,
         ));
@@ -519,6 +699,9 @@ export class V2TransportSession {
       admissionCredits: this.#availableCredits(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#delivery.roundTripEwmaMs,
+      sidecarPeerAgeMs: this.#lastValidPeerAtMs === null
+        ? null
+        : Math.max(0, this.#clock.now() - this.#lastValidPeerAtMs),
       diagnostics: { host: this.#hostTransportDiagnostics(), sidecar: this.#sidecarDiagnostics },
     };
   }
@@ -532,9 +715,85 @@ export class V2TransportSession {
     if (this.#connected && !this.#closed) this.#pacer.requestUrgent();
   }
 
+  #observeSidecarLiveness(envelope: AwarenessEnvelope<SidecarFrame>): void {
+    if (this.#closed || this.#protocolFailed || !validBinding(envelope, this.#binding)) return;
+    const lane: AwarenessLane = envelope.lane ?? "data";
+    if (lane === "control" && envelope.frames.length > 0) return;
+    const expectedInstanceId = this.#expectedSidecarInstanceId;
+    if (!expectedInstanceId) return;
+    if (envelope.instanceId !== expectedInstanceId) {
+      if (
+        this.#sidecarInstanceId &&
+        lane === "data" &&
+        envelope.epoch <= this.#inbound.ack().epoch
+      ) return;
+      const probe = this.#livenessProbe;
+      if (probe && !this.#retiredSidecarInstances.has(envelope.instanceId)) {
+        this.#rejectLivenessProbe(
+          probe,
+          new V2TransportLivenessError(
+            "V2 sidecar instance changed during its liveness probe",
+            "instance_changed",
+          ),
+        );
+      }
+      return;
+    }
+    if (this.#retiredSidecarInstances.has(envelope.instanceId)) return;
+    if (envelope.revision <= this.#observedPeerRevision[lane]) return;
+    this.#observedPeerRevision[lane] = envelope.revision;
+    this.#lastValidPeerAtMs = this.#clock.now();
+    if (lane !== "control") return;
+
+    const pong = envelope.liveness;
+    const probe = this.#livenessProbe;
+    if (!probe || pong?.kind !== "pong" || pong.sentAtMs !== probe.sentAtMs) return;
+    this.#resolveLivenessProbe(probe, {
+      rttMs: Math.max(0, this.#clock.now() - probe.startedAtMs),
+      sentAtMs: probe.sentAtMs,
+    });
+  }
+
+  #resolveLivenessProbe(
+    probe: LivenessProbe,
+    result: V2TransportLivenessResult,
+  ): void {
+    if (!this.#finishLivenessProbe(probe, true)) return;
+    probe.resolve(result);
+  }
+
+  #rejectLivenessProbe(
+    probe: LivenessProbe,
+    error: unknown,
+    clearState = true,
+  ): void {
+    if (!this.#finishLivenessProbe(probe, clearState)) return;
+    probe.reject(error);
+  }
+
+  #finishLivenessProbe(probe: LivenessProbe, clearState: boolean): boolean {
+    if (this.#livenessProbe !== probe) return false;
+    this.#livenessProbe = null;
+    if (probe.timer) clearTimeout(probe.timer);
+    probe.signal?.removeEventListener("abort", probe.onAbort!);
+    if (clearState && this.#connected && !this.#closed) {
+      try {
+        // Replace the persistent control state so a late pong cannot heal a
+        // later probe and reconnecting peers do not replay a stale ping.
+        this.#publishLane("control", [], "urgent");
+      } catch {
+        // The probe result is already known. Cleanup publication is best effort.
+      }
+    }
+    return true;
+  }
+
   readonly #onAwarenessUpdate = (
     update: AwarenessPeerUpdate<SidecarFrame>,
   ): void => {
+    // Liveness must not queue behind a response frame waiting for client-side
+    // buffer space. Only the reliable data path remains serialized below.
+    this.#observeSidecarLiveness(update.envelope);
     this.#processing = this.#processing
       .then(() => this.#processEnvelope(update.envelope))
       .catch(error => this.#failProtocol(error));
@@ -543,11 +802,29 @@ export class V2TransportSession {
   async #processEnvelope(
     envelope: AwarenessEnvelope<SidecarFrame>,
   ): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closed || this.#protocolFailed) return;
     if (!validBinding(envelope, this.#binding)) {
       throw new Error("Sidecar Awareness binding is invalid");
     }
     const lane: AwarenessLane = envelope.lane ?? "data";
+    if (
+      this.#expectedSidecarInstanceId &&
+      envelope.instanceId !== this.#expectedSidecarInstanceId
+    ) {
+      // An old data-state replay cannot take over the transport and may arrive
+      // after the bootstrap-bound peer is already live. Ignore that stale
+      // epoch; a foreign current/new epoch or any control state fails closed.
+      if (
+        this.#sidecarInstanceId &&
+        lane === "data" &&
+        envelope.epoch <= this.#inbound.ack().epoch
+      ) return;
+      this.#retiredSidecarInstances.add(envelope.instanceId);
+      throw new V2TransportLivenessError(
+        "Sidecar instance does not match the bootstrap-bound instance",
+        "instance_changed",
+      );
+    }
     const legacy = envelope.lane === undefined;
     if (lane === "control" && envelope.frames.length > 0) {
       throw new Error("Sidecar control Awareness state contains reliable frames");
@@ -559,7 +836,7 @@ export class V2TransportSession {
       this.#retiredSidecarInstances.add(this.#sidecarInstanceId);
       const message = "Sidecar instance changed while transport state was active";
       for (const state of [...this.#requests.values()]) {
-        if (state.committed) {
+        if (state.committed || state.commitPublished) {
           this.#failCommitted(state, new V2CommittedError(message, "instance_changed", true));
         } else {
           this.#failPreCommit(state, new V2PreCommitError(message, "instance_changed"));
@@ -598,9 +875,15 @@ export class V2TransportSession {
     let delivered: readonly ReliableFrame<SidecarFrame>[] = [];
     if (lane === "data") {
       const currentEpoch = this.#inbound.ack().epoch;
-      if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
+      if (envelope.epoch > currentEpoch) {
+        this.#inbound.reset(envelope.epoch);
+        this.#processedInboundAck = { epoch: envelope.epoch, sequence: -1 };
+      }
       delivered = this.#inbound.accept(envelope.frames);
-      for (const frame of delivered) await this.#processFrame(frame);
+      for (const frame of delivered) {
+        await this.#processFrame(frame);
+        this.#processedInboundAck = { epoch: frame.epoch, sequence: frame.sequence };
+      }
     }
     this.#admitPending();
     const urgency = this.#pump();
@@ -616,7 +899,7 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (frame.requestDigest !== state.requestDigest) {
-          if (state.committed) {
+          if (state.committed || state.commitPublished) {
             this.#failCommitted(state, new V2CommittedError(
               "Committed ACK digest does not match the request",
               "ack_digest",
@@ -655,10 +938,12 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (!state.committed) {
-          this.#failPreCommit(state, new V2PreCommitError(
-            "Sidecar emitted response data before commitment",
-            "protocol",
-          ));
+          const message = "Sidecar emitted response data before commitment";
+          if (state.commitPublished) {
+            this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
+          } else {
+            this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
+          }
           return;
         }
         if (!state.firstResponseSeen) { state.firstResponseSeen = true; state.diagnostics.firstFrame(frame.diagnostics); }
@@ -667,7 +952,7 @@ export class V2TransportSession {
       }
       case "response_batch": {
         const state=this.#requests.get(frame.requestId);if(!state)return;
-        if(!state.committed){this.#failPreCommit(state,new V2PreCommitError("Sidecar emitted response data before commitment","protocol"));return;}
+        if(!state.committed){const message="Sidecar emitted response data before commitment";if(state.commitPublished)this.#failCommitted(state,new V2CommittedError(message,"protocol",true));else this.#failPreCommit(state,new V2PreCommitError(message,"protocol"));return;}
         for(let offset=0;offset<frame.items.length;offset++){
           const eventIndex=frame.firstEventIndex+offset;const item=frame.items[offset]!;let bytes:Uint8Array;let data:string;
           try{bytes=base64UrlDecode(item.dataBase64Url);data=utf8Text(bytes);}catch{this.#failCommitted(state,new V2CommittedError("Response batch encoding is invalid","response_encoding",true));return;}
@@ -681,10 +966,12 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (!state.committed) {
-          this.#failPreCommit(state, new V2PreCommitError(
-            "Sidecar emitted a terminal before commitment",
-            "protocol",
-          ));
+          const message = "Sidecar emitted a terminal before commitment";
+          if (state.commitPublished) {
+            this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
+          } else {
+            this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
+          }
           return;
         }
         if (state.terminal && state.terminal.transcriptSha256 !== frame.transcriptSha256) {
@@ -707,6 +994,7 @@ export class V2TransportSession {
             frame.message,
             frame.code,
             frame.ambiguous,
+            frame.rateLimit,
           ));
         } else {
           this.#failPreCommit(state, new V2PreCommitError(frame.message, frame.code));
@@ -870,7 +1158,7 @@ export class V2TransportSession {
     const wasCancelled = state.cancelled;
     const wasQuarantined = state.quarantined;
     this.#removeState(state);
-    if (!wasCancelled) state.handle.settle(final);
+    if (!wasCancelled) state.handle.settle(final, terminal.rateLimit);
     if (wasQuarantined) this.#quarantined = Math.max(0, this.#quarantined - 1);
     this.#scheduler.enqueue("control", state.requestId, {
       kind: "response_ack",
@@ -970,6 +1258,7 @@ export class V2TransportSession {
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
         const state = this.#requests.get(reliable.requestId);
         if (state) state.published = true;
+        if (state && reliable.kind === "request_commit") state.commitStaged = true;
         if (state) state.diagnostics.published();
       }
     }
@@ -983,20 +1272,24 @@ export class V2TransportSession {
 
   #publish(reason: PublicationReason): void {
     if (!this.#connected || this.#closed) return;
-    const outbound = this.#outbound.snapshot();
-    const publishData = reason === "retransmission" || this.#dataDirty;
-    if (publishData) {
-      this.#flight.published(outbound.frames);
-      this.#delivery.published(outbound.frames, this.#clock.now());
-      this.#publishLane("data", outbound.frames, reason);
-      this.#dataDirty = false;
+    try {
+      const outbound = this.#outbound.snapshot();
+      const publishData = reason === "retransmission" || this.#dataDirty;
+      if (publishData) {
+        this.#flight.published(outbound.frames);
+        this.#delivery.published(outbound.frames, this.#clock.now());
+        this.#publishLane("data", outbound.frames, reason);
+        this.#dataDirty = false;
+      }
+      if (reason === "initial" || reason === "urgent" || !publishData) {
+        this.#publishLane("control", [], reason);
+      }
+      const diagnostics = this.#hostTransportDiagnostics();
+      for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
+      this.#armRetransmission();
+    } catch (cause) {
+      this.#failProtocol(cause);
     }
-    if (reason === "initial" || reason === "urgent" || !publishData) {
-      this.#publishLane("control", [], reason);
-    }
-    const diagnostics = this.#hostTransportDiagnostics();
-    for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
-    this.#armRetransmission();
   }
 
   #publishLane(
@@ -1018,13 +1311,19 @@ export class V2TransportSession {
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
-      ack: this.#inbound.ack(),
+      ack: this.#processedInboundAck,
       credits: this.#hostCeiling,
       active: committed,
       queued: this.#pending.filter(state => !state.admitted).length,
       draining: this.#draining,
       frames,
       lane,
+      ...(lane === "control" && this.#livenessProbe
+        ? { liveness: {
+            kind: "ping",
+            sentAtMs: this.#livenessProbe.sentAtMs,
+          } satisfies AwarenessLiveness }
+        : {}),
     };
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
@@ -1037,6 +1336,16 @@ export class V2TransportSession {
     } else {
       this.#controlPublications++;
       this.#controlPublishedBytes += encodedBytes;
+    }
+    if (lane === "data") {
+      // A transport may throw after handing bytes to the underlying socket.
+      // Fence the request before the call so publish failure is never treated
+      // as safely retryable once request_commit may have escaped.
+      for (const frame of frames) {
+        if (frame.kind !== "request_commit") continue;
+        const state = this.#requests.get(frame.requestId);
+        if (state) state.commitPublished = true;
+      }
     }
     this.#channel.publish(envelope, lane);
   }
@@ -1106,17 +1415,23 @@ export class V2TransportSession {
   #abortRequest(state: RequestState): void {
     if (!this.#requests.has(state.requestId)) return;
     this.#scheduler.removeStream(state.requestId);
-    if (state.committed) {
+    if (state.committed || state.commitPublished || state.commitStaged) {
+      const acknowledged = state.committed;
+      // A staged commit cannot be retracted from the cumulative window. The
+      // already-scheduled publication may still send it after this callback.
+      if (state.commitStaged) state.commitPublished = true;
       state.cancelled = true;
       if (!state.quarantined) {
         state.quarantined = true;
         this.#quarantined++;
       }
-      state.handle.cancel(new V2CommittedError(
+      const error = new V2CommittedError(
         "V2 request was cancelled after commitment",
         "cancelled",
         true,
-      ));
+      );
+      if (!acknowledged) state.rejectRun(error);
+      state.handle.cancel(error);
       this.#scheduler.enqueue("control", state.requestId, {
         kind: "request_cancel",
         requestId: state.requestId,
@@ -1147,11 +1462,16 @@ export class V2TransportSession {
 
   #failCommitted(state: RequestState, error: V2CommittedError): void {
     if (!this.#requests.has(state.requestId)) return;
+    const acknowledged = state.committed;
     if (error.ambiguous && !state.quarantined) {
       state.quarantined = true;
       this.#quarantined++;
     }
+    // commitPublished is deliberately promoted to committed-risk here so
+    // removal cannot release capacity for work that may still be executing.
+    state.committed = true;
     this.#removeState(state);
+    if (!acknowledged) state.rejectRun(error);
     state.handle.fail(error);
   }
 
@@ -1175,8 +1495,22 @@ export class V2TransportSession {
 
   #failProtocol(cause: unknown): void {
     const message = cause instanceof Error ? cause.message : "V2 transport protocol failed";
+    this.#protocolFailed = true;
+    this.#connected = false;
+    this.#draining = true;
+    this.#remoteCredits = 0;
+    if (this.#livenessProbe) {
+      this.#rejectLivenessProbe(
+        this.#livenessProbe,
+        new V2TransportLivenessError(
+          "V2 transport failed during its liveness probe",
+          "unavailable",
+        ),
+        false,
+      );
+    }
     for (const state of [...this.#requests.values()]) {
-      if (state.committed) {
+      if (state.committed || state.commitPublished) {
         this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
       } else {
         this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));

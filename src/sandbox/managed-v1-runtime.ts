@@ -5,6 +5,8 @@ import type {
   PrismProvisioningClient,
   ProvisionedRuntimeCredentials,
 } from "../prism/provisioning-client";
+import type { ProvisionedSandbox } from "../prism/protocol";
+import type { CredentialRefreshOutcome } from "../observability/events";
 import type { CpuTransformPool } from "../router/cpu-transform-pool";
 import type { RunHandle } from "../relay/run-handle";
 import { SandboxSlotRunner } from "../relay/slot-runner";
@@ -19,11 +21,13 @@ import { SandboxRuntime } from "./runtime";
 import type { ProjectId } from "./types";
 import { SandboxYDoc } from "./ydoc";
 
-const LAUNCHER_SOURCE = [
-  "$pdf_mode = 1;",
-  "system('rm -f main.pdf main.aux main.fls main.fdb_latexmk; rm -f /workspace/response.json');",
-  "$pdflatex = 'nohup python gp_daemon.py >> /tmp/gp_daemon.log 2>&1 & pdflatex -interaction=nonstopmode %O %S'",
-].join("\n") + "\n";
+function launcherSource(generation: number): string {
+  return [
+    "$pdf_mode = 1;",
+    "system('rm -f main.pdf main.aux main.fls main.fdb_latexmk; rm -f /workspace/response.json');",
+    `$pdflatex = 'GP_GENERATION=${generation} nohup python gp_daemon.py >> /tmp/gp_daemon.log 2>&1 & pdflatex -interaction=nonstopmode %O %S'`,
+  ].join("\n") + "\n";
+}
 
 const MAIN_SOURCE = [
   "\\documentclass{article}",
@@ -61,6 +65,16 @@ export interface ManagedV1RuntimeOptions {
   daemonSource: string;
   expectedBuild: string;
   requestedCapacity: number;
+  leaderGeneration?: number;
+  initialSandbox?: ProvisionedSandbox;
+  acquireSandboxForAuth?(
+    status: number,
+    signal: AbortSignal,
+  ): Promise<ProvisionedSandbox>;
+  onCredentialRefresh?(
+    outcome: CredentialRefreshOutcome,
+    status: number,
+  ): void;
 }
 
 export class ManagedV1Runtime implements RoutableSandboxRuntime {
@@ -70,17 +84,34 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
   #gateway: SandboxGateway | null = null;
   #runner: SandboxSlotRunner | null = null;
   #credentials: ProvisionedRuntimeCredentials | null = null;
+  #sandboxOverride: ProvisionedSandbox | null = null;
+  #replacementSandbox: ProvisionedSandbox | null = null;
+  #credentialRefreshPending = false;
   #draining = false;
 
   constructor(options: ManagedV1RuntimeOptions) {
+    const leaderGeneration = options.leaderGeneration ?? 0;
+    if (!Number.isSafeInteger(leaderGeneration) || leaderGeneration < 0) {
+      throw new RangeError("leaderGeneration must be a non-negative safe integer");
+    }
     this.projectId = options.projectId;
     this.#cpuPool = options.cpuPool;
     this.#lifecycle = new SandboxRuntime({
       projectId: options.projectId,
       provision: async (projectId, signal, hooks) => {
-        const credentials = await options.provisioning.provision(projectId, signal, hooks);
-        this.#credentials = credentials;
-        return credentials;
+        const credentials = options.initialSandbox
+          ? await options.provisioning.provisionAcquired(
+            projectId,
+            options.initialSandbox,
+            signal,
+            hooks,
+          )
+          : await options.provisioning.provision(projectId, signal, hooks);
+        const effective = this.#sandboxOverride
+          ? { ...credentials, sandbox: this.#sandboxOverride }
+          : credentials;
+        this.#credentials = effective;
+        return effective;
       },
       createHeartbeat: (sandbox, callbacks) => {
         const gateway = new SandboxGateway({
@@ -93,8 +124,51 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
           projectId: options.projectId,
           gateway,
           initialDelayMs: 10_000,
+          onAuthenticationFailure: async (status, signal) => {
+            if (!this.#credentials) return "retry";
+            this.#credentialRefreshPending = true;
+            let candidate: ProvisionedSandbox;
+            try {
+              candidate = options.acquireSandboxForAuth
+                ? await options.acquireSandboxForAuth(status, signal)
+                : await options.provisioning.acquireSandbox(
+                  signal,
+                  { maxAttempts: 1 },
+                );
+            } catch (error) {
+              const value = error && typeof error === "object"
+                ? error as { kind?: unknown; status?: unknown }
+                : {};
+              this.#notifyCredentialRefresh(
+                options,
+                signal.aborted
+                  ? "aborted"
+                  : value.kind === "auth" || value.status === 401 || value.status === 403
+                    ? "auth_rejected"
+                    : "transport_failed",
+                status,
+              );
+              return "expired";
+            }
+            if (gateway.rotateSameSession(candidate)) {
+              this.#sandboxOverride = candidate;
+              if (this.#credentials) {
+                this.#credentials = { ...this.#credentials, sandbox: candidate };
+              }
+              this.#notifyCredentialRefresh(options, "updated_in_place", status);
+              return "retry";
+            }
+            this.#replacementSandbox = candidate;
+            this.#notifyCredentialRefresh(options, "replacement_required", status);
+            return "expired";
+          },
+          onSuccess: () => {
+            this.#credentialRefreshPending = false;
+            callbacks.onSuccess();
+          },
           onExpired: callbacks.onExpired,
           onTransientFailure: callbacks.onTransientFailure,
+          onUnreachable: callbacks.onUnreachable,
         });
       },
       createYDoc: credentials => {
@@ -122,11 +196,12 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
         const controller = new DaemonController({
           ydoc: ydoc as SandboxYDoc,
           gateway: this.#gateway,
+          expectedGeneration: leaderGeneration,
           assets: {
             daemonFile: "gp_daemon.py",
             daemonSource: options.daemonSource,
             launcherFile: ".latexmkrc",
-            launcherSource: LAUNCHER_SOURCE,
+            launcherSource: launcherSource(leaderGeneration),
             mainFile: "main.tex",
             mainSource: MAIN_SOURCE,
             trackedFiles: trackedV1DaemonFiles(options.requestedCapacity),
@@ -143,6 +218,7 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
               ydoc: ydoc as SandboxYDoc,
               gateway: this.#gateway!,
               daemon: controller,
+              leaderGeneration,
               gzip: bytes => this.#cpuPool.gzip(bytes),
             });
             return descriptor;
@@ -150,6 +226,10 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
         };
       },
     });
+  }
+
+  subscribe(listener: () => void): () => void {
+    return this.#lifecycle.subscribe(() => listener());
   }
 
   start(): Promise<void> {
@@ -173,6 +253,7 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
     await this.#lifecycle.stop();
     this.#runner = null;
     this.#gateway = null;
+    this.#credentialRefreshPending = false;
   }
 
   run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
@@ -186,15 +267,21 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
     return this.#runner.run(body, signal);
   }
 
+  takeReplacementSandbox(): ProvisionedSandbox | null {
+    const sandbox = this.#replacementSandbox;
+    this.#replacementSandbox = null;
+    return sandbox;
+  }
+
   snapshot(): RoutableSandboxSnapshot {
     const lifecycle = this.#lifecycle.snapshot();
     const lanes = this.#runner?.snapshot();
     return {
       projectId: this.projectId,
       state: lifecycle.state.type,
-      capacity: lanes?.capacity ?? lifecycle.capacity,
+      capacity: this.#credentialRefreshPending ? 0 : lanes?.capacity ?? lifecycle.capacity,
       active: lanes?.active ?? 0,
-      available: lanes?.available ?? 0,
+      available: this.#credentialRefreshPending ? 0 : lanes?.available ?? 0,
       quarantined: lanes?.quarantined ?? 0,
       heartbeatAgeMs: lifecycle.heartbeatAgeMs,
       credentialExpiresInMs: this.#credentials
@@ -207,5 +294,13 @@ export class ManagedV1Runtime implements RoutableSandboxRuntime {
       memoryPressure: 0,
       failure: lifecycle.failure,
     };
+  }
+
+  #notifyCredentialRefresh(
+    options: ManagedV1RuntimeOptions,
+    outcome: CredentialRefreshOutcome,
+    status: number,
+  ): void {
+    try { options.onCredentialRefresh?.(outcome, status); } catch {}
   }
 }

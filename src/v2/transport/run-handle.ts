@@ -2,6 +2,7 @@ import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
 import type { SseFrame } from "../../relay/sse";
 import { utf8Bytes } from "../protocol/shared";
+import type { RateLimitHint } from "../rate-limit";
 
 export class V2PreCommitError extends Error {
   readonly name = "V2PreCommitError";
@@ -20,6 +21,7 @@ export class V2CommittedError extends Error {
     message: string,
     readonly code: string,
     readonly ambiguous: boolean,
+    readonly rateLimit?: RateLimitHint,
   ) {
     super(message);
   }
@@ -37,6 +39,7 @@ export interface V2RunHandleOptions {
 
 export class V2RunHandle implements RunHandle {
   readonly final: Promise<Record<string, unknown>>;
+  rateLimit?: RateLimitHint;
   readonly stats: RunHandle["stats"] = {
     bytes: 0,
     firstByteMs: null as number | null,
@@ -114,8 +117,9 @@ export class V2RunHandle implements RunHandle {
     }
   }
 
-  settle(final: Record<string, unknown>): void {
+  settle(final: Record<string, unknown>, rateLimit?: RateLimitHint): void {
     if (this.#closed) return;
+    this.rateLimit = rateLimit;
     this.#closed = true;
     this.#resolveFinal(final);
     this.#wakeAll();

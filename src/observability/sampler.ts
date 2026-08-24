@@ -7,6 +7,7 @@ import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../v2/diagnostics/types";
+import type { FleetRecoverySnapshot } from "../prism/recovery-coordinator";
 
 function ratio(numerator: number, denominator: number): number {
   return denominator > 0 ? Math.round((numerator / denominator) * 1_000) / 1_000 : 0;
@@ -89,6 +90,7 @@ export interface FleetSamplerOptions {
   memoryUsage?: () => NodeJS.MemoryUsage;
   cpuUsage?: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
   webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
+  recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
 }
 
 export class FleetSampler {
@@ -102,6 +104,7 @@ export class FleetSampler {
   readonly #memoryUsage: () => NodeJS.MemoryUsage;
   readonly #cpuUsage: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
   readonly #webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
+  readonly #recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
   #lastCpu: NodeJS.CpuUsage;
   #lastSampleAtMs: number;
   #timer: ReturnType<typeof setInterval> | null = null;
@@ -122,6 +125,7 @@ export class FleetSampler {
     this.#memoryUsage = options.memoryUsage ?? process.memoryUsage;
     this.#cpuUsage = options.cpuUsage ?? process.cpuUsage;
     this.#webSocketSnapshot = options.webSocketSnapshot;
+    this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
     this.#lastCpu = this.#cpuUsage();
     this.#lastSampleAtMs = this.#clock.now();
   }
@@ -162,6 +166,7 @@ export class FleetSampler {
       };
       const runtimes: JsonValue = router.runtimes.map(runtime => ({
         project_id: runtime.projectId,
+        incarnation: runtime.incarnation ?? 0,
         state: runtime.state,
         capacity: runtime.capacity,
         active: runtime.active,
@@ -172,14 +177,21 @@ export class FleetSampler {
         completion_ewma_ms: runtime.completionEwmaMs,
         recent_failure_rate: runtime.recentFailureRate,
         heartbeat_age_ms: runtime.heartbeatAgeMs,
+        sidecar_peer_age_ms: runtime.sidecarPeerAgeMs ?? null,
         credential_expires_in_ms: runtime.credentialExpiresInMs,
         memory_pressure: runtime.memoryPressure,
         error_kind: runtime.failure?.kind ?? null,
+        recovery: runtime.recovery ? {
+          attempt: runtime.recovery.attempt,
+          consecutive_failures: runtime.recovery.consecutiveFailures,
+          retry_in_ms: runtime.recovery.retryInMs,
+        } : null,
         diagnostics: runtime.diagnostics ? {
           host: transportJson(runtime.diagnostics.host),
           sidecar: sidecarJson(runtime.diagnostics.sidecar),
         } : null,
       }));
+      const circuit = this.#recoveryCircuitSnapshot?.();
       this.#logger.emit(observabilityEvent("fleet.sample", {
         capacity: router.capacity,
         active: router.active,
@@ -197,6 +209,16 @@ export class FleetSampler {
         resources,
         logger: this.#logger.snapshot() as unknown as JsonValue,
         runtimes,
+        provisioning_circuit: circuit ? {
+          state: circuit.state,
+          scope: circuit.scope,
+          consecutive_failures: circuit.consecutiveFailures,
+          retry_in_ms: circuit.nextProbeAtMs === null
+            ? null
+            : Math.max(0, circuit.nextProbeAtMs - this.#clock.now()),
+          queued: circuit.queued,
+          last_failure_kind: circuit.lastFailureKind,
+        } : null,
         websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
       }), "sample");
       this.#eventLoop.reset();

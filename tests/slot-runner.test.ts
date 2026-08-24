@@ -141,6 +141,21 @@ describe("SlotPool", () => {
 });
 
 describe("SandboxSlotRunner", () => {
+  it("publishes a leader-generation fence with every V1 job", async () => {
+    const value = runner(A, 1, new FastClock(), { leaderGeneration: 42 });
+    let published: Record<string, unknown> | null = null;
+    value.ydoc.onWrite = (name, content) => {
+      if (name !== "job_s1.json" || !content) return;
+      published = JSON.parse(content);
+      value.gateway.response = terminal(sha12(content), "resp_generation");
+    };
+
+    const handle = await value.runner.run({ model: "gpt-5.6-sol", input: "fenced" });
+    await handle.final;
+
+    expect(published).toMatchObject({ _ghostprov_generation: 42 });
+  });
+
   it("synchronizes the published workspace revision before polling", async () => {
     const value = runner(A, 1);
     let published = false;

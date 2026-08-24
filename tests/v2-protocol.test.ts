@@ -71,6 +71,9 @@ describe("V2 shared protocol", () => {
     expect(canonicalJson(GP_V2_SCHEMA_DESCRIPTOR)).toContain(
       '"response_event":["requestId","eventIndex","event","partIndex","partCount","offset","dataBase64Url","diagnostics?"]',
     );
+    expect(canonicalJson(GP_V2_SCHEMA_DESCRIPTOR)).toContain(
+      '"livenessFields":{"ping":["sentAtMs"],"pong":["sentAtMs"]}',
+    );
   });
 
   it("parses a fully bound host envelope", () => {
@@ -90,6 +93,61 @@ describe("V2 shared protocol", () => {
       ...validEnvelope(),
       lane: "invalid",
     }, BINDING, "host")).toThrow("lane");
+  });
+
+  it("validates directional out-of-band liveness on frame-free control envelopes", () => {
+    const hostProbe = {
+      ...validEnvelope(),
+      lane: "control",
+      frames: [],
+      liveness: { kind: "ping", sentAtMs: 1_000.25 },
+    };
+    expect(parseAwarenessEnvelope(hostProbe, BINDING, "host")).toMatchObject({
+      lane: "control",
+      frames: [],
+      liveness: { kind: "ping", sentAtMs: 1_000.25 },
+    });
+
+    const sidecarProbe = {
+      ...hostProbe,
+      peerId: "sidecar",
+      instanceId: "sidecar-instance-1",
+      liveness: { kind: "pong", sentAtMs: 1_000.25 },
+    };
+    expect(parseAwarenessEnvelope(sidecarProbe, BINDING, "sidecar")).toMatchObject({
+      lane: "control",
+      frames: [],
+      liveness: { kind: "pong", sentAtMs: 1_000.25 },
+    });
+  });
+
+  it("rejects liveness on the wrong lane, with frames, in the wrong direction, or malformed", () => {
+    const probe = {
+      ...validEnvelope(),
+      lane: "control",
+      frames: [],
+      liveness: { kind: "ping", sentAtMs: 1_000 },
+    };
+    const invalidHostProbes: unknown[] = [
+      { ...probe, lane: undefined },
+      { ...probe, lane: "data" },
+      { ...probe, frames: [ping()] },
+      { ...probe, liveness: { kind: "pong", sentAtMs: 1_000 } },
+      { ...probe, liveness: { kind: "ping", sentAtMs: -1 } },
+      { ...probe, liveness: { kind: "ping", sentAtMs: Number.NaN } },
+      { ...probe, liveness: { kind: "ping", sentAtMs: Number.POSITIVE_INFINITY } },
+      { ...probe, liveness: { kind: "ping", sentAtMs: "1000" } },
+      { ...probe, liveness: { kind: "ping" } },
+      { ...probe, liveness: { kind: "ping", sentAtMs: 1_000, sequence: 0 } },
+    ];
+    for (const mutation of invalidHostProbes) {
+      expect(() => parseAwarenessEnvelope(mutation, BINDING, "host"))
+        .toThrow(V2ProtocolError);
+    }
+    expect(() => parseAwarenessEnvelope({
+      ...probe,
+      liveness: { kind: "ping", sentAtMs: 1_000 },
+    }, BINDING, "sidecar")).toThrow("must be pong");
   });
 
   it("rejects wrong project, schema, build, leader, and frame kinds", () => {

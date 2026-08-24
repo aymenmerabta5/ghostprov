@@ -146,8 +146,14 @@ function runtimeMetrics(value: unknown): JsonValue | null {
     completion_ewma_ms: metric(value.completionEwmaMs),
     recent_failure_rate: metric(value.recentFailureRate),
     heartbeat_age_ms: metric(value.heartbeatAgeMs),
+    sidecar_peer_age_ms: metric(value.sidecarPeerAgeMs),
     credential_expires_in_ms: metric(value.credentialExpiresInMs),
     memory_pressure: metric(value.memoryPressure),
+    recovery: isRecord(value.recovery) ? {
+      attempt: metric(value.recovery.attempt),
+      consecutive_failures: metric(value.recovery.consecutiveFailures),
+      retry_in_ms: metric(value.recovery.retryInMs),
+    } : null,
   };
 }
 

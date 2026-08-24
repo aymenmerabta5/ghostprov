@@ -340,6 +340,18 @@ export class DenoAwarenessPeer {
       this.#hostPeerId = envelope.peerId;
       this.#hostClientId[lane] = clientId;
       this.#hostRevision[lane] = envelope.revision;
+      if (envelope.liveness?.kind === "ping") {
+        // Liveness is deliberately best-effort and out of band. Answer it
+        // before (and instead of) the reliable ACK/window, admission, engine,
+        // scheduler, and output-backpressure paths below.
+        try {
+          this.#publishLivenessPong(envelope.liveness.sentAtMs);
+        } catch {
+          // A later probe can retry if the Awareness provider rejects this
+          // publication while its connection is being re-established.
+        }
+        continue;
+      }
       try {
         if (lane === "control" && envelope.frames.length > 0) {
           throw new Error("host control Awareness state contains reliable frames");
@@ -443,6 +455,40 @@ export class DenoAwarenessPeer {
       this.#publishLane("control", [], reason);
     }
     this.#armRetransmission();
+  }
+
+  #publishLivenessPong(sentAtMs: number): void {
+    const current = this.#controlProvider.awareness.getLocalState()
+      ?.ghostprovV2Control as AwarenessEnvelope<SidecarFrame> | undefined;
+    const envelope: AwarenessEnvelope<SidecarFrame> = {
+      protocol: "gp-awareness-v2",
+      schemaVersion: 1,
+      schemaHash: this.#binding.schemaHash,
+      buildHash: this.#binding.buildHash,
+      projectId: this.#binding.projectId,
+      sessionId: this.#binding.sessionId,
+      peerId: "sidecar",
+      instanceId: this.#instanceId,
+      leaderGeneration: this.#binding.leaderGeneration,
+      epoch: current?.epoch ?? 1,
+      revision: this.#controlRevision++,
+      ack: current?.ack ?? { epoch: 1, sequence: -1 },
+      credits: current?.credits ?? 0,
+      active: current?.active ?? 0,
+      queued: current?.queued ?? 0,
+      draining: current?.draining ?? false,
+      frames: [],
+      lane: "control",
+      liveness: { kind: "pong", sentAtMs },
+      ...(current?.diagnostics ? { diagnostics: current.diagnostics } : {}),
+    };
+    const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    this.#publications++;
+    this.#urgentPublications++;
+    this.#publishedBytes += encodedBytes;
+    this.#controlPublications++;
+    this.#controlPublishedBytes += encodedBytes;
+    this.#controlProvider.awareness.setLocalStateField("ghostprovV2Control", envelope);
   }
 
   #publishLane(

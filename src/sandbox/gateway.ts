@@ -117,10 +117,11 @@ async function unzipStream(response: Response, wanted: readonly string[]): Promi
 export class SandboxGateway {
   readonly projectId: ProjectId;
   readonly #account: AccountRequestClient;
-  readonly #sandbox: ProvisionedSandbox;
   readonly #clock: Clock;
   readonly #zipCoordinator: ZipPollCoordinator;
   readonly #syncBatchMs: number;
+  #sandbox: ProvisionedSandbox;
+  #effectiveSessionId: string | null;
   #cacheBust = 0;
   #zipChain: Promise<void> = Promise.resolve();
   #syncRequestedEpoch = 0;
@@ -130,7 +131,8 @@ export class SandboxGateway {
   constructor(options: SandboxGatewayOptions) {
     this.projectId = options.projectId;
     this.#account = options.account;
-    this.#sandbox = options.sandbox;
+    this.#sandbox = { ...options.sandbox };
+    this.#effectiveSessionId = options.sandbox.sessionId ?? null;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#syncBatchMs = options.syncBatchMs ?? 5;
     if (!Number.isFinite(this.#syncBatchMs) || this.#syncBatchMs < 0 || this.#syncBatchMs > 1_000) {
@@ -145,12 +147,64 @@ export class SandboxGateway {
   async heartbeat(signal?: AbortSignal): Promise<HeartbeatResult> {
     const started = this.#clock.now();
     const response = await this.#request("heartbeat", { method: "GET", signal });
+    const sessionId = this.#headerSessionId(response);
+    if (
+      response.ok &&
+      sessionId !== null &&
+      this.#effectiveSessionId !== null &&
+      sessionId !== this.#effectiveSessionId
+    ) {
+      // A live gateway silently switching sessions invalidates every V2
+      // binding and V1 daemon assumption. Fail closed and let the supervisor
+      // create a freshly fenced generation instead of adopting it in place.
+      return {
+        ok: false,
+        status: 409,
+        durationMs: Math.max(0, this.#clock.now() - started),
+        sessionId,
+      };
+    }
+    if (response.ok && sessionId !== null) this.#effectiveSessionId = sessionId;
     return {
       ok: response.ok,
       status: response.status,
       durationMs: Math.max(0, this.#clock.now() - started),
-      sessionId: response.headers.get("x-session-id"),
+      sessionId,
     };
+  }
+
+  /**
+   * Atomically replaces credentials only when the candidate is known to
+   * address the currently-running sandbox session. URLs and missing identity
+   * fields are deliberately never treated as proof of identity.
+   */
+  rotateSameSession(candidate: ProvisionedSandbox): boolean {
+    const currentSessionId = this.#effectiveSessionId;
+    const candidateSessionId = candidate.sessionId ?? null;
+    if (currentSessionId === null || candidateSessionId === null || candidateSessionId !== currentSessionId) {
+      return false;
+    }
+
+    const current = this.#sandbox;
+    if (
+      current.sandboxId !== undefined &&
+      candidate.sandboxId !== undefined &&
+      current.sandboxId !== candidate.sandboxId
+    ) return false;
+    if (
+      current.sessionFirstSeenAtMs !== undefined &&
+      candidate.sessionFirstSeenAtMs !== undefined &&
+      current.sessionFirstSeenAtMs !== candidate.sessionFirstSeenAtMs
+    ) return false;
+
+    this.#sandbox = {
+      ...candidate,
+      sandboxId: candidate.sandboxId ?? current.sandboxId,
+      sessionId: candidate.sessionId,
+      sessionFirstSeenAtMs: candidate.sessionFirstSeenAtMs ?? current.sessionFirstSeenAtMs,
+    };
+    this.#effectiveSessionId = candidateSessionId;
+    return true;
   }
 
   async waitForSync(signal?: AbortSignal): Promise<{ response: Response; body: unknown }> {
@@ -207,11 +261,19 @@ export class SandboxGateway {
   }
 
   async #request(suffix: string, init: RequestInit): Promise<Response> {
+    // A request owns one immutable credential snapshot. Rotation may happen
+    // while the request is in flight, but can only affect later requests.
+    const sandbox = this.#sandbox;
     const delimiter = suffix.includes("?") ? "&" : "?";
-    const path = `${this.#sandbox.url}${suffix}${delimiter}prism_cache_bust=gp${Date.now().toString(36)}${this.#cacheBust++}`;
+    const path = `${sandbox.url}${suffix}${delimiter}prism_cache_bust=gp${Date.now().toString(36)}${this.#cacheBust++}`;
     const headers = new Headers(init.headers);
-    headers.set("x-crixet-sandbox-token", this.#sandbox.token.reveal());
+    headers.set("x-crixet-sandbox-token", sandbox.token.reveal());
     return this.#account.request(path, { ...init, headers });
+  }
+
+  #headerSessionId(response: Response): string | null {
+    const value = response.headers.get("x-session-id")?.trim();
+    return value ? value : null;
   }
 
   async #drainWorkspaceSync(): Promise<void> {

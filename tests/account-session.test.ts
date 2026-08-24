@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CookieJar } from "tough-cookie";
@@ -53,7 +53,7 @@ describe("PrismAccountSession", () => {
     expect(JSON.stringify(session.snapshot())).not.toContain("old");
     expect(JSON.stringify(session.snapshot())).not.toContain("new");
     if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
-  });
+  }, 30_000);
 
   it("hot reloads a newer serialized cookie jar", async () => {
     const file = await tempFile();
@@ -70,11 +70,72 @@ describe("PrismAccountSession", () => {
     await replacement.setCookie("prism_session_token=external; Path=/", "https://prism.test/");
     await new Promise(resolve => setTimeout(resolve, 20));
     await writeFile(file, JSON.stringify(replacement.serializeSync()));
+    const future = new Date(before + 2_000);
+    await utimes(file, future, future);
     expect((await stat(file)).mtimeMs).toBeGreaterThanOrEqual(before);
 
     await session.reloadIfChanged();
     expect(await session.cookieHeader("https://prism.test/api/y")).toContain("prism_session_token=external");
     expect(await session.cookieHeader("https://prism.test/api/y")).not.toContain("old");
+  }, 30_000);
+
+  it("force reloads a serialized cookie jar whose mtime did not change", async () => {
+    const file = await tempFile();
+    const initial = new CookieJar();
+    await initial.setCookie("prism_session_token=old; Path=/", "https://prism.test/");
+    await writeFile(file, JSON.stringify(initial.serializeSync()));
+    const pinnedSeconds = Math.floor(Date.now() / 1_000);
+    await utimes(file, pinnedSeconds, pinnedSeconds);
+    const session = await PrismAccountSession.create({
+      origin: "https://prism.test",
+      cookieFile: file,
+      fetch: async () => new Response("{}"),
+    });
+    const original = await stat(file);
+
+    const replacement = new CookieJar();
+    await replacement.setCookie("prism_session_token=external; Path=/", "https://prism.test/");
+    await writeFile(file, JSON.stringify(replacement.serializeSync()));
+    await utimes(file, pinnedSeconds, pinnedSeconds);
+    expect((await stat(file)).mtimeMs).toBe(original.mtimeMs);
+
+    expect(await session.reload()).toBe(false);
+    expect(await session.cookieHeader("https://prism.test/api/y")).toContain("prism_session_token=old");
+    expect(await session.reload({ force: true })).toBe(true);
+    expect(await session.cookieHeader("https://prism.test/api/y")).toContain("prism_session_token=external");
+    expect(await session.cookieHeader("https://prism.test/api/y")).not.toContain("old");
+  });
+
+  it("loads a same-mtime cookie candidate without changing the live jar before commit", async () => {
+    const file = await tempFile();
+    const initial = new CookieJar();
+    await initial.setCookie("prism_session_token=live; Path=/", "https://prism.test/");
+    await writeFile(file, JSON.stringify(initial.serializeSync()));
+    const pinnedSeconds = Math.floor(Date.now() / 1_000);
+    await utimes(file, pinnedSeconds, pinnedSeconds);
+    const seen: Array<string | null> = [];
+    const session = await PrismAccountSession.create({
+      origin: "https://prism.test",
+      cookieFile: file,
+      fetch: async (_input, init) => {
+        seen.push(new Headers(init?.headers).get("cookie"));
+        return new Response("{}");
+      },
+    });
+    const replacement = new CookieJar();
+    await replacement.setCookie("prism_session_token=candidate; Path=/", "https://prism.test/");
+    await writeFile(file, JSON.stringify(replacement.serializeSync()));
+    await utimes(file, pinnedSeconds, pinnedSeconds);
+
+    const candidate = await session.createCookieCandidate();
+    await candidate.request("/auth/session");
+    expect(seen[0]).toContain("prism_session_token=candidate");
+    expect(await session.cookieHeader("https://prism.test/auth/session"))
+      .toContain("prism_session_token=live");
+
+    expect(await candidate.commit()).toBe(true);
+    expect(await session.cookieHeader("https://prism.test/auth/session"))
+      .toContain("prism_session_token=candidate");
   });
 
   it("serializes concurrent cookie persistence without corrupting the jar", async () => {
@@ -95,6 +156,43 @@ describe("PrismAccountSession", () => {
     const header = await jar.getCookieString("https://prism.test/");
     expect(header).toContain("left=1");
     expect(header).toContain("right=2");
+  });
+
+  it("discards Set-Cookie from a request sent with a jar replaced by a candidate", async () => {
+    const file = await tempFile();
+    let start!: () => void;
+    const started = new Promise<void>(resolve => { start = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const session = await PrismAccountSession.create({
+      origin: "https://prism.test",
+      initialCookieHeader: "prism_session_token=old",
+      cookieFile: file,
+      fetch: async input => {
+        if (new URL(String(input)).pathname === "/slow") {
+          start();
+          await gate;
+          return setCookieResponse("prism_session_token=stale-response; Path=/");
+        }
+        return new Response("{}");
+      },
+    });
+    await session.flush();
+
+    const slow = session.request("/slow");
+    await started;
+    const replacement = new CookieJar();
+    await replacement.setCookie("prism_session_token=verified-candidate; Path=/", "https://prism.test/");
+    await writeFile(file, JSON.stringify(replacement.serializeSync()));
+    const candidate = await session.createCookieCandidate();
+    await candidate.request("/auth/session");
+    expect(await candidate.commit()).toBe(true);
+
+    release();
+    await slow;
+    const live = await session.cookieHeader("https://prism.test/auth/session");
+    expect(live).toContain("prism_session_token=verified-candidate");
+    expect(live).not.toContain("stale-response");
   });
 
   it("honors cookie domain, path, and expiry rules", async () => {

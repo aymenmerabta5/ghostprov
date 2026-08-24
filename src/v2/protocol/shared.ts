@@ -1,4 +1,5 @@
 import type { V2EnvelopeDiagnostics, V2FirstEventDiagnostics, V2RequestAckDiagnostics, V2TerminalDiagnostics } from "../diagnostics/types";
+import type { RateLimitHint } from "../rate-limit";
 
 export const GP_V2_PROTOCOL = "gp-awareness-v2" as const;
 export const GP_V2_SCHEMA_VERSION = 1 as const;
@@ -97,6 +98,7 @@ export type SidecarFrame =
     finalEventIndex: number;
     finalSha256: string;
     diagnostics?: V2TerminalDiagnostics;
+    rateLimit?: RateLimitHint;
   }
   | {
     kind: "response_error";
@@ -104,6 +106,7 @@ export type SidecarFrame =
     code: string;
     message: string;
     ambiguous: boolean;
+    rateLimit?: RateLimitHint;
   }
   | { kind: "request_cancelled"; requestId: string }
   | { kind: "credential_ack"; rotationId: string }
@@ -111,6 +114,15 @@ export type SidecarFrame =
   | { kind: "pong"; sentAtMs: number };
 
 export type ReliableFrame<T> = T & FrameIdentity;
+
+/**
+ * A best-effort control-lane probe that deliberately stays outside the
+ * reliable frame window. Direction is enforced by the wire validator because
+ * generic envelope helpers commonly construct either side of the channel.
+ */
+export type AwarenessLiveness =
+  | { kind: "ping"; sentAtMs: number }
+  | { kind: "pong"; sentAtMs: number };
 
 export interface AwarenessEnvelope<T> {
   protocol: typeof GP_V2_PROTOCOL;
@@ -131,6 +143,7 @@ export interface AwarenessEnvelope<T> {
   draining: boolean;
   frames: readonly ReliableFrame<T>[];
   lane?: AwarenessLane;
+  liveness?: AwarenessLiveness;
   diagnostics?: V2EnvelopeDiagnostics;
 }
 
@@ -162,8 +175,14 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     "draining",
     "frames",
     "lane?",
+    "liveness?",
     "diagnostics?",
   ],
+  livenessKinds: ["ping", "pong"],
+  livenessFields: {
+    ping: ["sentAtMs"],
+    pong: ["sentAtMs"],
+  },
   hostFrameKinds: [
     "request_open",
     "request_data",
@@ -205,9 +224,9 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
     response_batch: ["requestId", "firstEventIndex", "items"],
     response_terminal: [
       "requestId", "requestDigest", "responseId", "eventCount", "byteCount",
-      "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256", "diagnostics?",
+      "transcriptSha256", "terminalStatus", "finalEventIndex", "finalSha256", "diagnostics?", "rateLimit?",
     ],
-    response_error: ["requestId", "code", "message", "ambiguous"],
+    response_error: ["requestId", "code", "message", "ambiguous", "rateLimit?"],
     request_cancelled: ["requestId"],
     credential_ack: ["rotationId"],
     drained: ["active", "queued"],

@@ -56,6 +56,7 @@ Failure rules:
 - Global zero-capacity queueing fails with a typed 503 after 30 seconds instead of waiting for a client WebSocket idle timeout.
 - Client cancellations and definitive upstream errors are routing-neutral; only transport-attributable failures feed a sixty-second decaying sandbox health score.
 - ACK-stall age starts with the active reliable flight; idle time never suppresses credits, and a fully drained transport restores credits immediately.
+- Every project runtime is supervised. A dead child is replaced with a fresh sandbox session for the **same Prism project and worker index**; recovery never creates or deletes a project.
 
 ## Concurrency and latency
 
@@ -64,6 +65,8 @@ One V2 sidecar retains a hard physical ceiling of 128 simultaneous upstream call
 ```text
 min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
 ```
+
+GhostProv applies one host-wide upstream TPM controller **per model** across every V1 and V2 sandbox. Organization/model TPM is shared by the sandboxes because they use the same OpenAI organization, so a 429 on one project closes that model's whole fleet rather than retrying the same exhausted budget elsewhere. The controller starts each unseen model with one probe until it learns token metadata, parses the canonical TPM message when proxies strip headers, conservatively reserves token budget, and reopens with one probe after `Retry-After`/reset. Configure dashboard-declared shared model families with `GP_RATE_LIMIT_SHARED_MODEL_GROUPS` (comma-separated models, semicolon-separated groups) so they use one budget. The original credential-scrubbed upstream error is returned to Codex and retained as `lastRateLimit`; local cooldown responses reuse that explanation instead of replacing it with a generic retry-exhaustion message.
 
 Hardware detection uses physical/free RAM, process RSS, and logical processors:
 
@@ -184,7 +187,7 @@ supports_websockets = true
 ## Performance observability
 
 - `GET /health` returns aggregate capacity, active, available, queued, and runtime count; zero routable capacity returns HTTP 503 with `ok:false`.
-- `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, and resource snapshots.
+- `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, resource, and host-wide TPM-controller snapshots. Each model includes the latest full rate-limit problem plus parsed organization, model, limit, used, requested, remaining, and retry values. When a canonical 429 names an organization, the originating runtime also records `upstreamOrganization` so operators can compare evidence across Prism projects; no unsupported `/v1/me` call is made through the scoped sandbox proxy.
 
 Start the read-only external monitor against an already-running router without restarting it:
 
@@ -195,6 +198,8 @@ bun run monitor:v2
 It polls only `GET /health` and `GET /__sandboxes`, retries failures with capped exponential jitter, and writes `monitor.sample` or sanitized `monitor.error` JSONL events. The default target is `http://127.0.0.1:18787`; non-loopback roots and roots containing paths, credentials, queries, or fragments are rejected. Ctrl+C stops only the monitor and flushes its log.
 
 Built-in tracing starts with the upgraded router after the operator's next manual restart. It records `request.accepted`, `admission.acquired`, `request.queued`, `route.selected`, `transport.committed`, `response.first_event`, and exactly one `request.completed` or `request.failed`. A periodic `fleet.sample` adds host memory, CPU, event-loop delay, logger pressure, aggregate capacity, and per-runtime health. The external monitor provides immediate fleet visibility, but only built-in tracing can attribute per-request queue, commit, first-event, and total latency.
+
+Recovery tracing adds `sandbox.recovery.started`, `sandbox.recovery.retry_scheduled`, `sandbox.recovery.completed`, `sandbox.recovery.aborted`, `sandbox.credential_refresh`, and transition-only `prism.circuit.changed`. These events contain only project/worker indexes, bounded categories, counters, durations, and HTTP status codes—never sandbox/session IDs, URLs, cookies, tokens, prompts, or responses. `/__sandboxes` exposes process-local runtime incarnations, bounded recovery counters, and sidecar peer age; periodic `fleet.sample` additionally records the sanitized provisioning-circuit state.
 
 Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous queue preserves terminal events ahead of progress and sample events. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 
@@ -237,7 +242,14 @@ Operational recovery states are intentionally distinct:
 - committed definitive failure: pinned, no fallback;
 - committed ambiguous failure or lost instance: quarantined, no retry;
 - proven terminal spool: replayed and ACKed without a second fetch;
-- expired heartbeat/credential: runtime drains without affecting healthy projects.
+- heartbeat `401`/`403`: account cookies are revalidated once fleet-wide, `/api/backend/1/new` reacquires the sandbox credential, and an exactly matching session rotates its token in place; a changed or unverifiable session is handed directly to a fresh generation without a second acquisition;
+- heartbeat `404`/`409`/`410`, three consecutive transient heartbeat failures, a stale/missing heartbeat, or an expired resource credential: the child fails closed and is replaced;
+- V2 proves the exact bootstrap-bound sidecar over an out-of-band control-lane ping before readiness and every ten seconds thereafter; one missed pong removes capacity and three misses replace the sidecar generation without confusing request backpressure with liveness;
+- replacement always keeps the same persisted Prism project UUID and worker index, increments only the leader generation, and reacquires a sandbox through `/api/backend/1/new` before resynchronizing that project;
+- shared auth, rate-limit, and Prism 5xx failures pass through one fleet-wide revalidation/half-open probe circuit, preventing a fleet stampede; local `404`/`409`/`410` recovery bypasses that circuit;
+- failed replacement attempts retry forever with capped exponential jitter while respecting the fleet provisioning-concurrency limit. Every fresh authenticated `auto` generation tries V2 first and keeps V1 as its lazy pre-commit fallback. Healthy projects continue serving throughout recovery.
+
+Heartbeat requests have a five-second deadline inside the exact ten-second cadence, so a hung proxy request cannot freeze liveness detection. The stable registry entry exposes zero capacity while its disposable child is recovering. Project creation remains controlled exclusively by initial fleet reconciliation and `GP_AUTO_CREATE_PROJECTS`; the recovery path never calls project creation or deletion.
 
 Project deletion is never automatic. Preview managed targets first:
 
@@ -260,6 +272,7 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | --- | ---: | --- |
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
 | `GP_TRANSPORT` | `auto` | `v2`, `v1`, or authenticated rollout fallback; guests are V2-only |
+| `GP_RATE_LIMIT_SHARED_MODEL_GROUPS` | unset | Dashboard-declared shared TPM groups: `model-a,model-b;model-c,model-d` |
 | `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
 | `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16` | Maximum adaptive active request limit |
@@ -358,13 +371,19 @@ The isolated suite includes:
 - `tests/project-inspector.test.ts`
 - `tests/provisioning-client.test.ts`
 - `tests/projects-client.test.ts`
+- `tests/rate-limit-gate.test.ts`
 - `tests/resource-governor.test.ts`
+- `tests/recovery-chaos.test.ts`
+- `tests/recovery-coordinator.test.ts`
+- `tests/recovery-observability.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/router-http.test.ts`
 - `tests/router-observability.test.ts`
 - `tests/router-policy.test.ts`
+- `tests/router-rate-limit.test.ts`
 - `tests/sandbox-gateway.test.ts`
 - `tests/sandbox-runtime.test.ts`
+- `tests/supervised-runtime.test.ts`
 - `tests/sandbox-ydoc.test.ts`
 - `tests/scheduler.test.ts`
 - `tests/session-manager.test.ts`
@@ -407,6 +426,7 @@ The isolated suite includes:
 - `tests/v2-monitor.test.ts`
 - `tests/v2-output-sink.test.ts`
 - `tests/v2-protocol.test.ts`
+- `tests/v2-rate-limit-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
 - `tests/v2-publication-pacer.test.ts`
 - `tests/v2-response-batch.test.ts`

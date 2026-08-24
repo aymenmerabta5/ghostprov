@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { chooseRuntime, type RouteCandidate } from "../src/router/policy";
+import {
+  chooseRuntime,
+  isRuntimeHealthy,
+  type RouteCandidate,
+} from "../src/router/policy";
 import type { RandomSource } from "../src/core/ports";
 import type { WorkloadDescriptor } from "../src/router/workload";
 import { projectId } from "../src/sandbox/types";
@@ -38,6 +42,13 @@ function candidate(
 }
 
 describe("chooseRuntime", () => {
+  it("separates runtime health from immediate spare capacity", () => {
+    expect(isRuntimeHealthy(candidate("1", { active: 30 }))).toBe(true);
+    expect(isRuntimeHealthy(candidate("2", { heartbeatAgeMs: null }))).toBe(false);
+    expect(isRuntimeHealthy(candidate("3", { heartbeatAgeMs: 20_001 }))).toBe(false);
+    expect(isRuntimeHealthy(candidate("4", { credentialExpiresInMs: 29_999 }))).toBe(false);
+  });
+
   it("chooses the lowest predicted completion time instead of round robin", () => {
     const decision = chooseRuntime(TEXT, [
       candidate("1", { active: 28, ackEwmaMs: 900 }),

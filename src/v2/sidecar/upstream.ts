@@ -4,7 +4,17 @@ import {
   TranscriptProof,
   type TranscriptSnapshot,
 } from "../protocol/transcript";
-import { utf8Bytes, utf8Text, type TerminalStatus } from "../protocol/shared";
+import {
+  utf8Bytes,
+  utf8Text,
+  type TerminalStatus,
+} from "../protocol/shared";
+import {
+  rateLimitHintFromError,
+  rateLimitHintFromHeaders,
+  rateLimitProblemFromError,
+  type RateLimitHint,
+} from "../rate-limit";
 
 export interface SecretSource {
   reveal(): string;
@@ -27,6 +37,8 @@ export interface UpstreamTerminal {
   finalSha256: string;
   final: Record<string, unknown>;
   transcriptBytes: Uint8Array;
+  /** Present only when the upstream terminal represents a rate-limit failure. */
+  rateLimit?: RateLimitHint;
 }
 
 export class UpstreamExecutionError extends Error {
@@ -37,6 +49,7 @@ export class UpstreamExecutionError extends Error {
     readonly code: string,
     readonly ambiguous: boolean,
     readonly status?: number,
+    readonly rateLimit?: RateLimitHint,
   ) {
     super(message);
   }
@@ -54,13 +67,28 @@ function sanitizeMessage(value: unknown, fallback: string): string {
   return raw
     .replace(/\b(token|api[_-]?key|secret|password)\s*[:=]\s*[^;\s,]+/gi, "$1=[REDACTED]")
     .replace(/[A-Za-z0-9+/_=-]{48,}/g, "[REDACTED]")
-    .slice(0, 240);
+    .slice(0, 512);
 }
 
 function safeCode(value: unknown, fallback: string): string {
   return typeof value === "string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(value)
     ? value
     : fallback;
+}
+
+function rateLimitTransportError(
+  error: unknown,
+  headerHint?: RateLimitHint,
+): UpstreamExecutionError | null {
+  const problem = rateLimitProblemFromError(error);
+  if (!problem) return null;
+  return new UpstreamExecutionError(
+    sanitizeMessage(problem.message, "Upstream token rate limit was reached"),
+    safeCode(problem.code, "rate_limit_exceeded"),
+    false,
+    429,
+    rateLimitHintFromError(error, headerHint),
+  );
 }
 
 function parseBody(bytes: Uint8Array): Record<string, unknown> {
@@ -83,11 +111,21 @@ async function httpError(response: Response): Promise<UpstreamExecutionError> {
   } catch {}
   const upstream = body?.error && typeof body.error === "object" ? body.error : null;
   const fallback = `Upstream Responses request failed (${response.status})`;
+  const message = sanitizeMessage(upstream?.message, fallback);
+  const rateLimit = rateLimitHintFromError({
+    status: response.status,
+    error: {
+      code: upstream?.code,
+      type: upstream?.type,
+      message,
+    },
+  }, rateLimitHintFromHeaders(response.headers));
   return new UpstreamExecutionError(
-    sanitizeMessage(upstream?.message, fallback),
+    message,
     safeCode(upstream?.code ?? upstream?.type, `http_${response.status}`),
     false,
     response.status,
+    rateLimit,
   );
 }
 
@@ -146,7 +184,9 @@ export class DirectResponsesClient {
         },
         body: requestBody,
       });
-    } catch {
+    } catch (error) {
+      const rateLimited = rateLimitTransportError(error);
+      if (rateLimited) throw rateLimited;
       throw new UpstreamExecutionError(
         "Upstream Responses transport failed after request start",
         "transport",
@@ -154,8 +194,15 @@ export class DirectResponsesClient {
       );
     }
     if (!response.ok) throw await httpError(response);
+    const responseRateLimit = rateLimitHintFromHeaders(response.headers);
     if (!response.body) {
-      throw new UpstreamExecutionError("Upstream response has no stream body", "missing_body", true, response.status);
+      throw new UpstreamExecutionError(
+        "Upstream response has no stream body",
+        "missing_body",
+        true,
+        response.status,
+        responseRateLimit,
+      );
     }
     const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
     if (!contentType.includes("text/event-stream")) {
@@ -165,6 +212,7 @@ export class DirectResponsesClient {
         "content_type",
         true,
         response.status,
+        responseRateLimit,
       );
     }
 
@@ -179,14 +227,26 @@ export class DirectResponsesClient {
       for (const frame of parsed.frames) {
         const eventBytes = utf8Bytes(`event: ${frame.event}\ndata: ${frame.data}\n\n`).byteLength;
         if (eventBytes > this.#maxEventBytes) {
-          throw new UpstreamExecutionError("Upstream SSE event exceeds byte limit", "event_too_large", true);
+          throw new UpstreamExecutionError(
+            "Upstream SSE event exceeds byte limit",
+            "event_too_large",
+            true,
+            undefined,
+            responseRateLimit,
+          );
         }
         transcript.append(frame);
         await input.onEvent(frame);
       }
       pending = pending.slice(parsed.nextOffset);
       if (utf8Bytes(pending).byteLength > this.#maxEventBytes) {
-        throw new UpstreamExecutionError("Upstream SSE event exceeds byte limit", "event_too_large", true);
+        throw new UpstreamExecutionError(
+          "Upstream SSE event exceeds byte limit",
+          "event_too_large",
+          true,
+          undefined,
+          responseRateLimit,
+        );
       }
     };
 
@@ -202,16 +262,26 @@ export class DirectResponsesClient {
     } catch (error) {
       await reader.cancel().catch(() => undefined);
       if (error instanceof UpstreamExecutionError) throw error;
+      const rateLimited = rateLimitTransportError(error, responseRateLimit);
+      if (rateLimited) throw rateLimited;
       throw new UpstreamExecutionError(
         "Upstream event stream failed after request start",
         "stream",
         true,
+        undefined,
+        responseRateLimit,
       );
     } finally {
       reader.releaseLock();
     }
     if (pending.trim()) {
-      throw new UpstreamExecutionError("Upstream event stream ended mid-frame", "missing_terminal", true);
+      throw new UpstreamExecutionError(
+        "Upstream event stream ended mid-frame",
+        "missing_terminal",
+        true,
+        undefined,
+        responseRateLimit,
+      );
     }
 
     let proof;
@@ -220,11 +290,24 @@ export class DirectResponsesClient {
       proof = await transcript.createTerminal();
       snapshot = transcript.snapshot();
     } catch {
-      throw new UpstreamExecutionError("Upstream event stream has no terminal proof", "missing_terminal", true);
+      throw new UpstreamExecutionError(
+        "Upstream event stream has no terminal proof",
+        "missing_terminal",
+        true,
+        undefined,
+        responseRateLimit,
+      );
     }
     if (!snapshot.final || snapshot.finalEventIndex === null || !snapshot.terminalStatus) {
-      throw new UpstreamExecutionError("Upstream terminal state is incomplete", "missing_terminal", true);
+      throw new UpstreamExecutionError(
+        "Upstream terminal state is incomplete",
+        "missing_terminal",
+        true,
+        undefined,
+        responseRateLimit,
+      );
     }
+    const terminalRateLimit = rateLimitHintFromError(snapshot.final, responseRateLimit) ?? responseRateLimit;
     return {
       responseId: proof.responseId,
       status: proof.terminalStatus,
@@ -235,6 +318,7 @@ export class DirectResponsesClient {
       finalSha256: proof.finalSha256,
       final: snapshot.final,
       transcriptBytes: snapshot.canonicalBytes,
+      ...(terminalRateLimit ? { rateLimit: terminalRateLimit } : {}),
     };
   }
 }

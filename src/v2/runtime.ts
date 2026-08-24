@@ -1,5 +1,6 @@
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type {
+  AcquireSandboxOptions,
   ProvisionedRuntimeCredentials,
   ProvisioningHooks,
   YSweetRequestContext,
@@ -21,6 +22,7 @@ import type {
   SidecarFrame,
 } from "./protocol/shared";
 import type { V2SidecarAssets } from "./sidecar/assets";
+import type { CredentialRefreshOutcome } from "../observability/events";
 import type {
   V2TransportSession,
   V2TransportSnapshot,
@@ -37,6 +39,16 @@ export interface V2RuntimeProvisioning {
     signal?: AbortSignal,
     hooks?: ProvisioningHooks,
   ): Promise<ProvisionedRuntimeCredentials>;
+  acquireSandbox?(
+    signal?: AbortSignal,
+    options?: AcquireSandboxOptions,
+  ): Promise<ProvisionedSandbox>;
+  provisionAcquired?(
+    projectId: ProjectId,
+    sandbox: ProvisionedSandbox,
+    signal?: AbortSignal,
+    hooks?: ProvisioningHooks,
+  ): Promise<ProvisionedRuntimeCredentials>;
   refreshResources(
     current: ProvisionedRuntimeCredentials,
     signal?: AbortSignal,
@@ -49,18 +61,74 @@ export interface V2RuntimeProvisioning {
 }
 
 export interface V2RuntimeGateway {
-  heartbeat(signal?: AbortSignal): Promise<{
-    ok: boolean;
-    status: number;
-    durationMs: number;
-    sessionId: string | null;
-  }>;
+  heartbeat(signal?: AbortSignal): Promise<V2RuntimeHeartbeatResult>;
+  rotateSameSession?(candidate: ProvisionedSandbox): boolean;
+}
+
+export interface V2RuntimeHeartbeatResult {
+  ok: boolean;
+  status: number;
+  durationMs: number;
+  sessionId: string | null;
 }
 
 export interface V2RuntimeHeartbeat {
   start(): void;
   stop(): Promise<void>;
   snapshot(): { lastSuccessAtMs: number | null };
+}
+
+export interface V2RuntimeHeartbeatCallbacks {
+  onSuccess(result: V2RuntimeHeartbeatResult): void;
+  onAuthenticationFailure(
+    status: number,
+    signal: AbortSignal,
+  ): Promise<"retry" | "expired">;
+  onExpired(status: number): void;
+  onTransientFailure(status: number | null): void;
+  onUnreachable(status: number | null): void;
+}
+
+export type V2RuntimeLifecycleFailureKind =
+  | "heartbeat_expired"
+  | "heartbeat_unreachable"
+  | "sidecar_unreachable"
+  | "resource_credential_expired";
+
+function normalizedHttpStatus(status: number | null): number | null {
+  return Number.isInteger(status) && status !== null && status >= 100 && status <= 599
+    ? status
+    : null;
+}
+
+/** A bounded, secret-free failure that is safe to expose in runtime snapshots. */
+export class V2RuntimeLifecycleFailure extends Error {
+  readonly status: number | null;
+  readonly operation: "heartbeat" | "sidecar_liveness" | "refresh_resources";
+
+  constructor(
+    readonly kind: V2RuntimeLifecycleFailureKind,
+    status: number | null = null,
+    options?: ErrorOptions,
+  ) {
+    const safeStatus = normalizedHttpStatus(status);
+    const suffix = safeStatus === null ? "" : ` (${safeStatus})`;
+    const message = kind === "heartbeat_expired"
+      ? `V2 sandbox heartbeat credentials expired${suffix}`
+      : kind === "heartbeat_unreachable"
+        ? `V2 sandbox heartbeat became unreachable${suffix}`
+        : kind === "sidecar_unreachable"
+          ? "V2 sandbox sidecar became unreachable"
+          : "V2 sandbox resource credential expired after refresh failed";
+    super(message, options);
+    this.name = "V2RuntimeLifecycleFailure";
+    this.status = safeStatus;
+    this.operation = kind === "resource_credential_expired"
+      ? "refresh_resources"
+      : kind === "sidecar_unreachable"
+        ? "sidecar_liveness"
+        : "heartbeat";
+  }
 }
 
 export interface V2RuntimeYDoc {
@@ -82,6 +150,7 @@ export interface V2RuntimeTransport {
   snapshot(): V2TransportSnapshot;
   setHostCeiling?(value: number): void;
   rotateCredential?(rotationId: string, sealedJson: string, signal?: AbortSignal): Promise<void>;
+  probeLiveness?(signal?: AbortSignal): Promise<{ rttMs: number; sentAtMs: number }>;
 }
 
 export interface V2RuntimeGovernor {
@@ -106,13 +175,22 @@ export interface V2SandboxRuntimeOptions {
   clock?: Clock;
   resourceRefreshLeadMs?: number;
   ySweetRefreshMs?: number;
+  sidecarProbePeriodMs?: number;
+  sidecarFailureThreshold?: number;
+  sidecarCommitStallMs?: number;
+  initialSandbox?: ProvisionedSandbox;
+  acquireSandboxForAuth?(
+    status: number,
+    signal: AbortSignal,
+  ): Promise<ProvisionedSandbox>;
+  onCredentialRefresh?(
+    outcome: CredentialRefreshOutcome,
+    status: number,
+  ): void;
   createGateway(sandbox: ProvisionedSandbox): V2RuntimeGateway;
   createHeartbeat(
     gateway: V2RuntimeGateway,
-    callbacks: {
-      onExpired(status: number): void;
-      onTransientFailure(status: number | null): void;
-    },
+    callbacks: V2RuntimeHeartbeatCallbacks,
   ): V2RuntimeHeartbeat;
   createYDoc(credentials: ProvisionedRuntimeCredentials): V2RuntimeYDoc;
   createAwareness(
@@ -135,6 +213,7 @@ export interface V2SandboxRuntimeOptions {
     channel: AwarenessChannel<HostFrame, SidecarFrame>;
     maxResponseBytes: number;
     gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+    expectedSidecarInstanceId: string;
   }): V2RuntimeTransport | V2TransportSession;
 }
 
@@ -159,12 +238,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   readonly #listeners = new Set<() => void>();
   readonly #resourceRefreshLeadMs: number;
   readonly #ySweetRefreshMs: number;
+  readonly #sidecarProbePeriodMs: number;
+  readonly #sidecarFailureThreshold: number;
+  readonly #sidecarCommitStallMs: number;
   #state: RuntimeState = "configured";
   #generation = 0;
   #controller: AbortController | null = null;
   #starting: Promise<void> | null = null;
   #refreshLoop: Promise<void> | null = null;
   #ySweetLoop: Promise<void> | null = null;
+  #sidecarLoop: Promise<void> | null = null;
+  #sidecarSuspect = false;
   #gateway: V2RuntimeGateway | null = null;
   #heartbeat: V2RuntimeHeartbeat | null = null;
   #ydoc: V2RuntimeYDoc | null = null;
@@ -174,6 +258,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #credentials: ProvisionedRuntimeCredentials | null = null;
   #descriptor: V2ReadyDescriptor | null = null;
   #failure: unknown = null;
+  #replacementSandbox: ProvisionedSandbox | null = null;
+  #credentialRefreshPending = false;
 
   constructor(options: V2SandboxRuntimeOptions) {
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
@@ -209,6 +295,18 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#completionEstimate = new DecayingRuntimeCompletionEstimate({ clock: this.#clock });
     this.#resourceRefreshLeadMs = refreshLead;
     this.#ySweetRefreshMs = ySweetRefreshMs;
+    this.#sidecarProbePeriodMs = options.sidecarProbePeriodMs ?? 10_000;
+    this.#sidecarFailureThreshold = options.sidecarFailureThreshold ?? 3;
+    this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? 60_000;
+    if (!Number.isSafeInteger(this.#sidecarProbePeriodMs) || this.#sidecarProbePeriodMs < 1) {
+      throw new RangeError("sidecarProbePeriodMs must be positive");
+    }
+    if (!Number.isSafeInteger(this.#sidecarFailureThreshold) || this.#sidecarFailureThreshold < 1) {
+      throw new RangeError("sidecarFailureThreshold must be positive");
+    }
+    if (!Number.isSafeInteger(this.#sidecarCommitStallMs) || this.#sidecarCommitStallMs < 1) {
+      throw new RangeError("sidecarCommitStallMs must be positive");
+    }
   }
 
   subscribe(listener: () => void): () => void {
@@ -260,6 +358,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       handle = await this.#transport.run(body, signal);
     } catch (error) {
       this.#runtimeHealth.record(classifyRuntimeError(error));
+      this.#maybeFailAmbiguousTransport(error);
       this.#emit();
       throw error;
     }
@@ -277,6 +376,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       },
       error => {
         this.#runtimeHealth.record(classifyRuntimeError(error));
+        this.#maybeFailAmbiguousTransport(error);
         this.#emit();
         throw error;
       },
@@ -290,6 +390,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     };
   }
 
+  takeReplacementSandbox(): ProvisionedSandbox | null {
+    const sandbox = this.#replacementSandbox;
+    this.#replacementSandbox = null;
+    return sandbox;
+  }
+
   snapshot(): RoutableSandboxSnapshot {
     const transport = this.#transport?.snapshot() ?? null;
     const descriptorCapacity = this.#descriptor?.capacity ?? 0;
@@ -301,7 +407,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const creditCapacity = transport
       ? Math.max(0, transport.credits + active)
       : 0;
-    const capacity = this.#state === "ready"
+    const capacity = this.#state === "ready" && !this.#sidecarSuspect && !this.#credentialRefreshPending
       ? Math.max(0, Math.min(descriptorCapacity, governorCapacity, creditCapacity))
       : 0;
     const heartbeatAt = this.#heartbeat?.snapshot().lastSuccessAtMs ?? null;
@@ -314,11 +420,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       state: this.#state,
       capacity,
       active,
-      available: this.#state === "ready" && transport
+      available: this.#state === "ready" && !this.#sidecarSuspect && !this.#credentialRefreshPending && transport
         ? Math.max(0, Math.min(transport.admissionCredits ?? transport.credits, capacity - active - quarantined))
         : 0,
       quarantined,
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
+      sidecarPeerAgeMs: transport?.sidecarPeerAgeMs ?? null,
       credentialExpiresInMs: this.#credentials
         ? Math.max(0, this.#credentials.resource.expiresAtMs - this.#clock.now())
         : null,
@@ -337,17 +444,87 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#controller = controller;
     this.#failure = null;
     this.#setState("provisioning");
+    let effectiveSandbox = this.#options.initialSandbox ?? null;
     const startHeartbeat = (sandbox: ProvisionedSandbox) => {
       if (generation !== this.#generation || this.#heartbeat) return;
+      effectiveSandbox = sandbox;
       this.#setState("syncing_credentials");
       const gateway = this.#options.createGateway(sandbox);
-      const heartbeat = this.#options.createHeartbeat(gateway, {
+      let heartbeat: V2RuntimeHeartbeat | null = null;
+      const callbackIsCurrent = () => generation === this.#generation &&
+        heartbeat !== null && heartbeat === this.#heartbeat;
+      heartbeat = this.#options.createHeartbeat(gateway, {
+        onSuccess: () => {
+          if (!callbackIsCurrent()) return;
+          this.#credentialRefreshPending = false;
+          this.#emit();
+        },
         onExpired: status => {
-          if (generation === this.#generation) void this.drain(`heartbeat-expired:${status}`);
+          if (!callbackIsCurrent()) return;
+          this.#failGeneration(
+            generation,
+            new V2RuntimeLifecycleFailure("heartbeat_expired", status),
+          );
+        },
+        onAuthenticationFailure: async (status, signal) => {
+          if (
+            !callbackIsCurrent() ||
+            (!this.#options.acquireSandboxForAuth && !this.#options.provisioning.acquireSandbox)
+          ) {
+            return "retry";
+          }
+          // Provisioning still owns its original credential object until it
+          // completes. Do not rotate underneath resource/token sync calls.
+          if (!this.#credentials) return "retry";
+          this.#credentialRefreshPending = true;
+          this.#emit();
+          let candidate: ProvisionedSandbox;
+          try {
+            candidate = this.#options.acquireSandboxForAuth
+              ? await this.#options.acquireSandboxForAuth(status, signal)
+              : await this.#options.provisioning.acquireSandbox!(
+                signal,
+                { maxAttempts: 1 },
+              );
+          } catch (error) {
+            const value = error && typeof error === "object"
+              ? error as { kind?: unknown; status?: unknown }
+              : {};
+            this.#notifyCredentialRefresh(
+              signal.aborted
+                ? "aborted"
+                : value.kind === "auth" || value.status === 401 || value.status === 403
+                  ? "auth_rejected"
+                  : "transport_failed",
+              status,
+            );
+            return "expired";
+          }
+          if (!callbackIsCurrent()) return "expired";
+          if (gateway.rotateSameSession?.(candidate)) {
+            effectiveSandbox = candidate;
+            if (this.#credentials) {
+              this.#credentials = { ...this.#credentials, sandbox: candidate };
+            }
+            this.#emit();
+            this.#notifyCredentialRefresh("updated_in_place", status);
+            return "retry";
+          }
+          this.#replacementSandbox = candidate;
+          this.#notifyCredentialRefresh("replacement_required", status);
+          return "expired";
         },
         onTransientFailure: () => {
+          if (!callbackIsCurrent()) return;
           this.#runtimeHealth.record("unhealthy");
           this.#emit();
+        },
+        onUnreachable: status => {
+          if (!callbackIsCurrent()) return;
+          this.#failGeneration(
+            generation,
+            new V2RuntimeLifecycleFailure("heartbeat_unreachable", status),
+          );
         },
       });
       this.#gateway = gateway;
@@ -355,15 +532,25 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       heartbeat.start();
     };
     try {
-      const credentials = await this.#options.provisioning.provision(
-        this.projectId,
-        controller.signal,
-        { onSandboxAcquired: startHeartbeat },
-      );
+      const initialSandbox = this.#options.initialSandbox;
+      const credentials = initialSandbox && this.#options.provisioning.provisionAcquired
+        ? await this.#options.provisioning.provisionAcquired(
+          this.projectId,
+          initialSandbox,
+          controller.signal,
+          { onSandboxAcquired: startHeartbeat },
+        )
+        : await this.#options.provisioning.provision(
+          this.projectId,
+          controller.signal,
+          { onSandboxAcquired: startHeartbeat },
+        );
       if (generation !== this.#generation) return;
       startHeartbeat(credentials.sandbox);
       if (!this.#gateway) throw new Error("V2 sandbox gateway was not created");
-      this.#credentials = credentials;
+      this.#credentials = effectiveSandbox
+        ? { ...credentials, sandbox: effectiveSandbox }
+        : credentials;
 
       this.#setState("syncing_workspace");
       const ydoc = this.#options.createYDoc(credentials);
@@ -410,18 +597,34 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         channel: awareness,
         maxResponseBytes: this.#options.maxResponseBytes ?? 64 * 1024 * 1024,
         gzip: this.#options.gzip,
+        expectedSidecarInstanceId: descriptor.instanceId,
       });
       this.#transport = transport;
       transport.setHostCeiling?.(this.#hostCeiling(descriptor.capacity));
       this.#setState("connecting_transport");
       await transport.connect(controller.signal);
       if (generation !== this.#generation) return;
+      if (transport.probeLiveness) {
+        await this.#proveInitialSidecar(transport, controller.signal);
+      }
+      if (generation !== this.#generation) return;
+      this.#sidecarSuspect = false;
       this.#setState("ready");
       this.#refreshLoop = this.#refreshResources(generation, controller.signal);
       void this.#refreshLoop.catch(error => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        this.#failure = error;
-        this.#emit();
+        if (controller.signal.aborted || generation !== this.#generation) return;
+        const status = error && typeof error === "object" &&
+          typeof (error as { status?: unknown }).status === "number"
+          ? (error as { status: number }).status
+          : null;
+        this.#failGeneration(
+          generation,
+          new V2RuntimeLifecycleFailure(
+            "resource_credential_expired",
+            status,
+            { cause: error },
+          ),
+        );
       });
       this.#ySweetLoop = this.#refreshYSweet(generation, controller.signal);
       void this.#ySweetLoop.catch(error => {
@@ -429,6 +632,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#failure = error;
         this.#emit();
       });
+      if (transport.probeLiveness) {
+        this.#sidecarLoop = this.#monitorSidecar(
+          generation,
+          transport,
+          controller.signal,
+        );
+        void this.#sidecarLoop.catch(() => undefined);
+      }
     } catch (error) {
       if (generation !== this.#generation) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -437,6 +648,85 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       await this.#dispose(true);
       throw error;
     }
+  }
+
+  async #monitorSidecar(
+    generation: number,
+    transport: V2RuntimeTransport,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!transport.probeLiveness) return;
+    let consecutiveFailures = 0;
+    let deadline = this.#clock.now() + this.#sidecarProbePeriodMs;
+    while (!signal.aborted && generation === this.#generation) {
+      try {
+        await this.#clock.waitUntil(deadline, signal);
+      } catch {
+        if (signal.aborted) return;
+      }
+      if (signal.aborted || generation !== this.#generation) return;
+      try {
+        const diagnostics = transport.snapshot().diagnostics?.host;
+        if (
+          diagnostics &&
+          diagnostics.admittedUncommitted > 0 &&
+          diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs
+        ) {
+          throw new Error("V2 sidecar commit processing stopped making progress");
+        }
+        await transport.probeLiveness(signal);
+        if (generation !== this.#generation) return;
+        consecutiveFailures = 0;
+        if (this.#sidecarSuspect) {
+          this.#sidecarSuspect = false;
+          this.#emit();
+        }
+      } catch (error) {
+        if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+          return;
+        }
+        if (generation !== this.#generation) return;
+        consecutiveFailures++;
+        if (!this.#sidecarSuspect) {
+          this.#sidecarSuspect = true;
+          this.#emit();
+        }
+        if (consecutiveFailures >= this.#sidecarFailureThreshold) {
+          this.#failGeneration(
+            generation,
+            new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: error }),
+          );
+          return;
+        }
+      }
+      deadline += this.#sidecarProbePeriodMs;
+      while (deadline <= this.#clock.now()) deadline += this.#sidecarProbePeriodMs;
+    }
+  }
+
+  async #proveInitialSidecar(
+    transport: V2RuntimeTransport,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!transport.probeLiveness) return;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= this.#sidecarFailureThreshold; attempt++) {
+      try {
+        await transport.probeLiveness(signal);
+        return;
+      } catch (error) {
+        if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+          throw error;
+        }
+        lastError = error;
+        if (attempt < this.#sidecarFailureThreshold) {
+          await this.#clock.sleep(1_000, signal);
+        }
+      }
+    }
+    throw new V2RuntimeLifecycleFailure("sidecar_unreachable", null, {
+      cause: lastError,
+    });
   }
 
   async #refreshResources(generation: number, signal: AbortSignal): Promise<void> {
@@ -449,9 +739,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       );
       await this.#clock.waitUntil(deadline, signal);
       if (signal.aborted || generation !== this.#generation) return;
+      const current = this.#credentials;
+      if (!current) return;
       try {
         const resource = await this.#options.provisioning.refreshResources(
-          credentials,
+          current,
           signal,
         );
         if (generation !== this.#generation) return;
@@ -460,7 +752,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       } catch (error) {
         if (signal.aborted) return;
         this.#runtimeHealth.record("unhealthy");
-        if (this.#clock.now() >= credentials.resource.expiresAtMs) throw error;
+        if (this.#clock.now() >= current.resource.expiresAtMs) throw error;
         await this.#clock.sleep(30_000, signal);
       }
     }
@@ -519,13 +811,38 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     );
   }
 
+  #failGeneration(generation: number, failure: V2RuntimeLifecycleFailure): void {
+    if (generation !== this.#generation) return;
+    if (this.#state === "failed" || this.#state === "stopped") return;
+    this.#failure = failure;
+    this.#runtimeHealth.record("unhealthy");
+    ++this.#generation;
+    this.#setState("failed");
+    this.#controller?.abort();
+  }
+
+  #maybeFailAmbiguousTransport(error: unknown): void {
+    if (!error || typeof error !== "object") return;
+    const value = error as { committed?: unknown; ambiguous?: unknown };
+    if (value.committed !== true || value.ambiguous !== true) return;
+    const transport = this.#transport?.snapshot();
+    if (!transport || (transport.connected && transport.quarantined < 4)) return;
+    this.#failGeneration(
+      this.#generation,
+      new V2RuntimeLifecycleFailure("sidecar_unreachable"),
+    );
+  }
+
   async #dispose(closeTransport: boolean): Promise<void> {
+    const sidecarLoop = this.#sidecarLoop;
+    this.#sidecarLoop = null;
     const refreshLoop = this.#refreshLoop;
     this.#refreshLoop = null;
     const ySweetLoop = this.#ySweetLoop;
     this.#ySweetLoop = null;
     if (refreshLoop) await refreshLoop.catch(() => undefined);
     if (ySweetLoop) await ySweetLoop.catch(() => undefined);
+    if (sidecarLoop) await sidecarLoop.catch(() => undefined);
     const transport = this.#transport;
     const awareness = this.#awareness;
     const heartbeat = this.#heartbeat;
@@ -544,6 +861,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#bootstrap = null;
     this.#descriptor = null;
     this.#credentials = null;
+    this.#sidecarSuspect = false;
+    this.#credentialRefreshPending = false;
   }
 
   #setState(state: RuntimeState): void {
@@ -553,5 +872,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
 
   #emit(): void {
     for (const listener of this.#listeners) listener();
+  }
+
+  #notifyCredentialRefresh(
+    outcome: CredentialRefreshOutcome,
+    status: number,
+  ): void {
+    try { this.#options.onCredentialRefresh?.(outcome, status); } catch {}
   }
 }

@@ -44,6 +44,18 @@ export interface ProvisioningHooks {
   onSandboxAcquired?: (sandbox: ProvisionedSandbox) => void | Promise<void>;
 }
 
+export interface AcquireSandboxOptions {
+  /**
+   * Number of attempts made for retryable Prism responses. The default of
+   * three preserves the original provisioning behaviour while allowing a
+   * supervisor to opt into a single, externally-coordinated attempt.
+   */
+  maxAttempts?: number;
+}
+
+const DEFAULT_ACQUIRE_MAX_ATTEMPTS = 3;
+const MAX_ACQUIRE_MAX_ATTEMPTS = 10;
+
 export type ProvisioningErrorKind =
   | "auth"
   | "reprovision"
@@ -57,6 +69,7 @@ export class ProvisioningError extends Error {
     message: string,
     readonly kind: ProvisioningErrorKind,
     readonly status?: number,
+    readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "ProvisioningError";
@@ -77,6 +90,14 @@ function abortError(): DOMException {
 
 function checkAbort(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortError();
+}
+
+function acquireMaxAttempts(options?: AcquireSandboxOptions): number {
+  const value = options?.maxAttempts ?? DEFAULT_ACQUIRE_MAX_ATTEMPTS;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_ACQUIRE_MAX_ATTEMPTS) {
+    throw new RangeError(`maxAttempts must be an integer between 1 and ${MAX_ACQUIRE_MAX_ATTEMPTS}`);
+  }
+  return value;
 }
 
 function retryAfterMs(response: Response, fallback: number): number {
@@ -138,15 +159,32 @@ export class PrismProvisioningClient {
     signal?: AbortSignal,
     hooks: ProvisioningHooks = {},
   ): Promise<ProvisionedRuntimeCredentials> {
+    const sandbox = await this.acquireSandbox(signal);
+    return this.provisionAcquired(projectId, sandbox, signal, hooks);
+  }
+
+  async acquireSandbox(
+    signal?: AbortSignal,
+    options?: AcquireSandboxOptions,
+  ): Promise<ProvisionedSandbox> {
     checkAbort(signal);
-    const provisionedAtMs = this.#clock.now();
     const sandboxResponse = await this.#requestWithRetry(
       "/api/backend/1/new",
       { method: "POST", signal },
-      3,
+      acquireMaxAttempts(options),
       signal,
     );
-    const sandbox = parseProvisionedSandbox(await parseJsonResponse(sandboxResponse, "Sandbox acquisition"));
+    return parseProvisionedSandbox(await parseJsonResponse(sandboxResponse, "Sandbox acquisition"));
+  }
+
+  async provisionAcquired(
+    projectId: ProjectId,
+    sandbox: ProvisionedSandbox,
+    signal?: AbortSignal,
+    hooks: ProvisioningHooks = {},
+  ): Promise<ProvisionedRuntimeCredentials> {
+    checkAbort(signal);
+    const provisionedAtMs = this.#clock.now();
     await hooks.onSandboxAcquired?.(sandbox);
 
     const resource = await this.#syncResources(projectId, sandbox, signal);
@@ -337,7 +375,12 @@ export class PrismProvisioningClient {
       const retryable = response.status === 429 || (response.status >= 500 && response.status < 600);
       if (!retryable || attempt === maxAttempts) {
         const kind: ProvisioningErrorKind = response.status === 429 ? "rate_limit" : "transport";
-        throw new ProvisioningError(`Prism request failed (${response.status})`, kind, response.status);
+        throw new ProvisioningError(
+          `Prism request failed (${response.status})`,
+          kind,
+          response.status,
+          response.status === 429 ? retryAfterMs(response, 1_000 * attempt) : undefined,
+        );
       }
       await this.#clock.sleep(
         response.status === 429

@@ -19,6 +19,8 @@ export interface MultiSandboxConfig {
   slotsPerProject: number;
   machine: MachineSample;
   transport: TransportMode;
+  /** Semicolon-separated dashboard-declared shared TPM groups. */
+  rateLimitSharedModelGroups: readonly (readonly string[])[];
   sessionMode: PrismSessionMode;
   allowAnonymous: boolean;
   guestMaxProjects: number;
@@ -79,6 +81,34 @@ function binaryFlag(value: string | undefined, name: string): boolean {
   throw new TypeError(`${name} must be 0 or 1`);
 }
 
+function parseRateLimitSharedModelGroups(value: string | undefined): readonly (readonly string[])[] {
+  if (value === undefined || value.trim() === "") return Object.freeze([]);
+  const seen = new Set<string>();
+  const groups = value.split(";").map((rawGroup, groupIndex) => {
+    const models = rawGroup.split(",").map(model => model.trim().toLowerCase()).filter(Boolean);
+    if (models.length < 2) {
+      throw new TypeError(
+        `GP_RATE_LIMIT_SHARED_MODEL_GROUPS group ${groupIndex + 1} must contain at least two models`,
+      );
+    }
+    const unique = [...new Set(models)];
+    if (unique.length !== models.length) {
+      throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS group ${groupIndex + 1} contains a duplicate model`);
+    }
+    for (const model of unique) {
+      if (!/^[a-z0-9][a-z0-9._:-]{0,127}$/.test(model)) {
+        throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS model ${JSON.stringify(model)} is invalid`);
+      }
+      if (seen.has(model)) {
+        throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS model ${JSON.stringify(model)} appears in multiple groups`);
+      }
+      seen.add(model);
+    }
+    return Object.freeze(unique);
+  });
+  return Object.freeze(groups);
+}
+
 export function resolveDesiredSandboxCount(input: {
   targetConcurrency: number;
   targetSandboxes: number | null;
@@ -105,6 +135,9 @@ export function resolveMultiSandboxConfig(
     "auto",
     ["v1", "v2", "auto"],
     "GP_TRANSPORT",
+  );
+  const rateLimitSharedModelGroups = parseRateLimitSharedModelGroups(
+    env.GP_RATE_LIMIT_SHARED_MODEL_GROUPS,
   );
   const sessionMode = enumValue<PrismSessionMode>(
     env.GP_PRISM_SESSION,
@@ -275,6 +308,7 @@ export function resolveMultiSandboxConfig(
     slotsPerProject,
     machine,
     transport,
+    rateLimitSharedModelGroups,
     sessionMode,
     allowAnonymous,
     guestMaxProjects,

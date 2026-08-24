@@ -74,6 +74,23 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow("GP_V2_DIAGNOSTICS");
   });
 
+  it("parses dashboard-declared shared TPM model groups without guessing others", () => {
+    const config = resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-luna,gpt-5.5",
+    }, MACHINE);
+    expect(config.rateLimitSharedModelGroups).toEqual([
+      ["gpt-5.6-sol", "gpt-5.6-terra"],
+      ["gpt-5.6-luna", "gpt-5.5"],
+    ]);
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-sol,gpt-5.6-luna",
+    }, MACHINE)).toThrow("multiple groups");
+  });
+
   it("allows a project-less managed V2 fleet and derives its size", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",

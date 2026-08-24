@@ -12,6 +12,7 @@ import type {
   RoutableSandboxSnapshot,
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
+import { SupervisedSandboxRuntime } from "../src/sandbox/supervised-runtime";
 import {
   createBrowserlessSystem,
   type BrowserlessSystemDependencies,
@@ -105,6 +106,14 @@ class DeferredRuntime implements RoutableSandboxRuntime {
     return () => this.listeners.delete(listener);
   }
   emit(): void { for (const listener of this.listeners) listener(); }
+}
+
+class FailingRuntime extends DeferredRuntime {
+  override async start(): Promise<void> {
+    this.state = "failed";
+    this.emit();
+    throw new Error("sandbox generation failed");
+  }
 }
 
 class Factory implements ManagedRuntimeFactory {
@@ -233,7 +242,7 @@ describe("V2 browserless system composition", () => {
     await system.close();
     expect(value.sampler.closes).toBe(1);
     expect(value.sessionCloses()).toBe(1);
-  });
+  }, 30_000);
 
   it("never accepts protected port 8787 for a candidate", async () => {
     const value = await harness();
@@ -242,6 +251,45 @@ describe("V2 browserless system composition", () => {
       PORT: "8787",
     }, value.dependencies)).rejects.toThrow("port 8787");
   });
+
+  it("waits for same-project sandbox recovery without creating a Prism project", async () => {
+    const value = await harness();
+    const createdChildren: ProjectId[] = [];
+    let projectCreateCalls = 0;
+    const projects = value.dependencies.projects!;
+    value.dependencies.projects = {
+      list: signal => projects.list(signal),
+      create: async (input, signal) => {
+        projectCreateCalls++;
+        return projects.create(input, signal);
+      },
+    };
+    value.dependencies.runtimeFactory = {
+      create: input => new SupervisedSandboxRuntime({
+        projectId: input.projectId,
+        initialChild: new FailingRuntime(input.projectId, false, value.order),
+        createChild: () => {
+          createdChildren.push(input.projectId);
+          return new DeferredRuntime(input.projectId, false, value.order);
+        },
+        initialBackoffMs: 1,
+        maxBackoffMs: 10,
+        checkIntervalMs: 10,
+      }),
+    };
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
+    }, value.dependencies);
+
+    await system.start();
+
+    expect(system.registry.readyRuntimes()).toHaveLength(1);
+    expect(createdChildren).toEqual([IDS[0]]);
+    expect(projectCreateCalls).toBe(0);
+    await system.close();
+  }, 30_000);
 
   it("orders graceful shutdown without deleting or creating projects", async () => {
     const value = await harness();

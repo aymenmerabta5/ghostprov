@@ -99,4 +99,38 @@ describe("traceRunHandle", () => {
       status: 502,
     });
   });
+
+  it("logs V2 committed ambiguity as quarantined with its code", async () => {
+    const logger = new MemoryLogger();
+    const final = Promise.reject(Object.assign(new Error("sidecar unavailable"), {
+      committed: true,
+      ambiguous: true,
+      code: "sidecar_unreachable",
+    }));
+    void final.catch(() => undefined);
+    const traced = traceRunHandle({
+      async *events() {},
+      final,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }, {
+      logger,
+      clock: new FakeClock(),
+      traceId: "trace-3",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+
+    await expect(traced.final).rejects.toThrow("sidecar unavailable");
+    expect(logger.events[0]).toMatchObject({
+      event: "request.failed",
+      committed: true,
+      quarantined: true,
+      error_kind: "sidecar_unreachable",
+    });
+  });
 });

@@ -74,13 +74,20 @@ class FakeRuntime implements RoutableSandboxRuntime {
   state = "configured";
   starts = 0;
   drains = 0;
+  heartbeatAgeMs: number | null = 0;
+  readonly listeners = new Set<() => void>();
 
   constructor(readonly projectId: ProjectId) {}
 
-  async start(): Promise<void> { this.starts++; this.state = "ready"; }
+  async start(): Promise<void> { this.starts++; this.state = "ready"; this.emit(); }
   async drain(): Promise<void> { this.drains++; this.state = "stopped"; }
   async stop(): Promise<void> { this.state = "stopped"; }
   async run(): Promise<RunHandle> { throw new Error("not used"); }
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  emit(): void { for (const listener of this.listeners) listener(); }
 
   snapshot(): RoutableSandboxSnapshot {
     return {
@@ -90,7 +97,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
       active: 0,
       available: this.state === "ready" ? 128 : 0,
       quarantined: 0,
-      heartbeatAgeMs: 0,
+      heartbeatAgeMs: this.heartbeatAgeMs,
       credentialExpiresInMs: 3_600_000,
       ackEwmaMs: 0,
       completionEwmaMs: 0,
@@ -312,5 +319,30 @@ describe("ProjectFleetManager", () => {
     await expect(harness.value.reconcile()).rejects.toThrow("shutting down");
     expect(projects.created).toEqual([]);
     expect(harness.registry.runtimes()).toEqual([]);
+  });
+
+  it("does not report ready until a runtime has a successful fresh heartbeat", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.reserveWorker({ index: 1, projectId: A, title: "GhostProv Worker 1", nowMs: 1 });
+    await files.manifest.markCreated(A, 2);
+    const runtime = new FakeRuntime(A);
+    await runtime.start();
+    runtime.heartbeatAgeMs = null;
+    const registry = new SandboxRegistry([runtime]);
+    const harness = manager({
+      config: config(files.cookieFile, { desired: 1, explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      registry,
+    });
+
+    const snapshot = await harness.value.reconcile();
+    expect(snapshot.ready).toBe(0);
+    const waiting = harness.value.waitForReady(1);
+    runtime.heartbeatAgeMs = 0;
+    runtime.emit();
+    await expect(waiting).resolves.toMatchObject({ ready: 1 });
+    await harness.value.shutdown("test-complete");
   });
 });

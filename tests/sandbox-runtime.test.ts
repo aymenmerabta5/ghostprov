@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { SandboxRuntime, type RuntimeHeartbeat, type RuntimeYDoc } from "../src/sandbox/runtime";
+import { ManagedV1Runtime } from "../src/sandbox/managed-v1-runtime";
+import {
+  SandboxRuntime,
+  type RuntimeHeartbeat,
+  type RuntimeHeartbeatCallbacks,
+  type RuntimeYDoc,
+} from "../src/sandbox/runtime";
 import { parseProvisionedSandbox, parseResourceCredential, parseYSweetEnvelope } from "../src/prism/protocol";
 import { projectId } from "../src/sandbox/types";
 
@@ -45,7 +51,12 @@ function harness(project = A) {
   const events: string[] = [];
   const ydocs: FakeYDoc[] = [];
   const heartbeats: FakeHeartbeat[] = [];
-  let callbacks: { onExpired: (status: number) => void; onTransientFailure: (status: number | null) => void } | null = null;
+  let callbacks: {
+    onSuccess: () => void;
+    onExpired: (status: number) => void;
+    onTransientFailure: (status: number | null) => void;
+    onUnreachable: (status: number | null) => void;
+  } | null = null;
   const runtime = new SandboxRuntime({
     projectId: project,
     provision: async () => credentials(project),
@@ -70,7 +81,15 @@ function harness(project = A) {
     }),
   });
   runtime.subscribe(snapshot => events.push(snapshot.state.type));
-  return { runtime, events, ydocs, heartbeats, expire: (status = 409) => callbacks?.onExpired(status) };
+  return {
+    runtime,
+    events,
+    ydocs,
+    heartbeats,
+    succeed: () => callbacks?.onSuccess(),
+    expire: (status = 409) => callbacks?.onExpired(status),
+    unreachable: (status: number | null = null) => callbacks?.onUnreachable(status),
+  };
 }
 
 describe("SandboxRuntime", () => {
@@ -114,12 +133,73 @@ describe("SandboxRuntime", () => {
     await pending;
   });
 
-  it("drains only the runtime whose heartbeat reports expiry", async () => {
+  it("does not let startup overwrite a heartbeat failure from the same generation", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let callbacks: RuntimeHeartbeatCallbacks | null = null;
+    const runtime = new SandboxRuntime({
+      projectId: A,
+      provision: async (_project, _signal, hooks) => {
+        await hooks?.onSandboxAcquired?.(credentials(A).sandbox);
+        await gate;
+        return credentials(A);
+      },
+      createYDoc: () => new FakeYDoc(),
+      createHeartbeat: (_sandbox, value) => {
+        callbacks = value;
+        return new FakeHeartbeat();
+      },
+      createDaemonController: () => ({
+        ensureReady: async () => ({ build: "v-test", pid: 1, capacity: 30, protocols: [] }),
+      }),
+    });
+
+    const starting = runtime.start();
+    for (let index = 0; index < 3; index++) await Promise.resolve();
+    callbacks!.onExpired(401);
+    release();
+    await starting;
+
+    expect(runtime.snapshot().state).toMatchObject({
+      type: "failed",
+      error: { kind: "heartbeat_expired", status: 401 },
+    });
+  });
+
+  it("fails only the runtime whose heartbeat reports expiry", async () => {
     const left = harness(A);
     const right = harness(B);
     await Promise.all([left.runtime.start(), right.runtime.start()]);
     left.expire();
-    expect(left.runtime.snapshot().state.type).toBe("draining");
+    expect(left.runtime.snapshot().state).toMatchObject({
+      type: "failed",
+      error: { kind: "heartbeat_expired", status: 409 },
+    });
+    expect(right.runtime.snapshot().state.type).toBe("ready");
+  });
+
+  it("notifies subscribers when a heartbeat succeeds without changing lifecycle state", async () => {
+    const value = harness();
+    await value.runtime.start();
+    const eventCount = value.events.length;
+
+    value.succeed();
+
+    expect(value.events).toHaveLength(eventCount + 1);
+    expect(value.events.at(-1)).toBe("ready");
+  });
+
+  it("fails only the runtime whose heartbeat becomes unreachable", async () => {
+    const left = harness(A);
+    const right = harness(B);
+    await Promise.all([left.runtime.start(), right.runtime.start()]);
+
+    left.unreachable();
+
+    expect(left.runtime.snapshot().state).toMatchObject({
+      type: "failed",
+      error: { kind: "heartbeat_unreachable", status: null },
+    });
     expect(right.runtime.snapshot().state.type).toBe("ready");
   });
 
@@ -153,6 +233,40 @@ describe("SandboxRuntime", () => {
     expect(runtime.snapshot().generation).toBe(2);
   });
 
+  it("ignores heartbeat callbacks from a superseded generation", async () => {
+    const callbacks: Array<{
+      onSuccess: () => void;
+      onExpired: (status: number) => void;
+      onTransientFailure: (status: number | null) => void;
+      onUnreachable: (status: number | null) => void;
+    }> = [];
+    const runtime = new SandboxRuntime({
+      projectId: A,
+      provision: async () => credentials(A),
+      createYDoc: () => new FakeYDoc(),
+      createHeartbeat: (_sandbox, value) => {
+        callbacks.push(value);
+        return new FakeHeartbeat();
+      },
+      createDaemonController: () => ({ ensureReady: async () => ({ build: "v-test", pid: 1, capacity: 30, protocols: [] }) }),
+    });
+    const events: string[] = [];
+    runtime.subscribe(snapshot => events.push(snapshot.state.type));
+    await runtime.start();
+    await runtime.recover("test");
+    const eventCount = events.length;
+
+    callbacks[0]!.onSuccess();
+    callbacks[0]!.onExpired(409);
+    callbacks[0]!.onUnreachable(null);
+
+    expect(events).toHaveLength(eventCount);
+    expect(runtime.snapshot()).toMatchObject({
+      generation: 2,
+      state: { type: "ready" },
+    });
+  });
+
   it("exposes a bounded sanitized failure summary for monitoring", async () => {
     const secret = "session-secret-value";
     const error = Object.assign(
@@ -180,5 +294,31 @@ describe("SandboxRuntime", () => {
     expect(failure?.message.length).toBeLessThanOrEqual(240);
     expect(JSON.stringify(failure)).not.toContain(secret);
     expect(JSON.stringify(failure)).not.toContain("a".repeat(64));
+  });
+});
+
+describe("ManagedV1Runtime", () => {
+  it("forwards lifecycle notifications and stops forwarding after unsubscribe", async () => {
+    const failure = new Error("provisioning unavailable");
+    const runtime = new ManagedV1Runtime({
+      projectId: A,
+      account: {} as never,
+      provisioning: {
+        provision: async () => { throw failure; },
+      } as never,
+      cpuPool: {} as never,
+      daemonSource: "",
+      expectedBuild: "v-test",
+      requestedCapacity: 1,
+    });
+    const states: string[] = [];
+    const unsubscribe = runtime.subscribe(() => states.push(runtime.snapshot().state));
+
+    await expect(runtime.start()).rejects.toBe(failure);
+    expect(states).toEqual(["configured", "provisioning", "failed"]);
+
+    unsubscribe();
+    await runtime.stop();
+    expect(states).toEqual(["configured", "provisioning", "failed"]);
   });
 });

@@ -51,6 +51,7 @@ SOURCE_PATH = pathlib.Path(__file__).resolve()
 # being executed so both launch paths watch their own adjacent lane files.
 WORKSPACE = pathlib.Path(os.environ.get("WORKSPACE_DIR", str(SOURCE_PATH.parent)))
 NUM_SLOTS = int(os.environ.get("GP_SLOTS", "30"))
+GENERATION = int(os.environ.get("GP_GENERATION", "0"))
 PIDFILE = pathlib.Path(os.environ.get("GP_PIDFILE", str(WORKSPACE / ".gp_daemon.pid")))
 POLL_INTERVAL = 0.25
 STATUS_EVERY = 2.0
@@ -208,6 +209,13 @@ def request_identity(job_text: str):
     if family_id is not None:
         identity["family_id"] = family_id
     return identity
+
+
+def consume_generation_fence(body):
+    """Remove the private generation field and prove this daemon owns the job."""
+    if not isinstance(body, dict):
+        return False
+    return body.pop("_ghostprov_generation", 0) == GENERATION
 
 
 def ensure_slot_files():
@@ -456,13 +464,6 @@ def assemble_segmented_job(slot: int, manifest: dict):
         raise SegmentAssemblyError(f"v6 assembled job is not valid UTF-8: {ex}") from ex
 
 
-def _retry_delay(header):
-    try:
-        return min(max(float(header), 0.0), 45.0)
-    except (TypeError, ValueError):
-        return 20.0
-
-
 def _source_signature():
     # Yjs/doc-to-disk convergence can replace this file with byte-identical
     # content, changing mtime and sometimes inode metadata. Hot reload must be
@@ -654,6 +655,7 @@ def write_status():
             "version": 5,
             "protocol": "tail-v3-terminal-sse",
             "daemon_build": DAEMON_BUILD,
+            "generation": GENERATION,
             "job_protocols": [
                 "single-v5",
                 "segmented-v6.2",
@@ -803,6 +805,10 @@ class SlotWorker(threading.Thread):
         if not isinstance(body, dict):
             self.write_failed(ack, "bad_job_json", "job body is not an object")
             return False
+        if not consume_generation_fence(body):
+            # Another sandbox/runtime generation owns this immutable job.  Do
+            # not write a response: the matching daemon will process it.
+            return False
         body.setdefault("store", False)
         body.setdefault("service_tier", "fast")
 
@@ -825,25 +831,11 @@ class SlotWorker(threading.Thread):
             err_body = e.read().decode("utf-8", "replace")[:1500]
             print(f"[slot {self.slot}] HTTPError {e.code} {err_body[:200]}", flush=True)
             if e.code == 429:
-                ra = e.headers.get("retry-after") if e.headers else None
-                wait_s = _retry_delay(ra)
-                print(f"[slot {self.slot}] 429; sleeping {wait_s}", flush=True)
-                time.sleep(wait_s)
-                req2 = urllib.request.Request(BASE + "/responses", data=json.dumps(body).encode(), headers=headers)
-                try:
-                    r = urllib.request.urlopen(
-                        req2,
-                        context=CTX,
-                        timeout=UPSTREAM_IDLE_TIMEOUT,
-                    )
-                except urllib.error.HTTPError as e2:
-                    self.write_failed(ack, f"rate_limited_{e2.code}", e2.read().decode("utf-8", "replace"))
-                    return False
-                except (TimeoutError, socket.timeout, urllib.error.URLError):
-                    raise
-                except Exception as ex:
-                    self.write_failed(ack, "retry_error", repr(ex))
-                    return False
+                # TPM is shared by the OpenAI organization/model, not by this
+                # sandbox. Retrying here (or in another project) only hides the
+                # canonical error and adds pressure to the same exhausted pool.
+                self.write_failed(ack, "rate_limited_429", err_body)
+                return False
             else:
                 self.write_failed(ack, f"http_{e.code}", err_body)
                 return False

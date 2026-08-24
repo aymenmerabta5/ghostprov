@@ -1,3 +1,9 @@
+import {
+  isRateLimited,
+  rateLimitHintFromError,
+  rateLimitProblemFromError,
+} from "../v2/rate-limit";
+
 export interface ApiErrorOptions {
   type?: string;
   param?: string | null;
@@ -103,6 +109,32 @@ function relayKind(error: unknown): string | null {
   return typeof candidate?.kind === "string" ? candidate.kind : null;
 }
 
+function rateLimitMetadata(error: unknown): {
+  retryAfterMs: number | null;
+  resetTokensMs: number | null;
+  resetProjectTokensMs: number | null;
+  limitTokens: number | null;
+  remainingTokens: number | null;
+  limitProjectTokens: number | null;
+  remainingProjectTokens: number | null;
+} {
+  const candidate = record(error);
+  const nested = record(candidate?.rateLimit);
+  const extracted = rateLimitHintFromError(error);
+  const number = (value: unknown): number | null => (
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null
+  );
+  return {
+    retryAfterMs: number(candidate?.retryAfterMs) ?? number(nested?.retryAfterMs) ?? extracted?.retryAfterMs ?? null,
+    resetTokensMs: number(candidate?.resetTokensMs) ?? number(nested?.resetTokensMs) ?? extracted?.resetTokensMs ?? null,
+    resetProjectTokensMs: number(candidate?.resetProjectTokensMs) ?? number(nested?.resetProjectTokensMs) ?? extracted?.resetProjectTokensMs ?? null,
+    limitTokens: number(nested?.limitTokens) ?? extracted?.limitTokens ?? null,
+    remainingTokens: number(nested?.remainingTokens) ?? extracted?.remainingTokens ?? null,
+    limitProjectTokens: number(nested?.limitProjectTokens) ?? extracted?.limitProjectTokens ?? null,
+    remainingProjectTokens: number(nested?.remainingProjectTokens) ?? extracted?.remainingProjectTokens ?? null,
+  };
+}
+
 export function normalizeApiError(error: unknown): NormalizedApiError {
   if (error instanceof ApiError) {
     return {
@@ -161,9 +193,46 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
       },
     };
   }
+  if (
+    structured?.name === "RouterRateLimitedError" &&
+    structured.status === 429 &&
+    structured.code === "rate_limit_exceeded"
+  ) {
+    const problem = record(structured.problem);
+    return {
+      status: 429,
+      error: {
+        message: typeof problem?.message === "string"
+          ? problem.message
+          : error instanceof Error
+            ? error.message
+            : "Upstream token rate limit is cooling down",
+        type: typeof problem?.type === "string" ? problem.type : "rate_limit_error",
+        param: typeof problem?.param === "string" ? problem.param : null,
+        code: typeof problem?.code === "string" ? problem.code : "rate_limit_exceeded",
+      },
+    };
+  }
 
   const daemon = normalizeDaemonError(error);
   if (daemon) return daemon;
+
+  if (
+    isRateLimited(error) ||
+    structured?.code === "rate_limit_exceeded" ||
+    structured?.code === "rate_limit"
+  ) {
+    const problem = rateLimitProblemFromError(error);
+    return {
+      status: 429,
+      error: {
+        message: problem?.message ?? (error instanceof Error ? error.message : "Upstream token rate limit was reached"),
+        type: problem?.type ?? "rate_limit_error",
+        param: problem?.param ?? null,
+        code: problem?.code ?? "rate_limit_exceeded",
+      },
+    };
+  }
 
   const kind = relayKind(error);
   const message = error instanceof Error && error.message.length > 0
@@ -198,7 +267,33 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
 
 export function apiErrorResponse(error: unknown): Response {
   const normalized = normalizeApiError(error);
-  return Response.json({ error: normalized.error }, { status: normalized.status });
+  const metadata = rateLimitMetadata(error);
+  const headers = new Headers();
+  if (normalized.status === 429) {
+    const retryAfterMs = metadata.retryAfterMs;
+    if (retryAfterMs !== null) {
+      headers.set("retry-after", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
+    }
+    const resetTokensMs = metadata.resetTokensMs;
+    if (resetTokensMs !== null) headers.set("x-ratelimit-reset-tokens", `${Math.ceil(resetTokensMs)}ms`);
+    const resetProjectTokensMs = metadata.resetProjectTokensMs;
+    if (resetProjectTokensMs !== null) {
+      headers.set("x-ratelimit-reset-project-tokens", `${Math.ceil(resetProjectTokensMs)}ms`);
+    }
+    if (metadata.limitTokens !== null) {
+      headers.set("x-ratelimit-limit-tokens", String(Math.floor(metadata.limitTokens)));
+    }
+    if (metadata.remainingTokens !== null) {
+      headers.set("x-ratelimit-remaining-tokens", String(Math.floor(metadata.remainingTokens)));
+    }
+    if (metadata.limitProjectTokens !== null) {
+      headers.set("x-ratelimit-limit-project-tokens", String(Math.floor(metadata.limitProjectTokens)));
+    }
+    if (metadata.remainingProjectTokens !== null) {
+      headers.set("x-ratelimit-remaining-project-tokens", String(Math.floor(metadata.remainingProjectTokens)));
+    }
+  }
+  return Response.json({ error: normalized.error }, { status: normalized.status, headers });
 }
 
 export function apiErrorEvent(error: unknown): {

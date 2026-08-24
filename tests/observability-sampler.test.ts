@@ -101,12 +101,14 @@ describe("FleetSampler", () => {
         },
         runtimes: [{
           projectId: projectId("00000000-0000-4000-8000-000000000001"),
+          incarnation: 3,
           state: "ready",
           capacity: 128,
           active: 4,
           available: 124,
           quarantined: 0,
           heartbeatAgeMs: 500,
+          sidecarPeerAgeMs: 250,
           credentialExpiresInMs: 3_000_000,
           ackEwmaMs: 15,
           completionEwmaMs: 2_000,
@@ -114,6 +116,7 @@ describe("FleetSampler", () => {
           queueDepth: 0,
           memoryPressure: 0.1,
           failure: null,
+          recovery: { attempt: 2, consecutiveFailures: 1, retryInMs: 1_000 },
           diagnostics: {
             host: { ...transport, logicalEventsTotal: 0, responseBatchFramesTotal: 0, batchedEventsTotal: 0 },
             sidecar: { version: 1, resource: null, transport, malformedCount: 0 },
@@ -124,6 +127,16 @@ describe("FleetSampler", () => {
       eventLoop,
       memoryUsage: () => ({ rss: 500, heapTotal: 400, heapUsed: 300, external: 200, arrayBuffers: 100 }),
       cpuUsage: () => (cpu = { user: cpu.user + 250_000, system: cpu.system + 50_000 }),
+      recoveryCircuitSnapshot: () => ({
+        state: "open",
+        scope: "outage",
+        consecutiveFailures: 2,
+        queued: 3,
+        probeInFlight: false,
+        revalidationInFlight: false,
+        nextProbeAtMs: clock.now() + 1_000,
+        lastFailureKind: "server",
+      }),
     });
 
     sampler.sample();
@@ -142,7 +155,10 @@ describe("FleetSampler", () => {
     expect((event.resources as any).transform_workers).toBe(6);
     expect((event.runtimes as any[])[0]).toMatchObject({
       project_id: "00000000-0000-4000-8000-000000000001",
+      incarnation: 3,
       awareness_rtt_ms: 15,
+      sidecar_peer_age_ms: 250,
+      recovery: { attempt: 2, consecutive_failures: 1, retry_in_ms: 1_000 },
       completion_ewma_ms: 2_000,
       diagnostics: {
         sidecar: {
@@ -158,6 +174,13 @@ describe("FleetSampler", () => {
           },
         },
       },
+    });
+    expect(event.provisioning_circuit).toMatchObject({
+      state: "open",
+      scope: "outage",
+      consecutive_failures: 2,
+      retry_in_ms: 1_000,
+      queued: 3,
     });
     expect(JSON.stringify(event)).not.toMatch(/token|cookie|prompt|output|url/i);
   });

@@ -13,6 +13,7 @@ function deferred<T>() {
 }
 
 class FakeRuntime implements RoutableSandboxRuntime {
+  incarnation = 1;
   active = 0;
   executions = 0;
   state: "ready" | "draining" | "stopped" = "ready";
@@ -20,6 +21,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   failDelayMs = 0;
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
+  readonly listeners = new Set<() => void>();
   constructor(readonly projectId: ProjectId, readonly capacity = 30) {}
   async start(): Promise<void> {}
   async drain(): Promise<void> {
@@ -27,9 +29,18 @@ class FakeRuntime implements RoutableSandboxRuntime {
     if (this.active === 0) this.state = "stopped";
   }
   async stop(): Promise<void> { this.state = "stopped"; }
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  replaceIncarnation(): void {
+    this.incarnation++;
+    for (const listener of this.listeners) listener();
+  }
   snapshot() {
     return {
       projectId: this.projectId,
+      incarnation: this.incarnation,
       state: this.state,
       capacity: this.capacity,
       active: this.active,
@@ -141,10 +152,29 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes[0].executions).toBe(1);
   });
 
+  it("allows a safe retry on a fresh incarnation of the same Prism project", async () => {
+    const system = createSystem(1, 1);
+    const runtime = system.runtimes[0];
+    runtime.failStarts = 1;
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "same-project-recovery", stream: true },
+      { clientId: "same-project-recovery", source: "websocket" },
+    );
+    await flush();
+    expect(runtime.executions).toBe(1);
+
+    runtime.replaceIncarnation();
+    const handle = await pending;
+    expect(runtime.executions).toBe(2);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
   it("never dispatches a retry after its absolute queue deadline", async () => {
-    const system = createSystem(2, 1, 10);
+    const system = createSystem(2, 1, 100);
     system.runtimes[1].failStarts = 1;
-    system.runtimes[1].failDelayMs = 25;
+    system.runtimes[1].failDelayMs = 150;
     const pending = system.router.startRelay(
       { model: "gpt-5.6-sol", input: "expired-retry", stream: true },
       { clientId: "expired-retry", source: "websocket" },
@@ -154,7 +184,7 @@ describe("MultiSandboxRouter", () => {
         handle => ({ kind: "handle" as const, handle }),
         error => ({ kind: "error" as const, error }),
       ),
-      Bun.sleep(75).then(() => ({ kind: "idle-timeout" as const })),
+      Bun.sleep(500).then(() => ({ kind: "idle-timeout" as const })),
     ]);
     if (outcome.kind === "handle") {
       system.runtimes[0].completeOne();
@@ -236,6 +266,29 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
     system.runtimes.find(runtime => runtime.finals.length)?.completeOne();
     await expect(handle.final).resolves.toBeDefined();
+  });
+
+  it("never reroutes a commit-published ambiguous startup error", async () => {
+    const system = createSystem(2, 1);
+    const selected = system.runtimes[1];
+    const ambiguous = Object.assign(new Error("commit ACK was lost"), {
+      committed: true,
+      ambiguous: true,
+      code: "sidecar_unreachable",
+    });
+    selected.run = async () => {
+      selected.executions++;
+      throw ambiguous;
+    };
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "ambiguous", stream: true },
+      { clientId: "ambiguous", source: "websocket" },
+    )).rejects.toBe(ambiguous);
+
+    expect(selected.executions).toBe(1);
+    expect(system.runtimes[0].executions).toBe(0);
+    await system.router.close();
   });
 
   it("defaults omitted service tiers to fast and preserves explicit tiers", async () => {

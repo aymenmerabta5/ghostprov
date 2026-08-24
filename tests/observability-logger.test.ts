@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { ObservabilityLogger, type ObservabilitySink } from "../src/observability/logger";
-import { observabilityEvent } from "../src/observability/events";
+import { observabilityEvent, recoveryObservabilityEvent } from "../src/observability/events";
 import type { ObservabilityConfig } from "../src/observability/config";
 
 function config(overrides: Partial<ObservabilityConfig> = {}): ObservabilityConfig {
@@ -72,6 +72,31 @@ describe("ObservabilityLogger", () => {
       .not.toThrow();
     await expect(logger.close()).resolves.toBeUndefined();
     expect(logger.snapshot().sinkErrors).toBeGreaterThan(0);
+  });
+
+  it("keeps terminal recovery and circuit transitions at error log level", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink] });
+    logger.emit(recoveryObservabilityEvent("sandbox.recovery.started", {
+      project_id: "00000000-0000-4000-8000-000000000001",
+      cause: "heartbeat",
+      attempt: 1,
+    }), "terminal");
+    logger.emit(recoveryObservabilityEvent("prism.circuit.changed", {
+      cause: "circuit",
+      circuit_state: "open",
+      circuit_scope: "outage",
+    }), "terminal");
+    logger.emit(recoveryObservabilityEvent("sandbox.recovery.retry_scheduled", {
+      cause: "runtime",
+      retry_delay_ms: 1_000,
+    }), "progress");
+    await logger.close();
+
+    expect(sink.events().map(event => event.event)).toEqual([
+      "sandbox.recovery.started",
+      "prism.circuit.changed",
+    ]);
   });
 
   it("keeps hot-path enqueue bounded", async () => {

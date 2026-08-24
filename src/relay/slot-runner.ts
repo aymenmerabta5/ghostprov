@@ -38,6 +38,7 @@ export interface SandboxSlotRunnerOptions {
   ydoc: SlotRunnerYDoc;
   gateway: SlotRunnerGateway;
   daemon: SlotRunnerDaemon;
+  leaderGeneration?: number;
   clock?: Clock;
   pollMinMs?: number;
   pollMaxMs?: number;
@@ -98,6 +99,7 @@ export class SandboxSlotRunner {
   readonly #ydoc: SlotRunnerYDoc;
   readonly #gateway: SlotRunnerGateway;
   readonly #daemon: SlotRunnerDaemon;
+  readonly #leaderGeneration: number;
   readonly #clock: Clock;
   readonly #pool: SlotPool;
   readonly #pollMinMs: number;
@@ -118,6 +120,10 @@ export class SandboxSlotRunner {
     this.#ydoc = options.ydoc;
     this.#gateway = options.gateway;
     this.#daemon = options.daemon;
+    this.#leaderGeneration = options.leaderGeneration ?? 0;
+    if (!Number.isSafeInteger(this.#leaderGeneration) || this.#leaderGeneration < 0) {
+      throw new RangeError("leaderGeneration must be a non-negative safe integer");
+    }
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#pool = new SlotPool(options.capacity);
     this.#pollMinMs = options.pollMinMs ?? 60;
@@ -135,7 +141,10 @@ export class SandboxSlotRunner {
   }
 
   async run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
-    const serialized = JSON.stringify(body);
+    const serialized = JSON.stringify({
+      ...body,
+      _ghostprov_generation: this.#leaderGeneration,
+    });
     const ack = sha12(serialized);
     const isSegmented = Buffer.byteLength(serialized, "utf8") > this.#segmentThresholdBytes;
     const gzipBytes = isSegmented && this.#gzip

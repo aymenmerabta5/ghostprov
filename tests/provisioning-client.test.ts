@@ -6,6 +6,7 @@ import {
   type AccountRequestClient,
 } from "../src/prism/provisioning-client";
 import { AccountAuthError } from "../src/prism/account-session";
+import { parseProvisionedSandbox } from "../src/prism/protocol";
 import { projectId, sandboxSessionId } from "../src/sandbox/types";
 
 const PROJECT = "e631d12c-d917-4434-b360-41b4715d6679";
@@ -149,6 +150,38 @@ describe("PrismProvisioningClient", () => {
     expect(acquired).toBe(true);
   });
 
+  it("acquires a sandbox without starting the remaining bootstrap", async () => {
+    const account = new ScriptedAccountSession([successResponses()[0]]);
+
+    const sandbox = await client(account).acquireSandbox();
+
+    expect(sandbox.token.reveal()).toBe("sandbox-token");
+    expect(sandbox.sessionId).toBe(sandboxSessionId(SESSION));
+    expect(account.calls.map(call => call.path)).toEqual(["/api/backend/1/new"]);
+  });
+
+  it("bootstraps an acquired sandbox without making another acquisition request", async () => {
+    const sandbox = parseProvisionedSandbox({
+      url: "/s/sandboxes/proxy",
+      token: "sandbox-token",
+      sandbox_id: SANDBOX,
+      sandbox_session_id: SESSION,
+    });
+    const account = new ScriptedAccountSession(successResponses().slice(1));
+    let exposed = false;
+
+    const result = await client(account).provisionAcquired(projectId(PROJECT), sandbox, undefined, {
+      onSandboxAcquired: candidate => {
+        exposed = candidate === sandbox;
+      },
+    });
+
+    expect(result.sandbox).toBe(sandbox);
+    expect(exposed).toBe(true);
+    expect(account.calls.some(call => call.path === "/api/backend/1/new")).toBe(false);
+    expect(account.calls[0].path).toBe(`/api/projects/${PROJECT}/sandbox/resources-token`);
+  });
+
   it("accepts the proven legacy readiness shape", async () => {
     const responses = successResponses();
     responses.splice(-2, 2, json(200, {
@@ -195,6 +228,32 @@ describe("PrismProvisioningClient", () => {
     responses.unshift(new Response("rate limited", { status: 429, headers: { "retry-after": "2" } }));
     await client(new ScriptedAccountSession(responses), clock).provision(projectId(PROJECT));
     expect(clock.sleeps[0]).toBe(2_000);
+  });
+
+  it("supports bounded acquisition attempts for externally coordinated retries", async () => {
+    const once = new ScriptedAccountSession([
+      new Response("temporary", { status: 503 }),
+    ]);
+    await expect(client(once).acquireSandbox(undefined, { maxAttempts: 1 })).rejects.toMatchObject({
+      kind: "transport",
+      status: 503,
+    });
+    expect(once.calls).toHaveLength(1);
+
+    await expect(client(new ScriptedAccountSession([
+      new Response("rate limited", { status: 429, headers: { "retry-after": "7" } }),
+    ])).acquireSandbox(undefined, { maxAttempts: 1 })).rejects.toMatchObject({
+      kind: "rate_limit",
+      status: 429,
+      retryAfterMs: 7_000,
+    });
+
+    await expect(client(new ScriptedAccountSession([])).acquireSandbox(undefined, {
+      maxAttempts: 0,
+    })).rejects.toBeInstanceOf(RangeError);
+    await expect(client(new ScriptedAccountSession([])).acquireSandbox(undefined, {
+      maxAttempts: 11,
+    })).rejects.toBeInstanceOf(RangeError);
   });
 
   it("honors an already-aborted provisioning signal", async () => {

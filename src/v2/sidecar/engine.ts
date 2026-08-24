@@ -182,6 +182,8 @@ export class SidecarEngine {
         await this.drain(frame.reason);
         return;
       case "ping":
+        // Bootstrap compatibility only. Steady-state liveness uses the
+        // frame-free Awareness envelope path and never reaches this engine.
         this.#emit(
           { kind: "pong", sentAtMs: frame.sentAtMs },
           "control",
@@ -374,6 +376,7 @@ export class SidecarEngine {
         finalEventIndex: terminal.finalEventIndex,
         finalSha256: terminal.finalSha256,
         ...(diagnostics ? { diagnostics } : {}),
+        ...(terminal.rateLimit ? { rateLimit: terminal.rateLimit } : {}),
       }, "terminal", request.requestId);
     } catch (error) {
       if (request.cancelRequested && request.controller.signal.aborted) return;
@@ -385,6 +388,7 @@ export class SidecarEngine {
         upstream?.code ?? "internal",
         upstream?.message ?? "Sidecar execution failed after commitment",
         ambiguous,
+        upstream?.rateLimit,
       );
     } finally {
       request.body.fill(0);
@@ -484,6 +488,7 @@ export class SidecarEngine {
     code: string,
     message: string,
     ambiguous: boolean,
+    rateLimit?: import("../rate-limit").RateLimitHint,
   ): void {
     this.#batcher?.flush(requestId,"terminal");
     this.#emit({
@@ -492,6 +497,7 @@ export class SidecarEngine {
       code: this.#safeCode(code),
       message: this.#safeMessage(message),
       ambiguous,
+      ...(rateLimit ? { rateLimit } : {}),
     }, "terminal", requestId);
   }
 
@@ -503,7 +509,7 @@ export class SidecarEngine {
     return value
       .replace(/\b(token|api[_-]?key|secret|password)\s*[:=]\s*[^;\s,]+/gi, "$1=[REDACTED]")
       .replace(/[A-Za-z0-9+/_=-]{48,}/g, "[REDACTED]")
-      .slice(0, 240) || "Sidecar request failed";
+      .slice(0, 512) || "Sidecar request failed";
   }
 
   #emit(frame: SidecarFrame, priority: FramePriority, streamId: string): void {

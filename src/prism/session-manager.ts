@@ -42,6 +42,7 @@ export type PrismSessionErrorKind =
   | "auth_required"
   | "guest_identity_lost"
   | "mode_mismatch"
+  | "timeout"
   | "protocol";
 
 export class PrismSessionError extends Error {
@@ -67,6 +68,7 @@ export interface PrismSessionManagerOptions {
   clock?: Clock;
   random?: RandomSource;
   lockTimeoutMs?: number;
+  revalidateTimeoutMs?: number;
 }
 
 function isNodeError(error: unknown, code: string): boolean {
@@ -75,6 +77,36 @@ function isNodeError(error: unknown, code: string): boolean {
 
 function fingerprint(userId: string): string {
   return createHash("sha256").update(userId).digest("hex");
+}
+
+function abortError(): DOMException {
+  return new DOMException("Prism session revalidation aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError();
+}
+
+function waitForShared<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function parseIdentityMetadata(value: unknown): IdentityMetadata {
@@ -125,10 +157,15 @@ export class PrismSessionManager {
   readonly #clock: Clock;
   readonly #random: RandomSource;
   readonly #lockTimeoutMs: number;
+  readonly #revalidateTimeoutMs: number;
   #leaseHeld = false;
   #closed = false;
   #resolved: ResolvedPrismIdentity | null = null;
   #resolving: Promise<ResolvedPrismIdentity> | null = null;
+  #revalidating: {
+    controller: AbortController;
+    promise: Promise<ResolvedPrismIdentity>;
+  } | null = null;
 
   private constructor(
     options: PrismSessionManagerOptions,
@@ -141,6 +178,10 @@ export class PrismSessionManager {
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#random = options.random ?? SYSTEM_RANDOM;
     this.#lockTimeoutMs = options.lockTimeoutMs ?? 30_000;
+    this.#revalidateTimeoutMs = options.revalidateTimeoutMs ?? 10_000;
+    if (!Number.isSafeInteger(this.#revalidateTimeoutMs) || this.#revalidateTimeoutMs < 1) {
+      throw new RangeError("revalidateTimeoutMs must be positive");
+    }
     this.#lease = new FileLease({
       file: `${path.resolve(options.cookieFile)}.lock`,
       staleAfterMs: 60_000,
@@ -176,6 +217,35 @@ export class PrismSessionManager {
     return this.#resolving;
   }
 
+  revalidate(signal?: AbortSignal): Promise<ResolvedPrismIdentity> {
+    if (this.#closed) {
+      return Promise.reject(new PrismSessionError("Prism session manager is closed", "protocol"));
+    }
+    if (signal?.aborted) return Promise.reject(abortError());
+    if (!this.#revalidating) {
+      const controller = new AbortController();
+      const operation = this.#revalidate(controller.signal);
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new PrismSessionError(
+            "Prism session revalidation timed out",
+            "timeout",
+          ));
+        }, this.#revalidateTimeoutMs);
+        timer.unref?.();
+      });
+      const promise = Promise.race([operation, timeout])
+        .finally(() => {
+          if (timer) clearTimeout(timer);
+          if (this.#revalidating?.promise === promise) this.#revalidating = null;
+        });
+      this.#revalidating = { controller, promise };
+    }
+    return waitForShared(this.#revalidating.promise, signal);
+  }
+
   async flush(): Promise<void> {
     await this.#ensureLease();
     await this.#account.flush();
@@ -184,6 +254,9 @@ export class PrismSessionManager {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    const revalidating = this.#revalidating;
+    revalidating?.controller.abort();
+    if (revalidating) await revalidating.promise.catch(() => undefined);
     if (this.#resolving) await this.#resolving.catch(() => undefined);
     if (!this.#leaseHeld) return;
     try {
@@ -231,14 +304,82 @@ export class PrismSessionManager {
     return this.#acceptUser(user, metadata);
   }
 
+  async #revalidate(signal: AbortSignal): Promise<ResolvedPrismIdentity> {
+    throwIfAborted(signal);
+    await this.#ensureLease(signal);
+    throwIfAborted(signal);
+
+    const current = this.#resolved;
+    if (!current) {
+      throw new PrismSessionError(
+        "The Prism identity must be resolved before it can be revalidated",
+        "protocol",
+      );
+    }
+    const metadata = await this.#readIdentityMetadata();
+    throwIfAborted(signal);
+    if (
+      !metadata ||
+      metadata.kind !== current.kind ||
+      metadata.fingerprint !== current.fingerprint
+    ) {
+      throw new PrismSessionError(
+        "The persisted Prism identity does not match the resolved session",
+        "mode_mismatch",
+      );
+    }
+
+    for (;;) {
+      throwIfAborted(signal);
+      const candidate = await this.#account.createCookieCandidate();
+      throwIfAborted(signal);
+      let user: AuthUser | null;
+      try {
+        user = await this.#loadAuthUser(signal, candidate);
+      } catch (error) {
+        throwIfAborted(signal);
+        throw error;
+      }
+      throwIfAborted(signal);
+      if (!user) {
+        throw new PrismSessionError(
+          current.kind === "anonymous"
+            ? "The persisted anonymous Prism identity is no longer available"
+            : "A signed-in Prism session is required",
+          current.kind === "anonymous" ? "guest_identity_lost" : "auth_required",
+        );
+      }
+      const hash = fingerprint(user.id);
+      if (user.kind !== current.kind || hash !== current.fingerprint) {
+        throw new PrismSessionError(
+          "The active Prism session identity changed during revalidation",
+          "mode_mismatch",
+        );
+      }
+      if (!await candidate.commit(signal)) continue;
+
+      const refreshed: ResolvedPrismIdentity = {
+        kind: current.kind,
+        fingerprint: current.fingerprint,
+        account: this.#account,
+        resolvedAtMs: this.#clock.now(),
+      };
+      this.#resolved = refreshed;
+      return refreshed;
+    }
+  }
+
   async #ensureLease(signal?: AbortSignal): Promise<void> {
     if (this.#leaseHeld) return;
     await this.#lease.acquire({ timeoutMs: this.#lockTimeoutMs, signal });
     this.#leaseHeld = true;
   }
 
-  async #loadAuthUser(signal?: AbortSignal): Promise<AuthUser | null> {
-    const response = await this.#account.request("/auth/session", {
+  async #loadAuthUser(
+    signal?: AbortSignal,
+    requester: Pick<PrismAccountSession, "request"> = this.#account,
+  ): Promise<AuthUser | null> {
+    const response = await requester.request("/auth/session", {
       method: "GET",
       signal,
       headers: { accept: "application/json" },

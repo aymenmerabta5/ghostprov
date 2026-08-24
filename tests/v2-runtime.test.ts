@@ -30,6 +30,7 @@ import {
   type V2RuntimeBootstrap,
   type V2RuntimeGovernor,
   type V2RuntimeHeartbeat,
+  type V2RuntimeHeartbeatCallbacks,
   type V2RuntimeTransport,
   type V2RuntimeYDoc,
 } from "../src/v2/runtime";
@@ -110,6 +111,7 @@ class FakeAwareness implements AwarenessChannel<HostFrame, SidecarFrame> {
 }
 
 class FakeBootstrap implements V2RuntimeBootstrap {
+  drains = 0;
   constructor(
     readonly order: string[],
     readonly descriptor: V2ReadyDescriptor,
@@ -118,7 +120,7 @@ class FakeBootstrap implements V2RuntimeBootstrap {
     this.order.push("bootstrap");
     return this.descriptor;
   }
-  async drainAndStop(): Promise<void> {}
+  async drainAndStop(): Promise<void> { this.drains++; }
   async sealCredentialRotation(): Promise<string> {
     return JSON.stringify({ encrypted: "rotation" });
   }
@@ -132,6 +134,10 @@ class FakeTransport implements V2RuntimeTransport {
   }> = [];
   hostCeilings: number[] = [];
   rotations = 0;
+  drains = 0;
+  closes = 0;
+  livenessProbes = 0;
+  probeLiveness?: (signal?: AbortSignal) => Promise<{ rttMs: number; sentAtMs: number }>;
 
   constructor(
     readonly order: string[],
@@ -168,8 +174,8 @@ class FakeTransport implements V2RuntimeTransport {
       stats: { bytes: 32, firstByteMs: 5, frames: 1 },
     };
   }
-  async drain(): Promise<void> { this.snapshotValue.connected = false; }
-  async close(): Promise<void> { this.snapshotValue.connected = false; }
+  async drain(): Promise<void> { this.drains++; this.snapshotValue.connected = false; }
+  async close(): Promise<void> { this.closes++; this.snapshotValue.connected = false; }
   snapshot(): V2TransportSnapshot { return { ...this.snapshotValue }; }
   setHostCeiling(value: number): void { this.hostCeilings.push(value); }
   async rotateCredential(): Promise<void> { this.rotations++; }
@@ -218,24 +224,53 @@ function runtimeHarness(options: {
   credits?: number;
   governorCeiling?: number;
   resourceExpiresInMs?: number;
+  resourceRefreshError?: Error;
+  livenessOutcomes?: Array<Error | null>;
+  authSandbox?: ProvisionedSandbox;
+  rotateSameSession?: boolean;
+  initialSandbox?: ProvisionedSandbox;
 } = {}) {
   const order: string[] = [];
   const clock = new ManualClock();
   let current = credentials(clock, options.resourceExpiresInMs ?? 600_000);
   let refreshes = 0;
   let ySweetMints = 0;
+  let acquisitions = 0;
+  let acquiredProvisions = 0;
+  let provisions = 0;
+  let refreshedSandboxToken: string | null = null;
+  const credentialOutcomes: string[] = [];
+  let heartbeatCallbacks: V2RuntimeHeartbeatCallbacks | null = null;
   const provisioner = {
     async provision(
       _projectId: typeof PROJECT,
       _signal?: AbortSignal,
       hooks: ProvisioningHooks = {},
     ) {
+      provisions++;
       order.push("provision");
       await hooks.onSandboxAcquired?.(current.sandbox);
       return current;
     },
+    async acquireSandbox() {
+      acquisitions++;
+      return options.authSandbox ?? current.sandbox;
+    },
+    async provisionAcquired(
+      _projectId: typeof PROJECT,
+      sandbox: ProvisionedSandbox,
+      _signal?: AbortSignal,
+      hooks: ProvisioningHooks = {},
+    ) {
+      acquiredProvisions++;
+      order.push("provision-acquired");
+      await hooks.onSandboxAcquired?.(sandbox);
+      return { ...current, sandbox };
+    },
     async refreshResources(value: ProvisionedRuntimeCredentials) {
       refreshes++;
+      refreshedSandboxToken = value.sandbox.token.reveal();
+      if (options.resourceRefreshError) throw options.resourceRefreshError;
       current = {
         ...value,
         resource: parseResourceCredential({
@@ -270,6 +305,16 @@ function runtimeHarness(options: {
   };
   const bootstrap = new FakeBootstrap(order, descriptor);
   const transport = new FakeTransport(order, { credits: options.credits ?? 128 });
+  if (options.livenessOutcomes) {
+    const outcomes = [...options.livenessOutcomes];
+    transport.probeLiveness = async signal => {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      transport.livenessProbes++;
+      const outcome = outcomes.shift() ?? null;
+      if (outcome) throw outcome;
+      return { rttMs: 1, sentAtMs: clock.now() };
+    };
+  }
   const governor = new FakeGovernor(options.governorCeiling ?? 128);
   const runtime = new V2SandboxRuntime({
     projectId: PROJECT,
@@ -281,13 +326,21 @@ function runtimeHarness(options: {
     assets: ASSETS,
     transportReservationBytes: 16 * 1024 * 1024,
     ySweetRefreshMs: 300_000,
-    createGateway: (_sandbox: ProvisionedSandbox) => ({ heartbeat: async () => ({
-      ok: true,
-      status: 200,
-      durationMs: 1,
-      sessionId: "sandbox-session-1",
-    }) }),
-    createHeartbeat: () => heartbeat,
+    initialSandbox: options.initialSandbox,
+    onCredentialRefresh: outcome => credentialOutcomes.push(outcome),
+    createGateway: (_sandbox: ProvisionedSandbox) => ({
+      heartbeat: async () => ({
+        ok: true,
+        status: 200,
+        durationMs: 1,
+        sessionId: "sandbox-session-1",
+      }),
+      rotateSameSession: () => options.rotateSameSession ?? false,
+    }),
+    createHeartbeat: (_gateway, callbacks) => {
+      heartbeatCallbacks = callbacks;
+      return heartbeat;
+    },
     createYDoc: () => ydoc,
     createAwareness: (_binding: ProtocolBinding) => awareness,
     createBootstrap: () => bootstrap,
@@ -301,8 +354,27 @@ function runtimeHarness(options: {
     transport,
     awareness,
     governor,
+    bootstrap,
     refreshes: () => refreshes,
     ySweetMints: () => ySweetMints,
+    acquisitions: () => acquisitions,
+    provisions: () => provisions,
+    acquiredProvisions: () => acquiredProvisions,
+    refreshedSandboxToken: () => refreshedSandboxToken,
+    credentialOutcomes,
+    heartbeatSuccess: () => heartbeatCallbacks?.onSuccess({
+      ok: true,
+      status: 200,
+      durationMs: 1,
+      sessionId: "sandbox-session-1",
+    }),
+    heartbeatExpired: (status = 401) => heartbeatCallbacks?.onExpired(status),
+    heartbeatAuthenticationFailure: (status = 401, signal = new AbortController().signal) =>
+      heartbeatCallbacks?.onAuthenticationFailure(status, signal),
+    heartbeatTransientFailure: (status: number | null = null) =>
+      heartbeatCallbacks?.onTransientFailure(status),
+    heartbeatUnreachable: (status: number | null = null) =>
+      heartbeatCallbacks?.onUnreachable(status),
   };
 }
 
@@ -318,6 +390,203 @@ describe("V2SandboxRuntime", () => {
       capacity: 128,
       active: 0,
       quarantined: 0,
+    });
+    await harness.runtime.stop();
+  });
+
+  it("emits heartbeat successes without masking transient failures", async () => {
+    const harness = runtimeHarness();
+    let changes = 0;
+    harness.runtime.subscribe(() => { changes++; });
+    await harness.runtime.start();
+    const afterStart = changes;
+
+    harness.heartbeatTransientFailure(502);
+    expect(changes).toBe(afterStart + 1);
+    expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.20);
+
+    harness.heartbeatSuccess();
+    expect(changes).toBe(afterStart + 2);
+    expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.20);
+    await harness.runtime.stop();
+  });
+
+  it("becomes synchronously unroutable on heartbeat expiry without draining", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    harness.heartbeatExpired(401);
+
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      available: 0,
+      failure: {
+        name: "V2RuntimeLifecycleFailure",
+        kind: "heartbeat_expired",
+        status: 401,
+        operation: "heartbeat",
+        message: "V2 sandbox heartbeat credentials expired (401)",
+      },
+    });
+    expect(harness.transport.drains).toBe(0);
+    expect(harness.bootstrap.drains).toBe(0);
+
+    harness.heartbeatUnreachable(502);
+    expect(harness.runtime.snapshot().failure?.kind).toBe("heartbeat_expired");
+    await harness.runtime.stop();
+  });
+
+  it("rotates a proven same-session sandbox token without replacing the runtime", async () => {
+    const candidate = parseProvisionedSandbox({
+      url: "https://prism.test/s/sandboxes/proxy",
+      token: "sandbox-token-2",
+      sandbox_session_id: "sandbox-session-1",
+    });
+    const harness = runtimeHarness({
+      authSandbox: candidate,
+      rotateSameSession: true,
+      resourceExpiresInMs: 300_001,
+    });
+    await harness.runtime.start();
+
+    await expect(harness.heartbeatAuthenticationFailure()).resolves.toBe("retry");
+    expect(harness.acquisitions()).toBe(1);
+    expect(harness.runtime.takeReplacementSandbox()).toBeNull();
+    expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0 });
+    harness.heartbeatSuccess();
+    expect(harness.runtime.snapshot().capacity).toBe(128);
+    expect(harness.credentialOutcomes).toEqual(["updated_in_place"]);
+    await harness.clock.advanceBy(1);
+    expect(harness.refreshedSandboxToken()).toBe("sandbox-token-2");
+    await harness.runtime.stop();
+  });
+
+  it("hands a changed sandbox session to the next generation exactly once", async () => {
+    const candidate = parseProvisionedSandbox({
+      url: "https://prism.test/s/sandboxes/proxy",
+      token: "sandbox-token-2",
+      sandbox_session_id: "sandbox-session-2",
+    });
+    const harness = runtimeHarness({ authSandbox: candidate, rotateSameSession: false });
+    await harness.runtime.start();
+
+    await expect(harness.heartbeatAuthenticationFailure()).resolves.toBe("expired");
+    expect(harness.runtime.takeReplacementSandbox()).toBe(candidate);
+    expect(harness.credentialOutcomes).toEqual(["replacement_required"]);
+    expect(harness.runtime.takeReplacementSandbox()).toBeNull();
+    await harness.runtime.stop();
+  });
+
+  it("bootstraps a pre-acquired sandbox without another acquisition", async () => {
+    const seed = parseProvisionedSandbox({
+      url: "https://prism.test/s/sandboxes/proxy",
+      token: "seed-token",
+      sandbox_session_id: "sandbox-session-2",
+    });
+    const harness = runtimeHarness({ initialSandbox: seed });
+
+    await harness.runtime.start();
+
+    expect(harness.provisions()).toBe(0);
+    expect(harness.acquiredProvisions()).toBe(1);
+    await harness.runtime.stop();
+  });
+
+  it("becomes synchronously unroutable when heartbeat failures reach unreachable", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    harness.heartbeatUnreachable(503);
+
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      available: 0,
+      failure: {
+        name: "V2RuntimeLifecycleFailure",
+        kind: "heartbeat_unreachable",
+        status: 503,
+        operation: "heartbeat",
+        message: "V2 sandbox heartbeat became unreachable (503)",
+      },
+    });
+    expect(harness.transport.drains).toBe(0);
+    expect(harness.bootstrap.drains).toBe(0);
+
+    await harness.runtime.stop();
+    harness.heartbeatExpired(410);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("fails closed with a sanitized lifecycle failure when resource refresh expires", async () => {
+    const harness = runtimeHarness({
+      resourceExpiresInMs: 1,
+      resourceRefreshError: new DOMException(
+        "authorization=Bearer super-secret-resource-token",
+        "AbortError",
+      ),
+    });
+    await harness.runtime.start();
+    for (let index = 0; index < 10; index++) await Promise.resolve();
+
+    expect(harness.refreshes()).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+
+    await harness.clock.advanceBy(30_000);
+
+    expect(harness.refreshes()).toBe(2);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      available: 0,
+      failure: {
+        name: "V2RuntimeLifecycleFailure",
+        kind: "resource_credential_expired",
+        status: null,
+        operation: "refresh_resources",
+        message: "V2 sandbox resource credential expired after refresh failed",
+      },
+    });
+    expect(JSON.stringify(harness.runtime.snapshot().failure)).not.toContain("super-secret");
+    expect(harness.transport.drains).toBe(0);
+    await harness.runtime.stop();
+  });
+
+  it("gates readiness on a bound sidecar liveness proof", async () => {
+    const harness = runtimeHarness({ livenessOutcomes: [null] });
+
+    await harness.runtime.start();
+
+    expect(harness.transport.livenessProbes).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    await harness.runtime.stop();
+  });
+
+  it("removes capacity on a missed sidecar probe, heals, then fails after three misses", async () => {
+    const miss = () => new Error("sidecar pong timed out");
+    const harness = runtimeHarness({
+      livenessOutcomes: [null, miss(), null, miss(), miss(), miss()],
+    });
+    await harness.runtime.start();
+
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot().capacity).toBe(128);
+
+    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      failure: {
+        kind: "sidecar_unreachable",
+        operation: "sidecar_liveness",
+      },
     });
     await harness.runtime.stop();
   });

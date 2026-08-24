@@ -70,6 +70,10 @@ export class ObservabilityLogger implements LoggerLike {
       "request.failed",
       "monitor.error",
       "logger.error",
+      "sandbox.recovery.started",
+      "sandbox.recovery.completed",
+      "sandbox.recovery.aborted",
+      "prism.circuit.changed",
     ].includes(event.event)) return;
     try {
       assertSafeObservabilityEvent(event);

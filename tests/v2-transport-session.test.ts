@@ -7,6 +7,7 @@ import {
   base64UrlEncode,
   utf8Bytes,
   type AwarenessEnvelope,
+  type AwarenessLiveness,
   type HostFrame,
   type ProtocolBinding,
   type ReliableFrame,
@@ -40,6 +41,37 @@ async function promiseState(value: Promise<unknown>): Promise<"pending" | "settl
   ]);
 }
 
+function throwOnSelectedPublish(
+  channel: AwarenessChannel<HostFrame, SidecarFrame>,
+  options: { data: boolean; commit: boolean; liveness: boolean },
+): AwarenessChannel<HostFrame, SidecarFrame> {
+  return {
+    get projectId() { return channel.projectId; },
+    get localPeerId() { return channel.localPeerId; },
+    connect: signal => channel.connect(signal),
+    publish(envelope, lane) {
+      if (options.data && lane === "data") {
+        throw new Error("synthetic data publication failure");
+      }
+      if (
+        options.commit &&
+        lane === "data" &&
+        envelope.frames.some(frame => frame.kind === "request_commit")
+      ) {
+        throw new Error("synthetic commit publication failure");
+      }
+      if (options.liveness && envelope.liveness?.kind === "ping") {
+        throw new Error("synthetic liveness publication failure");
+      }
+      channel.publish(envelope, lane);
+    },
+    clear: lane => channel.clear(lane),
+    subscribe: listener => channel.subscribe(listener),
+    peerIds: () => channel.peerIds(),
+    close: () => channel.close(),
+  };
+}
+
 class TransportHarness {
   readonly network: FakeAwarenessNetwork<HostFrame, SidecarFrame>;
   readonly host: AwarenessChannel<HostFrame, SidecarFrame>;
@@ -56,6 +88,7 @@ class TransportHarness {
   hostAck = -1;
   credits = 128;
   readonly publicationIntervalMs: number;
+  readonly autoPong: boolean;
 
   constructor(options: {
     drop?: readonly number[];
@@ -66,10 +99,26 @@ class TransportHarness {
     rotationTimeoutMs?: number;
     publicationIntervalMs?: number;
     unadmittedTimeoutMs?: number;
+    livenessTimeoutMs?: number;
+    autoPong?: boolean;
+    throwOnDataPublish?: boolean;
+    throwOnCommitPublish?: boolean;
+    throwOnLivenessPublish?: boolean;
+    expectedSidecarInstanceId?: string | null;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
+    this.autoPong = options.autoPong ?? false;
     this.network = new FakeAwarenessNetwork({ drop: options.drop });
-    this.host = this.network.connectHost("host", PROJECT);
+    const host = this.network.connectHost("host", PROJECT);
+    this.host = options.throwOnDataPublish ||
+      options.throwOnCommitPublish ||
+      options.throwOnLivenessPublish
+      ? throwOnSelectedPublish(host, {
+          data: options.throwOnDataPublish ?? false,
+          commit: options.throwOnCommitPublish ?? false,
+          liveness: options.throwOnLivenessPublish ?? false,
+        })
+      : host;
     this.sidecar = this.network.connectSidecar("sidecar", PROJECT);
     this.sidecar.subscribe(update => {
       const envelope = update.envelope;
@@ -84,6 +133,14 @@ class TransportHarness {
           this.sidecarOutstanding.splice(index, 1);
         }
       }
+      const liveness = envelope.liveness;
+      if (this.autoPong && liveness?.kind === "ping") {
+        this.publish([], {
+          lane: "control",
+          ackSequence: -1,
+          liveness: { kind: "pong", sentAtMs: liveness.sentAtMs },
+        });
+      }
     });
     this.session = new V2TransportSession({
       binding: BINDING,
@@ -95,6 +152,10 @@ class TransportHarness {
       retransmitMs: options.retransmitMs ?? 250,
       publicationIntervalMs: this.publicationIntervalMs,
       unadmittedTimeoutMs: options.unadmittedTimeoutMs,
+      ...(options.expectedSidecarInstanceId === null
+        ? {}
+        : { expectedSidecarInstanceId: options.expectedSidecarInstanceId ?? "sidecar-instance-1" }),
+      livenessTimeoutMs: options.livenessTimeoutMs,
     });
   }
 
@@ -111,6 +172,8 @@ class TransportHarness {
       lane?: "data" | "control";
       ackSequence?: number;
       revision?: number;
+      instanceId?: string;
+      liveness?: AwarenessLiveness;
     } = {},
   ): void {
     for (const frame of frames) {
@@ -120,7 +183,7 @@ class TransportHarness {
         sequence: this.sidecarSequence++,
       } as ReliableFrame<SidecarFrame>);
     }
-    this.sidecar.publish({
+    const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
       schemaHash: BINDING.schemaHash,
@@ -128,7 +191,7 @@ class TransportHarness {
       projectId: PROJECT,
       sessionId: BINDING.sessionId,
       peerId: "sidecar",
-      instanceId: this.sidecarInstanceId,
+      instanceId: options.instanceId ?? this.sidecarInstanceId,
       leaderGeneration: BINDING.leaderGeneration,
       epoch: this.sidecarEpoch,
       revision: options.revision ?? this.revision++,
@@ -139,7 +202,17 @@ class TransportHarness {
       draining: false,
       frames: options.lane === "control" ? [] : [...this.sidecarOutstanding],
       ...(options.lane ? { lane: options.lane } : {}),
-    });
+      ...(options.liveness ? { liveness: options.liveness } : {}),
+    };
+    this.sidecar.publish(envelope);
+  }
+
+  lastHostPing(): Extract<AwarenessLiveness, { kind: "ping" }> {
+    for (let index = this.hostEnvelopes.length - 1; index >= 0; index--) {
+      const liveness = this.hostEnvelopes[index]!.liveness;
+      if (liveness?.kind === "ping") return liveness;
+    }
+    throw new Error("Host liveness ping was not published");
   }
 
   restartSidecar(): void {
@@ -234,6 +307,346 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("probes on the control lane without disturbing an active reliable flight", async () => {
+    const harness = new TransportHarness({ autoPong: true, livenessTimeoutMs: 250 });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    const pending = harness.session.run({
+      ...BODY,
+      input: "liveness-flight-".repeat(30_000),
+    });
+    try {
+      await harness.settle();
+      const dataBefore = harness.hostEnvelopes.filter(envelope => envelope.lane === "data");
+      const framesBefore = [...harness.hostFrames.values()];
+      expect(dataBefore).toHaveLength(1);
+      expect(dataBefore[0]!.frames.length).toBeGreaterThan(0);
+
+      const probing = harness.session.probeLiveness();
+      await expect(harness.session.probeLiveness()).rejects.toMatchObject({
+        code: "probe_in_flight",
+      });
+      await harness.settle();
+
+      await expect(probing).resolves.toMatchObject({
+        rttMs: expect.any(Number),
+        sentAtMs: expect.any(Number),
+      });
+      const pingEnvelope = harness.hostEnvelopes.find(envelope => (
+        envelope.liveness?.kind === "ping"
+      ));
+      expect(pingEnvelope).toMatchObject({ lane: "control", frames: [] });
+      expect(harness.hostEnvelopes.filter(envelope => envelope.lane === "data"))
+        .toHaveLength(dataBefore.length);
+      expect([...harness.hostFrames.values()]).toEqual(framesBefore);
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("observes a control pong while reliable response processing is backpressured", async () => {
+    const harness = new TransportHarness({
+      autoPong: true,
+      livenessTimeoutMs: 250,
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+    });
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([0, 1, 2].map(eventIndex => ({
+      kind: "response_event" as const,
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+    })));
+    await harness.settle();
+    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence))).toBe(0);
+
+    const probing = harness.session.probeLiveness();
+    await harness.settle();
+    await expect(Promise.race([
+      probing,
+      Bun.sleep(100).then(() => {
+        throw new Error("liveness pong waited behind response backpressure");
+      }),
+    ])).resolves.toMatchObject({ sentAtMs: expect.any(Number) });
+    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
+      .toBeLessThan(harness.sidecarSequence - 1);
+
+    await harness.close();
+    await Promise.allSettled([handle.final]);
+  });
+
+  it("fails terminally instead of ACK-jumping after backpressured processing throws", async () => {
+    const harness = new TransportHarness({
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+    });
+    await harness.start();
+    const controller = new AbortController();
+    const handle = await harness.commit(harness.session.run(BODY, controller.signal));
+    const final = handle.final.catch(error => error);
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([0, 1, 2].map(eventIndex => ({
+      kind: "response_event" as const,
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+    })));
+    await harness.settle();
+
+    controller.abort();
+    for (let round = 0; round < 8; round++) await Bun.sleep(0);
+    expect(await final).toMatchObject({ committed: true, ambiguous: true });
+    expect(harness.session.snapshot()).toMatchObject({ connected: false, credits: 0 });
+    await harness.network.flushAll();
+    const ackAfterFailure = Math.max(
+      ...harness.hostEnvelopes.map(envelope => envelope.ack.sequence),
+    );
+    expect(ackAfterFailure).toBeLessThan(harness.sidecarSequence - 1);
+
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
+      .toBe(ackAfterFailure);
+    await harness.close();
+  });
+
+  it("accepts only an exact pong from the bootstrap-bound sidecar instance", async () => {
+    const harness = new TransportHarness({ livenessTimeoutMs: 500 });
+    await harness.start();
+    const probing = harness.session.probeLiveness();
+    await harness.settle();
+    const ping = harness.lastHostPing();
+
+    harness.publish([], {
+      lane: "data",
+      instanceId: "sidecar-instance-stale",
+    });
+    await harness.settle();
+    expect(await promiseState(probing)).toBe("pending");
+
+    harness.publish([], {
+      lane: "control",
+      liveness: { kind: "pong", sentAtMs: ping.sentAtMs - 1 },
+    });
+    await harness.settle();
+    expect(await promiseState(probing)).toBe("pending");
+
+    harness.publish([], {
+      lane: "control",
+      instanceId: "sidecar-instance-unbound",
+      liveness: { kind: "pong", sentAtMs: ping.sentAtMs },
+    });
+    await harness.settle();
+    await expect(probing).rejects.toMatchObject({ code: "instance_changed" });
+    await harness.close();
+  });
+
+  it("rejects a foreign instance before the first expected sidecar envelope", async () => {
+    const harness = new TransportHarness({ livenessTimeoutMs: 500 });
+    await harness.sidecar.connect();
+    await harness.session.connect();
+    const probing = harness.session.probeLiveness();
+    const rejected = probing.catch(error => error);
+    harness.publish([], {
+      lane: "data",
+      instanceId: "sidecar-instance-foreign",
+    });
+    await harness.settle();
+
+    expect(await rejected).toMatchObject({ code: "instance_changed" });
+    await harness.close();
+  });
+
+  it("times out even when a generic sidecar envelope was seen recently", async () => {
+    const harness = new TransportHarness({ livenessTimeoutMs: 15 });
+    await harness.start();
+    expect(harness.session.snapshot().sidecarPeerAgeMs).not.toBeNull();
+
+    await expect(harness.session.probeLiveness()).rejects.toMatchObject({ code: "timeout" });
+    await harness.settle();
+    const latestControl = harness.hostEnvelopes
+      .filter(envelope => envelope.lane === "control")
+      .at(-1)!;
+    expect(latestControl.liveness).toBeUndefined();
+    await harness.close();
+  });
+
+  it("bounds a synchronous liveness publication failure", async () => {
+    const harness = new TransportHarness({ throwOnLivenessPublish: true });
+    await harness.start();
+
+    await expect(harness.session.probeLiveness()).rejects.toMatchObject({
+      name: "V2TransportLivenessError",
+      code: "publish",
+      message: "V2 sidecar liveness probe could not be published",
+    });
+    const latestControl = harness.hostEnvelopes
+      .filter(envelope => envelope.lane === "control")
+      .at(-1)!;
+    expect(latestControl.liveness).toBeUndefined();
+    await harness.close();
+  });
+
+  it("aborts cleanly and ignores a late pong from the cancelled probe", async () => {
+    const harness = new TransportHarness({ livenessTimeoutMs: 1_000 });
+    await harness.start();
+    const controller = new AbortController();
+    const first = harness.session.probeLiveness(controller.signal);
+    await harness.settle();
+    const firstPing = harness.lastHostPing();
+    controller.abort();
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+
+    const second = harness.session.probeLiveness();
+    await harness.settle();
+    const secondPing = harness.lastHostPing();
+    expect(secondPing.sentAtMs).toBeGreaterThan(firstPing.sentAtMs);
+
+    harness.publish([], {
+      lane: "control",
+      liveness: { kind: "pong", sentAtMs: firstPing.sentAtMs },
+    });
+    await harness.settle();
+    expect(await promiseState(second)).toBe("pending");
+
+    harness.publish([], {
+      lane: "control",
+      liveness: { kind: "pong", sentAtMs: secondPing.sentAtMs },
+    });
+    await harness.settle();
+    await expect(second).resolves.toMatchObject({ sentAtMs: secondPing.sentAtMs });
+    await harness.close();
+  });
+
+  it("rejects and cleans up an outstanding liveness probe when closed", async () => {
+    const harness = new TransportHarness({ livenessTimeoutMs: 1_000 });
+    await harness.start();
+    const controller = new AbortController();
+    const probing = harness.session.probeLiveness(controller.signal);
+    await harness.settle();
+
+    const closing = harness.session.close();
+    await expect(probing).rejects.toMatchObject({ code: "unavailable" });
+    await closing;
+    controller.abort();
+    expect(harness.sidecar.peerIds()).toEqual([]);
+    await expect(harness.session.probeLiveness()).rejects.toMatchObject({
+      code: "unavailable",
+    });
+    await harness.sidecar.close();
+  });
+
+  it("treats a published commit with a lost ACK as committed and ambiguous", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    await harness.settle();
+    expect([...harness.hostFrames.values()]).toContainEqual(expect.objectContaining({
+      kind: "request_commit",
+    }));
+
+    const closing = harness.session.close();
+    await expect(pending).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "closed",
+    });
+    await closing;
+    expect(harness.session.snapshot().quarantined).toBe(1);
+    await harness.sidecar.close();
+  });
+
+  it("treats an abort after commit staging as ambiguous before paced publication", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 100 });
+    await harness.start();
+    // Reset the peer-wide cadence immediately before staging the request.
+    harness.session.setHostCeiling(127);
+    await Bun.sleep(0);
+    await harness.network.flushAll();
+
+    const controller = new AbortController();
+    const pending = harness.session.run(BODY, controller.signal);
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (harness.session.snapshot().active === 1) break;
+      await Bun.sleep(1);
+    }
+    expect(harness.session.snapshot().active).toBe(1);
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit"))
+      .toBe(false);
+
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "cancelled",
+    });
+    for (let round = 0; round < 4; round++) {
+      await Bun.sleep(0);
+      await harness.network.flushAll();
+    }
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit"))
+      .toBe(true);
+    await harness.close();
+  });
+
+  it("marks commit risk before a synchronous data publication failure", async () => {
+    const harness = new TransportHarness({ throwOnCommitPublish: true });
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    const rejected = pending.catch(error => error);
+    await harness.settle();
+
+    expect(await rejected).toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "protocol",
+      message: "synthetic commit publication failure",
+    });
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit"))
+      .toBe(false);
+    expect(harness.session.snapshot()).toMatchObject({
+      connected: false,
+      credits: 0,
+      quarantined: 1,
+    });
+    await harness.close();
+  });
+
+  it("makes the transport unavailable after a pre-commit data publication failure", async () => {
+    const harness = new TransportHarness({ throwOnDataPublish: true });
+    await harness.start();
+    const pending = harness.session.run({
+      ...BODY,
+      input: "precommit-flight-".repeat(30_000),
+    });
+    const rejected = pending.catch(error => error);
+    await harness.settle();
+
+    expect(await rejected).toMatchObject({
+      committed: false,
+      code: "protocol",
+      message: "synthetic data publication failure",
+    });
+    expect(harness.session.snapshot()).toMatchObject({ connected: false, credits: 0 });
+    await expect(harness.session.run(BODY)).rejects.toMatchObject({
+      committed: false,
+      code: "not_connected",
+    });
+    await harness.close();
+  });
+
   it("rejects only never-admitted work when sandbox capacity changes", async () => {
     const harness = new TransportHarness({
       publicationIntervalMs: 1,
@@ -569,7 +982,7 @@ describe("V2TransportSession", () => {
   });
 
   it("fences a replacement sidecar and quarantines work committed to the retired instance", async () => {
-    const idle = new TransportHarness();
+    const idle = new TransportHarness({ expectedSidecarInstanceId: null });
     await idle.start();
     idle.restartSidecar();
     idle.credits = 64;
@@ -578,7 +991,7 @@ describe("V2TransportSession", () => {
     expect(idle.session.snapshot()).toMatchObject({ connected: true, credits: 64 });
     await idle.close();
 
-    const active = new TransportHarness();
+    const active = new TransportHarness({ expectedSidecarInstanceId: null });
     await active.start();
     const handle = await active.commit(active.session.run(BODY));
     active.restartSidecar();
@@ -725,6 +1138,24 @@ describe("V2TransportSession", () => {
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(queued.session.snapshot().queued).toBe(0);
     await queued.close();
+
+    const published = new TransportHarness();
+    await published.start();
+    const abortPublished = new AbortController();
+    const awaitingAck = published.session.run(BODY, abortPublished.signal);
+    await published.settle();
+    const publishedRequest = published.requestIdentity().requestId;
+    abortPublished.abort();
+    await expect(awaitingAck).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "cancelled",
+    });
+    expect(published.session.snapshot().quarantined).toBe(1);
+    published.publish([{ kind: "request_cancelled", requestId: publishedRequest }]);
+    await published.settle();
+    expect(published.session.snapshot().quarantined).toBe(0);
+    await published.close();
 
     const committed = new TransportHarness();
     await committed.start();
