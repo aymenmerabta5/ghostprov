@@ -48,6 +48,35 @@ describe("project documentation", () => {
     expect(readme).toContain("18787");
   });
 
+  it("documents same-port Claude Code setup, routes, auth, and tier mapping", () => {
+    for (const value of [
+      "POST /v1/messages",
+      "POST /v1/messages/count_tokens",
+      "POST /v1/messages?beta=true",
+      "POST /v1/messages/count_tokens?beta=true",
+      "ANTHROPIC_BASE_URL=http://127.0.0.1:18787",
+      "ANTHROPIC_API_KEY=ghostprov-local",
+      "must not end in `/v1`",
+      "Opus → `gpt-5.6-sol`",
+      "Sonnet → `gpt-5.6-terra`",
+      "Haiku → `gpt-5.6-luna`",
+      "GP_ANTHROPIC_OPUS_MODEL",
+      "GP_ANTHROPIC_SONNET_MODEL",
+      "GP_ANTHROPIC_HAIKU_MODEL",
+      "GP_ANTHROPIC_DEFAULT_MODEL",
+      "anthropic-version",
+      "x-api-key",
+      "Bearer",
+      "bun run verify:claude-code",
+      "127.0.0.1:18788",
+    ]) expect(readme).toContain(value);
+    expect(envExample).toContain("ANTHROPIC_BASE_URL=http://127.0.0.1:18787");
+    expect(envExample).toContain("ANTHROPIC_API_KEY=ghostprov-local");
+    expect(envExample).toContain("GP_CLAUDE_VERIFY_PORT=18788");
+    expect(envExample).toContain("GP_CLAUDE_VERIFY_UPSTREAM=http://127.0.0.1:18787");
+    expect(pkg.scripts["verify:claude-code"]).toBe("bun scripts/verify_claude_code.ts");
+  });
+
   it("provides stable verification scripts", () => {
     const unitScript = String(pkg.scripts["test:unit"]);
     const integrationScript = String(pkg.scripts["test:integration"]);

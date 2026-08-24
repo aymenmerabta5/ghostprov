@@ -103,6 +103,51 @@ curl.exe -X POST http://127.0.0.1:18787/v1/responses `
 
 Use `stream:true` for incremental SSE. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
+## Anthropic Messages and Claude Code
+
+The production Anthropic adapter is part of the same `createGhostProvApp` and uses the same router, queue, sandbox capacity, and listener as the OpenAI routes. Point Claude Code directly at the GhostProv origin; `ANTHROPIC_BASE_URL` is a root URL and must not end in `/v1`:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787"
+$env:ANTHROPIC_API_KEY = "ghostprov-local"
+claude
+```
+
+The equivalent values are `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and `ANTHROPIC_API_KEY=ghostprov-local`. The key must be nonempty so Claude Code's Anthropic SDK initializes; GhostProv does not require a local secret by default. The SDK adds the required `anthropic-version: 2023-06-01` header itself, so normal Claude Code setup does not configure that header separately.
+
+Supported Anthropic routes are:
+
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
+- `POST /v1/messages?beta=true`
+- `POST /v1/messages/count_tokens?beta=true`
+
+The beta query and nonempty `anthropic-beta` headers enable current beta response fields. Unknown beta names and additive Claude Code/Stainless headers are tolerated. Local routes accept `x-api-key`, `Authorization: Bearer ...`, both headers, or neither; a future shared authentication layer may tighten that policy.
+
+Claude model names are selected by tier, case-insensitively:
+
+- Opus → `gpt-5.6-sol`
+- Sonnet → `gpt-5.6-terra`
+- Haiku → `gpt-5.6-luna`
+- Native `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5` IDs pass through.
+- Unknown model names use `gpt-5.6-sol`.
+
+Override those defaults with `GP_ANTHROPIC_OPUS_MODEL`, `GP_ANTHROPIC_SONNET_MODEL`, `GP_ANTHROPIC_HAIKU_MODEL`, and `GP_ANTHROPIC_DEFAULT_MODEL`. Responses continue to echo the Claude model name requested by the client.
+
+Messages supports streaming and non-streaming text, client tool use/results (including parallel calls), stateless encrypted-reasoning continuity, current image/document inputs, structured output, prompt-cache annotations, local token estimates, cancellation, and Anthropic error envelopes. Token counts are conservative local estimates rather than provider billing counts. Anthropic server-hosted tools and exact manual thinking-budget enforcement are non-goals; unsupported content/tool variants return a bounded `invalid_request_error`. Legacy Completions, Message Batches, and Anthropic Files/Admin APIs are not implemented. `GET /v1/models` remains the OpenAI-compatible GhostProv route, not an Anthropic Models response.
+
+### Separate-port forwarding verifier
+
+`bun run verify:claude-code` is a disposable branch verifier, not a production proxy. It defaults to `127.0.0.1:18788` and forwards translated Responses streams to the loopback root in `GP_CLAUDE_VERIFY_UPSTREAM` (default `http://127.0.0.1:18787`). Override the listener with `GP_CLAUDE_VERIFY_PORT` only when another non-protected loopback port is needed:
+
+```powershell
+$env:GP_CLAUDE_VERIFY_PORT = "18788"
+$env:GP_CLAUDE_VERIFY_UPSTREAM = "http://127.0.0.1:18787"
+bun run verify:claude-code
+```
+
+The verifier refuses listener ports `18787` and `8787`, non-loopback upstreams, credentials, paths, queries, fragments, and self-forwarding. It never enumerates, starts, stops, restarts, or signals the upstream process. Ctrl+C closes only the verifier listener and its outbound requests. Live Claude Code calls through this verifier belong to the separate live-verification task; automated tests import it without opening a listener or contacting the upstream.
+
 ## Codex WebSocket mode
 
 WebSocket mode follows the [official OpenAI Responses WebSocket contract](https://developers.openai.com/api/docs/guides/websocket-mode/). Clients send direct `response.create` events to `ws://127.0.0.1:18787/v1/responses`. Named lanes execute independently, same-lane work remains FIFO, and `previous_response_id` lineage is separate from lane identity.
@@ -217,6 +262,12 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | WebSocket named lanes | `32` | Per-connection named-lane ceiling |
 | `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Raw multipart edit-input budget |
 | `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart envelope ceiling |
+| `GP_ANTHROPIC_OPUS_MODEL` | `gpt-5.6-sol` | Default target for Claude Opus names |
+| `GP_ANTHROPIC_SONNET_MODEL` | `gpt-5.6-terra` | Default target for Claude Sonnet names |
+| `GP_ANTHROPIC_HAIKU_MODEL` | `gpt-5.6-luna` | Default target for Claude Haiku names |
+| `GP_ANTHROPIC_DEFAULT_MODEL` | `gpt-5.6-sol` | Fallback for unknown model names |
+| `GP_CLAUDE_VERIFY_PORT` | `18788` | Separate loopback-only verifier listener |
+| `GP_CLAUDE_VERIFY_UPSTREAM` | `http://127.0.0.1:18787` | Loopback root used only by the verifier |
 | `GP_LOG_LEVEL` | `info` | `off`, `error`, `info`, or `debug` bounded JSONL tracing |
 | `GP_LOG_DIR` | `.ghostprov/logs` | Absolute or working-directory-relative log directory |
 | `GP_LOG_ROTATE_BYTES` | `67108864` | Active-file rotation threshold (64 MiB) |
@@ -262,6 +313,7 @@ The isolated suite includes:
 - `tests/anthropic-stream-safety.test.ts`
 - `tests/anthropic-stream.test.ts`
 - `tests/anthropic-token-count.test.ts`
+- `tests/claude-code-verifier.test.ts`
 - `tests/concurrency.test.ts`
 - `tests/cpu-transform-pool.test.ts`
 - `tests/daemon-controller.test.ts`
