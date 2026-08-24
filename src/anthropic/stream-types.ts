@@ -2,6 +2,7 @@ import type { AnthropicErrorEnvelope } from "./errors";
 import type {
   AnthropicAdapterMessage,
   AnthropicAdapterStopReason,
+  AnthropicContextManagementResponse,
   AnthropicResponseContentBlock,
   AnthropicUsage,
 } from "./types";
@@ -40,6 +41,7 @@ export type AnthropicContentBlockStopEvent = {
 
 export type AnthropicMessageDeltaEvent = {
   type: "message_delta";
+  context_management?: AnthropicContextManagementResponse | null;
   delta: {
     stop_reason: AnthropicAdapterStopReason;
     stop_sequence: string | null;

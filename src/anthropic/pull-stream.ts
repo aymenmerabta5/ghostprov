@@ -7,6 +7,12 @@ type PendingRead =
   | { kind: "next"; result: IteratorResult<SseFrame> }
   | { kind: "error"; error: unknown };
 
+type FinalRead =
+  | { kind: "final"; value: unknown }
+  | { kind: "error"; error: unknown };
+
+type ClosedRead = { kind: "closed" };
+
 export type AnthropicPullStreamOptions = {
   handle: RunHandle;
   translator: AnthropicStreamTranslator;
@@ -14,23 +20,6 @@ export type AnthropicPullStreamOptions = {
   abortController: AbortController;
   onClose(): void;
 };
-
-function timeout(ms: number): {
-  promise: Promise<{ kind: "keepalive" }>;
-  cancel(): void;
-} {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return {
-    promise: new Promise(resolve => {
-      timer = setTimeout(() => resolve({ kind: "keepalive" }), ms);
-      timer.unref?.();
-    }),
-    cancel() {
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-    },
-  };
-}
 
 /**
  * Adapt one relay iterator to a downstream-pull-driven Anthropic SSE stream.
@@ -50,10 +39,20 @@ export function createAnthropicPullStream(
   let upstreamDone = false;
   let closed = false;
   let iteratorReturned = false;
+  let activeTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveClosed!: (value: ClosedRead) => void;
+  const closedRead = new Promise<ClosedRead>(resolve => { resolveClosed = resolve; });
+
+  const clearKeepAlive = (): void => {
+    if (activeTimer !== undefined) clearTimeout(activeTimer);
+    activeTimer = undefined;
+  };
 
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
+    clearKeepAlive();
+    resolveClosed({ kind: "closed" });
     options.onClose();
   };
 
@@ -79,12 +78,46 @@ export function createAnthropicPullStream(
 
   const startRead = (): Promise<PendingRead> => {
     if (!pendingRead) {
-      pendingRead = Promise.resolve(iterator.next()).then(
-        result => ({ kind: "next" as const, result }),
-        error => ({ kind: "error" as const, error }),
-      );
+      try {
+        pendingRead = Promise.resolve(iterator.next()).then(
+          result => ({ kind: "next" as const, result }),
+          error => ({ kind: "error" as const, error }),
+        );
+      } catch (error) {
+        pendingRead = Promise.resolve({ kind: "error", error });
+      }
     }
     return pendingRead;
+  };
+
+  const keepAlive = (): Promise<{ kind: "keepalive" }> => {
+    clearKeepAlive();
+    return new Promise(resolve => {
+      activeTimer = setTimeout(() => {
+        activeTimer = undefined;
+        resolve({ kind: "keepalive" });
+      }, options.keepAliveMs);
+      activeTimer.unref?.();
+    });
+  };
+
+  const readFinal = (): Promise<FinalRead> => {
+    try {
+      return Promise.resolve(options.handle.final).then(
+        value => ({ kind: "final" as const, value }),
+        error => ({ kind: "error" as const, error }),
+      );
+    } catch (error) {
+      return Promise.resolve({ kind: "error", error });
+    }
+  };
+
+  const fail = (error: unknown): void => {
+    append(options.translator.fail(error));
+    upstreamDone = true;
+    clearKeepAlive();
+    if (!options.abortController.signal.aborted) options.abortController.abort();
+    returnIterator();
   };
 
   return new ReadableStream<Uint8Array>({
@@ -101,10 +134,9 @@ export function createAnthropicPullStream(
           return;
         }
 
-        const keepalive = timeout(options.keepAliveMs);
-        const winner = await Promise.race([startRead(), keepalive.promise]);
-        keepalive.cancel();
-        if (closed) return;
+        const winner = await Promise.race([startRead(), keepAlive(), closedRead]);
+        clearKeepAlive();
+        if (winner.kind === "closed" || closed) return;
         if (winner.kind === "keepalive") {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
           return;
@@ -112,17 +144,16 @@ export function createAnthropicPullStream(
 
         pendingRead = null;
         if (winner.kind === "error") {
-          append(options.translator.fail(winner.error));
-          upstreamDone = true;
-          returnIterator();
+          fail(winner.error);
           continue;
         }
         if (winner.result.done) {
-          upstreamDone = true;
-          try {
-            append(options.translator.finish(await options.handle.final));
-          } catch (error) {
-            append(options.translator.fail(error));
+          const final = await Promise.race([readFinal(), closedRead]);
+          if (final.kind === "closed" || closed) return;
+          if (final.kind === "error") fail(final.error);
+          else {
+            append(options.translator.finish(final.value));
+            upstreamDone = true;
           }
           continue;
         }
@@ -137,8 +168,8 @@ export function createAnthropicPullStream(
       }
     },
     cancel(reason) {
-      if (!options.abortController.signal.aborted) options.abortController.abort(reason);
       cleanup();
+      if (!options.abortController.signal.aborted) options.abortController.abort(reason);
       returnIterator();
     },
   });

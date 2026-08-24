@@ -45,11 +45,31 @@ describe("Anthropic deterministic input token estimation", () => {
     }));
   });
 
-  it("uses UTF-8 bytes at 3.5 bytes per token and always returns at least one", () => {
+  it("uses exact escaped JSON UTF-8 bytes at 3.5 bytes per token and returns at least one", () => {
     expect(estimateAnthropicInputTokens("")).toBe(1);
-    expect(estimateAnthropicInputTokens("abc")).toBe(1);
+    expect(estimateAnthropicInputTokens("abc")).toBe(2);
     expect(estimateAnthropicInputTokens("éé")).toBe(2);
     expect(estimateAnthropicInputTokens("🚀🚀")).toBe(3);
+    for (const value of ["\"\\\n", { key: "line\n\"quoted\"\\tail" }]) {
+      expect(estimateAnthropicInputTokens(value)).toBe(
+        Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / 3.5)),
+      );
+    }
+  });
+
+  it("does not classify base64-looking tool schemas as media", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        payload: {
+          type: "base64",
+          data: "A".repeat(4096),
+        },
+      },
+    };
+    expect(estimateAnthropicInputTokens(schema)).toBe(
+      Math.ceil(Buffer.byteLength(JSON.stringify(schema), "utf8") / 3.5),
+    );
   });
 
   it("caps each decoded base64 media contribution without allocating decoded media", () => {

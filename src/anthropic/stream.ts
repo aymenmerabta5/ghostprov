@@ -136,6 +136,9 @@ export class AnthropicStreamTranslator {
         stop_reason: null,
         stop_sequence: null,
         container: null,
+        ...(this.#context.beta
+          ? { context_management: this.#context.contextManagement ?? null }
+          : {}),
         usage,
       },
     }];
@@ -606,6 +609,9 @@ export class AnthropicStreamTranslator {
     }
     events.push({
       type: "message_delta",
+      ...(this.#context.beta
+        ? { context_management: this.#context.contextManagement ?? null }
+        : {}),
       delta: {
         stop_reason: converted.stop_reason,
         stop_sequence: converted.stop_sequence,

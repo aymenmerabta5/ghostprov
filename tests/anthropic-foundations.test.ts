@@ -225,14 +225,44 @@ describe("Anthropic foundations", () => {
     expect(response.status).toBe(529);
     expect(await response.json()).toEqual({
       type: "error",
-      error: { type: "overloaded_error", message: "temporarily unavailable" },
+      error: { type: "overloaded_error", message: "Service temporarily overloaded" },
       request_id: "req_busy",
     });
     expect(anthropicErrorEvent(new ApiError(503, "temporarily unavailable"), "req_busy")).toEqual({
       type: "error",
-      error: { type: "overloaded_error", message: "temporarily unavailable" },
+      error: { type: "overloaded_error", message: "Service temporarily overloaded" },
       request_id: "req_busy",
     });
+  });
+
+  it("sanitizes untrusted statuses/messages and preserves only safe retry headers", async () => {
+    const cases = [
+      [new ApiError(502, "secret gateway response"), 500, "api_error", "Internal server error"],
+      [new ApiError(503, "secret capacity detail"), 529, "overloaded_error", "Service temporarily overloaded"],
+      [new ApiError(504, "secret timeout detail"), 504, "timeout_error", "Request timed out"],
+    ] as const;
+    for (const [error, status, type, message] of cases) {
+      const response = anthropicErrorResponse(error, "req_safe");
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({
+        type: "error",
+        error: { type, message },
+        request_id: "req_safe",
+      });
+    }
+
+    const retryable = Object.assign(new ApiError(429, "secret quota"), {
+      headers: {
+        "Retry-After": "12",
+        "X-Should-Retry": "false",
+        "set-cookie": "secret=1",
+      },
+    });
+    const response = anthropicErrorResponse(retryable, "req_retry");
+    expect(response.headers.get("retry-after")).toBe("12");
+    expect(response.headers.get("x-should-retry")).toBe("false");
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(JSON.stringify(await response.json())).not.toContain("secret quota");
   });
 
   it("exposes permissive current request and response wire types", () => {

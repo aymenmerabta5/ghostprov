@@ -53,12 +53,65 @@ function normalizeAnthropicError(error: unknown): {
   }
 
   const normalized = normalizeApiError(error);
-  const status = normalized.status === 503 ? 529 : normalized.status;
+  const status = normalized.status === 503
+    ? 529
+    : normalized.status === 502
+      ? 500
+      : normalized.status;
   return {
     status,
     type: anthropicErrorType(status),
-    message: normalized.error.message,
+    message: safeAnthropicMessage(status),
   };
+}
+
+function safeAnthropicMessage(status: number): string {
+  if (status === 400) return "Invalid request";
+  if (status === 401) return "Authentication error";
+  if (status === 402) return "Billing error";
+  if (status === 403) return "Permission denied";
+  if (status === 404) return "Resource not found";
+  if (status === 409) return "Request conflict";
+  if (status === 413) return "Request too large";
+  if (status === 429) return "Rate limit exceeded";
+  if (status === 504) return "Request timed out";
+  if (status === 529) return "Service temporarily overloaded";
+  return "Internal server error";
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function headerValue(value: unknown, name: string): string | null {
+  if (value instanceof Headers) return value.get(name);
+  const headers = record(value);
+  if (!headers) return null;
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+  const candidate = entry?.[1];
+  if (Array.isArray(candidate)) return typeof candidate[0] === "string" ? candidate[0] : null;
+  return typeof candidate === "string" ? candidate : null;
+}
+
+function errorHeaders(error: unknown): Headers {
+  const output = new Headers();
+  const value = record(error);
+  const response = record(value?.response);
+  const details = record(value?.details);
+  const candidates = [value?.headers, response?.headers, details?.headers];
+  for (const candidate of candidates) {
+    const retryAfter = headerValue(candidate, "retry-after")?.trim();
+    if (retryAfter && retryAfter.length <= 128 && !/[\r\n]/.test(retryAfter)) {
+      output.set("retry-after", retryAfter);
+    }
+    const shouldRetry = headerValue(candidate, "x-should-retry")?.trim().toLowerCase();
+    if (shouldRetry === "true" || shouldRetry === "false") {
+      output.set("x-should-retry", shouldRetry);
+    }
+  }
+  return output;
 }
 
 function anthropicErrorEnvelope(
@@ -77,9 +130,11 @@ function anthropicErrorEnvelope(
 
 export function anthropicErrorResponse(error: unknown, requestId: string): Response {
   const normalized = normalizeAnthropicError(error);
+  const headers = errorHeaders(error);
+  headers.set("request-id", requestId);
   return Response.json(anthropicErrorEnvelope(normalized, requestId), {
     status: normalized.status,
-    headers: { "request-id": requestId },
+    headers,
   });
 }
 

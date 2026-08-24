@@ -62,18 +62,42 @@ type ValidatedRequest = {
   stream: boolean;
 };
 
-function requireRequest(value: unknown, limits: AnthropicRequestLimits): ValidatedRequest {
+type ValidatedRequestBase = Pick<ValidatedRequest, "body" | "requestedModel" | "messages">;
+
+type SharedRequestParts = {
+  input: ResponsesInputItem[];
+  instructions?: string;
+  tools: ReturnType<typeof translateTools>;
+  toolChoice: ReturnType<typeof translateToolChoice>["toolChoice"];
+  parallelToolCalls: ReturnType<typeof translateToolChoice>["parallelToolCalls"];
+  output: ReturnType<typeof translateOutputConfig>;
+  thinking: ReturnType<typeof translateThinking>;
+  stopSequences: string[];
+  serviceTier: ReturnType<typeof translateServiceTier>;
+  sampling: ReturnType<typeof translateSampling>;
+  privacy: ReturnType<typeof translateMetadata>;
+};
+
+function requireRequestBase(value: unknown, limits: AnthropicRequestLimits): ValidatedRequestBase {
   const body = requireRecord(value, "request");
   if (typeof body.model !== "string" || !body.model.trim()) {
     throw new AnthropicRequestError(400, "model is required");
   }
-  if (!Number.isSafeInteger(body.max_tokens) || Number(body.max_tokens) < 0) {
-    throw new AnthropicRequestError(400, "max_tokens must be a nonnegative integer");
-  }
   if (!Array.isArray(body.messages)) {
     throw new AnthropicRequestError(400, "messages is required");
   }
-  const messages = requireArray(body.messages, "messages", limits);
+  return {
+    body,
+    requestedModel: body.model,
+    messages: requireArray(body.messages, "messages", limits),
+  };
+}
+
+function requireRequest(value: unknown, limits: AnthropicRequestLimits): ValidatedRequest {
+  const { body, requestedModel, messages } = requireRequestBase(value, limits);
+  if (!Number.isSafeInteger(body.max_tokens) || Number(body.max_tokens) < 0) {
+    throw new AnthropicRequestError(400, "max_tokens must be a nonnegative integer");
+  }
   if (hasOwn(body, "stream") && typeof body.stream !== "boolean") {
     throw new AnthropicRequestError(400, "stream must be a boolean");
   }
@@ -84,22 +108,21 @@ function requireRequest(value: unknown, limits: AnthropicRequestLimits): Validat
   }
   return {
     body,
-    requestedModel: body.model,
+    requestedModel,
     maxTokens,
     messages,
     stream,
   };
 }
 
-export function translateAnthropicRequest(
-  value: unknown,
-  options: TranslateAnthropicRequestOptions,
-): TranslatedAnthropicRequest {
-  const limits = resolveAnthropicRequestLimits(options.limits);
-  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
-  const { body, requestedModel, maxTokens, messages, stream } = requireRequest(value, limits);
+function sharedRequestParts(
+  body: Record<string, unknown>,
+  messages: unknown[],
+  maxTokens: number,
+  limits: AnthropicRequestLimits,
+): SharedRequestParts {
   const mediaBudget = new RequestMediaBudget(limits.mediaBytes);
-  const input: ResponsesInputItem[] = translateMessages(messages, mediaBudget, limits);
+  const input = translateMessages(messages, mediaBudget, limits);
   const instructions = translateSystem(body.system, limits);
   const tools = translateTools(body.tools, limits);
   const declaredToolNames = new Set(tools.map(tool => tool.name));
@@ -113,15 +136,67 @@ export function translateAnthropicRequest(
   const serviceTier = translateServiceTier(body);
   const sampling = translateSampling(body);
   const privacy = translateMetadata(body.metadata);
+  if (thinking.manual && (toolChoice === "required" || typeof toolChoice === "object")) {
+    throw new AnthropicRequestError(400, "manual thinking does not support forced tool choice");
+  }
+  return {
+    input,
+    instructions,
+    tools,
+    toolChoice,
+    parallelToolCalls,
+    output,
+    thinking,
+    stopSequences,
+    serviceTier,
+    sampling,
+    privacy,
+  };
+}
+
+function countValidationMaxTokens(body: Record<string, unknown>): number {
+  if (!body.thinking || typeof body.thinking !== "object" || Array.isArray(body.thinking)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const budget = (body.thinking as Record<string, unknown>).budget_tokens;
+  return Number.isSafeInteger(budget) && Number(budget) < Number.MAX_SAFE_INTEGER
+    ? Number(budget) + 1
+    : Number.MAX_SAFE_INTEGER;
+}
+
+export function validateAnthropicCountRequest(value: unknown): void {
+  const limits = resolveAnthropicRequestLimits(undefined);
+  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
+  const { body, messages } = requireRequestBase(value, limits);
+  sharedRequestParts(body, messages, countValidationMaxTokens(body), limits);
+}
+
+export function translateAnthropicRequest(
+  value: unknown,
+  options: TranslateAnthropicRequestOptions,
+): TranslatedAnthropicRequest {
+  const limits = resolveAnthropicRequestLimits(options.limits);
+  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
+  const { body, requestedModel, maxTokens, messages, stream } = requireRequest(value, limits);
+  const {
+    input,
+    instructions,
+    tools,
+    toolChoice,
+    parallelToolCalls,
+    output,
+    thinking,
+    stopSequences,
+    serviceTier,
+    sampling,
+    privacy,
+  } = sharedRequestParts(body, messages, maxTokens, limits);
   const maxTokensZero = maxTokens === 0;
   if (maxTokensZero && output.text) {
     throw new AnthropicRequestError(400, "max_tokens 0 does not support structured output");
   }
   if (maxTokensZero && (toolChoice === "required" || typeof toolChoice === "object")) {
     throw new AnthropicRequestError(400, "max_tokens 0 does not support forced tool choice");
-  }
-  if (thinking.manual && (toolChoice === "required" || typeof toolChoice === "object")) {
-    throw new AnthropicRequestError(400, "manual thinking does not support forced tool choice");
   }
 
   const relayBody: ResponsesRequestBody = {

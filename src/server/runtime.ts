@@ -4,11 +4,15 @@ import { writeFetchResponse } from "../http/adapter";
 import { collectRequestBody, contentLengthExceeds } from "../http/body";
 import { ApiError, apiErrorResponse } from "../http/errors";
 import {
+  isAnthropicRequestPath,
+  requestBodyLimitForUrl,
+  requestPath,
+} from "../http/request-policy";
+import {
   AnthropicRequestError,
   anthropicErrorResponse,
   newAnthropicRequestId,
 } from "../anthropic/errors";
-import { DEFAULT_ANTHROPIC_REQUEST_LIMITS } from "../anthropic/request";
 import { attachResponsesWebSocket } from "../ws/server";
 import type { RouterLike } from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
@@ -22,23 +26,7 @@ export interface GhostProvServerOptions {
   webSocketTelemetry?: WebSocketTelemetry;
 }
 
-function requestPath(value: string | undefined): string {
-  try {
-    return new URL(value ?? "/", "http://ghostprov.local").pathname;
-  } catch {
-    return (value ?? "/").split("?", 1)[0];
-  }
-}
-
-function isAnthropicRequestPath(path: string): boolean {
-  return path === "/v1/messages" || path === "/v1/messages/count_tokens";
-}
-
-export function requestBodyLimitForUrl(value: string | undefined, sharedLimit: number): number {
-  return isAnthropicRequestPath(requestPath(value))
-    ? Math.min(sharedLimit, DEFAULT_ANTHROPIC_REQUEST_LIMITS.inboundBytes)
-    : sharedLimit;
-}
+export { requestBodyLimitForUrl } from "../http/request-policy";
 
 function bodyTooLarge(maxBodyBytes: number): ApiError {
   return new ApiError(
@@ -96,7 +84,10 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
             const reservationBytes = Number.isFinite(declared) && declared >= 0
               ? declared
               : maxBodyBytes;
-            bodyLease = await options.router.acquireIncomingBody?.(reservationBytes) ?? null;
+            bodyLease = await options.router.acquireIncomingBody?.(
+              reservationBytes,
+              relayAbort.signal,
+            ) ?? null;
             const collected = await collectRequestBody(request, maxBodyBytes);
             if (collected.length) body = new Uint8Array(collected);
           }

@@ -6,6 +6,7 @@ import {
 } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
 import type { SseFrame } from "../src/relay/sse";
+import { ApiError } from "../src/http/errors";
 import {
   anthropicModelsFromEnv,
   type AnthropicModelOptions,
@@ -26,6 +27,10 @@ import {
 const MiB = 1024 ** 2;
 const ANTHROPIC_MAX_BODY_BYTES = 32 * MiB;
 const servers: Server[] = [];
+const ANTHROPIC_HEADERS = {
+  "content-type": "application/json",
+  "anthropic-version": "2023-06-01",
+} as const;
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => {
@@ -98,6 +103,14 @@ function messageRequest(overrides: Record<string, unknown> = {}) {
     messages: [{ role: "user", content: "hello" }],
     ...overrides,
   };
+}
+
+async function waitFor(predicate: () => boolean, message: string): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  if (!predicate()) throw new Error(message);
 }
 
 function requestId(response: Response): string {
@@ -191,20 +204,30 @@ describe("Anthropic HTTP routes", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
         authorization: "Bearer local-dummy-token",
         "x-api-key": "also-tolerated",
         "anthropic-beta": "legacy-private-beta,unknown-future-beta",
         "x-ghostprov-client-id": "claude-session",
       },
-      body: JSON.stringify(messageRequest({ model: "claude-opus-4-6" })),
+      body: JSON.stringify(messageRequest({
+        model: "claude-opus-4-6",
+        context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+      })),
     });
 
     expect(stable.status).toBe(200);
     expect(stable.headers.get("content-type")).toContain("application/json");
-    expect((await stable.json() as any).model).toBe("claude-sonnet-4-6");
+    const stableBody = await stable.json() as any;
+    expect(stableBody.model).toBe("claude-sonnet-4-6");
+    expect(stableBody).not.toHaveProperty("context_management");
+    expect(stableBody).not.toHaveProperty("diagnostics");
     requestId(stable);
     expect(beta.status).toBe(200);
-    expect((await beta.json() as any).model).toBe("claude-opus-4-6");
+    const betaBody = await beta.json() as any;
+    expect(betaBody.model).toBe("claude-opus-4-6");
+    expect(betaBody.context_management).toEqual({ applied_edits: [] });
+    expect(betaBody).not.toHaveProperty("diagnostics");
     requestId(beta);
     expect(router.calls).toHaveLength(2);
     expect(router.calls.map(call => ({
@@ -236,6 +259,7 @@ describe("Anthropic HTTP routes", () => {
         method: "POST",
         headers: {
           "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
           authorization: "Bearer ignored",
           "anthropic-beta": "unknown-beta",
         },
@@ -243,9 +267,192 @@ describe("Anthropic HTTP routes", () => {
       });
       expect(response.status).toBe(200);
       requestId(response);
-      expect(await response.json()).toEqual({
-        input_tokens: estimateAnthropicInputTokens(body),
+      expect(await response.json()).toEqual(path.includes("beta=true")
+        ? { input_tokens: estimateAnthropicInputTokens(body), context_management: null }
+        : { input_tokens: estimateAnthropicInputTokens(body) });
+    }
+    expect(router.calls).toHaveLength(0);
+  });
+
+  it("applies current Messages validation to count-token inputs without dispatch", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const malformed = [
+      {
+        name: "message role",
+        body: { model: "claude-sonnet-4-6", messages: [{ role: "system", content: "x" }] },
+        message: /role must be user or assistant/i,
+      },
+      {
+        name: "message content",
+        body: { model: "claude-sonnet-4-6", messages: [{ role: "user", content: 7 }] },
+        message: /content must be a string or an array/i,
+      },
+      {
+        name: "media",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [{ role: "user", content: [{
+            type: "image",
+            source: { type: "base64", media_type: "image/tiff", data: "AAAA" },
+          }] }],
+        },
+        message: /media_type is unsupported/i,
+      },
+      {
+        name: "system",
+        body: { model: "claude-sonnet-4-6", messages: [], system: null },
+        message: /system must not be null/i,
+      },
+      {
+        name: "tools",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [],
+          tools: [{ name: "Read", input_schema: { type: "string" } }],
+        },
+        message: /input_schema\.type must be object/i,
+      },
+      {
+        name: "tool choice",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [],
+          tools: [{ name: "Read", input_schema: { type: "object" } }],
+          tool_choice: { type: "tool", name: "Write" },
+        },
+        message: /tool is not declared/i,
+      },
+      {
+        name: "thinking",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [],
+          thinking: { type: "enabled", budget_tokens: 12 },
+        },
+        message: /budget_tokens/i,
+      },
+      {
+        name: "output config",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [],
+          output_config: { format: { type: "xml", schema: {} } },
+        },
+        message: /unsupported output_config\.format type/i,
+      },
+      {
+        name: "metadata",
+        body: {
+          model: "claude-sonnet-4-6",
+          messages: [],
+          metadata: { user_id: 7 },
+        },
+        message: /metadata\.user_id is required/i,
+      },
+      {
+        name: "known speed",
+        body: { model: "claude-sonnet-4-6", messages: [], speed: "instant" },
+        message: /speed must be standard or fast/i,
+      },
+    ];
+
+    for (const value of malformed) {
+      const response = await app.request("/v1/messages/count_tokens", {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(value.body),
       });
+      expect(response.status, value.name).toBe(400);
+      expect((await response.json() as any).error.message, value.name)
+        .toMatch(value.message);
+    }
+    expect(router.calls).toHaveLength(0);
+  });
+
+  it("accepts valid thinking and ignored context-management hints while counting", async () => {
+    const router = new FakeRouter();
+    const body = {
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "hello" }],
+      thinking: { type: "enabled", budget_tokens: 1024 },
+      context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+    };
+    const response = await createGhostProvApp({ router }).request(
+      "/v1/messages/count_tokens?beta=true",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(body),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).input_tokens).toBeGreaterThan(0);
+    expect(router.calls).toHaveLength(0);
+  });
+
+  it("requires JSON content type and the current Anthropic version on POST routes", async () => {
+    const paths = ["/v1/messages", "/v1/messages/count_tokens"];
+    for (const path of paths) {
+      const body = path.endsWith("count_tokens")
+        ? { model: "claude-sonnet-4-6", messages: [] }
+        : messageRequest();
+      const cases: Array<{ headers: Record<string, string>; message: RegExp }> = [
+        {
+          headers: { "anthropic-version": "2023-06-01" },
+          message: /content-type must be application\/json/i,
+        },
+        {
+          headers: { "content-type": "text/plain", "anthropic-version": "2023-06-01" },
+          message: /content-type must be application\/json/i,
+        },
+        {
+          headers: { "content-type": "application/json" },
+          message: /anthropic-version.*required/i,
+        },
+        {
+          headers: { "content-type": "application/json", "anthropic-version": "2024-01-01" },
+          message: /anthropic-version.*2023-06-01/i,
+        },
+      ];
+      for (const value of cases) {
+        const response = await createGhostProvApp({ router: new FakeRouter() }).request(path, {
+          method: "POST",
+          headers: value.headers,
+          body: JSON.stringify(body),
+        });
+        await expectAnthropicError(response, 400, value.message);
+      }
+    }
+
+    const accepted = await createGhostProvApp({ router: new FakeRouter() }).request(
+      "/v1/messages/count_tokens",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "Application/JSON; charset=utf-8",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
+      },
+    );
+    expect(accepted.status).toBe(200);
+  });
+
+  it("returns route-local Anthropic 405 envelopes with Allow POST", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    for (const path of [
+      "/v1/messages",
+      "/v1/messages?beta=true",
+      "/v1/messages/count_tokens",
+      "/v1/messages/count_tokens?beta=true",
+    ]) {
+      const response = await app.request(path, { method: "PUT" });
+      const body = await expectAnthropicError(response, 405, /method.*not allowed/i);
+      expect(response.headers.get("allow")).toBe("POST");
+      expect(body.error.type).toBe("api_error");
     }
     expect(router.calls).toHaveLength(0);
   });
@@ -256,22 +463,22 @@ describe("Anthropic HTTP routes", () => {
 
     await expectAnthropicError(await app.request("/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: "{not-json",
     }), 400, /valid JSON/i);
     await expectAnthropicError(await app.request("/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
     }), 400, /max_tokens/i);
     await expectAnthropicError(await app.request("/v1/messages/count_tokens", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: JSON.stringify({ messages: [] }),
     }), 400, /model is required/i);
     await expectAnthropicError(await app.request("/v1/messages/count_tokens", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: JSON.stringify({ model: "claude-sonnet-4-6", messages: "invalid" }),
     }), 400, /messages is required/i);
     expect(router.calls).toHaveLength(0);
@@ -290,7 +497,7 @@ describe("Anthropic HTTP routes", () => {
     const response = await Promise.race([
       app.request("/v1/messages", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: ANTHROPIC_HEADERS,
         body: JSON.stringify(messageRequest()),
       }),
       new Promise<never>((_, reject) => setTimeout(
@@ -305,6 +512,144 @@ describe("Anthropic HTTP routes", () => {
     expect(router.calls).toHaveLength(1);
   });
 
+  it("discards non-stream relay events without Array.fromAsync transcript retention", async () => {
+    const original = Array.fromAsync;
+    let fromAsyncCalled = false;
+    Object.defineProperty(Array, "fromAsync", {
+      configurable: true,
+      value: () => {
+        fromAsyncCalled = true;
+        throw new Error("Array.fromAsync must not retain the relay transcript");
+      },
+    });
+    try {
+      const router = new FakeRouter(() => relayHandle(
+        completed("resp_discard", "discarded"),
+        async function* () {
+          for (let index = 0; index < 1_000; index += 1) {
+            yield { event: "unknown", data: String(index) };
+          }
+        },
+      ));
+      const response = await createGhostProvApp({ router }).request("/v1/messages", {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest()),
+      });
+
+      expect(response.status).toBe(200);
+      expect(fromAsyncCalled).toBe(false);
+      expect((await response.json() as any).content[0].text).toBe("discarded");
+    } finally {
+      Object.defineProperty(Array, "fromAsync", {
+        configurable: true,
+        value: original,
+      });
+    }
+  });
+
+  it("aborts, returns, and settles final after a non-stream drain failure", async () => {
+    let returnCalls = 0;
+    let finalSettled = false;
+    let relaySignal: AbortSignal | undefined;
+    const router = new FakeRouter((_body, options) => {
+      relaySignal = options.signal;
+      const final = new Promise<unknown>((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          setTimeout(() => {
+            finalSettled = true;
+            reject(new Error("late final secret"));
+          }, 10);
+        }, { once: true });
+      });
+      const iterator = {
+        next: () => Promise.reject(new Error("drain secret")),
+        return: () => {
+          returnCalls += 1;
+          return Promise.resolve({ done: true as const, value: undefined });
+        },
+        throw: (error?: unknown) => Promise.reject(error),
+        [Symbol.asyncIterator]() { return this; },
+      } as unknown as AsyncGenerator<SseFrame>;
+      return relayHandle(final, () => iterator);
+    });
+
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest()),
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalls).toBe(1);
+    expect(finalSettled).toBe(true);
+    expect(text).not.toContain("drain secret");
+    expect(text).not.toContain("late final secret");
+  });
+
+  it("aborts, returns, and settles the drain after a non-stream final failure", async () => {
+    let returnCalls = 0;
+    let drainSettled = false;
+    let settleNext!: (result: IteratorResult<SseFrame>) => void;
+    const router = new FakeRouter((_body, options) => {
+      const iterator = {
+        next: () => new Promise<IteratorResult<SseFrame>>(resolve => { settleNext = resolve; }),
+        return: () => {
+          returnCalls += 1;
+          setTimeout(() => {
+            drainSettled = true;
+            settleNext({ done: true, value: undefined });
+          }, 10);
+          return Promise.resolve({ done: true as const, value: undefined });
+        },
+        throw: (error?: unknown) => Promise.reject(error),
+        [Symbol.asyncIterator]() { return this; },
+      } as unknown as AsyncGenerator<SseFrame>;
+      return relayHandle(Promise.reject(new Error("final secret")), () => iterator);
+    });
+
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest()),
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(returnCalls).toBe(1);
+    expect(drainSettled).toBe(true);
+    expect(text).not.toContain("final secret");
+  });
+
+  it("sanitizes pre-stream upstream failures and preserves only retry headers", async () => {
+    const upstream = Object.assign(
+      new ApiError(502, "secret upstream response body", { type: "upstream_error" }),
+      {
+        headers: {
+          "retry-after": "7",
+          "x-should-retry": "true",
+          authorization: "Bearer secret",
+        },
+      },
+    );
+    const router = new FakeRouter(() => Promise.reject(upstream));
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest()),
+    });
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(500);
+    expect(body).toMatchObject({ type: "error", error: { type: "api_error" } });
+    expect(JSON.stringify(body)).not.toContain("secret upstream response body");
+    expect(response.headers.get("retry-after")).toBe("7");
+    expect(response.headers.get("x-should-retry")).toBe("true");
+    expect(response.headers.get("authorization")).toBeNull();
+  });
+
   it("emits canonical named SSE from body.stream with request and no-buffer headers", async () => {
     const final = completed("resp_stream", "streamed");
     const router = new FakeRouter(() => relayHandle(final, async function* () {
@@ -314,8 +659,11 @@ describe("Anthropic HTTP routes", () => {
 
     const response = await app.request("/v1/messages?beta=true", {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(messageRequest({ stream: true })),
+      headers: { ...ANTHROPIC_HEADERS, accept: "application/json" },
+      body: JSON.stringify(messageRequest({
+        stream: true,
+        context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+      })),
     });
     const text = await response.text();
 
@@ -331,6 +679,15 @@ describe("Anthropic HTTP routes", () => {
     expect(text).toContain("event: message_delta\n");
     expect(text).toContain("event: message_stop\n");
     expect(text).not.toContain("[DONE]");
+    const events = text.split("\n")
+      .filter(line => line.startsWith("data: "))
+      .map(line => JSON.parse(line.slice("data: ".length)));
+    const start = events.find(event => event.type === "message_start");
+    const delta = events.find(event => event.type === "message_delta");
+    expect(start?.message.context_management).toEqual({ applied_edits: [] });
+    expect(delta?.context_management).toEqual({ applied_edits: [] });
+    expect(start?.message).not.toHaveProperty("diagnostics");
+    expect(events.every(event => !("diagnostics" in event))).toBe(true);
     expect(router.calls).toHaveLength(1);
     expect(router.calls[0].body.stream).toBe(true);
   });
@@ -370,7 +727,7 @@ describe("Anthropic HTTP routes", () => {
     const app = createGhostProvApp({ router, keepAliveMs: 10 });
     const response = await app.request("/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: JSON.stringify(messageRequest({ stream: true })),
     });
     const reader = response.body!.getReader();
@@ -387,6 +744,165 @@ describe("Anthropic HTTP routes", () => {
     expect(relaySignal?.aborted).toBe(true);
     expect(returnCalls).toBe(1);
     expect(finalAccesses).toBe(0);
+  });
+
+  it("wakes cancellation for a noncooperative iterator and clears the keepalive timer", async () => {
+    let nextCalls = 0;
+    let returnCalls = 0;
+    let relaySignal: AbortSignal | undefined;
+    let clearedTimers = 0;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const iterator = {
+      next() {
+        nextCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      return() {
+        returnCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter((_body, options) => {
+      relaySignal = options.signal;
+      return relayHandle(new Promise(() => undefined), () => iterator);
+    });
+    const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).request(
+      "/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest({ stream: true })),
+      },
+    );
+    const reader = response.body!.getReader();
+    await reader.read();
+    const pending = reader.read();
+    await waitFor(() => nextCalls === 1, "upstream read did not start");
+    globalThis.clearTimeout = ((timer?: ReturnType<typeof setTimeout>) => {
+      clearedTimers += 1;
+      return originalClearTimeout(timer);
+    }) as typeof clearTimeout;
+    try {
+      await reader.cancel("noncooperative cancellation");
+      await Promise.race([
+        pending,
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error("pending read was not woken by cancellation")),
+          100,
+        )),
+      ]);
+    } finally {
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalls).toBe(1);
+    expect(clearedTimers).toBeGreaterThan(0);
+  });
+
+  it("does not finish translation when a pending final settles after cancellation", async () => {
+    let resolveFinal!: (value: unknown) => void;
+    let finalConsumed = false;
+    let finalAccessed = false;
+    const final = new Promise<unknown>(resolve => { resolveFinal = resolve; });
+    const iterator = {
+      next: () => Promise.resolve({ done: true as const, value: undefined }),
+      return: () => Promise.resolve({ done: true as const, value: undefined }),
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter(() => ({
+      events: () => iterator,
+      get final() {
+        finalAccessed = true;
+        return final;
+      },
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }));
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ stream: true })),
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+    const pending = reader.read();
+    await waitFor(() => finalAccessed, "final wait did not start");
+    await reader.cancel("cancel pending final");
+    const lateFinal = new Proxy(completed("resp_late"), {
+      get(target, key, receiver) {
+        if (key !== "then") finalConsumed = true;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    resolveFinal(lateFinal);
+    await Promise.resolve();
+    await Promise.resolve();
+    await pending.catch(() => undefined);
+
+    expect(finalConsumed).toBe(false);
+  });
+
+  it("converts synchronous iterator.next failures into a safe terminal error", async () => {
+    let returnCalls = 0;
+    let relaySignal: AbortSignal | undefined;
+    const iterator = {
+      next(): Promise<IteratorResult<SseFrame>> {
+        throw new Error("synchronous next secret");
+      },
+      return() {
+        returnCalls += 1;
+        return Promise.resolve({ done: true as const, value: undefined });
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter((_body, options) => {
+      relaySignal = options.signal;
+      return relayHandle(new Promise(() => undefined), () => iterator);
+    });
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ stream: true })),
+    });
+    const text = await response.text();
+
+    expect(text).toContain("event: error\n");
+    expect(text).not.toContain("synchronous next secret");
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalls).toBe(1);
+  });
+
+  it("aborts and returns after an asynchronous iterator.next rejection", async () => {
+    let returnCalls = 0;
+    let relaySignal: AbortSignal | undefined;
+    const iterator = {
+      next: () => Promise.reject(new Error("asynchronous next secret")),
+      return() {
+        returnCalls += 1;
+        return Promise.resolve({ done: true as const, value: undefined });
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter((_body, options) => {
+      relaySignal = options.signal;
+      return relayHandle(new Promise(() => undefined), () => iterator);
+    });
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ stream: true })),
+    });
+    const text = await response.text();
+
+    expect(text).toContain("event: error\n");
+    expect(text).not.toContain("asynchronous next secret");
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalls).toBe(1);
   });
 
   it("links the incoming request signal and sanitizes midstream failures", async () => {
@@ -406,7 +922,7 @@ describe("Anthropic HTTP routes", () => {
     const incoming = new AbortController();
     const response = await app.fetch(new Request("http://local/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: ANTHROPIC_HEADERS,
       body: JSON.stringify(messageRequest({ stream: true })),
       signal: incoming.signal,
     }));
@@ -453,7 +969,7 @@ describe("Anthropic HTTP routes", () => {
       "/v1/messages",
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: ANTHROPIC_HEADERS,
         body: JSON.stringify(messageRequest({ stream: true })),
       },
     );
@@ -530,6 +1046,48 @@ describe("Anthropic runtime body limits", () => {
     expect(body).toMatchObject({ type: "error", error: { type: "request_too_large" } });
     expect(router.calls).toHaveLength(0);
   }, 15_000);
+
+  it("aborts a blocked incoming-body lease when the client disconnects", async () => {
+    let leaseStarted!: () => void;
+    let leaseAborted!: () => void;
+    const started = new Promise<void>(resolve => { leaseStarted = resolve; });
+    const aborted = new Promise<void>(resolve => { leaseAborted = resolve; });
+    const base = new FakeRouter();
+    const router: RouterLike = {
+      ...base,
+      snapshot: () => base.snapshot(),
+      startRelay: (body, options) => base.startRelay(body, options),
+      acquireIncomingBody: (_bytes, signal) => {
+        leaseStarted();
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            leaseAborted();
+            reject(new DOMException("body lease aborted", "AbortError"));
+          }, { once: true });
+        });
+      },
+    };
+    const port = await listen(createGhostProvApp({ router }), router);
+    const request = httpRequest({
+      hostname: "127.0.0.1",
+      port,
+      path: "/v1/messages",
+      method: "POST",
+      headers: { ...ANTHROPIC_HEADERS, "content-length": "1024" },
+    });
+    request.on("error", () => undefined);
+    request.flushHeaders();
+    await started;
+    request.destroy();
+
+    await Promise.race([
+      aborted,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("body lease did not receive client cancellation")),
+        300,
+      )),
+    ]);
+  });
 });
 
 describe("Anthropic model options", () => {

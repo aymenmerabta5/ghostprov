@@ -2,9 +2,8 @@ import { AnthropicRequestError } from "./errors";
 import {
   DEFAULT_ANTHROPIC_REQUEST_LIMITS,
   measureBoundedJson,
-  requireArray,
-  requireRecord,
 } from "./request-validation";
+import { validateAnthropicCountRequest } from "./request";
 
 const BYTES_PER_TOKEN = 3.5;
 const MESSAGE_OVERHEAD_TOKENS = 4;
@@ -14,24 +13,51 @@ const TOOL_OVERHEAD_TOKENS = 12;
 const MEDIA_OVERHEAD_TOKENS = 85;
 const MAX_MEDIA_TOKENS = 1_000_000;
 
-type VisitFrame = { value: unknown };
-
-function utf8Bytes(value: string): number {
-  return Buffer.byteLength(value, "utf8");
-}
-
-function scalarBytes(value: string | number | boolean | null): number {
-  if (typeof value === "string") return utf8Bytes(value);
-  if (value === null) return 4;
-  if (typeof value === "boolean") return value ? 4 : 5;
-  return Object.is(value, -0) ? 1 : String(value).length;
-}
-
 function base64Value(code: number): boolean {
   return (code >= 0x41 && code <= 0x5a) ||
     (code >= 0x61 && code <= 0x7a) ||
     (code >= 0x30 && code <= 0x39) ||
     code === 0x2b || code === 0x2f;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function contentBlocks(value: unknown, stack: unknown[]): void {
+  if (!Array.isArray(value)) return;
+  for (let index = value.length - 1; index >= 0; index -= 1) stack.push(value[index]);
+}
+
+function contextualBase64Media(value: unknown): string[] {
+  const request = record(value);
+  if (!request || !Array.isArray(request.messages)) return [];
+  const stack: unknown[] = [];
+  for (const messageValue of request.messages) {
+    const message = record(messageValue);
+    contentBlocks(message?.content, stack);
+  }
+
+  const media: string[] = [];
+  while (stack.length) {
+    const block = record(stack.pop());
+    if (!block || typeof block.type !== "string") continue;
+    if (block.type === "tool_result") {
+      contentBlocks(block.content, stack);
+      continue;
+    }
+    if (block.type !== "image" && block.type !== "document") continue;
+    const source = record(block.source);
+    if (!source || typeof source.type !== "string") continue;
+    if (source.type === "base64" && typeof source.data === "string") {
+      media.push(source.data);
+    } else if (block.type === "document" && source.type === "content") {
+      contentBlocks(source.content, stack);
+    }
+  }
+  return media;
 }
 
 function decodedBase64Bytes(value: string): number {
@@ -84,47 +110,15 @@ function fixedOverhead(value: unknown): number {
  */
 export function estimateAnthropicInputTokens(value: unknown): number {
   const limits = DEFAULT_ANTHROPIC_REQUEST_LIMITS;
-  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
-
-  const stack: VisitFrame[] = [{ value }];
-  let jsonBytes = 0;
+  let jsonBytes = measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
   let mediaTokens = 0;
-
-  while (stack.length) {
-    const current = stack.pop()!.value;
-    if (current === null || typeof current === "string" ||
-      typeof current === "number" || typeof current === "boolean") {
-      jsonBytes += scalarBytes(current as string | number | boolean | null);
-      continue;
-    }
-
-    if (Array.isArray(current)) {
-      jsonBytes += 2 + Math.max(0, current.length - 1);
-      for (let index = current.length - 1; index >= 0; index -= 1) {
-        stack.push({ value: current[index] });
-      }
-      continue;
-    }
-
-    const record = current as Record<string, unknown>;
-    const keys = Object.keys(record);
-    const base64Data = record.type === "base64" && typeof record.data === "string"
-      ? record.data
-      : null;
-    jsonBytes += 2 + Math.max(0, keys.length - 1);
-    for (let index = keys.length - 1; index >= 0; index -= 1) {
-      const key = keys[index];
-      jsonBytes += utf8Bytes(key) + 1;
-      if (key === "data" && base64Data !== null) {
-        const decodedBytes = decodedBase64Bytes(base64Data);
-        mediaTokens += Math.min(
-          MAX_MEDIA_TOKENS,
-          MEDIA_OVERHEAD_TOKENS + Math.ceil(decodedBytes / BYTES_PER_TOKEN),
-        );
-      } else {
-        stack.push({ value: record[key] });
-      }
-    }
+  for (const data of contextualBase64Media(value)) {
+    const decodedBytes = decodedBase64Bytes(data);
+    jsonBytes -= data.length + 2;
+    mediaTokens += Math.min(
+      MAX_MEDIA_TOKENS,
+      MEDIA_OVERHEAD_TOKENS + Math.ceil(decodedBytes / BYTES_PER_TOKEN),
+    );
   }
 
   return Math.max(
@@ -134,12 +128,5 @@ export function estimateAnthropicInputTokens(value: unknown): number {
 }
 
 export function validateAnthropicCountTokenRequest(value: unknown): void {
-  const request = requireRecord(value, "request");
-  if (typeof request.model !== "string" || !request.model.trim()) {
-    throw new AnthropicRequestError(400, "model is required");
-  }
-  if (!Array.isArray(request.messages)) {
-    throw new AnthropicRequestError(400, "messages is required");
-  }
-  requireArray(request.messages, "messages", DEFAULT_ANTHROPIC_REQUEST_LIMITS);
+  validateAnthropicCountRequest(value);
 }

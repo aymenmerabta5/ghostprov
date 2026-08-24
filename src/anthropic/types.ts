@@ -107,6 +107,10 @@ export type AnthropicUsage = {
   [key: string]: unknown;
 };
 
+export type AnthropicContextManagementResponse = {
+  applied_edits: unknown[];
+};
+
 export type AnthropicMessage = {
   id: string;
   type: "message";
@@ -118,6 +122,7 @@ export type AnthropicMessage = {
   stop_reason: AnthropicStopReason;
   stop_sequence: string | null;
   usage: AnthropicUsage;
+  context_management?: AnthropicContextManagementResponse | null;
   [key: string]: unknown;
 };
 

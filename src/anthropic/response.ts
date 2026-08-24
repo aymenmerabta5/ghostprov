@@ -29,6 +29,7 @@ import type { AnthropicStreamLimits } from "./stream-limits";
 import { assertUnicodeWellFormed } from "./stream-stop-filter";
 import type {
   AnthropicAdapterMessage,
+  AnthropicContextManagementResponse,
   AnthropicResponseContentBlock,
   AnthropicThinkingBlock,
   AnthropicToolUseBlock,
@@ -64,9 +65,19 @@ export type AnthropicResponseContext = Pick<
   | "maxTokensZero"
 > & {
   requestId: string;
+  beta?: boolean;
+  contextManagement?: AnthropicContextManagementResponse | null;
   limits?: Partial<AnthropicRequestLimits>;
   streamLimits?: Partial<AnthropicStreamLimits>;
 };
+
+function betaResponseFields(context: AnthropicResponseContext): {
+  context_management?: AnthropicContextManagementResponse | null;
+} {
+  return context.beta
+    ? { context_management: context.contextManagement ?? null }
+    : {};
+}
 
 function reasoningBlock(
   item: ResponsesFinalReasoningItem,
@@ -216,6 +227,7 @@ export function responseToAnthropic(
       stop_reason: "max_tokens",
       stop_sequence: null,
       container: null,
+      ...betaResponseFields(context),
       usage: {
         ...usage,
         output_tokens: 0,
@@ -306,6 +318,7 @@ export function responseToAnthropic(
     stop_reason: stopReason,
     stop_sequence: stopReason === "stop_sequence" ? match!.sequence : null,
     container: null,
+    ...betaResponseFields(context),
     usage,
   };
 }

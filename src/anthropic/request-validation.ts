@@ -1,4 +1,5 @@
 import { AnthropicRequestError } from "./errors";
+import { ANTHROPIC_HTTP_MAX_BODY_BYTES } from "../http/request-policy";
 
 export type AnthropicRequestLimits = {
   inboundBytes: number;
@@ -11,7 +12,7 @@ export type AnthropicRequestLimits = {
 };
 
 export const DEFAULT_ANTHROPIC_REQUEST_LIMITS: Readonly<AnthropicRequestLimits> = Object.freeze({
-  inboundBytes: 32 * 1024 * 1024,
+  inboundBytes: ANTHROPIC_HTTP_MAX_BODY_BYTES,
   outputBytes: 32 * 1024 * 1024,
   relayBytes: 64 * 1024 * 1024,
   mediaBytes: 32 * 1024 * 1024,
