@@ -13,6 +13,7 @@ export interface RateLimitGateSnapshot {
   tokenLimit: number | null;
   remainingTokens: number | null;
   active: number;
+  coldMaxActive: number;
   lastRateLimit: RateLimitProblem | null;
 }
 
@@ -26,13 +27,15 @@ export interface RateLimitLease {
 const MIN_HEADROOM_TOKENS = 10_000;
 
 /**
- * One host-level controller shared by every V2 sidecar.  It starts cold (one
- * request globally) until upstream headers teach it the active TPM budget.
+ * One host-level controller shared by every sandbox. It starts with bounded
+ * parallel admission until upstream headers or a canonical 429 teach it the
+ * active TPM budget. Cold saturation is queue pressure, not a synthetic 429.
  * Thereafter it maintains a conservative token bucket and, after any 429,
  * permits only a single half-open probe before reopening the fleet.
  */
 export class FleetRateLimitGate {
   readonly #clock: Clock;
+  readonly #coldMaxActive: number;
   readonly #listeners = new Set<() => void>();
   #state: RateLimitGateState = "cold";
   #active = 0;
@@ -44,8 +47,16 @@ export class FleetRateLimitGate {
   #refilledAtMs: number;
   #timer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(options: { clock?: Clock } = {}) {
+  constructor(options: { clock?: Clock; coldMaxActive?: number } = {}) {
     this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#coldMaxActive = options.coldMaxActive ?? 16;
+    if (
+      !Number.isSafeInteger(this.#coldMaxActive) ||
+      this.#coldMaxActive < 1 ||
+      this.#coldMaxActive > 128
+    ) {
+      throw new RangeError("coldMaxActive must be an integer from 1 through 128");
+    }
     this.#refilledAtMs = this.#clock.now();
   }
 
@@ -56,7 +67,7 @@ export class FleetRateLimitGate {
 
   snapshot(): RateLimitGateSnapshot {
     this.#refill();
-    const retryAfterMs = this.#blockedFor(0);
+    const retryAfterMs = this.#rateLimitDelay(0);
     return {
       state: this.#state,
       retryAfterMs,
@@ -67,6 +78,7 @@ export class FleetRateLimitGate {
           ? 0
           : Math.floor(this.#remainingTokens),
       active: this.#active,
+      coldMaxActive: this.#coldMaxActive,
       lastRateLimit: this.#lastProblem,
     };
   }
@@ -81,7 +93,7 @@ export class FleetRateLimitGate {
       throw new RangeError("estimatedTokens must be non-negative");
     }
     this.#refill();
-    return this.#blockedFor(Math.ceil(estimatedTokens));
+    return this.#rateLimitDelay(Math.ceil(estimatedTokens));
   }
 
   tryAcquire(estimatedTokens: number): RateLimitLease | null {
@@ -90,9 +102,12 @@ export class FleetRateLimitGate {
     }
     const tokens = Math.ceil(estimatedTokens);
     this.#refill();
-    if (this.#blockedFor(tokens) !== null) return null;
+    if (this.#rateLimitDelay(tokens) !== null) return null;
     const stateAtAcquire = this.#state;
-    if ((stateAtAcquire === "cold" || stateAtAcquire === "probe") && this.#active > 0) {
+    if (
+      (stateAtAcquire === "cold" && this.#active >= this.#coldMaxActive) ||
+      (stateAtAcquire === "probe" && this.#active > 0)
+    ) {
       return null;
     }
     if (this.#remainingTokens !== null) this.#remainingTokens -= tokens;
@@ -117,8 +132,8 @@ export class FleetRateLimitGate {
         generation === this.#generation &&
         this.#state === stateAtAcquire
       ) {
-        // With no usable headers, continue serially. A successful header lets
-        // the conservative token bucket safely open normal fleet admission.
+        // With no usable headers, continue with bounded cold admission. A
+        // successful header lets the conservative token bucket open normally.
         this.#state = this.#remainingTokens === null ? "cold" : "open";
       }
       this.#emit();
@@ -183,15 +198,12 @@ export class FleetRateLimitGate {
     this.#refilledAtMs = now;
   }
 
-  #blockedFor(estimatedTokens: number): number | null {
+  #rateLimitDelay(estimatedTokens: number): number | null {
     const now = this.#clock.now();
     if (this.#state === "cooldown") {
       const remaining = Math.max(0, this.#cooldownUntilMs - now);
       if (remaining > 0) return Math.max(1, Math.ceil(remaining));
       this.#state = "probe";
-    }
-    if ((this.#state === "cold" || this.#state === "probe") && this.#active > 0) {
-      return 1_000;
     }
     if (this.#remainingTokens === null || this.#tokenLimit === null) return null;
     const headroom = Math.max(MIN_HEADROOM_TOKENS, Math.ceil(this.#tokenLimit * 0.01));
@@ -227,6 +239,7 @@ export class FleetRateLimitGate {
  */
 export class ModelRateLimitGates {
   readonly #clock?: Clock;
+  readonly #coldMaxActive: number;
   readonly #scopeForModel: (model: string) => string;
   readonly #gates = new Map<string, FleetRateLimitGate>();
   readonly #modelScopes = new Map<string, string>();
@@ -235,9 +248,18 @@ export class ModelRateLimitGates {
 
   constructor(options: {
     clock?: Clock;
+    coldMaxActive?: number;
     scopeForModel?: (model: string) => string;
   } = {}) {
     this.#clock = options.clock;
+    this.#coldMaxActive = options.coldMaxActive ?? 16;
+    if (
+      !Number.isSafeInteger(this.#coldMaxActive) ||
+      this.#coldMaxActive < 1 ||
+      this.#coldMaxActive > 128
+    ) {
+      throw new RangeError("coldMaxActive must be an integer from 1 through 128");
+    }
     this.#scopeForModel = options.scopeForModel ?? (model => model);
   }
 
@@ -259,7 +281,10 @@ export class ModelRateLimitGates {
       this.#modelScopes.set(modelScope, key);
       return fallback;
     }
-    const gate = new FleetRateLimitGate({ ...(this.#clock ? { clock: this.#clock } : {}) });
+    const gate = new FleetRateLimitGate({
+      ...(this.#clock ? { clock: this.#clock } : {}),
+      coldMaxActive: this.#coldMaxActive,
+    });
     this.#gates.set(key, gate);
     this.#modelScopes.set(modelScope, key);
     this.#unsubscribes.set(key, gate.subscribe(() => this.#emit()));

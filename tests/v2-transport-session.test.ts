@@ -977,8 +977,37 @@ describe("V2TransportSession", () => {
     }]);
     await after.settle();
     await expect(handle.final).rejects.toBeInstanceOf(V2CommittedError);
-    expect(after.session.snapshot().quarantined).toBe(1);
+    expect(after.session.snapshot()).toMatchObject({
+      quarantined: 1,
+      ambiguousQuarantined: 1,
+      ambiguityLimit: 4,
+    });
     await after.close();
+  });
+
+  it("reports ambiguity exhaustion against the configured admission ceiling", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    harness.session.setHostCeiling(1);
+    const handle = await harness.commit(harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([{
+      kind: "response_error",
+      requestId,
+      code: "transport",
+      message: "lost terminal proof",
+      ambiguous: true,
+    }]);
+    await harness.settle();
+
+    await expect(handle.final).rejects.toMatchObject({ ambiguous: true });
+    expect(harness.session.snapshot()).toMatchObject({
+      quarantined: 1,
+      ambiguousQuarantined: 1,
+      ambiguityLimit: 1,
+      admissionCredits: 0,
+    });
+    await harness.close();
   });
 
   it("fences a replacement sidecar and quarantines work committed to the retired instance", async () => {
@@ -1151,7 +1180,10 @@ describe("V2TransportSession", () => {
       ambiguous: true,
       code: "cancelled",
     });
-    expect(published.session.snapshot().quarantined).toBe(1);
+    expect(published.session.snapshot()).toMatchObject({
+      quarantined: 1,
+      ambiguousQuarantined: 0,
+    });
     published.publish([{ kind: "request_cancelled", requestId: publishedRequest }]);
     await published.settle();
     expect(published.session.snapshot().quarantined).toBe(0);
@@ -1168,7 +1200,10 @@ describe("V2TransportSession", () => {
       kind: "request_cancel",
     }));
     await expect(handle.final).rejects.toMatchObject({ committed: true });
-    expect(committed.session.snapshot().quarantined).toBe(1);
+    expect(committed.session.snapshot()).toMatchObject({
+      quarantined: 1,
+      ambiguousQuarantined: 0,
+    });
     committed.publish([{
       kind: "request_cancelled",
       requestId: cancelledRequest,

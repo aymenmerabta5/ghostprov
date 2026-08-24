@@ -126,6 +126,12 @@ function metric(value: unknown): number {
     : 0;
 }
 
+function nullableMetric(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.round(value * 1_000) / 1_000
+    : null;
+}
+
 function runtimeMetrics(value: unknown): JsonValue | null {
   if (!isRecord(value)) return null;
   const id = typeof value.projectId === "string" && UUID.test(value.projectId)
@@ -141,6 +147,8 @@ function runtimeMetrics(value: unknown): JsonValue | null {
     active: metric(value.active),
     available: metric(value.available),
     quarantined: metric(value.quarantined),
+    ambiguous_quarantined: metric(value.ambiguousQuarantined),
+    ambiguity_limit: metric(value.ambiguityLimit),
     queue_depth: metric(value.queueDepth),
     awareness_rtt_ms: metric(value.ackEwmaMs),
     completion_ewma_ms: metric(value.completionEwmaMs),
@@ -155,6 +163,25 @@ function runtimeMetrics(value: unknown): JsonValue | null {
       retry_in_ms: metric(value.recovery.retryInMs),
     } : null,
   };
+}
+
+function rateLimitMetrics(value: unknown, queuedValue: unknown): JsonValue {
+  if (!isRecord(value)) return null;
+  const queued = isRecord(queuedValue) ? queuedValue : {};
+  const output: Record<string, JsonValue> = {};
+  for (const [scope, candidate] of Object.entries(value).slice(0, 64)) {
+    if (!/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(scope) || !isRecord(candidate)) continue;
+    output[scope] = {
+      state: typeof candidate.state === "string" ? candidate.state.slice(0, 16) : "unknown",
+      retry_after_ms: nullableMetric(candidate.retryAfterMs),
+      budget_limit: nullableMetric(candidate.tokenLimit),
+      budget_remaining: nullableMetric(candidate.remainingTokens),
+      active: metric(candidate.active),
+      queued: metric(queued[scope]),
+      cold_max_active: metric(candidate.coldMaxActive),
+    };
+  }
+  return output;
 }
 
 function resourceMetrics(value: unknown): JsonValue {
@@ -273,6 +300,10 @@ export async function pollMonitorSample(
       queued: metric(sandboxes.value.queued),
       resources: resourceMetrics(sandboxes.value.resources),
       runtimes,
+      rate_limit: rateLimitMetrics(
+        sandboxes.value.rateLimit,
+        sandboxes.value.rateLimitQueued,
+      ),
     });
   } catch (error) {
     if (error instanceof MonitorPollError) {

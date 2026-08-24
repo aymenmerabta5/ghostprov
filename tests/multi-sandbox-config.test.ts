@@ -53,6 +53,8 @@ describe("multi-sandbox configuration", () => {
     expect(config.desiredSandboxes).toBe(1);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
+    expect(config.shutdownDrainMs).toBe(300_000);
+    expect(config.rateLimitColdMaxActive).toBe(16);
   });
 
   it("parses bounded opt-in V2 diagnostics", () => {
@@ -79,16 +81,25 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
       GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-luna,gpt-5.5",
+      GP_RATE_LIMIT_COLD_MAX_ACTIVE: "24",
+      GP_SHUTDOWN_DRAIN_MS: "600000",
     }, MACHINE);
     expect(config.rateLimitSharedModelGroups).toEqual([
       ["gpt-5.6-sol", "gpt-5.6-terra"],
       ["gpt-5.6-luna", "gpt-5.5"],
     ]);
+    expect(config.rateLimitColdMaxActive).toBe(24);
+    expect(config.shutdownDrainMs).toBe(600_000);
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
       GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-sol,gpt-5.6-luna",
     }, MACHINE)).toThrow("multiple groups");
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_RATE_LIMIT_COLD_MAX_ACTIVE: "129",
+    }, MACHINE)).toThrow("GP_RATE_LIMIT_COLD_MAX_ACTIVE");
   });
 
   it("allows a project-less managed V2 fleet and derives its size", () => {

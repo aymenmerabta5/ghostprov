@@ -89,6 +89,79 @@ function router(runtime: Runtime | readonly Runtime[], rateLimit: {
 }
 
 describe("V2 fleet TPM admission", () => {
+  it("queues above bounded cold parallelism instead of returning a local 429", async () => {
+    const runtime = new Runtime();
+    const value = router(runtime, {
+      rateLimitGate: new FleetRateLimitGate({ coldMaxActive: 2 }),
+    });
+    const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
+    const second = await value.startRelay({ model: "gpt-5.6-sol", input: "second" });
+    let thirdSettled = false;
+    const thirdPending = value
+      .startRelay({ model: "gpt-5.6-sol", input: "third" })
+      .then(handle => {
+        thirdSettled = true;
+        return handle;
+      });
+    await Bun.sleep(0);
+    expect(runtime.calls).toBe(2);
+    expect(thirdSettled).toBe(false);
+    expect(value.snapshot().rateLimit).toMatchObject({
+      state: "cold",
+      active: 2,
+      coldMaxActive: 2,
+      retryAfterMs: null,
+    });
+
+    runtime.finals[0]!.resolve({ id: "resp_first", status: "completed" });
+    await first.final;
+    const third = await thirdPending;
+    expect(runtime.calls).toBe(3);
+
+    runtime.finals[1]!.resolve({ id: "resp_second", status: "completed" });
+    runtime.finals[2]!.resolve({ id: "resp_third", status: "completed" });
+    await Promise.all([second.final, third.final]);
+    await Bun.sleep(0);
+    expect(value.trafficSnapshotAndReset()).toMatchObject({
+      accepted: 3,
+      committed: 3,
+      succeeded: 3,
+      failed: 0,
+      rateLimited: 0,
+      totalMs: { count: 3 },
+    });
+    await value.close();
+  });
+
+  it("does not head-of-line block a different model behind a saturated cold scope", async () => {
+    const runtime = new Runtime();
+    const value = router(runtime, {
+      rateLimitGates: new ModelRateLimitGates({ coldMaxActive: 1 }),
+    });
+    const firstSol = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
+    let secondSolSettled = false;
+    const secondSolPending = value
+      .startRelay({ model: "gpt-5.6-sol", input: "second" })
+      .then(handle => {
+        secondSolSettled = true;
+        return handle;
+      });
+    await Bun.sleep(0);
+    expect(runtime.calls).toBe(1);
+
+    const terra = await value.startRelay({ model: "gpt-5.6-terra", input: "independent" });
+    expect(runtime.calls).toBe(2);
+    expect(secondSolSettled).toBe(false);
+
+    runtime.finals[0]!.resolve({ id: "resp_sol_1", status: "completed" });
+    await firstSol.final;
+    const secondSol = await secondSolPending;
+    runtime.finals[1]!.resolve({ id: "resp_terra", status: "completed" });
+    runtime.finals[2]!.resolve({ id: "resp_sol_2", status: "completed" });
+    await Promise.all([terra.final, secondSol.final]);
+    await value.close();
+  });
+
   it("turns a streamed rate-limit terminal into a fleet-wide local 429 before another sandbox call", async () => {
     const runtime = new Runtime();
     runtime.rateLimits.push({

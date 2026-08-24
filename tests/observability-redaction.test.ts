@@ -105,4 +105,24 @@ describe("observability privacy", () => {
       } as any)).toThrow();
     }
   });
+
+  it("accepts credential-free soak telemetry rollups", () => {
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
+      traffic: {
+        accepted: 10,
+        requests_per_second: 2,
+        total: { count: 10, p50_ms: 100, p95_ms: 500, max_ms: 900 },
+      },
+      rate_limit: {
+        "gpt-5.6-sol": {
+          state: "cold",
+          active: 8,
+          queued: 2,
+          cold_max_active: 16,
+          budget_limit: null,
+          budget_remaining: null,
+        },
+      },
+    }))).not.toThrow();
+  });
 });

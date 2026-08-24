@@ -67,6 +67,8 @@ function successfulFetch(onRequest?: (path: string, init?: RequestInit) => void)
           active: 4,
           available: 124,
           quarantined: 0,
+          ambiguousQuarantined: 1,
+          ambiguityLimit: 4,
           queueDepth: 0,
           ackEwmaMs: 12,
           completionEwmaMs: 2_000,
@@ -76,6 +78,18 @@ function successfulFetch(onRequest?: (path: string, init?: RequestInit) => void)
           memoryPressure: 0.1,
           output: "must never be copied",
         }],
+        rateLimit: {
+          "gpt-5.6-sol": {
+            state: "cold",
+            retryAfterMs: null,
+            tokenLimit: null,
+            remainingTokens: null,
+            active: 8,
+            coldMaxActive: 16,
+            lastRateLimit: null,
+          },
+        },
+        rateLimitQueued: { "gpt-5.6-sol": 2 },
       });
     }
     return json({ error: "unexpected endpoint" }, 404);
@@ -129,6 +143,17 @@ describe("V2 external monitor", () => {
       project_id: "00000000-0000-4000-8000-000000000001",
       awareness_rtt_ms: 12,
       completion_ewma_ms: 2_000,
+      ambiguous_quarantined: 1,
+      ambiguity_limit: 4,
+    });
+    expect(event.rate_limit).toMatchObject({
+      "gpt-5.6-sol": {
+        state: "cold",
+        active: 8,
+        queued: 2,
+        cold_max_active: 16,
+        budget_limit: null,
+      },
     });
     expect(JSON.stringify(event)).not.toMatch(/prompt|output|forbiddenToken|sk-secret/i);
     expect(() => assertSafeObservabilityEvent(event)).not.toThrow();

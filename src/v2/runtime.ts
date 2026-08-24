@@ -93,6 +93,7 @@ export type V2RuntimeLifecycleFailureKind =
   | "heartbeat_expired"
   | "heartbeat_unreachable"
   | "sidecar_unreachable"
+  | "ambiguity_exhausted"
   | "resource_credential_expired";
 
 function normalizedHttpStatus(status: number | null): number | null {
@@ -119,13 +120,15 @@ export class V2RuntimeLifecycleFailure extends Error {
         ? `V2 sandbox heartbeat became unreachable${suffix}`
         : kind === "sidecar_unreachable"
           ? "V2 sandbox sidecar became unreachable"
+          : kind === "ambiguity_exhausted"
+            ? "V2 sandbox ambiguous-commit capacity was exhausted"
           : "V2 sandbox resource credential expired after refresh failed";
     super(message, options);
     this.name = "V2RuntimeLifecycleFailure";
     this.status = safeStatus;
     this.operation = kind === "resource_credential_expired"
       ? "refresh_resources"
-      : kind === "sidecar_unreachable"
+      : kind === "sidecar_unreachable" || kind === "ambiguity_exhausted"
         ? "sidecar_liveness"
         : "heartbeat";
   }
@@ -424,6 +427,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         ? Math.max(0, Math.min(transport.admissionCredits ?? transport.credits, capacity - active - quarantined))
         : 0,
       quarantined,
+      ambiguousQuarantined: transport?.ambiguousQuarantined ?? 0,
+      ambiguityLimit: transport?.ambiguityLimit ?? Math.max(
+        1,
+        Math.min(4, governorCapacity || descriptorCapacity || 4),
+      ),
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
       sidecarPeerAgeMs: transport?.sidecarPeerAgeMs ?? null,
       credentialExpiresInMs: this.#credentials
@@ -822,14 +830,23 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #maybeFailAmbiguousTransport(error: unknown): void {
+    if (classifyRuntimeError(error) === "neutral") return;
     if (!error || typeof error !== "object") return;
     const value = error as { committed?: unknown; ambiguous?: unknown };
     if (value.committed !== true || value.ambiguous !== true) return;
     const transport = this.#transport?.snapshot();
-    if (!transport || (transport.connected && transport.quarantined < 4)) return;
+    if (!transport) return;
+    const ambiguityLimit = transport.ambiguityLimit ?? Math.max(
+      1,
+      Math.min(4, this.#descriptor?.capacity ?? 4),
+    );
+    const ambiguousQuarantined = transport.ambiguousQuarantined ?? transport.quarantined;
+    if (transport.connected && ambiguousQuarantined < ambiguityLimit) return;
     this.#failGeneration(
       this.#generation,
-      new V2RuntimeLifecycleFailure("sidecar_unreachable"),
+      new V2RuntimeLifecycleFailure(
+        transport.connected ? "ambiguity_exhausted" : "sidecar_unreachable",
+      ),
     );
   }
 

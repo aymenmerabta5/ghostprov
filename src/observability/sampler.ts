@@ -3,6 +3,8 @@ import type { Clock, MachineProbe } from "../core/ports";
 import { SYSTEM_CLOCK } from "../core/ports";
 import type { CpuTransformPoolSnapshot } from "../router/cpu-transform-pool";
 import type { MultiSandboxRouterSnapshot } from "../router/router";
+import type { RouterTrafficSnapshot } from "../router/telemetry";
+import type { RateLimitGateSnapshot } from "../router/rate-limit-gate";
 import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
@@ -59,6 +61,62 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
 }
 function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue { if(!value)return null;const r=value.resource;return { version:value.version,malformed_count:value.malformedCount,resource:r?{process_rss_bytes:r.processRssBytes,heap_used_bytes:r.heapUsedBytes,heap_total_bytes:r.heapTotalBytes,external_bytes:r.externalBytes,system_total_bytes:r.systemTotalBytes,system_free_bytes:r.systemFreeBytes,process_cpu_percent:r.processCpuPercent,normalized_load_1:r.normalizedLoad1,event_loop_p50_ms:r.eventLoopP50Ms,event_loop_p95_ms:r.eventLoopP95Ms,event_loop_max_ms:r.eventLoopMaxMs}:null,transport:transportJson(value.transport) }; }
 
+function distributionJson(value: RouterTrafficSnapshot["totalMs"]): JsonValue {
+  return { count: value.count, p50_ms: value.p50, p95_ms: value.p95, max_ms: value.max };
+}
+
+function trafficJson(value: RouterTrafficSnapshot, intervalMs: number): JsonValue {
+  const terminals = value.succeeded + value.failed;
+  return {
+    accepted: value.accepted,
+    committed: value.committed,
+    succeeded: value.succeeded,
+    failed: value.failed,
+    rate_limited: value.rateLimited,
+    retries: value.retries,
+    response_bytes: value.responseBytes,
+    requests_per_second: intervalMs > 0 ? terminals / (intervalMs / 1_000) : 0,
+    success_rate: terminals > 0 ? value.succeeded / terminals : 0,
+    queue_wait: distributionJson(value.queueWaitMs),
+    commit_ack: distributionJson(value.commitAckMs),
+    total: distributionJson(value.totalMs),
+    first_byte: distributionJson(value.firstByteMs),
+  };
+}
+
+function oneRateLimitJson(value: RateLimitGateSnapshot, queued: number): JsonValue {
+  return {
+    state: value.state,
+    retry_after_ms: value.retryAfterMs,
+    budget_limit: value.tokenLimit,
+    budget_remaining: value.remainingTokens,
+    active: value.active,
+    queued,
+    cold_max_active: value.coldMaxActive,
+    last_limit: value.lastRateLimit?.tokenLimit ?? null,
+    last_used: value.lastRateLimit?.usedTokens ?? null,
+    last_requested: value.lastRateLimit?.requestedTokens ?? null,
+  };
+}
+
+function isRateLimitGateSnapshot(value: unknown): value is RateLimitGateSnapshot {
+  return !!value && typeof value === "object" &&
+    typeof (value as { state?: unknown }).state === "string" &&
+    typeof (value as { active?: unknown }).active === "number";
+}
+
+function rateLimitJson(router: MultiSandboxRouterSnapshot): JsonValue {
+  const value = router.rateLimit;
+  if (!value) return null;
+  if (isRateLimitGateSnapshot(value)) {
+    return { global: oneRateLimitJson(value, router.rateLimitQueued?.global ?? 0) };
+  }
+  return Object.fromEntries(Object.entries(value).map(([scope, snapshot]) => [
+    scope,
+    oneRateLimitJson(snapshot, router.rateLimitQueued?.[scope] ?? 0),
+  ]));
+}
+
 interface EventLoopDelayLike {
   min: number | bigint;
   max: number | bigint;
@@ -91,6 +149,7 @@ export interface FleetSamplerOptions {
   cpuUsage?: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
   webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
   recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
+  routerTrafficSnapshot?: () => RouterTrafficSnapshot;
 }
 
 export class FleetSampler {
@@ -105,6 +164,7 @@ export class FleetSampler {
   readonly #cpuUsage: (previousValue?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
   readonly #webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
   readonly #recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
+  readonly #routerTrafficSnapshot?: () => RouterTrafficSnapshot;
   #lastCpu: NodeJS.CpuUsage;
   #lastSampleAtMs: number;
   #timer: ReturnType<typeof setInterval> | null = null;
@@ -126,6 +186,7 @@ export class FleetSampler {
     this.#cpuUsage = options.cpuUsage ?? process.cpuUsage;
     this.#webSocketSnapshot = options.webSocketSnapshot;
     this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
+    this.#routerTrafficSnapshot = options.routerTrafficSnapshot;
     this.#lastCpu = this.#cpuUsage();
     this.#lastSampleAtMs = this.#clock.now();
   }
@@ -172,6 +233,8 @@ export class FleetSampler {
         active: runtime.active,
         available: runtime.available,
         quarantined: runtime.quarantined,
+        ambiguous_quarantined: runtime.ambiguousQuarantined ?? 0,
+        ambiguity_limit: runtime.ambiguityLimit ?? null,
         queue_depth: runtime.queueDepth,
         awareness_rtt_ms: runtime.ackEwmaMs,
         completion_ewma_ms: runtime.completionEwmaMs,
@@ -192,6 +255,7 @@ export class FleetSampler {
         } : null,
       }));
       const circuit = this.#recoveryCircuitSnapshot?.();
+      const traffic = this.#routerTrafficSnapshot?.();
       this.#logger.emit(observabilityEvent("fleet.sample", {
         capacity: router.capacity,
         active: router.active,
@@ -219,6 +283,8 @@ export class FleetSampler {
           queued: circuit.queued,
           last_failure_kind: circuit.lastFailureKind,
         } : null,
+        traffic: traffic ? trafficJson(traffic, this.#intervalMs) : null,
+        rate_limit: rateLimitJson(router),
         websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
       }), "sample");
       this.#eventLoop.reset();

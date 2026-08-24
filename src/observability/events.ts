@@ -95,6 +95,7 @@ export const SANDBOX_RECOVERY_ERROR_KINDS = [
   "heartbeat_expired",
   "heartbeat_unreachable",
   "sidecar_unreachable",
+  "ambiguity_exhausted",
   "resource_credential_expired",
   "sync",
   "missing",
@@ -201,7 +202,11 @@ export function normalizeSandboxRecoveryCause(value: unknown): SandboxRecoveryCa
   const normalized = value.trim().toLowerCase();
   if (RECOVERY_CAUSE_SET.has(normalized)) return normalized as SandboxRecoveryCause;
   if (normalized.includes("heartbeat")) return "heartbeat";
-  if (normalized.includes("sidecar") || normalized.includes("liveness")) return "sidecar";
+  if (
+    normalized.includes("sidecar") ||
+    normalized.includes("liveness") ||
+    normalized.includes("ambiguity")
+  ) return "sidecar";
   if (
     normalized.includes("credential") ||
     normalized.includes("auth") ||

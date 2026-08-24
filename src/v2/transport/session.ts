@@ -59,6 +59,8 @@ export interface V2TransportSnapshot {
   active: number;
   queued: number;
   quarantined: number;
+  ambiguousQuarantined?: number;
+  ambiguityLimit?: number;
   credits: number;
   admissionCredits?: number;
   retransmissions: number;
@@ -137,7 +139,7 @@ interface RequestState {
   commitPublished: boolean;
   committed: boolean;
   cancelled: boolean;
-  quarantined: boolean;
+  quarantineKind: "cancellation" | "ambiguity" | null;
   responseBytes: number;
   nextEventIndex: number;
   assemblies: Map<number, EventAssembly>;
@@ -278,6 +280,7 @@ export class V2TransportSession {
   #remoteCredits = 0;
   #creditReservations = 0;
   #quarantined = 0;
+  #ambiguousQuarantined = 0;
   #retransmissions = 0;
   #drainResolve: (() => void) | null = null;
   #drainReject: ((error: unknown) => void) | null = null;
@@ -524,7 +527,7 @@ export class V2TransportSession {
       commitPublished: false,
       committed: false,
       cancelled: false,
-      quarantined: false,
+      quarantineKind: null,
       responseBytes: 0,
       nextEventIndex: 0,
       assemblies: new Map(),
@@ -695,6 +698,8 @@ export class V2TransportSession {
       active: this.#requests.size - this.#pending.filter(state => !state.admitted).length,
       queued: this.#pending.filter(state => !state.admitted).length,
       quarantined: this.#quarantined,
+      ambiguousQuarantined: this.#ambiguousQuarantined,
+      ambiguityLimit: Math.max(1, Math.min(4, this.#hostCeiling)),
       credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
       admissionCredits: this.#availableCredits(),
       retransmissions: this.#retransmissions,
@@ -1004,10 +1009,11 @@ export class V2TransportSession {
       case "request_cancelled": {
         const state = this.#requests.get(frame.requestId);
         if (!state?.cancelled) return;
-        const releaseQuarantine = state.quarantined;
+        const releaseQuarantine = state.quarantineKind === "cancellation";
         this.#removeState(state);
         if (releaseQuarantine) {
           this.#quarantined = Math.max(0, this.#quarantined - 1);
+          state.quarantineKind = null;
         }
         return;
       }
@@ -1156,10 +1162,13 @@ export class V2TransportSession {
       return;
     }
     const wasCancelled = state.cancelled;
-    const wasQuarantined = state.quarantined;
+    const wasQuarantined = state.quarantineKind === "cancellation";
     this.#removeState(state);
     if (!wasCancelled) state.handle.settle(final, terminal.rateLimit);
-    if (wasQuarantined) this.#quarantined = Math.max(0, this.#quarantined - 1);
+    if (wasQuarantined) {
+      this.#quarantined = Math.max(0, this.#quarantined - 1);
+      state.quarantineKind = null;
+    }
     this.#scheduler.enqueue("control", state.requestId, {
       kind: "response_ack",
       requestId: state.requestId,
@@ -1232,7 +1241,11 @@ export class V2TransportSession {
   }
 
   #availableCredits(): number {
-    return Math.max(0, Math.min(this.#remoteCredits - this.#creditReservations, 4 - this.#creditReservations));
+    return Math.max(0, Math.min(
+      this.#remoteCredits - this.#creditReservations,
+      this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
+      4 - this.#creditReservations - this.#ambiguousQuarantined,
+    ));
   }
 
   #pump(): PublicationUrgency | null {
@@ -1421,8 +1434,8 @@ export class V2TransportSession {
       // already-scheduled publication may still send it after this callback.
       if (state.commitStaged) state.commitPublished = true;
       state.cancelled = true;
-      if (!state.quarantined) {
-        state.quarantined = true;
+      if (!state.quarantineKind) {
+        state.quarantineKind = "cancellation";
         this.#quarantined++;
       }
       const error = new V2CommittedError(
@@ -1463,9 +1476,15 @@ export class V2TransportSession {
   #failCommitted(state: RequestState, error: V2CommittedError): void {
     if (!this.#requests.has(state.requestId)) return;
     const acknowledged = state.committed;
-    if (error.ambiguous && !state.quarantined) {
-      state.quarantined = true;
-      this.#quarantined++;
+    if (error.ambiguous) {
+      if (!state.quarantineKind) {
+        state.quarantineKind = "ambiguity";
+        this.#quarantined++;
+        this.#ambiguousQuarantined++;
+      } else if (state.quarantineKind === "cancellation") {
+        state.quarantineKind = "ambiguity";
+        this.#ambiguousQuarantined++;
+      }
     }
     // commitPublished is deliberately promoted to committed-risk here so
     // removal cannot release capacity for work that may still be executing.

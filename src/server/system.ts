@@ -61,6 +61,7 @@ import {
 } from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
 import { WebSocketTelemetry } from "../ws/telemetry";
+import { closeResponsesWebSockets } from "../ws/server";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -492,6 +493,7 @@ export async function createBrowserlessSystem(
   const rateLimitGates = !dependencies.router
     ? new ModelRateLimitGates({
       scopeForModel: rateLimitScopeResolver(config.rateLimitSharedModelGroups),
+      coldMaxActive: config.rateLimitColdMaxActive,
     })
     : undefined;
   const router = dependencies.router ?? new MultiSandboxRouter({
@@ -514,6 +516,7 @@ export async function createBrowserlessSystem(
     cpuPoolSnapshot: cpuPool.snapshot ? () => cpuPool.snapshot!() : undefined,
     webSocketSnapshot: webSocketTelemetry ? () => webSocketTelemetry.snapshotAndReset() : undefined,
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
+    routerTrafficSnapshot: () => router.trafficSnapshotAndReset(),
   });
   const app = createGhostProvApp({ router });
   const server = dependencies.server ?? createGhostProvServer({
@@ -593,10 +596,13 @@ export async function createBrowserlessSystem(
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
         try {
-          await router.awaitIdle(30_000);
+          await router.awaitIdle(config.shutdownDrainMs);
         } catch (error) {
           firstError = error;
         }
+        await closeResponsesWebSockets(server as import("node:http").Server, {
+          reason: "GhostProv graceful shutdown",
+        }).catch(error => { firstError ??= error; });
         try {
           recoveryCoordinator.close();
           await fleet.shutdown("system-shutdown");

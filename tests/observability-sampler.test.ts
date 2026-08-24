@@ -107,6 +107,8 @@ describe("FleetSampler", () => {
           active: 4,
           available: 124,
           quarantined: 0,
+          ambiguousQuarantined: 1,
+          ambiguityLimit: 4,
           heartbeatAgeMs: 500,
           sidecarPeerAgeMs: 250,
           credentialExpiresInMs: 3_000_000,
@@ -122,6 +124,18 @@ describe("FleetSampler", () => {
             sidecar: { version: 1, resource: null, transport, malformedCount: 0 },
           },
         }],
+        rateLimit: {
+          "gpt-5.6-sol": {
+            state: "cold",
+            retryAfterMs: null,
+            tokenLimit: null,
+            remainingTokens: null,
+            active: 8,
+            coldMaxActive: 16,
+            lastRateLimit: null,
+          },
+        },
+        rateLimitQueued: { "gpt-5.6-sol": 3 },
       }),
       cpuPoolSnapshot: () => ({ workers: 6, active: 1, queued: 0, maxActive: 2, closed: false }),
       eventLoop,
@@ -136,6 +150,19 @@ describe("FleetSampler", () => {
         revalidationInFlight: false,
         nextProbeAtMs: clock.now() + 1_000,
         lastFailureKind: "server",
+      }),
+      routerTrafficSnapshot: () => ({
+        accepted: 50,
+        committed: 48,
+        succeeded: 45,
+        failed: 3,
+        rateLimited: 1,
+        retries: 2,
+        responseBytes: 4096,
+        queueWaitMs: { count: 48, p50: 4, p95: 20, max: 30 },
+        commitAckMs: { count: 48, p50: 30, p95: 100, max: 150 },
+        totalMs: { count: 48, p50: 500, p95: 2_000, max: 3_000 },
+        firstByteMs: { count: 47, p50: 100, p95: 400, max: 600 },
       }),
     });
 
@@ -159,6 +186,8 @@ describe("FleetSampler", () => {
       awareness_rtt_ms: 15,
       sidecar_peer_age_ms: 250,
       recovery: { attempt: 2, consecutive_failures: 1, retry_in_ms: 1_000 },
+      ambiguous_quarantined: 1,
+      ambiguity_limit: 4,
       completion_ewma_ms: 2_000,
       diagnostics: {
         sidecar: {
@@ -181,6 +210,21 @@ describe("FleetSampler", () => {
       consecutive_failures: 2,
       retry_in_ms: 1_000,
       queued: 3,
+    });
+    expect(event.traffic).toMatchObject({
+      accepted: 50,
+      succeeded: 45,
+      failed: 3,
+      requests_per_second: 9.6,
+      total: { p50_ms: 500, p95_ms: 2_000, max_ms: 3_000 },
+    });
+    expect(event.rate_limit).toMatchObject({
+      "gpt-5.6-sol": {
+        state: "cold",
+        active: 8,
+        queued: 3,
+        cold_max_active: 16,
+      },
     });
     expect(JSON.stringify(event)).not.toMatch(/token|cookie|prompt|output|url/i);
   });

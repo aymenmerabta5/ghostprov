@@ -28,6 +28,7 @@ export interface RouterLike {
     runtimes: unknown[];
     resources: unknown;
     rateLimit?: unknown;
+    rateLimitQueued?: unknown;
   };
 }
 
@@ -213,6 +214,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       runtimes: snapshot.runtimes,
       resources: snapshot.resources,
       rateLimit: snapshot.rateLimit ?? null,
+      rateLimitQueued: snapshot.rateLimitQueued ?? null,
     });
   });
 

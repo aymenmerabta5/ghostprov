@@ -12,6 +12,8 @@ export interface AttachResponsesWebSocketOptions extends Omit<ResponsesWebSocket
   startRelay: WebSocketRelayStarter;
 }
 
+const attachedServers = new WeakMap<Server, WebSocketServer>();
+
 export function attachResponsesWebSocket(
   server: Server,
   options: AttachResponsesWebSocketOptions,
@@ -35,5 +37,35 @@ export function attachResponsesWebSocket(
       socket.destroy();
     }
   });
+  attachedServers.set(server, wss);
   return wss;
+}
+
+/** Closes only WebSockets owned by this GhostProv server after active relays drain. */
+export async function closeResponsesWebSockets(
+  server: Server,
+  options: { timeoutMs?: number; code?: number; reason?: string } = {},
+): Promise<void> {
+  const wss = attachedServers.get(server);
+  if (!wss) return;
+  attachedServers.delete(server);
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const code = options.code ?? 1012;
+  const reason = (options.reason ?? "GhostProv service restart").slice(0, 120);
+  await new Promise<void>(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      for (const socket of wss.clients) socket.terminate();
+      finish();
+    }, timeoutMs);
+    timer.unref?.();
+    for (const socket of wss.clients) socket.close(code, reason);
+    wss.close(() => finish());
+  });
 }

@@ -15,12 +15,15 @@ export interface MultiSandboxConfig {
   candidate: boolean;
   heartbeatMs: 10_000;
   routerQueueTimeoutMs: number;
+  shutdownDrainMs: number;
   maxProjects: number;
   slotsPerProject: number;
   machine: MachineSample;
   transport: TransportMode;
   /** Semicolon-separated dashboard-declared shared TPM groups. */
   rateLimitSharedModelGroups: readonly (readonly string[])[];
+  /** Bounded per-model concurrency while successful proxy responses omit TPM headers. */
+  rateLimitColdMaxActive: number;
   sessionMode: PrismSessionMode;
   allowAnonymous: boolean;
   guestMaxProjects: number;
@@ -139,6 +142,13 @@ export function resolveMultiSandboxConfig(
   const rateLimitSharedModelGroups = parseRateLimitSharedModelGroups(
     env.GP_RATE_LIMIT_SHARED_MODEL_GROUPS,
   );
+  const rateLimitColdMaxActive = boundedPositiveInteger(
+    env.GP_RATE_LIMIT_COLD_MAX_ACTIVE,
+    16,
+    "GP_RATE_LIMIT_COLD_MAX_ACTIVE",
+    1,
+    128,
+  );
   const sessionMode = enumValue<PrismSessionMode>(
     env.GP_PRISM_SESSION,
     "authenticated",
@@ -207,6 +217,13 @@ export function resolveMultiSandboxConfig(
     "GP_ROUTER_QUEUE_TIMEOUT_MS",
     1_000,
     300_000,
+  );
+  const shutdownDrainMs = boundedPositiveInteger(
+    env.GP_SHUTDOWN_DRAIN_MS,
+    300_000,
+    "GP_SHUTDOWN_DRAIN_MS",
+    1_000,
+    3_600_000,
   );
 
   const targetConcurrency = positiveInteger(
@@ -304,11 +321,13 @@ export function resolveMultiSandboxConfig(
     candidate,
     heartbeatMs: 10_000,
     routerQueueTimeoutMs,
+    shutdownDrainMs,
     maxProjects,
     slotsPerProject,
     machine,
     transport,
     rateLimitSharedModelGroups,
+    rateLimitColdMaxActive,
     sessionMode,
     allowAnonymous,
     guestMaxProjects,

@@ -24,11 +24,20 @@ class TestClock implements Clock {
 }
 
 describe("FleetRateLimitGate", () => {
-  it("serializes a cold fleet until an upstream token header establishes its budget", () => {
-    const gate = new FleetRateLimitGate({ clock: new TestClock() });
+  it("admits bounded cold parallelism without reporting a synthetic 429", () => {
+    const gate = new FleetRateLimitGate({ clock: new TestClock(), coldMaxActive: 2 });
     const first = gate.tryAcquire(128_000);
+    const second = gate.tryAcquire(128_000);
     expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
     expect(gate.tryAcquire(128_000)).toBeNull();
+    expect(gate.retryAfterMs(128_000)).toBeNull();
+    expect(gate.snapshot()).toMatchObject({
+      state: "cold",
+      active: 2,
+      coldMaxActive: 2,
+      retryAfterMs: null,
+    });
 
     first!.complete({
       limitTokens: 40_000_000,
@@ -37,7 +46,13 @@ describe("FleetRateLimitGate", () => {
     });
     expect(gate.snapshot()).toMatchObject({ state: "open", tokenLimit: 40_000_000 });
     expect(gate.tryAcquire(128_000)).not.toBeNull();
+    second!.release();
     gate.close();
+  });
+
+  it("validates the cold concurrency ceiling", () => {
+    expect(() => new FleetRateLimitGate({ coldMaxActive: 0 })).toThrow("coldMaxActive");
+    expect(() => new ModelRateLimitGates({ coldMaxActive: 129 })).toThrow("coldMaxActive");
   });
 
   it("holds the fleet after a TPM hit and lets only one half-open probe through", () => {

@@ -688,6 +688,46 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("ignores cancellation quarantine but fails at the capacity-aware ambiguity limit", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    const cancelled = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "cancelled-at-full-window",
+    });
+    harness.transport.snapshotValue.quarantined = 4;
+    harness.transport.snapshotValue.ambiguousQuarantined = 0;
+    harness.transport.snapshotValue.ambiguityLimit = 1;
+    harness.transport.pending[0]!.reject(new V2CommittedError(
+      "V2 request was cancelled after commitment",
+      "cancelled",
+      true,
+    ));
+    await expect(cancelled.final).rejects.toMatchObject({ code: "cancelled" });
+    expect(harness.runtime.snapshot().state).toBe("ready");
+
+    const ambiguous = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "permanent-ambiguity",
+    });
+    harness.transport.snapshotValue.quarantined = 1;
+    harness.transport.snapshotValue.ambiguousQuarantined = 1;
+    harness.transport.snapshotValue.ambiguityLimit = 1;
+    harness.transport.pending[1]!.reject(new V2CommittedError(
+      "Transport lost terminal proof",
+      "transport",
+      true,
+    ));
+    await expect(ambiguous.final).rejects.toMatchObject({ code: "transport" });
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      failure: { kind: "ambiguity_exhausted" },
+    });
+    await harness.runtime.stop();
+  });
+
   it("penalizes ambiguous transport failure temporarily and heals on success", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();

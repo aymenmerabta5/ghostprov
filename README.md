@@ -66,7 +66,7 @@ One V2 sidecar retains a hard physical ceiling of 128 simultaneous upstream call
 min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
 ```
 
-GhostProv applies one host-wide upstream TPM controller **per model** across every V1 and V2 sandbox. Organization/model TPM is shared by the sandboxes because they use the same OpenAI organization, so a 429 on one project closes that model's whole fleet rather than retrying the same exhausted budget elsewhere. The controller starts each unseen model with one probe until it learns token metadata, parses the canonical TPM message when proxies strip headers, conservatively reserves token budget, and reopens with one probe after `Retry-After`/reset. Configure dashboard-declared shared model families with `GP_RATE_LIMIT_SHARED_MODEL_GROUPS` (comma-separated models, semicolon-separated groups) so they use one budget. The original credential-scrubbed upstream error is returned to Codex and retained as `lastRateLimit`; local cooldown responses reuse that explanation instead of replacing it with a generic retry-exhaustion message.
+GhostProv applies one host-wide upstream TPM controller **per model** across every V1 and V2 sandbox. Organization/model TPM may be shared by sandboxes, so a 429 closes that model's fleet rather than blindly retrying the same exhausted budget elsewhere. Because successful Prism responses omit TPM headers, an unseen model admits up to `GP_RATE_LIMIT_COLD_MAX_ACTIVE` concurrent requests and queues additional work without fabricating local 429s. Once headers or a canonical TPM error reveal the budget, the controller uses conservative token admission and reopens with one probe after `Retry-After`/reset. Configure dashboard-declared shared model families with `GP_RATE_LIMIT_SHARED_MODEL_GROUPS` (comma-separated models, semicolon-separated groups). The original credential-scrubbed upstream error is returned to Codex and retained as `lastRateLimit`; local cooldown responses reuse that explanation instead of replacing it with a generic retry-exhaustion message.
 
 Hardware detection uses physical/free RAM, process RSS, and logical processors:
 
@@ -197,7 +197,7 @@ bun run monitor:v2
 
 It polls only `GET /health` and `GET /__sandboxes`, retries failures with capped exponential jitter, and writes `monitor.sample` or sanitized `monitor.error` JSONL events. The default target is `http://127.0.0.1:18787`; non-loopback roots and roots containing paths, credentials, queries, or fragments are rejected. Ctrl+C stops only the monitor and flushes its log.
 
-Built-in tracing starts with the upgraded router after the operator's next manual restart. It records `request.accepted`, `admission.acquired`, `request.queued`, `route.selected`, `transport.committed`, `response.first_event`, and exactly one `request.completed` or `request.failed`. A periodic `fleet.sample` adds host memory, CPU, event-loop delay, logger pressure, aggregate capacity, and per-runtime health. The external monitor provides immediate fleet visibility, but only built-in tracing can attribute per-request queue, commit, first-event, and total latency.
+Built-in tracing starts with the upgraded router after the operator's next manual restart. It records `request.accepted`, `admission.acquired`, `request.queued`, `route.selected`, `transport.committed`, `response.first_event`, and exactly one `request.completed` or `request.failed`. A periodic `fleet.sample` adds host memory, CPU, event-loop delay, logger pressure, aggregate capacity, per-runtime health, interval requests/second and success rate, response bytes, retries, rate-limit active/queued pressure, and bounded p50/p95/max distributions for queue wait, commit ACK, first byte, and total latency. The external monitor provides immediate fleet visibility, but only built-in tracing can attribute per-request queue, commit, first-event, and total latency.
 
 Recovery tracing adds `sandbox.recovery.started`, `sandbox.recovery.retry_scheduled`, `sandbox.recovery.completed`, `sandbox.recovery.aborted`, `sandbox.credential_refresh`, and transition-only `prism.circuit.changed`. These events contain only project/worker indexes, bounded categories, counters, durations, and HTTP status codes—never sandbox/session IDs, URLs, cookies, tokens, prompts, or responses. `/__sandboxes` exposes process-local runtime incarnations, bounded recovery counters, and sidecar peer age; periodic `fleet.sample` additionally records the sanitized provisioning-circuit state.
 
@@ -220,6 +220,8 @@ Diagnose a slow multi-agent run in this order:
 5. Normal first-event latency with high total duration means long reasoning or generation.
 6. One runtime with worse RTT, completion EWMA, failures, or quarantine indicates sandbox imbalance.
 7. High event-loop p95/max points to local CPU or synchronous work.
+8. `rate_limit.*.state=cold` with `queued>0` means the bounded unknown-budget ceiling is applying backpressure; it must not appear as a local 429.
+9. `ambiguous_quarantined >= ambiguity_limit` should be followed by one supervised runtime replacement; cancellation-only churn must leave `ambiguous_quarantined=0`.
 
 For boundary-level V2 diagnostics, explicitly enable instrumentation, manually restart once so the sidecars redeploy, then run the paid controlled 1/4/8/16 WebSocket probe:
 
@@ -251,6 +253,39 @@ Operational recovery states are intentionally distinct:
 
 Heartbeat requests have a five-second deadline inside the exact ten-second cadence, so a hung proxy request cannot freeze liveness detection. The stable registry entry exposes zero capacity while its disposable child is recovering. Project creation remains controlled exclusively by initial fleet reconciliation and `GP_AUTO_CREATE_PROJECTS`; the recovery path never calls project creation or deletion.
 
+## Host supervision and rolling upgrades
+
+`bun run start:supervised` runs a cross-platform supervisor that owns the public loopback port and proxies to one internal GhostProv worker. It restarts crashed workers with bounded backoff. A planned `bun run upgrade` stops new worker dispatch, lets existing HTTP responses finish, closes persistent Responses WebSockets with restart code `1012`, gracefully stops the old worker, starts exactly one replacement, then releases requests queued at the stable public listener. Old and new workers never manage the same Prism projects concurrently.
+
+The supervisor exposes `GET /__supervisor`, writes its current state to `.ghostprov/supervisor.json`, and appends bounded structured history to `.ghostprov/logs/supervisor.jsonl`. `host.supervisor.sample` records request rate, proxy errors, queued/active requests, WebSockets, generations, crashes, restart backoff, and upgrade duration. The first migration from a directly bound `18787` process still requires the operator to stop that old process once; after the supervisor owns the port, upgrades do not require rebinding it.
+
+Foreground controls work on both Windows and Linux:
+
+```text
+bun run start:supervised
+bun run upgrade
+bun run stop:supervised
+```
+
+Windows user service (Task Scheduler, restarted on failure):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 install
+powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 restart
+powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 status
+```
+
+Linux user service (systemd):
+
+```bash
+bash scripts/ghostprov_service.sh install
+bash scripts/ghostprov_service.sh restart   # systemctl --user reload
+bash scripts/ghostprov_service.sh status
+journalctl --user -u ghostprov.service -f
+```
+
+For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
+
 Project deletion is never automatic. Preview managed targets first:
 
 ```powershell
@@ -273,6 +308,11 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
 | `GP_TRANSPORT` | `auto` | `v2`, `v1`, or authenticated rollout fallback; guests are V2-only |
 | `GP_RATE_LIMIT_SHARED_MODEL_GROUPS` | unset | Dashboard-declared shared TPM groups: `model-a,model-b;model-c,model-d` |
+| `GP_RATE_LIMIT_COLD_MAX_ACTIVE` | `16` | Per-model parallel requests before Prism exposes a TPM budget; excess work queues |
+| `GP_SUPERVISOR_READY_TIMEOUT_MS` | `120000` | Maximum internal-worker startup time |
+| `GP_SHUTDOWN_DRAIN_MS` | `300000` | Maximum wait for active terminal proofs during graceful shutdown |
+| `GP_SUPERVISOR_GRACE_MS` | `330000` | Graceful drain before force-stopping only the owned worker |
+| `GP_SUPERVISOR_REQUEST_WAIT_MS` | `480000` | Maximum public-listener queue wait during restart |
 | `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
 | `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16` | Maximum adaptive active request limit |
@@ -351,6 +391,7 @@ The isolated suite includes:
 - `tests/fleet-manager.test.ts`
 - `tests/graceful-shutdown.test.ts`
 - `tests/heartbeat.test.ts`
+- `tests/host-supervisor.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
 - `tests/http-streaming.test.ts`

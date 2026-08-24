@@ -12,6 +12,8 @@ export interface RoutableSandboxSnapshot {
   active: number;
   available: number;
   quarantined: number;
+  ambiguousQuarantined?: number;
+  ambiguityLimit?: number;
   heartbeatAgeMs: number | null;
   sidecarPeerAgeMs?: number | null;
   credentialExpiresInMs: number | null;

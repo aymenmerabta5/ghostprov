@@ -13,6 +13,7 @@ import {
 import { projectId } from "../src/sandbox/types";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
+import { closeResponsesWebSockets } from "../src/ws/server";
 
 const servers: Server[] = [];
 
@@ -320,6 +321,25 @@ describe("router HTTP composition", () => {
     await completed;
     expect(router.workloads.at(-1)?.source).toBe("websocket");
     socket.close();
+  });
+
+  it("closes owned WebSockets with a restart code after graceful drain", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const closed = new Promise<number>(resolve => socket.once("close", code => resolve(code)));
+
+    await closeResponsesWebSockets(server, { timeoutMs: 1_000 });
+    expect(await closed).toBe(1012);
   });
 
   it("reserves HTTP body memory before buffering and releases it after parsing", async () => {
