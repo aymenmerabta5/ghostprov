@@ -1,6 +1,10 @@
 import { AnthropicRequestError } from "./errors";
 import { resolveAnthropicModel, type AnthropicModelOptions } from "./model";
-import { translateMessages, translateSystem } from "./request-content";
+import {
+  translateMessages,
+  translateSystem,
+  type AnthropicMessageRolePolicy,
+} from "./request-content";
 import {
   translateMetadata,
   translateOutputConfig,
@@ -82,6 +86,21 @@ type SharedRequestParts = {
   privacy: ReturnType<typeof translateMetadata>;
 };
 
+const MID_CONVERSATION_SYSTEM_MODELS = new Set([
+  "claude-fable-5",
+  "claude-mythos-5",
+  "claude-opus-4-8",
+  "claude-opus-5",
+]);
+
+function messageRolePolicy(model: string): AnthropicMessageRolePolicy {
+  const normalized = model.trim().toLowerCase();
+  if (!normalized.startsWith("claude-")) return "custom";
+  return MID_CONVERSATION_SYSTEM_MODELS.has(normalized)
+    ? "mid-conversation-system"
+    : "standard";
+}
+
 function requireRequestBase(value: unknown, limits: AnthropicRequestLimits): ValidatedRequestBase {
   const body = requireRecord(value, "request");
   if (typeof body.model !== "string" || !body.model.trim()) {
@@ -129,8 +148,7 @@ function sharedRequestParts(
   validatePromptCacheControls(body, limits);
   const mediaBudget = new RequestMediaBudget(limits.mediaBytes);
   const model = String(body.model);
-  const allowControlRoles = !model.toLowerCase().startsWith("claude-");
-  const input = translateMessages(messages, mediaBudget, limits, allowControlRoles);
+  const input = translateMessages(messages, mediaBudget, limits, messageRolePolicy(model));
   const instructions = translateSystem(body.system, limits);
   const tools = translateTools(body.tools, limits);
   const declaredToolNames = new Set(tools.map(tool => tool.name));

@@ -274,6 +274,59 @@ describe("Anthropic HTTP routes", () => {
     expect(router.calls).toHaveLength(0);
   });
 
+  it("shares current mid-conversation system validation between generation and count", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const validMessages = [
+      { role: "user", content: "Apply an updated constraint" },
+      { role: "system", content: "Use the updated constraint" },
+    ];
+
+    for (const path of ["/v1/messages", "/v1/messages/count_tokens"]) {
+      const response = await app.request(path, {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify({
+          model: "claude-opus-5",
+          ...(path === "/v1/messages" ? { max_tokens: 64 } : {}),
+          messages: validMessages,
+        }),
+      });
+      expect(response.status, path).toBe(200);
+    }
+    expect(router.calls).toHaveLength(1);
+
+    const invalid = [
+      {
+        name: "unsupported model",
+        model: "claude-sonnet-5",
+        messages: validMessages,
+        error: /system role is not supported for this model/i,
+      },
+      {
+        name: "invalid placement",
+        model: "claude-opus-5",
+        messages: [{ role: "system", content: "too early" }],
+        error: /system message must immediately follow a user turn/i,
+      },
+    ];
+    for (const value of invalid) {
+      for (const path of ["/v1/messages", "/v1/messages/count_tokens"]) {
+        const response = await app.request(path, {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify({
+            model: value.model,
+            ...(path === "/v1/messages" ? { max_tokens: 64 } : {}),
+            messages: value.messages,
+          }),
+        });
+        await expectAnthropicError(response, 400, value.error);
+      }
+    }
+    expect(router.calls, "invalid requests must not dispatch").toHaveLength(1);
+  });
+
   it("activates beta response shapes from a nonempty anthropic-beta header", async () => {
     const router = new FakeRouter();
     const app = createGhostProvApp({ router });

@@ -98,16 +98,172 @@ describe("Anthropic request current contracts", () => {
     ]);
   });
 
-  it("keeps standard Claude Messages restricted to user and assistant roles", () => {
-    for (const role of ["system", "developer"]) {
-      expectInvalid(request({ messages: [{ role, content: "not a standard Messages role" }] }),
-        "role must be user or assistant");
+  it("accepts final mid-conversation system messages on currently supported Claude models", () => {
+    for (const model of [
+      "claude-fable-5",
+      "claude-mythos-5",
+      "claude-opus-4-8",
+      "claude-opus-5",
+    ]) {
+      const input = translate(request({
+        model,
+        messages: [
+          { role: "user", content: "Apply an updated constraint" },
+          { role: "system", content: "Use the updated constraint" },
+        ],
+      })).relayBody.input;
+
+      expect(input.at(-1), model).toEqual({
+        type: "message",
+        role: "system",
+        content: [{ type: "input_text", text: "Use the updated constraint" }],
+      });
+    }
+  });
+
+  it("accepts a supported mid-conversation system message before an assistant turn", () => {
+    const input = translate(request({
+      model: "claude-opus-5",
+      messages: [
+        { role: "user", content: "Apply an updated constraint" },
+        { role: "system", content: "Use the updated constraint" },
+        { role: "assistant", content: "Understood" },
+      ],
+    })).relayBody.input;
+
+    expect(input.map(item => item.type)).toEqual(["message", "message", "message"]);
+    expect(input[1]).toMatchObject({ role: "system" });
+    expect(input[2]).toMatchObject({ role: "assistant", content: "Understood" });
+  });
+
+  it("accepts a supported system message after a user tool-result turn", () => {
+    const input = translate(request({
+      model: "claude-opus-5",
+      messages: [
+        { role: "user", content: "Read the file" },
+        { role: "assistant", content: [toolUse("call_read")] },
+        { role: "user", content: [toolResult("call_read", "contents")] },
+        { role: "system", content: "Now summarize only the key point" },
+      ],
+    })).relayBody.input;
+
+    expect(input.slice(-2)).toEqual([
+      { type: "function_call_output", call_id: "call_read", output: "contents" },
+      {
+        type: "message",
+        role: "system",
+        content: [{ type: "input_text", text: "Now summarize only the key point" }],
+      },
+    ]);
+  });
+
+  it("rejects mid-conversation system messages on unsupported Claude models", () => {
+    for (const model of [
+      "claude-sonnet-5",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6",
+      "claude-haiku-5",
+      "claude-unknown",
+    ]) {
+      expectInvalid(request({
+        model,
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "system", content: "unsupported update" },
+        ],
+      }), "system role is not supported for this model");
+    }
+  });
+
+  it("keeps developer messages exclusive to custom non-Claude models", () => {
+    for (const model of [
+      "claude-fable-5",
+      "claude-mythos-5",
+      "claude-opus-4-8",
+      "claude-opus-5",
+      "claude-sonnet-5",
+    ]) {
+      expectInvalid(request({
+        model,
+        messages: [{ role: "developer", content: "not an Anthropic role" }],
+      }), "developer role is only supported for custom models");
+    }
+  });
+
+  it("normalizes surrounding model whitespace before selecting the role policy", () => {
+    const supported = translate(request({
+      model: "  claude-opus-5  ",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: "supported update" },
+      ],
+    })).relayBody.input;
+    expect(supported.at(-1)).toMatchObject({ role: "system" });
+
+    expectInvalid(request({
+      model: "  claude-sonnet-5  ",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: "unsupported update" },
+      ],
+    }), "system role is not supported for this model");
+    expectInvalid(request({
+      model: "  claude-opus-5  ",
+      messages: [{ role: "developer", content: "not an Anthropic role" }],
+    }), "developer role is only supported for custom models");
+  });
+
+  it("enforces current mid-conversation system placement", () => {
+    const cases: Array<[unknown[], string]> = [
+      [
+        [{ role: "system", content: "too early" }],
+        "system message must immediately follow a user turn",
+      ],
+      [
+        [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "answer" },
+          { role: "system", content: "misplaced" },
+        ],
+        "system message must immediately follow a user turn",
+      ],
+      [
+        [
+          { role: "user", content: "hello" },
+          { role: "system", content: "misplaced" },
+          { role: "user", content: "continue" },
+        ],
+        "system message must be final or immediately followed by an assistant turn",
+      ],
+      [
+        [
+          { role: "user", content: "hello" },
+          { role: "system", content: "first" },
+          { role: "system", content: "second" },
+        ],
+        "system message must be final or immediately followed by an assistant turn",
+      ],
+    ];
+
+    for (const [messages, error] of cases) {
+      expectInvalid(request({ model: "claude-opus-5", messages }), error);
     }
   });
 
   it("does not let compatibility control roles interrupt pending tool results", () => {
     expectInvalid(request({
       model: "gpt-5.6-sol",
+      messages: [
+        { role: "assistant", content: [toolUse("call_pending")] },
+        { role: "system", content: "intervening control message" },
+        { role: "user", content: [toolResult("call_pending")] },
+      ],
+    }), "system turn intervened before pending tool_result blocks");
+  });
+
+  it("does not let a supported system message interrupt pending tool results", () => {
+    expectInvalid(request({
+      model: "claude-opus-5",
       messages: [
         { role: "assistant", content: [toolUse("call_pending")] },
         { role: "system", content: "intervening control message" },

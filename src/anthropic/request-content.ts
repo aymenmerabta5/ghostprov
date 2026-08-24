@@ -424,10 +424,15 @@ type LogicalMessage = {
   name: string;
 };
 
+export type AnthropicMessageRolePolicy =
+  | "standard"
+  | "mid-conversation-system"
+  | "custom";
+
 function coalesceMessages(
   messages: unknown[],
   limits: AnthropicRequestLimits,
-  allowControlRoles: boolean,
+  rolePolicy: AnthropicMessageRolePolicy,
 ): LogicalMessage[] {
   const logical: LogicalMessage[] = [];
   for (let index = 0; index < messages.length; index += 1) {
@@ -441,8 +446,14 @@ function coalesceMessages(
         `${name}.role must be user, assistant, system, or developer`,
       );
     }
-    if (controlRole && !allowControlRoles) {
-      throw new AnthropicRequestError(400, `${name}.role must be user or assistant`);
+    if (role === "system" && rolePolicy === "standard") {
+      throw new AnthropicRequestError(400, "system role is not supported for this model");
+    }
+    if (role === "developer" && rolePolicy !== "custom") {
+      throw new AnthropicRequestError(
+        400,
+        "developer role is only supported for custom models",
+      );
     }
     if (typeof message.content !== "string" && !Array.isArray(message.content)) {
       throw new AnthropicRequestError(400, `${name}.content must be a string or an array`);
@@ -451,7 +462,9 @@ function coalesceMessages(
       ? [{ type: "text", text: message.content }]
       : contentBlocks(message.content, `${name}.content`, limits);
     const previous = logical.at(-1);
-    if (previous?.role === role) {
+    const shouldCoalesce = previous?.role === role &&
+      (role !== "system" || rolePolicy !== "mid-conversation-system");
+    if (shouldCoalesce) {
       previous.content.push(...blocks);
       if (previous.content.length > limits.maxArrayItems) {
         throw new AnthropicRequestError(
@@ -470,7 +483,7 @@ export function translateMessages(
   messages: unknown[],
   budget: RequestMediaBudget,
   limits: AnthropicRequestLimits,
-  allowControlRoles = false,
+  rolePolicy: AnthropicMessageRolePolicy = "standard",
 ): ResponsesInputItem[] {
   const input: ResponsesInputItem[] = [];
   const history: ToolHistory = {
@@ -479,7 +492,9 @@ export function translateMessages(
     pending: new Set(),
   };
 
-  for (const message of coalesceMessages(messages, limits, allowControlRoles)) {
+  const logicalMessages = coalesceMessages(messages, limits, rolePolicy);
+  for (let index = 0; index < logicalMessages.length; index += 1) {
+    const message = logicalMessages[index];
     if (message.role === "user") {
       appendUserMessage(input, message.content, message.name, history, budget, limits);
     } else if (message.role === "assistant") {
@@ -495,6 +510,23 @@ export function translateMessages(
           400,
           `${message.role} turn intervened before pending tool_result blocks`,
         );
+      }
+      if (message.role === "system" && rolePolicy === "mid-conversation-system") {
+        if (logicalMessages[index - 1]?.role !== "user") {
+          throw new AnthropicRequestError(
+            400,
+            "system message must immediately follow a user turn",
+          );
+        }
+        if (
+          index + 1 < logicalMessages.length &&
+          logicalMessages[index + 1].role !== "assistant"
+        ) {
+          throw new AnthropicRequestError(
+            400,
+            "system message must be final or immediately followed by an assistant turn",
+          );
+        }
       }
       const content = message.content.map((block, index) => {
         const name = `${message.name}.content[${index}]`;
