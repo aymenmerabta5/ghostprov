@@ -366,7 +366,9 @@ export class ResponsesStreamProtocol {
   #argumentsDone(event: Record<string, unknown>): void {
     const item = this.#eventItem(event, "function_call");
     if (item.argumentsDone || item.done) fail();
-    requiredString(event, "name");
+    // Current GPT Responses streams omit `name` here; the authoritative alias
+    // arrives on response.output_item.added/done. Validate it when repeated.
+    if (event.name !== undefined) requiredString(event, "name");
     const args = requiredText(event, "arguments");
     if (args.length < item.argumentUnits) fail();
     this.#acceptedSuffix = { category: "function", value: args.slice(item.argumentUnits) };

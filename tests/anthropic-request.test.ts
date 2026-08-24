@@ -581,7 +581,7 @@ describe("Anthropic request translation", () => {
       [request({ max_tokens: 1.5 }), "max_tokens must be a nonnegative integer"],
       [request({ messages: "hello" }), "messages is required"],
       [request({ messages: [null] }), "messages[0] must be an object"],
-      [request({ messages: [{ role: "system", content: "no" }] }), "messages[0].role"],
+      [request({ messages: [{ role: "invalid", content: "no" }] }), "messages[0].role"],
       [request({ messages: [{ role: "user", content: 17 }] }), "messages[0].content"],
       [request({ messages: [{ role: "user", content: [null] }] }), "content[0] must be an object"],
       [

@@ -81,6 +81,23 @@ function toolResult(id: string, content: unknown = "ok"): Record<string, unknown
 }
 
 describe("Anthropic request current contracts", () => {
+  it("preserves Claude Code custom-model system and developer message roles", () => {
+    const translated = translate(request({
+      model: "gpt-5.6-sol",
+      messages: [
+        { role: "user", content: "Hi" },
+        { role: "system", content: "Claude Code compatibility instructions" },
+        { role: "developer", content: [{ type: "text", text: "Use tools safely" }] },
+      ],
+    }));
+
+    expect(translated.relayBody.input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Hi" }] },
+      { type: "message", role: "system", content: [{ type: "input_text", text: "Claude Code compatibility instructions" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "Use tools safely" }] },
+    ]);
+  });
+
   it("uses exact Responses easy-input text parts for assistant history", () => {
     const body = translate(request({
       messages: [

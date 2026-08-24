@@ -588,7 +588,6 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
     expectError(functionDone.push(frame(5, "response.function_call_arguments.done", {
       item_id: "fc_bad_done",
       output_index: 0,
-      arguments: "{}",
     })));
 
     const missingStatus = new AnthropicStreamTranslator(context({ maxTokensZero: true }));
@@ -603,6 +602,34 @@ describe("Anthropic stream identity and lifecycle integrity", () => {
         arguments: "",
       },
     })));
+  });
+
+  it("accepts the live function-arguments done shape without a repeated name", () => {
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    translator.start();
+    expect(translator.push(frame(0, "response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_live_shape",
+        status: "in_progress",
+        call_id: "call_live_shape",
+        name: "Write",
+        arguments: "",
+      },
+    }))).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "error" })]));
+    expect(translator.push(frame(1, "response.function_call_arguments.delta", {
+      item_id: "fc_live_shape",
+      output_index: 0,
+      delta: "{\"file_path\":\"proof.txt\"}",
+    }))).toEqual([]);
+
+    const done = translator.push(frame(2, "response.function_call_arguments.done", {
+      item_id: "fc_live_shape",
+      output_index: 0,
+      arguments: "{\"file_path\":\"proof.txt\"}",
+    }));
+    expect(done).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "error" })]));
   });
 
   it("recursively validates known output item members during prewarm", () => {

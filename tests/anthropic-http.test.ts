@@ -484,8 +484,8 @@ describe("Anthropic HTTP routes", () => {
     const malformed = [
       {
         name: "message role",
-        body: { model: "claude-sonnet-4-6", messages: [{ role: "system", content: "x" }] },
-        message: /role must be user or assistant/i,
+        body: { model: "claude-sonnet-4-6", messages: [{ role: "invalid", content: "x" }] },
+        message: /role must be user, assistant, system, or developer/i,
       },
       {
         name: "message content",

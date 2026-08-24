@@ -422,7 +422,7 @@ function appendAssistantMessage(
 }
 
 type LogicalMessage = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system" | "developer";
   content: Record<string, unknown>[];
   name: string;
 };
@@ -436,8 +436,11 @@ function coalesceMessages(
     const name = `messages[${index}]`;
     const message = requireRecord(messages[index], name);
     const role = message.role;
-    if (role !== "user" && role !== "assistant") {
-      throw new AnthropicRequestError(400, `${name}.role must be user or assistant`);
+    if (role !== "user" && role !== "assistant" && role !== "system" && role !== "developer") {
+      throw new AnthropicRequestError(
+        400,
+        `${name}.role must be user, assistant, system, or developer`,
+      );
     }
     if (typeof message.content !== "string" && !Array.isArray(message.content)) {
       throw new AnthropicRequestError(400, `${name}.content must be a string or an array`);
@@ -476,13 +479,35 @@ export function translateMessages(
   for (const message of coalesceMessages(messages, limits)) {
     if (message.role === "user") {
       appendUserMessage(input, message.content, message.name, history, budget, limits);
-    } else {
+    } else if (message.role === "assistant") {
       if (history.pending.size) {
         throw new AnthropicRequestError(400, "assistant turn intervened before pending tool_result blocks");
       }
       history.pending = new Set(
         appendAssistantMessage(input, message.content, message.name, history, limits),
       );
+    } else {
+      if (history.pending.size) {
+        throw new AnthropicRequestError(
+          400,
+          `${message.role} turn intervened before pending tool_result blocks`,
+        );
+      }
+      const content = message.content.map((block, index) => {
+        const name = `${message.name}.content[${index}]`;
+        const type = blockType(block, name);
+        if (type !== "text") {
+          throw new AnthropicRequestError(
+            400,
+            `unsupported ${message.role} content block type: ${type}`,
+          );
+        }
+        return {
+          type: "input_text" as const,
+          text: requireString(block, "text", `${name} text`, true),
+        };
+      });
+      input.push({ type: "message", role: message.role, content });
     }
   }
 

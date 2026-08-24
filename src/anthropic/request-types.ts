@@ -26,6 +26,11 @@ export type ResponsesMessageInput =
     type: "message";
     role: "assistant";
     content: ResponsesInputText[];
+  }
+  | {
+    type: "message";
+    role: "system" | "developer";
+    content: ResponsesInputText[];
   };
 
 export type ResponsesFunctionCallInput = {

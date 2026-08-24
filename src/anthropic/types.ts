@@ -47,7 +47,8 @@ export type AnthropicAdapterStopReason = Extract<
 >;
 
 export type AnthropicMessageParam = {
-  role: "user" | "assistant";
+  /** system/developer are Claude Code custom-model compatibility extensions. */
+  role: "user" | "assistant" | "system" | "developer";
   content: string | AnthropicContentBlock[];
 };
 
