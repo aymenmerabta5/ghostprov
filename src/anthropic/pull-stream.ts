@@ -36,6 +36,8 @@ export function createAnthropicPullStream(
   const iterator = options.handle.events();
   const output: string[] = options.translator.start().map(anthropicSseFrame);
   let pendingRead: Promise<PendingRead> | null = null;
+  let pendingFinal: Promise<FinalRead> | null = null;
+  let iteratorDone = false;
   let upstreamDone = false;
   let closed = false;
   let iteratorReturned = false;
@@ -101,15 +103,18 @@ export function createAnthropicPullStream(
     });
   };
 
-  const readFinal = (): Promise<FinalRead> => {
-    try {
-      return Promise.resolve(options.handle.final).then(
-        value => ({ kind: "final" as const, value }),
-        error => ({ kind: "error" as const, error }),
-      );
-    } catch (error) {
-      return Promise.resolve({ kind: "error", error });
+  const startFinal = (): Promise<FinalRead> => {
+    if (!pendingFinal) {
+      try {
+        pendingFinal = Promise.resolve(options.handle.final).then(
+          value => ({ kind: "final" as const, value }),
+          error => ({ kind: "error" as const, error }),
+        );
+      } catch (error) {
+        pendingFinal = Promise.resolve({ kind: "error", error });
+      }
     }
+    return pendingFinal;
   };
 
   const fail = (error: unknown): void => {
@@ -134,6 +139,23 @@ export function createAnthropicPullStream(
           return;
         }
 
+        if (iteratorDone) {
+          const final = await Promise.race([startFinal(), keepAlive(), closedRead]);
+          clearKeepAlive();
+          if (final.kind === "closed" || closed) return;
+          if (final.kind === "keepalive") {
+            controller.enqueue(encoder.encode(": keepalive\n\n"));
+            return;
+          }
+          pendingFinal = null;
+          if (final.kind === "error") fail(final.error);
+          else {
+            append(options.translator.finish(final.value));
+            upstreamDone = true;
+          }
+          continue;
+        }
+
         const winner = await Promise.race([startRead(), keepAlive(), closedRead]);
         clearKeepAlive();
         if (winner.kind === "closed" || closed) return;
@@ -148,13 +170,7 @@ export function createAnthropicPullStream(
           continue;
         }
         if (winner.result.done) {
-          const final = await Promise.race([readFinal(), closedRead]);
-          if (final.kind === "closed" || closed) return;
-          if (final.kind === "error") fail(final.error);
-          else {
-            append(options.translator.finish(final.value));
-            upstreamDone = true;
-          }
+          iteratorDone = true;
           continue;
         }
         const terminal = append(options.translator.push(winner.result.value));

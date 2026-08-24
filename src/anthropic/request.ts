@@ -14,6 +14,10 @@ import {
 } from "./request-options";
 import type { ResponsesInputItem, ResponsesRequestBody } from "./request-types";
 import {
+  validateContextManagement,
+  validatePromptCacheControls,
+} from "./request-extensions";
+import {
   type AnthropicRequestLimits,
   hasOwn,
   measureBoundedJson,
@@ -121,6 +125,8 @@ function sharedRequestParts(
   maxTokens: number,
   limits: AnthropicRequestLimits,
 ): SharedRequestParts {
+  validateContextManagement(body.context_management, limits);
+  validatePromptCacheControls(body, limits);
   const mediaBudget = new RequestMediaBudget(limits.mediaBytes);
   const input = translateMessages(messages, mediaBudget, limits);
   const instructions = translateSystem(body.system, limits);

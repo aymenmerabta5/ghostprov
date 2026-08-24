@@ -209,6 +209,7 @@ describe("Anthropic foundations", () => {
       [409, "conflict_error"],
       [413, "request_too_large"],
       [429, "rate_limit_error"],
+      [405, "invalid_request_error"],
       [504, "timeout_error"],
       [503, "overloaded_error"],
       [529, "overloaded_error"],
@@ -239,7 +240,11 @@ describe("Anthropic foundations", () => {
     const cases = [
       [new ApiError(502, "secret gateway response"), 500, "api_error", "Internal server error"],
       [new ApiError(503, "secret capacity detail"), 529, "overloaded_error", "Service temporarily overloaded"],
+      [new ApiError(501, "secret unsupported detail"), 500, "api_error", "Internal server error"],
+      [new ApiError(599, "secret proxy detail"), 500, "api_error", "Internal server error"],
+      [new ApiError(405, "secret method detail"), 405, "invalid_request_error", "Invalid request"],
       [new ApiError(504, "secret timeout detail"), 504, "timeout_error", "Request timed out"],
+      [new ApiError(529, "secret overloaded detail"), 529, "overloaded_error", "Service temporarily overloaded"],
     ] as const;
     for (const [error, status, type, message] of cases) {
       const response = anthropicErrorResponse(error, "req_safe");
@@ -263,6 +268,30 @@ describe("Anthropic foundations", () => {
     expect(response.headers.get("x-should-retry")).toBe("false");
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(JSON.stringify(await response.json())).not.toContain("secret quota");
+  });
+
+  it("accepts only bounded retry seconds or canonical HTTP dates", () => {
+    const cases = [
+      ["12", "12"],
+      ["Sun, 06 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 08:49:37 GMT"],
+      ["retry after secret backend detail", null],
+      ["999999999999999999999", null],
+      ["Sunday, 06-Nov-94 08:49:37 GMT", null],
+      ["Sun, 06 Nov 1994 08:49:37 UTC", null],
+    ] as const;
+    for (const [value, expected] of cases) {
+      const error = Object.assign(new ApiError(429, "private"), {
+        headers: { "retry-after": value },
+      });
+      expect(anthropicErrorResponse(error, "req_retry").headers.get("retry-after"))
+        .toBe(expected);
+    }
+
+    const noncanonicalBoolean = Object.assign(new ApiError(429, "private"), {
+      headers: { "x-should-retry": "TRUE" },
+    });
+    expect(anthropicErrorResponse(noncanonicalBoolean, "req_retry")
+      .headers.get("x-should-retry")).toBeNull();
   });
 
   it("exposes permissive current request and response wire types", () => {

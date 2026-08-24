@@ -43,6 +43,8 @@ export type AnthropicMessageDeltaEvent = {
   type: "message_delta";
   context_management?: AnthropicContextManagementResponse | null;
   delta: {
+    container: null;
+    stop_details: null;
     stop_reason: AnthropicAdapterStopReason;
     stop_sequence: string | null;
   };

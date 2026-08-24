@@ -613,6 +613,8 @@ export class AnthropicStreamTranslator {
         ? { context_management: this.#context.contextManagement ?? null }
         : {}),
       delta: {
+        container: null,
+        stop_details: null,
         stop_reason: converted.stop_reason,
         stop_sequence: converted.stop_sequence,
       },

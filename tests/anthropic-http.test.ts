@@ -261,7 +261,7 @@ describe("Anthropic HTTP routes", () => {
           "content-type": "application/json",
           "anthropic-version": "2023-06-01",
           authorization: "Bearer ignored",
-          "anthropic-beta": "unknown-beta",
+          ...(path.includes("beta=true") ? { "anthropic-beta": "unknown-beta" } : {}),
         },
         body: JSON.stringify(body),
       });
@@ -272,6 +272,176 @@ describe("Anthropic HTTP routes", () => {
         : { input_tokens: estimateAnthropicInputTokens(body) });
     }
     expect(router.calls).toHaveLength(0);
+  });
+
+  it("activates beta response shapes from a nonempty anthropic-beta header", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const headers = { ...ANTHROPIC_HEADERS, "anthropic-beta": "context-management-2025-06-27" };
+    const message = await app.request("/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(messageRequest({ context_management: { edits: [] } })),
+    });
+    const count = await app.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        messages: [],
+        context_management: { edits: [] },
+      }),
+    });
+    const stable = await app.request("/v1/messages", {
+      method: "POST",
+      headers: { ...ANTHROPIC_HEADERS, "anthropic-beta": "   " },
+      body: JSON.stringify(messageRequest()),
+    });
+
+    expect((await message.json() as any).context_management).toEqual({ applied_edits: [] });
+    expect(await count.json()).toMatchObject({ context_management: null });
+    expect(await stable.json()).not.toHaveProperty("context_management");
+  });
+
+  it("validates current context-management edits for generation and count", async () => {
+    const invalid = [
+      null,
+      {},
+      { edits: "not-an-array" },
+      { edits: [{ type: "unknown_edit" }] },
+      { edits: [{ type: "clear_tool_uses_20250919", clear_tool_inputs: ["Read", 7] }] },
+      { edits: [{ type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: -1 } }] },
+      { edits: [{ type: "compact_20260112", pause_after_compaction: "yes" }] },
+    ];
+    for (const context_management of invalid) {
+      for (const path of ["/v1/messages?beta=true", "/v1/messages/count_tokens?beta=true"]) {
+        const router = new FakeRouter();
+        const body = path.includes("count_tokens")
+          ? { model: "claude-sonnet-4-6", messages: [], context_management }
+          : messageRequest({ context_management });
+        const response = await createGhostProvApp({ router }).request(path, {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json() as any).error.message).toMatch(/context_management/i);
+        expect(router.calls).toHaveLength(0);
+      }
+    }
+
+    const valid = {
+      edits: [
+        {
+          type: "clear_tool_uses_20250919",
+          clear_at_least: { type: "input_tokens", value: 100 },
+          clear_tool_inputs: ["Read"],
+          exclude_tools: ["Keep"],
+          keep: { type: "tool_uses", value: 2 },
+          trigger: { type: "tool_uses", value: 10 },
+        },
+        { type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 2 } },
+        {
+          type: "compact_20260112",
+          instructions: "Keep decisions",
+          pause_after_compaction: false,
+          trigger: { type: "input_tokens", value: 1000 },
+        },
+      ],
+    };
+    const router = new FakeRouter();
+    const response = await createGhostProvApp({ router }).request("/v1/messages?beta=true", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ context_management: valid })),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).context_management).toEqual({ applied_edits: [] });
+  });
+
+  it("validates and strips prompt cache controls for generation and count", async () => {
+    const malformedBodies = [
+      messageRequest({ cache_control: "ephemeral" }),
+      messageRequest({ cache_control: { type: "persistent" } }),
+      messageRequest({
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: "10m" } }],
+        }],
+      }),
+      messageRequest({
+        system: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: null } }],
+      }),
+      messageRequest({
+        tools: [{
+          name: "Read",
+          input_schema: { type: "object" },
+          cache_control: { type: "ephemeral", ttl: "forever" },
+        }],
+      }),
+      messageRequest({
+        messages: [{
+          role: "user",
+          content: [{
+            type: "document",
+            source: {
+              type: "content",
+              content: [{
+                type: "text",
+                text: "nested",
+                cache_control: { type: "persistent" },
+              }],
+            },
+          }],
+        }],
+      }),
+    ];
+    for (const generationBody of malformedBodies) {
+      for (const path of ["/v1/messages", "/v1/messages/count_tokens"]) {
+        const router = new FakeRouter();
+        const body = path.endsWith("count_tokens")
+          ? Object.fromEntries(Object.entries(generationBody).filter(([key]) => key !== "max_tokens"))
+          : generationBody;
+        const response = await createGhostProvApp({ router }).request(path, {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json() as any).error.message).toMatch(/cache_control/i);
+        expect(router.calls).toHaveLength(0);
+      }
+    }
+
+    const valid = messageRequest({
+      cache_control: null,
+      system: [{
+        type: "text",
+        text: "system",
+        cache_control: { type: "ephemeral", ttl: "1h", future: true },
+      }],
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text",
+          text: "hello",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        }],
+      }],
+      tools: [{
+        name: "Read",
+        input_schema: { type: "object" },
+        cache_control: { type: "ephemeral" },
+      }],
+    });
+    const router = new FakeRouter();
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(valid),
+    });
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(router.calls[0].body)).not.toContain("cache_control");
   });
 
   it("applies current Messages validation to count-token inputs without dispatch", async () => {
@@ -452,7 +622,7 @@ describe("Anthropic HTTP routes", () => {
       const response = await app.request(path, { method: "PUT" });
       const body = await expectAnthropicError(response, 405, /method.*not allowed/i);
       expect(response.headers.get("allow")).toBe("POST");
-      expect(body.error.type).toBe("api_error");
+      expect(body.error.type).toBe("invalid_request_error");
     }
     expect(router.calls).toHaveLength(0);
   });
@@ -623,6 +793,87 @@ describe("Anthropic HTTP routes", () => {
     expect(text).not.toContain("final secret");
   });
 
+  it("settles non-stream cancellation without waiting for noncooperative final or drain", async () => {
+    let nextCalls = 0;
+    let returnCalls = 0;
+    let relayStarted!: () => void;
+    const started = new Promise<void>(resolve => { relayStarted = resolve; });
+    const iterator = {
+      next() {
+        nextCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      return() {
+        returnCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter(() => {
+      relayStarted();
+      return relayHandle(new Promise(() => undefined), () => iterator);
+    });
+    const incoming = new AbortController();
+    const pending = createGhostProvApp({ router }).fetch(new Request(
+      "http://local/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest()),
+        signal: incoming.signal,
+      },
+    ));
+    await started;
+    await waitFor(() => nextCalls === 1, "non-stream drain did not start");
+    incoming.abort();
+
+    const response = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error("non-stream cancellation waited for noncooperative work")),
+        100,
+      )),
+    ]);
+    expect(response.status).toBe(499);
+    expect(returnCalls).toBe(1);
+  });
+
+  it("bounds non-stream failure cleanup when the drain never cooperates", async () => {
+    let settleNext!: (result: IteratorResult<SseFrame>) => void;
+    let returnCalls = 0;
+    const iterator = {
+      next: () => new Promise<IteratorResult<SseFrame>>(resolve => { settleNext = resolve; }),
+      return() {
+        returnCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter(() => relayHandle(
+      Promise.reject(new Error("final failure secret")),
+      () => iterator,
+    ));
+    const pending = Promise.resolve(createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest()),
+    }));
+    const winner = await Promise.race([
+      pending.then(response => ({ response })),
+      new Promise<{ response: null }>(resolve => setTimeout(() => resolve({ response: null }), 100)),
+    ]);
+    if (winner.response === null) {
+      settleNext({ done: true, value: undefined });
+      await pending;
+    }
+
+    expect(winner.response).not.toBeNull();
+    expect(winner.response?.status).toBe(500);
+    expect(returnCalls).toBe(1);
+  });
+
   it("sanitizes pre-stream upstream failures and preserves only retry headers", async () => {
     const upstream = Object.assign(
       new ApiError(502, "secret upstream response body", { type: "upstream_error" }),
@@ -686,6 +937,7 @@ describe("Anthropic HTTP routes", () => {
     const delta = events.find(event => event.type === "message_delta");
     expect(start?.message.context_management).toEqual({ applied_edits: [] });
     expect(delta?.context_management).toEqual({ applied_edits: [] });
+    expect(delta?.delta).toMatchObject({ container: null, stop_details: null });
     expect(start?.message).not.toHaveProperty("diagnostics");
     expect(events.every(event => !("diagnostics" in event))).toBe(true);
     expect(router.calls).toHaveLength(1);
@@ -843,6 +1095,55 @@ describe("Anthropic HTTP routes", () => {
     await pending.catch(() => undefined);
 
     expect(finalConsumed).toBe(false);
+  });
+
+  it("keeps one pending final promise while emitting keepalives and cancels it promptly", async () => {
+    let resolveFinal!: (value: unknown) => void;
+    let finalAccesses = 0;
+    let returnCalls = 0;
+    const final = new Promise<unknown>(resolve => { resolveFinal = resolve; });
+    const iterator = {
+      next: () => Promise.resolve({ done: true as const, value: undefined }),
+      return() {
+        returnCalls += 1;
+        return Promise.resolve({ done: true as const, value: undefined });
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter(() => ({
+      events: () => iterator,
+      get final() {
+        finalAccesses += 1;
+        return final;
+      },
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }));
+    const response = await createGhostProvApp({ router, keepAliveMs: 10 }).request(
+      "/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest({ stream: true })),
+      },
+    );
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    await reader.read();
+    try {
+      const first = await Promise.race([
+        reader.read(),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 100)),
+      ]);
+      expect(first).not.toBeNull();
+      expect(decoder.decode(first?.value)).toBe(": keepalive\n\n");
+      expect(decoder.decode((await reader.read()).value)).toBe(": keepalive\n\n");
+      expect(finalAccesses).toBe(1);
+    } finally {
+      await reader.cancel("pending final cancellation");
+      resolveFinal(completed("resp_after_cancel"));
+    }
+    expect(returnCalls).toBe(1);
   });
 
   it("converts synchronous iterator.next failures into a safe terminal error", async () => {
@@ -1087,6 +1388,33 @@ describe("Anthropic runtime body limits", () => {
         300,
       )),
     ]);
+  });
+
+  it("sanitizes an internal body-admission 413 instead of trusting its message", async () => {
+    const base = new FakeRouter();
+    const router: RouterLike = {
+      snapshot: () => base.snapshot(),
+      startRelay: (body, options) => base.startRelay(body, options),
+      acquireIncomingBody: () => Promise.reject(new ApiError(
+        413,
+        "secret body admission accounting detail",
+        { code: "request_too_large" },
+      )),
+    };
+    const port = await listen(createGhostProvApp({ router }), router);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest()),
+    });
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(413);
+    expect(body).toMatchObject({
+      type: "error",
+      error: { type: "request_too_large", message: "Request too large" },
+    });
+    expect(JSON.stringify(body)).not.toContain("secret body admission accounting detail");
   });
 });
 

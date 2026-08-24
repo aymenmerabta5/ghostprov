@@ -9,7 +9,6 @@ import {
   requestPath,
 } from "../http/request-policy";
 import {
-  AnthropicRequestError,
   anthropicErrorResponse,
   newAnthropicRequestId,
 } from "../anthropic/errors";
@@ -38,10 +37,7 @@ function bodyTooLarge(maxBodyBytes: number): ApiError {
 
 function requestErrorResponse(error: unknown, anthropic: boolean): Response {
   if (!anthropic) return apiErrorResponse(error);
-  const normalized = error instanceof ApiError && error.status === 413
-    ? new AnthropicRequestError(413, error.message, "request_too_large")
-    : error;
-  return anthropicErrorResponse(normalized, newAnthropicRequestId());
+  return anthropicErrorResponse(error, newAnthropicRequestId());
 }
 
 export function createGhostProvServer(options: GhostProvServerOptions): Server {

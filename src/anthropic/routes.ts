@@ -35,6 +35,7 @@ const ANTHROPIC_SSE_HEADERS = {
 } as const;
 
 const ANTHROPIC_VERSION = "2023-06-01";
+const NONSTREAM_CLEANUP_MS = 25;
 
 async function jsonBody(request: { json(): Promise<unknown> }): Promise<unknown> {
   try {
@@ -105,9 +106,16 @@ function betaContextManagement(
     : null;
 }
 
+function betaRequest(request: {
+  query(name: string): string | undefined;
+  header(name: string): string | undefined;
+}): boolean {
+  return request.query("beta") === "true" || Boolean(request.header("anthropic-beta")?.trim());
+}
+
 function methodNotAllowed(requestId: string): Response {
   const response = anthropicErrorResponse(
-    new AnthropicRequestError(405, "Method not allowed", "api_error"),
+    new AnthropicRequestError(405, "Method not allowed"),
     requestId,
   );
   response.headers.set("allow", "POST");
@@ -120,39 +128,103 @@ async function discardRelayEvents(iterator: AsyncGenerator<unknown>): Promise<vo
   }
 }
 
+type AsyncOutcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: unknown };
+
+function settle<T>(promise: Promise<T>): Promise<AsyncOutcome<T>> {
+  return promise.then(
+    value => ({ ok: true, value }),
+    error => ({ ok: false, error }),
+  );
+}
+
+function cancellation(signal: AbortSignal): {
+  promise: Promise<{ cancelled: true; error: unknown }>;
+  dispose(): void;
+} {
+  let onAbort: (() => void) | undefined;
+  const promise = new Promise<{ cancelled: true; error: unknown }>(resolve => {
+    const finish = () => resolve({
+      cancelled: true,
+      error: signal.reason ?? new DOMException("Request was cancelled", "AbortError"),
+    });
+    if (signal.aborted) finish();
+    else {
+      onAbort = finish;
+      signal.addEventListener("abort", finish, { once: true });
+    }
+  });
+  return {
+    promise,
+    dispose() {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      onAbort = undefined;
+    },
+  };
+}
+
+async function boundedCleanup(promises: readonly Promise<unknown>[]): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, NONSTREAM_CLEANUP_MS);
+  });
+  await Promise.race([Promise.all(promises).then(() => undefined), timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+}
+
 async function nonStreamingFinal(
   handle: RunHandle,
   controller: AbortController,
 ): Promise<unknown> {
   const iterator = handle.events();
   const drain = discardRelayEvents(iterator);
+  let iteratorReturned = false;
+  const returnIterator = (): void => {
+    if (iteratorReturned) return;
+    iteratorReturned = true;
+    try {
+      void Promise.resolve(iterator.return(undefined)).catch(() => undefined);
+    } catch {
+      // Cancellation/error completion never depends on iterator cooperation.
+    }
+  };
   let final: Promise<unknown>;
   try {
     final = Promise.resolve(handle.final);
   } catch (error) {
-    if (!controller.signal.aborted) controller.abort(error);
-    try {
-      void iterator.return(undefined).catch(() => undefined);
-    } catch {
-      // The route-local abort remains authoritative if iterator teardown throws.
-    }
-    await Promise.allSettled([drain]);
-    throw error;
+    final = Promise.reject(error);
   }
+  const finalOutcome = settle(final);
+  const drainOutcome = settle(drain);
+  const work = Promise.race([
+    finalOutcome.then(result => ({ source: "final" as const, result })),
+    drainOutcome.then(result => ({ source: "drain" as const, result })),
+  ]).then(async first => {
+    if (!first.result.ok) {
+      return { completed: false as const, error: first.result.error };
+    }
+    const second = first.source === "final" ? await drainOutcome : await finalOutcome;
+    if (!second.ok) return { completed: false as const, error: second.error };
+    const finalResult = first.source === "final" ? first.result : second;
+    return { completed: true as const, value: finalResult.value };
+  });
+  const cancelled = cancellation(controller.signal);
+  const winner = await Promise.race([work, cancelled.promise]);
+  cancelled.dispose();
 
-  try {
-    const [value] = await Promise.all([final, drain]);
-    return value;
-  } catch (error) {
-    if (!controller.signal.aborted) controller.abort(error);
-    try {
-      void iterator.return(undefined).catch(() => undefined);
-    } catch {
-      // The route-local abort remains authoritative if iterator teardown throws.
-    }
-    await Promise.allSettled([final, drain]);
-    throw error;
+  if ("cancelled" in winner) {
+    returnIterator();
+    void Promise.all([finalOutcome, drainOutcome]);
+    throw winner.error;
   }
+  if (!winner.completed) {
+    if (!controller.signal.aborted) controller.abort(winner.error);
+    returnIterator();
+    await boundedCleanup([finalOutcome, drainOutcome]);
+    throw winner.error;
+  }
+  return winner.value;
 }
 
 export function registerAnthropicRoutes(
@@ -165,7 +237,7 @@ export function registerAnthropicRoutes(
       validateProtocolHeaders(c.req);
       const body = await jsonBody(c.req);
       validateAnthropicCountTokenRequest(body);
-      const beta = c.req.query("beta") === "true";
+      const beta = betaRequest(c.req);
       return c.json(
         {
           input_tokens: estimateAnthropicInputTokens(body),
@@ -187,7 +259,7 @@ export function registerAnthropicRoutes(
       validateProtocolHeaders(c.req);
       const body = await jsonBody(c.req);
       const translated = translateAnthropicRequest(body, { models: dependencies.models });
-      const beta = c.req.query("beta") === "true";
+      const beta = betaRequest(c.req);
       const context = responseContext(
         translated,
         requestId,
