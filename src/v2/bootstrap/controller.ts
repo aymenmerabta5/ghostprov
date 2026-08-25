@@ -81,6 +81,16 @@ function processInterlockHelpers(): string[] {
     "  my @gp_fields = gp_proc_fields($_[0]);",
     "  return @gp_fields > 18 && $gp_fields[18] =~ /^\\d+$/ ? $gp_fields[18] : '';",
     "}",
+    "sub gp_process_state_start {",
+    "  my ($gp_pid) = @_;",
+    "  my $gp_stat = gp_read_file(\"/proc/$gp_pid/stat\", 4096);",
+    "  return () unless defined $gp_stat;",
+    "  my ($gp_state, $gp_tail) = $gp_stat =~ /^\\d+\\s+\\(.*\\)\\s+(\\S+)\\s+(.*)$/s;",
+    "  return () unless defined($gp_state) && defined($gp_tail);",
+    "  my @gp_fields = split /\\s+/, $gp_tail;",
+    "  return () unless @gp_fields > 18 && $gp_fields[18] =~ /^\\d+$/;",
+    "  return ($gp_state, $gp_fields[18]);",
+    "}",
     "sub gp_process_matches {",
     "  my ($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
     "  return 0 unless $gp_pid =~ /^\\d+$/ && $gp_pid > 1;",
@@ -88,16 +98,46 @@ function processInterlockHelpers(): string[] {
     "  return 0 unless defined $gp_cmd;",
     "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
     "  return 0 unless @gp_args && $gp_args[0] =~ m{(?:^|/)deno$};",
-    "  return 0 unless grep { $_ eq $gp_expected_entrypoint } @gp_args;",
-    "  return 0 unless grep { $_ eq \"--ghostprov-launch-nonce=$gp_nonce\" } @gp_args;",
-    "  return 0 unless grep { $_ eq \"--ghostprov-process-start=$gp_start\" } @gp_args;",
+    "  my @gp_entries = grep { $_ eq $gp_expected_entrypoint } @gp_args;",
+    "  my @gp_nonces = grep { $_ eq \"--ghostprov-launch-nonce=$gp_nonce\" } @gp_args;",
+    "  my @gp_starts = grep { $_ eq \"--ghostprov-process-start=$gp_start\" } @gp_args;",
+    "  return 0 unless @gp_entries == 1 && @gp_nonces == 1 && @gp_starts == 1;",
     "  my @gp_fields = gp_proc_fields($gp_pid);",
     "  return 0 unless @gp_fields > 18;",
     "  return 0 unless $gp_fields[1] eq \"$gp_pid\" && $gp_fields[2] eq \"$gp_pid\";",
     "  return 0 unless $gp_fields[18] eq \"$gp_start\";",
     "  return 1;",
     "}",
-    "sub gp_group_alive { return kill(0, -$_[0]) ? 1 : 0; }",
+    "sub gp_exact_r2_entrypoint {",
+    "  my ($gp_pid) = @_;",
+    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
+    "  return undef unless defined $gp_cmd;",
+    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r2/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
+    "}",
+    "sub gp_exact_sidecar_entrypoint {",
+    "  my ($gp_pid) = @_;",
+    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
+    "  return undef unless defined $gp_cmd;",
+    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[12]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
+    "}",
+    "sub gp_group_alive {",
+    "  my ($gp_group) = @_;",
+    "  return 0 unless defined($gp_group) && $gp_group =~ /^\\d+$/ && $gp_group > 1;",
+    "  for my $gp_stat_path (glob('/proc/[0-9]*/stat')) {",
+    "    my $gp_stat = gp_read_file($gp_stat_path, 4096);",
+    "    next unless defined $gp_stat;",
+    "    my ($gp_state, $gp_tail) = $gp_stat =~ /^\\d+\\s+\\(.*\\)\\s+(\\S+)\\s+(.*)$/s;",
+    "    next unless defined($gp_state) && defined($gp_tail);",
+    "    my @gp_fields = split /\\s+/, $gp_tail;",
+    "    next unless @gp_fields > 2;",
+    "    return 1 if $gp_state ne 'Z' && $gp_state ne 'X' && $gp_state ne 'x' && $gp_fields[1] eq \"$gp_group\" && $gp_fields[2] eq \"$gp_group\";",
+    "  }",
+    "  return 0;",
+    "}",
     "sub gp_identity_is_current {",
     "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock) = @_;",
     "  return $gp_require_lock ? gp_owner_record_is_locked($gp_identity_path, $gp_identity_record) : gp_record_is($gp_identity_path, $gp_identity_record);",
@@ -242,16 +282,26 @@ export type V2BootstrapErrorKind =
   | "readiness"
   | "timeout";
 
+export interface V2SidecarFatalDiagnostic {
+  readonly errorName: string;
+  readonly errorCode: string;
+  readonly causeName: string | null;
+}
+
 export class V2BootstrapError extends Error {
   readonly name = "V2BootstrapError";
+  readonly operation: "bootstrap" | "render";
+  readonly sidecarDiagnostic: V2SidecarFatalDiagnostic | null;
 
   constructor(
     message: string,
     readonly kind: V2BootstrapErrorKind,
     readonly attempt: number,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { sidecarDiagnostic?: V2SidecarFatalDiagnostic },
   ) {
     super(message, options);
+    this.operation = kind === "render" ? "render" : "bootstrap";
+    this.sidecarDiagnostic = options?.sidecarDiagnostic ?? null;
   }
 }
 
@@ -304,10 +354,12 @@ function temporaryLauncher(
   entrypointPath: string,
   launchNonce: string,
   revision: V2SidecarRevision,
+  staticConfig: string,
 ): string {
   const workspaceEntrypoint = `/workspace/${entrypointPath}`;
   const expected = perlSingleQuoted(workspaceEntrypoint);
   const nonce = perlSingleQuoted(launchNonce);
+  const expectedStatic = perlSingleQuoted(staticConfig);
   const helloExpression = revision === "r2"
     ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$gp_pid"'
     : '"$gp_dir/bootstrap-hello"';
@@ -323,6 +375,7 @@ function temporaryLauncher(
     "my $gp_owner_file = '/tmp/ghostprov-v2/sidecar.owner.lock';",
     `my $gp_expected = '${expected}';`,
     `my $gp_launch_nonce = '${nonce}';`,
+    `my $gp_expected_static = '${expectedStatic}';`,
     `my $gp_require_owner = ${revision === "r2" ? 1 : 0};`,
     "my $gp_hello = '';",
     "my $gp_candidate_pid_file = '';",
@@ -337,11 +390,76 @@ function temporaryLauncher(
     "mkdir $gp_dir, 0700 unless -d $gp_dir;",
     "unlink $gp_log if -e $gp_log;",
     "unlink $gp_tex if -e $gp_tex;",
+    // A delayed render must not retire the owner chosen by a newer binding.
+    // The canonical static config contains the project/session/generation,
+    // release hashes, protocol revision, launch nonce, and runtime limits.
+    "my $gp_current_static = gp_read_file('/workspace/.ghostprov-v2/static.json', 16384);",
+    "if (!defined($gp_current_static) || $gp_current_static ne $gp_expected_static) { $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
     "my $gp_deno = '';",
     "for my $gp_candidate (grep { defined $_ && length $_ } ($ENV{DENO_BIN}, '/usr/local/bin/deno', '/usr/bin/deno', '/root/.deno/bin/deno', '/code/crixet/deno')) { if (-x $gp_candidate) { $gp_deno = $gp_candidate; last; } }",
     "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
-    "if (!$gp_deno) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
-    "if ($gp_deno) {",
+    "if (!$gp_deno && !$gp_launch_error) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
+    // A host restart does not imply a sandbox restart. Retire a prior R2
+    // owner before forking the fresh nonce; otherwise tryLock correctly makes
+    // every new child lose forever. The locked owner record, canonical PID
+    // record, Linux start tick, process group/session, immutable entrypoint,
+    // and argv nonce are all revalidated immediately before either signal.
+    "my $gp_prior_owner = $gp_deno && !$gp_launch_error ? gp_owner_record_if_locked($gp_owner_file) : undef;",
+    "if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner) {",
+    "    my ($gp_owner_instance, $gp_owner_nonce, $gp_owner_pid, $gp_owner_time) = $gp_prior_owner =~ /^\\{\"version\":1,\"instanceId\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"nonce\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"pid\":([0-9]+),\"acquiredAtMs\":([0-9]+)\\}$/;",
+    "    my $gp_prior_pid_record = gp_read_file($gp_pid_file, 4096);",
+    "    my ($gp_prior_pid, $gp_prior_nonce, $gp_prior_start) = defined($gp_prior_pid_record) ? $gp_prior_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n$/ : ();",
+    "    my $gp_prior_entrypoint = defined($gp_prior_pid) ? gp_exact_r2_entrypoint($gp_prior_pid) : undef;",
+    "    if (!defined($gp_owner_pid) || !defined($gp_prior_start) || !defined($gp_prior_entrypoint) || $gp_owner_pid ne $gp_prior_pid || $gp_owner_pid < 2) {",
+    "      $gp_launch_error = 'existing owned sidecar identity is incomplete';",
+    "    } elsif (!gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)) {",
+    "      $gp_launch_error = 'existing owned sidecar process identity is invalid';",
+    "    } else {",
+    "      my $gp_prior_stopped = gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint);",
+    "      if (!$gp_prior_stopped) {",
+    "        $gp_launch_error = 'existing owned sidecar could not be retired safely';",
+    "      } else {",
+    "        gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_prior_pid_record);",
+    "        $gp_launch_error = 'existing sidecar ownership lock did not release' if defined gp_owner_record_if_locked($gp_owner_file);",
+    "      }",
+    "    }",
+    "} elsif ($gp_deno && !$gp_launch_error) {",
+    "  if (!open my $gp_preflight_owner_fh, '+>>', $gp_owner_file) {",
+    "    $gp_launch_error = 'unable to open sidecar ownership interlock';",
+    "  } elsif (!flock($gp_preflight_owner_fh, LOCK_EX | LOCK_NB)) {",
+    "    close $gp_preflight_owner_fh;",
+    "    $gp_launch_error = 'sidecar ownership changed during startup preflight';",
+    "  } else {",
+    "    chmod 0600, $gp_owner_file;",
+    "    my $gp_unowned_pid_record = gp_read_file($gp_pid_file, 4096);",
+    "    if (defined $gp_unowned_pid_record) {",
+    "      my ($gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start) = $gp_unowned_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n$/;",
+    "      if (!defined($gp_unowned_start) || $gp_unowned_pid < 2) {",
+    "        $gp_launch_error = 'unowned sidecar PID identity is malformed';",
+    "      } else {",
+    "        my ($gp_live_state, $gp_live_start) = gp_process_state_start($gp_unowned_pid);",
+    "        if (!defined($gp_live_state)) {",
+    "          if (-d \"/proc/$gp_unowned_pid\") { $gp_launch_error = 'unowned sidecar process identity cannot be inspected'; }",
+    "          else { unlink $gp_pid_file if gp_record_is($gp_pid_file, $gp_unowned_pid_record); }",
+    "        } elsif ($gp_live_state eq 'Z' || $gp_live_state eq 'X' || $gp_live_state eq 'x' || $gp_live_start ne $gp_unowned_start) {",
+    "          unlink $gp_pid_file if gp_record_is($gp_pid_file, $gp_unowned_pid_record);",
+    "        } else {",
+    "          my $gp_unowned_entrypoint = gp_exact_sidecar_entrypoint($gp_unowned_pid);",
+    "          if (!defined($gp_unowned_entrypoint) || !gp_process_matches($gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint)) {",
+    "            $gp_launch_error = 'unowned live sidecar identity is not an immutable GhostProv release';",
+    "          } else {",
+    "            my $gp_unowned_stopped = gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint);",
+    "            if (!$gp_unowned_stopped) { $gp_launch_error = 'unowned sidecar could not be retired safely'; }",
+    "            elsif (gp_record_is($gp_pid_file, $gp_unowned_pid_record)) { unlink $gp_pid_file; }",
+    "          }",
+    "        }",
+    "      }",
+    "    }",
+    "    flock($gp_preflight_owner_fh, LOCK_UN);",
+    "    close $gp_preflight_owner_fh;",
+    "  }",
+    "}",
+    "if ($gp_deno && !$gp_launch_error) {",
     "  my $gp_pid = fork();",
     "  die 'GhostProv V2 fork failed' unless defined $gp_pid;",
     "  if ($gp_pid > 0) {",
@@ -416,7 +534,7 @@ function temporaryLauncher(
     "  }",
     "  unlink $gp_hello if $gp_hello && -e $gp_hello;",
     "  my $gp_diag = $gp_launch_error || 'sidecar log is missing';",
-    "  if (!$gp_launch_error && open my $gp_log_fh, '<', $gp_log) { local $/; $gp_diag = <$gp_log_fh>; close $gp_log_fh; }",
+    "  if (open my $gp_log_fh, '<', $gp_log) { local $/; my $gp_sidecar_diag = <$gp_log_fh>; close $gp_log_fh; $gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag); }",
     "  $gp_diag = substr($gp_diag // '', 0, 4096);",
     "  $gp_marker = gp_hex_diag($gp_diag);",
     "}",
@@ -439,15 +557,60 @@ function sanitizeSidecarDiagnostic(value: string): string {
   return sanitized || "unknown sidecar launch failure";
 }
 
-function decodeSidecarDiagnostic(value: string): string {
+interface DecodedSidecarDiagnostic {
+  readonly message: string;
+  readonly fatal: V2SidecarFatalDiagnostic | null;
+}
+
+function parseSidecarFatalDiagnostic(value: string): V2SidecarFatalDiagnostic | null {
+  const lines = value.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!.trim();
+    if (!line.startsWith("{") || !line.endsWith("}") || line.length > 1_024) continue;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (
+        !exactKeys(parsed, ["event", "error_name", "error_code", "cause_name"]) ||
+        parsed.event !== "ghostprov_v2_sidecar_fatal" ||
+        typeof parsed.error_name !== "string" ||
+        !SAFE_ID.test(parsed.error_name) ||
+        typeof parsed.error_code !== "string" ||
+        !SAFE_ID.test(parsed.error_code) ||
+        !(
+          parsed.cause_name === null ||
+          (typeof parsed.cause_name === "string" && SAFE_ID.test(parsed.cause_name))
+        )
+      ) continue;
+      return Object.freeze({
+        errorName: parsed.error_name,
+        errorCode: parsed.error_code,
+        causeName: parsed.cause_name as string | null,
+      });
+    } catch {
+      // Only the sidecar's exact bounded JSON fatal record is structured.
+    }
+  }
+  return null;
+}
+
+function decodeSidecarDiagnostic(value: string): DecodedSidecarDiagnostic {
   if (value.length < 2 || value.length > 8192 || value.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(value)) {
-    return "malformed sidecar launch diagnostic";
+    return { message: "malformed sidecar launch diagnostic", fatal: null };
   }
   const bytes = new Uint8Array(value.length / 2);
   for (let index = 0; index < bytes.length; index++) {
     bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
   }
-  return sanitizeSidecarDiagnostic(utf8Text(bytes));
+  let decoded: string;
+  try {
+    decoded = utf8Text(bytes);
+  } catch {
+    return { message: "malformed sidecar launch diagnostic", fatal: null };
+  }
+  return {
+    message: sanitizeSidecarDiagnostic(decoded),
+    fatal: parseSidecarFatalDiagnostic(decoded),
+  };
 }
 
 function renderLogText(value: string): string {
@@ -1038,24 +1201,26 @@ export class V2BootstrapController {
     attempt: number,
     signal?: AbortSignal,
   ): Promise<V2ReadyDescriptor> {
+    const staticConfig = canonicalJson({
+      version: 1,
+      binding,
+      physicalMax: this.#physicalMax,
+      acceptedMax: this.#acceptedMax,
+      initialActivePerSandbox: this.#initialActivePerSandbox,
+      maxActivePerSandbox: this.#maxActivePerSandbox,
+      memoryBudgetBytes: this.#memoryBudgetBytes,
+      diagnostics: this.#diagnostics,
+      batching: this.#batching,
+    });
     try {
-      await this.#ydoc.writePath(STATIC_PATH, canonicalJson({
-        version: 1,
-        binding,
-        physicalMax: this.#physicalMax,
-        acceptedMax: this.#acceptedMax,
-        initialActivePerSandbox: this.#initialActivePerSandbox,
-        maxActivePerSandbox: this.#maxActivePerSandbox,
-        memoryBudgetBytes: this.#memoryBudgetBytes,
-        diagnostics: this.#diagnostics,
-        batching: this.#batching,
-      }));
+      await this.#ydoc.writePath(STATIC_PATH, staticConfig);
       await this.#ydoc.writePath(
         LAUNCHER_PATH,
         temporaryLauncher(
           this.#assets.entrypointPath,
           binding.nonce,
           this.#selectedRevision,
+          staticConfig,
         ),
       );
       await this.#gateway.syncWorkspace(signal);
@@ -1144,10 +1309,12 @@ export class V2BootstrapController {
         }
         const diagnostic = extractWrappedMarker(log, SIDECAR_HEX_PREFIX, /^[0-9a-fA-F]+/, 8_192);
         if (diagnostic) {
+          const decoded = decodeSidecarDiagnostic(diagnostic);
           throw new V2BootstrapError(
-            `V2 sidecar failed before bootstrap hello: ${decodeSidecarDiagnostic(diagnostic)}`,
+            `V2 sidecar failed before bootstrap hello: ${decoded.message}`,
             "hello",
             attempt,
+            decoded.fatal ? { sidecarDiagnostic: decoded.fatal } : undefined,
           );
         }
       }

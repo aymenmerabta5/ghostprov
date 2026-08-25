@@ -16,6 +16,15 @@ function redactFailureMessage(value: string): string {
 
 export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
   const record = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const rawSidecar = record.sidecarDiagnostic;
+  const sidecar = rawSidecar && typeof rawSidecar === "object" && !Array.isArray(rawSidecar)
+    ? rawSidecar as Record<string, unknown>
+    : null;
+  const sidecarErrorName = safeDetail(sidecar?.errorName);
+  const sidecarErrorCode = safeDetail(sidecar?.errorCode);
+  const sidecarCauseName = sidecar?.causeName === null
+    ? null
+    : safeDetail(sidecar?.causeName);
   const rawMessage = error instanceof Error ? error.message : String(error ?? "Sandbox runtime failed");
   const rawName = error instanceof Error ? error.name : "Error";
   const status = typeof record.status === "number" && Number.isInteger(record.status) &&
@@ -28,5 +37,12 @@ export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
     status,
     operation: safeDetail(record.operation),
     message: redactFailureMessage(rawMessage) || "Sandbox runtime failed",
+    ...(sidecarErrorName && sidecarErrorCode
+      ? {
+          sidecarErrorName,
+          sidecarErrorCode,
+          sidecarCauseName,
+        }
+      : {}),
   };
 }

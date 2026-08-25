@@ -42,6 +42,7 @@ type Fault =
   | "wrong-generation"
   | "stale-instance"
   | "sidecar-log"
+  | "sidecar-fatal"
   | "sidecar-log-secret"
   | "timeout"
   | "first-wrong-nonce";
@@ -161,8 +162,19 @@ class FakeGateway implements V2BootstrapGateway {
     const keys = await createBootstrapKeyPair(helloBinding);
     const instanceId = `sidecar-instance-${this.renders}`;
     this.current = { binding: helloBinding, instanceId, keys };
-    if (this.fault === "sidecar-log" || this.fault === "sidecar-log-secret") {
-      const message = this.fault === "sidecar-log-secret"
+    if (
+      this.fault === "sidecar-log" ||
+      this.fault === "sidecar-fatal" ||
+      this.fault === "sidecar-log-secret"
+    ) {
+      const message = this.fault === "sidecar-fatal"
+        ? JSON.stringify({
+            event: "ghostprov_v2_sidecar_fatal",
+            error_name: "SidecarOwnershipError",
+            error_code: "contended",
+            cause_name: null,
+          })
+        : this.fault === "sidecar-log-secret"
         ? "Authorization: Bearer sk-bootstrap-secret-123456789012345678901234"
         : "Can't exec /code/crixet/deno: No such file or directory";
       const wrapped = Buffer.from(message).toString("hex").match(/.{1,48}/g)!.join("\n");
@@ -349,6 +361,24 @@ describe("V2BootstrapController", () => {
     expect(harness.ydoc.deleted.filter(path => path.endsWith("bootstrap.enc.json"))).toHaveLength(2);
   });
 
+  it("runs exact prior-owner retirement again before a retry fork", async () => {
+    const harness = bootstrapHarness("first-wrong-nonce", "r2", 8, R2_ASSETS);
+
+    await expect(harness.controller.ensureReady()).resolves.toMatchObject({
+      instanceId: "sidecar-instance-2",
+    });
+
+    expect(harness.gateway.launchers).toHaveLength(2);
+    for (const launcher of harness.gateway.launchers) {
+      const takeover = launcher.indexOf("my $gp_prior_owner = $gp_deno && !$gp_launch_error ? gp_owner_record_if_locked");
+      expect(takeover).toBeGreaterThan(-1);
+      expect(takeover).toBeLessThan(launcher.indexOf("my $gp_pid = fork()"));
+      expect(launcher).toContain(
+        "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
+      );
+    }
+  });
+
   it("atomically advances the build marker for the same V2 worker identity", async () => {
     const harness = bootstrapHarness();
     harness.ydoc.files.set(".ghostprov-v2/worker.json", canonicalJson({
@@ -455,6 +485,53 @@ describe("V2BootstrapController", () => {
     );
   });
 
+  it("retires a strictly proven prior R2 owner before forking a fresh build", async () => {
+    const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+    const denoDiscovery = launcher.indexOf("my $gp_deno = ''");
+    const authority = launcher.indexOf("bootstrap launcher binding is no longer current");
+    const takeover = launcher.indexOf("my $gp_prior_owner = $gp_deno && !$gp_launch_error ? gp_owner_record_if_locked");
+    const fork = launcher.indexOf("my $gp_pid = fork()");
+
+    expect(takeover).toBeGreaterThan(-1);
+    expect(denoDiscovery).toBeLessThan(takeover);
+    expect(authority).toBeGreaterThan(-1);
+    expect(authority).toBeLessThan(takeover);
+    expect(takeover).toBeLessThan(fork);
+    expect(launcher).toContain("$gp_current_static ne $gp_expected_static");
+    expect(launcher).toContain("if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner)");
+    expect(launcher).toContain("sub gp_exact_r2_entrypoint");
+    expect(launcher).toContain(
+      "/workspace/\\.ghostprov-v2/revisions/r2/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+    );
+    expect(launcher).toContain(
+      "gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
+    );
+    expect(launcher).toContain(
+      "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
+    );
+    expect(launcher).toContain(
+      "gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_prior_pid_record)",
+    );
+    expect(launcher).toContain("existing sidecar ownership lock did not release");
+    expect(launcher).toContain("if ($gp_deno && !$gp_launch_error)");
+    expect(launcher).toContain("sub gp_exact_sidecar_entrypoint");
+    expect(launcher).toContain(
+      "/workspace/\\.ghostprov-v2/revisions/r[12]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+    );
+    expect(launcher).toContain(
+      "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint)",
+    );
+    expect(launcher).toContain("sidecar ownership changed during startup preflight");
+    expect(launcher).toContain("sub gp_process_state_start");
+    expect(launcher).toContain("$gp_state ne 'Z' && $gp_state ne 'X' && $gp_state ne 'x'");
+    expect(launcher).toContain("$gp_live_state eq 'Z' || $gp_live_state eq 'X' || $gp_live_state eq 'x'");
+    expect(launcher).not.toContain(
+      "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_expected)",
+    );
+  });
+
   it("reaps an exit-fast contender and removes only its exact candidate identity", async () => {
     const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
     await harness.controller.ensureReady();
@@ -473,6 +550,9 @@ describe("V2BootstrapController", () => {
     expect(exited).toBeLessThan(pollSleep);
     expect(launcher).toContain("sidecar exited before bootstrap hello");
     expect(launcher).toContain(
+      "$gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag)",
+    );
+    expect(launcher).toContain(
       "($gp_reaped || $gp_stopped || !gp_group_alive($gp_child_pid)) && gp_record_is($gp_candidate_pid_file, $gp_candidate_record)",
     );
   });
@@ -484,6 +564,20 @@ describe("V2BootstrapController", () => {
       name: "V2BootstrapError",
       kind: "hello",
       message: "V2 sidecar failed before bootstrap hello: Can't exec /code/crixet/deno: No such file or directory",
+    });
+  });
+
+  it("preserves the exact allowlisted sidecar fatal category for recovery telemetry", async () => {
+    const harness = bootstrapHarness("sidecar-fatal");
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "hello",
+      sidecarDiagnostic: {
+        errorName: "SidecarOwnershipError",
+        errorCode: "contended",
+        causeName: null,
+      },
     });
   });
 

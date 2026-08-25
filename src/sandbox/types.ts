@@ -65,4 +65,8 @@ export interface SandboxFailureSnapshot {
   status: number | null;
   operation: string | null;
   message: string;
+  /** Bounded atoms emitted by the trusted sidecar fatal record, when present. */
+  sidecarErrorName?: string;
+  sidecarErrorCode?: string;
+  sidecarCauseName?: string | null;
 }

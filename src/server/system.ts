@@ -52,6 +52,9 @@ import {
   normalizeSandboxRecoveryErrorKind,
   normalizeSandboxRecoveryErrorName,
   normalizeSandboxRecoveryOperation,
+  normalizeV2SidecarFatalCauseName,
+  normalizeV2SidecarFatalErrorCode,
+  normalizeV2SidecarFatalErrorName,
   observabilityEvent,
   recoveryObservabilityEvent,
   type JsonValue,
@@ -524,6 +527,15 @@ function defaultRuntimeFactory(options: {
               : null,
             error_kind: failure
               ? normalizeSandboxRecoveryErrorKind(failure.kind)
+              : null,
+            sidecar_error_name: failure?.sidecarErrorName
+              ? normalizeV2SidecarFatalErrorName(failure.sidecarErrorName)
+              : null,
+            sidecar_error_code: failure?.sidecarErrorCode
+              ? normalizeV2SidecarFatalErrorCode(failure.sidecarErrorCode)
+              : null,
+            sidecar_cause_name: failure && "sidecarCauseName" in failure
+              ? normalizeV2SidecarFatalCauseName(failure.sidecarCauseName)
               : null,
             operation: failure
               ? normalizeSandboxRecoveryOperation(failure.operation)

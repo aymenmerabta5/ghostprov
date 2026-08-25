@@ -116,6 +116,51 @@ export const SANDBOX_RECOVERY_ERROR_KINDS = [
 ] as const;
 export type SandboxRecoveryErrorKind = typeof SANDBOX_RECOVERY_ERROR_KINDS[number];
 
+/** Exact secret-free atoms the R2 sidecar may emit in its fatal JSON record. */
+export const V2_SIDECAR_FATAL_ERROR_NAMES = [
+  "AggregateError",
+  "DOMException",
+  "Error",
+  "RangeError",
+  "SidecarLifecycleError",
+  "SidecarOwnershipError",
+  "SyntaxError",
+  "TypeError",
+  "unknown",
+] as const;
+export type V2SidecarFatalErrorName = typeof V2_SIDECAR_FATAL_ERROR_NAMES[number];
+
+export const V2_SIDECAR_FATAL_ERROR_CODES = [
+  "cleanup_timeout",
+  "contended",
+  "event_memory_leak",
+  "fatal",
+  "forced_drain",
+  "instance_mismatch",
+  "lost",
+  "storage",
+  "unknown",
+] as const;
+export type V2SidecarFatalErrorCode = typeof V2_SIDECAR_FATAL_ERROR_CODES[number];
+
+export const V2_SIDECAR_FATAL_CAUSE_NAMES = [
+  "AggregateError",
+  "AlreadyExists",
+  "BadResource",
+  "DOMException",
+  "Error",
+  "NotCapable",
+  "NotFound",
+  "PermissionDenied",
+  "RangeError",
+  "SidecarLifecycleError",
+  "SidecarOwnershipError",
+  "SyntaxError",
+  "TypeError",
+  "unknown",
+] as const;
+export type V2SidecarFatalCauseName = typeof V2_SIDECAR_FATAL_CAUSE_NAMES[number] | null;
+
 export const CREDENTIAL_REFRESH_OUTCOMES = [
   "cookie_retry_succeeded",
   "updated_in_place",
@@ -181,6 +226,9 @@ export interface RecoveryObservabilityFields {
   status?: number | null;
   error_name?: SandboxRecoveryErrorName | null;
   error_kind?: SandboxRecoveryErrorKind | null;
+  sidecar_error_name?: V2SidecarFatalErrorName | null;
+  sidecar_error_code?: V2SidecarFatalErrorCode | null;
+  sidecar_cause_name?: V2SidecarFatalCauseName;
   operation?: SandboxRecoveryOperation | null;
   retry_delay_ms?: number;
   attempt_duration_ms?: number;
@@ -195,6 +243,9 @@ const RECOVERY_CAUSE_SET = new Set<string>(SANDBOX_RECOVERY_CAUSES);
 const RECOVERY_OPERATION_SET = new Set<string>(SANDBOX_RECOVERY_OPERATIONS);
 const RECOVERY_ERROR_NAME_SET = new Set<string>(SANDBOX_RECOVERY_ERROR_NAMES);
 const RECOVERY_ERROR_KIND_SET = new Set<string>(SANDBOX_RECOVERY_ERROR_KINDS);
+const V2_SIDECAR_FATAL_ERROR_NAME_SET = new Set<string>(V2_SIDECAR_FATAL_ERROR_NAMES);
+const V2_SIDECAR_FATAL_ERROR_CODE_SET = new Set<string>(V2_SIDECAR_FATAL_ERROR_CODES);
+const V2_SIDECAR_FATAL_CAUSE_NAME_SET = new Set<string>(V2_SIDECAR_FATAL_CAUSE_NAMES);
 
 /** Collapse a possibly dynamic supervisor reason to a fixed safe category. */
 export function normalizeSandboxRecoveryCause(value: unknown): SandboxRecoveryCause {
@@ -251,6 +302,25 @@ export function normalizeSandboxRecoveryErrorKind(value: unknown): SandboxRecove
   return typeof value === "string" && RECOVERY_ERROR_KIND_SET.has(value)
     ? value as SandboxRecoveryErrorKind
     : "other";
+}
+
+export function normalizeV2SidecarFatalErrorName(value: unknown): V2SidecarFatalErrorName {
+  return typeof value === "string" && V2_SIDECAR_FATAL_ERROR_NAME_SET.has(value)
+    ? value as V2SidecarFatalErrorName
+    : "unknown";
+}
+
+export function normalizeV2SidecarFatalErrorCode(value: unknown): V2SidecarFatalErrorCode {
+  return typeof value === "string" && V2_SIDECAR_FATAL_ERROR_CODE_SET.has(value)
+    ? value as V2SidecarFatalErrorCode
+    : "unknown";
+}
+
+export function normalizeV2SidecarFatalCauseName(value: unknown): V2SidecarFatalCauseName {
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" && V2_SIDECAR_FATAL_CAUSE_NAME_SET.has(value)
+    ? value as Exclude<V2SidecarFatalCauseName, null>
+    : "unknown";
 }
 
 export function observabilityEvent(
