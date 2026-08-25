@@ -109,6 +109,8 @@ export interface V2PerformanceHarnessOptions {
   rttMs: number;
   requestBytes: number;
   concurrency: number;
+  /** Logical SSE events emitted per response, including created/completed. */
+  responseEventCount?: number;
   corpus?: V2PerformanceCorpus;
   linkBandwidthBytesPerSecond?: number;
   serializationBytesPerSecond?: number;
@@ -704,6 +706,8 @@ class DigestingUpstream {
   readonly proofs = new Map<number, UpstreamProof>();
   readonly #gate = new HoldGate();
 
+  constructor(readonly responseEventCount = 2) {}
+
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
     await input.beforeFetch();
     const body = JSON.parse(new TextDecoder().decode(input.body)) as {
@@ -746,6 +750,13 @@ class DigestingUpstream {
             response: { id: responseId },
           }),
         },
+        ...Array.from({ length: this.responseEventCount - 2 }, (_, eventIndex) => ({
+          event: "response.output_text.delta",
+          data: JSON.stringify({
+            type: "response.output_text.delta",
+            delta: `${index}:${eventIndex}`,
+          }),
+        })),
         {
           event: "response.completed",
           data: JSON.stringify({ type: "response.completed", response: final }),
@@ -974,7 +985,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       sampler,
     });
     let peer!: DenoAwarenessPeer;
-    const upstream = new DigestingUpstream();
+    const upstream = new DigestingUpstream(options.responseEventCount ?? 2);
     const engine = new SidecarEngine({
       binding,
       assembler: new RequestAssembler({
@@ -1329,6 +1340,13 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
     options.concurrency > 128
   ) {
     throw new RangeError("concurrency must be 1 through 128");
+  }
+  if (
+    options.responseEventCount !== undefined &&
+    (!Number.isSafeInteger(options.responseEventCount) ||
+      options.responseEventCount < 2 || options.responseEventCount > 4_096)
+  ) {
+    throw new RangeError("responseEventCount must be 2 through 4096");
   }
   if (
     options.corpus !== undefined &&

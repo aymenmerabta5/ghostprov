@@ -1302,6 +1302,14 @@ export class V2TransportSession {
     }
     this.#rotationStreams.clear();
     for (const waiter of [...this.#drainWaiters]) waiter.reject(preCommitError);
+    // Wake any reliable-data delivery currently waiting for client buffer
+    // space before joining the serialized processing tail. Teardown is already
+    // irreversible, so retaining a blocked producer here would deadlock close
+    // and prevent the state below from being classified and released.
+    for (const state of this.#requests.values()) {
+      if (this.#hasExecutionRisk(state)) state.handle.cancel(committedError);
+      else state.handle.fail(preCommitError);
+    }
     const teardown = Promise.resolve().then(async () => {
       await this.#joinProcessingTail();
       for (const state of [...this.#requests.values()]) {
@@ -2419,21 +2427,30 @@ export class V2TransportSession {
       state.completedEvents.delete(state.nextEventIndex);
       state.nextEventIndex++;
       const started = this.#clock.now();
-      let accepted: boolean;
       try {
-        accepted = state.handle.tryAcceptEvent(completed.frame, wireBytes, permit);
+        // Backpressure the reliable data lane instead of converting a short
+        // consumer pause into an ambiguous committed failure. While this
+        // awaits, the inbound cumulative ACK intentionally does not advance,
+        // so the sidecar's bounded reliable window and output backpressure
+        // stop upstream consumption. Control-lane liveness is observed before
+        // this serialized data path and therefore remains responsive.
+        await state.handle.acceptEvent(completed.frame, wireBytes, permit);
+        permit = undefined;
       } catch (error) {
-        permit?.release();
+        // V2RunHandle releases a transferred permit on rejection. A client
+        // abort may close the stream while delivery is waiting for space; the
+        // cancellation path owns that outcome and must not become ambiguity.
+        permit = undefined;
+        if (
+          !this.#ownsLifecycle(lifecycleEpoch) ||
+          !this.#requests.has(state.requestId) ||
+          state.cancelled
+        ) return;
         this.#failCommitted(state, new V2CommittedError(
           error instanceof Error ? error.message : "Host event delivery failed",
           "event_memory_delivery",
           true,
         ));
-        return;
-      }
-      if (!accepted) {
-        permit?.release();
-        this.#failEventMemory(state, "Slow consumer exhausted its immediate event buffer");
         return;
       }
       state.diagnostics.assemblyDelivered(this.#clock.now() - started);

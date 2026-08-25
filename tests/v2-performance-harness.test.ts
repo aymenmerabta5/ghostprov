@@ -18,13 +18,16 @@ import {
   type V2PerformanceHarnessReport,
 } from "./support/v2-performance-harness";
 
-function expectExactAndBounded(report: V2PerformanceHarnessReport): void {
+function expectExactAndBounded(
+  report: V2PerformanceHarnessReport,
+  expectedEventCount = 2,
+): void {
   expect(report.requests).toHaveLength(report.concurrency);
   expect(report.upstream.calls).toBe(report.concurrency);
   expect(report.upstream.maxActive).toBe(report.concurrency);
   expect(report.requests.every(value => value.exactRequest)).toBe(true);
   expect(report.requests.every(value => value.exactTerminal)).toBe(true);
-  expect(report.requests.every(value => value.eventCount === 2)).toBe(true);
+  expect(report.requests.every(value => value.eventCount === expectedEventCount)).toBe(true);
   expect(report.requests.every(value => value.ackRoundsAtCommit > 0)).toBe(true);
   expect(report.requests.every(value =>
     value.modeledFirstEventMs >= value.modeledCommitMs)).toBe(true);
@@ -350,5 +353,18 @@ describe("V2 deterministic performance harness", () => {
       // exact maximum proves no model-wide 16-request gate delayed dispatch.
       expect(report.upstream.maxActive).toBe(concurrency);
     }
+  }, 60_000);
+
+  it("delivers 17 concurrent 512-event bursts without ambiguity or loss", async () => {
+    const report = await runV2PerformanceHarness({
+      rttMs: 50,
+      requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.kib128,
+      concurrency: 17,
+      responseEventCount: 512,
+      timeoutMs: 60_000,
+    });
+
+    expectExactAndBounded(report, 512);
+    expect(report.timings.measuredWall.totalMs.p95).toBeLessThan(10_000);
   }, 60_000);
 });

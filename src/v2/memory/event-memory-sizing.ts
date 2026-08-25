@@ -16,8 +16,13 @@ export const V2_EVENT_JUMBO_OVERHEAD_BYTES = ATOMIC_EVENT_FIXED_OVERHEAD_BYTES;
 export const V2_EVENT_RETAINED_FACTOR = 4;
 /** Per buffered event references, queue entry, carrier, and allocator metadata. */
 export const V2_EVENT_RETAINED_OVERHEAD_BYTES = 4 * KiB;
-/** A byte bound alone does not constrain arbitrarily many empty/tiny events. */
-export const V2_EVENT_MAX_BUFFERED_EVENTS = 128;
+/**
+ * A byte bound alone does not constrain arbitrarily many empty/tiny events.
+ * Keep enough metadata slots for normal tool-heavy responses (pressure traces
+ * reached p95 ~= 350 events) while the byte bound and global permit pool still
+ * cap retained memory exactly.
+ */
+export const V2_EVENT_MAX_BUFFERED_EVENTS = 512;
 
 function checkedNonNegative(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 0) {

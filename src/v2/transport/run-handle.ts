@@ -241,10 +241,7 @@ export class V2RunHandle implements RunHandle {
     }
   }
 
-  /**
-   * Immediate delivery used by the cumulative transport receive chain. False
-   * leaves the transferred permit owned by the caller and never queues/waits.
-   */
+  /** Immediate optional admission. False retains caller permit ownership. */
   tryAcceptEvent(
     frame: SseFrame,
     knownWireBytes?: number,

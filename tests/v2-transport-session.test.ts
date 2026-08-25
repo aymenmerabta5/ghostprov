@@ -411,7 +411,7 @@ describe("V2TransportSession", () => {
     }
   });
 
-  it("observes a control pong after isolating a slow response consumer", async () => {
+  it("observes a control pong while the reliable data lane backpressures a slow consumer", async () => {
     const harness = new TransportHarness({
       autoPong: true,
       livenessTimeoutMs: 250,
@@ -432,12 +432,7 @@ describe("V2TransportSession", () => {
       dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
     })));
     await harness.settle();
-    await expect(handle.final).rejects.toMatchObject({
-      committed: true,
-      code: "event_memory_capacity",
-    });
-    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
-      .toBe(harness.sidecarSequence - 1);
+    expect(await promiseState(handle.final)).toBe("pending");
 
     const probing = harness.session.probeLiveness();
     await harness.settle();
@@ -447,14 +442,25 @@ describe("V2TransportSession", () => {
         throw new Error("liveness pong waited behind response backpressure");
       }),
     ])).resolves.toMatchObject({ sentAtMs: expect.any(Number) });
-    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
-      .toBe(harness.sidecarSequence - 1);
+    const events = handle.events();
+    for (let index = 0; index < 3; index++) {
+      await expect(events.next()).resolves.toMatchObject({
+        value: { event: "response.output_text.delta" },
+        done: false,
+      });
+      await harness.settle();
+    }
+    await harness.settleUntil(() => Math.max(
+      ...harness.hostEnvelopes.map(envelope => envelope.ack.sequence),
+    ) === harness.sidecarSequence - 1);
+    expect(await promiseState(handle.final)).toBe("pending");
+    await events.return(undefined);
 
     await harness.close();
     await Promise.allSettled([handle.final]);
   });
 
-  it("fails only the slow request without poisoning the transport", async () => {
+  it("lets cancellation close a backpressured request without poisoning the transport", async () => {
     const harness = new TransportHarness({
       maxResponseBytes: 4_096,
       maxBufferedResponseBytes: 160,
@@ -481,7 +487,7 @@ describe("V2TransportSession", () => {
     expect(await final).toMatchObject({
       committed: true,
       ambiguous: true,
-      code: "event_memory_capacity",
+      code: "cancelled",
     });
     expect(harness.session.snapshot()).toMatchObject({ connected: true });
     await harness.network.flushAll();
@@ -978,6 +984,58 @@ describe("V2TransportSession", () => {
     const final={id:"resp_batch",object:"response",status:"completed",output:[]};const events=[{event:"response.created",data:JSON.stringify({type:"response.created",response:{id:"resp_batch"}})},{event:"response.output_text.delta",data:JSON.stringify({type:"response.output_text.delta",delta:"hello"})},{event:"response.completed",data:JSON.stringify({type:"response.completed",response:final})}];const proof=new TranscriptProof(id.requestId,id.requestDigest);for(const event of events)proof.append(event);const terminal=await proof.createTerminal();
     harness.publish([{kind:"response_batch",requestId:id.requestId,firstEventIndex:0,items:events.map(event=>({event:event.event,dataBase64Url:base64UrlEncode(utf8Bytes(event.data))}))},terminal]);await harness.settle();const received=[];for await(const event of handle.events())received.push(event);expect(received).toEqual(events);await expect(handle.final).resolves.toMatchObject({id:"resp_batch"});await harness.close();
   });
+
+  it("backpressures a 768-event batched burst without ambiguity or loss", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    const identity = harness.requestIdentity();
+    const final = { id: "resp_burst", object: "response", status: "completed", output: [] };
+    const events = Array.from({ length: 768 }, (_, index) => index === 767
+      ? {
+          event: "response.completed",
+          data: JSON.stringify({ type: "response.completed", response: final }),
+        }
+      : {
+          event: "response.output_text.delta",
+          data: JSON.stringify({ type: "response.output_text.delta", delta: String(index) }),
+        });
+    const proof = new TranscriptProof(identity.requestId, identity.requestDigest);
+    for (const event of events) proof.append(event);
+    const batches = Array.from({ length: 24 }, (_, batchIndex) => ({
+      kind: "response_batch" as const,
+      requestId: identity.requestId,
+      firstEventIndex: batchIndex * 32,
+      items: events.slice(batchIndex * 32, batchIndex * 32 + 32).map(event => ({
+        event: event.event,
+        dataBase64Url: base64UrlEncode(utf8Bytes(event.data)),
+      })),
+    }));
+
+    harness.publish([...batches, await proof.createTerminal()]);
+    // Let the data path reach the bounded event-count boundary before attaching the
+    // consumer. The request must remain committed and pending, not ambiguous.
+    await harness.settle();
+    expect(await promiseState(handle.final)).toBe("pending");
+    expect(harness.session.snapshot()).toMatchObject({
+      connected: true,
+      quarantined: 0,
+      ambiguousQuarantined: 0,
+    });
+
+    const received = await Promise.race([
+      Array.fromAsync(handle.events()),
+      Bun.sleep(2_000).then(() => { throw new Error("batched burst remained backpressured"); }),
+    ]);
+    await harness.settleUntil(() => harness.sidecarOutstanding.length === 0);
+    expect(received).toEqual(events);
+    await expect(handle.final).resolves.toMatchObject({ id: "resp_burst" });
+    expect(harness.session.snapshot()).toMatchObject({
+      quarantined: 0,
+      ambiguousQuarantined: 0,
+    });
+    await harness.close();
+  });
   it("admits at most four uncommitted requests per sandbox", async () => {
     const harness=new TransportHarness();await harness.start();
     const pending=Array.from({length:5},(_,i)=>harness.session.run({...BODY,input:`request-${i}`}));
@@ -1086,7 +1144,7 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
-  it("fails a full client buffer immediately without stalling cumulative ACK", async () => {
+  it("withholds the cumulative ACK until a full client buffer has space", async () => {
     const harness = new TransportHarness({
       maxResponseBytes: 4_096,
       maxBufferedResponseBytes: 160,
@@ -1106,12 +1164,40 @@ describe("V2TransportSession", () => {
     })));
     await harness.settle();
 
-    await expect(handle.final).rejects.toMatchObject({
-      committed: true,
-      code: "event_memory_capacity",
-    });
+    expect(await promiseState(handle.final)).toBe("pending");
+    const events = handle.events();
+    await expect(events.next()).resolves.toMatchObject({ done: false });
+    await harness.settle();
     expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence))).toBe(2);
+    await events.return(undefined);
     await harness.close();
+  });
+
+  it("tears down promptly while reliable delivery is waiting for client space", async () => {
+    const harness = new TransportHarness({
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+    });
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([0, 1].map(eventIndex => ({
+      kind: "response_event" as const,
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+    })));
+    await harness.settle();
+
+    await expect(Promise.race([
+      harness.close(),
+      Bun.sleep(250).then(() => { throw new Error("transport close remained backpressured"); }),
+    ])).resolves.toBeUndefined();
+    await expect(handle.final).rejects.toMatchObject({ committed: true, code: "closed" });
   });
 
   it("shares one event pool across sessions without letting slow A block B", async () => {
@@ -1154,20 +1240,24 @@ describe("V2TransportSession", () => {
 
     a.publish([response(idA, 1)]);
     await a.settle();
-    await expect(handleA.final).rejects.toMatchObject({
-      code: "event_memory_capacity",
-      committed: true,
-    });
+    expect(await promiseState(handleA.final)).toBe("pending");
     expect(b.session.snapshot().connected).toBe(true);
-    expect(pool.snapshot().activePermits).toBe(1);
+    expect(pool.snapshot().activePermits).toBe(3);
 
     const eventsB = handleB.events();
     await expect(eventsB.next()).resolves.toMatchObject({
       value: { event: "response.output_text.delta" },
       done: false,
     });
-    expect(pool.snapshot().activePermits).toBe(1);
+    expect(pool.snapshot().activePermits).toBe(3);
     await eventsB.return(undefined);
+    expect(pool.snapshot().activePermits).toBe(2);
+
+    const eventsA = handleA.events();
+    await expect(eventsA.next()).resolves.toMatchObject({ done: false });
+    await a.settle();
+    await expect(eventsA.next()).resolves.toMatchObject({ done: false });
+    await eventsA.return(undefined);
     expect(pool.snapshot().activePermits).toBe(0);
 
     await a.close();
