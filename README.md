@@ -84,7 +84,7 @@ Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers 
 
 WebSocket `store:false` continuation caches retain only byte-budgeted deltas; full histories are materialized per request and never cached quadratically.
 
-Per-runtime completion estimates cap extreme model durations and decay halfway toward a neutral ten-second baseline every idle minute.
+Per-runtime completion estimates cap extreme model durations and decay halfway toward a neutral ten-second baseline every idle minute. Routing throughput is learned only from request-bearing data publications, never from idle ACK/control heartbeats, and a stale throughput sample returns to neutral after one idle minute so a recovered sandbox cannot remain permanently starved. Host transcript hashing uses exact-sized buffers for ordinary events and a bounded scratch path for jumbo events, while WebSocket reasoning redaction uses copy-on-write so ordinary streaming events are not deep-cloned.
 
 Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 

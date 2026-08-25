@@ -95,7 +95,53 @@ describe("ResponseGraph", () => {
     releaseResponseGraphMaterialization(continuation.relayBody);
 
     const visible = graph.resolve(request([], { include: ["reasoning.encrypted_content"] }));
-    expect(graph.sanitizeOutbound(final, visible)).toEqual(final);
+    expect(graph.sanitizeOutbound(final, visible)).toBe(final);
+  });
+
+  it("reuses unchanged streaming objects and copy-on-writes only redacted paths", () => {
+    const graph = new ResponseGraph();
+    const hidden = graph.resolve(request([]));
+    const plain = {
+      type: "response.output_text.delta",
+      delta: "token",
+      nested: { annotations: [] },
+    };
+    expect(graph.sanitizeOutbound(plain, hidden)).toBe(plain);
+
+    const encrypted = {
+      type: "response.reasoning.done",
+      item: {
+        id: "rs_copy_on_write",
+        encrypted_content: "secret",
+        summary: [],
+      },
+      unchanged: { marker: true },
+    };
+    const sanitized = graph.sanitizeOutbound(encrypted, hidden);
+    expect(sanitized).not.toBe(encrypted);
+    expect(sanitized.item).not.toBe(encrypted.item);
+    expect(sanitized.unchanged).toBe(encrypted.unchanged);
+    expect(sanitized.item).not.toHaveProperty("encrypted_content");
+    expect(encrypted.item.encrypted_content).toBe("secret");
+  });
+
+  it("rewrites continuation IDs without mutating the terminal object", () => {
+    const graph = new ResponseGraph();
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, { id: "resp_parent", output: [] });
+    const continuation = graph.resolve(request([], {
+      previous_response_id: "resp_parent",
+    }));
+    const terminal = {
+      type: "response.completed",
+      response: { id: "resp_child", previous_response_id: null as string | null },
+    };
+    const outbound = graph.sanitizeOutbound(terminal, continuation);
+    expect(outbound).not.toBe(terminal);
+    expect(outbound.response).not.toBe(terminal.response);
+    expect(outbound.response.previous_response_id).toBe("resp_parent");
+    expect(terminal.response.previous_response_id).toBeNull();
+    releaseResponseGraphMaterialization(continuation.relayBody);
   });
 
   it("evicts least-recently-used independent leaves within count and shared byte budgets", () => {

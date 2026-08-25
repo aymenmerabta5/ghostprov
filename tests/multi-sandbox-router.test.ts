@@ -29,6 +29,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
   waitForAdmissionAbort = false;
   postAdmissionDelayMs = 0;
   admissionWindow: number | null = null;
+  ackEwmaMs = 1_000;
+  diagnostics: any = undefined;
   lastRunSignal?: AbortSignal;
   pulseAdmissionOnFailure = false;
   readonly executionStartedAtMs: number[] = [];
@@ -70,12 +72,13 @@ class FakeRuntime implements RoutableSandboxRuntime {
       quarantined: 0,
       heartbeatAgeMs: 1_000,
       credentialExpiresInMs: 3_600_000,
-      ackEwmaMs: 1_000,
+      ackEwmaMs: this.ackEwmaMs,
       completionEwmaMs: 10_000,
       recentFailureRate: 0,
       queueDepth: 0,
       memoryPressure: 0,
       failure: null,
+      diagnostics: this.diagnostics,
     } as const;
   }
   async run(
@@ -815,6 +818,120 @@ describe("MultiSandboxRouter", () => {
 
     await system.router.close();
     await Promise.all(pending);
+  });
+
+  it("does not mistake cold-runtime control traffic for payload throughput", async () => {
+    let now = performance.timeOrigin + performance.now();
+    const clock: Clock = {
+      now: () => now,
+      sleep: () => Promise.resolve(),
+      waitUntil: () => Promise.resolve(),
+    };
+    const system = createSystem(2, 8, undefined, undefined, undefined, clock);
+    const cold = system.runtimes[0]!;
+    const warm = system.runtimes[1]!;
+    cold.ackEwmaMs = 0;
+    warm.ackEwmaMs = 300;
+
+    cold.diagnostics = {
+      host: { publishedBytesTotal: 1_000, dataPublishedBytesTotal: 0 },
+    };
+    warm.diagnostics = {
+      host: { publishedBytesTotal: 1_000, dataPublishedBytesTotal: 1_000 },
+    };
+    cold.notify();
+    warm.notify();
+
+    now += 1_000;
+    cold.diagnostics = {
+      // An idle runtime still publishes control frames. They are not evidence
+      // that request payloads move at only 1 KiB/s.
+      host: { publishedBytesTotal: 2_024, dataPublishedBytesTotal: 0 },
+    };
+    warm.diagnostics = {
+      host: {
+        publishedBytesTotal: 1024 ** 2 + 1_000,
+        dataPublishedBytesTotal: 1024 ** 2 + 1_000,
+      },
+    };
+    cold.notify();
+    warm.notify();
+
+    const handle = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x".repeat(256 * 1024),
+      stream: true,
+    });
+    expect(cold.executions).toBe(1);
+    expect(warm.executions).toBe(0);
+    cold.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("forgets a stale slow payload sample so an idle runtime can recover", async () => {
+    let now = performance.timeOrigin + performance.now();
+    const clock: Clock = {
+      now: () => now,
+      sleep: () => Promise.resolve(),
+      waitUntil: () => Promise.resolve(),
+    };
+    const system = createSystem(2, 8, undefined, undefined, undefined, clock);
+    const recovered = system.runtimes[0]!;
+    const warm = system.runtimes[1]!;
+    recovered.ackEwmaMs = 0;
+    warm.ackEwmaMs = 300;
+    recovered.diagnostics = {
+      host: { publishedBytesTotal: 0, dataPublishedBytesTotal: 0 },
+    };
+    warm.diagnostics = {
+      host: { publishedBytesTotal: 0, dataPublishedBytesTotal: 0 },
+    };
+    recovered.notify();
+    warm.notify();
+
+    now += 1_000;
+    recovered.diagnostics = {
+      host: { publishedBytesTotal: 1_024, dataPublishedBytesTotal: 1_024 },
+    };
+    warm.diagnostics = {
+      host: { publishedBytesTotal: 1024 ** 2, dataPublishedBytesTotal: 1024 ** 2 },
+    };
+    recovered.notify();
+    warm.notify();
+
+    const beforeReset = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x".repeat(256 * 1024),
+      stream: true,
+    });
+    expect(warm.executions).toBe(1);
+    expect(recovered.executions).toBe(0);
+    warm.completeOne();
+    await beforeReset.final;
+
+    now += 60_001;
+    recovered.diagnostics = {
+      host: { publishedBytesTotal: 2_048, dataPublishedBytesTotal: 1_024 },
+    };
+    warm.diagnostics = {
+      host: {
+        publishedBytesTotal: 61 * 1024 ** 2,
+        dataPublishedBytesTotal: 61 * 1024 ** 2,
+      },
+    };
+    recovered.notify();
+    warm.notify();
+
+    const afterReset = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "x".repeat(256 * 1024),
+      stream: true,
+    });
+    expect(recovered.executions).toBe(1);
+    recovered.completeOne();
+    await afterReset.final;
+    await system.router.close();
   });
 
   it("ages cached heartbeat and credential health without registry events", async () => {

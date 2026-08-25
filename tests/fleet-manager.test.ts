@@ -583,6 +583,36 @@ describe("ProjectFleetManager", () => {
     await harness.value.shutdown("test-complete");
   });
 
+  it("reports late supervisor health transitions without another reconciliation", async () => {
+    const files = await state();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A), project(B)]),
+    });
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 2 });
+
+    const recovering = harness.factory.runtimes.get(B)!;
+    recovering.state = "recovering";
+    expect(harness.value.snapshot()).toMatchObject({
+      desired: 2,
+      ready: 1,
+      provisioning: 1,
+    });
+
+    // A supervised runtime may recover entirely in the background after the
+    // manager's original reconcile promise has settled.
+    recovering.state = "ready";
+    recovering.heartbeatAgeMs = 0;
+    expect(harness.value.snapshot()).toMatchObject({
+      desired: 2,
+      ready: 2,
+      provisioning: 0,
+      unavailable: 0,
+    });
+    await harness.value.shutdown("test-complete");
+  });
+
   it("rejects deleted and wrong-project metadata without adopting a substitute", async () => {
     for (const invalid of [
       { ...project(A), deleted: true },

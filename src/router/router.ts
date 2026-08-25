@@ -46,6 +46,7 @@ const DEFAULT_QUEUE_CAPACITY = 4_096;
 const DEFAULT_QUEUE_BYTES = 1024 * MiB;
 const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
+const ROUTE_THROUGHPUT_IDLE_RESET_MS = 60_000;
 
 interface ClientLane {
   readonly key: string;
@@ -304,8 +305,9 @@ export class MultiSandboxRouter {
   readonly #reserved = new Map<ProjectId, Set<QueuedJob>>();
   readonly #routeSamples = new Map<ProjectId, {
     observedAtMs: number;
-    publishedBytes: number;
+    dataPublishedBytes: number;
     bytesPerSecond: number;
+    lastProgressAtMs: number | null;
   }>();
   readonly #rateLimitObservations = new Map<ProjectId, Map<string, {
     hint: RateLimitHint;
@@ -1305,31 +1307,55 @@ export class MultiSandboxRouter {
 
   #routeCandidate(snapshot: RoutableSandboxSnapshot): RouteCandidate {
     const host = snapshot.diagnostics?.host;
-    const publishedBytes = host?.publishedBytesTotal;
+    // Only request-bearing data publications measure host -> sidecar payload
+    // throughput. Control/ACK heartbeats continue while a runtime is idle;
+    // treating those few bytes as payload throughput gives a cold runtime a
+    // permanently terrible request-size penalty and prevents it from ever
+    // receiving the work needed to establish a real sample.
+    const dataPublishedBytes = host?.dataPublishedBytesTotal;
     let throughputBytesPerSecond: number | null = null;
-    if (typeof publishedBytes === "number" && Number.isFinite(publishedBytes)) {
+    if (typeof dataPublishedBytes === "number" && Number.isFinite(dataPublishedBytes)) {
       const now = this.#clock.now();
       const previous = this.#routeSamples.get(snapshot.projectId);
-      if (!previous || publishedBytes < previous.publishedBytes) {
+      if (!previous || dataPublishedBytes < previous.dataPublishedBytes) {
         this.#routeSamples.set(snapshot.projectId, {
           observedAtMs: now,
-          publishedBytes,
+          dataPublishedBytes,
           bytesPerSecond: 0,
+          lastProgressAtMs: null,
         });
-      } else if (publishedBytes > previous.publishedBytes && now > previous.observedAtMs) {
-        const instantaneous = (publishedBytes - previous.publishedBytes) * 1_000 /
+      } else if (
+        dataPublishedBytes > previous.dataPublishedBytes &&
+        now > previous.observedAtMs
+      ) {
+        const instantaneous = (dataPublishedBytes - previous.dataPublishedBytes) * 1_000 /
           (now - previous.observedAtMs);
         const bytesPerSecond = previous.bytesPerSecond > 0
           ? previous.bytesPerSecond * 0.75 + instantaneous * 0.25
           : instantaneous;
         this.#routeSamples.set(snapshot.projectId, {
           observedAtMs: now,
-          publishedBytes,
+          dataPublishedBytes,
           bytesPerSecond,
+          lastProgressAtMs: now,
         });
         throughputBytesPerSecond = bytesPerSecond;
-      } else if (previous.bytesPerSecond > 0) {
-        throughputBytesPerSecond = previous.bytesPerSecond;
+      } else {
+        const bytesPerSecond = previous.lastProgressAtMs !== null &&
+            now - previous.lastProgressAtMs < ROUTE_THROUGHPUT_IDLE_RESET_MS
+          ? previous.bytesPerSecond
+          : 0;
+        // Move the observation baseline forward while idle so the first real
+        // data flight is measured over its transfer interval, not over the
+        // runtime's entire idle lifetime. Forget stale rates after one idle
+        // minute so a formerly slow sandbox can be explored again.
+        this.#routeSamples.set(snapshot.projectId, {
+          observedAtMs: now,
+          dataPublishedBytes,
+          bytesPerSecond,
+          lastProgressAtMs: bytesPerSecond > 0 ? previous.lastProgressAtMs : null,
+        });
+        if (bytesPerSecond > 0) throughputBytesPerSecond = bytesPerSecond;
       }
     }
     return {

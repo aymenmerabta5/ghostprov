@@ -265,6 +265,12 @@ export class ProjectFleetManager {
   }
 
   snapshot(): FleetSnapshot {
+    // Runtime supervisors keep recovering after the initial reconciliation
+    // has returned. Recompute health on every public read so /health,
+    // /__sandboxes, and fleet.sample cannot keep reporting the older partial
+    // ready count (for example 7) after the registry already exposes all 8
+    // healthy runtimes and full routing capacity.
+    this.#refreshSnapshot(this.#snapshot.desired, this.#snapshot.projects);
     return this.#snapshot;
   }
 

@@ -39,6 +39,7 @@ import {
 import { HostRequestDiagnosticsObserver } from "../diagnostics/host-observer";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnostics/types";
 import {
+  MAX_TRANSCRIPT_CHUNK_BYTES,
   TranscriptProof,
   validateTerminalProof,
   type IncrementalSha256Hasher,
@@ -310,6 +311,20 @@ function base64UrlDecodedBytes(value: string): number | null {
   if (remainder === 2 && (alphabet.indexOf(value.at(-1)!) & 0x0f) !== 0) return null;
   if (remainder === 3 && (alphabet.indexOf(value.at(-1)!) & 0x03) !== 0) return null;
   return Math.floor(value.length * 3 / 4);
+}
+
+/**
+ * Host-only fast path after base64UrlDecodedBytes has already proved the
+ * alphabet, padding shape, trailing bits, and exact decoded length. The shared
+ * browser/Deno decoder must materialize an atob binary string and copy it one
+ * byte at a time; Bun's native Buffer decoder avoids that transient string.
+ */
+function decodeCanonicalBase64Url(value: string, decodedBytes: number): Uint8Array {
+  const output = Buffer.from(value, "base64url");
+  if (output.byteLength !== decodedBytes) {
+    throw new TypeError("Value must be canonical unpadded base64url");
+  }
+  return output;
 }
 
 function partialEventLogicalBytes(event: string, rawBytes: number): number {
@@ -2151,7 +2166,7 @@ export class V2TransportSession {
     }
     let bytes: Uint8Array;
     try {
-      bytes = base64UrlDecode(encoded);
+      bytes = decodeCanonicalBase64Url(encoded, decodedLength);
     } catch {
       permit?.release();
       this.#failCommitted(state, new V2CommittedError(
@@ -2290,7 +2305,7 @@ export class V2TransportSession {
     }
     let bytes: Uint8Array;
     try {
-      bytes = base64UrlDecode(frame.dataBase64Url);
+      bytes = decodeCanonicalBase64Url(frame.dataBase64Url, decodedLength);
     } catch {
       this.#failCommitted(state, new V2CommittedError(
         "Response event part is not valid base64url",
@@ -2385,7 +2400,15 @@ export class V2TransportSession {
       if (!completed) break;
       let wireBytes: number;
       try {
-        wireBytes = state.transcript.append(completed.frame);
+        // Batched response events are normally small. Hash their exact-size
+        // canonical buffer instead of TranscriptProof.append()'s 64 KiB
+        // general-purpose scratch allocation per logical event. Jumbo events
+        // retain the existing fixed-memory synchronous path; making delivery
+        // await timer-based transcript yields would change the serialized ACK
+        // boundary and can strand an unref-only test or shutdown lifecycle.
+        wireBytes = completed.wireBytes <= MAX_TRANSCRIPT_CHUNK_BYTES
+          ? state.transcript.appendCanonical(completed.frame).byteLength
+          : state.transcript.append(completed.frame);
       } catch (cause) {
         // Keep the entry map-owned until failure cleanup releases its permit.
         // Transcript validation (notably terminal JSON parsing) may throw

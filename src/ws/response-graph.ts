@@ -126,13 +126,34 @@ function byteSize(value: unknown): number {
 }
 
 function stripEncryptedContent(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripEncryptedContent);
-  if (!value || typeof value !== "object") return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (key !== "encrypted_content") output[key] = stripEncryptedContent(child);
+  if (Array.isArray(value)) {
+    let output: unknown[] | null = null;
+    for (let index = 0; index < value.length; index++) {
+      const original = value[index];
+      const sanitized = stripEncryptedContent(original);
+      if (!output && sanitized !== original) output = value.slice(0, index);
+      output?.push(sanitized);
+    }
+    return output ?? value;
   }
-  return output;
+  if (!value || typeof value !== "object") return value;
+  const source = value as Record<string, unknown>;
+  let output: Record<string, unknown> | null = null;
+  for (const key in source) {
+    if (!Object.hasOwn(source, key)) continue;
+    if (key === "encrypted_content") {
+      output ??= { ...source };
+      delete output[key];
+      continue;
+    }
+    const original = source[key];
+    const sanitized = stripEncryptedContent(original);
+    if (sanitized !== original) {
+      output ??= { ...source };
+      output[key] = sanitized;
+    }
+  }
+  return output ?? value;
 }
 
 export class ResponseGraph {
@@ -249,12 +270,23 @@ export class ResponseGraph {
   }
 
   sanitizeOutbound<T>(value: T, resolved: ResolvedRelayRequest): T {
-    const sanitized = (resolved.exposeEncryptedReasoning ? clone(value) : stripEncryptedContent(value)) as any;
+    let sanitized = (resolved.exposeEncryptedReasoning
+      ? value
+      : stripEncryptedContent(value)) as any;
     if (resolved.clientPreviousResponseId && sanitized && typeof sanitized === "object") {
       if (sanitized.response && typeof sanitized.response === "object") {
-        sanitized.response.previous_response_id = resolved.clientPreviousResponseId;
+        sanitized = {
+          ...sanitized,
+          response: {
+            ...sanitized.response,
+            previous_response_id: resolved.clientPreviousResponseId,
+          },
+        };
       } else if (sanitized.object === "response") {
-        sanitized.previous_response_id = resolved.clientPreviousResponseId;
+        sanitized = {
+          ...sanitized,
+          previous_response_id: resolved.clientPreviousResponseId,
+        };
       }
     }
     return sanitized as T;
