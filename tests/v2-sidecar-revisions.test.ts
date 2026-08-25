@@ -9,7 +9,7 @@ import {
   loadV2SidecarAssets,
   V2_R1_RELEASE,
   V2_R2_RELEASE,
-  V2_R3_RELEASE,
+  V2_R4_RELEASE,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
@@ -149,32 +149,32 @@ describe("V2SidecarRevisionSelector", () => {
     await expect(mutable.preload()).rejects.toThrow(/not frozen/i);
   });
 
-  it("provides a production R3 default backed by the pinned bundled release", async () => {
+  it("provides a production R4 default backed by the pinned bundled release", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2],
     });
 
     await selector.preload();
-    expect(selector.defaultRevision).toBe("r3");
+    expect(selector.defaultRevision).toBe("r4");
     expect(selector.loadedForProject(PROJECT_1).assets).toMatchObject({
-      revision: "r3",
+      revision: "r4",
       protocolRevision: "r2",
-      buildHash: V2_R3_RELEASE.buildHash,
+      buildHash: V2_R4_RELEASE.buildHash,
     });
     expect(selector.loadedForProject(PROJECT_2).assets).toBe(
       selector.loadedForProject(PROJECT_1).assets,
     );
   });
 
-  it("retains explicit pinned R1/R2 rollback and supports a mixed exact-project fleet", async () => {
+  it("retains explicit pinned prior-release rollback and supports a mixed exact-project fleet", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2, PROJECT_3],
       projectOverrides: { [PROJECT_2]: "r2", [PROJECT_3]: "r1" },
     });
     await selector.preload();
     expect(selector.loadedForProject(PROJECT_1)).toMatchObject({
-      revision: "r3",
-      assets: { protocolRevision: "r2", buildHash: V2_R3_RELEASE.buildHash },
+      revision: "r4",
+      assets: { protocolRevision: "r2", buildHash: V2_R4_RELEASE.buildHash },
     });
     expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
       revision: "r2",

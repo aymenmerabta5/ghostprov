@@ -134,6 +134,7 @@ class TransportHarness {
   credits = 128;
   readonly publicationIntervalMs: number;
   readonly autoPong: boolean;
+  stateChanges = 0;
 
   constructor(options: {
     drop?: readonly number[];
@@ -153,6 +154,7 @@ class TransportHarness {
     reconnectableFault?: ReconnectableFault;
     expectedSidecarInstanceId?: string | null;
     eventMemoryPool?: AtomicBytePermitPool;
+    transportStallMs?: number;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.autoPong = options.autoPong ?? false;
@@ -210,6 +212,8 @@ class TransportHarness {
         : { expectedSidecarInstanceId: options.expectedSidecarInstanceId ?? "sidecar-instance-1" }),
       livenessTimeoutMs: options.livenessTimeoutMs,
       eventMemoryPool: options.eventMemoryPool,
+      transportStallMs: options.transportStallMs,
+      onStateChange: () => { this.stateChanges++; },
     });
   }
 
@@ -871,6 +875,56 @@ describe("V2TransportSession", () => {
     }
   });
 
+  it("replays the processed ACK when a duplicate sidecar flight proves its ACK was lost", async () => {
+    const harness = new TransportHarness({ publicationIntervalMs: 1 });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    harness.publish([{
+      kind: "pong",
+      sentAtMs: 1,
+    }], { lane: "data" });
+    const duplicateFrame = structuredClone(harness.sidecarOutstanding[0]!);
+    await harness.settleUntil(() => (
+      harness.hostEnvelopes.some(value => value.ack.sequence === duplicateFrame.sequence)
+    ));
+    harness.hostEnvelopes.length = 0;
+
+    const duplicateEnvelope: AwarenessEnvelope<SidecarFrame> = {
+      protocol: "gp-awareness-v2",
+      schemaVersion: 1,
+      schemaHash: BINDING.schemaHash,
+      buildHash: BINDING.buildHash,
+      projectId: PROJECT,
+      sessionId: BINDING.sessionId,
+      peerId: "sidecar",
+      instanceId: harness.sidecarInstanceId,
+      leaderGeneration: BINDING.leaderGeneration,
+      epoch: harness.sidecarEpoch,
+      revision: harness.revision++,
+      ack: { epoch: 1, sequence: harness.hostAck },
+      credits: harness.credits,
+      active: 0,
+      queued: 0,
+      draining: false,
+      frames: [duplicateFrame],
+      lane: "data",
+    };
+    harness.sidecar.publish(duplicateEnvelope);
+    await harness.settle();
+
+    expect(harness.hostEnvelopes).toHaveLength(1);
+    expect(harness.hostEnvelopes[0]).toMatchObject({
+      lane: "control",
+      ack: { epoch: duplicateFrame.epoch, sequence: duplicateFrame.sequence },
+      frames: [],
+    });
+    harness.hostEnvelopes.length = 0;
+    harness.sidecar.publish(duplicateEnvelope);
+    await harness.settle();
+    expect(harness.hostEnvelopes).toHaveLength(0);
+    await harness.close();
+  });
+
   it("freezes a bounded request flight until its high sequence is acknowledged", async () => {
     const harness = new TransportHarness({ publicationIntervalMs: 1 });
     await harness.start();
@@ -979,6 +1033,48 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  it("routes with acknowledged request goodput rather than cumulative publications", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const handle = await harness.commit(harness.session.run({
+      ...BODY,
+      input: "acknowledged-goodput-".repeat(4_096),
+    }));
+    const diagnostics = harness.session.snapshot().diagnostics!.host;
+    expect(diagnostics.acknowledgedGoodputBytesPerSecond).toBeGreaterThan(0);
+    expect(diagnostics.uniqueAcknowledgedBytesTotal).toBeGreaterThan(0);
+    expect(diagnostics.retransmittedBytesTotal).toBe(0);
+    expect(diagnostics.stallEventsTotal).toBe(0);
+    expect(handle).toBeDefined();
+    await harness.close();
+  });
+
+  it("fails admission closed and fast-retransmits when a live peer leaves an ACK stale", async () => {
+    const harness = new TransportHarness({
+      retransmitMs: 10_000,
+      transportStallMs: 30,
+    });
+    await harness.start();
+    const pending = harness.session.run({ ...BODY, input: "stalled-flight" });
+    await harness.settle();
+    await Bun.sleep(50);
+    await harness.settle();
+
+    expect(harness.session.snapshot().admissionCredits).toBe(0);
+    expect(harness.session.snapshot().diagnostics!.host.stallEventsTotal).toBe(1);
+    expect(harness.stateChanges).toBeGreaterThan(0);
+
+    const before = harness.session.snapshot().retransmissions;
+    harness.publish([], { lane: "control", ackSequence: -1 });
+    await harness.settle();
+    expect(harness.session.snapshot().retransmissions).toBeGreaterThan(before);
+    expect(harness.session.snapshot().diagnostics!.host.retransmittedBytesTotal)
+      .toBeGreaterThan(0);
+
+    await harness.close();
+    await expect(pending).rejects.toBeDefined();
+  });
+
   it("expands response batches into the exact logical SSE transcript", async () => {
     const harness=new TransportHarness();await harness.start();const handle=await harness.commit(harness.session.run(BODY));const id=harness.requestIdentity();
     const final={id:"resp_batch",object:"response",status:"completed",output:[]};const events=[{event:"response.created",data:JSON.stringify({type:"response.created",response:{id:"resp_batch"}})},{event:"response.output_text.delta",data:JSON.stringify({type:"response.output_text.delta",delta:"hello"})},{event:"response.completed",data:JSON.stringify({type:"response.completed",response:final})}];const proof=new TranscriptProof(id.requestId,id.requestDigest);for(const event of events)proof.append(event);const terminal=await proof.createTerminal();
@@ -1048,7 +1144,7 @@ describe("V2TransportSession", () => {
     expect(computeV2RetransmitDelayMs(200, 1)).toBeGreaterThan(400);
     expect(computeV2RetransmitDelayMs(200, 1)).toBeLessThanOrEqual(440);
     expect(computeV2RetransmitDelayMs(null, 0, 250, 1)).toBe(3_000);
-    expect(computeV2RetransmitDelayMs(null, 0, 250, 20)).toBe(30_000);
+    expect(computeV2RetransmitDelayMs(null, 0, 250, 20)).toBe(5_000);
     expect(() => computeV2RetransmitDelayMs(null, 0, 250, 0, 100))
       .toThrow("initialRtoMs");
   });
@@ -1970,6 +2066,11 @@ describe("V2TransportSession", () => {
     expect(harness.session.snapshot().retransmissions).toBeGreaterThan(0);
     const handle = await harness.commit(pending);
     expect(handle).toBeDefined();
+    expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+      stallEventsTotal: 0,
+    });
+    expect(harness.session.snapshot().diagnostics!.host.retransmittedBytesTotal)
+      .toBeGreaterThan(0);
     await harness.close();
   });
 });

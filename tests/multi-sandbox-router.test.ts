@@ -938,14 +938,14 @@ describe("MultiSandboxRouter", () => {
     const system = createSystem(2, 8, undefined, undefined, undefined, clock);
     const cold = system.runtimes[0]!;
     const warm = system.runtimes[1]!;
-    cold.ackEwmaMs = 0;
+    cold.ackEwmaMs = 100;
     warm.ackEwmaMs = 300;
 
     cold.diagnostics = {
-      host: { publishedBytesTotal: 1_000, dataPublishedBytesTotal: 0 },
+      host: { acknowledgedGoodputBytesPerSecond: null },
     };
     warm.diagnostics = {
-      host: { publishedBytesTotal: 1_000, dataPublishedBytesTotal: 1_000 },
+      host: { acknowledgedGoodputBytesPerSecond: 1024 ** 2 },
     };
     cold.notify();
     warm.notify();
@@ -954,12 +954,11 @@ describe("MultiSandboxRouter", () => {
     cold.diagnostics = {
       // An idle runtime still publishes control frames. They are not evidence
       // that request payloads move at only 1 KiB/s.
-      host: { publishedBytesTotal: 2_024, dataPublishedBytesTotal: 0 },
+      host: { acknowledgedGoodputBytesPerSecond: null },
     };
     warm.diagnostics = {
       host: {
-        publishedBytesTotal: 1024 ** 2 + 1_000,
-        dataPublishedBytesTotal: 1024 ** 2 + 1_000,
+        acknowledgedGoodputBytesPerSecond: 1024 ** 2,
       },
     };
     cold.notify();
@@ -990,20 +989,20 @@ describe("MultiSandboxRouter", () => {
     recovered.ackEwmaMs = 0;
     warm.ackEwmaMs = 300;
     recovered.diagnostics = {
-      host: { publishedBytesTotal: 0, dataPublishedBytesTotal: 0 },
+      host: { acknowledgedGoodputBytesPerSecond: null },
     };
     warm.diagnostics = {
-      host: { publishedBytesTotal: 0, dataPublishedBytesTotal: 0 },
+      host: { acknowledgedGoodputBytesPerSecond: null },
     };
     recovered.notify();
     warm.notify();
 
     now += 1_000;
     recovered.diagnostics = {
-      host: { publishedBytesTotal: 1_024, dataPublishedBytesTotal: 1_024 },
+      host: { acknowledgedGoodputBytesPerSecond: 1_024 },
     };
     warm.diagnostics = {
-      host: { publishedBytesTotal: 1024 ** 2, dataPublishedBytesTotal: 1024 ** 2 },
+      host: { acknowledgedGoodputBytesPerSecond: 1024 ** 2 },
     };
     recovered.notify();
     warm.notify();
@@ -1020,15 +1019,20 @@ describe("MultiSandboxRouter", () => {
 
     now += 60_001;
     recovered.diagnostics = {
-      host: { publishedBytesTotal: 2_048, dataPublishedBytesTotal: 1_024 },
+      // The transport expires an idle goodput estimate rather than deriving a
+      // synthetic rate from cumulative publication counters.
+      host: { acknowledgedGoodputBytesPerSecond: null },
     };
     warm.diagnostics = {
       host: {
-        publishedBytesTotal: 61 * 1024 ** 2,
-        dataPublishedBytesTotal: 61 * 1024 ** 2,
+        acknowledgedGoodputBytesPerSecond: 1024 ** 2,
       },
     };
     recovered.notify();
+    warm.notify();
+    // A cold runtime is explored conservatively once the measured peer has
+    // real work, rather than being permanently poisoned by a stale sample.
+    warm.active = 1;
     warm.notify();
 
     const afterReset = await system.router.startRelay({

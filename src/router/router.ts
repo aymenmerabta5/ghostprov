@@ -47,7 +47,6 @@ const DEFAULT_QUEUE_CAPACITY = 4_096;
 const DEFAULT_QUEUE_BYTES = 1024 * MiB;
 const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
-const ROUTE_THROUGHPUT_IDLE_RESET_MS = 60_000;
 
 interface ClientLane {
   readonly key: string;
@@ -315,12 +314,6 @@ export class MultiSandboxRouter {
    * accounting. The per-job callback below is the only valid handoff proof.
    */
   readonly #reserved = new Map<ProjectId, Set<QueuedJob>>();
-  readonly #routeSamples = new Map<ProjectId, {
-    observedAtMs: number;
-    dataPublishedBytes: number;
-    bytesPerSecond: number;
-    lastProgressAtMs: number | null;
-  }>();
   readonly #rateLimitObservations = new Map<ProjectId, Map<string, {
     hint: RateLimitHint;
     problem: RateLimitProblem | null;
@@ -394,7 +387,6 @@ export class MultiSandboxRouter {
     this.#registryUnsubscribe = this.#registry.subscribe(event => {
       if (event.type === "removed") {
         this.#runtimeCache.delete(event.projectId);
-        this.#routeSamples.delete(event.projectId);
         this.#rateLimitObservations.delete(event.projectId);
         return;
       }
@@ -1320,57 +1312,15 @@ export class MultiSandboxRouter {
 
   #routeCandidate(snapshot: RoutableSandboxSnapshot): RouteCandidate {
     const host = snapshot.diagnostics?.host;
-    // Only request-bearing data publications measure host -> sidecar payload
-    // throughput. Control/ACK heartbeats continue while a runtime is idle;
-    // treating those few bytes as payload throughput gives a cold runtime a
-    // permanently terrible request-size penalty and prevents it from ever
-    // receiving the work needed to establish a real sample.
-    const dataPublishedBytes = host?.dataPublishedBytesTotal;
-    let throughputBytesPerSecond: number | null = null;
-    if (typeof dataPublishedBytes === "number" && Number.isFinite(dataPublishedBytes)) {
-      const now = this.#clock.now();
-      const previous = this.#routeSamples.get(snapshot.projectId);
-      if (!previous || dataPublishedBytes < previous.dataPublishedBytes) {
-        this.#routeSamples.set(snapshot.projectId, {
-          observedAtMs: now,
-          dataPublishedBytes,
-          bytesPerSecond: 0,
-          lastProgressAtMs: null,
-        });
-      } else if (
-        dataPublishedBytes > previous.dataPublishedBytes &&
-        now > previous.observedAtMs
-      ) {
-        const instantaneous = (dataPublishedBytes - previous.dataPublishedBytes) * 1_000 /
-          (now - previous.observedAtMs);
-        const bytesPerSecond = previous.bytesPerSecond > 0
-          ? previous.bytesPerSecond * 0.75 + instantaneous * 0.25
-          : instantaneous;
-        this.#routeSamples.set(snapshot.projectId, {
-          observedAtMs: now,
-          dataPublishedBytes,
-          bytesPerSecond,
-          lastProgressAtMs: now,
-        });
-        throughputBytesPerSecond = bytesPerSecond;
-      } else {
-        const bytesPerSecond = previous.lastProgressAtMs !== null &&
-            now - previous.lastProgressAtMs < ROUTE_THROUGHPUT_IDLE_RESET_MS
-          ? previous.bytesPerSecond
-          : 0;
-        // Move the observation baseline forward while idle so the first real
-        // data flight is measured over its transfer interval, not over the
-        // runtime's entire idle lifetime. Forget stale rates after one idle
-        // minute so a formerly slow sandbox can be explored again.
-        this.#routeSamples.set(snapshot.projectId, {
-          observedAtMs: now,
-          dataPublishedBytes,
-          bytesPerSecond,
-          lastProgressAtMs: bytesPerSecond > 0 ? previous.lastProgressAtMs : null,
-        });
-        if (bytesPerSecond > 0) throughputBytesPerSecond = bytesPerSecond;
-      }
-    }
+    // This value is measured over an immutable flight from first publication
+    // through cumulative acknowledgement. Published-byte deltas are not
+    // goodput: cumulative state and retransmissions made a lossy runtime look
+    // faster precisely while its commit latency was degrading.
+    const acknowledgedGoodput = host?.acknowledgedGoodputBytesPerSecond;
+    const throughputBytesPerSecond = typeof acknowledgedGoodput === "number" &&
+        Number.isFinite(acknowledgedGoodput) && acknowledgedGoodput > 0
+      ? acknowledgedGoodput
+      : null;
     return {
       ...snapshot,
       available: snapshot.available,
@@ -1570,11 +1520,25 @@ export class MultiSandboxRouter {
         retry_count: job.attempts,
         ...(handle.stats.diagnostics ? {
           host_prepare_ms: handle.stats.diagnostics.hostPrepareMs,
+          request_decoded_bytes: handle.stats.diagnostics.requestDecodedBytes,
+          request_encoded_bytes: handle.stats.diagnostics.requestEncodedBytes,
+          request_part_count: handle.stats.diagnostics.requestPartCount,
+          request_encoding: handle.stats.diagnostics.requestEncoding,
+          request_compression_ratio:
+            handle.stats.diagnostics.requestDecodedBytes &&
+              handle.stats.diagnostics.requestEncodedBytes !== null
+              ? handle.stats.diagnostics.requestEncodedBytes /
+                handle.stats.diagnostics.requestDecodedBytes
+              : null,
           host_scheduler_wait_ms: handle.stats.diagnostics.hostSchedulerWaitMs,
           host_publish_to_ack_ms: handle.stats.diagnostics.hostPublishToAckMs,
           sidecar_first_frame_to_commit_ms: handle.stats.diagnostics.sidecarFirstFrameToCommitMs,
+          sidecar_commit_to_assembly_ms: handle.stats.diagnostics.sidecarCommitToAssemblyMs,
           sidecar_claim_sync_ms: handle.stats.diagnostics.sidecarClaimSyncMs,
           sidecar_admission_wait_ms: handle.stats.diagnostics.sidecarAdmissionWaitMs,
+          sidecar_prepared_to_fetch_start_ms:
+            handle.stats.diagnostics.sidecarPreparedToFetchStartMs,
+          sidecar_fetch_start_sync_ms: handle.stats.diagnostics.sidecarFetchStartSyncMs,
           sidecar_commit_processing_ms: handle.stats.diagnostics.sidecarCommitProcessingMs,
           transport_commit_residual_ms: handle.stats.diagnostics.transportCommitResidualMs,
         } : {}),

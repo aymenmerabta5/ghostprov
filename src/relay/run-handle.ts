@@ -1,11 +1,15 @@
 import type { SseFrame } from "./sse";
 import type { V2TransportDiagnostics } from "../v2/diagnostics/types";
 import type { RateLimitHint } from "../v2/rate-limit";
-import type { UpstreamPrelude } from "../v2/protocol/shared";
+import type { RequestEncoding, UpstreamPrelude } from "../v2/protocol/shared";
 
 export interface RunDiagnostics {
+  requestDecodedBytes: number | null;
+  requestEncodedBytes: number | null;
+  requestPartCount: number | null;
+  requestEncoding: RequestEncoding | null;
   hostPrepareMs: number | null; hostSchedulerWaitMs: number | null; hostPublishToAckMs: number | null;
-  sidecarFirstFrameToCommitMs: number | null; sidecarClaimSyncMs: number | null; sidecarAdmissionWaitMs: number | null; sidecarCommitProcessingMs: number | null;
+  sidecarFirstFrameToCommitMs: number | null; sidecarCommitToAssemblyMs: number | null; sidecarClaimSyncMs: number | null; sidecarAdmissionWaitMs: number | null; sidecarPreparedToFetchStartMs: number | null; sidecarFetchStartSyncMs: number | null; sidecarCommitProcessingMs: number | null;
   transportCommitResidualMs: number | null; upstreamFirstEventMs: number | null; sidecarFirstEventSchedulerMs: number | null;
   hostAckToFirstFrameMs: number | null; hostAssemblyToDeliveryMs: number | null; peakTransport: V2TransportDiagnostics | null;
 }

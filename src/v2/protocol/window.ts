@@ -31,7 +31,7 @@ function validEpoch(value: number): void {
   }
 }
 
-function encodedFrameBytes(value: unknown): number {
+export function encodedFrameBytes(value: unknown): number {
   let json: string;
   try {
     json = JSON.stringify(value);

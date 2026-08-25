@@ -53,4 +53,12 @@ describe("TransportCongestion", () => {
       ackProgressAgeMs: 9_999,
     }))).toBe(false);
   });
+
+  it("supports a deterministic age fence without changing queue bounds", () => {
+    const congestion = new TransportCongestion({ highAgeMs: 30, lowAgeMs: 5 });
+    expect(congestion.update(sample({ windowFrames: 1, ackProgressAgeMs: 29 }))).toBe(false);
+    expect(congestion.update(sample({ windowFrames: 1, ackProgressAgeMs: 30 }))).toBe(true);
+    expect(() => new TransportCongestion({ highAgeMs: 10, lowAgeMs: 10 }))
+      .toThrow("thresholds");
+  });
 });

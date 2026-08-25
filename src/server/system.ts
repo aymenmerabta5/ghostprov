@@ -464,6 +464,7 @@ function defaultRuntimeFactory(options: {
         gzip: transport.gzip,
         expectedSidecarInstanceId: transport.expectedSidecarInstanceId,
         eventMemoryPool: transport.eventMemoryPool,
+        onStateChange: transport.onStateChange,
       }),
     });
   };

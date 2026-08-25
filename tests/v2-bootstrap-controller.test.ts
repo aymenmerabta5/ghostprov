@@ -31,7 +31,7 @@ import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
 const R2_ASSETS = await loadV2SidecarAssets({ revision: "r2" });
-const R3_ASSETS = await loadV2SidecarAssets({ revision: "r3" });
+const R4_ASSETS = await loadV2SidecarAssets({ revision: "r4" });
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
@@ -268,7 +268,7 @@ function readyEnvelope(
 
 function bootstrapHarness(
   fault: Fault = "none",
-  revision?: "r1" | "r2" | "r3",
+  revision?: "r1" | "r2" | "r3" | "r4",
   maxActivePerSandbox = 8,
   assets = ASSETS,
   controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number } = {},
@@ -354,18 +354,18 @@ describe("V2BootstrapController", () => {
       .toThrow(/selected V2 revision r2 does not match supplied assets r1/i);
   });
 
-  it("launches immutable R3 over the R2 wire protocol", async () => {
-    const harness = bootstrapHarness("none", "r3", 8, R3_ASSETS);
+  it("launches immutable R4 over the R2 wire protocol", async () => {
+    const harness = bootstrapHarness("none", "r4", 8, R4_ASSETS);
     await expect(harness.controller.ensureReady()).resolves.toMatchObject({
       protocolRevision: "r2",
-      buildHash: R3_ASSETS.buildHash,
-      schemaHash: R3_ASSETS.schemaHash,
+      buildHash: R4_ASSETS.buildHash,
+      schemaHash: R4_ASSETS.schemaHash,
     });
     expect(harness.gateway.launchers[0]).toContain(
-      `/workspace/${R3_ASSETS.entrypointPath}`,
+      `/workspace/${R4_ASSETS.entrypointPath}`,
     );
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!))
-      .toMatchObject({ revision: "r3", protocolRevision: "r2" });
+      .toMatchObject({ revision: "r4", protocolRevision: "r2" });
   });
 
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
@@ -613,7 +613,7 @@ describe("V2BootstrapController", () => {
     expect(launcher).toContain("if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner)");
     expect(launcher).toContain("sub gp_exact_r2_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[23]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      "/workspace/\\.ghostprov-v2/revisions/r[234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
     );
     expect(launcher).toContain(
       "gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
@@ -641,7 +641,7 @@ describe("V2BootstrapController", () => {
     );
     expect(launcher).toContain("sub gp_exact_sidecar_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[123]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      "/workspace/\\.ghostprov-v2/revisions/r[1234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
     );
     expect(launcher).toContain(
       "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint, $gp_static_path, $gp_expected_static)",

@@ -1,5 +1,6 @@
 import {
   DEFAULT_V2_INITIAL_RETRANSMIT_MS,
+  DEFAULT_V2_MAX_RETRANSMIT_MS,
   computeV2RetransmitDelayMs,
 } from "./retransmit";
 import {
@@ -35,11 +36,14 @@ export class ReliableDeliveryTiming {
   #epoch: number;
   readonly #minimumMs: number;
   readonly #initialRtoMs: number;
+  readonly #maximumRtoMs: number;
   readonly #maxTracked: number;
   readonly #firstSentAt = new Map<number, number>();
   readonly #retransmittedSequences = new Set<number>();
   #lastAcknowledged = -1;
   #roundTripEwmaMs: number | null = null;
+  #roundTripVariationMs: number | null = null;
+  #roundTripSamples = 0;
   #attempt = 0;
   #deadlineBaseMs: number | null = null;
   #lastProgressAtMs: number | null = null;
@@ -48,6 +52,7 @@ export class ReliableDeliveryTiming {
     epoch: number;
     minimumMs?: number;
     initialRtoMs?: number;
+    maximumRtoMs?: number;
     maxTracked?: number;
   }) {
     assertEpoch(options.epoch);
@@ -69,11 +74,28 @@ export class ReliableDeliveryTiming {
       throw new RangeError("initialRtoMs must be finite and no less than minimumMs");
     }
     this.#initialRtoMs = initialRtoMs;
+    const maximumRtoMs = options.maximumRtoMs ?? Math.max(
+      DEFAULT_V2_MAX_RETRANSMIT_MS,
+      initialRtoMs,
+    );
+    if (!Number.isFinite(maximumRtoMs) || maximumRtoMs < initialRtoMs) {
+      throw new RangeError("maximumRtoMs must be finite and no less than initialRtoMs");
+    }
+    this.#maximumRtoMs = maximumRtoMs;
     this.#maxTracked = maxTracked;
   }
 
   get roundTripEwmaMs(): number | null {
     return this.#roundTripEwmaMs;
+  }
+
+  get roundTripVariationMs(): number | null {
+    return this.#roundTripVariationMs;
+  }
+
+  /** Number of clean Karn-safe RTT observations in the current epoch. */
+  get roundTripSamples(): number {
+    return this.#roundTripSamples;
   }
 
   get attempt(): number {
@@ -152,9 +174,16 @@ export class ReliableDeliveryTiming {
     // specific send, so it advances progress without contaminating RTT/RTO.
     if (sampledAt !== null && !sampledAfterRetransmission) {
       const sampleMs = Math.max(0, nowMs - sampledAt);
-      this.#roundTripEwmaMs = this.#roundTripEwmaMs === null
-        ? sampleMs
-        : this.#roundTripEwmaMs * 0.8 + sampleMs * 0.2;
+      if (this.#roundTripEwmaMs === null) {
+        this.#roundTripEwmaMs = sampleMs;
+        this.#roundTripVariationMs = sampleMs / 2;
+      } else {
+        const previous = this.#roundTripEwmaMs;
+        this.#roundTripVariationMs = (this.#roundTripVariationMs ?? previous / 2) * 0.75 +
+          Math.abs(previous - sampleMs) * 0.25;
+        this.#roundTripEwmaMs = previous * 0.875 + sampleMs * 0.125;
+      }
+      this.#roundTripSamples++;
       this.#attempt = 0;
     }
     this.#deadlineBaseMs = hasOutstanding ? nowMs : null;
@@ -183,6 +212,8 @@ export class ReliableDeliveryTiming {
       this.#minimumMs,
       this.#attempt,
       this.#initialRtoMs,
+      this.#maximumRtoMs,
+      this.#roundTripVariationMs,
     );
     return Math.max(0, this.#deadlineBaseMs + delayMs - nowMs);
   }
@@ -197,6 +228,8 @@ export class ReliableDeliveryTiming {
     this.#retransmittedSequences.clear();
     this.#lastAcknowledged = -1;
     this.#roundTripEwmaMs = null;
+    this.#roundTripVariationMs = null;
+    this.#roundTripSamples = 0;
     this.#attempt = 0;
     this.#deadlineBaseMs = null;
     this.#lastProgressAtMs = null;

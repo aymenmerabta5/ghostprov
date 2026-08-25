@@ -24,6 +24,8 @@ export class AdaptiveTransportCapacity {
   constructor(options: {
     initial: number;
     maximum: number;
+    /** Lower recovery floor. It is deliberately independent from initial. */
+    minimum?: number;
     severeRttMs?: number;
     healthyRttMs?: number;
     healthySamples?: number;
@@ -46,8 +48,12 @@ export class AdaptiveTransportCapacity {
     if (!Number.isSafeInteger(this.#healthySamples) || this.#healthySamples < 1) {
       throw new RangeError("healthySamples must be a positive safe integer");
     }
+    const minimum = options.minimum ?? 1;
+    if (!Number.isSafeInteger(minimum) || minimum < 1 || minimum > options.initial) {
+      throw new RangeError("minimum capacity must be between one and initial capacity");
+    }
     this.#limit = options.initial;
-    this.#minimum = options.initial;
+    this.#minimum = minimum;
     this.#maximum = options.maximum;
   }
 

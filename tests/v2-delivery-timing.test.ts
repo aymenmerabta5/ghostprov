@@ -18,6 +18,7 @@ describe("ReliableDeliveryTiming", () => {
     timing.retransmitted(100);
     expect(timing.acknowledged({ epoch: 1, sequence: 0 }, false, 500)).toBe(true);
     expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.roundTripSamples).toBe(0);
     expect(timing.attempt).toBe(1);
   });
 
@@ -30,14 +31,17 @@ describe("ReliableDeliveryTiming", () => {
     timing.retransmitted(100);
     expect(timing.acknowledged({ epoch: 1, sequence: 0 }, true, 200)).toBe(true);
     expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.roundTripSamples).toBe(0);
     expect(timing.attempt).toBe(1);
     expect(timing.acknowledged({ epoch: 1, sequence: 1 }, false, 300)).toBe(true);
     expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.roundTripSamples).toBe(0);
     expect(timing.attempt).toBe(1);
     timing.published([{ epoch: 1, sequence: 2 }], 300);
     expect(timing.nextDelayMs(300, 0)).toBe(3_000);
     expect(timing.acknowledged({ epoch: 1, sequence: 2 }, false, 600)).toBe(true);
     expect(timing.roundTripEwmaMs).toBe(300);
+    expect(timing.roundTripSamples).toBe(1);
     expect(timing.attempt).toBe(0);
   });
 
@@ -68,11 +72,14 @@ describe("ReliableDeliveryTiming", () => {
     expect(timing.trackedSequences).toBe(1);
     expect(timing.acknowledged({ epoch: 1, sequence: 0 }, false, 300)).toBe(true);
     expect(timing.roundTripEwmaMs).toBe(200);
+    expect(timing.roundTripSamples).toBe(1);
     expect(timing.trackedSequences).toBe(0);
 
     timing.published([{ epoch: 1, sequence: 1 }], 400);
     expect(timing.acknowledged({ epoch: 1, sequence: 1 }, false, 520)).toBe(true);
-    expect(timing.roundTripEwmaMs).toBe(184);
+    expect(timing.roundTripEwmaMs).toBe(190);
+    expect(timing.roundTripVariationMs).toBe(95);
+    expect(timing.roundTripSamples).toBe(2);
 
     timing.published([
       { epoch: 1, sequence: 2 },
@@ -80,7 +87,9 @@ describe("ReliableDeliveryTiming", () => {
     ], 600);
     timing.published([{ epoch: 1, sequence: 3 }], 620);
     expect(timing.acknowledged({ epoch: 1, sequence: 3 }, false, 700)).toBe(true);
-    expect(timing.roundTripEwmaMs).toBeCloseTo(167.2, 8);
+    expect(timing.roundTripEwmaMs).toBeCloseTo(178.75, 8);
+    expect(timing.roundTripVariationMs).toBeCloseTo(93.75, 8);
+    expect(timing.roundTripSamples).toBe(3);
   });
 
   it("anchors its deadline to progress rather than duplicate publications", () => {

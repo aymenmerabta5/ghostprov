@@ -798,6 +798,28 @@ describe("V2SandboxRuntime", () => {
     await rejected.runtime.stop();
   });
 
+  it("learns successful completion despite non-exhausted rate-limit budget headers", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    let resolve!: (value: Record<string, unknown>) => void;
+    const final = new Promise<Record<string, unknown>>(done => { resolve = done; });
+    harness.transport.run = async () => ({
+      async *events() {},
+      final,
+      // Exhausted budget metadata affects the next admission decision, not the
+      // validity of this successful request's completion sample.
+      rateLimit: { limitTokens: 40_000_000, remainingTokens: 0 },
+      stats: { bytes: 32, firstByteMs: 5, frames: 1 },
+    });
+
+    const handle = await harness.runtime.run({ model: "gpt-5.6-sol", input: "success" });
+    await harness.clock.advanceBy(6_000);
+    resolve({ id: "resp_success", status: "completed" });
+    await expect(handle.final).resolves.toMatchObject({ status: "completed" });
+    expect(harness.runtime.snapshot().completionEwmaMs).toBeCloseTo(9_200, 5);
+    await harness.runtime.stop();
+  });
+
   it("reaches ready only after provision, heartbeat, YDoc, bootstrap, and transport", async () => {
     const harness = runtimeHarness();
 

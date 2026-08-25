@@ -38,6 +38,7 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     published_bytes_total: value.publishedBytesTotal,
     admitted_uncommitted: value.admittedUncommitted,
     round_trip_ewma_ms: value.roundTripEwmaMs,
+    round_trip_variation_ms: value.roundTripVariationMs ?? null,
     paced_publications_total: value.pacedPublicationsTotal,
     urgent_publications_total: value.urgentPublicationsTotal,
     logical_events_total: value.logicalEventsTotal,
@@ -52,6 +53,11 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     capacity_increases_total: value.capacityIncreasesTotal,
     capacity_reductions_total: value.capacityReductionsTotal,
     unadmitted_timeouts_total: value.unadmittedTimeoutsTotal,
+    acknowledged_goodput_bytes_per_sec:
+      value.acknowledgedGoodputBytesPerSecond ?? null,
+    unique_acknowledged_bytes_total: value.uniqueAcknowledgedBytesTotal ?? 0,
+    retransmitted_bytes_total: value.retransmittedBytesTotal ?? 0,
+    stall_events_total: value.stallEventsTotal ?? 0,
     logical_events_per_batch: ratio(
       value.batchedEventsTotal,
       value.responseBatchFramesTotal,

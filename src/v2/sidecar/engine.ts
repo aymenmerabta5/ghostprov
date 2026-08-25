@@ -1162,6 +1162,7 @@ export class SidecarEngine {
   }
 
   #emitPrepared(prepared: PreparedRequest): void {
+    this.#diagnostics?.prepared(prepared.requestId);
     const fence = prepared.commitment;
     const frame: R2RequestPreparedFrame = {
       kind: "request_prepared",
@@ -1287,16 +1288,18 @@ export class SidecarEngine {
         signal: request.controller.signal,
         beforeFetch: async () => {
           await this.#proveExecutionBoundary(request.executionFence);
+          const fetchStartSyncStarted = performance.now();
           try {
             await this.#journal.markFetchStarting(request.requestId);
           } catch (error) {
             this.#reportFatalJournalError(error);
             throw error;
           }
+          const fetchStartSyncMs = performance.now() - fetchStartSyncStarted;
           await this.#proveExecutionBoundary(request.executionFence);
           request.fetchStarted = true;
+          this.#diagnostics?.fetchStarted(request.requestId, fetchStartSyncMs);
           if (request.executionFence !== null) this.#emitRequestAck(request);
-          this.#diagnostics?.fetchStarted(request.requestId);
         },
         onPrelude: async prelude => {
           upstreamPrelude = { ...prelude };

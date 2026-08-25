@@ -45,7 +45,7 @@ export interface MultiSandboxConfig {
   v2DiagnosticsEnabled: boolean;
   v2DiagnosticsIntervalMs: number;
   v2BatchingEnabled: boolean;
-  /** Process-wide immutable sidecar release. R3 is normal operation; R1/R2 are explicit rollback. */
+  /** Process-wide immutable sidecar release. R4 is normal operation; prior releases are rollback. */
   v2SidecarRevision: V2SidecarRevision;
   /** Exact configured-project overrides only; no prefix, cohort, or fallback matching. */
   v2SidecarProjectRevisions: Readonly<Record<string, V2SidecarRevision>>;
@@ -103,7 +103,7 @@ function v2SidecarProjectRevisions(
       separator === entry.length - 1
     ) {
       throw new TypeError(
-        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3 entries",
+        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3|r4 entries",
       );
     }
     const rawProjectId = entry.slice(0, separator).trim();

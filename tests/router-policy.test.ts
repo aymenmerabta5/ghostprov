@@ -140,6 +140,50 @@ describe("chooseRuntime", () => {
     expect(chooseRuntime(large, [slow, fast], RANDOM)?.projectId).toBe(fast.projectId);
   });
 
+  it("does not route a long context to an optimistic cold R2 link", () => {
+    const longContext: WorkloadDescriptor = {
+      ...TEXT,
+      class: "text-large",
+      requestBytes: 2_654_745,
+    };
+    const coldSlow = candidate("1", {
+      protocolRevision: "r2",
+      capacity: 8,
+      available: 4,
+      active: 0,
+      ackEwmaMs: 784,
+      throughputBytesPerSecond: null,
+    });
+    const measuredFast = candidate("2", {
+      protocolRevision: "r2",
+      capacity: 8,
+      available: 4,
+      active: 1,
+      ackEwmaMs: 296,
+      throughputBytesPerSecond: 1.7 * 1024 ** 2,
+    });
+
+    expect(chooseRuntime(longContext, [coldSlow, measuredFast], RANDOM)?.projectId)
+      .toBe(measuredFast.projectId);
+    // Preserve cold-runtime exploration for low-context UX and capacity.
+    expect(chooseRuntime(TEXT, [coldSlow, measuredFast], RANDOM)?.projectId)
+      .toBe(coldSlow.projectId);
+  });
+
+  it("does not score an unknown ready R2 RTT as a zero-latency link", () => {
+    const cold = candidate("1", {
+      protocolRevision: "r2",
+      ackEwmaMs: 0,
+      throughputBytesPerSecond: null,
+    });
+    const measured = candidate("2", {
+      protocolRevision: "r2",
+      ackEwmaMs: 100,
+      throughputBytesPerSecond: null,
+    });
+    expect(chooseRuntime(TEXT, [cold, measured], RANDOM)?.projectId).toBe(measured.projectId);
+  });
+
   it("keeps 100,000 four-runtime decisions below the 2ms p95 budget", () => {
     const candidates = [candidate("1"), candidate("2"), candidate("3"), candidate("4")];
     const samples: number[] = [];

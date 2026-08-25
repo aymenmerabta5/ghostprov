@@ -134,7 +134,7 @@ function processInterlockHelpers(): string[] {
     "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
     "  return undef unless defined $gp_cmd;",
     "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[23]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
     "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
     "}",
     "sub gp_exact_sidecar_entrypoint {",
@@ -142,7 +142,7 @@ function processInterlockHelpers(): string[] {
     "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
     "  return undef unless defined $gp_cmd;",
     "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[123]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[1234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
     "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
     "}",
     "sub gp_group_alive {",
@@ -465,7 +465,7 @@ function temporaryLauncher(
     "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
     "if (!$gp_deno && !$gp_launch_error) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
     // A host restart does not imply a sandbox restart. Retire a prior immutable
-    // R1, R2, or R3 owner before forking the selected release; otherwise tryLock
+    // R1, R2, R3, or R4 owner before forking the selected release; otherwise tryLock
     // correctly makes every new child lose forever. The locked owner record,
     // canonical PID record, Linux start tick, process group/session, immutable
     // entrypoint, and argv nonce are all revalidated immediately before signal.

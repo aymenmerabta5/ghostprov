@@ -43,11 +43,16 @@ import type { AtomicBytePermitPool } from "./memory/atomic-byte-permits";
 import { isRateLimited, rateLimitHintFromError } from "./rate-limit";
 
 function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
-  if (handle.rateLimit !== undefined) return true;
+  // Successful Responses calls commonly carry budget headers. Those headers
+  // are useful evidence, but their mere presence must not make a completed
+  // request routing-neutral or the completion estimator will remain frozen at
+  // its cold baseline. Only an actual failed/incomplete rate-limit outcome (or
+  // explicit exhausted header evidence) is neutral.
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const status = (value as Record<string, unknown>).status;
   if (status !== "failed" && status !== "incomplete") return false;
-  return isRateLimited(value) || rateLimitHintFromError(value) !== undefined;
+  return isRateLimited(value) ||
+    rateLimitHintFromError(value, handle.rateLimit) !== undefined;
 }
 
 function shouldQuarantineSandboxSession(error: unknown): boolean {
@@ -273,6 +278,7 @@ export interface V2SandboxRuntimeOptions {
     gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
     expectedSidecarInstanceId: string;
     eventMemoryPool?: AtomicBytePermitPool;
+    onStateChange?(): void;
   }): V2RuntimeTransport | V2TransportSession;
 }
 
@@ -738,13 +744,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (generation !== this.#generation) return;
       this.#descriptor = descriptor;
 
-      const transport = this.#options.createTransport({
+      let transport!: V2RuntimeTransport;
+      transport = this.#options.createTransport({
         binding,
         channel: awareness,
         maxResponseBytes: this.#options.maxResponseBytes ?? 64 * 1024 * 1024,
         gzip: this.#options.gzip,
         expectedSidecarInstanceId: descriptor.instanceId,
         eventMemoryPool: this.#options.eventMemoryPool,
+        onStateChange: () => {
+          if (generation === this.#generation && this.#transport === transport) this.#emit();
+        },
       });
       this.#transport = transport;
       transport.setHostCeiling?.(descriptor.capacity);
@@ -1027,6 +1037,13 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         gzip: this.#options.gzip,
         expectedSidecarInstanceId: descriptor.instanceId,
         eventMemoryPool: this.#options.eventMemoryPool,
+        onStateChange: () => {
+          if (
+            generation === this.#generation &&
+            context.transport !== null &&
+            this.#transport === context.transport
+          ) this.#emit();
+        },
       });
       const candidate = context.transport;
       if (!candidate.adoptRecoveredSidecar || !candidate.failSidecarRecovery) {

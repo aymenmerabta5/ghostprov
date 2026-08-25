@@ -16,8 +16,8 @@ describe("optional V2 protocol diagnostics", () => {
   });
 
   it("accepts bounded ACK diagnostics but still rejects invalid core fields", () => {
-    const frame = parseFrame({ kind: "request_ack", requestId: "req-1", requestDigest: "a".repeat(64), committed: true, diagnostics: { firstFrameToCommitMs: 4, commitToAssemblyMs: 1, claimSyncMs: 2, admissionWaitMs: 0, commitProcessingMs: 3 }, epoch: 1, sequence: 0 }, "sidecar", "r1");
-    expect((frame as any).diagnostics).toMatchObject({ claimSyncMs: 2 });
+    const frame = parseFrame({ kind: "request_ack", requestId: "req-1", requestDigest: "a".repeat(64), committed: true, diagnostics: { firstFrameToCommitMs: 4, commitToAssemblyMs: 1, claimSyncMs: 2, admissionWaitMs: 0, commitProcessingMs: 3, preparedToFetchStartMs: 7, fetchStartSyncMs: 2 }, epoch: 1, sequence: 0 }, "sidecar", "r1");
+    expect((frame as any).diagnostics).toMatchObject({ claimSyncMs: 2, preparedToFetchStartMs: 7, fetchStartSyncMs: 2 });
     expect(() => parseFrame({ ...(frame as any), committed: false }, "sidecar", "r1")).toThrow("commitment");
   });
 });

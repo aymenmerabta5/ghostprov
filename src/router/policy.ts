@@ -4,6 +4,8 @@ import type { WorkloadDescriptor } from "./workload";
 
 export interface RouteCandidate {
   projectId: ProjectId;
+  /** Verified wire revision; ready production V2 runtimes always provide it. */
+  protocolRevision?: "r1" | "r2" | null;
   incarnation?: number;
   state: string;
   capacity: number;
@@ -33,6 +35,20 @@ export interface RouteCandidate {
   /** Measured host-to-sidecar publication throughput for this runtime. */
   throughputBytesPerSecond?: number | null;
 }
+
+const KiB = 1024;
+const UNKNOWN_THROUGHPUT_BYTES_PER_ACK: Readonly<Record<"r1" | "r2", number>> =
+  Object.freeze({
+    // R1's 128 KiB encoded flight fits roughly ten 8 KiB request parts.
+    r1: 80 * KiB,
+    // R2 carries exactly thirty-two 11 KiB request parts per full flight.
+    r2: 32 * 11 * KiB,
+  });
+// A fresh/recovered remote sandbox must not look faster than every measured
+// peer merely because it has no RTT sample yet. This matches the conservative
+// upper-middle of observed production Awareness RTTs and lasts only until the
+// first clean ACK.
+const UNKNOWN_RTT_FLOOR_MS = 750;
 
 export interface RouteDecision {
   projectId: ProjectId;
@@ -85,13 +101,23 @@ function score(workload: WorkloadDescriptor, candidate: RouteCandidate): number 
   const loadDelay = (effectiveWork / usable) * candidate.completionEwmaMs;
   const queuedWaves = candidate.queueDepth / usable;
   const throughput = candidate.throughputBytesPerSecond ?? 0;
+  const measuredRevision = candidate.protocolRevision === "r1" ||
+      candidate.protocolRevision === "r2"
+    ? candidate.protocolRevision
+    : null;
+  const effectiveAckMs = measuredRevision && candidate.ackEwmaMs <= 0
+    ? UNKNOWN_RTT_FLOOR_MS
+    : Math.max(0, candidate.ackEwmaMs);
+  const fallbackFlightBytes = measuredRevision
+    ? UNKNOWN_THROUGHPUT_BYTES_PER_ACK[measuredRevision]
+    : 2 * 1024 ** 2;
   const payloadPenalty = throughput > 0
     ? Math.min(candidate.completionEwmaMs, workload.requestBytes / throughput * 1_000)
     : Math.min(
         candidate.completionEwmaMs,
-        (workload.requestBytes / (2 * 1024 ** 2)) * Math.max(25, candidate.ackEwmaMs),
+        (workload.requestBytes / fallbackFlightBytes) * Math.max(25, effectiveAckMs),
       );
-  const commitPenalty = commitBacklog * Math.max(1, candidate.ackEwmaMs) /
+  const commitPenalty = commitBacklog * Math.max(1, effectiveAckMs) /
     Math.max(1, effectiveCredits);
   const schedulerPenalty = Math.max(0, candidate.schedulerOldestMs ?? 0) +
     (throughput > 0
@@ -99,7 +125,7 @@ function score(workload: WorkloadDescriptor, candidate: RouteCandidate): number 
       : 0);
   const failurePenalty = Math.max(0, candidate.recentFailureRate) * candidate.completionEwmaMs * 5;
   const memoryPenalty = Math.max(0, candidate.memoryPressure) * candidate.completionEwmaMs;
-  return candidate.ackEwmaMs + loadDelay + queuedWaves * candidate.completionEwmaMs +
+  return effectiveAckMs + loadDelay + queuedWaves * candidate.completionEwmaMs +
     payloadPenalty + commitPenalty + schedulerPenalty + failurePenalty + memoryPenalty;
 }
 

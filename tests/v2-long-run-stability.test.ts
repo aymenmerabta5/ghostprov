@@ -4,7 +4,7 @@ import { AdaptiveTransportCapacity } from "../src/v2/transport/adaptive-capacity
 describe("V2 long-run capacity invariants", () => {
   it("cannot exhaust eight healthy sandboxes through adaptation and cancellation churn", () => {
     const controllers = Array.from({ length: 8 }, () => (
-      new AdaptiveTransportCapacity({ initial: 8, maximum: 16 })
+      new AdaptiveTransportCapacity({ initial: 8, maximum: 8, minimum: 4 })
     ));
 
     // Model many healthy flights separated by arbitrary idle time. The
@@ -14,7 +14,7 @@ describe("V2 long-run capacity invariants", () => {
         controller.observe({ rttMs: 350, congested: false });
       }
     }
-    expect(controllers.every(controller => controller.limit === 16)).toBe(true);
+    expect(controllers.every(controller => controller.limit === 8)).toBe(true);
 
     // Even a simultaneous severe sample cannot reduce below the safe floor.
     for (const controller of controllers) {
@@ -22,7 +22,7 @@ describe("V2 long-run capacity invariants", () => {
         controller.observe({ rttMs: 10_000, congested: true });
       }
     }
-    expect(controllers.every(controller => controller.limit === 8)).toBe(true);
+    expect(controllers.every(controller => controller.limit === 4)).toBe(true);
 
     // Reproduce the observed distribution of thirteen cancellations before
     // their definitive acknowledgements arrive.
@@ -31,7 +31,7 @@ describe("V2 long-run capacity invariants", () => {
       (sum, controller, index) => sum + controller.limit - temporaryQuarantines[index]!,
       0,
     );
-    expect(usableDuringCancellation).toBe(51);
+    expect(usableDuringCancellation).toBe(19);
     expect(usableDuringCancellation).toBeGreaterThan(0);
 
     // Matching completion acknowledgements release all cancellation-only
@@ -40,6 +40,13 @@ describe("V2 long-run capacity invariants", () => {
       (sum, controller) => sum + controller.limit,
       0,
     );
-    expect(usableAfterCompletion).toBe(64);
+    expect(usableAfterCompletion).toBe(32);
+
+    for (let round = 0; round < 32; round++) {
+      for (const controller of controllers) {
+        controller.observe({ rttMs: 350, congested: false });
+      }
+    }
+    expect(controllers.every(controller => controller.limit === 8)).toBe(true);
   });
 });

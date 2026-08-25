@@ -46,9 +46,11 @@ import {
   type IncrementalSha256Hasher,
 } from "../protocol/transcript";
 import {
+  encodedFrameBytes,
   InboundFrameCursor,
   OutboundFrameWindow,
 } from "../protocol/window";
+import { TransportCongestion } from "./congestion";
 import {
   V2CommittedError,
   V2PreCommitError,
@@ -73,6 +75,15 @@ const R2_REQUEST_PART_BYTES = 11 * 1024;
 const MIN_GZIP_SAVINGS_RATIO = 0.05;
 const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
 const GZIP_SAMPLE_BYTES = 64 * 1024;
+const DEFAULT_TRANSPORT_STALL_MS = 2_000;
+const GOODPUT_IDLE_RESET_MS = 60_000;
+
+function hostFrameCarriesRequest(frame: ReliableFrame<HostFrame>): boolean {
+  // Route payloads by request-body goodput only. Tiny request_start/commit
+  // control flights would otherwise drag the EWMA toward a few KiB/s after
+  // every successful handshake and make healthy sandboxes look unusable.
+  return frame.kind === "request_data";
+}
 
 function containsLargeInlineBase64(value: unknown, seen = new Set<object>()): boolean {
   if (typeof value === "string") {
@@ -161,6 +172,10 @@ export interface V2TransportSessionOptions {
   livenessTimeoutMs?: number;
   /** One process-wide pool shared by every V2 transport session. */
   eventMemoryPool?: AtomicBytePermitPool;
+  /** Coalesced notification when admission or transport-health state changes. */
+  onStateChange?(): void;
+  /** Deterministic tests may shorten the production two-second stall fence. */
+  transportStallMs?: number;
 }
 
 interface EventPart {
@@ -446,6 +461,9 @@ export class V2TransportSession {
   readonly #maxResponseBytes: number;
   readonly #maxBufferedResponseBytes: number;
   readonly #eventMemoryPool?: AtomicBytePermitPool;
+  readonly #onStateChange?: () => void;
+  readonly #transportStallMs: number;
+  readonly #fastRetransmitFloorMs: number;
   #hostCeiling: number;
   readonly #rotationTimeoutMs: number;
   readonly #unadmittedTimeoutMs: number;
@@ -475,6 +493,7 @@ export class V2TransportSession {
   #connecting: Promise<void> | null = null;
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
+  #stallTimer: ReturnType<typeof setTimeout> | null = null;
   #processing: Promise<void> = Promise.resolve();
   #lifecycleEpoch = 0;
   #teardownPromise: Promise<void> | null = null;
@@ -516,6 +535,17 @@ export class V2TransportSession {
   #flightCompletions = 0;
   #peakRetransmissionAttempt = 0;
   #unadmittedTimeouts = 0;
+  readonly #congestion: TransportCongestion;
+  #stallEvents = 0;
+  #stateChangeScheduled = false;
+  #flightStartedAtMs: number | null = null;
+  #flightRequestBytes = 0;
+  #acknowledgedGoodputBytesPerSecond: number | null = null;
+  #goodputUpdatedAtMs: number | null = null;
+  #uniqueAcknowledgedBytes = 0;
+  #retransmittedBytes = 0;
+  #lastFastRetransmitAtMs: number | null = null;
+  #stallTimerDueAtMs: number | null = null;
 
   constructor(options: V2TransportSessionOptions) {
     if (options.channel.projectId !== options.binding.projectId) {
@@ -578,6 +608,13 @@ export class V2TransportSession {
     this.#maxResponseBytes = options.maxResponseBytes;
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
     this.#eventMemoryPool = options.eventMemoryPool;
+    this.#onStateChange = options.onStateChange;
+    this.#transportStallMs = options.transportStallMs ?? DEFAULT_TRANSPORT_STALL_MS;
+    if (!Number.isFinite(this.#transportStallMs) || this.#transportStallMs < 1) {
+      throw new RangeError("transportStallMs must be positive");
+    }
+    this.#fastRetransmitFloorMs = Math.min(1_000, this.#transportStallMs);
+    this.#congestion = new TransportCongestion({ highAgeMs: this.#transportStallMs });
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
@@ -752,7 +789,7 @@ export class V2TransportSession {
     const requestId = `req-${crypto.randomUUID()}`;
     const diagnostics = new HostRequestDiagnosticsObserver(() => this.#clock.now());
     const prepared = await this.#prepareRequest(body, signal);
-    diagnostics.prepared();
+    diagnostics.prepared(prepared);
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
     if (this.#sidecarRecovery || !this.#connected) {
       throw new V2PreCommitError(
@@ -889,6 +926,9 @@ export class V2TransportSession {
     this.#unsubscribe = null;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
+    if (this.#stallTimer) clearTimeout(this.#stallTimer);
+    this.#stallTimer = null;
+    this.#stallTimerDueAtMs = null;
     if (this.#livenessProbe) {
       this.#rejectLivenessProbe(
         this.#livenessProbe,
@@ -992,6 +1032,7 @@ export class V2TransportSession {
     this.#outbound.reset(nextOutboundEpoch);
     this.#delivery.reset(nextOutboundEpoch);
     this.#flight.reset(nextOutboundEpoch);
+    this.#resetFlightMeasurement();
     const nextInboundEpoch = this.#inbound.ack().epoch + 1;
     this.#inbound.reset(nextInboundEpoch);
     this.#processedInboundAck = { epoch: nextInboundEpoch, sequence: -1 };
@@ -1331,6 +1372,9 @@ export class V2TransportSession {
     this.#pacer.close();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
+    if (this.#stallTimer) clearTimeout(this.#stallTimer);
+    this.#stallTimer = null;
+    this.#stallTimerDueAtMs = null;
     this.#unsubscribe?.();
     this.#unsubscribe = null;
     for (const [rotationId, waiter] of this.#rotations) {
@@ -1369,6 +1413,7 @@ export class V2TransportSession {
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
       this.#flight.reset(nextEpoch);
+      this.#resetFlightMeasurement();
       this.#dataDirty = false;
       try {
         this.#channel.clear();
@@ -1411,6 +1456,15 @@ export class V2TransportSession {
     if (value === this.#hostCeiling) return;
     this.#hostCeiling = value;
     if (this.#connected && !this.#closed) this.#pacer.requestUrgent();
+  }
+
+  #notifyStateChange(): void {
+    if (!this.#onStateChange || this.#stateChangeScheduled || this.#closed) return;
+    this.#stateChangeScheduled = true;
+    queueMicrotask(() => {
+      this.#stateChangeScheduled = false;
+      if (!this.#closed) this.#onStateChange?.();
+    });
   }
 
   #observeSidecarLiveness(envelope: AwarenessEnvelope<SidecarFrame>): void {
@@ -1572,6 +1626,7 @@ export class V2TransportSession {
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
       this.#flight.reset(nextEpoch);
+      this.#resetFlightMeasurement();
       this.#channel.clear("data");
       this.#dataDirty = false;
       this.#sidecarRevision.data = -1;
@@ -1581,35 +1636,65 @@ export class V2TransportSession {
     if (envelope.revision <= this.#sidecarRevision[lane]) return;
     this.#sidecarInstanceId = envelope.instanceId;
     this.#sidecarRevision[lane] = envelope.revision;
+    let creditsChanged = false;
     if (lane === "control" || legacy) {
       this.#sidecarDiagnostics = envelope.diagnostics ?? null;
-      this.#remoteCredits = Math.max(0, Math.min(128, envelope.credits));
+      const nextCredits = Math.max(0, Math.min(128, envelope.credits));
+      creditsChanged = nextCredits !== this.#remoteCredits;
+      this.#remoteCredits = nextCredits;
     }
 
     this.#acknowledgeOutbound(envelope.ack);
     const flightCompleted = this.#flight.acknowledged(envelope.ack);
-    if (flightCompleted) this.#flightCompletions++;
     const now = this.#clock.now();
+    let goodputChanged = false;
+    if (flightCompleted) {
+      this.#flightCompletions++;
+      goodputChanged = this.#recordAcknowledgedFlight(now);
+    }
     const acknowledgementAdvanced = this.#delivery.acknowledged(
       envelope.ack,
       this.#outbound.snapshot().frames.length > 0,
       now,
     );
     if (acknowledgementAdvanced) {
+      this.#lastFastRetransmitAtMs = null;
       this.#armRetransmission();
     }
+    const congestionChanged = this.#updateCongestion();
+    if (creditsChanged || congestionChanged || goodputChanged) this.#notifyStateChange();
+    if (!acknowledgementAdvanced && lane === "control") {
+      this.#maybeFastRetransmit(now);
+    }
     let delivered: readonly ReliableFrame<SidecarFrame>[] = [];
+    let replayProcessedAck = false;
     if (lane === "data") {
       const currentEpoch = this.#inbound.ack().epoch;
       if (envelope.epoch > currentEpoch) {
         this.#inbound.reset(envelope.epoch);
         this.#processedInboundAck = { epoch: envelope.epoch, sequence: -1 };
       }
+      const envelopeHigh = envelope.frames.reduce(
+        (high, frame) => frame.epoch === this.#processedInboundAck.epoch
+          ? Math.max(high, frame.sequence)
+          : high,
+        -1,
+      );
       delivered = this.#inbound.accept(envelope.frames);
       for (const frame of delivered) {
         await this.#processFrame(frame, lifecycleEpoch);
         if (!this.#ownsLifecycle(lifecycleEpoch)) return;
         this.#processedInboundAck = { epoch: frame.epoch, sequence: frame.sequence };
+      }
+      if (
+        delivered.length === 0 &&
+        envelopeHigh >= 0 &&
+        envelopeHigh <= this.#processedInboundAck.sequence
+      ) {
+        // A newer publication carrying an already-processed immutable flight
+        // proves the peer missed our ACK-only state. Replay the current ACK
+        // immediately instead of making it climb the retransmission backoff.
+        replayProcessedAck = true;
       }
     }
     if (!this.#ownsLifecycle(lifecycleEpoch)) return;
@@ -1618,8 +1703,9 @@ export class V2TransportSession {
     const urgency = this.#pump();
     if (flightCompleted && urgency === null) this.#channel.clear("data");
     this.#requestPublication(
-      replaced || delivered.length > 0 ? "urgent" : urgency,
+      replaced || delivered.length > 0 || replayProcessedAck ? "urgent" : urgency,
     );
+    this.#armStallWatchdog();
   }
 
   async #processFrame(
@@ -2825,7 +2911,10 @@ export class V2TransportSession {
   }
 
   #availableCredits(): number {
-    if (this.#sidecarRecovery || !this.#connected || this.#closed || this.#draining) return 0;
+    if (
+      this.#sidecarRecovery || !this.#connected || this.#closed || this.#draining ||
+      this.#congestion.congested
+    ) return 0;
     return Math.max(0, Math.min(
       this.#remoteCredits - this.#creditReservations,
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
@@ -2879,6 +2968,7 @@ export class V2TransportSession {
   #requestPublication(urgency: PublicationUrgency | null): void {
     if (urgency === "urgent") this.#pacer.requestUrgent();
     else if (urgency === "paced") this.#pacer.requestPaced();
+    this.#armStallWatchdog();
   }
 
   #publish(reason: PublicationReason): void {
@@ -2887,6 +2977,16 @@ export class V2TransportSession {
       const outbound = this.#outbound.snapshot();
       const publishData = reason === "retransmission" || this.#dataDirty;
       if (publishData) {
+        const newFlight = !this.#flight.active;
+        if (newFlight) {
+          this.#flightStartedAtMs = this.#clock.now();
+          this.#flightRequestBytes = outbound.frames
+            .filter(hostFrameCarriesRequest)
+            .reduce((total, frame) => total + encodedFrameBytes(frame), 0);
+        }
+        if (reason === "retransmission") {
+          this.#retransmittedBytes += outbound.encodedBytes;
+        }
         this.#flight.published(outbound.frames);
         this.#delivery.published(outbound.frames, this.#clock.now());
         this.#publishLane("data", outbound.frames, reason);
@@ -2898,6 +2998,7 @@ export class V2TransportSession {
       const diagnostics = this.#hostTransportDiagnostics();
       for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
       this.#armRetransmission();
+      this.#armStallWatchdog();
     } catch (cause) {
       if (this.#isReconnectableAwarenessFailure(cause)) {
         this.#remoteCredits = 0;
@@ -2935,7 +3036,7 @@ export class V2TransportSession {
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#processedInboundAck,
-      credits: this.#sidecarRecovery ? 0 : this.#hostCeiling,
+      credits: this.#sidecarRecovery || this.#congestion.congested ? 0 : this.#hostCeiling,
       active: this.#sidecarRecovery ? Math.max(1, recoveryActive) : committed,
       queued: this.#pending.filter(state => !state.admitted).length,
       draining: this.#draining,
@@ -3007,6 +3108,7 @@ export class V2TransportSession {
       admittedUncommitted: [...this.#requests.values()]
         .filter(value => value.admitted && !value.committed).length,
       roundTripEwmaMs: this.#delivery.roundTripEwmaMs,
+      roundTripVariationMs: this.#delivery.roundTripVariationMs,
       pacedPublicationsTotal: this.#pacedPublications,
       urgentPublicationsTotal: this.#urgentPublications,
       logicalEventsTotal: 0,
@@ -3021,7 +3123,128 @@ export class V2TransportSession {
       capacityIncreasesTotal: 0,
       capacityReductionsTotal: 0,
       unadmittedTimeoutsTotal: this.#unadmittedTimeouts,
+      acknowledgedGoodputBytesPerSecond: this.#currentGoodput(),
+      uniqueAcknowledgedBytesTotal: this.#uniqueAcknowledgedBytes,
+      retransmittedBytesTotal: this.#retransmittedBytes,
+      stallEventsTotal: this.#stallEvents,
     };
+  }
+
+  #currentGoodput(): number | null {
+    if (
+      this.#acknowledgedGoodputBytesPerSecond === null ||
+      this.#goodputUpdatedAtMs === null ||
+      this.#clock.now() - this.#goodputUpdatedAtMs >= GOODPUT_IDLE_RESET_MS
+    ) return null;
+    return this.#acknowledgedGoodputBytesPerSecond;
+  }
+
+  #recordAcknowledgedFlight(now: number): boolean {
+    const started = this.#flightStartedAtMs;
+    const bytes = this.#flightRequestBytes;
+    this.#flightStartedAtMs = null;
+    this.#flightRequestBytes = 0;
+    if (bytes > 0) this.#uniqueAcknowledgedBytes += bytes;
+    if (started === null || bytes <= 0 || now <= started) return false;
+    const sample = bytes * 1_000 / (now - started);
+    this.#acknowledgedGoodputBytesPerSecond =
+      this.#acknowledgedGoodputBytesPerSecond === null
+        ? sample
+        : this.#acknowledgedGoodputBytesPerSecond * 0.75 + sample * 0.25;
+    this.#goodputUpdatedAtMs = now;
+    return true;
+  }
+
+  #resetFlightMeasurement(): void {
+    this.#flightStartedAtMs = null;
+    this.#flightRequestBytes = 0;
+    this.#lastFastRetransmitAtMs = null;
+  }
+
+  #updateCongestion(): boolean {
+    const before = this.#congestion.congested;
+    const scheduled = this.#scheduler.snapshot();
+    const outbound = this.#outbound.snapshot();
+    const ackProgressAgeMs = this.#delivery.ackProgressAgeMs(this.#clock.now());
+    this.#congestion.update({
+      schedulerFrames: scheduled.queuedFrames,
+      schedulerBytes: scheduled.queuedEncodedBytes,
+      oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs,
+      ackProgressAgeMs,
+      windowFrames: outbound.frames.length,
+    });
+    if (
+      !before && this.#congestion.congested && outbound.frames.length > 0 &&
+      ackProgressAgeMs >= this.#transportStallMs
+    ) this.#stallEvents++;
+    return before !== this.#congestion.congested;
+  }
+
+  #armStallWatchdog(): void {
+    if (!this.#connected || this.#closed) return;
+    const scheduled = this.#scheduler.snapshot();
+    const outbound = this.#outbound.snapshot();
+    if (scheduled.queuedFrames === 0 && outbound.frames.length === 0) {
+      if (this.#stallTimer) clearTimeout(this.#stallTimer);
+      this.#stallTimer = null;
+      this.#stallTimerDueAtMs = null;
+      if (this.#updateCongestion()) this.#notifyStateChange();
+      return;
+    }
+    const now = this.#clock.now();
+    const age = Math.max(
+      scheduled.oldestQueuedFrameMs,
+      outbound.frames.length > 0
+        ? this.#delivery.ackProgressAgeMs(now)
+        : 0,
+    );
+    const delay = this.#congestion.congested
+      ? Math.max(100, Math.min(500, this.#transportStallMs / 2))
+      : Math.max(1, this.#transportStallMs - age);
+    const dueAt = now + delay;
+    if (
+      this.#stallTimer && this.#stallTimerDueAtMs !== null &&
+      this.#stallTimerDueAtMs <= dueAt
+    ) return;
+    if (this.#stallTimer) clearTimeout(this.#stallTimer);
+    this.#stallTimerDueAtMs = dueAt;
+    this.#stallTimer = setTimeout(() => {
+      this.#stallTimer = null;
+      this.#stallTimerDueAtMs = null;
+      if (this.#closed) return;
+      if (this.#updateCongestion()) {
+        this.#notifyStateChange();
+        this.#pacer.requestUrgent();
+      }
+      this.#armStallWatchdog();
+    }, delay);
+    this.#stallTimer.unref?.();
+  }
+
+  #maybeFastRetransmit(now: number): boolean {
+    if (!this.#flight.active || this.#outbound.snapshot().frames.length === 0) return false;
+    const rtt = this.#delivery.roundTripEwmaMs;
+    const threshold = Math.max(
+      this.#fastRetransmitFloorMs,
+      (rtt ?? this.#fastRetransmitFloorMs) * 1.5,
+    );
+    if (this.#delivery.ackProgressAgeMs(now) < threshold) return false;
+    if (
+      this.#lastFastRetransmitAtMs !== null &&
+      now - this.#lastFastRetransmitAtMs < Math.max(
+        this.#fastRetransmitFloorMs,
+        (rtt ?? this.#fastRetransmitFloorMs) * 2,
+      )
+    ) return false;
+    this.#lastFastRetransmitAtMs = now;
+    this.#delivery.retransmitted(now);
+    this.#retransmissions++;
+    this.#peakRetransmissionAttempt = Math.max(
+      this.#peakRetransmissionAttempt,
+      this.#delivery.attempt,
+    );
+    this.#pacer.flushNow("retransmission");
+    return true;
   }
 
   #armRetransmission(): void {

@@ -64,6 +64,7 @@ class R2Harness {
   readonly sidecar = this.network.connectSidecar("sidecar", PROJECT);
   readonly session: V2TransportSession;
   readonly hostFrames = new Map<number, ReliableFrame<HostFrame>>();
+  readonly hostEnvelopes: AwarenessEnvelope<HostFrame>[] = [];
   readonly sidecarOutstanding: ReliableFrame<SidecarFrame>[] = [];
   hostAck = -1;
   nextHostSequence = 0;
@@ -75,6 +76,7 @@ class R2Harness {
     const base = this.network.connectHost("host", PROJECT);
     const host = options.throwOnStart ? withThrowingStart(base) : base;
     this.sidecar.subscribe(update => {
+      this.hostEnvelopes.push(update.envelope);
       if ((update.envelope.lane ?? "data") !== "data") return;
       for (const frame of update.envelope.frames) this.hostFrames.set(frame.sequence, frame);
       while (this.hostFrames.has(this.nextHostSequence)) {
@@ -230,6 +232,39 @@ describe("R2 prepared/start host boundary", () => {
     await harness.settle();
     await expect(pending).resolves.toBeDefined();
     await harness.close();
+  });
+
+  it("replays an R2 processed ACK when the sidecar retransmits a prepared flight", async () => {
+    const harness = new R2Harness();
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    await harness.settle();
+    const prepared = harness.prepared();
+
+    harness.publish([prepared]);
+    await harness.settle();
+    const preparedSequence = harness.sidecarOutstanding[0]!.sequence;
+    expect(harness.starts()).toHaveLength(1);
+    expect(harness.hostEnvelopes.some(envelope => (
+      envelope.ack.sequence >= preparedSequence
+    ))).toBe(true);
+    harness.hostEnvelopes.length = 0;
+
+    // Re-publish the same immutable outstanding sequence as if the first host
+    // ACK/control update was lost before it reached the sidecar.
+    harness.publish([]);
+    await harness.settle();
+    expect(harness.starts()).toHaveLength(1);
+    expect(harness.hostEnvelopes).toHaveLength(1);
+    expect(harness.hostEnvelopes[0]).toMatchObject({
+      lane: "control",
+      ack: { epoch: 1, sequence: preparedSequence },
+      frames: [],
+    });
+
+    await harness.session.close();
+    await expect(pending).rejects.toBeInstanceOf(V2CommittedError);
+    await harness.sidecar.close();
   });
 
   it("can retract a merely queued start on abort without quarantine", async () => {
