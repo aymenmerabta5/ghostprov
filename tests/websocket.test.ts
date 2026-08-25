@@ -5,6 +5,7 @@ import {
   attachResponsesWebSocket,
   DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES,
   DEFAULT_WS_MAX_PAYLOAD_BYTES,
+  DEFAULT_WS_PROMOTION_HEADROOM_BYTES,
   DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
   decodeWebSocketRawData,
   MAX_WS_PAYLOAD_BYTES,
@@ -139,7 +140,7 @@ describe("Responses WebSocket server", () => {
     expect(budget.snapshot().sessions).toBe(1);
   });
 
-  it("bounds thirty default parser reservations and one explicit jumbo mix", () => {
+  it("guarantees full promotion headroom while retaining legacy Node jumbo math", () => {
     const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
     const jumboBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
     expect(normalBytes).toBe(17 * 1024 * 1024);
@@ -150,15 +151,22 @@ describe("Responses WebSocket server", () => {
       maxQueuedBytes: 512 * 1024 * 1024,
       maxIngressBytes: DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
     });
-    const defaults = Array.from({ length: 30 }, () => budget.openSession(normalBytes));
+    expect(DEFAULT_WS_PROMOTION_HEADROOM_BYTES).toBe(48 * 1024 * 1024);
+    const defaults = Array.from(
+      { length: 27 },
+      () => budget.openSession(normalBytes, DEFAULT_WS_PROMOTION_HEADROOM_BYTES),
+    );
     expect(defaults.every(Boolean)).toBe(true);
-    expect(budget.openSession(normalBytes)).toBeNull();
+    expect(budget.openSession(normalBytes, DEFAULT_WS_PROMOTION_HEADROOM_BYTES)).toBeNull();
     expect(budget.snapshot()).toMatchObject({
-      sessions: 30,
-      ingressReservedBytes: 510 * 1024 * 1024,
+      sessions: 27,
+      ingressReservedBytes: 459 * 1024 * 1024,
       queuedBytes: 0,
       maxIngressBytes: 512 * 1024 * 1024,
     });
+    expect(defaults[0]!.tryEnsureIngress(DEFAULT_WS_PROMOTION_HEADROOM_BYTES)).toBe(true);
+    expect(budget.snapshot().ingressReservedBytes).toBe(507 * 1024 * 1024);
+    defaults[0]!.releaseIngress();
     for (const lease of defaults) lease!.close();
 
     const jumbo = budget.openSession(jumboBytes);
@@ -198,6 +206,39 @@ describe("Responses WebSocket server", () => {
     }
   });
 
+  it("reserves enough raw parser memory when a custom fast path is smaller", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 64,
+      maxQueuedBytes: 512 * MiB,
+      maxIngressBytes: 512 * MiB,
+    });
+    await startServer(
+      async () => relayHandle(Promise.resolve(completed("unused"))),
+      {
+        processBudget: budget,
+        fastPathPayloadBytes: MiB,
+        maxPayloadBytes: DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES,
+      },
+    );
+    expect(budget.snapshot().ingressReservedBytes).toBe(17 * MiB);
+  });
+
+  it("does not spend a 257 MiB jumbo reservation on Bun's compatibility path", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 64,
+      maxQueuedBytes: 512 * MiB,
+      maxIngressBytes: 512 * MiB,
+    });
+    await startServer(
+      async () => relayHandle(Promise.resolve(completed("unused"))),
+      { processBudget: budget },
+      { "x-ghostprov-ws-jumbo": "1" },
+    );
+    expect(budget.snapshot().ingressReservedBytes).toBe(17 * MiB);
+  });
+
   it("automatically promotes a large message without changing the connection", async () => {
     const input = "x".repeat(10 * 1024 * 1024);
     const telemetry = new WebSocketTelemetry();
@@ -234,11 +275,12 @@ describe("Responses WebSocket server", () => {
 
   it("enforces Bun's native ceiling and retains the jumbo header below it", async () => {
     const input = "x".repeat(DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES + 1024);
+    const parserTelemetry = new WebSocketTelemetry();
     let normalCalls = 0;
     const normal = await startServer(async () => {
       normalCalls++;
       return relayHandle(Promise.resolve(completed("unexpected")));
-    });
+    }, { telemetry: parserTelemetry });
     const normalClosed = new Promise<number>(resolve => normal.once("close", resolve));
     normal.send(JSON.stringify({ type: "response.create", input }));
     // Bun's `ws` compatibility layer may surface a parser-sized close as
@@ -246,6 +288,7 @@ describe("Responses WebSocket server", () => {
     // preserve the protocol's 1009 close code.
     expect([1006, 1009]).toContain(await normalClosed);
     expect(normalCalls).toBe(0);
+    expect(parserTelemetry.snapshotAndReset().ingressParserRejections).toBe(1);
 
     let jumboCalls = 0;
     const jumbo = await startServer(async () => {
@@ -263,65 +306,25 @@ describe("Responses WebSocket server", () => {
     expect(jumboCalls).toBe(1);
   }, 20_000);
 
-  it("holds a large decoded message until shared ingress memory becomes available", async () => {
+  it("fails fast and releases its connection when large-message ingress is unavailable", async () => {
     const MiB = 1024 * 1024;
     const budget = new WebSocketProcessBudget({
       maxSessions: 2,
       maxQueuedBytes: 64 * MiB,
       maxIngressBytes: 70 * MiB,
     });
-    const blocker = budget.openSession(17 * MiB)!;
-    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
     const telemetry = new WebSocketTelemetry();
     let calls = 0;
     const socket = await startServer(async () => {
       calls++;
       return relayHandle(Promise.resolve(completed("resp_waited_jumbo")));
     }, { processBudget: budget, telemetry });
-    const messages = collect(socket);
-    socket.send(JSON.stringify({
-      type: "response.create",
-      stream_id: "waited",
-      model: "gpt-5.6-sol",
-      store: false,
-      input: "x".repeat(5 * MiB),
-    }));
-    await waitFor(() => budget.snapshot().ingressWaiters === 1);
-    expect(calls).toBe(0);
-    blocker.releaseIngress();
-    await waitFor(() => messages.some(message => message.type === "response.completed"), 5_000);
-    expect(calls).toBe(1);
-    expect(budget.snapshot().ingressWaiters).toBe(0);
-    expect(telemetry.snapshotAndReset()).toMatchObject({
-      ingressPromotions: 1,
-      ingressWaits: 1,
-      ingressRejections: 0,
-    });
-    blocker.close();
-  }, 15_000);
-
-  it("closes only a large message connection after bounded ingress wait timeout", async () => {
-    const MiB = 1024 * 1024;
-    const budget = new WebSocketProcessBudget({
-      maxSessions: 2,
-      maxQueuedBytes: 64 * MiB,
-      maxIngressBytes: 70 * MiB,
-    });
-    const blocker = budget.openSession(17 * MiB)!;
-    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
-    const telemetry = new WebSocketTelemetry();
-    let calls = 0;
-    const socket = await startServer(async () => {
-      calls++;
-      return relayHandle(Promise.resolve(completed("unexpected")));
-    }, {
-      processBudget: budget,
-      telemetry,
-      ingressWaitTimeoutMs: 20,
-    });
+    const blocker = budget.openSession(0)!;
+    expect(blocker.tryEnsureIngress(53 * MiB)).toBe(true);
     const closed = new Promise<number>(resolve => socket.once("close", resolve));
     socket.send(JSON.stringify({
       type: "response.create",
+      stream_id: "unavailable",
       model: "gpt-5.6-sol",
       store: false,
       input: "x".repeat(5 * MiB),
@@ -330,60 +333,50 @@ describe("Responses WebSocket server", () => {
     expect(calls).toBe(0);
     expect(telemetry.snapshotAndReset()).toMatchObject({
       ingressPromotions: 1,
-      ingressWaits: 1,
       ingressRejections: 1,
-      ingressTimeouts: 1,
+      ingressReservedBytes: 53 * MiB,
     });
     await waitFor(() => budget.snapshot().sessions === 1);
-    expect(budget.snapshot()).toMatchObject({
-      sessions: 1,
-      ingressReservedBytes: 53 * MiB,
-      ingressWaiters: 0,
-    });
+    expect(budget.snapshot().ingressReservedBytes).toBe(53 * MiB);
     blocker.close();
   }, 15_000);
 
-  it("cancels a waiting ingress lease immediately when its connection terminates", async () => {
+  it("never lets a later small message overtake a large message awaiting ingress", async () => {
     const MiB = 1024 * 1024;
     const budget = new WebSocketProcessBudget({
       maxSessions: 2,
       maxQueuedBytes: 64 * MiB,
       maxIngressBytes: 70 * MiB,
     });
-    const blocker = budget.openSession(17 * MiB)!;
-    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
-    let calls = 0;
-    const socket = await startServer(async () => {
-      calls++;
-      return relayHandle(Promise.resolve(completed("unexpected")));
-    }, {
-      processBudget: budget,
-      ingressWaitTimeoutMs: 10_000,
-    });
+    const calls: string[] = [];
+    const socket = await startServer(async body => {
+      const serialized = JSON.stringify(body.input);
+      calls.push(serialized.includes("small-follow-up") ? "small" : "large");
+      return relayHandle(Promise.resolve(completed(`resp_${calls.length}`)));
+    }, { processBudget: budget });
+    const blocker = budget.openSession(0)!;
+    expect(blocker.tryEnsureIngress(53 * MiB)).toBe(true);
+    const closed = new Promise<number>(resolve => socket.once("close", resolve));
     socket.send(JSON.stringify({
       type: "response.create",
+      stream_id: "ordered",
       model: "gpt-5.6-sol",
       store: false,
       input: "x".repeat(5 * MiB),
     }));
-    await waitFor(() => budget.snapshot().ingressWaiters === 1);
-    socket.terminate();
-    await waitFor(() => budget.snapshot().sessions === 1);
-    expect(calls).toBe(0);
-    expect(budget.snapshot()).toMatchObject({
-      sessions: 1,
-      ingressReservedBytes: 53 * MiB,
-      ingressWaiters: 0,
-    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "ordered",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "small-follow-up",
+    }));
+    expect(await closed).toBe(1013);
+    expect(calls).toEqual([]);
     blocker.close();
-    expect(budget.snapshot()).toMatchObject({
-      sessions: 0,
-      ingressReservedBytes: 0,
-      ingressWaiters: 0,
-    });
   }, 15_000);
 
-  it("keeps nineteen normal agents healthy while one agent sends a large image-sized turn", async () => {
+  it("keeps twenty-six normal agents healthy while one sends a 10 MiB turn", async () => {
     const MiB = 1024 * 1024;
     const budget = new WebSocketProcessBudget({
       maxSessions: 32,
@@ -406,7 +399,7 @@ describe("Responses WebSocket server", () => {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("missing test address");
     const clients = Array.from(
-      { length: 20 },
+      { length: 27 },
       () => new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`),
     );
     sockets.push(...clients);
@@ -420,22 +413,20 @@ describe("Responses WebSocket server", () => {
       stream_id: `mixed-${index}`,
       model: "gpt-5.6-sol",
       store: false,
-      input: index === 0 ? "x".repeat(5 * MiB) : `small-${index}`,
+      input: index === 0 ? "x".repeat(10 * MiB) : `small-${index}`,
     })));
     await waitFor(
       () => outputs.every(messages => messages.some(message => message.type === "response.completed")),
       10_000,
     );
-    expect(calls).toBe(20);
+    expect(calls).toBe(27);
     expect(clients.every(socket => socket.readyState === WebSocket.OPEN)).toBe(true);
     expect(budget.snapshot()).toMatchObject({
-      sessions: 20,
-      ingressWaiters: 0,
+      sessions: 27,
       queuedBytes: 0,
     });
     expect(telemetry.snapshotAndReset()).toMatchObject({
       ingressPromotions: 1,
-      ingressWaits: 0,
       ingressRejections: 0,
     });
   }, 20_000);
@@ -447,9 +438,11 @@ describe("Responses WebSocket server", () => {
       maxQueuedBytes: 1024 * 1024,
       maxIngressBytes: normalBytes,
     });
+    const telemetry = new WebSocketTelemetry();
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
     attachResponsesWebSocket(server, {
       processBudget: budget,
+      telemetry,
       startRelay: async () => relayHandle(new Promise(() => {})),
     });
     servers.push(server);
@@ -479,6 +472,10 @@ describe("Responses WebSocket server", () => {
       });
     });
     expect(status).toBe(503);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressUpgradeRejections: 1,
+      ingressUpgradeRejectionsTotal: 1,
+    });
     expect(budget.snapshot()).toMatchObject({
       sessions: 1,
       ingressReservedBytes: normalBytes,
@@ -488,12 +485,12 @@ describe("Responses WebSocket server", () => {
     expect(budget.snapshot().ingressReservedBytes).toBe(0);
   });
 
-  it("reaps thirty dead-idle peers and recovers every ingress reservation", async () => {
+  it("reaps twenty-seven dead-idle peers and recovers every ingress reservation", async () => {
     const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
     const budget = new WebSocketProcessBudget({
-      maxSessions: 30,
+      maxSessions: 27,
       maxQueuedBytes: 1024 * 1024,
-      maxIngressBytes: normalBytes * 30,
+      maxIngressBytes: normalBytes * 27 + DEFAULT_WS_PROMOTION_HEADROOM_BYTES,
     });
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
     attachResponsesWebSocket(server, {
@@ -509,15 +506,15 @@ describe("Responses WebSocket server", () => {
     if (!address || typeof address === "string") throw new Error("missing test address");
     const url = `ws://127.0.0.1:${address.port}/v1/responses`;
 
-    const dead = Array.from({ length: 30 }, () => new WebSocket(url));
+    const dead = Array.from({ length: 27 }, () => new WebSocket(url));
     sockets.push(...dead);
     await Promise.all(dead.map(socket => new Promise<void>((resolve, reject) => {
       socket.once("open", resolve);
       socket.once("error", reject);
     })));
     expect(budget.snapshot()).toMatchObject({
-      sessions: 30,
-      ingressReservedBytes: normalBytes * 30,
+      sessions: 27,
+      ingressReservedBytes: normalBytes * 27,
     });
     await waitFor(() => budget.snapshot().sessions === 0, 2_000);
     expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
@@ -737,6 +734,56 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("previous_response_id");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call_output");
+  });
+
+  it("records a store:false response before exposing its terminal across lanes", async () => {
+    const parent = completed("resp_record_barrier");
+    const parentFinal = deferred<any>();
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      if (calls === 1) {
+        return relayHandle(parentFinal.promise, [{
+          event: "response.completed",
+          data: JSON.stringify({ type: "response.completed", response: parent }),
+        }]);
+      }
+      return relayHandle(Promise.resolve(completed("resp_record_child")));
+    });
+    const messages: any[] = [];
+    let continuationSent = false;
+    socket.on("message", data => {
+      const message = JSON.parse(data.toString());
+      messages.push(message);
+      if (message.response?.id === parent.id && !continuationSent) {
+        continuationSent = true;
+        socket.send(JSON.stringify({
+          type: "response.create",
+          stream_id: "child-lane",
+          model: "gpt-5.6-sol",
+          store: false,
+          previous_response_id: parent.id,
+          input: "continue immediately",
+        }));
+      }
+    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "parent-lane",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "parent",
+    }));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const terminalExposedBeforeFinal = continuationSent;
+    parentFinal.resolve(parent);
+    await waitFor(() =>
+      messages.some(message => message.response?.id === "resp_record_child") ||
+      messages.some(message => message.error?.code === "previous_response_not_found")
+    );
+    expect(terminalExposedBeforeFinal).toBe(false);
+    expect(messages.some(message => message.error?.code === "previous_response_not_found")).toBe(false);
+    expect(messages.some(message => message.response?.id === "resp_record_child")).toBe(true);
   });
 
   it("preserves one exact large image across a small store:false continuation", async () => {

@@ -97,6 +97,7 @@ export function formatConsoleObservabilityLine(line: string): string {
     const resources = record(event.resources);
     const traffic = record(event.traffic);
     const trafficTotal = record(traffic?.total);
+    const websocket = record(event.websocket);
     return JSON.stringify({
       schema: event.schema,
       event: event.event,
@@ -125,6 +126,18 @@ export function formatConsoleObservabilityLine(line: string): string {
         success_rate: traffic.success_rate,
         failed: traffic.failed,
         total_p95_ms: trafficTotal?.p95_ms,
+      } : null,
+      websocket: websocket ? {
+        active_sessions: websocket.activeSessions,
+        pending_requests: websocket.pendingRequests,
+        ingress_reserved_bytes: websocket.ingressReservedBytes,
+        ingress_reserved_peak_bytes: websocket.ingressReservedBytesPeak,
+        ingress_capacity_bytes: websocket.ingressCapacityBytes,
+        ingress_promotions: websocket.ingressPromotions,
+        ingress_rejections: websocket.ingressRejections,
+        ingress_parser_rejections: websocket.ingressParserRejections,
+        ingress_upgrade_rejections: websocket.ingressUpgradeRejections,
+        response_graph_rejections: websocket.responseGraphRejections,
       } : null,
       release: compactRelease(event.release),
     });

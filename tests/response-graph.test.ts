@@ -4,6 +4,7 @@ import {
   ResponseGraph,
   SharedByteBudget,
   releaseResponseGraphMaterialization,
+  releaseResponseGraphPayload,
   type ResponseCreateEvent,
 } from "../src/ws/response-graph";
 
@@ -61,6 +62,27 @@ describe("ResponseGraph", () => {
     expect(graph.stats().nodes).toBe(1);
     releaseResponseGraphMaterialization(left.relayBody);
     releaseResponseGraphMaterialization(right.relayBody);
+  });
+
+  it("shares frozen JSON values without allowing caller or transport mutation", () => {
+    const graph = new ResponseGraph();
+    const source = [user("immutable")];
+    const root = graph.resolve(request(source));
+    (source[0]!.content[0] as { text: string }).text = "caller-mutated";
+    expect(root.relayBody.input).toEqual([user("immutable")]);
+    expect(Object.isFrozen(root.relayBody.input)).toBe(true);
+    expect(Object.isFrozen((root.relayBody.input as any[])[0])).toBe(true);
+
+    const final = { id: "immutable-root", output: [assistant("original-output")] };
+    graph.record(root, final);
+    final.output[0]!.content[0]!.text = "final-mutated";
+    const continuation = graph.resolve(request([user("next")], {
+      previous_response_id: "immutable-root",
+    }));
+    expect(JSON.stringify(continuation.relayBody.input)).toContain("original-output");
+    expect(JSON.stringify(continuation.relayBody.input)).not.toContain("caller-mutated");
+    expect(JSON.stringify(continuation.relayBody.input)).not.toContain("final-mutated");
+    releaseResponseGraphMaterialization(continuation.relayBody);
   });
 
   it("rejects an unknown store:false previous_response_id", () => {
@@ -183,7 +205,10 @@ describe("ResponseGraph", () => {
     const root = graph.resolve(request([user("root")]));
     graph.record(root, { id: "root", output: [assistant("root")] });
     const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
-    graph.record(child, { id: "child", output: [assistant("child")] });
+    expect(() => graph.record(child, {
+      id: "child",
+      output: [assistant("child")],
+    })).toThrow("capacity");
 
     const retained = graph.resolve(request([], { previous_response_id: "root" }));
     expect(retained.parentId).toBe("root");
@@ -191,6 +216,79 @@ describe("ResponseGraph", () => {
     expect(() => graph.resolve(request([], { previous_response_id: "child" }))).toThrow(
       PreviousResponseNotFoundError,
     );
+  });
+
+  it("retains a continuation parent from payload handoff through child recording", () => {
+    const graph = new ResponseGraph({
+      maxNodes: 2,
+      maxBytes: 10_000,
+      sharedBudget: new SharedByteBudget(10_000),
+    });
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, { id: "root", output: [assistant("root")] });
+    const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
+
+    // This models the current router-handoff release before the child settles.
+    releaseResponseGraphPayload(child);
+    const pressureOne = graph.resolve(request([user("pressure-one")]));
+    graph.record(pressureOne, { id: "pressure-one", output: [] });
+    const pressureTwo = graph.resolve(request([user("pressure-two")]));
+    graph.record(pressureTwo, { id: "pressure-two", output: [] });
+    graph.record(child, { id: "child", output: [assistant("child")] });
+
+    const grandchild = graph.resolve(request([user("grandchild")], {
+      previous_response_id: "child",
+    }));
+    expect(grandchild.relayBody.input).toEqual([
+      user("root"),
+      assistant("root"),
+      user("child"),
+      assistant("child"),
+      user("grandchild"),
+    ]);
+    releaseResponseGraphMaterialization(grandchild.relayBody);
+  });
+
+  it("reports cache admission failure instead of silently publishing an unusable id", () => {
+    const graph = new ResponseGraph({
+      maxNodes: 1,
+      maxBytes: 10_000,
+      sharedBudget: new SharedByteBudget(10_000),
+    });
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, { id: "root", output: [assistant("root")] });
+    const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
+    expect(() => graph.record(child, {
+      id: "child",
+      output: [assistant("child")],
+    })).toThrow("capacity");
+  });
+
+  it("does not evict valid local history when shared cache admission cannot succeed", () => {
+    const shared = new SharedByteBudget(5_000);
+    const graph = new ResponseGraph({ maxNodes: 8, maxBytes: 5_000, sharedBudget: shared });
+    const competing = new ResponseGraph({ maxNodes: 8, maxBytes: 5_000, sharedBudget: shared });
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, { id: "root", output: [assistant("a".repeat(1_000))] });
+    const other = competing.resolve(request([user("other")]));
+    competing.record(other, {
+      id: "other",
+      output: [{ type: "message", content: "b".repeat(1_500) }],
+    });
+
+    const impossible = graph.resolve(request([user("impossible")]));
+    expect(() => graph.record(impossible, {
+      id: "impossible",
+      output: [assistant("c".repeat(2_000))],
+    })).toThrow("capacity");
+
+    expect(graph.stats().nodes).toBe(1);
+    competing.clear();
+    const retained = graph.resolve(request([], { previous_response_id: "root" }));
+    expect(retained.parentId).toBe("root");
+    releaseResponseGraphMaterialization(retained.relayBody);
+    graph.clear();
+    expect(shared.used).toBe(0);
   });
 
   it("retains only byte-accounted deltas across a deep continuation chain", () => {

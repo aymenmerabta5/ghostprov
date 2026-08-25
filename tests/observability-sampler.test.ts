@@ -5,6 +5,7 @@ import type { ObservabilityEvent } from "../src/observability/events";
 import { FleetSampler } from "../src/observability/sampler";
 import { projectId } from "../src/sandbox/types";
 import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
+import { WebSocketTelemetry } from "../src/ws/telemetry";
 
 class MemoryLogger implements LoggerLike {
   readonly events: ObservabilityEvent[] = [];
@@ -43,6 +44,7 @@ describe("FleetSampler", () => {
       reset() {},
     };
     let cpu = { user: 0, system: 0 };
+    const webSocketTelemetry = new WebSocketTelemetry({ capacity: 8 });
     const unavailableProject = projectId("00000000-0000-4000-8000-000000000002");
     let fleetRecovered = false;
     const transport: V2TransportDiagnostics = {
@@ -197,6 +199,7 @@ describe("FleetSampler", () => {
       eventLoop,
       memoryUsage: () => ({ rss: 500, heapTotal: 400, heapUsed: 300, external: 200, arrayBuffers: 100 }),
       cpuUsage: () => (cpu = { user: cpu.user + 250_000, system: cpu.system + 50_000 }),
+      webSocketSnapshot: () => webSocketTelemetry.snapshotAndReset(),
       recoveryCircuitSnapshot: () => ({
         state: "open",
         scope: "outage",
@@ -259,6 +262,12 @@ describe("FleetSampler", () => {
       unavailable_projects: [unavailableProject],
       unavailable_projects_truncated: false,
     });
+    webSocketTelemetry.recordIngressBudget({
+      ingressReservedBytes: 17 * 1024 ** 2,
+      maxIngressBytes: 512 * 1024 ** 2,
+    });
+    webSocketTelemetry.ingressPromoted(24 * 1024 ** 2);
+    webSocketTelemetry.ingressParserRejected();
     fleetRecovered = true;
     clock.value += 5_000;
     sampler.sample();
@@ -287,6 +296,16 @@ describe("FleetSampler", () => {
       jumbo_active: false,
       active_permits: 4,
       waiters: 1,
+    });
+    expect(event.websocket).toMatchObject({
+      ingressPromotionBytesPeak: 24 * 1024 ** 2,
+      ingressReservedBytes: 17 * 1024 ** 2,
+      ingressReservedBytesPeak: 17 * 1024 ** 2,
+      ingressCapacityBytes: 512 * 1024 ** 2,
+      ingressPromotions: 1,
+      ingressPromotionsTotal: 1,
+      ingressParserRejections: 1,
+      ingressParserRejectionsTotal: 1,
     });
     expect((event.runtimes as any[])[0]).toMatchObject({
       project_id: "00000000-0000-4000-8000-000000000001",

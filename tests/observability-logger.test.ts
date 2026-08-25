@@ -55,6 +55,18 @@ describe("ObservabilityLogger", () => {
         failed: 0,
         total: { p95_ms: 1_000 },
       },
+      websocket: {
+        activeSessions: 8,
+        pendingRequests: 2,
+        ingressReservedBytes: 136 * 1024 * 1024,
+        ingressReservedBytesPeak: 160 * 1024 * 1024,
+        ingressCapacityBytes: 512 * 1024 * 1024,
+        ingressPromotions: 1,
+        ingressRejections: 0,
+        ingressParserRejections: 1,
+        ingressUpgradeRejections: 0,
+        responseGraphRejections: 0,
+      },
       runtimes: Array.from({ length: 100 }, (_, index) => ({
         project_id: `private-${index}`,
         state: index === 99 ? "recovering" : "ready",
@@ -69,6 +81,11 @@ describe("ObservabilityLogger", () => {
       queued_bytes: 16_384,
       pressure: { governor_queued: 0 },
       traffic: { requests_per_second: 20, total_p95_ms: 1_000 },
+      websocket: {
+        active_sessions: 8,
+        ingress_promotions: 1,
+        ingress_parser_rejections: 1,
+      },
     });
     expect(compact).not.toContain("private-99");
     expect(formatConsoleObservabilityLine('{"event":"request.completed"}\n'))

@@ -6,8 +6,10 @@ import {
   PreviousResponseNotFoundError,
   ResponseGraph,
   ResponseGraphCapacityError,
-  releaseResponseGraphMaterialization,
+  releaseResponseGraphPayload,
+  releaseResponseGraphResolution,
   type ResponseCreateEvent,
+  type ResolvedRelayRequest,
 } from "./response-graph";
 import type { WebSocketTelemetry } from "./telemetry";
 import {
@@ -33,7 +35,6 @@ export interface WebSocketProcessBudgetSnapshot {
   sessions: number;
   queuedBytes: number;
   ingressReservedBytes: number;
-  ingressWaiters: number;
   maxSessions: number;
   maxQueuedBytes: number;
   maxIngressBytes: number;
@@ -44,24 +45,8 @@ export interface WebSocketProcessLease {
   tryReserve(bytes: number): boolean;
   release(bytes: number): void;
   tryEnsureIngress(bytes: number): boolean;
-  ensureIngress(bytes: number, signal: AbortSignal, timeoutMs: number): Promise<void>;
   releaseIngress(): void;
   close(): void;
-}
-
-interface IngressWaiter {
-  readonly bytes: number;
-  active: boolean;
-  grant(): boolean;
-  reject(error: Error): void;
-}
-
-export class WebSocketIngressCapacityError extends Error {
-  readonly name = "WebSocketIngressCapacityError";
-}
-
-export class WebSocketIngressTimeoutError extends Error {
-  readonly name = "WebSocketIngressTimeoutError";
 }
 
 /** Shared process-level fence across every WebSocket server/session. */
@@ -72,7 +57,6 @@ export class WebSocketProcessBudget {
   #sessions = 0;
   #queuedBytes = 0;
   #ingressReservedBytes = 0;
-  readonly #ingressWaiters: IngressWaiter[] = [];
 
   constructor(options: WebSocketProcessBudgetOptions) {
     this.#maxSessions = positiveInteger(options.maxSessions, "maxSessions");
@@ -86,21 +70,28 @@ export class WebSocketProcessBudget {
     );
   }
 
-  openSession(ingressReservationBytes = 0): WebSocketProcessLease | null {
+  openSession(
+    ingressReservationBytes = 0,
+    ingressHeadroomBytes = 0,
+  ): WebSocketProcessLease | null {
     if (
       !Number.isSafeInteger(ingressReservationBytes) ||
       ingressReservationBytes < 0
     ) throw new RangeError("ingressReservationBytes must be a non-negative safe integer");
     if (
+      !Number.isSafeInteger(ingressHeadroomBytes) ||
+      ingressHeadroomBytes < 0
+    ) throw new RangeError("ingressHeadroomBytes must be a non-negative safe integer");
+    if (
       this.#sessions >= this.#maxSessions ||
-      this.#ingressReservedBytes + ingressReservationBytes > this.#maxIngressBytes
+      this.#ingressReservedBytes + ingressReservationBytes + ingressHeadroomBytes >
+        this.#maxIngressBytes
     ) return null;
     this.#sessions++;
     this.#ingressReservedBytes += ingressReservationBytes;
     let closed = false;
     let queuedReserved = 0;
     let dynamicIngressReserved = 0;
-    let pendingIngress: IngressWaiter | null = null;
     const validateIngressTarget = (bytes: number): number => {
       if (!Number.isSafeInteger(bytes) || bytes < 0) {
         throw new RangeError("WebSocket ingress target must be a non-negative safe integer");
@@ -116,9 +107,6 @@ export class WebSocketProcessBudget {
       this.#ingressReservedBytes += growth;
       dynamicIngressReserved = target;
       return true;
-    };
-    const cancelPendingIngress = (error: Error): void => {
-      if (pendingIngress?.active) pendingIngress.reject(error);
     };
     return {
       canReserve: bytes => !closed && this.#canReserve(bytes),
@@ -136,89 +124,17 @@ export class WebSocketProcessBudget {
         this.#queuedBytes = Math.max(0, this.#queuedBytes - value);
       },
       tryEnsureIngress,
-      ensureIngress: (bytes, signal, timeoutMs) => {
-        const target = validateIngressTarget(bytes);
-        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
-          return Promise.reject(new RangeError("WebSocket ingress timeout must be positive"));
-        }
-        if (tryEnsureIngress(target)) return Promise.resolve();
-        if (closed) {
-          return Promise.reject(new WebSocketIngressCapacityError(
-            "WebSocket ingress lease is closed",
-          ));
-        }
-        if (pendingIngress?.active || this.#ingressWaiters.length >= this.#maxSessions) {
-          return Promise.reject(new WebSocketIngressCapacityError(
-            "WebSocket ingress waiter capacity is exhausted",
-          ));
-        }
-        if (signal.aborted) {
-          return Promise.reject(signal.reason instanceof Error
-            ? signal.reason
-            : new DOMException("WebSocket ingress wait aborted", "AbortError"));
-        }
-        const growth = target - dynamicIngressReserved;
-        return new Promise<void>((resolve, reject) => {
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          const cleanup = () => {
-            if (timer !== undefined) clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            if (pendingIngress === waiter) pendingIngress = null;
-            const index = this.#ingressWaiters.indexOf(waiter);
-            if (index >= 0) this.#ingressWaiters.splice(index, 1);
-          };
-          const settleReject = (error: Error) => {
-            if (!waiter.active) return;
-            waiter.active = false;
-            cleanup();
-            reject(error);
-          };
-          const waiter: IngressWaiter = {
-            bytes: growth,
-            active: true,
-            grant: () => {
-              if (!waiter.active || closed) return false;
-              if (this.#ingressReservedBytes + growth > this.#maxIngressBytes) return false;
-              this.#ingressReservedBytes += growth;
-              dynamicIngressReserved += growth;
-              waiter.active = false;
-              cleanup();
-              resolve();
-              return true;
-            },
-            reject: settleReject,
-          };
-          const onAbort = () => settleReject(signal.reason instanceof Error
-            ? signal.reason
-            : new DOMException("WebSocket ingress wait aborted", "AbortError"));
-          pendingIngress = waiter;
-          this.#ingressWaiters.push(waiter);
-          signal.addEventListener("abort", onAbort, { once: true });
-          timer = setTimeout(() => settleReject(new WebSocketIngressTimeoutError(
-            "WebSocket ingress memory remained unavailable",
-          )), timeoutMs);
-          timer.unref?.();
-          this.#drainIngressWaiters();
-        });
-      },
       releaseIngress: () => {
         if (closed) return;
-        cancelPendingIngress(new WebSocketIngressCapacityError(
-          "WebSocket ingress message was released while waiting",
-        ));
         this.#ingressReservedBytes = Math.max(
           0,
           this.#ingressReservedBytes - dynamicIngressReserved,
         );
         dynamicIngressReserved = 0;
-        this.#drainIngressWaiters();
       },
       close: () => {
         if (closed) return;
         closed = true;
-        cancelPendingIngress(new WebSocketIngressCapacityError(
-          "WebSocket ingress lease closed while waiting",
-        ));
         this.#queuedBytes = Math.max(0, this.#queuedBytes - queuedReserved);
         this.#ingressReservedBytes = Math.max(
           0,
@@ -227,7 +143,6 @@ export class WebSocketProcessBudget {
         queuedReserved = 0;
         dynamicIngressReserved = 0;
         this.#sessions = Math.max(0, this.#sessions - 1);
-        this.#drainIngressWaiters();
       },
     };
   }
@@ -237,7 +152,6 @@ export class WebSocketProcessBudget {
       sessions: this.#sessions,
       queuedBytes: this.#queuedBytes,
       ingressReservedBytes: this.#ingressReservedBytes,
-      ingressWaiters: this.#ingressWaiters.filter(waiter => waiter.active).length,
       maxSessions: this.#maxSessions,
       maxQueuedBytes: this.#maxQueuedBytes,
       maxIngressBytes: this.#maxIngressBytes,
@@ -249,18 +163,6 @@ export class WebSocketProcessBudget {
       this.#queuedBytes + bytes <= this.#maxQueuedBytes;
   }
 
-  #drainIngressWaiters(): void {
-    for (;;) {
-      const index = this.#ingressWaiters.findIndex(waiter =>
-        !waiter.active ||
-        this.#ingressReservedBytes + waiter.bytes <= this.#maxIngressBytes
-      );
-      if (index < 0) return;
-      const [waiter] = this.#ingressWaiters.splice(index, 1);
-      if (!waiter?.active) continue;
-      if (!waiter.grant()) return;
-    }
-  }
 }
 
 export type WebSocketRelayStarter = (
@@ -712,6 +614,8 @@ export class ResponsesWebSocketSession {
   ): Promise<void> {
     let release: (() => void) | undefined;
     let handle: RunHandle | undefined;
+    let resolved: ResolvedRelayRequest | undefined;
+    let pendingTerminal: Record<string, unknown> | undefined;
     let finalObserved = false;
     let requestReleased = false;
     const releaseRequest = () => {
@@ -727,8 +631,14 @@ export class ResponsesWebSocketSession {
         await this.#completeWarmup(event);
         return;
       }
-      const resolved = this.#graph.resolve(event);
+      const streamId = event.stream_id;
+      const localContinuation = event.store === false &&
+        typeof event.previous_response_id === "string";
+      resolved = this.#graph.resolve(event);
       const relayBody = resolved.relayBody;
+      // resolve() owns independent graph and relay representations now; avoid
+      // retaining the original payload for the complete streamed response.
+      delete event.input;
       try {
         handle = await this.#startRelay(relayBody, {
           signal: controller.signal,
@@ -736,14 +646,14 @@ export class ResponsesWebSocketSession {
           // A normal response.create envelope is at least as large as relayBody.
           // Local continuations materialize graph history, so they intentionally
           // fall back to structural sizing instead of under-accounting it.
-          encodedBodyBytes: event.store === false && event.previous_response_id
+          encodedBodyBytes: localContinuation
             ? undefined
             : requestBytes,
         });
       } finally {
         // Router/transport preparation has taken ownership of its encoded
         // request by this boundary; the large reconstructed lineage can drop.
-        releaseResponseGraphMaterialization(relayBody);
+        releaseResponseGraphPayload(resolved);
         // Retain only the tiny field needed by graph.record; the reconstructed
         // lineage is now owned by router/transport preparation, not the session.
         resolved.relayBody = typeof relayBody.model === "string"
@@ -756,7 +666,7 @@ export class ResponsesWebSocketSession {
           parseEventData(frame.data),
           resolved,
         );
-        if (event.stream_id) outbound.stream_id = event.stream_id;
+        if (streamId) outbound.stream_id = streamId;
         const type = outbound.type;
         if (
           type === "response.completed" ||
@@ -764,6 +674,10 @@ export class ResponsesWebSocketSession {
           type === "response.incomplete"
         ) {
           sawTerminal = true;
+          releaseAtomicBytePermit(pendingTerminal);
+          transferAtomicBytePermit(frame, outbound, "websocket-terminal-pending");
+          pendingTerminal = outbound;
+          continue;
         }
         transferAtomicBytePermit(frame, outbound, "websocket-outbound");
         await this.#send(outbound);
@@ -773,11 +687,15 @@ export class ResponsesWebSocketSession {
       try {
         if (this.#closed || controller.signal.aborted) return;
         this.#graph.record(resolved, final);
-        if (!sawTerminal) {
+        if (pendingTerminal) {
+          const outbound = pendingTerminal;
+          pendingTerminal = undefined;
+          await this.#send(outbound);
+        } else if (!sawTerminal) {
           const outbound = this.#graph.sanitizeOutbound({
             type: "response.completed",
             response: final,
-            ...(event.stream_id ? { stream_id: event.stream_id } : {}),
+            ...(streamId ? { stream_id: streamId } : {}),
           }, resolved);
           transferAtomicBytePermit(final, outbound, "websocket-final-outbound");
           await this.#send(outbound);
@@ -793,6 +711,9 @@ export class ResponsesWebSocketSession {
         error instanceof WebSocketDeliveryError
       ) return;
       const streamId = event.stream_id;
+      if (error instanceof ResponseGraphCapacityError) {
+        this.#telemetry?.responseGraphRejected();
+      }
       if (error instanceof WebSocketRequestOutputError) controller.abort();
       // Release the request/body reservation before queuing its terminal error,
       // otherwise a full process byte budget could deadlock error delivery.
@@ -835,6 +756,8 @@ export class ResponsesWebSocketSession {
         // the relay wins the cancellation race and settles successfully.
         void handle.final.then(releaseAtomicBytePermit, () => undefined);
       }
+      releaseAtomicBytePermit(pendingTerminal);
+      if (resolved) releaseResponseGraphResolution(resolved);
       release?.();
       if (release) this.#telemetry?.responseFinished(requestBytes);
       releaseRequest();
@@ -861,7 +784,7 @@ export class ResponsesWebSocketSession {
         ...(event.stream_id ? { stream_id: event.stream_id } : {}),
       }, resolved));
     } finally {
-      releaseResponseGraphMaterialization(resolved.relayBody);
+      releaseResponseGraphResolution(resolved);
     }
   }
 

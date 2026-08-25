@@ -30,10 +30,20 @@ export interface WebSocketTelemetrySnapshot {
   bufferedBytesPeak: number;
   delayedByBackpressure: number;
   ingressMessageBytesPeak: number;
+  ingressPromotionBytesPeak: number;
+  ingressReservedBytes: number;
+  ingressReservedBytesPeak: number;
+  ingressCapacityBytes: number;
   ingressPromotions: number;
-  ingressWaits: number;
   ingressRejections: number;
-  ingressTimeouts: number;
+  ingressParserRejections: number;
+  ingressUpgradeRejections: number;
+  ingressPromotionsTotal: number;
+  ingressRejectionsTotal: number;
+  ingressParserRejectionsTotal: number;
+  ingressUpgradeRejectionsTotal: number;
+  responseGraphRejections: number;
+  responseGraphRejectionsTotal: number;
   enqueueToSend: DistributionSnapshot;
   sendCallback: DistributionSnapshot;
 }
@@ -66,10 +76,20 @@ export class WebSocketTelemetry {
   #bufferPeak = 0;
   #delayed = 0;
   #ingressMessageBytesPeak = 0;
+  #ingressPromotionBytesPeak = 0;
+  #ingressReservedBytes = 0;
+  #ingressReservedBytesPeak = 0;
+  #ingressCapacityBytes = 0;
   #ingressPromotions = 0;
-  #ingressWaits = 0;
   #ingressRejections = 0;
-  #ingressTimeouts = 0;
+  #ingressParserRejections = 0;
+  #ingressUpgradeRejections = 0;
+  #ingressPromotionsTotal = 0;
+  #ingressRejectionsTotal = 0;
+  #ingressParserRejectionsTotal = 0;
+  #ingressUpgradeRejectionsTotal = 0;
+  #responseGraphRejections = 0;
+  #responseGraphRejectionsTotal = 0;
 
   constructor(options: { capacity?: number } = {}) {
     this.#queue = new BoundedDistribution(options.capacity ?? 256);
@@ -161,11 +181,40 @@ export class WebSocketTelemetry {
       nonNegativeInteger(bytes),
     );
   }
-  ingressPromoted(): void { this.#ingressPromotions++; }
-  ingressWaited(): void { this.#ingressWaits++; }
-  ingressRejected(timedOut = false): void {
+  recordIngressBudget(value: {
+    ingressReservedBytes: number;
+    maxIngressBytes: number;
+  }): void {
+    this.#ingressReservedBytes = nonNegativeInteger(value.ingressReservedBytes);
+    this.#ingressCapacityBytes = nonNegativeInteger(value.maxIngressBytes);
+    this.#ingressReservedBytesPeak = Math.max(
+      this.#ingressReservedBytesPeak,
+      this.#ingressReservedBytes,
+    );
+  }
+  ingressPromoted(dynamicBytes = 0): void {
+    this.#ingressPromotions++;
+    this.#ingressPromotionsTotal++;
+    this.#ingressPromotionBytesPeak = Math.max(
+      this.#ingressPromotionBytesPeak,
+      nonNegativeInteger(dynamicBytes),
+    );
+  }
+  ingressRejected(): void {
     this.#ingressRejections++;
-    if (timedOut) this.#ingressTimeouts++;
+    this.#ingressRejectionsTotal++;
+  }
+  ingressParserRejected(): void {
+    this.#ingressParserRejections++;
+    this.#ingressParserRejectionsTotal++;
+  }
+  ingressUpgradeRejected(): void {
+    this.#ingressUpgradeRejections++;
+    this.#ingressUpgradeRejectionsTotal++;
+  }
+  responseGraphRejected(): void {
+    this.#responseGraphRejections++;
+    this.#responseGraphRejectionsTotal++;
   }
 
   recordSend(value: {
@@ -211,10 +260,20 @@ export class WebSocketTelemetry {
       bufferedBytesPeak: this.#bufferPeak,
       delayedByBackpressure: this.#delayed,
       ingressMessageBytesPeak: this.#ingressMessageBytesPeak,
+      ingressPromotionBytesPeak: this.#ingressPromotionBytesPeak,
+      ingressReservedBytes: this.#ingressReservedBytes,
+      ingressReservedBytesPeak: this.#ingressReservedBytesPeak,
+      ingressCapacityBytes: this.#ingressCapacityBytes,
       ingressPromotions: this.#ingressPromotions,
-      ingressWaits: this.#ingressWaits,
       ingressRejections: this.#ingressRejections,
-      ingressTimeouts: this.#ingressTimeouts,
+      ingressParserRejections: this.#ingressParserRejections,
+      ingressUpgradeRejections: this.#ingressUpgradeRejections,
+      ingressPromotionsTotal: this.#ingressPromotionsTotal,
+      ingressRejectionsTotal: this.#ingressRejectionsTotal,
+      ingressParserRejectionsTotal: this.#ingressParserRejectionsTotal,
+      ingressUpgradeRejectionsTotal: this.#ingressUpgradeRejectionsTotal,
+      responseGraphRejections: this.#responseGraphRejections,
+      responseGraphRejectionsTotal: this.#responseGraphRejectionsTotal,
       enqueueToSend: this.#queue.snapshotAndReset(),
       sendCallback: this.#callback.snapshotAndReset(),
     };
@@ -235,10 +294,13 @@ export class WebSocketTelemetry {
     this.#bufferPeak = 0;
     this.#delayed = 0;
     this.#ingressMessageBytesPeak = 0;
+    this.#ingressPromotionBytesPeak = 0;
+    this.#ingressReservedBytesPeak = this.#ingressReservedBytes;
     this.#ingressPromotions = 0;
-    this.#ingressWaits = 0;
     this.#ingressRejections = 0;
-    this.#ingressTimeouts = 0;
+    this.#ingressParserRejections = 0;
+    this.#ingressUpgradeRejections = 0;
+    this.#responseGraphRejections = 0;
     return value;
   }
 

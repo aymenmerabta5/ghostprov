@@ -1305,7 +1305,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           this.#ySweetRefreshRequested = false;
           return true;
         })();
-        this.#ySweetRotation = rotation.then(() => undefined);
+        const trackedRotation = rotation.then(() => undefined);
+        // The refresh loop awaits `rotation` below, while recovery/shutdown may
+        // independently await this void projection. Attach an owner now so a
+        // recoverable reconnect failure never reaches process unhandledRejection.
+        void trackedRotation.catch(() => undefined);
+        this.#ySweetRotation = trackedRotation;
         const applied = await rotation;
         if (applied) this.#emit();
         deadline = applied

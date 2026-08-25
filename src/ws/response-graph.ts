@@ -1,3 +1,5 @@
+import { jsonEncodedByteLength } from "../router/workload";
+
 export interface ResponseCreateEvent {
   type: "response.create";
   stream_id?: string;
@@ -21,16 +23,32 @@ export interface ResolvedRelayRequest {
 }
 
 interface MaterializationReservation {
+  releasePayload(): void;
+  releasePin(): void;
   release(): void;
 }
 
 const MATERIALIZATION_RESERVATIONS = new WeakMap<object, MaterializationReservation>();
+const RESOLUTION_RESERVATIONS = new WeakMap<ResolvedRelayRequest, MaterializationReservation>();
 
 export function releaseResponseGraphMaterialization(value: unknown): void {
   if (!value || typeof value !== "object") return;
   const reservation = MATERIALIZATION_RESERVATIONS.get(value);
   if (!reservation) return;
   MATERIALIZATION_RESERVATIONS.delete(value);
+  reservation.release();
+}
+
+/** Releases only the payload-sized materialization charge after router handoff. */
+export function releaseResponseGraphPayload(resolved: ResolvedRelayRequest): void {
+  RESOLUTION_RESERVATIONS.get(resolved)?.releasePayload();
+}
+
+/** Releases every remaining materialization charge and lineage pin. */
+export function releaseResponseGraphResolution(resolved: ResolvedRelayRequest): void {
+  const reservation = RESOLUTION_RESERVATIONS.get(resolved);
+  if (!reservation) return;
+  RESOLUTION_RESERVATIONS.delete(resolved);
   reservation.release();
 }
 
@@ -104,25 +122,34 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function clone<T>(value: T): T {
-  return structuredClone(value);
+function freezeJson<T>(value: T, seen = new Set<object>()): T {
+  if (!value || typeof value !== "object") return value;
+  const object = value as object;
+  if (seen.has(object)) return value;
+  seen.add(object);
+  for (const child of Object.values(object)) freezeJson(child, seen);
+  return Object.freeze(value);
+}
+
+function cloneFrozen<T>(value: T): T {
+  return freezeJson(structuredClone(value));
 }
 
 function normalizeInput(input: unknown): unknown[] {
-  if (input == null) return [];
-  if (Array.isArray(input)) return clone(input);
+  if (input == null) return freezeJson([] as unknown[]);
+  if (Array.isArray(input)) return cloneFrozen(input);
   if (typeof input === "string") {
-    return [{
+    return freezeJson([{
       type: "message",
       role: "user",
       content: [{ type: "input_text", text: input }],
-    }];
+    }]);
   }
-  return [clone(input)];
+  return freezeJson([cloneFrozen(input)]);
 }
 
 function byteSize(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8");
+  return jsonEncodedByteLength(value);
 }
 
 function stripEncryptedContent(value: unknown): unknown {
@@ -195,13 +222,13 @@ export class ResponseGraph {
       const inputDelta = normalizeInput(event.input);
       if (localContinuation) {
         const history = this.materialize(materialization!.lineage);
-        history.push(...clone(inputDelta));
-        relayBody.input = history;
+        history.push(...inputDelta);
+        relayBody.input = Object.freeze(history);
         delete relayBody.previous_response_id;
         const parent = materialization!.lineage[0]!;
         if (relayBody.model == null && parent.model) relayBody.model = parent.model;
       } else {
-        relayBody.input = clone(inputDelta);
+        relayBody.input = inputDelta;
         if (event.previous_response_id == null) delete relayBody.previous_response_id;
       }
 
@@ -219,7 +246,7 @@ export class ResponseGraph {
         MATERIALIZATION_RESERVATIONS.set(relayBody, materialization.reservation);
       }
 
-      return {
+      const resolved: ResolvedRelayRequest = {
         relayBody,
         parentId,
         clientPreviousResponseId: typeof event.previous_response_id === "string"
@@ -229,6 +256,10 @@ export class ResponseGraph {
         cacheLocally: event.store === false,
         exposeEncryptedReasoning,
       };
+      if (materialization) {
+        RESOLUTION_RESERVATIONS.set(resolved, materialization.reservation);
+      }
+      return resolved;
     } catch (error) {
       materialization?.reservation.release();
       throw error;
@@ -236,37 +267,54 @@ export class ResponseGraph {
   }
 
   record(resolved: ResolvedRelayRequest, final: any): void {
-    releaseResponseGraphMaterialization(resolved.relayBody);
-    if (!resolved.cacheLocally || typeof final?.id !== "string") return;
-    const output = Array.isArray(final.output) ? clone(final.output) : [];
-    const node: ResponseNode = {
-      id: final.id,
-      parentId: resolved.parentId,
-      children: new Set(),
-      input: clone(resolved.inputDelta),
-      output,
-      model: typeof final.model === "string"
-        ? final.model
-        : typeof resolved.relayBody.model === "string"
-          ? resolved.relayBody.model
-          : undefined,
-      bytes: 0,
-      lastAccess: ++this.clock,
-    };
-    node.bytes = byteSize({ input: node.input, output: node.output, model: node.model });
+    try {
+      if (!resolved.cacheLocally || typeof final?.id !== "string") return;
+      if (resolved.parentId && !this.nodes.has(resolved.parentId)) {
+        throw new ResponseGraphCapacityError(
+          "WebSocket continuation parent became unavailable before cache commit",
+        );
+      }
+      const output = Array.isArray(final.output) ? cloneFrozen(final.output) : Object.freeze([]);
+      const node: ResponseNode = {
+        id: final.id,
+        parentId: resolved.parentId,
+        children: new Set(),
+        input: resolved.inputDelta,
+        output,
+        model: typeof final.model === "string"
+          ? final.model
+          : typeof resolved.relayBody.model === "string"
+            ? resolved.relayBody.model
+            : undefined,
+        bytes: 0,
+        lastAccess: ++this.clock,
+      };
+      node.bytes = byteSize({ input: node.input, output: node.output, model: node.model });
+      if (node.bytes > this.maxBytes || node.bytes > this.sharedBudget.limit) {
+        throw new ResponseGraphCapacityError("WebSocket response exceeds cache capacity");
+      }
 
-    if (this.nodes.has(node.id)) this.removeNode(node.id);
-    const protectedIds = this.ancestorsOf(node.parentId);
-    if (!this.makeRoom(node.bytes, protectedIds)) return;
-    if (
-      this.nodes.size >= this.maxNodes ||
-      this.bytes + node.bytes > this.maxBytes ||
-      !this.sharedBudget.reserve(node.bytes)
-    ) return;
+      if (this.nodes.has(node.id)) {
+        throw new ResponseGraphCapacityError("WebSocket response id is already cached");
+      }
+      const protectedIds = this.ancestorsOf(node.parentId);
+      if (!this.makeRoom(node.bytes, protectedIds)) {
+        throw new ResponseGraphCapacityError("WebSocket response cache capacity is exhausted");
+      }
+      if (
+        this.nodes.size >= this.maxNodes ||
+        this.bytes + node.bytes > this.maxBytes ||
+        !this.sharedBudget.reserve(node.bytes)
+      ) {
+        throw new ResponseGraphCapacityError("WebSocket response cache admission failed");
+      }
 
-    this.nodes.set(node.id, node);
-    this.bytes += node.bytes;
-    if (node.parentId) this.nodes.get(node.parentId)?.children.add(node.id);
+      this.nodes.set(node.id, node);
+      this.bytes += node.bytes;
+      if (node.parentId) this.nodes.get(node.parentId)!.children.add(node.id);
+    } finally {
+      releaseResponseGraphResolution(resolved);
+    }
   }
 
   sanitizeOutbound<T>(value: T, resolved: ResolvedRelayRequest): T {
@@ -345,17 +393,26 @@ export class ResponseGraph {
         (this.activeMaterializations.get(entry.id) ?? 0) + 1,
       );
     }
-    let released = false;
+    let payloadReleased = false;
+    let pinReleased = false;
     const reservation: MaterializationReservation = {
-      release: () => {
-        if (released) return;
-        released = true;
+      releasePayload: () => {
+        if (payloadReleased) return;
+        payloadReleased = true;
         this.sharedBudget.release(lineageBytes);
+      },
+      releasePin: () => {
+        if (pinReleased) return;
+        pinReleased = true;
         for (const entry of lineage) {
           const remaining = (this.activeMaterializations.get(entry.id) ?? 1) - 1;
           if (remaining <= 0) this.activeMaterializations.delete(entry.id);
           else this.activeMaterializations.set(entry.id, remaining);
         }
+      },
+      release: () => {
+        reservation.releasePayload();
+        reservation.releasePin();
       },
     };
     return { lineage, reservation };
@@ -365,27 +422,34 @@ export class ResponseGraph {
     const history: unknown[] = [];
     for (let index = lineage.length - 1; index >= 0; index--) {
       const entry = lineage[index]!;
-      history.push(...clone(entry.input), ...clone(entry.output));
+      history.push(...entry.input, ...entry.output);
     }
     return history;
   }
 
   private makeRoom(incomingBytes: number, protectedIds: Set<string>): boolean {
+    const remaining = new Set(this.nodes.keys());
+    const removals: string[] = [];
+    let removedBytes = 0;
     while (
-      this.nodes.size >= this.maxNodes ||
-      this.bytes + incomingBytes > this.maxBytes ||
-      !this.sharedBudget.canReserve(incomingBytes)
+      remaining.size >= this.maxNodes ||
+      this.bytes - removedBytes + incomingBytes > this.maxBytes ||
+      this.sharedBudget.used - removedBytes + incomingBytes > this.sharedBudget.limit
     ) {
       const candidate = [...this.nodes.values()]
         .filter(node =>
-          node.children.size === 0 &&
+          remaining.has(node.id) &&
+          ![...node.children].some(childId => remaining.has(childId)) &&
           !protectedIds.has(node.id) &&
           !this.activeMaterializations.has(node.id)
         )
         .sort((left, right) => left.lastAccess - right.lastAccess)[0];
       if (!candidate) return false;
-      this.removeNode(candidate.id);
+      remaining.delete(candidate.id);
+      removals.push(candidate.id);
+      removedBytes += candidate.bytes;
     }
+    for (const id of removals) this.removeNode(id);
     return true;
   }
 

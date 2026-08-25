@@ -148,7 +148,8 @@ describe("terminal final-object permit ownership", () => {
     await waitFor(() => firstSocket.sent.length === 1);
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 1, jumboUsedBytes: first.retainedBytes });
     firstSocket.flush();
-    await waitFor(() => firstGraph.stats().nodes === 1);
+    await waitFor(() => first.pool.snapshot().activePermits === 0);
+    expect(firstGraph.stats().nodes).toBe(1);
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 0, jumboUsedBytes: 0 });
 
     // Keep the first socket and its 1 MiB continuation cache open. A second
@@ -170,7 +171,8 @@ describe("terminal final-object permit ownership", () => {
     }));
     await waitFor(() => secondSocket.sent.length === 1);
     secondSocket.flush();
-    await waitFor(() => secondGraph.stats().nodes === 1);
+    await waitFor(() => first.pool.snapshot().activePermits === 0);
+    expect(secondGraph.stats().nodes).toBe(1);
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 0, jumboUsedBytes: 0 });
 
     firstSession.close();

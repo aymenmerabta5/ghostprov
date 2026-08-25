@@ -11,7 +11,10 @@ describe("WebSocketTelemetry", () => {
     telemetry.sendQueued(512);
     telemetry.recordSend({ queueMs: 12, callbackMs: 3, bufferedBytes: 2_048, delayed: true });
     telemetry.recordIngressMessageBytes(6 * 1024 * 1024);
-    telemetry.ingressPromoted(); telemetry.ingressWaited(); telemetry.ingressRejected(true);
+    telemetry.recordIngressBudget({ ingressReservedBytes: 17 * 1024 * 1024, maxIngressBytes: 512 * 1024 * 1024 });
+    telemetry.ingressPromoted(8 * 1024 * 1024);
+    telemetry.ingressRejected(); telemetry.ingressParserRejected(); telemetry.ingressUpgradeRejected();
+    telemetry.responseGraphRejected();
     const value = telemetry.snapshotAndReset();
     expect(value).toMatchObject({
       activeSessions: 1,
@@ -37,14 +40,37 @@ describe("WebSocketTelemetry", () => {
       bufferedBytesPeak: 2_048,
       delayedByBackpressure: 1,
       ingressMessageBytesPeak: 6 * 1024 * 1024,
+      ingressPromotionBytesPeak: 8 * 1024 * 1024,
+      ingressReservedBytes: 17 * 1024 * 1024,
+      ingressReservedBytesPeak: 17 * 1024 * 1024,
+      ingressCapacityBytes: 512 * 1024 * 1024,
       ingressPromotions: 1,
-      ingressWaits: 1,
       ingressRejections: 1,
-      ingressTimeouts: 1,
+      ingressParserRejections: 1,
+      ingressUpgradeRejections: 1,
+      ingressPromotionsTotal: 1,
+      ingressRejectionsTotal: 1,
+      ingressParserRejectionsTotal: 1,
+      ingressUpgradeRejectionsTotal: 1,
+      responseGraphRejections: 1,
+      responseGraphRejectionsTotal: 1,
       enqueueToSend: { p95: 12 },
       sendCallback: { p95: 3 },
     });
     expect(JSON.stringify(value)).not.toMatch(/client|stream|url|token|prompt/i);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 0,
+      ingressRejections: 0,
+      ingressParserRejections: 0,
+      ingressUpgradeRejections: 0,
+      ingressPromotionsTotal: 1,
+      ingressRejectionsTotal: 1,
+      ingressParserRejectionsTotal: 1,
+      ingressUpgradeRejectionsTotal: 1,
+      responseGraphRejections: 0,
+      responseGraphRejectionsTotal: 1,
+      ingressReservedBytes: 17 * 1024 * 1024,
+    });
     telemetry.sendSettled(1_024, true); telemetry.sendSettled(512);
     telemetry.responseFinished(512);
     telemetry.requestSettled(512); telemetry.requestSettled(256);

@@ -3,7 +3,6 @@ import { WebSocketServer, type RawData } from "ws";
 import {
   ResponsesWebSocketSession,
   WebSocketProcessBudget,
-  WebSocketIngressTimeoutError,
   WebSocketSessionCapacityError,
   type ResponsesWebSocketSessionOptions,
   type WebSocketProcessLease,
@@ -16,17 +15,19 @@ export type { WebSocketRelayStarter } from "./session";
 
 export const DEFAULT_WS_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
-/** Compatibility ceiling for Node/ws hosts; Bun 1.4 itself caps messages at 16 MiB. */
+/** Legacy Node/ws ceiling; Bun's node:http compatibility path remains at 16 MiB. */
 export const MAX_WS_PAYLOAD_BYTES = 64 * 1024 * 1024;
 export const WS_INGRESS_WORKING_SET_FACTOR = 4;
 export const WS_INGRESS_FIXED_OVERHEAD_BYTES = 1024 * 1024;
+export const DEFAULT_WS_PROMOTION_HEADROOM_BYTES =
+  (DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES - DEFAULT_WS_MAX_PAYLOAD_BYTES) *
+  WS_INGRESS_WORKING_SET_FACTOR;
 export const DEFAULT_WS_PROCESS_MAX_SESSIONS = 256;
 export const DEFAULT_WS_PROCESS_MAX_QUEUED_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_WS_HEARTBEAT_INTERVAL_MS = 30_000;
 export const DEFAULT_WS_PONG_TIMEOUT_MS = 15_000;
 export const DEFAULT_WS_IDLE_TIMEOUT_MS = 5 * 60_000;
-export const DEFAULT_WS_INGRESS_WAIT_TIMEOUT_MS = 30_000;
 
 const DEFAULT_PROCESS_BUDGET = new WebSocketProcessBudget({
   maxSessions: DEFAULT_WS_PROCESS_MAX_SESSIONS,
@@ -76,7 +77,7 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   startRelay: WebSocketRelayStarter;
   /** Shared OpenAI-compatible bearer credential for the upgrade request. */
   apiKey?: string;
-  /** Hard parser-level limit enforced before a complete message reaches JS. */
+  /** Application limit; Bun's node:http shim may assemble up to 16 MiB before this check. */
   maxPayloadBytes?: number;
   /** Normal-path threshold before automatic per-message memory promotion. */
   fastPathPayloadBytes?: number;
@@ -87,7 +88,6 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   heartbeatIntervalMs?: number;
   pongTimeoutMs?: number;
   idleTimeoutMs?: number;
-  ingressWaitTimeoutMs?: number;
 }
 
 const attachedServers = new WeakMap<Server, readonly WebSocketServer[]>();
@@ -109,9 +109,33 @@ export function attachResponsesWebSocket(
     fastPathPayloadBytes < 1 ||
     fastPathPayloadBytes > maxPayloadBytes
   ) throw new RangeError("fastPathPayloadBytes must be within the normal parser limit");
-  const ingressReservationBytes = webSocketIngressReservationBytes(fastPathPayloadBytes);
+  const parserAssemblyLimitBytes = process.versions.bun
+    ? DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES
+    : maxPayloadBytes;
+  const automaticPayloadLimitBytes = Math.min(
+    parserAssemblyLimitBytes,
+    maxPayloadBytes,
+  );
+  const ingressReservationBytes = Math.max(
+    webSocketIngressReservationBytes(fastPathPayloadBytes),
+    parserAssemblyLimitBytes + WS_INGRESS_FIXED_OVERHEAD_BYTES,
+  );
+  const automaticWorkingSetBytes = webSocketIngressReservationBytes(
+    automaticPayloadLimitBytes,
+  );
+  const promotionHeadroomBytes = Math.max(
+    0,
+    automaticWorkingSetBytes - ingressReservationBytes,
+  );
   const jumboIngressReservationBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
   const processBudget = options.processBudget ?? DEFAULT_PROCESS_BUDGET;
+  const recordIngressBudget = () => {
+    options.telemetry?.recordIngressBudget(processBudget.snapshot());
+  };
+  const admittedPromotionHeadroomBytes = Math.min(
+    promotionHeadroomBytes,
+    Math.max(0, processBudget.snapshot().maxIngressBytes - ingressReservationBytes),
+  );
   const heartbeatIntervalMs = positiveTimer(
     options.heartbeatIntervalMs ?? DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
     "heartbeatIntervalMs",
@@ -123,10 +147,6 @@ export function attachResponsesWebSocket(
   const idleTimeoutMs = positiveTimer(
     options.idleTimeoutMs ?? DEFAULT_WS_IDLE_TIMEOUT_MS,
     "idleTimeoutMs",
-  );
-  const ingressWaitTimeoutMs = positiveTimer(
-    options.ingressWaitTimeoutMs ?? DEFAULT_WS_INGRESS_WAIT_TIMEOUT_MS,
-    "ingressWaitTimeoutMs",
   );
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
@@ -156,6 +176,7 @@ export function attachResponsesWebSocket(
       });
     } catch (error) {
       processLease.close();
+      recordIngressBudget();
       socket.close(
         error instanceof WebSocketSessionCapacityError ? 1013 : 1011,
         error instanceof WebSocketSessionCapacityError
@@ -166,15 +187,13 @@ export function attachResponsesWebSocket(
     }
     let cleaned = false;
     let pingSentAt: number | null = null;
-    let ingressWaiting = false;
-    const ingressAbort = new AbortController();
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
-      ingressAbort.abort(new DOMException("WebSocket ingress closed", "AbortError"));
       processLease.releaseIngress();
       clearInterval(heartbeat);
       session.close();
+      recordIngressBudget();
     };
     const terminate = () => {
       cleanup();
@@ -200,21 +219,25 @@ export function attachResponsesWebSocket(
     }, heartbeatIntervalMs);
     heartbeat.unref?.();
     socket.on("pong", () => { pingSentAt = null; });
-    const pauseIngress = () => {
-      try { (socket as import("ws").WebSocket & { pause?(): void }).pause?.(); } catch {}
-    };
-    const resumeIngress = () => {
-      try { (socket as import("ws").WebSocket & { resume?(): void }).resume?.(); } catch {}
-    };
     const consumeMessage = (data: RawData, releaseIngress: boolean) => {
       try {
         const decoded = decodeWebSocketRawData(data);
         session.receive(decoded.text, decoded.bytes);
       } finally {
-        if (releaseIngress) processLease.releaseIngress();
+        if (releaseIngress) {
+          processLease.releaseIngress();
+          recordIngressBudget();
+        }
       }
     };
+    let parserRejectionRecorded = false;
+    const recordParserRejection = () => {
+      if (parserRejectionRecorded) return;
+      parserRejectionRecorded = true;
+      options.telemetry?.ingressParserRejected();
+    };
     socket.on("message", data => {
+      if (cleaned) return;
       lastApplicationActivityAt = Date.now();
       pingSentAt = null;
       const bytes = Array.isArray(data)
@@ -224,6 +247,7 @@ export function attachResponsesWebSocket(
       // layer has historically ignored that option, so retain this secondary
       // cross-runtime check before decoding the message as text.
       if (bytes > parserLimitBytes) {
+        recordParserRejection();
         cleanup();
         socket.close(1009, "WebSocket message exceeds configured limit");
         return;
@@ -237,54 +261,29 @@ export function attachResponsesWebSocket(
         ? webSocketIngressReservationBytes(bytes)
         : baseReservationBytes;
       const dynamicIngressBytes = Math.max(0, totalWorkingSet - baseReservationBytes);
-      options.telemetry?.ingressPromoted();
+      options.telemetry?.ingressPromoted(dynamicIngressBytes);
       if (
         dynamicIngressBytes === 0 ||
         processLease.tryEnsureIngress(dynamicIngressBytes)
       ) {
+        if (dynamicIngressBytes > 0) recordIngressBudget();
         consumeMessage(data, true);
         return;
       }
-      if (ingressWaiting) {
-        options.telemetry?.ingressRejected(false);
-        ingressWaiting = false;
-        resumeIngress();
-        cleanup();
-        socket.close(1013, "GhostProv WebSocket ingress already has a waiting message");
-        return;
-      }
-      ingressWaiting = true;
-      options.telemetry?.ingressWaited();
-      pauseIngress();
-      void processLease.ensureIngress(
-        dynamicIngressBytes,
-        ingressAbort.signal,
-        ingressWaitTimeoutMs,
-      ).then(() => {
-        if (cleaned) return;
-        ingressWaiting = false;
-        try {
-          consumeMessage(data, true);
-        } finally {
-          resumeIngress();
-        }
-      }, error => {
-        if (cleaned) return;
-        ingressWaiting = false;
-        const timedOut = error instanceof WebSocketIngressTimeoutError;
-        options.telemetry?.ingressRejected(timedOut);
-        resumeIngress();
-        cleanup();
-        socket.close(
-          1013,
-          timedOut
-            ? "GhostProv WebSocket large-message ingress timed out"
-            : "GhostProv WebSocket large-message ingress is unavailable",
-        );
-      });
+      options.telemetry?.ingressRejected();
+      cleanup();
+      socket.close(1013, "GhostProv WebSocket large-message ingress is unavailable");
     });
-    socket.once("close", cleanup);
-    socket.once("error", cleanup);
+    socket.once("close", (code, reason) => {
+      if (code === 1009 || isWebSocketPayloadLimitError(reason)) {
+        recordParserRejection();
+      }
+      cleanup();
+    });
+    socket.once("error", error => {
+      if (isWebSocketPayloadLimitError(error)) recordParserRejection();
+      cleanup();
+    });
   };
   wss.on("connection", socket => acceptConnection(
     socket,
@@ -327,15 +326,23 @@ export function attachResponsesWebSocket(
         return;
       }
       const jumboHeader = request.headers["x-ghostprov-ws-jumbo"];
-      const jumbo = jumboHeader === "1" || (
+      const requestedJumbo = jumboHeader === "1" || (
         Array.isArray(jumboHeader) && jumboHeader.length === 1 && jumboHeader[0] === "1"
       );
+      // Bun's node:http compatibility server ignores `ws` maxPayload and fixes
+      // its parser at 16 MiB. Keep the legacy header compatible without paying
+      // a 257 MiB reservation for capacity the runtime cannot expose.
+      const jumbo = requestedJumbo && !process.versions.bun;
       const selectedWss = jumbo ? jumboWss : wss;
       const selectedIngressBytes = jumbo
         ? jumboIngressReservationBytes
         : ingressReservationBytes;
-      const processLease = processBudget.openSession(selectedIngressBytes);
+      const processLease = processBudget.openSession(
+        selectedIngressBytes,
+        jumbo ? 0 : admittedPromotionHeadroomBytes,
+      );
       if (!processLease) {
+        options.telemetry?.ingressUpgradeRejected();
         socket.end(
           "HTTP/1.1 503 Service Unavailable\r\n" +
           "Connection: close\r\n" +
@@ -343,9 +350,13 @@ export function attachResponsesWebSocket(
         );
         return;
       }
+      recordIngressBudget();
       let handedOff = false;
       const releasePending = () => {
-        if (!handedOff) processLease.close();
+        if (!handedOff) {
+          processLease.close();
+          recordIngressBudget();
+        }
       };
       socket.once("close", releasePending);
       try {
@@ -358,6 +369,7 @@ export function attachResponsesWebSocket(
       } catch (error) {
         socket.off("close", releasePending);
         processLease.close();
+        recordIngressBudget();
         throw error;
       }
     } catch {
@@ -373,6 +385,35 @@ function positiveTimer(value: number, label: string): number {
     throw new RangeError(`${label} must be a positive schedulable integer`);
   }
   return value;
+}
+
+function isWebSocketPayloadLimitError(error: unknown): boolean {
+  if (typeof error === "string") {
+    return /(?:max(?:imum)?\s+payload|payload\s+(?:size|length)|too\s+(?:big|large))/i.test(error);
+  }
+  if (ArrayBuffer.isView(error)) {
+    return isWebSocketPayloadLimitError(
+      Buffer.from(error.buffer, error.byteOffset, error.byteLength).toString("utf8"),
+    );
+  }
+  if (!error || typeof error !== "object") return false;
+  const value = error as {
+    code?: unknown;
+    message?: unknown;
+    error?: { code?: unknown; message?: unknown };
+  };
+  const code = typeof value.code === "string"
+    ? value.code
+    : typeof value.error?.code === "string"
+      ? value.error.code
+      : "";
+  const message = typeof value.message === "string"
+    ? value.message
+    : typeof value.error?.message === "string"
+      ? value.error.message
+      : "";
+  return code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH" ||
+    /(?:max(?:imum)?\s+payload|payload\s+(?:size|length)|too\s+(?:big|large))/i.test(message);
 }
 
 /** Closes only WebSockets owned by this GhostProv server after active relays drain. */

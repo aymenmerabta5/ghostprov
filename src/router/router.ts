@@ -1469,6 +1469,9 @@ export class MultiSandboxRouter {
     selectedRetryEpoch: number,
   ): Promise<void> {
     const started = this.#clock.now();
+    const requestModel = typeof job.body.model === "string"
+      ? job.body.model
+      : job.workload.model;
     const admissionController = new AbortController();
     let admissionDeadlineExpired = false;
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1568,7 +1571,7 @@ export class MultiSandboxRouter {
             hint,
             rateLimitProblemFromError(final),
             runtime.projectId,
-            job.body.model,
+            requestModel,
             selectedIncarnation,
           );
         },
@@ -1585,11 +1588,15 @@ export class MultiSandboxRouter {
             hint,
             rateLimitProblemFromError(error),
             runtime.projectId,
-            job.body.model,
+            requestModel,
             selectedIncarnation,
           );
         },
       );
+      // All post-commit callbacks now capture only scalar metadata. The
+      // transport owns canonical request bytes, so the router can drop its
+      // payload reference before publishing the handle to the caller.
+      job.body = {};
       job.resolve(traced);
       void traced.final.then(
         () => undefined,
@@ -1624,7 +1631,7 @@ export class MultiSandboxRouter {
           rateLimit,
           problem,
           runtime.projectId,
-          job.body.model,
+          requestModel,
           selectedIncarnation,
         );
         job.signal?.removeEventListener("abort", job.onAbort!);

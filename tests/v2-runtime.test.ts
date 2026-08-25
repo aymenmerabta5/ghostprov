@@ -15,6 +15,7 @@ import type {
 import type { SandboxRunOptions } from "../src/sandbox/registry";
 import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
+import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import type { V2ReadyDescriptor } from "../src/v2/bootstrap/controller";
 import type {
   AwarenessEnvelope,
@@ -1376,6 +1377,28 @@ describe("V2SandboxRuntime", () => {
     await expect(handle.final).resolves.toMatchObject({ id: "resp_1" });
     expect(harness.runtime.snapshot().completionEwmaMs).toBeGreaterThan(0);
     await harness.runtime.stop();
+  });
+
+  it("owns a rejected Y-Sweet rotation without an unhandled process rejection", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 600_000 });
+    await harness.runtime.start();
+    harness.awareness.rotationError = new AwarenessChannelError(
+      "Y-Sweet Awareness synchronization timed out",
+      "timeout",
+    );
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await harness.clock.advanceBy(300_001);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      await Bun.sleep(0);
+      expect(unhandled).toEqual([]);
+      expect(harness.runtime.snapshot().state).toBe("ready");
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await harness.runtime.stop();
+    }
   });
 
   it("caps extreme completion duration and recovers its routing estimate while idle", async () => {
