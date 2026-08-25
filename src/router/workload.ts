@@ -10,16 +10,102 @@ export interface WorkloadDescriptor {
   reservedBytes: number;
   cpuPermits: 0 | 1;
   stream: boolean;
-  serializedBody: string;
   model?: string;
 }
 
 export interface WorkloadOptions {
   encodedBytes?: number;
-  serializedBody?: string;
 }
 
 const MiB = 1024 ** 2;
+
+/**
+ * Counts a JSON string without materializing its escaped representation.
+ * Request bodies can contain multi-megabyte prompts/base64 images, so keeping
+ * a second serialized copy solely for admission accounting is prohibitively
+ * expensive under concurrency.
+ */
+function jsonStringBytes(value: string): number {
+  let bytes = Buffer.byteLength(value, "utf8") + 2;
+  const escaped = /["\\\u0000-\u001f\ud800-\udfff]/g;
+  for (let match = escaped.exec(value); match; match = escaped.exec(value)) {
+    const index = match.index;
+    const unit = value.charCodeAt(index);
+    if (unit === 0x22 || unit === 0x5c || unit === 0x08 || unit === 0x09 ||
+        unit === 0x0a || unit === 0x0c || unit === 0x0d) {
+      bytes += 1;
+      continue;
+    }
+    if (unit <= 0x1f) {
+      bytes += 5;
+      continue;
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        escaped.lastIndex = index + 2;
+      } else {
+        // Buffer encodes a lone surrogate as a three-byte replacement while
+        // well-formed JSON.stringify emits a six-byte \udxxx escape.
+        bytes += 3;
+      }
+      continue;
+    }
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function jsonEncodedBytes(value: unknown, seen = new Set<object>()): number | null {
+  if (value === null) return 4;
+  switch (typeof value) {
+    case "string":
+      return jsonStringBytes(value);
+    case "boolean":
+      return value ? 4 : 5;
+    case "number":
+      return Number.isFinite(value) ? Buffer.byteLength(String(value), "utf8") : 4;
+    case "bigint":
+      throw new TypeError("Do not know how to serialize a BigInt");
+    case "undefined":
+    case "function":
+    case "symbol":
+      return null;
+    case "object":
+      break;
+  }
+
+  const object = value as Record<string, unknown>;
+  if (seen.has(object)) {
+    throw new TypeError("Converting circular structure to JSON");
+  }
+  seen.add(object);
+  try {
+    let bytes = 2; // brackets/braces
+    let entries = 0;
+    if (Array.isArray(object)) {
+      for (let index = 0; index < object.length; index++) {
+        const item = jsonEncodedBytes(object[index], seen);
+        bytes += (entries++ > 0 ? 1 : 0) + (item ?? 4);
+      }
+      return bytes;
+    }
+    for (const key of Object.keys(object)) {
+      const item = jsonEncodedBytes(object[key], seen);
+      if (item === null) continue;
+      bytes += (entries++ > 0 ? 1 : 0) + jsonStringBytes(key) + 1 + item;
+    }
+    return bytes;
+  } finally {
+    seen.delete(object);
+  }
+}
+
+export function jsonEncodedByteLength(value: unknown): number {
+  return jsonEncodedBytes(value) ?? 0;
+}
 
 function containsInputImage(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
@@ -33,8 +119,14 @@ export function classifyWorkload(
   body: Record<string, unknown>,
   options: WorkloadOptions = {},
 ): WorkloadDescriptor {
-  const serializedBody = options.serializedBody ?? JSON.stringify(body);
-  const requestBytes = options.encodedBytes ?? Buffer.byteLength(serializedBody, "utf8");
+  if (
+    options.encodedBytes !== undefined &&
+    (!Number.isSafeInteger(options.encodedBytes) || options.encodedBytes < 0)
+  ) {
+    throw new RangeError("encodedBytes must be a non-negative safe integer");
+  }
+  const structuralBytes = jsonEncodedByteLength(body);
+  const requestBytes = Math.max(options.encodedBytes ?? 0, structuralBytes);
   const tools = Array.isArray(body.tools) ? body.tools : [];
   const imageTool = tools.find(tool => tool && typeof tool === "object" && (tool as any).type === "image_generation") as Record<string, unknown> | undefined;
   const stream = body.stream === true;
@@ -66,7 +158,6 @@ export function classifyWorkload(
     reservedBytes: Math.ceil(reservedBytes),
     cpuPermits,
     stream,
-    serializedBody,
     model: typeof body.model === "string" ? body.model : undefined,
   };
 }

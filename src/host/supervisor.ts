@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFile, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import {
   Agent,
   createServer as createHttpServer,
@@ -11,6 +12,13 @@ import {
 import { connect as connectTcp, createServer as createTcpServer } from "node:net";
 import * as path from "node:path";
 import type { Duplex } from "node:stream";
+import {
+  parseSupervisorControlRequest,
+  requestTargetsSupervisor,
+  validSupervisorControlTarget,
+  type SupervisorControlAction,
+  type SupervisorControlTarget,
+} from "./supervisor-control";
 
 export type HostSupervisorState =
   | "starting"
@@ -23,6 +31,8 @@ export type HostSupervisorState =
 export interface HostSupervisorSnapshot {
   state: HostSupervisorState;
   supervisorPid: number;
+  startedAt: string;
+  instanceNonce: string;
   workerPid: number | null;
   generation: number;
   externalPort: number | null;
@@ -32,6 +42,9 @@ export interface HostSupervisorSnapshot {
   consecutiveFailures: number;
   queuedRequests: number;
   queuedRequestsPeak: number;
+  queuedBytes: number;
+  queuedBytesPeak: number;
+  queueRejectedTotal: number;
   activeProxyRequests: number;
   activeWebSockets: number;
   forwardedTotal: number;
@@ -39,6 +52,10 @@ export interface HostSupervisorSnapshot {
   lastReadyAt: string | null;
   lastExitCode: number | null;
   lastExitSignal: NodeJS.Signals | null;
+  shutdownClean: boolean | null;
+  forcedStops: number;
+  statusWritesTotal: number;
+  statusWritesCoalesced: number;
 }
 
 export interface GhostProvHostSupervisorOptions {
@@ -50,6 +67,8 @@ export interface GhostProvHostSupervisorOptions {
   readyTimeoutMs?: number;
   gracefulShutdownMs?: number;
   requestWaitMs?: number;
+  maxQueuedRequests?: number;
+  maxQueuedBytes?: number;
   restartBaseMs?: number;
   restartMaxMs?: number;
   stableResetMs?: number;
@@ -58,6 +77,10 @@ export interface GhostProvHostSupervisorOptions {
   stopFile?: string;
   statusFile?: string;
   logFile?: string;
+  startedAt?: string;
+  instanceNonce?: string;
+  /** Testable internal-port allocator; production uses an ephemeral loopback bind. */
+  allocatePort?: () => Promise<number>;
 }
 
 interface WorkerTarget {
@@ -136,6 +159,68 @@ function safeReason(value: unknown): string {
     .slice(0, 128) || "unknown";
 }
 
+function queuedRequestFootprint(request: IncomingMessage, extraBytes = 0): number | null {
+  let bytes = Buffer.byteLength(
+    `${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}\r\n`,
+  ) + extraBytes + 2;
+  for (const value of request.rawHeaders) bytes += Buffer.byteLength(value) + 4;
+  const contentLength = request.headers["content-length"];
+  if (Array.isArray(contentLength)) return null;
+  if (contentLength !== undefined) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(contentLength)) return null;
+    const parsed = Number(contentLength);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+    bytes += parsed;
+  } else if (request.headers["transfer-encoding"] !== undefined) {
+    // A queued chunked body has no provable upper bound. Ready workers still
+    // receive it normally; only the restart/startup holding queue refuses it.
+    return null;
+  }
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+}
+
+function unavailableBody(code: "host_restarting" | "host_queue_full"): string {
+  return JSON.stringify({ error: {
+    message: code === "host_queue_full"
+      ? "GhostProv restart queue is full"
+      : "GhostProv worker is restarting",
+    type: "service_unavailable_error",
+    param: null,
+    code,
+  }});
+}
+
+function rejectHttpUnavailable(
+  response: ServerResponse,
+  code: "host_restarting" | "host_queue_full",
+): void {
+  if (response.headersSent || response.destroyed) return;
+  const body = unavailableBody(code);
+  response.writeHead(503, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    "retry-after": "1",
+    connection: "close",
+  });
+  response.end(body);
+}
+
+function rejectUpgradeUnavailable(
+  socket: Duplex,
+  code: "host_restarting" | "host_queue_full",
+): void {
+  if (socket.destroyed) return;
+  const body = unavailableBody(code);
+  socket.end(
+    "HTTP/1.1 503 Service Unavailable\r\n" +
+    "Content-Type: application/json\r\n" +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+    "Retry-After: 1\r\n" +
+    "Connection: close\r\n\r\n" +
+    body,
+  );
+}
+
 export class GhostProvHostSupervisor {
   readonly #options: Required<Omit<GhostProvHostSupervisorOptions,
     "workerEnv" | "controlFile" | "stopFile" | "statusFile" | "logFile">> & {
@@ -148,6 +233,7 @@ export class GhostProvHostSupervisor {
   readonly #server: HttpServer;
   readonly #targetWaiters = new Set<TargetWaiter>();
   readonly #proxySockets = new Set<Duplex>();
+  readonly #condemnedChildren = new WeakSet<ChildProcess>();
   #state: HostSupervisorState = "starting";
   #target: WorkerTarget | null = null;
   #child: ChildProcess | null = null;
@@ -158,18 +244,28 @@ export class GhostProvHostSupervisor {
   #plannedRestart = false;
   #stopping = false;
   #runPromise: Promise<void> | null = null;
+  #runFailure: Error | null = null;
+  #listenPromise: Promise<void> | null = null;
+  #startPromise: Promise<void> | null = null;
+  #preparePromise: Promise<void> | null = null;
   #closePromise: Promise<void> | null = null;
   #restartPromise: Promise<void> | null = null;
   #controlTimer: ReturnType<typeof setInterval> | null = null;
   #sampleTimer: ReturnType<typeof setInterval> | null = null;
-  #controlMtimeMs = 0;
-  #stopMtimeMs = 0;
+  #controlContent: string | null = null;
+  #stopContent: string | null = null;
+  readonly #seenControlRequestIds = new Set<string>();
   #forceTimer: ReturnType<typeof setTimeout> | null = null;
   #statusWrite: Promise<void> = Promise.resolve();
+  #statusWriteRunning = false;
+  #statusPendingPayload: string | null = null;
   #logWrite: Promise<void> = Promise.resolve();
   #externalPort: number | null = null;
   #queuedRequests = 0;
   #queuedRequestsPeak = 0;
+  #queuedBytes = 0;
+  #queuedBytesPeak = 0;
+  #queueRejectedTotal = 0;
   #activeProxyRequests = 0;
   #activeWebSockets = 0;
   #forwardedTotal = 0;
@@ -179,6 +275,10 @@ export class GhostProvHostSupervisor {
   #lastReadyAt: string | null = null;
   #lastExitCode: number | null = null;
   #lastExitSignal: NodeJS.Signals | null = null;
+  #shutdownClean: boolean | null = null;
+  #forcedStops = 0;
+  #statusWritesTotal = 0;
+  #statusWritesCoalesced = 0;
 
   constructor(options: GhostProvHostSupervisorOptions) {
     if (!Number.isSafeInteger(options.externalPort) || options.externalPort < 0 || options.externalPort > 65_535) {
@@ -188,15 +288,28 @@ export class GhostProvHostSupervisor {
       throw new TypeError("GhostProv supervisor host must be loopback");
     }
     const cwd = path.resolve(options.cwd ?? process.cwd());
+    const startedAt = options.startedAt ?? new Date().toISOString();
+    const instanceNonce = options.instanceNonce ?? randomUUID();
+    if (!validSupervisorControlTarget({
+      supervisorPid: process.pid,
+      startedAt,
+      instanceNonce,
+    })) {
+      throw new TypeError("GhostProv supervisor control identity is invalid");
+    }
     this.#options = {
       externalPort: options.externalPort,
       host: options.host ?? "127.0.0.1",
       cwd,
       workerEntry: path.resolve(cwd, options.workerEntry ?? "src/server.ts"),
-      workerEnv: { ...options.workerEnv },
+      // Freeze the complete environment once. A rolling restart must not pick
+      // up later process.env mutations or a newly edited .env file.
+      workerEnv: { ...process.env, ...options.workerEnv },
       readyTimeoutMs: options.readyTimeoutMs ?? 120_000,
       gracefulShutdownMs: options.gracefulShutdownMs ?? 330_000,
       requestWaitMs: options.requestWaitMs ?? 480_000,
+      maxQueuedRequests: options.maxQueuedRequests ?? 256,
+      maxQueuedBytes: options.maxQueuedBytes ?? 64 * 1024 * 1024,
       restartBaseMs: options.restartBaseMs ?? 500,
       restartMaxMs: options.restartMaxMs ?? 30_000,
       stableResetMs: options.stableResetMs ?? 60_000,
@@ -205,6 +318,9 @@ export class GhostProvHostSupervisor {
       stopFile: path.resolve(cwd, options.stopFile ?? ".ghostprov/stop.request"),
       statusFile: path.resolve(cwd, options.statusFile ?? ".ghostprov/supervisor.json"),
       logFile: path.resolve(cwd, options.logFile ?? ".ghostprov/logs/supervisor.jsonl"),
+      startedAt,
+      instanceNonce,
+      allocatePort: options.allocatePort ?? freeLoopbackPort,
     };
     for (const [name, value, minimum] of [
       ["readyTimeoutMs", this.#options.readyTimeoutMs, 100],
@@ -222,6 +338,12 @@ export class GhostProvHostSupervisor {
     if (this.#options.restartMaxMs < this.#options.restartBaseMs) {
       throw new RangeError("restartMaxMs must be at least restartBaseMs");
     }
+    if (!Number.isSafeInteger(this.#options.maxQueuedRequests) || this.#options.maxQueuedRequests < 1) {
+      throw new RangeError("maxQueuedRequests must be a positive integer");
+    }
+    if (!Number.isSafeInteger(this.#options.maxQueuedBytes) || this.#options.maxQueuedBytes < 1_024) {
+      throw new RangeError("maxQueuedBytes must be an integer of at least 1024 bytes");
+    }
     this.#server = createHttpServer((request, response) => {
       void this.#forwardHttp(request, response);
     });
@@ -234,6 +356,8 @@ export class GhostProvHostSupervisor {
     return {
       state: this.#state,
       supervisorPid: process.pid,
+      startedAt: this.#options.startedAt,
+      instanceNonce: this.#options.instanceNonce,
       workerPid: this.#child?.pid ?? null,
       generation: this.#generation,
       externalPort: this.#externalPort,
@@ -243,6 +367,9 @@ export class GhostProvHostSupervisor {
       consecutiveFailures: this.#consecutiveFailures,
       queuedRequests: this.#queuedRequests,
       queuedRequestsPeak: this.#queuedRequestsPeak,
+      queuedBytes: this.#queuedBytes,
+      queuedBytesPeak: this.#queuedBytesPeak,
+      queueRejectedTotal: this.#queueRejectedTotal,
       activeProxyRequests: this.#activeProxyRequests,
       activeWebSockets: this.#activeWebSockets,
       forwardedTotal: this.#forwardedTotal,
@@ -250,42 +377,98 @@ export class GhostProvHostSupervisor {
       lastReadyAt: this.#lastReadyAt,
       lastExitCode: this.#lastExitCode,
       lastExitSignal: this.#lastExitSignal,
+      shutdownClean: this.#shutdownClean,
+      forcedStops: this.#forcedStops,
+      statusWritesTotal: this.#statusWritesTotal,
+      statusWritesCoalesced: this.#statusWritesCoalesced,
     };
   }
 
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    if (this.#startPromise) return this.#startPromise;
+    const starting = this.#startInternal();
+    this.#startPromise = starting;
+    return starting;
+  }
+
+  async #startInternal(): Promise<void> {
+    if (this.#stopping) throw new Error("Supervisor is stopping");
+    if (this.#runFailure) throw this.#runFailure;
     if (this.#runPromise) {
-      await this.#waitForTarget(1, this.#options.readyTimeoutMs);
+      await Promise.race([
+        this.#waitForTarget(1, this.#options.readyTimeoutMs),
+        this.#runPromise.then(() => {
+          throw new Error("Supervisor run loop stopped before worker readiness");
+        }),
+      ]);
       return;
     }
-    await mkdir(path.dirname(this.#options.controlFile), { recursive: true });
-    await mkdir(path.dirname(this.#options.statusFile), { recursive: true });
-    await mkdir(path.dirname(this.#options.logFile), { recursive: true });
-    this.#controlMtimeMs = await stat(this.#options.controlFile)
-      .then(value => value.mtimeMs)
-      .catch(() => 0);
-    this.#stopMtimeMs = await stat(this.#options.stopFile)
-      .then(value => value.mtimeMs)
-      .catch(() => 0);
-    await new Promise<void>((resolve, reject) => {
-      this.#server.once("error", reject);
-      this.#server.listen(this.#options.externalPort, this.#options.host, () => {
-        this.#server.off("error", reject);
-        const address = this.#server.address();
-        this.#externalPort = address && typeof address !== "string" ? address.port : null;
-        resolve();
-      });
+    await this.prepareControlPlane();
+    if (this.#stopping) throw new Error("Supervisor is stopping");
+    const listening = new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => {
+        this.#server.off("error", onError);
+        reject(error);
+      };
+      this.#server.once("error", onError);
+      try {
+        this.#server.listen(this.#options.externalPort, this.#options.host, () => {
+          this.#server.off("error", onError);
+          const address = this.#server.address();
+          this.#externalPort = address && typeof address !== "string" ? address.port : null;
+          resolve();
+        });
+      } catch (error) {
+        this.#server.off("error", onError);
+        reject(error);
+      }
     });
+    this.#listenPromise = listening;
+    try {
+      await listening;
+    } finally {
+      if (this.#listenPromise === listening) this.#listenPromise = null;
+    }
+    if (this.#stopping) throw new Error("Supervisor is stopping");
     this.#controlTimer = setInterval(() => void this.#pollControlFile(), 1_000);
     this.#controlTimer.unref?.();
     this.#sampleTimer = setInterval(() => this.#emitSample(), this.#options.sampleIntervalMs);
     this.#sampleTimer.unref?.();
-    this.#runPromise = this.#runLoop();
-    await this.#waitForTarget(1, this.#options.readyTimeoutMs);
+    const run = this.#runLoop().catch(error => {
+      const failure = error instanceof Error ? error : new Error("Supervisor run loop failed");
+      this.#runFailure = failure;
+      for (const waiter of [...this.#targetWaiters]) this.#finishWaiter(waiter, failure);
+      throw failure;
+    });
+    this.#runPromise = run;
+    await Promise.race([
+      this.#waitForTarget(1, this.#options.readyTimeoutMs),
+      run.then(() => {
+        throw new Error("Supervisor run loop stopped before worker readiness");
+      }),
+    ]);
+  }
+
+  prepareControlPlane(): Promise<void> {
+    if (this.#preparePromise) return this.#preparePromise;
+    this.#preparePromise = (async () => {
+      await mkdir(path.dirname(this.#options.controlFile), { recursive: true });
+      await mkdir(path.dirname(this.#options.statusFile), { recursive: true });
+      await mkdir(path.dirname(this.#options.logFile), { recursive: true });
+      this.#controlContent = await readFile(this.#options.controlFile, "utf8").catch(() => null);
+      this.#stopContent = await readFile(this.#options.stopFile, "utf8").catch(() => null);
+      for (const content of [this.#controlContent, this.#stopContent]) {
+        if (content === null) continue;
+        const request = parseSupervisorControlRequest(content);
+        if (request) this.#seenControlRequestIds.add(request.requestId);
+      }
+    })();
+    return this.#preparePromise;
   }
 
   requestRestart(reason = "upgrade-request"): Promise<void> {
     if (this.#stopping) return Promise.reject(new Error("Supervisor is stopping"));
+    if (this.#runFailure) return Promise.reject(this.#runFailure);
     if (this.#restartPromise) return this.#restartPromise;
     const minimumGeneration = this.#generation + 1;
     const startedAt = performance.now();
@@ -325,22 +508,40 @@ export class GhostProvHostSupervisor {
         this.#finishWaiter(waiter, new Error("Supervisor is stopping"));
       }
       this.#requestChildShutdown("supervisor-stop", 0);
-      const closingServer = new Promise<void>(resolve => {
-        if (!this.#server.listening) return resolve();
-        this.#server.close(() => resolve());
-      });
+      const pendingListen = this.#listenPromise;
+      const closingServer = (async () => {
+        await pendingListen?.catch(() => undefined);
+        if (!this.#server.listening) return;
+        await new Promise<void>(resolve => this.#server.close(() => resolve()));
+      })();
+      let runCompleted = this.#runPromise === null;
       await Promise.race([
-        this.#runPromise ?? Promise.resolve(),
+        (this.#runPromise ?? Promise.resolve()).then(
+          () => { runCompleted = true; },
+          () => { runCompleted = true; },
+        ),
         sleep(this.#options.gracefulShutdownMs + 1_000),
       ]);
-      if (this.#child) this.#child.kill();
+      const forced = this.#child !== null;
+      if (forced) {
+        this.#child?.kill();
+      }
       for (const socket of this.#proxySockets) socket.destroy();
       this.#proxySockets.clear();
       this.#server.closeAllConnections?.();
       await closingServer;
+      this.#shutdownClean = runCompleted && !forced && (
+        this.#generation === 0 ||
+        (this.#lastExitCode === 0 && this.#lastExitSignal === null)
+      );
       this.#state = "stopped";
+      this.#log("shutdown_completed", {
+        clean: this.#shutdownClean,
+        forced,
+        last_exit_code: this.#lastExitCode,
+      });
       this.#writeStatus();
-      await this.#statusWrite;
+      await this.#flushStatusWrites();
       await this.#logWrite;
     })();
     return this.#closePromise;
@@ -369,6 +570,12 @@ export class GhostProvHostSupervisor {
         this.#consecutiveFailures++;
       } else if (!expected) {
         this.#consecutiveFailures = 0;
+        // A stable worker crash is restarted immediately rather than backed
+        // off, but it is still an automatic restart. Emit the same scheduling
+        // lifecycle event with a zero delay so operators can distinguish the
+        // intentional restart decision from an unexplained worker launch.
+        this.#log("restart_scheduled", { delay_ms: 0, consecutive_failures: 0 });
+        this.#writeStatus();
       }
     }
   }
@@ -376,18 +583,26 @@ export class GhostProvHostSupervisor {
   async #launchWorker(): Promise<ChildExit> {
     this.#state = "starting";
     this.#setTarget(null);
-    const port = await freeLoopbackPort();
+    const port = await this.#options.allocatePort();
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+      throw new Error("Internal worker port allocator returned an invalid port");
+    }
     const generation = ++this.#generation;
     if (generation > 1) this.#restarts++;
     const startedAt = performance.now();
-    const child = spawn(process.execPath, [this.#options.workerEntry], {
+    const child = spawn(process.execPath, ["--no-env-file", this.#options.workerEntry], {
       cwd: this.#options.cwd,
       env: {
-        ...process.env,
         ...this.#options.workerEnv,
         PORT: String(port),
         GP_SUPERVISED_CHILD: "1",
         GP_SUPERVISOR_GENERATION: String(generation),
+        // src/server.ts explicitly imports dotenv/config. Point that import at
+        // the platform null device so an edited .env cannot leak into a rolling
+        // worker restart. A fresh supervisor has already loaded .env into the
+        // frozen environment above.
+        DOTENV_CONFIG_PATH: process.platform === "win32" ? "NUL" : "/dev/null",
+        DOTENV_CONFIG_QUIET: "true",
       },
       stdio: ["inherit", "inherit", "inherit", "ipc"],
       windowsHide: true,
@@ -397,12 +612,15 @@ export class GhostProvHostSupervisor {
     this.#writeStatus();
     let ready = false;
     let readyTimer: ReturnType<typeof setTimeout> | null = null;
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
     const markReady = () => {
-      if (ready || this.#child !== child || this.#stopping) return;
+      if (
+        ready ||
+        this.#child !== child ||
+        this.#stopping ||
+        this.#condemnedChildren.has(child)
+      ) return;
       ready = true;
       if (readyTimer) clearTimeout(readyTimer);
-      if (pollTimer) clearInterval(pollTimer);
       const agent = new Agent({ keepAlive: true, maxSockets: 1_024, maxFreeSockets: 64 });
       this.#setTarget({ generation, port, pid: child.pid ?? -1, agent });
       this.#state = "ready";
@@ -417,19 +635,21 @@ export class GhostProvHostSupervisor {
     };
     child.on("message", message => {
       if (!message || typeof message !== "object") return;
-      const value = message as { type?: unknown; port?: unknown; pid?: unknown };
+      const value = message as {
+        type?: unknown;
+        port?: unknown;
+        pid?: unknown;
+        generation?: unknown;
+      };
       if (
         value.type === "ghostprov.ready" &&
         value.port === port &&
-        (value.pid === child.pid || child.pid === undefined)
+        value.generation === generation &&
+        Number.isSafeInteger(child.pid) &&
+        (child.pid ?? 0) > 0 &&
+        value.pid === child.pid
       ) markReady();
     });
-    pollTimer = setInterval(() => {
-      void fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1_000) })
-        .then(response => { if (response.status === 200 || response.status === 503) markReady(); })
-        .catch(() => undefined);
-    }, 500);
-    pollTimer.unref?.();
     readyTimer = setTimeout(() => {
       if (ready || this.#child !== child) return;
       this.#log("worker_ready_timeout", { generation, pid: child.pid ?? null });
@@ -450,7 +670,6 @@ export class GhostProvHostSupervisor {
       child.once("exit", (code, signal) => finish({ code, signal }));
     });
     if (readyTimer) clearTimeout(readyTimer);
-    if (pollTimer) clearInterval(pollTimer);
     if (this.#forceTimer) clearTimeout(this.#forceTimer);
     this.#forceTimer = null;
     if (this.#target?.generation === generation) {
@@ -475,6 +694,7 @@ export class GhostProvHostSupervisor {
   #requestChildShutdown(reason: string, exitCode: number): void {
     const child = this.#child;
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    this.#condemnedChildren.add(child);
     try {
       if (child.connected && child.send) {
         child.send({
@@ -496,6 +716,7 @@ export class GhostProvHostSupervisor {
     if (this.#forceTimer) clearTimeout(this.#forceTimer);
     this.#forceTimer = setTimeout(() => {
       if (this.#child === child && child.exitCode === null && child.signalCode === null) {
+        this.#forcedStops++;
         this.#log("worker_forced_stop", { pid: child.pid ?? null, reason: safeReason(reason) });
         child.kill();
       }
@@ -519,6 +740,8 @@ export class GhostProvHostSupervisor {
     if (this.#target && this.#target.generation >= minimumGeneration) {
       return Promise.resolve(this.#target);
     }
+    if (this.#runFailure) return Promise.reject(this.#runFailure);
+    if (this.#stopping) return Promise.reject(new Error("Supervisor is stopping"));
     if (signal?.aborted) return Promise.reject(abortError("Supervisor target wait aborted"));
     return new Promise<WorkerTarget>((resolve, reject) => {
       const waiter: TargetWaiter = {
@@ -545,6 +768,42 @@ export class GhostProvHostSupervisor {
     else waiter.resolve(target!);
   }
 
+  #reserveQueuedRequest(bytes: number | null): number | null {
+    if (
+      bytes === null ||
+      bytes > this.#options.maxQueuedBytes ||
+      this.#queuedRequests >= this.#options.maxQueuedRequests ||
+      this.#queuedBytes > this.#options.maxQueuedBytes - bytes
+    ) {
+      this.#queueRejectedTotal++;
+      return null;
+    }
+    const wasEmpty = this.#queuedRequests === 0;
+    this.#queuedRequests++;
+    this.#queuedBytes += bytes;
+    this.#queuedRequestsPeak = Math.max(this.#queuedRequestsPeak, this.#queuedRequests);
+    this.#queuedBytesPeak = Math.max(this.#queuedBytesPeak, this.#queuedBytes);
+    if (wasEmpty) this.#writeStatus();
+    return bytes;
+  }
+
+  #releaseQueuedRequest(bytes: number): void {
+    if (this.#queuedRequests < 1 || bytes < 0 || bytes > this.#queuedBytes) {
+      this.#log("queue_accounting_error", {
+        queued_requests: this.#queuedRequests,
+        queued_bytes: this.#queuedBytes,
+        release_bytes: bytes,
+      });
+      this.#queuedRequests = 0;
+      this.#queuedBytes = 0;
+      this.#writeStatus();
+      return;
+    }
+    this.#queuedRequests--;
+    this.#queuedBytes -= bytes;
+    if (this.#queuedRequests === 0) this.#writeStatus();
+  }
+
   async #forwardHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (request.url === "/__supervisor") {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -556,38 +815,34 @@ export class GhostProvHostSupervisor {
       response.end(JSON.stringify({ ok: false, supervisor: this.#state, retryable: true }));
       return;
     }
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    request.once("aborted", abort);
-    response.once("close", abort);
     const queuedAt = performance.now();
-    this.#queuedRequests++;
-    this.#queuedRequestsPeak = Math.max(this.#queuedRequestsPeak, this.#queuedRequests);
-    this.#writeStatus();
-    let target: WorkerTarget;
-    try {
-      target = await this.#waitForTarget(this.#generation, this.#options.requestWaitMs, controller.signal);
-    } catch {
-      if (!response.headersSent && !response.destroyed) {
-        response.writeHead(503, {
-          "content-type": "application/json",
-          "retry-after": "1",
-          connection: "close",
-        });
-        response.end(JSON.stringify({ error: {
-          message: "GhostProv worker is restarting",
-          type: "service_unavailable_error",
-          param: null,
-          code: "host_restarting",
-        }}));
+    let target = this.#target;
+    if (!target) {
+      const reservation = this.#reserveQueuedRequest(queuedRequestFootprint(request));
+      if (reservation === null) {
+        rejectHttpUnavailable(response, "host_queue_full");
+        return;
       }
-      return;
-    } finally {
-      this.#queuedRequests = Math.max(0, this.#queuedRequests - 1);
-      request.off("aborted", abort);
-      response.off("close", abort);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      request.once("aborted", abort);
+      response.once("close", abort);
+      try {
+        target = await this.#waitForTarget(
+          this.#generation,
+          this.#options.requestWaitMs,
+          controller.signal,
+        );
+      } catch {
+        rejectHttpUnavailable(response, "host_restarting");
+        return;
+      } finally {
+        this.#releaseQueuedRequest(reservation);
+        request.off("aborted", abort);
+        response.off("close", abort);
+      }
+      if (controller.signal.aborted) return;
     }
-    if (controller.signal.aborted) return;
     this.#activeProxyRequests++;
     this.#forwardedTotal++;
     const waitMs = Math.max(0, performance.now() - queuedAt);
@@ -610,11 +865,30 @@ export class GhostProvHostSupervisor {
       agent: target.agent,
     }, upstreamResponse => {
       response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      let responseSettled = false;
+      const settleResponse = (failed: boolean, error?: Error) => {
+        if (responseSettled) return;
+        responseSettled = true;
+        if (failed && !finished) this.#proxyErrorsTotal++;
+        finish();
+        if (error && !response.destroyed) response.destroy(error);
+      };
+      upstreamResponse.once("end", () => settleResponse(false));
+      upstreamResponse.once("aborted", () => settleResponse(
+        true,
+        new Error("Upstream response aborted after headers"),
+      ));
+      upstreamResponse.once("error", error => settleResponse(true, error));
+      upstreamResponse.once("close", () => settleResponse(
+        !upstreamResponse.complete,
+        upstreamResponse.complete
+          ? undefined
+          : new Error("Upstream response closed before completion"),
+      ));
       upstreamResponse.pipe(response);
-      upstreamResponse.once("end", finish);
     });
     upstream.once("error", error => {
-      this.#proxyErrorsTotal++;
+      if (!finished) this.#proxyErrorsTotal++;
       finish();
       if (!response.headersSent && !response.destroyed) {
         response.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
@@ -638,22 +912,31 @@ export class GhostProvHostSupervisor {
   }
 
   async #forwardUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    socket.once("close", abort);
-    this.#queuedRequests++;
-    this.#queuedRequestsPeak = Math.max(this.#queuedRequestsPeak, this.#queuedRequests);
-    let target: WorkerTarget;
-    try {
-      target = await this.#waitForTarget(this.#generation, this.#options.requestWaitMs, controller.signal);
-    } catch {
-      if (!socket.destroyed) {
-        socket.end("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n\r\n");
+    let target = this.#target;
+    if (!target) {
+      const reservation = this.#reserveQueuedRequest(
+        queuedRequestFootprint(request, head.byteLength),
+      );
+      if (reservation === null) {
+        rejectUpgradeUnavailable(socket, "host_queue_full");
+        return;
       }
-      return;
-    } finally {
-      this.#queuedRequests = Math.max(0, this.#queuedRequests - 1);
-      socket.off("close", abort);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      socket.once("close", abort);
+      try {
+        target = await this.#waitForTarget(
+          this.#generation,
+          this.#options.requestWaitMs,
+          controller.signal,
+        );
+      } catch {
+        rejectUpgradeUnavailable(socket, "host_restarting");
+        return;
+      } finally {
+        this.#releaseQueuedRequest(reservation);
+        socket.off("close", abort);
+      }
     }
     if (socket.destroyed) return;
     const upstream = connectTcp(target.port, "127.0.0.1");
@@ -686,22 +969,52 @@ export class GhostProvHostSupervisor {
   }
 
   async #pollControlFile(): Promise<void> {
-    const stopMtimeMs = await stat(this.#options.stopFile)
-      .then(value => value.mtimeMs)
-      .catch(() => 0);
-    if (stopMtimeMs > this.#stopMtimeMs) {
-      this.#stopMtimeMs = stopMtimeMs;
+    if (await this.#consumeControlRequest(this.#options.stopFile, "shutdown")) {
       await this.close();
       return;
     }
-    const mtimeMs = await stat(this.#options.controlFile)
-      .then(value => value.mtimeMs)
-      .catch(() => 0);
-    if (mtimeMs <= this.#controlMtimeMs) return;
-    this.#controlMtimeMs = mtimeMs;
-    await this.requestRestart("control-file").catch(error => {
+    if (!await this.#consumeControlRequest(this.#options.controlFile, "upgrade")) return;
+    await this.requestRestart("control-request").catch(error => {
       this.#log("upgrade_failed", { error_name: error instanceof Error ? error.name : "Error" });
     });
+  }
+
+  #controlTarget(): SupervisorControlTarget {
+    return {
+      supervisorPid: process.pid,
+      startedAt: this.#options.startedAt,
+      instanceNonce: this.#options.instanceNonce,
+    };
+  }
+
+  async #consumeControlRequest(
+    target: string,
+    action: SupervisorControlAction,
+  ): Promise<boolean> {
+    const content = await readFile(target, "utf8").catch(() => null);
+    const previous = action === "upgrade" ? this.#controlContent : this.#stopContent;
+    if (content === previous) return false;
+    if (action === "upgrade") this.#controlContent = content;
+    else this.#stopContent = content;
+    if (content === null) return false;
+    const request = parseSupervisorControlRequest(content);
+    if (!request) {
+      this.#log("control_rejected", { action, reason: "invalid_request" });
+      return false;
+    }
+    if (this.#seenControlRequestIds.has(request.requestId)) {
+      this.#log("control_rejected", { action, reason: "duplicate", request_id: request.requestId });
+      return false;
+    }
+    // Remember every well-formed identity before target checks. Rewriting a
+    // stale request after another supervisor starts can never make it fresh.
+    this.#seenControlRequestIds.add(request.requestId);
+    if (!requestTargetsSupervisor(request, action, this.#controlTarget())) {
+      this.#log("control_rejected", { action, reason: "stale_target", request_id: request.requestId });
+      return false;
+    }
+    this.#log("control_accepted", { action, request_id: request.requestId });
+    return true;
   }
 
   #emitSample(): void {
@@ -717,6 +1030,7 @@ export class GhostProvHostSupervisor {
       proxy_errors_interval: errors,
     });
     this.#queuedRequestsPeak = this.#queuedRequests;
+    this.#queuedBytesPeak = this.#queuedBytes;
     this.#writeStatus();
   }
 
@@ -726,12 +1040,45 @@ export class GhostProvHostSupervisor {
       updatedAt: new Date().toISOString(),
       ...this.snapshot(),
     }, null, 2);
+    if (this.#statusWriteRunning) {
+      this.#statusPendingPayload = payload;
+      this.#statusWritesCoalesced++;
+      return;
+    }
+    this.#statusWriteRunning = true;
     const target = this.#options.statusFile;
     const temporary = `${target}.${process.pid}.tmp`;
-    this.#statusWrite = this.#statusWrite.then(async () => {
-      await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, target);
-    }).catch(() => undefined);
+    this.#statusWrite = (async () => {
+      try {
+        let next: string | null = payload;
+        while (next !== null) {
+          const current = next;
+          this.#statusPendingPayload = null;
+          try {
+            await writeFile(temporary, current, { encoding: "utf8", mode: 0o600 });
+            await rename(temporary, target);
+            this.#statusWritesTotal++;
+          } catch {
+            // Status is diagnostic and must never crash supervision. A dirty
+            // replacement queued during the failed write is still attempted.
+          }
+          next = this.#statusPendingPayload;
+        }
+      } finally {
+        // This runs in the same continuation that observed no pending payload,
+        // so another caller either dirtied the active pump before this point or
+        // sees running=false and starts the next pump itself.
+        this.#statusWriteRunning = false;
+      }
+    })();
+  }
+
+  async #flushStatusWrites(): Promise<void> {
+    for (;;) {
+      const current = this.#statusWrite;
+      await current;
+      if (!this.#statusWriteRunning && this.#statusWrite === current) return;
+    }
   }
 
   #log(event: string, fields: Record<string, unknown>): void {

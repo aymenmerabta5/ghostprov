@@ -16,6 +16,19 @@ class FakeClock implements Clock {
 }
 
 describe("AdmissionController", () => {
+  it("does not double-count bytes already held by the global atomic pool", async () => {
+    const admission = new AdmissionController({
+      physicalMax: 2,
+      acceptedMax: 4,
+      hostCeiling: 2,
+      memoryBudgetBytes: 1,
+    });
+    const lease = await admission.acquire(64 * 1024 * 1024, undefined, true);
+    expect(admission.snapshot()).toMatchObject({ active: 1, reservedBytes: 0 });
+    lease.release();
+    expect(admission.snapshot()).toMatchObject({ active: 0, reservedBytes: 0 });
+  });
+
   it("caps active work at 128 and applies the lower host ceiling", async () => {
     const admission = new AdmissionController({
       physicalMax: 128,

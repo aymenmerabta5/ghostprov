@@ -23,8 +23,43 @@ export interface PhaseZeroBootstrapOptions {
   instanceId?: string;
   encryptedPath: string;
   helloPath?: string;
+  /** Must finish the owner-held PID promotion before the hello becomes visible. */
+  beforeHelloPublished?: () => Promise<void>;
   timeoutMs?: number;
   signal?: AbortSignal;
+}
+
+const SAFE_LAUNCH_NONCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * Resolves the hello path for one exact R2 fork. The launcher passes the
+ * authenticated launch nonce as a distinct argv field, while Deno.pid binds
+ * the file to that fork so an overlapping loser cannot consume another
+ * candidate's ownership hello.
+ */
+export function resolveSidecarBootstrapHelloPath(options: {
+  launchNonce: string;
+  pid: number;
+  args: readonly string[];
+  root?: string;
+}): { helloPath: string; processStart: string } {
+  if (!SAFE_LAUNCH_NONCE.test(options.launchNonce)) {
+    throw new TypeError("Bootstrap launch nonce is invalid");
+  }
+  if (!Number.isSafeInteger(options.pid) || options.pid < 2) {
+    throw new TypeError("Bootstrap process PID is invalid");
+  }
+  const expectedArgument = `--ghostprov-launch-nonce=${options.launchNonce}`;
+  const processStart = options.args[1]?.match(/^--ghostprov-process-start=([0-9]+)$/)?.[1];
+  if (options.args.length !== 2 || options.args[0] !== expectedArgument || !processStart) {
+    throw new TypeError("Bootstrap launch argument does not match the binding nonce");
+  }
+  const root = (options.root ?? "/tmp/ghostprov-v2").replace(/\/+$/, "");
+  if (!root) throw new TypeError("Bootstrap runtime root is invalid");
+  return {
+    helloPath: `${root}/bootstrap-hello.${options.launchNonce}.${options.pid}`,
+    processStart,
+  };
 }
 
 async function atomicWrite(path: string, value: string): Promise<void> {
@@ -63,11 +98,14 @@ export async function phaseZeroBootstrap(
     publicJwk: keys.publicJwk,
   };
   const line = `GPV2_BOOTSTRAP ${base64UrlEncode(utf8Bytes(canonicalJson(hello)))}\n`;
-  await atomicWrite(helloPath, line);
-
-  const deadline = Date.now() + timeoutMs;
-  let lastCiphertext = "";
   try {
+    // A visible hello is the commit proof that this exact child both owns the
+    // sidecar lease and completed canonical PID promotion. Promotion failure
+    // therefore cannot leave a consumable historical hello behind.
+    await options.beforeHelloPublished?.();
+    await atomicWrite(helloPath, line);
+    const deadline = Date.now() + timeoutMs;
+    let lastCiphertext = "";
     while (Date.now() < deadline) {
       if (options.signal?.aborted) {
         throw new DOMException("Bootstrap aborted", "AbortError");

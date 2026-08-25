@@ -49,6 +49,38 @@ function completeSse(): Response {
   ]);
 }
 
+async function rejectionBeforeCancelTimeout(
+  operation: Promise<unknown>,
+  message: string,
+): Promise<unknown> {
+  return await Promise.race([
+    operation.then(
+      () => { throw new Error("expected upstream rejection"); },
+      error => error,
+    ),
+    Bun.sleep(250).then(() => { throw new Error(message); }),
+  ]);
+}
+
+function nonSettlingCancelStream(chunks: Uint8Array[] = []): {
+  stream: ReadableStream<Uint8Array>;
+  cancelCalls(): number;
+} {
+  let calls = 0;
+  return {
+    stream: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+      },
+      cancel() {
+        calls++;
+        return new Promise<void>(() => undefined);
+      },
+    }),
+    cancelCalls: () => calls,
+  };
+}
+
 describe("DirectResponsesClient", () => {
   it("marks FETCH_STARTING before fetch and streams complete SSE events", async () => {
     const order: string[] = [];
@@ -58,27 +90,31 @@ describe("DirectResponsesClient", () => {
       apiKey: secret("api-secret"),
       fetch: async (_url, init) => {
         order.push("fetch");
-        bodies.push(JSON.parse(String(init?.body)));
+        expect(init?.body).toBe(body);
+        bodies.push(JSON.parse(new TextDecoder().decode(init?.body as Uint8Array)));
         expect(new Headers(init?.headers).get("authorization")).toBe("Bearer api-secret");
         return completeSse();
       },
     });
     const events: SseFrame[] = [];
+    let spooledBytes = 0;
     const body = new TextEncoder().encode(JSON.stringify({
       model: "gpt-5.6-sol",
       input: "hello",
-      stream: false,
+      stream: true,
       reasoning: { effort: "max", mode: "pro" },
       service_tier: "fast",
     }));
 
     const terminal = await client.execute({
       body,
+      bodyIsCanonicalStream: true,
       beforeFetch: async () => { order.push("fetch_starting"); },
       onPrelude: async prelude => {
         expect(prelude).toMatchObject({ status: 200, contentType: "text/event-stream" });
         order.push("prelude");
       },
+      onTranscriptBytes: async bytes => { spooledBytes += bytes.byteLength; },
       onEvent: async event => { events.push(event); },
     });
 
@@ -93,15 +129,16 @@ describe("DirectResponsesClient", () => {
     expect(events.map(event => event.event)).toEqual([
       "response.created",
       "response.output_text.delta",
-      "response.completed",
     ]);
+    expect(terminal.event?.event).toBe("response.completed");
     expect(terminal).toMatchObject({
       responseId: "resp_1",
       status: "completed",
       final: FINAL,
       eventCount: 3,
     });
-    expect(terminal.transcriptBytes.byteLength).toBe(terminal.byteCount);
+    expect(spooledBytes).toBe(terminal.byteCount);
+    expect("transcriptBytes" in terminal).toBe(false);
   });
 
   it("classifies a transport exception after FETCH_STARTING as ambiguous", async () => {
@@ -335,6 +372,48 @@ describe("DirectResponsesClient", () => {
     expect(calls).toBe(0);
   });
 
+  it("does not await a non-settling body cancel for an invalid content type", async () => {
+    const source = nonSettlingCancelStream();
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(source.stream, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "invalid content type waited for non-settling cancel");
+    expect(error).toMatchObject({ ambiguous: true, code: "content_type" });
+    expect(source.cancelCalls()).toBe(1);
+  });
+
+  it("does not await a non-settling body cancel after prelude failure", async () => {
+    const source = nonSettlingCancelStream();
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(source.stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => { throw new Error("journal failed"); },
+      onEvent: async () => {},
+    }), "prelude failure waited for non-settling cancel");
+    expect(error).toMatchObject({ ambiguous: true, code: "prelude" });
+    expect(source.cancelCalls()).toBe(1);
+  });
+
   it("propagates an R2 election loss without wrapping it as a provider outcome", async () => {
     let calls = 0;
     const client = new DirectResponsesClient({
@@ -382,6 +461,37 @@ describe("DirectResponsesClient", () => {
     }
   });
 
+  it("clears the total error-body deadline after an early body completion", async () => {
+    let clearedTimers = 0;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      httpErrorReadTimeoutMs: 5_000,
+      fetch: async () => Response.json({
+        error: { message: "bad request", type: "invalid_request_error" },
+      }, { status: 400 }),
+    });
+
+    globalThis.clearTimeout = ((timer?: ReturnType<typeof setTimeout>) => {
+      clearedTimers++;
+      return originalClearTimeout(timer);
+    }) as typeof clearTimeout;
+    let error: unknown;
+    try {
+      error = await rejectionBeforeCancelTimeout(client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      }), "completed HTTP error body retained its deadline timer");
+    } finally {
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+    expect(error).toMatchObject({ ambiguous: false, status: 400 });
+    expect(clearedTimers).toBeGreaterThan(0);
+  });
+
   it("keeps a known HTTP failure definitive when its error body cannot be read", async () => {
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",
@@ -413,6 +523,170 @@ describe("DirectResponsesClient", () => {
         },
       },
     });
+  });
+
+  it("does not await a non-settling error-body cancel after an oversized first chunk", async () => {
+    const source = nonSettlingCancelStream([new Uint8Array(64 * 1024 + 1).fill(0x78)]);
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(source.stream, { status: 502 }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "oversized HTTP error body waited for non-settling cancel");
+    expect(error).toMatchObject({ ambiguous: false, status: 502 });
+    expect(source.cancelCalls()).toBe(1);
+  });
+
+  it("does not await a non-settling error-body cancel after the exact byte cap", async () => {
+    const source = nonSettlingCancelStream([
+      new Uint8Array(64 * 1024).fill(0x78),
+      Uint8Array.of(0x79),
+    ]);
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(source.stream, { status: 502 }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "capped HTTP error body waited for non-settling cancel");
+    expect(error).toMatchObject({ ambiguous: false, status: 502 });
+    expect(source.cancelCalls()).toBe(1);
+  });
+
+  it("bounds an HTTP error body that never yields and preserves definitive retry headers", async () => {
+    const source = nonSettlingCancelStream();
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      httpErrorReadTimeoutMs: 20,
+      fetch: async () => new Response(source.stream, {
+        status: 429,
+        headers: {
+          "retry-after": "0.25",
+          "x-ratelimit-limit-tokens": "40000000",
+          "x-ratelimit-remaining-tokens": "0",
+          "x-request-id": "req_never_yields",
+        },
+      }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "never-yielding HTTP error body exceeded its total deadline");
+    expect(error).toMatchObject({
+      ambiguous: false,
+      status: 429,
+      message: "Upstream Responses request failed (429)",
+      rateLimit: {
+        retryAfterMs: 250,
+        limitTokens: 40_000_000,
+        remainingTokens: 0,
+      },
+      providerError: {
+        origin: "http",
+        status: 429,
+        upstreamRequestId: "req_never_yields",
+        headers: {
+          "retry-after": "0.25",
+          "x-ratelimit-limit-tokens": "40000000",
+          "x-ratelimit-remaining-tokens": "0",
+        },
+      },
+    });
+    expect(source.cancelCalls()).toBe(1);
+  });
+
+  it("uses one total deadline while an HTTP error body keeps yielding slow chunks", async () => {
+    let chunks = 0;
+    let cancelCalls = 0;
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        interval = setInterval(() => {
+          chunks++;
+          controller.enqueue(Uint8Array.of(0x78));
+        }, 2);
+      },
+      cancel() {
+        cancelCalls++;
+        if (interval !== null) clearInterval(interval);
+        interval = null;
+        return new Promise<void>(() => undefined);
+      },
+    });
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      httpErrorReadTimeoutMs: 40,
+      fetch: async () => new Response(stream, {
+        status: 503,
+        headers: {
+          "retry-after": "0.4",
+          "x-request-id": "req_slow_error",
+        },
+      }),
+    });
+
+    let error: unknown;
+    try {
+      error = await rejectionBeforeCancelTimeout(client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      }), "slow HTTP error chunks reset the total deadline");
+    } finally {
+      if (interval !== null) clearInterval(interval);
+    }
+    expect(chunks).toBeGreaterThan(0);
+    expect(cancelCalls).toBe(1);
+    expect(error).toMatchObject({
+      ambiguous: false,
+      status: 503,
+      message: "Upstream Responses request failed (503)",
+      providerError: {
+        origin: "http",
+        status: 503,
+        upstreamRequestId: "req_slow_error",
+        headers: { "retry-after": "0.4" },
+      },
+    });
+  });
+
+  it("stops a definitive HTTP error-body read when the request signal aborts", async () => {
+    const source = nonSettlingCancelStream();
+    const abort = new AbortController();
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      httpErrorReadTimeoutMs: 5_000,
+      fetch: async () => new Response(source.stream, { status: 502 }),
+    });
+    abort.abort(new DOMException("request ended", "AbortError"));
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      signal: abort.signal,
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "aborted HTTP error-body read waited for its deadline");
+    expect(error).toMatchObject({ ambiguous: false, status: 502 });
+    expect(source.cancelCalls()).toBe(1);
   });
 
   it("captures TPM headers from a 429 for observation-only host telemetry", async () => {
@@ -565,5 +839,28 @@ describe("DirectResponsesClient", () => {
       onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({ ambiguous: true, code: "event_too_large" });
+  });
+
+  it("does not await a non-settling reader cancel after a parser failure", async () => {
+    const source = nonSettlingCancelStream([
+      new TextEncoder().encode("event: .invalid\ndata: x\n\n"),
+    ]);
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(source.stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+
+    const error = await rejectionBeforeCancelTimeout(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    }), "parser failure waited for non-settling cancel");
+    expect(error).toMatchObject({ ambiguous: true, code: "invalid_event" });
+    expect(source.cancelCalls()).toBe(1);
   });
 });

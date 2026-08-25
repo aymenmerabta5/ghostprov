@@ -22,6 +22,14 @@ import type {
 } from "../src/v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../src/v2/protocol/validate";
 import { V2TransportSession } from "../src/v2/transport/session";
+import { AdmissionController } from "../src/v2/sidecar/admission";
+import { RequestAssembler } from "../src/v2/sidecar/assembler";
+import { SidecarEngine } from "../src/v2/sidecar/engine";
+import { ClaimJournal } from "../src/v2/sidecar/journal";
+import {
+  FakeSidecarStorage,
+  completedUpstream,
+} from "./support/fake-v2-sidecar";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
@@ -93,6 +101,7 @@ class HubProvider implements AwarenessProviderLike, DenoAwarenessProviderLike {
 class AwarenessHub {
   readonly providers = new Set<HubProvider>();
   readonly bytesByLabel = new Map<string, number>();
+  dropBroadcast?: (source: HubProvider) => boolean;
 
   create(doc: Y.Doc, label: string): HubProvider {
     return new HubProvider(this, doc, label);
@@ -112,6 +121,7 @@ class AwarenessHub {
 
   broadcast(source: HubProvider, clientIds: readonly number[]): void {
     if (clientIds.length === 0) return;
+    if (this.dropBroadcast?.(source)) return;
     const update = encodeAwarenessUpdate(source.awareness, [...clientIds]);
     this.bytesByLabel.set(
       source.label,
@@ -237,4 +247,257 @@ describe("V2 split-flight production components", () => {
       await peer.close();
     }
   });
+
+  it("recovers a persisted terminal across two real R2 launches without another fetch", async () => {
+    const hub = new AwarenessHub();
+    const ySweet = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret",
+      authorization: "full",
+    });
+    const oldBinding: ProtocolBinding = {
+      protocolRevision: "r2",
+      launchNonce: "launch-recovery-source",
+      projectId: PROJECT,
+      sessionId: "same-persisted-sandbox-session",
+      leaderGeneration: 9,
+      buildHash: "c".repeat(64),
+      schemaHash: "d".repeat(64),
+    };
+    const newBinding: ProtocolBinding = {
+      ...oldBinding,
+      launchNonce: "launch-recovery-target",
+    };
+    const storage = new FakeSidecarStorage([]);
+    let upstreamCalls = 0;
+    let droppedTerminalFlights = 0;
+    const newSidecarFlights: string[][] = [];
+    let releaseAfterPrefix!: () => void;
+    const afterPrefix = new Promise<void>(resolve => { releaseAfterPrefix = resolve; });
+    let prefixProduced!: () => void;
+    const prefixProduction = new Promise<void>(resolve => { prefixProduced = resolve; });
+    hub.dropBroadcast = source => {
+      const frames = source.awareness.getLocalState()?.ghostprovV2Data?.frames ?? [];
+      if (source.label === "sidecar-new-data" && frames.length > 0) {
+        newSidecarFlights.push(frames.map((frame: SidecarFrame) => frame.kind));
+      }
+      if (source.label !== "sidecar-old-data") return false;
+      const drop = frames.some((frame: SidecarFrame) => frame.kind === "response_terminal");
+      if (drop) droppedTerminalFlights++;
+      return drop;
+    };
+
+    const createHost = (
+      binding: ProtocolBinding,
+      label: string,
+      sidecarInstanceId: string,
+    ) => {
+      const lane = (
+        lane: "data" | "control",
+        field: "ghostprovV2Data" | "ghostprovV2Control",
+      ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+        envelope: ySweet,
+        localPeerId: `${label}:${lane}`,
+        field,
+        parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+        providerFactory: doc => hub.create(doc, `${label}-${lane}`),
+        syncTimeoutMs: 100,
+      });
+      return new V2TransportSession({
+        binding,
+        channel: new SplitAwarenessChannel({
+          data: lane("data", "ghostprovV2Data"),
+          control: lane("control", "ghostprovV2Control"),
+        }),
+        expectedSidecarInstanceId: sidecarInstanceId,
+        maxResponseBytes: 2 * 1024 * 1024,
+        publicationIntervalMs: 1,
+        retransmitMs: 50,
+      });
+    };
+    const createSidecar = (
+      binding: ProtocolBinding,
+      label: string,
+      instanceId: string,
+      journal: ClaimJournal,
+      admission: AdmissionController,
+    ) => {
+      let peer!: DenoAwarenessPeer;
+      const engine = new SidecarEngine({
+        binding,
+        assembler: new RequestAssembler({ maxReservedBytes: 16 * 1024 * 1024 }),
+        journal,
+        admission,
+        upstream: {
+          execute: async input => {
+            const call = ++upstreamCalls;
+            await input.beforeFetch();
+            await input.onPrelude?.({
+              status: 200,
+              contentType: "text/event-stream",
+              upstreamRequestId: `upstream-${upstreamCalls}`,
+            });
+            let emitted = 0;
+            return completedUpstream({
+              ...input,
+              beforeFetch: async () => undefined,
+              onEvent: async event => {
+                await input.onEvent(event);
+                emitted++;
+                if (call === 1 && emitted === 1) {
+                  prefixProduced();
+                  await afterPrefix;
+                }
+              },
+            }, "persisted recovery");
+          },
+        },
+        assertExecutionFence: frame => peer.assertExecutionFence(frame),
+        emit: (frame, priority, streamId) => peer.enqueue(frame, priority, streamId),
+      });
+      peer = new DenoAwarenessPeer({
+        credential: {
+          url: ySweet.url,
+          baseUrl: ySweet.baseUrl,
+          docId: ySweet.docId,
+          token: ySweet.token.reveal(),
+          authorization: "full",
+          rotationKey: createCredentialRotationKey(),
+        },
+        binding,
+        instanceId,
+        engine,
+        providerFactory: (doc, _credential, lane) => hub.create(doc, `${label}-${lane}`),
+        publicationIntervalMs: 1,
+        retransmitMs: 50,
+        connectTimeoutMs: 100,
+        initialActivePerSandbox: 1,
+        maxActivePerSandbox: 1,
+      });
+      return { engine, peer };
+    };
+
+    const journal1 = new ClaimJournal({ storage, flushIntervalMs: 0, maxBatch: 32 });
+    const admission1 = new AdmissionController({
+      physicalMax: 1,
+      acceptedMax: 2,
+      hostCeiling: 1,
+      memoryBudgetBytes: 16 * 1024 * 1024,
+    });
+    const sidecar1 = createSidecar(
+      oldBinding,
+      "sidecar-old",
+      "sidecar-persisted-old",
+      journal1,
+      admission1,
+    );
+    const host1 = createHost(oldBinding, "host-old", "sidecar-persisted-old");
+    let host2: V2TransportSession | null = null;
+    let sidecar2: ReturnType<typeof createSidecar> | null = null;
+    let journal2: ClaimJournal | null = null;
+    let admission2: AdmissionController | null = null;
+
+    try {
+      await sidecar1.engine.start();
+      await sidecar1.peer.connect();
+      await host1.connect();
+      await waitFor(() => host1.snapshot().credits > 0);
+      const handle = await host1.run({
+        model: "gpt-5.6-sol",
+        input: "recover persisted terminal",
+        stream: true,
+      });
+      const iterator = handle.events();
+      await prefixProduction;
+      const prefix = await Promise.race([
+        iterator.next(),
+        Bun.sleep(2_000).then(() => { throw new Error("source prefix timed out"); }),
+      ]);
+      expect(prefix).toMatchObject({
+        done: false,
+        value: { event: "response.created" },
+      });
+      await waitFor(() => {
+        const provider = [...hub.providers].find(value => value.label === "sidecar-old-data");
+        return (provider?.awareness.getLocalState()?.ghostprovV2Data?.frames?.length ?? 0) === 0;
+      });
+      releaseAfterPrefix();
+      await waitFor(() => droppedTerminalFlights > 0 && storage.terminals.size === 1);
+      expect(upstreamCalls).toBe(1);
+      expect(storage.terminals.size).toBe(1);
+      expect(await Promise.race([
+        handle.final.then(() => "settled" as const, () => "settled" as const),
+        Promise.resolve("pending" as const),
+      ])).toBe("pending");
+
+      const capsule = await host1.suspendSidecarRecovery("real-two-launch");
+      await sidecar1.peer.close();
+      admission1.close();
+      await journal1.close();
+
+      journal2 = new ClaimJournal({ storage, flushIntervalMs: 0, maxBatch: 32 });
+      admission2 = new AdmissionController({
+        physicalMax: 1,
+        acceptedMax: 2,
+        hostCeiling: 1,
+        memoryBudgetBytes: 16 * 1024 * 1024,
+      });
+      sidecar2 = createSidecar(
+        newBinding,
+        "sidecar-new",
+        "sidecar-persisted-new",
+        journal2,
+        admission2,
+      );
+      host2 = createHost(newBinding, "host-new", "sidecar-persisted-new");
+      await sidecar2.engine.start();
+      await sidecar2.peer.connect();
+      const barrier = host2.adoptRecoveredSidecar(capsule);
+      await host2.connect();
+      const recoveredDelta = await Promise.race([
+        iterator.next(),
+        Bun.sleep(5_000).then(() => { throw new Error("recovered delta timed out"); }),
+      ]);
+      const recoveredCompleted = await Promise.race([
+        iterator.next(),
+        Bun.sleep(5_000).then(() => { throw new Error("recovered completion timed out"); }),
+      ]);
+      expect(recoveredDelta).toMatchObject({
+        done: false,
+        value: { event: "response.output_text.delta" },
+      });
+      expect(recoveredCompleted).toMatchObject({
+        done: false,
+        value: { event: "response.completed" },
+      });
+      expect(await iterator.next()).toMatchObject({ done: true });
+      await expect(handle.final).resolves.toMatchObject({ status: "completed" });
+      await Promise.race([
+        barrier,
+        Bun.sleep(5_000).then(() => { throw new Error("real recovery barrier timed out"); }),
+      ]);
+
+      expect(upstreamCalls).toBe(1);
+      expect(storage.terminals.size).toBe(0);
+      expect(journal2.status(storage.records[0]!.requestId)).toBe("acked");
+      const terminalFlight = newSidecarFlights.findIndex(kinds => kinds.includes("response_terminal"));
+      const markerFlight = newSidecarFlights.findIndex(kinds => kinds.includes("recovery_complete"));
+      expect(terminalFlight).toBeGreaterThanOrEqual(0);
+      expect(markerFlight).toBeGreaterThan(terminalFlight);
+      expect(newSidecarFlights[terminalFlight]).not.toContain("recovery_complete");
+      expect(newSidecarFlights[markerFlight]).not.toContain("response_terminal");
+    } finally {
+      releaseAfterPrefix?.();
+      await host2?.close().catch(() => undefined);
+      await sidecar2?.peer.close().catch(() => undefined);
+      admission2?.close();
+      await journal2?.close().catch(() => undefined);
+      await host1.close().catch(() => undefined);
+      await sidecar1.peer.close().catch(() => undefined);
+      admission1.close();
+      await journal1.close().catch(() => undefined);
+    }
+  }, 15_000);
 });

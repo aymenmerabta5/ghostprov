@@ -19,6 +19,7 @@ export interface SidecarOwnershipProof {
   readonly nonce: string;
   assertOwned(): Promise<void>;
   withOwnership<T>(operation: () => Promise<T>): Promise<T>;
+  promoteProcessIdentity(launchNonce: string, processStart: string): Promise<void>;
 }
 
 export interface SidecarOwnershipHandle {
@@ -35,6 +36,12 @@ export interface SidecarOwnershipBackend {
   now(): number;
   uuid(): string;
   open(root: string, path: string): Promise<SidecarOwnershipHandle>;
+  promoteProcessIdentity(
+    root: string,
+    launchNonce: string,
+    pid: number,
+    processStart: string,
+  ): Promise<void>;
 }
 
 interface OwnerRecord {
@@ -86,6 +93,10 @@ class DenoOwnershipHandle implements SidecarOwnershipHandle {
 
   static async open(root: string, path: string): Promise<DenoOwnershipHandle> {
     await Deno.mkdir(root, { recursive: true, mode: 0o700 });
+    const rootInfo = await Deno.lstat(root);
+    if (!rootInfo.isDirectory || rootInfo.isSymlink) {
+      throw new Error("ownership root must be a real directory");
+    }
     await Deno.chmod(root, 0o700);
     let file: Deno.FsFile;
     try {
@@ -172,7 +183,41 @@ function denoBackend(): SidecarOwnershipBackend {
     now: () => Date.now(),
     uuid: () => crypto.randomUUID(),
     open: (root, path) => DenoOwnershipHandle.open(root, path),
+    promoteProcessIdentity: promoteDenoProcessIdentity,
   };
+}
+
+async function promoteDenoProcessIdentity(
+  root: string,
+  launchNonce: string,
+  pid: number,
+  processStart: string,
+): Promise<void> {
+  const candidate = `${root}/sidecar.pid.${launchNonce}.${pid}.candidate`;
+  const canonical = `${root}/sidecar.pid`;
+  const info = await Deno.lstat(candidate);
+  if (!info.isFile || info.isSymlink || info.size < 1 || info.size > 512) {
+    throw new Error("sidecar candidate process identity is invalid");
+  }
+  const record = await Deno.readTextFile(candidate);
+  const match = /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\n$/.exec(record);
+  if (!match || Number(match[1]) !== pid || match[2] !== launchNonce) {
+    throw new Error("sidecar candidate process identity does not match this launch");
+  }
+  if (!/^\d+$/.test(processStart) || match[3] !== processStart) {
+    throw new Error("sidecar candidate process start identity is stale");
+  }
+  await Deno.rename(candidate, canonical);
+  await Deno.chmod(canonical, 0o600);
+  const file = await Deno.open(canonical, { read: true });
+  try {
+    await file.syncData();
+  } finally {
+    file.close();
+  }
+  if (await Deno.readTextFile(canonical) !== record) {
+    throw new Error("sidecar process identity promotion did not persist exactly");
+  }
 }
 
 export class DenoSidecarOwnershipLease implements SidecarOwnershipProof {
@@ -180,20 +225,27 @@ export class DenoSidecarOwnershipLease implements SidecarOwnershipProof {
   readonly nonce: string;
   readonly #record: OwnerRecord;
   readonly #handle: SidecarOwnershipHandle;
+  readonly #root: string;
+  readonly #backend: SidecarOwnershipBackend;
   #operationTail: Promise<void> = Promise.resolve();
   #acceptingOperations = true;
   #released = false;
+  #releasePromise: Promise<void> | null = null;
 
   private constructor(
     instanceId: string,
     nonce: string,
     record: OwnerRecord,
     handle: SidecarOwnershipHandle,
+    root: string,
+    backend: SidecarOwnershipBackend,
   ) {
     this.instanceId = instanceId;
     this.nonce = nonce;
     this.#record = record;
     this.#handle = handle;
+    this.#root = root;
+    this.#backend = backend;
   }
 
   static async acquire(options: {
@@ -234,6 +286,8 @@ export class DenoSidecarOwnershipLease implements SidecarOwnershipProof {
         nonce,
         record,
         handle,
+        root,
+        backend,
       );
       await lease.assertOwned();
       return lease;
@@ -247,6 +301,27 @@ export class DenoSidecarOwnershipLease implements SidecarOwnershipProof {
 
   async assertOwned(): Promise<void> {
     await this.withOwnership(async () => undefined);
+  }
+
+  async promoteProcessIdentity(launchNonce: string, processStart: string): Promise<void> {
+    if (!SAFE_INSTANCE.test(launchNonce) || !/^\d+$/.test(processStart)) {
+      throw new TypeError("sidecar launch nonce is invalid");
+    }
+    try {
+      await this.withOwnership(() => this.#backend.promoteProcessIdentity(
+        this.#root,
+        launchNonce,
+        this.#record.pid,
+        processStart,
+      ));
+    } catch (cause) {
+      if (cause instanceof SidecarOwnershipError) throw cause;
+      throw new SidecarOwnershipError(
+        "Unable to promote the owned sidecar process identity",
+        "storage",
+        { cause },
+      );
+    }
   }
 
   async withOwnership<T>(operation: () => Promise<T>): Promise<T> {
@@ -301,8 +376,14 @@ export class DenoSidecarOwnershipLease implements SidecarOwnershipProof {
     }
   }
 
-  async release(): Promise<void> {
-    if (this.#released) return;
+  release(): Promise<void> {
+    if (this.#releasePromise) return this.#releasePromise;
+    const releasing = this.#releaseOnce();
+    this.#releasePromise = releasing;
+    return releasing;
+  }
+
+  async #releaseOnce(): Promise<void> {
     this.#acceptingOperations = false;
     await this.#operationTail.catch(() => undefined);
     this.#released = true;

@@ -9,13 +9,15 @@ import {
 } from "./compat";
 import { executeImageBatch, type ImageRelayStarter } from "./service";
 import type { IncomingResourceLease } from "../router/router";
-import { takeIncomingBodyLease } from "../http/request-lease";
+import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
+import { permittedJsonResponse } from "../http/permitted-json";
 
 export interface ImageRouteDependencies {
   options: ImageCompatOptions;
   startRelay: (
     body: Record<string, unknown>,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    clientId: string,
     incomingLease?: IncomingResourceLease,
   ) => ReturnType<ImageRelayStarter>;
 }
@@ -23,15 +25,17 @@ export interface ImageRouteDependencies {
 function relayStarterForRequest(
   dependencies: ImageRouteDependencies,
   env: unknown,
+  explicitClientId?: string,
 ): ImageRelayStarter {
   let incomingLease = takeIncomingBodyLease(env);
+  const clientId = resolveHttpClientId(env, explicitClientId);
   return (body, signal) => {
     // Promise.all invokes each mapper synchronously up to this call. Clearing
     // before dispatch makes exactly one fan-out job the handoff owner even
     // when all relay promises are pending concurrently.
     const handoff = incomingLease;
     incomingLease = undefined;
-    return dependencies.startRelay(body, signal, handoff);
+    return dependencies.startRelay(body, signal, clientId, handoff);
   };
 }
 
@@ -63,10 +67,14 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
       const bodies = buildGenerationBodies(parsed);
       const response = await executeImageBatch(
         bodies,
-        relayStarterForRequest(dependencies, c.env),
+        relayStarterForRequest(
+          dependencies,
+          c.env,
+          c.req.header("x-ghostprov-client-id"),
+        ),
         c.req.raw.signal,
       );
-      return c.json(response);
+      return permittedJsonResponse(response, { owners: response.data });
     } catch (error) {
       return apiErrorResponse(error);
     }
@@ -84,10 +92,14 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
       const bodies = buildEditBodies(parsed);
       const response = await executeImageBatch(
         bodies,
-        relayStarterForRequest(dependencies, c.env),
+        relayStarterForRequest(
+          dependencies,
+          c.env,
+          c.req.header("x-ghostprov-client-id"),
+        ),
         c.req.raw.signal,
       );
-      return c.json(response);
+      return permittedJsonResponse(response, { owners: response.data });
     } catch (error) {
       return apiErrorResponse(error);
     }

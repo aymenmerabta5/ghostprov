@@ -7,6 +7,7 @@ import {
 import type { RunHandle } from "../src/relay/run-handle";
 import type { SseFrame } from "../src/relay/sse";
 import { ApiError } from "../src/http/errors";
+import { resolveHttpClientId } from "../src/http/request-lease";
 import {
   anthropicModelsFromEnv,
   type AnthropicModelOptions,
@@ -233,15 +234,25 @@ describe("Anthropic HTTP routes", () => {
     expect(betaBody).not.toHaveProperty("diagnostics");
     requestId(beta);
     expect(router.calls).toHaveLength(2);
-    expect(router.calls.map(call => ({
+    const calls = router.calls.map(call => ({
       source: call.options.source,
       clientId: call.options.clientId,
       model: call.body.model,
       stream: call.body.stream,
-    }))).toEqual([
-      { source: "anthropic", clientId: "http", model: "custom-sonnet", stream: false },
-      { source: "anthropic", clientId: "claude-session", model: "custom-opus", stream: false },
-    ]);
+    }));
+    expect(calls[0]).toMatchObject({
+      source: "anthropic",
+      model: "custom-sonnet",
+      stream: false,
+    });
+    expect(calls[0]!.clientId).toMatch(/^http-request-\d{4}$/);
+    expect(calls[1]).toEqual({
+      source: "anthropic",
+      clientId: resolveHttpClientId({}, "claude-session"),
+      model: "custom-opus",
+      stream: false,
+    });
+    expect(calls[1]!.clientId).not.toContain("claude-session");
   });
 
   it("counts stable and beta requests without dispatching a relay", async () => {

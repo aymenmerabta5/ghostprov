@@ -5,9 +5,15 @@ import { normalizeApiError } from "../http/errors";
 import {
   PreviousResponseNotFoundError,
   ResponseGraph,
+  ResponseGraphCapacityError,
+  releaseResponseGraphMaterialization,
   type ResponseCreateEvent,
 } from "./response-graph";
 import type { WebSocketTelemetry } from "./telemetry";
+import {
+  releaseAtomicBytePermit,
+  transferAtomicBytePermit,
+} from "../v2/memory/permit-carrier";
 
 const MiB = 1024 * 1024;
 const DEFAULT_MAX_PENDING_REQUESTS = 128;
@@ -20,16 +26,19 @@ const SOCKET_POLL_MS = 5;
 export interface WebSocketProcessBudgetOptions {
   maxSessions: number;
   maxQueuedBytes: number;
+  maxIngressBytes?: number;
 }
 
 export interface WebSocketProcessBudgetSnapshot {
   sessions: number;
   queuedBytes: number;
+  ingressReservedBytes: number;
   maxSessions: number;
   maxQueuedBytes: number;
+  maxIngressBytes: number;
 }
 
-interface WebSocketProcessLease {
+export interface WebSocketProcessLease {
   canReserve(bytes: number): boolean;
   tryReserve(bytes: number): boolean;
   release(bytes: number): void;
@@ -40,8 +49,10 @@ interface WebSocketProcessLease {
 export class WebSocketProcessBudget {
   readonly #maxSessions: number;
   readonly #maxQueuedBytes: number;
+  readonly #maxIngressBytes: number;
   #sessions = 0;
   #queuedBytes = 0;
+  #ingressReservedBytes = 0;
 
   constructor(options: WebSocketProcessBudgetOptions) {
     this.#maxSessions = positiveInteger(options.maxSessions, "maxSessions");
@@ -49,33 +60,49 @@ export class WebSocketProcessBudget {
       options.maxQueuedBytes,
       "maxQueuedBytes",
     );
+    this.#maxIngressBytes = positiveInteger(
+      options.maxIngressBytes ?? options.maxQueuedBytes,
+      "maxIngressBytes",
+    );
   }
 
-  openSession(): WebSocketProcessLease | null {
-    if (this.#sessions >= this.#maxSessions) return null;
+  openSession(ingressReservationBytes = 0): WebSocketProcessLease | null {
+    if (
+      !Number.isSafeInteger(ingressReservationBytes) ||
+      ingressReservationBytes < 0
+    ) throw new RangeError("ingressReservationBytes must be a non-negative safe integer");
+    if (
+      this.#sessions >= this.#maxSessions ||
+      this.#ingressReservedBytes + ingressReservationBytes > this.#maxIngressBytes
+    ) return null;
     this.#sessions++;
+    this.#ingressReservedBytes += ingressReservationBytes;
     let closed = false;
-    let reserved = 0;
+    let dynamicReserved = 0;
     return {
       canReserve: bytes => !closed && this.#canReserve(bytes),
       tryReserve: bytes => {
         if (closed || !this.#canReserve(bytes)) return false;
         const value = Math.max(0, Math.floor(bytes));
-        reserved += value;
+        dynamicReserved += value;
         this.#queuedBytes += value;
         return true;
       },
       release: bytes => {
         if (closed) return;
-        const value = Math.min(reserved, Math.max(0, Math.floor(bytes)));
-        reserved -= value;
+        const value = Math.min(dynamicReserved, Math.max(0, Math.floor(bytes)));
+        dynamicReserved -= value;
         this.#queuedBytes = Math.max(0, this.#queuedBytes - value);
       },
       close: () => {
         if (closed) return;
         closed = true;
-        this.#queuedBytes = Math.max(0, this.#queuedBytes - reserved);
-        reserved = 0;
+        this.#queuedBytes = Math.max(0, this.#queuedBytes - dynamicReserved);
+        this.#ingressReservedBytes = Math.max(
+          0,
+          this.#ingressReservedBytes - ingressReservationBytes,
+        );
+        dynamicReserved = 0;
         this.#sessions = Math.max(0, this.#sessions - 1);
       },
     };
@@ -85,8 +112,10 @@ export class WebSocketProcessBudget {
     return {
       sessions: this.#sessions,
       queuedBytes: this.#queuedBytes,
+      ingressReservedBytes: this.#ingressReservedBytes,
       maxSessions: this.#maxSessions,
       maxQueuedBytes: this.#maxQueuedBytes,
+      maxIngressBytes: this.#maxIngressBytes,
     };
   }
 
@@ -98,7 +127,7 @@ export class WebSocketProcessBudget {
 
 export type WebSocketRelayStarter = (
   body: Record<string, unknown>,
-  options: { signal: AbortSignal; clientId: string },
+  options: { signal: AbortSignal; clientId: string; encodedBodyBytes?: number },
 ) => Promise<RunHandle>;
 
 export interface ResponsesWebSocketSessionOptions {
@@ -121,6 +150,12 @@ export interface ResponsesWebSocketSessionOptions {
   clientId?: string;
   /** Shared process-level session and retained-byte fence. */
   processBudget?: WebSocketProcessBudget;
+  /** Pre-opened by the upgrade path before `ws` can assemble its first frame. */
+  processLease?: WebSocketProcessLease;
+  /** Direct-session test/integration fallback; server paths pass processLease. */
+  parserReservationBytes?: number;
+  /** Server-owned idle timer hook; not part of the public Responses contract. */
+  onActivity?: () => void;
   graph?: ResponseGraph;
   telemetry?: WebSocketTelemetry;
 }
@@ -344,6 +379,7 @@ export class ResponsesWebSocketSession {
   readonly #telemetry?: WebSocketTelemetry;
   readonly #socket: WebSocket;
   readonly #processLease: WebSocketProcessLease | null;
+  readonly #onActivity?: () => void;
   #activeSend: PendingSend | null = null;
   #pendingRequests = 0;
   #pendingRequestBytes = 0;
@@ -358,6 +394,7 @@ export class ResponsesWebSocketSession {
   ) {
     this.#socket = socket;
     this.#startRelay = options.startRelay;
+    this.#onActivity = options.onActivity;
     this.#maxNamedStreams = positiveInteger(
       options.maxNamedStreams ?? config.wsNamedStreams,
       "maxNamedStreams",
@@ -400,8 +437,10 @@ export class ResponsesWebSocketSession {
       this.#maxPendingRequests,
       this.#maxPendingRequestBytes,
     );
-    this.#processLease = options.processBudget?.openSession() ?? null;
-    if (options.processBudget && !this.#processLease) {
+    this.#processLease = options.processLease ??
+      options.processBudget?.openSession(options.parserReservationBytes ?? 0) ??
+      null;
+    if ((options.processLease || options.processBudget) && !this.#processLease) {
       throw new WebSocketSessionCapacityError(
         "GhostProv WebSocket session capacity is temporarily exhausted",
       );
@@ -412,6 +451,7 @@ export class ResponsesWebSocketSession {
 
   receive(raw: string, rawBytes = Buffer.byteLength(raw)): void {
     if (this.#closed) return;
+    this.#onActivity?.();
     let event: ResponseCreateEvent;
     try {
       event = JSON.parse(raw);
@@ -474,6 +514,12 @@ export class ResponsesWebSocketSession {
     ));
   }
 
+  isIdle(): boolean {
+    return this.#pendingRequests === 0 &&
+      this.#pendingSends === 0 &&
+      this.#controllers.size === 0;
+  }
+
   #validate(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return errorEvent("invalid_request", "Client event must be a JSON object");
@@ -527,6 +573,8 @@ export class ResponsesWebSocketSession {
     requestBytes: number,
   ): Promise<void> {
     let release: (() => void) | undefined;
+    let handle: RunHandle | undefined;
+    let finalObserved = false;
     let requestReleased = false;
     const releaseRequest = () => {
       if (requestReleased) return;
@@ -542,10 +590,28 @@ export class ResponsesWebSocketSession {
         return;
       }
       const resolved = this.#graph.resolve(event);
-      const handle = await this.#startRelay(resolved.relayBody, {
-        signal: controller.signal,
-        clientId: this.#clientId,
-      });
+      const relayBody = resolved.relayBody;
+      try {
+        handle = await this.#startRelay(relayBody, {
+          signal: controller.signal,
+          clientId: this.#clientId,
+          // A normal response.create envelope is at least as large as relayBody.
+          // Local continuations materialize graph history, so they intentionally
+          // fall back to structural sizing instead of under-accounting it.
+          encodedBodyBytes: event.store === false && event.previous_response_id
+            ? undefined
+            : requestBytes,
+        });
+      } finally {
+        // Router/transport preparation has taken ownership of its encoded
+        // request by this boundary; the large reconstructed lineage can drop.
+        releaseResponseGraphMaterialization(relayBody);
+        // Retain only the tiny field needed by graph.record; the reconstructed
+        // lineage is now owned by router/transport preparation, not the session.
+        resolved.relayBody = typeof relayBody.model === "string"
+          ? { model: relayBody.model }
+          : {};
+      }
       let sawTerminal = false;
       for await (const frame of handle.events()) {
         const outbound = this.#graph.sanitizeOutbound(
@@ -561,17 +627,26 @@ export class ResponsesWebSocketSession {
         ) {
           sawTerminal = true;
         }
+        transferAtomicBytePermit(frame, outbound, "websocket-outbound");
         await this.#send(outbound);
       }
       const final = await handle.final;
-      if (this.#closed || controller.signal.aborted) return;
-      this.#graph.record(resolved, final);
-      if (!sawTerminal) {
-        await this.#send(this.#graph.sanitizeOutbound({
-          type: "response.completed",
-          response: final,
-          ...(event.stream_id ? { stream_id: event.stream_id } : {}),
-        }, resolved));
+      finalObserved = true;
+      try {
+        if (this.#closed || controller.signal.aborted) return;
+        this.#graph.record(resolved, final);
+        if (!sawTerminal) {
+          const outbound = this.#graph.sanitizeOutbound({
+            type: "response.completed",
+            response: final,
+            ...(event.stream_id ? { stream_id: event.stream_id } : {}),
+          }, resolved);
+          transferAtomicBytePermit(final, outbound, "websocket-final-outbound");
+          await this.#send(outbound);
+        }
+      } finally {
+        // No-op when graph/send took ownership; releases final-only carriers.
+        releaseAtomicBytePermit(final);
       }
     } catch (error: any) {
       if (
@@ -589,6 +664,12 @@ export class ResponsesWebSocketSession {
             streamId,
             param: "previous_response_id",
           })
+        : error instanceof ResponseGraphCapacityError
+          ? errorEvent(error.code, error.message, {
+              streamId,
+              status: 503,
+              type: "overloaded_error",
+            })
         : error instanceof WebSocketQueueFullError
           ? errorEvent(error.code, error.message, {
               streamId,
@@ -610,6 +691,12 @@ export class ResponsesWebSocketSession {
         }
       }
     } finally {
+      if (handle && !finalObserved) {
+        // A socket/send failure can leave the iterator before it reaches
+        // handle.final. Release a definitive late terminal carrier even when
+        // the relay wins the cancellation race and settles successfully.
+        void handle.final.then(releaseAtomicBytePermit, () => undefined);
+      }
       release?.();
       if (release) this.#telemetry?.responseFinished(requestBytes);
       releaseRequest();
@@ -628,12 +715,16 @@ export class ResponsesWebSocketSession {
       output: [],
       store: event.store ?? true,
     };
-    this.#graph.record(resolved, final);
-    await this.#send(this.#graph.sanitizeOutbound({
-      type: "response.completed",
-      response: final,
-      ...(event.stream_id ? { stream_id: event.stream_id } : {}),
-    }, resolved));
+    try {
+      this.#graph.record(resolved, final);
+      await this.#send(this.#graph.sanitizeOutbound({
+        type: "response.completed",
+        response: final,
+        ...(event.stream_id ? { stream_id: event.stream_id } : {}),
+      }, resolved));
+    } finally {
+      releaseResponseGraphMaterialization(resolved.relayBody);
+    }
   }
 
   #reserveRequest(bytes: number): boolean {
@@ -673,7 +764,9 @@ export class ResponsesWebSocketSession {
     let encoded: { data: string; bytes: number };
     try {
       encoded = this.#encodeSend(value);
+      transferAtomicBytePermit(value, encoded, "websocket-encoded");
     } catch (error) {
+      releaseAtomicBytePermit(value);
       return Promise.reject(error);
     }
     return this.#enqueueSend(encoded);
@@ -684,8 +777,16 @@ export class ResponsesWebSocketSession {
       "WebSocket connection is closed",
       "websocket_closed",
     );
-    const encoded = this.#encodeSend(value);
+    let encoded: { data: string; bytes: number };
+    try {
+      encoded = this.#encodeSend(value);
+      transferAtomicBytePermit(value, encoded, "websocket-encoded");
+    } catch (error) {
+      releaseAtomicBytePermit(value);
+      throw error;
+    }
     if (encoded.bytes > this.#maxSendQueueBytes) {
+      releaseAtomicBytePermit(encoded);
       throw new WebSocketRequestOutputError(
         "WebSocket diagnostic exceeds its configured output limit",
         "websocket_response_too_large",
@@ -696,6 +797,7 @@ export class ResponsesWebSocketSession {
     const deadline = performance.now() + this.#sendTimeoutMs;
     while (!this.#hasSendCapacity(encoded.bytes)) {
       if (this.#closed || this.#socket.readyState !== this.#socket.OPEN) {
+        releaseAtomicBytePermit(encoded);
         throw new WebSocketDeliveryError(
           "WebSocket closed before response delivery",
           "websocket_closed",
@@ -703,6 +805,7 @@ export class ResponsesWebSocketSession {
       }
       const remaining = deadline - performance.now();
       if (remaining <= 0) {
+        releaseAtomicBytePermit(encoded);
         throw new WebSocketDeliveryError(
           "WebSocket output queue remained full past its delivery deadline",
           "websocket_backpressure_timeout",
@@ -741,6 +844,7 @@ export class ResponsesWebSocketSession {
       !this.#hasSendCapacity(encoded.bytes) ||
       (this.#processLease && !this.#processLease.tryReserve(encoded.bytes))
     ) {
+      releaseAtomicBytePermit(encoded);
       this.#telemetry?.sendRejected();
       return Promise.reject(new WebSocketRequestOutputError(
         "WebSocket output queue exceeded its configured limit",
@@ -759,6 +863,7 @@ export class ResponsesWebSocketSession {
         started: false,
         settled: false,
       };
+      transferAtomicBytePermit(encoded, item, "websocket-send-queue");
       this.#pendingSends++;
       this.#pendingSendBytes += encoded.bytes;
       this.#telemetry?.sendQueued(encoded.bytes);
@@ -793,6 +898,7 @@ export class ResponsesWebSocketSession {
           bufferedBytes: this.#socket.bufferedAmount,
           delayed,
         });
+        this.#onActivity?.();
         this.#settleSend(item);
       } catch (cause) {
         const error = cause instanceof WebSocketDeliveryError
@@ -863,6 +969,7 @@ export class ResponsesWebSocketSession {
     this.#pendingSends = Math.max(0, this.#pendingSends - 1);
     this.#pendingSendBytes = Math.max(0, this.#pendingSendBytes - item.bytes);
     this.#processLease?.release(item.bytes);
+    releaseAtomicBytePermit(item);
     this.#telemetry?.sendSettled(item.bytes, item.started);
     error ? item.reject(error) : item.resolve();
   }

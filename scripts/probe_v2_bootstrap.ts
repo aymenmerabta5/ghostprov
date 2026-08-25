@@ -7,10 +7,16 @@ import { SandboxHeartbeat } from "../src/sandbox/heartbeat";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { SandboxYDoc } from "../src/sandbox/ydoc";
 import { YSweetAwarenessChannel } from "../src/v2/awareness/y-sweet-channel";
+import { SplitAwarenessChannel } from "../src/v2/awareness/split-channel";
 import { V2BootstrapController } from "../src/v2/bootstrap/controller";
-import type { ProtocolBinding } from "../src/v2/protocol/shared";
+import type { HostFrame, ProtocolBinding, SidecarFrame } from "../src/v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../src/v2/protocol/validate";
-import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
+import {
+  DEFAULT_V2_SIDECAR_REVISION,
+  loadV2SidecarAssets,
+  resolveV2SidecarRevision,
+  type V2SidecarRevision,
+} from "../src/v2/sidecar/assets";
 
 const PROTECTED_ROOT = "http://127.0.0.1:8787";
 
@@ -30,6 +36,8 @@ export interface V2BootstrapProbeOptions {
   prismOrigin: string;
   port: number;
   timeoutMs: number;
+  revision: V2SidecarRevision;
+  rollbackFromR2SandboxSessionId?: string;
 }
 
 export function resolveV2BootstrapProbeOptions(
@@ -48,11 +56,26 @@ export function resolveV2BootstrapProbeOptions(
   }
   const cookieFile = env.PRISM_COOKIE_FILE?.trim();
   if (!cookieFile) throw new Error("PRISM_COOKIE_FILE is required");
-  const port = Number(env.PORT ?? 18_787);
+  const port = Number(env.PORT ?? 18_888);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
     throw new Error("PORT must be an integer from 1 through 65535");
   }
   if (port === 8_787) throw new Error("V2 bootstrap probe refuses protected port 8787");
+  if (port === 18_787) throw new Error("V2 bootstrap probe refuses protected port 18787");
+  const revision = resolveV2SidecarRevision(
+    env.GP_LIVE_V2_REVISION?.trim() || DEFAULT_V2_SIDECAR_REVISION,
+  );
+  const rollbackFromR2SandboxSessionId =
+    env.GP_LIVE_V2_ROLLBACK_FROM_R2_SANDBOX_SESSION_ID?.trim() || undefined;
+  if (
+    rollbackFromR2SandboxSessionId &&
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(rollbackFromR2SandboxSessionId)
+  ) {
+    throw new Error("R2 rollback sandbox session ID is invalid");
+  }
+  if (rollbackFromR2SandboxSessionId && revision !== "r1") {
+    throw new Error("R2 rollback proof requires GP_LIVE_V2_REVISION=r1");
+  }
   const timeoutMs = Number(env.GP_LIVE_TIMEOUT_MS ?? 120_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) {
     throw new Error("GP_LIVE_TIMEOUT_MS must be an integer of at least 1000ms");
@@ -63,6 +86,8 @@ export function resolveV2BootstrapProbeOptions(
     prismOrigin: (env.PRISM_ORIGIN ?? "https://prism.openai.com").replace(/\/+$/, ""),
     port,
     timeoutMs,
+    revision,
+    rollbackFromR2SandboxSessionId,
   };
 }
 
@@ -81,6 +106,18 @@ async function protectedHealth(): Promise<Record<string, unknown>> {
 async function assertCookieFile(file: string): Promise<void> {
   const metadata = await stat(file);
   if (!metadata.isFile()) throw new Error("PRISM_COOKIE_FILE must point to an existing file");
+}
+
+export function assertFreshV2RollbackSandbox(
+  rollbackFromR2SandboxSessionId: string | undefined,
+  selectedSandboxSessionId: string,
+): void {
+  if (
+    rollbackFromR2SandboxSessionId &&
+    selectedSandboxSessionId === rollbackFromR2SandboxSessionId
+  ) {
+    throw new Error("R2 to R1 rollback must use a fresh sandbox session in the same project");
+  }
 }
 
 async function assertNoCurrentSecretValues(
@@ -114,7 +151,7 @@ export async function main(
     heartbeat: SandboxHeartbeat | null;
   } = { gateway: null, heartbeat: null };
   let ydoc: SandboxYDoc | null = null;
-  let awareness: YSweetAwarenessChannel<any, any> | null = null;
+  let awareness: SplitAwarenessChannel<HostFrame, SidecarFrame> | null = null;
   let controller: V2BootstrapController | null = null;
   let failure: unknown = null;
   let result: Record<string, unknown> | null = null;
@@ -143,6 +180,7 @@ export async function main(
     if (!gateway) throw new Error("Sandbox gateway was not initialized");
     const sessionId = credentials.sandbox.sessionId ?? (await gateway.heartbeat(abort)).sessionId;
     if (!sessionId) throw new Error("Provisioned sandbox did not expose a session ID");
+    assertFreshV2RollbackSandbox(options.rollbackFromR2SandboxSessionId, sessionId);
 
     let initialYSweet = true;
     ydoc = new SandboxYDoc({
@@ -163,22 +201,31 @@ export async function main(
       },
     });
     await ydoc.connect();
-    const assets = await loadV2SidecarAssets();
-    const binding: ProtocolBinding = {
-  protocolRevision: "r1",
-  launchNonce: "launch-nonce-r1",
+    const assets = await loadV2SidecarAssets({ revision: options.revision });
+    const launchNonce = crypto.randomUUID();
+    const commonBinding = {
       projectId: options.projectId,
       sessionId,
       leaderGeneration: 1,
       buildHash: assets.buildHash,
       schemaHash: assets.schemaHash,
     };
-    awareness = new YSweetAwarenessChannel({
+    const binding: ProtocolBinding = assets.revision === "r2"
+      ? { ...commonBinding, protocolRevision: "r2", launchNonce }
+      : { ...commonBinding, protocolRevision: "r1", launchNonce };
+    const lane = (
+      name: "data" | "control",
+      field: "ghostprovV2Data" | "ghostprovV2Control",
+    ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
       envelope: credentials.ySweet,
-      localPeerId: "host-bootstrap-probe",
-      field: "ghostprovV2",
+      localPeerId: `host-bootstrap-probe:${name}`,
+      field,
       parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
       syncTimeoutMs: Math.min(options.timeoutMs, 30_000),
+    });
+    awareness = new SplitAwarenessChannel({
+      data: lane("data", "ghostprovV2Data"),
+      control: lane("control", "ghostprovV2Control"),
     });
     controller = new V2BootstrapController({
       projectId: options.projectId,
@@ -190,6 +237,8 @@ export async function main(
       gateway,
       awareness,
       assets,
+      revision: assets.revision,
+      launchNonce,
       timeoutMs: Math.min(options.timeoutMs, 45_000),
     });
     const started = performance.now();
@@ -203,6 +252,9 @@ export async function main(
     await controller.drainAndStop("live-bootstrap-probe", abort);
     result = {
       projectId: options.projectId,
+      protocolRevision: assets.revision,
+      sandboxSessionId: sessionId,
+      rollbackFromR2SandboxSessionId: options.rollbackFromR2SandboxSessionId ?? null,
       instanceId: descriptor.instanceId,
       buildHash: descriptor.buildHash,
       schemaHash: descriptor.schemaHash,

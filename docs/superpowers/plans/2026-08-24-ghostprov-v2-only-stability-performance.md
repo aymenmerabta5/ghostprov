@@ -134,7 +134,7 @@ For every project:
 6. prove gateway, transport, engine, and execution readiness;
 7. restore routing.
 
-Rollback reverses the selector to R1, rolls the sidecar back first, proves readiness, and only then rolls the host binary back if necessary.
+Rollback reverses the selector to R1, performs a full supervisor/fleet configuration restart so the edited selector is actually reloaded, rolls the sidecar back first, proves readiness, and only then rolls the host binary back if necessary. A rolling worker restart intentionally retains the supervisor's startup selector and is not a rollback mechanism.
 
 ## 6. Phase 0 - Freeze V2-R1 and build rollback rails
 

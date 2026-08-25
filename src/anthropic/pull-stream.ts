@@ -2,6 +2,10 @@ import type { RunHandle } from "../relay/run-handle";
 import type { SseFrame } from "../relay/sse";
 import { AnthropicStreamTranslator, anthropicSseFrame } from "./stream";
 import type { AnthropicSseEvent } from "./stream-types";
+import {
+  releaseAtomicBytePermit,
+  transferAtomicBytePermit,
+} from "../v2/memory/permit-carrier";
 
 type PendingRead =
   | { kind: "next"; result: IteratorResult<SseFrame> }
@@ -12,6 +16,12 @@ type FinalRead =
   | { kind: "error"; error: unknown };
 
 type ClosedRead = { kind: "closed" };
+
+interface PendingOutput {
+  data: string;
+  /** Present only on the last translated output derived from one owner. */
+  owner?: object;
+}
 
 export type AnthropicPullStreamOptions = {
   handle: RunHandle;
@@ -34,7 +44,9 @@ export function createAnthropicPullStream(
 
   const encoder = new TextEncoder();
   const iterator = options.handle.events();
-  const output: string[] = options.translator.start().map(anthropicSseFrame);
+  const output: PendingOutput[] = options.translator.start().map(event => ({
+    data: anthropicSseFrame(event),
+  }));
   let pendingRead: Promise<PendingRead> | null = null;
   let pendingFinal: Promise<FinalRead> | null = null;
   let iteratorDone = false;
@@ -42,6 +54,8 @@ export function createAnthropicPullStream(
   let closed = false;
   let iteratorReturned = false;
   let activeTimer: ReturnType<typeof setTimeout> | undefined;
+  let deliveredOwner: object | null = null;
+  let finalReleaseWatched = false;
   let resolveClosed!: (value: ClosedRead) => void;
   const closedRead = new Promise<ClosedRead>(resolve => { resolveClosed = resolve; });
 
@@ -50,10 +64,32 @@ export function createAnthropicPullStream(
     activeTimer = undefined;
   };
 
+  const releaseOutputOwners = (): void => {
+    releaseAtomicBytePermit(deliveredOwner);
+    deliveredOwner = null;
+    for (const item of output) releaseAtomicBytePermit(item.owner);
+    output.length = 0;
+  };
+
+  const finalDescriptor = Object.getOwnPropertyDescriptor(options.handle, "final");
+  const passiveFinal = finalDescriptor && "value" in finalDescriptor
+    ? finalDescriptor.value as Promise<unknown>
+    : null;
+  const releaseFinalWhenSettled = (allowAccessor = false): void => {
+    if (finalReleaseWatched) return;
+    if (!passiveFinal && !allowAccessor) return;
+    finalReleaseWatched = true;
+    void Promise.resolve(passiveFinal ?? options.handle.final).then(
+      releaseAtomicBytePermit,
+      () => undefined,
+    );
+  };
+
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     clearKeepAlive();
+    releaseOutputOwners();
     resolveClosed({ kind: "closed" });
     options.onClose();
   };
@@ -69,12 +105,26 @@ export function createAnthropicPullStream(
     }
   };
 
-  const append = (events: AnthropicSseEvent[]): "error" | "message_stop" | null => {
+  const append = (
+    events: AnthropicSseEvent[],
+    source?: unknown,
+  ): "error" | "message_stop" | null => {
     let terminal: "error" | "message_stop" | null = null;
+    const translated: PendingOutput[] = [];
     for (const event of events) {
-      output.push(anthropicSseFrame(event));
+      translated.push({ data: anthropicSseFrame(event) });
       if (event.type === "error" || event.type === "message_stop") terminal = event.type;
     }
+    if (source !== undefined) {
+      if (translated.length > 0) {
+        const owner = {};
+        transferAtomicBytePermit(source, owner, "anthropic-sse-output");
+        translated[translated.length - 1]!.owner = owner;
+      } else {
+        releaseAtomicBytePermit(source);
+      }
+    }
+    output.push(...translated);
     return terminal;
   };
 
@@ -120,6 +170,7 @@ export function createAnthropicPullStream(
   const fail = (error: unknown): void => {
     append(options.translator.fail(error));
     upstreamDone = true;
+    releaseFinalWhenSettled(Boolean(iteratorDone || pendingFinal));
     clearKeepAlive();
     if (!options.abortController.signal.aborted) options.abortController.abort();
     returnIterator();
@@ -128,9 +179,21 @@ export function createAnthropicPullStream(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (closed) return;
+      // A new pull proves the prior translated chunk left the stream queue.
+      releaseAtomicBytePermit(deliveredOwner);
+      deliveredOwner = null;
       for (;;) {
         if (output.length) {
-          controller.enqueue(encoder.encode(output.shift()!));
+          const item = output.shift()!;
+          try {
+            controller.enqueue(encoder.encode(item.data));
+            deliveredOwner = item.owner ?? null;
+          } catch (error) {
+            releaseAtomicBytePermit(item.owner);
+            fail(error);
+            cleanup();
+            controller.error(error);
+          }
           return;
         }
         if (upstreamDone) {
@@ -150,8 +213,13 @@ export function createAnthropicPullStream(
           pendingFinal = null;
           if (final.kind === "error") fail(final.error);
           else {
-            append(options.translator.finish(final.value));
-            upstreamDone = true;
+            try {
+              append(options.translator.finish(final.value), final.value);
+              upstreamDone = true;
+            } catch (error) {
+              releaseAtomicBytePermit(final.value);
+              fail(error);
+            }
           }
           continue;
         }
@@ -173,9 +241,20 @@ export function createAnthropicPullStream(
           iteratorDone = true;
           continue;
         }
-        const terminal = append(options.translator.push(winner.result.value));
+        let terminal: "error" | "message_stop" | null;
+        try {
+          terminal = append(
+            options.translator.push(winner.result.value),
+            winner.result.value,
+          );
+        } catch (error) {
+          releaseAtomicBytePermit(winner.result.value);
+          fail(error);
+          continue;
+        }
         if (terminal) {
           upstreamDone = true;
+          releaseFinalWhenSettled(true);
           if (terminal === "error" && !options.abortController.signal.aborted) {
             options.abortController.abort();
           }
@@ -184,6 +263,7 @@ export function createAnthropicPullStream(
       }
     },
     cancel(reason) {
+      releaseFinalWhenSettled(Boolean(iteratorDone || pendingFinal));
       cleanup();
       if (!options.abortController.signal.aborted) options.abortController.abort(reason);
       returnIterator();

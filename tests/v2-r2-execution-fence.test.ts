@@ -17,6 +17,7 @@ import {
   type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
+  type R2RequestCommitFrame,
   type R2AwarenessEnvelope,
   type ReliableFrame,
   type SidecarFrame,
@@ -298,6 +299,25 @@ async function requestHostEnvelope(options: {
   };
 }
 
+function startHostEnvelope(
+  request: R2AwarenessEnvelope<HostFrame>,
+  revision = request.revision + 1,
+): R2AwarenessEnvelope<HostFrame> {
+  const commit = request.frames.find(frame => frame.kind === "request_commit");
+  if (!commit || !("protocolRevision" in commit)) {
+    throw new Error("R2 request envelope has no fenced commit");
+  }
+  return {
+    ...request,
+    revision,
+    frames: [{
+      ...commit,
+      kind: "request_start",
+      sequence: commit.sequence + 1,
+    }],
+  };
+}
+
 function publishHostEnvelope(
   remote: Awareness,
   runtimes: readonly TestRuntime[],
@@ -352,6 +372,54 @@ function expectProtocolFailure(value: unknown, code: string): void {
 }
 
 describe("R2 exact execution fencing", () => {
+  it("revokes election on control revision rollback and while the exact host is draining", async () => {
+    const runtime = await createRuntime(SELECTED_SIDECAR);
+    const hostDoc = new Y.Doc();
+    const host = new Awareness(hostDoc);
+    try {
+      publishHostEnvelope(
+        host,
+        [runtime],
+        controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR, revision: 5 }),
+      );
+      const request = await requestHostEnvelope({ targetInstanceId: SELECTED_SIDECAR });
+      const commit = request.frames.find(frame => frame.kind === "request_commit");
+      if (!commit || commit.kind !== "request_commit" || !("protocolRevision" in commit)) {
+        throw new Error("missing R2 commit");
+      }
+      const fencedCommit = commit as ReliableFrame<R2RequestCommitFrame>;
+      expect(() => runtime.peer.assertExecutionFence(fencedCommit)).not.toThrow();
+
+      publishHostEnvelope(
+        host,
+        [runtime],
+        controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR, revision: 4 }),
+      );
+      expect(() => runtime.peer.assertExecutionFence(fencedCommit)).toThrow(
+        "R2 execution fence is no longer elected",
+      );
+
+      publishHostEnvelope(host, [runtime], {
+        ...controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR, revision: 6 }),
+        draining: true,
+      });
+      expect(() => runtime.peer.assertExecutionFence(fencedCommit)).toThrow(
+        "R2 execution fence is no longer elected",
+      );
+
+      publishHostEnvelope(
+        host,
+        [runtime],
+        controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR, revision: 7 }),
+      );
+      expect(() => runtime.peer.assertExecutionFence(fencedCommit)).not.toThrow();
+    } finally {
+      host.destroy();
+      hostDoc.destroy();
+      await runtime.close();
+    }
+  });
+
   it("allows exactly the targeted sidecar to ACK, durably claim, and fetch", async () => {
     const selected = await createRuntime(SELECTED_SIDECAR);
     const foreign = await createRuntime(FOREIGN_SIDECAR);
@@ -371,6 +439,11 @@ describe("R2 exact execution fencing", () => {
         revision: 1,
       });
       publishHostEnvelope(remote, [selected, foreign], request);
+      await eventually(
+        () => selected.emitted.some(frame => frame.kind === "request_prepared"),
+        "targeted R2 sidecar did not prepare the request",
+      );
+      publishHostEnvelope(remote, [selected, foreign], startHostEnvelope(request));
 
       await eventually(
         () => selected.engine.snapshot().active === 0 && selected.stats.fetches === 1,
@@ -483,7 +556,7 @@ describe("R2 exact execution fencing", () => {
     const fenceBlocked = new Promise<void>(resolve => { releaseFence = resolve; });
     const runtime = await createRuntime(SELECTED_SIDECAR, {
       beforeFence: async check => {
-        if (check !== 3) return;
+        if (check !== 5) return;
         reachedBeforeFetch();
         await fenceBlocked;
       },
@@ -497,11 +570,13 @@ describe("R2 exact execution fencing", () => {
         [runtime],
         controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR }),
       );
-      publishHostEnvelope(
-        host,
-        [runtime],
-        await requestHostEnvelope({ targetInstanceId: SELECTED_SIDECAR }),
+      const request = await requestHostEnvelope({ targetInstanceId: SELECTED_SIDECAR });
+      publishHostEnvelope(host, [runtime], request);
+      await eventually(
+        () => runtime.emitted.some(frame => frame.kind === "request_prepared"),
+        "R2 sidecar did not prepare before beforeFetch test",
       );
+      publishHostEnvelope(host, [runtime], startHostEnvelope(request));
       await beforeFetch;
 
       removeHostControl(host, [runtime]);
@@ -522,7 +597,8 @@ describe("R2 exact execution fencing", () => {
 
       expect(runtime.stats.fetches).toBe(0);
       expect(runtime.stats.fatals).toBeGreaterThanOrEqual(1);
-      expect(runtime.emitted).toEqual([]);
+      expect(runtime.emitted.map(frame => frame.kind)).toEqual(["request_prepared"]);
+      expect(runtime.emitted.some(frame => frame.kind === "request_ack")).toBe(false);
       expect(runtime.storage.records.filter(record => record.state === "fetch_starting"))
         .toHaveLength(0);
     } finally {
@@ -550,11 +626,13 @@ describe("R2 exact execution fencing", () => {
         [runtime],
         controlHostEnvelope({ targetInstanceId: SELECTED_SIDECAR, revision: 1 }),
       );
-      publishHostEnvelope(
-        host,
-        [runtime],
-        await requestHostEnvelope({ targetInstanceId: SELECTED_SIDECAR }),
+      const request = await requestHostEnvelope({ targetInstanceId: SELECTED_SIDECAR });
+      publishHostEnvelope(host, [runtime], request);
+      await eventually(
+        () => runtime.emitted.some(frame => frame.kind === "request_prepared"),
+        "same host did not prepare after regaining election",
       );
+      publishHostEnvelope(host, [runtime], startHostEnvelope(request));
       await eventually(() => runtime.stats.fetches === 1, "same host did not regain election");
 
       expect(runtime.emitted.filter(frame => frame.kind === "request_ack")).toHaveLength(1);

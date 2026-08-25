@@ -33,7 +33,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - A separately launched Deno sidecar that calls the sandbox `OPENAI_BASE_URL` directly
 - Append-only claims and terminal spools under `/tmp/ghostprov-v2`
 - P-256 ECDH/HKDF/AES-GCM bootstrap and AES-GCM credential rotation
-- ACK-clocked 32-frame/128 KiB data flights inside the 16 KiB frame and 128-frame/512 KiB hard ceilings
+- Revision-bound ACK-clocked flights: frozen R1 is 128 KiB in both directions; R2 permits a 512 KiB host request flight while keeping sidecar response flights at the proven 128 KiB ceiling, all inside the 16 KiB frame and 128-frame/512 KiB window bounds
 - Up to 128 physical upstream calls plus fair byte-bounded admission
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
@@ -58,7 +58,11 @@ Failure rules:
 
 ## Concurrency and latency
 
-One V2 sidecar retains a hard physical ceiling of 128 simultaneous upstream calls, while transport admission starts at 8 and grows only through healthy RTT samples to a maximum of 16. Four projects therefore expose 32–64 transport-safe calls and still retain 512 physical safety slots; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
+One V2 sidecar retains a hard protocol ceiling of 128 simultaneous upstream calls, while the proven 512 MiB terminal-spool quota reserves exactly 64 MiB per prepared request and therefore caps production admission at 8. `GP_V2_RESPONSE_MAX_BYTES` is fixed to exactly 64 MiB in this release and configuration rejects any other value. Four projects expose 32 durability-backed calls; fleets are dynamically tested at 1, 4, 8, 16, and 32 projects and have no fixed-four implementation limit. Actual admission is:
+
+The sidecar claim journal is bounded at 64 MiB and 100,000 checksummed records during both runtime and restart. New claims reserve their worst-case remaining transition/outcome space before acceptance, and exclusive compaction retains one minimal state snapshot per unresolved fence, terminal proof, provider outcome, or acknowledged duplicate fence. Per-request mutation lanes serialize terminal/provider/forced outcomes, with forced-deadline intent revalidated after terminal promotion. Torn unterminated UTF-8 tails are removed only after every complete line passes fatal decoding and checksum validation, and bounded orphan rewrite temps are cleaned under ownership. On POSIX, hierarchy creation, the first claim append, journal replacement, and terminal promotion fsync their directory entries before reporting durability.
+
+Host response events use one process-wide atomic byte-permit pool reserved in full through the global resource governor before startup. For each active slot, its ordinary region covers one in-progress assembly (`512 KiB × 4 + 1 MiB`), the full retained payload queue (`512 KiB × 4`), and metadata for at most 128 buffered events (`128 × 4 KiB`); that per-slot sum is multiplied by configured projects and the proven active limit. Its single jumbo lane is `GP_V2_RESPONSE_MAX_BYTES × 4 + 1 MiB`. Startup fails closed when that complete reservation cannot fit. A response is bounded by both 512 KiB and 128 queued events, while a larger canonical SSE event is accepted only with exclusive jumbo coverage. Permit ownership follows the event through the run handle, final object, and HTTP/WebSocket delivery or cache eviction, and fleet samples expose ordinary/jumbo usage and waiters.
 
 ```text
 min(sidecar credits, healthy non-quarantined calls, work fitting live RAM/CPU reservations)
@@ -76,7 +80,7 @@ resume above max(3 GiB, 15% total RAM) free
 CPU transform workers = clamp(2, 8, floor(logical processors / 2))
 ```
 
-Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent and frame-free, freezes each 128 KiB data flight until cumulative ACK, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer.
+Large HTTP bodies reserve memory before buffering. Gzip runs in bounded workers and is used only when it reduces frame count. Response ACK publication stops when a client buffer is full, providing end-to-end backpressure without unbounded memory. Each V2 peer shares one 25 ms data-publication cadence across all streams, keeps ACK/control traffic urgent and frame-free, freezes one revision/direction-specific flight until cumulative ACK, and derives bounded retransmission backoff from first-send sequence RTT instead of a fixed timer. R2's larger 512 KiB flight applies only from host to sidecar; sidecar-to-host response traffic remains 128 KiB.
 
 WebSocket `store:false` continuation caches retain only byte-budgeted deltas; full histories are materialized per request and never cached quadratically.
 
@@ -84,13 +88,9 @@ Per-runtime completion estimates cap extreme model durations and decay halfway t
 
 Fresh projects are initialized with Prism's current Yjs root/settings schema. Non-secret sidecar sources are content-addressed and written only when changed. The temporary launcher and encrypted credential entry are tombstoned after matching Awareness readiness; no cookie, OpenAI key, resource token, or Y-Sweet token is written in plaintext.
 
-Latency acceptance targets:
+The latest retained live-load baseline predates the final R2 release: commit ACK was about 1.06/2.42 seconds p50/p95, first event about 2.59/6.95 seconds, successful total about 6.9/19.4 seconds, and requests at or above 3 MiB committed in about 6.21/10.59 seconds. Host CPU was only about 17%/29% p50/p95 (41% max), so that run did not show host CPU saturation; request size versus commit latency correlated about 0.823 and points to the Y-Sweet/Awareness link and repeated ACK RTTs. Once commit is normal, high `post_commit_first_event_ms` or long streaming duration is upstream-model time, not evidence that local CPU is slow. A post-freeze R2 live benchmark is still required before claiming a 512 KiB-flight speedup.
 
-- Router decision p95 below 2 ms
-- Queue p95 below 250 ms while capacity is available
-- Small Awareness transport p95 below 1 second under 512 accepted/128 active load
-- One-project 128-call first-event p95 below 4 seconds
-- Four-project 512-call first-event p95 below 7 seconds per sandbox
+Current acceptance targets remain router decision p95 below 2 ms, queue p95 below 250 ms whenever local capacity is available, and no CPU/event-loop or memory saturation. Interpret high `commit_ack_ms` with RTT/retransmission counters as transport-link pressure; interpret high CPU/event-loop delay with normal RTT as local work; interpret normal commit with high first-event/total latency as model/upstream pressure.
 
 One sequential Codex task normally uses one lane. High utilization requires multiple tasks, API callers, named WebSocket lanes, or image fan-out.
 
@@ -167,6 +167,8 @@ WebSocket mode follows the [official OpenAI Responses WebSocket contract](https:
 
 Streaming is implicit in WebSocket mode: clients must omit the `stream` field. GhostProv adds `stream:true` only to its internal sandbox HTTP request.
 
+The normal WebSocket parser ceiling is 4 MiB. Each upgraded connection reserves its complete 17 MiB raw/decode/parse working set before `ws` can assemble a frame, so the fixed 512 MiB ingress region admits at most 30 default connections. A client that must send a message above 4 MiB must include `x-ghostprov-ws-jumbo: 1` in the HTTP upgrade; that explicitly acquires the sole 64 MiB parser class and its 257 MiB working-set reservation before upgrade. Jumbo mode therefore reduces remaining default-connection capacity to 15. An upgrade receives HTTP 503 before WebSocket parsing when its full reservation cannot fit. Server ping/pong detects half-open peers, and an otherwise idle connection expires after five minutes; a live active relay is never expired merely because upstream reasoning is temporarily silent.
+
 ```toml
 [model_providers.ghostprov]
 name = "GhostProv"
@@ -184,8 +186,8 @@ supports_websockets = true
 
 ## Performance observability
 
-- `GET /health` returns aggregate capacity, active, available, queued, and runtime count; zero routable capacity returns HTTP 503 with `ok:false`.
-- `GET /__sandboxes` returns sanitized per-project lifecycle, slot, heartbeat, latency, failure, quarantine, and resource snapshots. The originating runtime retains its latest observation-only `upstreamRateLimit` problem and parsed organization/model/limit/used/requested/remaining/retry evidence; no unsupported `/v1/me` call is made through the scoped sandbox proxy.
+- `GET /health` returns aggregate capacity, active, available, queued, desired/ready/unavailable fleet counts, bounded exact unavailable project UUIDs, runtime count, and an exact release summary (`protocolRevision`, `buildHash`, and `schemaHash`); zero routable capacity returns HTTP 503 with `ok:false`.
+- `GET /__sandboxes` returns sanitized per-project lifecycle, exact verified release, slot, heartbeat, latency, failure, quarantine, and resource snapshots. A runtime which has not proven a V2 release reports all three release fields as `null`; sandbox instance/session IDs and credentials are never exposed. The originating runtime retains its latest observation-only `upstreamRateLimit` problem and parsed organization/model/limit/used/requested/remaining/retry evidence; no unsupported `/v1/me` call is made through the scoped sandbox proxy.
 
 Start the read-only external monitor against an already-running router without restarting it:
 
@@ -199,7 +201,7 @@ Built-in tracing starts with the upgraded router after the operator's next manua
 
 Recovery tracing adds `sandbox.recovery.started`, `sandbox.recovery.retry_scheduled`, `sandbox.recovery.completed`, `sandbox.recovery.aborted`, `sandbox.credential_refresh`, and transition-only `prism.circuit.changed`. Recovery events report `attempt_duration_ms` separately from total `duration_ms`, so retry backoff is never mistaken for a slow provisioning attempt. These events contain only project/worker indexes, bounded categories, counters, durations, and HTTP status codes—never sandbox/session IDs, URLs, cookies, tokens, prompts, or responses. `/__sandboxes` exposes process-local runtime incarnations, bounded recovery counters, and sidecar peer age; periodic `fleet.sample` additionally records the sanitized provisioning-circuit state.
 
-Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous queue preserves terminal events ahead of progress and sample events. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
+Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous head-index queue preserves terminal events ahead of progress and sample events, validates and serializes only during batched drain, and keeps full records in JSONL. Console output batches terminal/error records and rate-limits progress/sample records to a fixed cadence. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 
 Inspect the latest records in PowerShell:
 
@@ -253,9 +255,11 @@ Heartbeat requests have a five-second deadline inside the exact ten-second caden
 
 ## Host supervision and rolling upgrades
 
-`bun run start:supervised` runs a cross-platform supervisor that owns the public loopback port and proxies to one internal GhostProv worker. It restarts crashed workers with bounded backoff. A planned `bun run upgrade` stops new worker dispatch, lets existing HTTP responses finish, closes persistent Responses WebSockets with restart code `1012`, gracefully stops the old worker, starts exactly one replacement, then releases requests queued at the stable public listener. Old and new workers never manage the same Prism projects concurrently.
+`bun run start:supervised` runs a cross-platform supervisor that owns the public loopback port and proxies to one internal GhostProv worker. It restarts crashed workers with bounded backoff. A worker becomes selectable only after its own IPC channel proves the exact PID, allocated port, and supervisor generation; an unrelated local listener returning HTTP 200/503 can never satisfy readiness or receive queued API bodies. A planned `bun run upgrade` stops new worker dispatch, lets existing HTTP responses finish, closes persistent Responses WebSockets with restart code `1012`, gracefully stops the old worker, starts exactly one replacement, then releases requests queued at the stable public listener. The restart queue is bounded by both count and declared request bytes; overflowed HTTP and WebSocket handshakes receive an immediate credential-free `503 host_queue_full` instead of retaining bodies and timers for the full wait. Old and new workers never manage the same Prism projects concurrently. This rolling worker restart deliberately keeps the supervisor's immutable startup environment; it does **not** reload an edited `.env`.
 
-The supervisor exposes `GET /__supervisor`, writes its current state to `.ghostprov/supervisor.json`, and appends bounded structured history to `.ghostprov/logs/supervisor.jsonl`. `host.supervisor.sample` records request rate, proxy errors, queued/active requests, WebSockets, generations, crashes, restart backoff, and upgrade duration. The first migration from a directly bound `18787` process still requires the operator to stop that old process once; after the supervisor owns the port, upgrades do not require rebinding it.
+The supervisor exposes `GET /__supervisor`, writes its current state to `.ghostprov/supervisor.json`, and appends bounded structured history to `.ghostprov/logs/supervisor.jsonl`. Status persistence coalesces bursts to at most one in-flight write and one latest dirty snapshot instead of writing once per forwarded request. `host.supervisor.sample` records request rate, proxy errors, exact queued request/byte pressure, rejections, active requests, WebSockets, generations, crashes, restart backoff, and upgrade duration. The first migration from a directly bound `18787` process still requires the operator to stop that old process once; after the supervisor owns the port, upgrades do not require rebinding it.
+
+Each supervisor process also atomically publishes `.ghostprov/supervisor-control.json`, a non-secret discovery record written with mode `0600` where supported and containing its PID, start time, random instance nonce, configured control/status paths, and lifecycle timeouts. Every upgrade/shutdown request has an exact schema, random request ID, action, timestamp, and descriptor-derived PID/start/nonce target. The supervisor parses content identity rather than trusting filesystem timestamp ordering, so stale-generation writes, duplicate IDs, equal/coarse timestamps, and backward timestamps cannot control a fresh process. Helpers re-read the descriptor after their atomic request rename and retry against a replacement rather than claiming a stale write succeeded. Lifecycle waits are capped at 1,800 seconds; systemd retains a finite 1,860-second cgroup-owned last resort, so it never signals a bare PID from the descriptor and cannot wait forever on a hung supervisor.
 
 Foreground controls work on both Windows and Linux:
 
@@ -265,11 +269,14 @@ bun run upgrade
 bun run stop:supervised
 ```
 
+For a foreground configuration change, run `bun run stop:supervised`, wait for the existing `bun run start:supervised` command to exit, and then launch `bun run start:supervised` again. This intentionally has a brief public-listener outage.
+
 Windows user service (Task Scheduler, restarted on failure):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 install
 powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 restart
+powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 config-restart
 powershell -ExecutionPolicy Bypass -File scripts/ghostprov_service.ps1 status
 ```
 
@@ -278,9 +285,23 @@ Linux user service (systemd):
 ```bash
 bash scripts/ghostprov_service.sh install
 bash scripts/ghostprov_service.sh restart   # systemctl --user reload
+bash scripts/ghostprov_service.sh config-restart  # systemctl --user restart
 bash scripts/ghostprov_service.sh status
 journalctl --user -u ghostprov.service -f
 ```
+
+Use `restart` only for a rolling code restart with the current startup configuration. After editing `GP_V2_SIDECAR_REVISION`, `GP_V2_SIDECAR_PROJECT_REVISIONS`, project IDs, credentials, or any other `.env` setting, use `config-restart`. It requests a graceful drain of the whole supervisor/fleet, applies the configured bounded fallback if a drain cannot finish, launches a fresh supervisor that reloads `.env`, and on both Windows and Linux waits boundedly for a new descriptor nonce plus matching ready status, supervisor PID, worker PID, start time, and readiness time. A timeout exits nonzero rather than reporting a Type=simple/systemd launch as ready. Windows also reports whether the old process proved a clean drain instead of silently calling a forced stop graceful. Every new sandbox session is acquired inside the same explicitly configured Prism project; this path never creates, adopts, deletes, or silently falls back to another project or protocol revision. Environment variables explicitly supplied by the service manager still take precedence over `.env` and must be updated there as well.
+
+`GP_V2_SIDECAR_REVISION=r2` selects the frozen production release for every configured project. `GP_V2_SIDECAR_PROJECT_REVISIONS` accepts only exact configured `project-id=r1|r2` overrides. To roll back, set the global value or exact overrides to `r1` and run `config-restart`—never the rolling `restart`. The old fleet drains first; the replacement uses a **fresh sandbox session in the same existing Prism project**, proves the pinned R1 build/schema, and only then becomes routable. There is no in-place sidecar downgrade, protocol fallback, or project creation.
+
+Before shipping or starting a pinned R2 release, run both independent release gates:
+
+```text
+bun run check:v2-sidecar-release
+bun run check:v2-sidecar-deno
+```
+
+The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and live R2 schema hash with the checked-in artifact. The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
@@ -308,9 +329,14 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_SHUTDOWN_DRAIN_MS` | `300000` | Maximum wait for active terminal proofs during graceful shutdown |
 | `GP_SUPERVISOR_GRACE_MS` | `330000` | Graceful drain before force-stopping only the owned worker |
 | `GP_SUPERVISOR_REQUEST_WAIT_MS` | `480000` | Maximum public-listener queue wait during restart |
+| `GP_SUPERVISOR_QUEUE_MAX_REQUESTS` | `256` | Maximum HTTP plus WebSocket handshakes retained while no worker is ready |
+| `GP_SUPERVISOR_QUEUE_MAX_BYTES` | `67108864` | Maximum declared request/header bytes retained by that restart queue |
 | `GP_V2_SANDBOX_CAPACITY` | `128` | Hard per-sidecar physical call ceiling |
 | `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
-| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16` | Maximum adaptive active request limit |
+| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
+| `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
+| `GP_V2_SIDECAR_REVISION` | `r2` | Frozen global sidecar revision; use `r1` only for explicit rollback |
+| `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact configured `project-id=r1|r2` overrides; no wildcard or fallback |
 | `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
 | `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000` | Maximum global wait for any sandbox capacity |
@@ -373,15 +399,18 @@ The isolated suite includes:
 - `tests/anthropic-stream.test.ts`
 - `tests/anthropic-token-count.test.ts`
 - `tests/claude-code-verifier.test.ts`
+- `tests/compat-final-permit.test.ts`
 - `tests/cpu-transform-pool.test.ts`
 - `tests/decommission-script.test.ts`
 - `tests/decommission.test.ts`
 - `tests/documentation.test.ts`
 - `tests/file-lease.test.ts`
+- `tests/final-object-permit.test.ts`
 - `tests/fleet-manifest.test.ts`
 - `tests/fleet-manager.test.ts`
 - `tests/graceful-shutdown.test.ts`
 - `tests/heartbeat.test.ts`
+- `tests/host-supervisor-service-control.test.ts`
 - `tests/host-supervisor.test.ts`
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
@@ -408,6 +437,7 @@ The isolated suite includes:
 - `tests/recovery-coordinator.test.ts`
 - `tests/recovery-observability.test.ts`
 - `tests/response-graph.test.ts`
+- `tests/response-graph-governor.test.ts`
 - `tests/router-http.test.ts`
 - `tests/router-observability.test.ts`
 - `tests/router-policy.test.ts`
@@ -416,6 +446,7 @@ The isolated suite includes:
 - `tests/supervised-runtime.test.ts`
 - `tests/sandbox-ydoc.test.ts`
 - `tests/session-manager.test.ts`
+- `tests/server-main-lifecycle.test.ts`
 - `tests/sse.test.ts`
 - `tests/system-v2.test.ts`
 - `tests/v2-awareness-channel.test.ts`
@@ -423,6 +454,8 @@ The isolated suite includes:
 - `tests/v2-batching-throughput.test.ts`
 - `tests/v2-admission.test.ts`
 - `tests/v2-assembler.test.ts`
+- `tests/v2-atomic-byte-permits.test.ts`
+- `tests/v2-atomic-event-large.test.ts`
 - `tests/v2-bootstrap-crypto.test.ts`
 - `tests/v2-bootstrap-binding.test.ts`
 - `tests/v2-bootstrap-controller.test.ts`
@@ -448,13 +481,16 @@ The isolated suite includes:
 - `tests/v2-live-guards.test.ts`
 - `tests/v2-long-run-stability.test.ts`
 - `tests/v2-monitor.test.ts`
+- `tests/v2-native-transcript-hasher.test.ts`
 - `tests/v2-output-sink.test.ts`
 - `tests/v2-performance-harness.test.ts`
 - `tests/v2-performance-large.test.ts`
+- `tests/v2-permit-carrier.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-provider-error.test.ts`
 - `tests/v2-r2-execution-fence.test.ts`
 - `tests/v2-r2-protocol.test.ts`
+- `tests/v2-r2-start-handshake.test.ts`
 - `tests/v2-rate-limit-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
 - `tests/v2-publication-pacer.test.ts`
@@ -471,13 +507,17 @@ The isolated suite includes:
 - `tests/v2-sidecar-bootstrap.test.ts`
 - `tests/v2-sidecar-engine.test.ts`
 - `tests/v2-sidecar-ownership.test.ts`
+- `tests/v2-sidecar-release-build.test.ts`
 - `tests/v2-sidecar-revisions.test.ts`
+- `tests/v2-sidecar-recovery.test.ts`
 - `tests/v2-sidecar-rotation.test.ts`
+- `tests/v2-sidecar-storage-paths.test.ts`
 - `tests/v2-split-awareness-channel.test.ts`
 - `tests/v2-split-flight-integration.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`
+- `tests/v2-upstream-incremental.test.ts`
 - `tests/v2-window.test.ts`
 - `tests/websocket.test.ts`
 - `tests/websocket-telemetry.test.ts`

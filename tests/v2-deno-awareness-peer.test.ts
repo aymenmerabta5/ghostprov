@@ -110,6 +110,449 @@ function hostEnvelope(ackSequence: number, revision = 0): AwarenessEnvelope<Host
 }
 
 describe("DenoAwarenessPeer", () => {
+  it("keeps R2 sidecar response egress at the conservative 128 KiB flight", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-r2-sidecar-flight",
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-instance-r2-flight",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    await peer.connect();
+    for (let index = 0; index < 40; index++) {
+      peer.enqueue({
+        ...(responseEvent(
+          index,
+          "req-r2-large-response",
+        ) as Extract<SidecarFrame, { kind: "response_event" }>),
+        dataBase64Url: "eA".repeat(5_000),
+      }, "data", "req-r2-large-response");
+    }
+    await Bun.sleep(5);
+
+    const envelope = providers.get("data")!.awareness.getLocalState()
+      ?.ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+    const encodedFrames = envelope.frames.reduce(
+      (total, frame) => total + new TextEncoder().encode(JSON.stringify(frame)).byteLength,
+      0,
+    );
+    expect("protocolRevision" in envelope && envelope.protocolRevision).toBe("r2");
+    expect(envelope.frames.length).toBeLessThan(32);
+    expect(encodedFrames).toBeLessThanOrEqual(128 * 1024);
+    expect(encodedFrames).toBeGreaterThan(100 * 1024);
+    await peer.close();
+  });
+
+  it("keeps R2 credits at zero until the reliable recovery marker is acknowledged", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-r2-recovery-barrier",
+    };
+    let replays = 0;
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-recovery-barrier",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 1, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+        hasRecoveredWork: () => true,
+        replayRecovered: async () => { replays++; },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+      initialActivePerSandbox: 1,
+      maxActivePerSandbox: 1,
+    });
+    await peer.connect();
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    let revision = 0;
+    const publishHost = (ack: number) => {
+      remote.setLocalStateField("ghostprovV2Control", {
+        protocol: "gp-awareness-v2",
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        schemaHash: binding.schemaHash,
+        buildHash: binding.buildHash,
+        projectId: binding.projectId,
+        sessionId: binding.sessionId,
+        peerId: "host",
+        instanceId: "host-recovery-barrier",
+        targetInstanceId: "sidecar-recovery-barrier",
+        launchNonce: binding.launchNonce,
+        leaderGeneration: binding.leaderGeneration,
+        epoch: 1,
+        revision: revision++,
+        ack: { epoch: 1, sequence: ack },
+        credits: 1,
+        active: 0,
+        queued: 0,
+        draining: false,
+        frames: [],
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "recovery-host",
+      );
+    };
+    publishHost(-1);
+    let markerSequence = -1;
+    for (let turn = 0; turn < 100 && markerSequence < 0; turn++) {
+      await Bun.sleep(2);
+      const frames = providers.get("data")!.awareness.getLocalState()
+        ?.ghostprovV2Data?.frames ?? [];
+      markerSequence = frames.find((frame: any) => frame.kind === "recovery_complete")?.sequence ?? -1;
+    }
+    expect(replays).toBe(1);
+    expect(markerSequence).toBeGreaterThanOrEqual(0);
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+      .toBe(0);
+    publishHost(markerSequence);
+    for (let turn = 0; turn < 100; turn++) {
+      await Bun.sleep(2);
+      if (providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits === 1) break;
+    }
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+      .toBe(1);
+    remote.destroy();
+    remoteDoc.destroy();
+    await peer.close();
+  });
+
+  it("emits the recovery marker only after ACKed outcomes finish durable cleanup", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-r2-durable-recovery",
+    };
+    let peer!: DenoAwarenessPeer;
+    let cleanupStarted!: () => void;
+    const cleanupObserved = new Promise<void>(resolve => { cleanupStarted = resolve; });
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+    peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-durable-recovery",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 1, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+        hasRecoveredWork: () => true,
+        replayRecovered: async () => {
+          peer.enqueue({
+            kind: "response_error",
+            requestId: "req-durable-outcome",
+            code: "provider_error",
+            message: "durable provider outcome",
+            ambiguous: false,
+          }, "terminal", "req-durable-outcome");
+        },
+        acknowledgeDeliveredOutcomes: async () => {
+          cleanupStarted();
+          await cleanupGate;
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    let revision = 0;
+    const publishAck = (ack: number) => {
+      remote.setLocalStateField("ghostprovV2Control", {
+        protocol: "gp-awareness-v2",
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        schemaHash: binding.schemaHash,
+        buildHash: binding.buildHash,
+        projectId: binding.projectId,
+        sessionId: binding.sessionId,
+        peerId: "host",
+        instanceId: "host-durable-recovery",
+        targetInstanceId: "sidecar-durable-recovery",
+        launchNonce: binding.launchNonce,
+        leaderGeneration: binding.leaderGeneration,
+        epoch: 1,
+        revision: revision++,
+        ack: { epoch: 1, sequence: ack },
+        credits: 1,
+        active: 0,
+        queued: 0,
+        draining: false,
+        frames: [],
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "durable-recovery-host",
+      );
+    };
+
+    try {
+      await peer.connect();
+      publishAck(-1);
+      let outcomeSequence = -1;
+      for (let turn = 0; turn < 100 && outcomeSequence < 0; turn++) {
+        await Bun.sleep(2);
+        const frames = providers.get("data")!.awareness.getLocalState()
+          ?.ghostprovV2Data?.frames ?? [];
+        outcomeSequence = frames.find((frame: any) => frame.kind === "response_error")?.sequence ?? -1;
+      }
+      expect(outcomeSequence).toBeGreaterThanOrEqual(0);
+      publishAck(outcomeSequence);
+      await cleanupObserved;
+      await Bun.sleep(20);
+      expect((providers.get("data")!.awareness.getLocalState()
+        ?.ghostprovV2Data?.frames ?? []).some((frame: any) => frame.kind === "recovery_complete"))
+        .toBe(false);
+
+      releaseCleanup();
+      let markerSequence = -1;
+      for (let turn = 0; turn < 100 && markerSequence < 0; turn++) {
+        await Bun.sleep(2);
+        const frames = providers.get("data")!.awareness.getLocalState()
+          ?.ghostprovV2Data?.frames ?? [];
+        markerSequence = frames.find((frame: any) => frame.kind === "recovery_complete")?.sequence ?? -1;
+      }
+      expect(markerSequence).toBeGreaterThan(outcomeSequence);
+      publishAck(markerSequence);
+      await Bun.sleep(10);
+    } finally {
+      releaseCleanup?.();
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("holds recovery_complete across split lanes until terminal response_ack is durably applied", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-r2-terminal-fence",
+    };
+    const requestId = "req-recovered-terminal-fence";
+    const terminalDigest = "d".repeat(64);
+    let pendingTerminal = true;
+    let releaseTerminalAck!: () => void;
+    const terminalAckGate = new Promise<void>(resolve => { releaseTerminalAck = resolve; });
+    let terminalAckStarted!: () => void;
+    const terminalAckObserved = new Promise<void>(resolve => { terminalAckStarted = resolve; });
+    let peer!: DenoAwarenessPeer;
+    peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-terminal-fence",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 1, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        hasRecoveredWork: () => true,
+        hasPendingTerminalAcknowledgement: () => pendingTerminal,
+        replayRecovered: async () => {
+          peer.enqueue({
+            kind: "response_terminal",
+            requestId,
+            requestDigest: "a".repeat(64),
+            responseId: "resp_terminal_fence",
+            eventCount: 1,
+            byteCount: 1,
+            transcriptSha256: terminalDigest,
+            terminalStatus: "completed",
+            finalEventIndex: 0,
+            finalSha256: "b".repeat(64),
+          }, "terminal", requestId);
+        },
+        accept: async (frame: any) => {
+          if (frame.kind !== "response_ack") return;
+          terminalAckStarted();
+          await terminalAckGate;
+          pendingTerminal = false;
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const controlDoc = new Y.Doc();
+    const control = new Awareness(controlDoc);
+    const dataDoc = new Y.Doc();
+    const data = new Awareness(dataDoc);
+    let controlRevision = 0;
+    const hostBase = {
+      protocol: "gp-awareness-v2" as const,
+      protocolRevision: "r2" as const,
+      schemaVersion: 2 as const,
+      schemaHash: binding.schemaHash,
+      buildHash: binding.buildHash,
+      projectId: binding.projectId,
+      sessionId: binding.sessionId,
+      peerId: "host" as const,
+      instanceId: "host-terminal-fence",
+      targetInstanceId: "sidecar-terminal-fence",
+      launchNonce: binding.launchNonce,
+      leaderGeneration: binding.leaderGeneration,
+      epoch: 1,
+      credits: 1,
+      active: 0,
+      queued: 0,
+      draining: false,
+    };
+    const publishControlAck = (ack: number) => {
+      control.setLocalStateField("ghostprovV2Control", {
+        ...hostBase,
+        revision: controlRevision++,
+        ack: { epoch: 1, sequence: ack },
+        frames: [],
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(control, [controlDoc.clientID]),
+        "terminal-fence-control",
+      );
+    };
+
+    try {
+      await peer.connect();
+      publishControlAck(-1);
+      let terminalSequence = -1;
+      for (let turn = 0; turn < 100 && terminalSequence < 0; turn++) {
+        await Bun.sleep(2);
+        const frames = providers.get("data")!.awareness.getLocalState()
+          ?.ghostprovV2Data?.frames ?? [];
+        terminalSequence = frames.find((frame: any) => frame.kind === "response_terminal")?.sequence ?? -1;
+      }
+      expect(terminalSequence).toBeGreaterThanOrEqual(0);
+      publishControlAck(terminalSequence);
+      await Bun.sleep(15);
+      expect((providers.get("data")!.awareness.getLocalState()
+        ?.ghostprovV2Data?.frames ?? []).some((frame: any) => frame.kind === "recovery_complete"))
+        .toBe(false);
+
+      data.setLocalStateField("ghostprovV2Data", {
+        ...hostBase,
+        revision: 0,
+        ack: { epoch: 1, sequence: terminalSequence },
+        frames: [{
+          kind: "response_ack",
+          requestId,
+          terminalDigest,
+          epoch: 1,
+          sequence: 0,
+        }],
+        lane: "data",
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(data, [dataDoc.clientID]),
+        "terminal-fence-data",
+      );
+      await terminalAckObserved;
+      await Bun.sleep(15);
+      expect((providers.get("data")!.awareness.getLocalState()
+        ?.ghostprovV2Data?.frames ?? []).some((frame: any) => frame.kind === "recovery_complete"))
+        .toBe(false);
+
+      releaseTerminalAck();
+      let markerSequence = -1;
+      for (let turn = 0; turn < 100 && markerSequence < 0; turn++) {
+        await Bun.sleep(2);
+        const frames = providers.get("data")!.awareness.getLocalState()
+          ?.ghostprovV2Data?.frames ?? [];
+        markerSequence = frames.find((frame: any) => frame.kind === "recovery_complete")?.sequence ?? -1;
+      }
+      expect(markerSequence).toBeGreaterThan(terminalSequence);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(0);
+      publishControlAck(markerSequence);
+      for (let turn = 0; turn < 100; turn++) {
+        await Bun.sleep(2);
+        if (providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits === 1) break;
+      }
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(1);
+    } finally {
+      releaseTerminalAck?.();
+      control.destroy();
+      controlDoc.destroy();
+      data.destroy();
+      dataDoc.destroy();
+      await peer.close();
+    }
+  });
+
   it("advertises no credits until the real engine becomes ready", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     let ready = false;
@@ -217,6 +660,7 @@ describe("DenoAwarenessPeer", () => {
       snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
       setHostCeiling: () => undefined,
       accept: async () => undefined,
+      hasRecoveredWork: () => true,
       replayRecovered: async () => { replayCalls++; },
     };
     const peer = new DenoAwarenessPeer({
@@ -330,6 +774,8 @@ describe("DenoAwarenessPeer", () => {
     });
     const controlDoc = new Y.Doc();
     const controlRemote = new Awareness(controlDoc);
+    const dataDoc = new Y.Doc();
+    const dataRemote = new Awareness(dataDoc);
     let revision = 1;
     const host = (ack: number): AwarenessEnvelope<HostFrame> => ({
       protocol: "gp-awareness-v2",
@@ -372,6 +818,7 @@ describe("DenoAwarenessPeer", () => {
 
       const received = new Map<number, SidecarFrame>();
       let sawTerminal = false;
+      let sentTerminalAck = false;
       let recoveryDrained = false;
       for (let attempt = 0; attempt < 250; attempt++) {
         await Bun.sleep(5);
@@ -387,6 +834,31 @@ describe("DenoAwarenessPeer", () => {
           );
         }
         sawTerminal ||= [...received.values()].some(frame => frame.kind === "response_terminal");
+        if (sawTerminal && !sentTerminalAck) {
+          const terminal = [...received.values()].find(
+            (frame): frame is Extract<SidecarFrame, { kind: "response_terminal" }> => (
+              frame.kind === "response_terminal"
+            ),
+          )!;
+          dataRemote.setLocalStateField("ghostprovV2Data", {
+            ...host(envelope?.frames?.at(-1)?.sequence ?? -1),
+            revision: 1,
+            frames: [{
+              kind: "response_ack",
+              requestId: terminal.requestId,
+              terminalDigest: terminal.transcriptSha256,
+              epoch: 1,
+              sequence: 0,
+            }],
+            lane: "data",
+          });
+          applyAwarenessUpdate(
+            providers.get("data")!.awareness,
+            encodeAwarenessUpdate(dataRemote, [dataDoc.clientID]),
+            "bound-host-terminal-ack",
+          );
+          sentTerminalAck = true;
+        }
         if (sawTerminal && !envelope) {
           recoveryDrained = true;
           break;
@@ -401,6 +873,8 @@ describe("DenoAwarenessPeer", () => {
     } finally {
       controlRemote.destroy();
       controlDoc.destroy();
+      dataRemote.destroy();
+      dataDoc.destroy();
       await peer.closeGracefully();
       backpressure.close();
     }
@@ -838,6 +1312,7 @@ describe("DenoAwarenessPeer", () => {
     let releaseOpen!: () => void;
     const blocked = new Promise<void>(resolve => { releaseOpen = resolve; });
     const accepted: string[] = [];
+    const ordering: string[] = [];
     const peer = new DenoAwarenessPeer({
       credential: {
         url: `wss://prism.test/y/d/${PROJECT}/ws`,
@@ -854,11 +1329,13 @@ describe("DenoAwarenessPeer", () => {
         setHostCeiling: () => undefined,
         accept: async (frame: { kind: string }) => {
           accepted.push(frame.kind);
+          ordering.push(`accept:${frame.kind}`);
           if (frame.kind === "request_open") {
             openStarted();
             await blocked;
           }
         },
+        preemptRequest: () => ordering.push("preempt"),
       } as any,
       providerFactory: (doc, _credential, lane) => {
         const provider = new FakeProvider(doc);
@@ -901,10 +1378,16 @@ describe("DenoAwarenessPeer", () => {
       await started;
       await Bun.sleep(0);
       expect(accepted).toEqual(["request_open"]);
+      expect(ordering).toEqual(["accept:request_open", "preempt"]);
 
       releaseOpen();
       await Bun.sleep(5);
       expect(accepted).toEqual(["request_open", "request_cancel"]);
+      expect(ordering).toEqual([
+        "accept:request_open",
+        "preempt",
+        "accept:request_cancel",
+      ]);
       expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
         .toEqual({ epoch: 1, sequence: 1 });
     } finally {

@@ -6,11 +6,13 @@ import {
   parseResourceCredential,
   parseYSweetEnvelope,
   type ProvisionedSandbox,
+  type YSweetEnvelope,
 } from "../src/prism/protocol";
 import type {
   ProvisionedRuntimeCredentials,
   ProvisioningHooks,
 } from "../src/prism/provisioning-client";
+import type { SandboxRunOptions } from "../src/sandbox/registry";
 import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
 import type { V2ReadyDescriptor } from "../src/v2/bootstrap/controller";
@@ -24,16 +26,24 @@ import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import type {
   V2TransportSnapshot,
 } from "../src/v2/transport/session";
-import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
+import {
+  V2CommittedError,
+  V2PreCommitError,
+  V2RunHandle,
+} from "../src/v2/transport/run-handle";
 import {
   V2SandboxRuntime,
   type V2RuntimeBootstrap,
   type V2RuntimeGovernor,
   type V2RuntimeHeartbeat,
   type V2RuntimeHeartbeatCallbacks,
+  type V2RuntimeHeartbeatResult,
   type V2RuntimeTransport,
   type V2RuntimeYDoc,
 } from "../src/v2/runtime";
+import type { V2SidecarRecoveryToken } from "../src/v2/transport/session";
+import { chooseRuntime, type RouteCandidate } from "../src/router/policy";
+import type { WorkloadDescriptor } from "../src/router/workload";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS: V2SidecarAssets = {
@@ -109,26 +119,44 @@ class FakeAwareness implements AwarenessChannel<HostFrame, SidecarFrame> {
   readonly projectId = PROJECT;
   readonly localPeerId = "host";
   rotations = 0;
+  readonly rotationTokens: string[] = [];
+  readonly failureListeners = new Set<(error: Error) => void>();
+  rotationError: Error | null = null;
   async connect(): Promise<void> {}
   publish(_envelope: AwarenessEnvelope<HostFrame>): void {}
   clear(): void {}
   subscribe(): () => void { return () => {}; }
   peerIds(): readonly string[] { return []; }
-  rotateCredential(): void { this.rotations++; }
+  async rotateCredential(ySweet: YSweetEnvelope): Promise<void> {
+    this.rotations++;
+    this.rotationTokens.push(ySweet.token.reveal());
+    if (this.rotationError) throw this.rotationError;
+  }
+  onConnectionFailure(listener: (error: Error) => void): () => void {
+    this.failureListeners.add(listener);
+    return () => this.failureListeners.delete(listener);
+  }
+  fail(error = new Error("awareness disconnected")): void {
+    for (const listener of this.failureListeners) listener(error);
+  }
   async close(): Promise<void> {}
 }
 
 class FakeBootstrap implements V2RuntimeBootstrap {
   drains = 0;
+  forceStops = 0;
+  ensureReadyWait: ((signal?: AbortSignal) => Promise<void>) | null = null;
   constructor(
     readonly order: string[],
     readonly descriptor: V2ReadyDescriptor,
   ) {}
-  async ensureReady(): Promise<V2ReadyDescriptor> {
+  async ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor> {
     this.order.push("bootstrap");
+    await this.ensureReadyWait?.(signal);
     return this.descriptor;
   }
   async drainAndStop(): Promise<void> { this.drains++; }
+  async forceStop(): Promise<void> { this.forceStops++; }
   async sealCredentialRotation(): Promise<string> {
     return JSON.stringify({ encrypted: "rotation" });
   }
@@ -142,9 +170,21 @@ class FakeTransport implements V2RuntimeTransport {
   }> = [];
   hostCeilings: number[] = [];
   rotations = 0;
+  awarenessResumes = 0;
   drains = 0;
+  forceStops = 0;
   closes = 0;
   livenessProbes = 0;
+  recoverySuspends = 0;
+  recoveryAdopts = 0;
+  recoveryFailures = 0;
+  recoveryAdoptError: Error | null = null;
+  recoveryAdoptPromise: Promise<void> | null = null;
+  connectPromise: Promise<void> | null = null;
+  rotationPromise: Promise<void> | null = null;
+  connectCalls = 0;
+  binding: ProtocolBinding | null = null;
+  expectedInstanceId = "sidecar-instance-1";
   probeLiveness?: (signal?: AbortSignal) => Promise<{ rttMs: number; sentAtMs: number }>;
 
   constructor(
@@ -165,11 +205,18 @@ class FakeTransport implements V2RuntimeTransport {
   }
   async connect(): Promise<void> {
     this.order.push("transport");
+    this.connectCalls++;
+    if (this.connectPromise) await this.connectPromise;
     this.snapshotValue.connected = true;
   }
-  async run(): Promise<RunHandle> {
+  async run(
+    _body?: Record<string, unknown>,
+    _signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
     this.snapshotValue.active++;
     this.snapshotValue.committed++;
+    options?.onAdmissionReflected?.();
     const final = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pending.push({ resolve, reject });
     }).finally(() => {
@@ -183,10 +230,30 @@ class FakeTransport implements V2RuntimeTransport {
     };
   }
   async drain(): Promise<void> { this.drains++; this.snapshotValue.connected = false; }
+  async forceStop(): Promise<void> { this.forceStops++; this.snapshotValue.connected = false; }
   async close(): Promise<void> { this.closes++; this.snapshotValue.connected = false; }
   snapshot(): V2TransportSnapshot { return { ...this.snapshotValue }; }
   setHostCeiling(value: number): void { this.hostCeilings.push(value); }
-  async rotateCredential(): Promise<void> { this.rotations++; }
+  async rotateCredential(): Promise<void> {
+    this.rotations++;
+    if (this.rotationPromise) await this.rotationPromise;
+  }
+  async resumeAwareness(): Promise<void> { this.awarenessResumes++; }
+  async suspendSidecarRecovery(): Promise<V2SidecarRecoveryToken> {
+    this.recoverySuspends++;
+    if (!this.binding) throw new Error("missing fake binding");
+    return {
+      id: `capsule-${this.recoverySuspends}`,
+      binding: this.binding,
+      previousInstanceId: this.expectedInstanceId,
+    };
+  }
+  async adoptRecoveredSidecar(): Promise<void> {
+    this.recoveryAdopts++;
+    if (this.recoveryAdoptError) throw this.recoveryAdoptError;
+    if (this.recoveryAdoptPromise) await this.recoveryAdoptPromise;
+  }
+  failSidecarRecovery(): void { this.recoveryFailures++; }
 }
 
 class FakeGovernor implements V2RuntimeGovernor {
@@ -239,6 +306,16 @@ function runtimeHarness(options: {
   authSandbox?: ProvisionedSandbox;
   rotateSameSession?: boolean;
   initialSandbox?: ProvisionedSandbox;
+  stopTimeoutMs?: number;
+  sidecarRecoveryTimeoutMs?: number;
+  enableR2Recovery?: boolean;
+  recoveryAdoptError?: Error;
+  heartbeatSessionId?: string;
+  recoveryAdoptPending?: boolean;
+  recoveryBootstrapDelayMs?: number;
+  recoveryConnectPending?: boolean;
+  gatewayHeartbeatOutcomes?: V2RuntimeHeartbeatResult[];
+  initialRotationPending?: boolean;
 } = {}) {
   const order: string[] = [];
   const clock = new ManualClock();
@@ -248,8 +325,18 @@ function runtimeHarness(options: {
   let acquisitions = 0;
   let acquiredProvisions = 0;
   let provisions = 0;
+  let gatewayHeartbeats = 0;
+  let gatewayRotations = 0;
   let refreshedSandboxToken: string | null = null;
   const credentialOutcomes: string[] = [];
+  const awarenessCredentials: Array<{ sandboxToken: string; ySweetToken: string }> = [];
+  const bootstrapCredentials: Array<{ sandboxToken: string; ySweetToken: string }> = [];
+  const heartbeatOutcomes = [...(options.gatewayHeartbeatOutcomes ?? [])];
+  let releaseInitialRotation: (() => void) | null = null;
+  let releaseRecoveryAdopt: (() => void) | null = null;
+  const initialRotationPromise = options.initialRotationPending
+    ? new Promise<void>(resolve => { releaseInitialRotation = resolve; })
+    : null;
   let heartbeatCallbacks: V2RuntimeHeartbeatCallbacks | null = null;
   const provisioner = {
     async provision(
@@ -306,9 +393,14 @@ function runtimeHarness(options: {
   const heartbeat = new FakeHeartbeat(order, clock);
   const ydoc = new FakeYDoc(order);
   const awareness = new FakeAwareness();
+  const awarenesses = [awareness];
+  let awarenessCalls = 0;
+  const assets = options.enableR2Recovery
+    ? { ...ASSETS, revision: "r2" as const }
+    : ASSETS;
   const descriptor: V2ReadyDescriptor = {
     instanceId: "sidecar-instance-1",
-    protocolRevision: "r1",
+    protocolRevision: options.enableR2Recovery ? "r2" : "r1",
     launchNonce: "runtime-launch-placeholder",
     buildHash: ASSETS.buildHash,
     schemaHash: ASSETS.schemaHash,
@@ -316,7 +408,10 @@ function runtimeHarness(options: {
     capacity: options.sidecarCapacity ?? 128,
   };
   const bootstrap = new FakeBootstrap(order, descriptor);
+  const bootstraps = [bootstrap];
   const transport = new FakeTransport(order, { credits: options.credits ?? 128 });
+  transport.rotationPromise = initialRotationPromise;
+  const transports = [transport];
   if (options.livenessOutcomes) {
     const outcomes = [...options.livenessOutcomes];
     transport.probeLiveness = async signal => {
@@ -335,31 +430,87 @@ function runtimeHarness(options: {
     provisioning: provisioner,
     governor,
     clock,
-    assets: ASSETS,
+    assets,
     transportReservationBytes: 16 * 1024 * 1024,
     ySweetRefreshMs: 300_000,
+    stopTimeoutMs: options.stopTimeoutMs,
+    sidecarRecoveryTimeoutMs: options.sidecarRecoveryTimeoutMs,
     initialSandbox: options.initialSandbox,
     onCredentialRefresh: outcome => credentialOutcomes.push(outcome),
     createGateway: (_sandbox: ProvisionedSandbox) => ({
-      heartbeat: async () => ({
-        ok: true,
-        status: 200,
-        durationMs: 1,
-        sessionId: "sandbox-session-1",
-      }),
-      rotateSameSession: () => options.rotateSameSession ?? false,
+      heartbeat: async () => {
+        gatewayHeartbeats++;
+        return heartbeatOutcomes.shift() ?? {
+          ok: true,
+          status: 200,
+          durationMs: 1,
+          sessionId: options.heartbeatSessionId ?? "sandbox-session-1",
+        };
+      },
+      rotateSameSession: () => {
+        gatewayRotations++;
+        return options.rotateSameSession ?? false;
+      },
     }),
     createHeartbeat: (_gateway, callbacks) => {
       heartbeatCallbacks = callbacks;
       return heartbeat;
     },
     createYDoc: () => ydoc,
-    createAwareness: (_binding: ProtocolBinding) => awareness,
-    createBootstrap: input => {
-      (descriptor as { launchNonce: string }).launchNonce = input.binding.launchNonce;
-      return bootstrap;
+    createAwareness: (_binding: ProtocolBinding, runtimeCredentials) => {
+      awarenessCredentials.push({
+        sandboxToken: runtimeCredentials.sandbox.token.reveal(),
+        ySweetToken: runtimeCredentials.ySweet.token.reveal(),
+      });
+      if (awarenessCalls++ === 0) return awareness;
+      const next = new FakeAwareness();
+      awarenesses.push(next);
+      return next;
     },
-    createTransport: () => transport,
+    createBootstrap: input => {
+      bootstrapCredentials.push({
+        sandboxToken: input.credentials.sandbox.token.reveal(),
+        ySweetToken: input.credentials.ySweet.token.reveal(),
+      });
+      if (bootstraps.length === 1 && !transport.binding) {
+        (descriptor as { launchNonce: string }).launchNonce = input.binding.launchNonce;
+        return bootstrap;
+      }
+      const nextDescriptor: V2ReadyDescriptor = {
+        ...descriptor,
+        instanceId: `sidecar-instance-${bootstraps.length + 1}`,
+        launchNonce: input.binding.launchNonce,
+      };
+      const next = new FakeBootstrap(order, nextDescriptor);
+      if (options.recoveryBootstrapDelayMs) {
+        next.ensureReadyWait = signal => clock.sleep(options.recoveryBootstrapDelayMs!, signal);
+      }
+      bootstraps.push(next);
+      return next;
+    },
+    createTransport: input => {
+      if (!transport.binding) {
+        transport.binding = input.binding;
+        transport.expectedInstanceId = input.expectedSidecarInstanceId;
+        return transport;
+      }
+      const next = new FakeTransport(order, { credits: options.credits ?? 128 });
+      next.binding = input.binding;
+      next.expectedInstanceId = input.expectedSidecarInstanceId;
+      next.probeLiveness = async () => {
+        next.livenessProbes++;
+        return { rttMs: 1, sentAtMs: clock.now() };
+      };
+      next.recoveryAdoptError = options.recoveryAdoptError ?? null;
+      if (options.recoveryAdoptPending) {
+        next.recoveryAdoptPromise = new Promise<void>(resolve => {
+          releaseRecoveryAdopt = resolve;
+        });
+      }
+      if (options.recoveryConnectPending) next.connectPromise = new Promise(() => undefined);
+      transports.push(next);
+      return next;
+    },
   });
   return {
     runtime,
@@ -370,13 +521,22 @@ function runtimeHarness(options: {
     awareness,
     governor,
     bootstrap,
+    bootstraps,
+    awarenesses,
+    transports,
     refreshes: () => refreshes,
     ySweetMints: () => ySweetMints,
     acquisitions: () => acquisitions,
     provisions: () => provisions,
     acquiredProvisions: () => acquiredProvisions,
+    gatewayHeartbeats: () => gatewayHeartbeats,
+    gatewayRotations: () => gatewayRotations,
     refreshedSandboxToken: () => refreshedSandboxToken,
     credentialOutcomes,
+    awarenessCredentials,
+    bootstrapCredentials,
+    releaseInitialRotation: () => releaseInitialRotation?.(),
+    releaseRecoveryAdopt: () => releaseRecoveryAdopt?.(),
     heartbeatSuccess: () => heartbeatCallbacks?.onSuccess({
       ok: true,
       status: 200,
@@ -394,6 +554,76 @@ function runtimeHarness(options: {
 }
 
 describe("V2SandboxRuntime", () => {
+  it("forwards the exact admission ownership callback to transport", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    let reflected = 0;
+    const handle = await harness.runtime.run(
+      { model: "gpt-5.6-sol", input: "handoff" },
+      undefined,
+      { onAdmissionReflected: () => { reflected++; } },
+    );
+    expect(reflected).toBe(1);
+    harness.transport.pending.shift()?.resolve({ id: "resp_handoff", status: "completed" });
+    await handle.final;
+    await harness.runtime.stop();
+  });
+
+  it("classifies lifecycle guard failures as safe local pre-commit outcomes", async () => {
+    const notReady = runtimeHarness();
+    await expect(notReady.runtime.run({ model: "gpt-5.6-sol", input: "early" }))
+      .rejects.toMatchObject({
+        name: "V2PreCommitError",
+        committed: false,
+        code: "not_ready",
+        message: "V2 sandbox runtime is not ready",
+      });
+    expect(notReady.transport.pending).toHaveLength(0);
+
+    const recovering = runtimeHarness();
+    await recovering.runtime.start();
+    recovering.heartbeatExpired(401);
+    await expect(recovering.runtime.run({ model: "gpt-5.6-sol", input: "recover" }))
+      .rejects.toMatchObject({
+        name: "V2PreCommitError",
+        committed: false,
+        code: "recovering",
+        message: "V2 sandbox runtime is recovering",
+      });
+    expect(recovering.transport.pending).toHaveLength(0);
+    await recovering.runtime.stop();
+
+    const draining = runtimeHarness();
+    await draining.runtime.start();
+    const drained = draining.runtime.drain("test lifecycle guard");
+    await expect(draining.runtime.run({ model: "gpt-5.6-sol", input: "late" }))
+      .rejects.toMatchObject({
+        name: "V2PreCommitError",
+        committed: false,
+        code: "draining",
+        message: "V2 sandbox runtime is draining",
+      });
+    expect(draining.transport.pending).toHaveLength(0);
+    await drained;
+  });
+
+  it("does not relabel transport committed failures as safe pre-commit guards", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    const committed = new V2CommittedError(
+      "provider request already committed",
+      "rate_limit_exceeded",
+      false,
+      { retryAfterMs: 17 },
+    );
+    harness.transport.run = async () => { throw committed; };
+
+    await expect(harness.runtime.run({ model: "gpt-5.6-sol", input: "committed" }))
+      .rejects.toBe(committed);
+    expect(committed).not.toBeInstanceOf(V2PreCommitError);
+    await harness.runtime.stop();
+  });
+
   it("dynamically forwards prelude and late rate metadata from the transport handle", async () => {
     const harness = runtimeHarness();
     const realHandle = new V2RunHandle({
@@ -422,6 +652,105 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("keeps resolved streamed 429 and rejected event:error routing inputs neutral", async () => {
+    const resolved = runtimeHarness();
+    const rejected = runtimeHarness();
+    await resolved.runtime.start();
+    await rejected.runtime.start();
+
+    const seedUnhealthy = async (harness: ReturnType<typeof runtimeHarness>) => {
+      const handle = await harness.runtime.run({ model: "gpt-5.6-sol", input: "seed" });
+      harness.transport.pending.at(-1)!.reject(new V2CommittedError(
+        "ambiguous transport reset",
+        "transport",
+        true,
+      ));
+      await expect(handle.final).rejects.toMatchObject({ code: "transport" });
+      expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.2);
+    };
+    await seedUnhealthy(resolved);
+    await seedUnhealthy(rejected);
+
+    const realHandle = new V2RunHandle({ maxBufferedBytes: 4_096 });
+    resolved.transport.run = async () => realHandle;
+    const resolvedHandle = await resolved.runtime.run({ model: "gpt-5.6-sol", input: "resolved" });
+    const final = {
+      id: "resp_streamed_429",
+      status: "failed",
+      error: {
+        type: "rate_limit_error",
+        code: "rate_limit_exceeded",
+        message: "Rate limit reached. Please try again in 136ms.",
+      },
+    };
+    realHandle.settle(final, { retryAfterMs: 136, remainingTokens: 0 });
+    await expect(resolvedHandle.final).resolves.toBe(final);
+    expect(resolvedHandle.rateLimit).toEqual({ retryAfterMs: 136, remainingTokens: 0 });
+
+    const evidenceOnly = new V2RunHandle({ maxBufferedBytes: 4_096 });
+    resolved.transport.run = async () => evidenceOnly;
+    const evidenceWrapped = await resolved.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "evidence-only",
+    });
+    const incomplete = {
+      id: "resp_streamed_incomplete_429",
+      status: "incomplete",
+      error: {
+        code: "rate_limit_exceeded",
+        message: "Rate limit reached. Please try again in 136ms.",
+      },
+    };
+    evidenceOnly.settle(incomplete);
+    await expect(evidenceWrapped.final).resolves.toBe(incomplete);
+
+    const rejectedHandle = await rejected.runtime.run({ model: "gpt-5.6-sol", input: "rejected" });
+    rejected.transport.pending.at(-1)!.reject(new V2CommittedError(
+      "Rate limit reached. Please try again in 136ms.",
+      "rate_limit_exceeded",
+      false,
+      { retryAfterMs: 136, remainingTokens: 0 },
+    ));
+    await expect(rejectedHandle.final).rejects.toMatchObject({ code: "rate_limit_exceeded" });
+
+    const resolvedSnapshot = resolved.runtime.snapshot();
+    const rejectedSnapshot = rejected.runtime.snapshot();
+    expect(resolvedSnapshot.completionEwmaMs).toBe(10_000);
+    expect(rejectedSnapshot.completionEwmaMs).toBe(10_000);
+    expect(resolvedSnapshot.recentFailureRate).toBeCloseTo(
+      rejectedSnapshot.recentFailureRate,
+      8,
+    );
+
+    const workload: WorkloadDescriptor = {
+      class: "text-small",
+      requestBytes: 1_024,
+      reservedBytes: 8 * 1024 ** 2,
+      cpuPermits: 0,
+      stream: true,
+    };
+    const candidate = (
+      snapshot: typeof resolvedSnapshot,
+      suffix: string,
+    ): RouteCandidate => ({
+      ...snapshot,
+      projectId: projectId(`00000000-0000-4000-8000-${suffix.padStart(12, "0")}`),
+      reserved: 0,
+    });
+    const left = chooseRuntime(workload, [candidate(resolvedSnapshot, "1")], {
+      next: () => 0,
+      uuid: () => "left",
+    });
+    const right = chooseRuntime(workload, [candidate(rejectedSnapshot, "2")], {
+      next: () => 0,
+      uuid: () => "right",
+    });
+    expect(left?.predictedCompletionMs).toBe(right?.predictedCompletionMs);
+
+    await resolved.runtime.stop();
+    await rejected.runtime.stop();
+  });
+
   it("reaches ready only after provision, heartbeat, YDoc, bootstrap, and transport", async () => {
     const harness = runtimeHarness();
 
@@ -430,6 +759,9 @@ describe("V2SandboxRuntime", () => {
     expect(harness.order).toEqual(["provision", "heartbeat", "ydoc", "bootstrap", "transport"]);
     expect(harness.runtime.snapshot()).toMatchObject({
       state: "ready",
+      protocolRevision: "r1",
+      buildHash: ASSETS.buildHash,
+      schemaHash: ASSETS.schemaHash,
       capacity: 128,
       active: 0,
       quarantined: 0,
@@ -634,6 +966,316 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("relaunches one R2 sidecar in the same sandbox session without provisioning", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+    });
+    await harness.runtime.start();
+    const originalNonce = harness.transport.binding!.launchNonce;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await harness.clock.advanceBy(10_000);
+    }
+    for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.runtime.snapshot().state).toBe("ready");
+
+    expect(harness.provisions()).toBe(1);
+    expect(harness.acquisitions()).toBe(0);
+    expect(harness.transport.recoverySuspends).toBe(1);
+    expect(harness.bootstrap.forceStops).toBe(1);
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+    expect(harness.awarenesses).toHaveLength(2);
+    expect(harness.transports[1]!.binding).toMatchObject({
+      projectId: PROJECT,
+      sessionId: "sandbox-session-1",
+      leaderGeneration: 4,
+      protocolRevision: "r2",
+    });
+    expect(harness.transports[1]!.binding!.launchNonce).not.toBe(originalNonce);
+    await harness.runtime.stop();
+  });
+
+  it("evaluates replay-time ambiguity against the adopted candidate instead of the retired source", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      recoveryAdoptPending: true,
+      sidecarRecoveryTimeoutMs: 100_000,
+    });
+    await harness.runtime.start();
+    const handle = await harness.runtime.run({ model: "gpt-5.6-sol", input: "replay ambiguity" });
+    void handle.final.catch(() => undefined);
+
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (
+      let turn = 0;
+      turn < 200 && (harness.transports.length < 2 || harness.transports[1]!.recoveryAdopts < 1);
+      turn++
+    ) await Promise.resolve();
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+
+    harness.transport.snapshotValue.connected = false;
+    harness.transport.snapshotValue.quarantined = 1;
+    harness.transport.snapshotValue.ambiguousQuarantined = 1;
+    harness.transport.snapshotValue.ambiguityLimit = 1;
+    harness.transport.pending[0]!.reject(new V2CommittedError(
+      "Recovered journal outcome is ambiguous",
+      "recovered_ambiguous",
+      true,
+    ));
+    await expect(handle.final).rejects.toMatchObject({ code: "recovered_ambiguous" });
+    expect(harness.runtime.snapshot().state).toBe("ready");
+
+    harness.releaseRecoveryAdopt();
+    for (let turn = 0; turn < 200 && !harness.transports[1]!.snapshotValue.connected; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.transports[1]!.snapshotValue.connected).toBe(true);
+    await harness.runtime.stop();
+  });
+
+  it("uses a dedicated recovery deadline when a valid R2 bootstrap outlives stop timeout", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      recoveryBootstrapDelayMs: 20,
+      stopTimeoutMs: 10,
+      sidecarRecoveryTimeoutMs: 100,
+    });
+    await harness.runtime.start();
+
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 200 && harness.bootstraps.length < 2; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.bootstraps).toHaveLength(2);
+
+    await harness.clock.advanceBy(11);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.transport.recoveryFailures).toBe(0);
+
+    await harness.clock.advanceBy(9);
+    for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+    await harness.runtime.stop();
+  });
+
+  for (const status of [401, 403] as const) {
+    it(`refreshes a same-session sandbox token and retries a ${status} recovery heartbeat`, async () => {
+      const failure = new Error("sidecar unavailable");
+      const refreshedSandbox = parseProvisionedSandbox({
+        url: "https://prism.test/s/sandboxes/proxy",
+        token: `sandbox-token-${status}`,
+        sandbox_session_id: "sandbox-session-1",
+      });
+      const harness = runtimeHarness({
+        enableR2Recovery: true,
+        livenessOutcomes: [null, failure, failure, failure],
+        authSandbox: refreshedSandbox,
+        rotateSameSession: true,
+        gatewayHeartbeatOutcomes: [
+          { ok: false, status, durationMs: 1, sessionId: null },
+          { ok: true, status: 200, durationMs: 1, sessionId: "sandbox-session-1" },
+        ],
+      });
+      await harness.runtime.start();
+
+      for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 300 && harness.transports.length < 2; turn++) {
+        await Promise.resolve();
+      }
+
+      expect(harness.runtime.snapshot().state).toBe("ready");
+      expect(harness.transports).toHaveLength(2);
+      expect(harness.gatewayHeartbeats()).toBeGreaterThanOrEqual(2);
+      expect(harness.gatewayRotations()).toBe(1);
+      expect(harness.acquisitions()).toBe(1);
+      expect(harness.provisions()).toBe(1);
+      expect(harness.credentialOutcomes).toEqual(["updated_in_place"]);
+      expect(harness.awarenessCredentials.at(-1)?.sandboxToken).toBe(`sandbox-token-${status}`);
+      expect(harness.bootstrapCredentials.at(-1)?.sandboxToken).toBe(`sandbox-token-${status}`);
+      await harness.runtime.stop();
+    });
+  }
+
+  it("fences an in-flight Y-Sweet rotation from a replacement R2 stack", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+      resourceExpiresInMs: 1_200_000,
+      initialRotationPending: true,
+      sidecarRecoveryTimeoutMs: 100_000,
+    });
+    await harness.runtime.start();
+
+    await harness.clock.advanceBy(300_001);
+    for (let turn = 0; turn < 200 && harness.transport.rotations < 1; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.ySweetMints()).toBe(1);
+    expect(harness.transport.rotations).toBe(1);
+    expect(harness.awareness.rotations).toBe(0);
+
+    harness.transport.probeLiveness = async signal => {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      harness.transport.livenessProbes++;
+      throw failure;
+    };
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.bootstrapCredentials).toHaveLength(1);
+
+    harness.releaseInitialRotation();
+    for (let turn = 0; turn < 300 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.awarenessCredentials.at(-1)?.ySweetToken).toBe("y-token-1");
+    expect(harness.bootstrapCredentials.at(-1)?.ySweetToken).toBe("y-token-1");
+    expect(harness.awarenesses[0]!.rotations).toBe(1);
+    expect(harness.awarenesses[0]!.rotationTokens).toEqual(["y-token-1"]);
+    expect(harness.awarenesses[1]!.rotations).toBe(0);
+    await harness.runtime.stop();
+  });
+
+  it("remints and reconnects Y-Sweet immediately after an Awareness disconnect", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000 });
+    await harness.runtime.start();
+    expect(harness.runtime.snapshot().capacity).toBe(128);
+
+    harness.awareness.fail(new Error("revoked Y-Sweet connection"));
+    expect(harness.runtime.snapshot()).toMatchObject({ capacity: 0, available: 0 });
+    for (let turn = 0; turn < 300 && harness.runtime.snapshot().capacity === 0; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.ySweetMints()).toBe(1);
+    expect(harness.transport.rotations).toBe(1);
+    expect(harness.transport.awarenessResumes).toBe(1);
+    expect(harness.awareness.rotationTokens).toEqual(["y-token-1"]);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.runtime.snapshot().capacity).toBe(128);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.provisions()).toBe(1);
+    await harness.runtime.stop();
+  });
+
+  it("cleans a created R2 candidate before stop reports the runtime stopped", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      recoveryConnectPending: true,
+      stopTimeoutMs: 25,
+      sidecarRecoveryTimeoutMs: 100,
+    });
+    await harness.runtime.start();
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (
+      let turn = 0;
+      turn < 200 && (harness.transports.length < 2 || harness.transports[1]!.connectCalls < 1);
+      turn++
+    ) {
+      await Promise.resolve();
+    }
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.transports[1]!.connectCalls).toBe(1);
+
+    let stopSettled = false;
+    const stopping = harness.runtime.stop().then(() => { stopSettled = true; });
+    for (let turn = 0; turn < 100 && !stopSettled; turn++) await Promise.resolve();
+    await harness.clock.advanceBy(25);
+    for (let turn = 0; turn < 200 && !stopSettled; turn++) await Promise.resolve();
+
+    expect(stopSettled).toBe(true);
+    expect(harness.transports[1]!.forceStops).toBeGreaterThanOrEqual(1);
+    expect(harness.bootstraps[1]!.forceStops).toBeGreaterThanOrEqual(1);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+    await stopping;
+  });
+
+  it("fails the recovery capsule before fresh-generation fallback when adoption fails", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      recoveryAdoptError: new Error("replay barrier failed"),
+    });
+    await harness.runtime.start();
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 200 && harness.runtime.snapshot().state !== "failed"; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.runtime.snapshot().state).toBe("failed");
+    expect(harness.transport.recoverySuspends).toBe(1);
+    expect(harness.transports[1]!.recoveryFailures).toBe(1);
+    expect(harness.provisions()).toBe(1);
+    await harness.runtime.stop();
+  });
+
+  it("refuses local relaunch when heartbeat proves a different sandbox session", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      heartbeatSessionId: "different-sandbox-session",
+    });
+    await harness.runtime.start();
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 200 && harness.runtime.snapshot().state !== "failed"; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.runtime.snapshot().state).toBe("failed");
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    await harness.runtime.stop();
+  });
+
+  it("bounds a single in-place relaunch whose replay barrier never completes", async () => {
+    const failure = new Error("sidecar unavailable");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, failure, failure, failure],
+      recoveryAdoptPending: true,
+      stopTimeoutMs: 10,
+      sidecarRecoveryTimeoutMs: 10,
+    });
+    await harness.runtime.start();
+    for (let attempt = 0; attempt < 3; attempt++) await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 100 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+    expect(harness.transports).toHaveLength(2);
+    await harness.clock.advanceBy(10);
+    for (let turn = 0; turn < 200 && harness.runtime.snapshot().state !== "failed"; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.runtime.snapshot().state).toBe("failed");
+    expect(harness.transport.recoverySuspends).toBe(1);
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+    expect(harness.transports[1]!.recoveryFailures).toBe(1);
+    await harness.runtime.stop();
+  });
+
   it("advertises the lower sidecar and credit ceiling without duplicating global memory", async () => {
     const harness = runtimeHarness({
       sidecarCapacity: 128,
@@ -821,5 +1463,94 @@ describe("V2SandboxRuntime", () => {
     await expect(healthy.final).resolves.toMatchObject({ id: "resp_healthy" });
     expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.08);
     await harness.runtime.stop();
+  });
+
+  it("force-stops a ready sidecar exactly once across concurrent stop calls", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    await Promise.all([harness.runtime.stop(), harness.runtime.stop()]);
+
+    expect(harness.transport.forceStops).toBe(1);
+    expect(harness.bootstrap.forceStops).toBe(1);
+    expect(harness.transport.closes).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("preserves graceful transport drain without invoking force retirement", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    await harness.runtime.drain("graceful shutdown");
+
+    expect(harness.transport.drains).toBe(1);
+    expect(harness.transport.forceStops).toBe(0);
+    expect(harness.bootstrap.forceStops).toBe(0);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("retires a ready sidecar when transport connection fails", async () => {
+    const harness = runtimeHarness();
+    harness.transport.connect = async () => {
+      harness.order.push("transport");
+      throw new Error("synthetic connect failure");
+    };
+
+    await expect(harness.runtime.start()).rejects.toThrow("synthetic connect failure");
+
+    expect(harness.transport.forceStops).toBe(1);
+    expect(harness.bootstrap.forceStops).toBe(1);
+    expect(harness.transport.closes).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("failed");
+  });
+
+  it("bounds a hung remote force-stop and still closes the old runtime", async () => {
+    const harness = runtimeHarness({ stopTimeoutMs: 10 });
+    await harness.runtime.start();
+    harness.transport.forceStop = async () => new Promise<void>(() => undefined);
+
+    const stopping = harness.runtime.stop();
+    let stopped = false;
+    void stopping.then(() => { stopped = true; });
+    for (let index = 0; index < 10 && !stopped; index++) {
+      await harness.clock.advanceBy(10);
+    }
+    await stopping;
+
+    expect(harness.bootstrap.forceStops).toBe(1);
+    expect(harness.transport.closes).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("cannot resurrect after stop while ensureReady ignores cancellation", async () => {
+    const harness = runtimeHarness({ stopTimeoutMs: 10 });
+    let resolveReady!: (descriptor: V2ReadyDescriptor) => void;
+    harness.bootstrap.ensureReady = async () => new Promise<V2ReadyDescriptor>(resolve => {
+      resolveReady = resolve;
+    });
+    const starting = harness.runtime.start();
+    for (let index = 0; index < 10 && !resolveReady; index++) await Promise.resolve();
+
+    const stopping = harness.runtime.stop();
+    let stopped = false;
+    void stopping.then(() => { stopped = true; });
+    for (let index = 0; index < 10 && !stopped; index++) {
+      await harness.clock.advanceBy(10);
+    }
+    await stopping;
+    resolveReady({
+      instanceId: "late-sidecar",
+      protocolRevision: "r1",
+      launchNonce: "late-launch",
+      buildHash: ASSETS.buildHash,
+      schemaHash: ASSETS.schemaHash,
+      leaderGeneration: 4,
+      capacity: 8,
+    });
+    await starting;
+
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+    expect(harness.transport.snapshotValue.connected).toBe(false);
+    await expect(harness.runtime.start()).rejects.toThrow("single-use");
   });
 });

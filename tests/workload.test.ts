@@ -34,12 +34,38 @@ describe("workload classification", () => {
     expect(edit.cpuPermits).toBe(1);
   });
 
-  it("honors precomputed encoded byte sizes without serializing twice", () => {
+  it("honors precomputed encoded byte sizes without retaining a serialized copy", () => {
+    const body: Record<string, unknown> = {
+      model: "gpt-5.6-sol",
+      input: "already encoded",
+    };
     const workload = classifyWorkload(
-      { model: "gpt-5.6-sol", input: "already encoded" },
-      { encodedBytes: 2 * MiB, serializedBody: '{"precomputed":true}' },
+      body,
+      { encodedBytes: 2 * MiB },
     );
     expect(workload.requestBytes).toBe(2 * MiB);
-    expect(workload.serializedBody).toBe('{"precomputed":true}');
+    expect(workload).not.toHaveProperty("serializedBody");
+  });
+
+  it("never trusts a shorter wire spelling than canonical structural JSON", () => {
+    const body = { model: "gpt-5.6-sol", input: Array(1_000).fill(1e-6) };
+    const canonicalBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
+    const workload = classifyWorkload(body, { encodedBytes: 4_000 });
+    expect(workload.requestBytes).toBe(canonicalBytes);
+    expect(() => classifyWorkload(body, { encodedBytes: Number.NaN })).toThrow(RangeError);
+    expect(() => classifyWorkload(body, { encodedBytes: -1 })).toThrow(RangeError);
+  });
+
+  it("counts exact JSON UTF-8 bytes without retaining a large duplicate", () => {
+    const body = {
+      model: "gpt-5.6-sol",
+      input: `quotes:\" slash:\\ controls:\n unicode:©🚀 lone:\ud800 ${"x".repeat(MiB)}`,
+      nullable: null,
+      omitted: undefined,
+      values: [true, false, Number.NaN, undefined],
+    };
+    const workload = classifyWorkload(body);
+    expect(workload.requestBytes).toBe(Buffer.byteLength(JSON.stringify(body), "utf8"));
+    expect(workload).not.toHaveProperty("serializedBody");
   });
 });

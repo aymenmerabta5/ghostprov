@@ -4,12 +4,9 @@ import type { Awareness } from "y-protocols/awareness";
 import type { BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
 import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
-  GP_V2_FLIGHT_MAX_BYTES,
-  GP_V2_FLIGHT_MAX_FRAMES,
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
-  GP_V2_WINDOW_MAX_BYTES,
-  GP_V2_WINDOW_MAX_FRAMES,
+  protocolTransportLimits,
   type AwarenessLane,
   type AwarenessEnvelope,
   type HostFrame,
@@ -17,7 +14,9 @@ import {
   type ReliableFrame,
   type R2AwarenessEnvelope,
   type R2RequestCommitFrame,
+  type R2RequestStartFrame,
   type SidecarFrame,
+  type V2ProtocolTransportLimits,
 } from "../../src/v2/protocol/shared.ts";
 import { AckClockedFlight } from "../../src/v2/protocol/flight.ts";
 import {
@@ -39,6 +38,7 @@ import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/val
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 import { TransportCongestion } from "../../src/v2/transport/congestion.ts";
 import { AdaptiveTransportCapacity } from "../../src/v2/transport/adaptive-capacity.ts";
+import { V2_TERMINAL_SPOOL_CAPACITY } from "../../src/v2/sidecar/capacity.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -158,6 +158,7 @@ function sleepWithSignal(delayMs: number, signal: AbortSignal): Promise<void> {
 
 export class DenoAwarenessPeer {
   readonly #binding: ProtocolBinding;
+  readonly #limits: V2ProtocolTransportLimits;
   readonly #instanceId: string;
   readonly #engine: SidecarEngine;
   readonly #rotator: SidecarCredentialRotator;
@@ -228,14 +229,17 @@ export class DenoAwarenessPeer {
   #recoveryReplayFailed = false;
   #recoveryReplayInProgress = false;
   #recoveryReplayPromise: Promise<void> | null = null;
+  readonly #recoveryTerminalAcks = new Set<string>();
   #inboundFrozen = false;
   readonly #requestAcceptChains = new Map<string, Promise<void>>();
+  readonly #requestAcceptStarts = new Map<string, Promise<void>>();
   #controlAcceptChain: Promise<void> = Promise.resolve();
   readonly #processedReady = new Map<number, ReliableFrame<HostFrame>>();
   readonly #bootstrapProcessedReady = new Map<number, ReliableFrame<HostFrame>>();
 
   constructor(options: DenoAwarenessPeerOptions) {
     this.#binding = options.binding;
+    this.#limits = protocolTransportLimits(options.binding.protocolRevision);
     this.#instanceId = options.instanceId;
     if (
       options.binding.protocolRevision === "r2" &&
@@ -279,7 +283,7 @@ export class DenoAwarenessPeer {
     });
     this.#adaptiveCapacity = new AdaptiveTransportCapacity({
       initial: options.initialActivePerSandbox ?? 8,
-      maximum: options.maxActivePerSandbox ?? 16,
+      maximum: options.maxActivePerSandbox ?? V2_TERMINAL_SPOOL_CAPACITY,
     });
     this.#dataProvider.awareness.on("change", this.#onDataAwarenessChange);
     this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
@@ -292,7 +296,7 @@ export class DenoAwarenessPeer {
    * this before durable claim and at the upstream fetch boundary, not merely
    * when the transport first observes the commit frame.
    */
-  assertExecutionFence(frame: R2RequestCommitFrame): void {
+  assertExecutionFence(frame: R2RequestCommitFrame | R2RequestStartFrame): void {
     if (this.#binding.protocolRevision !== "r2") {
       throw new Error("R2 execution fence cannot be used by an R1 peer");
     }
@@ -327,7 +331,9 @@ export class DenoAwarenessPeer {
         current.peerId !== "host" ||
         current.instanceId !== this.#hostInstanceId ||
         current.targetInstanceId !== this.#instanceId ||
-        current.lane !== "control"
+        current.lane !== "control" ||
+        current.revision !== this.#hostRevision.control ||
+        current.draining
       ) throw new Error("R2 control election state is not current");
     } catch (error) {
       throw new Error("R2 execution fence is no longer elected", { cause: error });
@@ -415,6 +421,15 @@ export class DenoAwarenessPeer {
     weight = 1,
   ): void {
     if (this.#closed) return;
+    if (
+      this.#recoveryReplayInProgress &&
+      frame.kind === "response_terminal" &&
+      typeof (this.#engine as SidecarEngine & {
+        hasPendingTerminalAcknowledgement?: (requestId: string) => boolean;
+      }).hasPendingTerminalAcknowledgement === "function"
+    ) {
+      this.#recoveryTerminalAcks.add(frame.requestId);
+    }
     if (frame.kind === "response_batch") {
       this.#responseBatchFrames++;
       this.#logicalEvents += frame.items.length;
@@ -494,6 +509,8 @@ export class DenoAwarenessPeer {
     }
     this.#lifecycleAbort.abort(new DOMException("Awareness peer closed", "AbortError"));
     this.#closed = true;
+    this.#recoveryTerminalAcks.clear();
+    this.#requestAcceptStarts.clear();
     try { this.#pacer.close(); } catch (error) { lifecycleErrors.push(error); }
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
@@ -760,8 +777,18 @@ export class DenoAwarenessPeer {
             }
             continue;
           }
-          if (envelope.revision <= this.#hostRevision[lane]) continue;
-          if (lane === "control") this.#steadyHostActive = true;
+          if (envelope.revision <= this.#hostRevision[lane]) {
+            if (lane === "control" && clientId === this.#hostClientId.control) {
+              // Awareness replaces the raw value even when its application
+              // revision rolls back. Revoke election until a strictly newer
+              // exact control proof arrives; never validate execution against
+              // the stale recorded revision and the rolled-back raw state.
+              this.#hostClientId.control = null;
+              this.#steadyHostActive = false;
+            }
+            continue;
+          }
+          if (lane === "control") this.#steadyHostActive = !envelope.draining;
           else if (!this.#steadyHostActive) continue;
           this.#hostClientId[lane] = clientId;
           this.#hostRevision[lane] = envelope.revision;
@@ -885,12 +912,12 @@ export class DenoAwarenessPeer {
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const remainingFrames = Math.min(
-        GP_V2_FLIGHT_MAX_FRAMES - snapshot.frames.length,
-        GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length,
+        this.#limits.sidecarFlightMaxFrames - snapshot.frames.length,
+        this.#limits.windowMaxFrames - snapshot.frames.length,
       );
       const remainingBytes = Math.min(
-        GP_V2_FLIGHT_MAX_BYTES - snapshot.encodedBytes,
-        GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes,
+        this.#limits.sidecarFlightMaxBytes - snapshot.encodedBytes,
+        this.#limits.windowMaxBytes - snapshot.encodedBytes,
       );
       if (remainingFrames < 1 || remainingBytes < 512) break;
       const next = this.#scheduler.take(1, Math.min(15 * 1024, remainingBytes - 256));
@@ -1069,8 +1096,15 @@ export class DenoAwarenessPeer {
     ) return;
     const replayRecovered = (this.#engine as SidecarEngine & {
       replayRecovered?: (signal?: AbortSignal) => Promise<void>;
+      hasRecoveredWork?: () => boolean;
     }).replayRecovered;
     if (typeof replayRecovered !== "function") return;
+    const hasRecoveredWork = (this.#engine as SidecarEngine & {
+      hasRecoveredWork?: () => boolean;
+    }).hasRecoveredWork?.call(this.#engine) === true;
+    const recoveryRequested = this.#binding.protocolRevision === "r2" &&
+      envelope.credits === 0 && envelope.active > 0 && !envelope.draining;
+    if (!hasRecoveredWork && !recoveryRequested) return;
     this.#recoveryReplayStarted = true;
     this.#recoveryReplayInProgress = true;
     this.#inboundFrozen = true;
@@ -1078,6 +1112,19 @@ export class DenoAwarenessPeer {
     const replay = (async () => {
       await replayRecovered.call(this.#engine, this.#lifecycleAbort.signal);
       await this.#waitForReliableOutputDrain(this.#lifecycleAbort.signal);
+      await this.#waitForStableAcceptDrain(this.#lifecycleAbort.signal);
+      await this.#waitForRecoveryTerminalAcks(this.#lifecycleAbort.signal);
+      await this.#waitForStableAcceptDrain(this.#lifecycleAbort.signal);
+      if (this.#binding.protocolRevision === "r2") {
+        this.enqueue(
+          { kind: "recovery_complete" },
+          "control",
+          "recovery",
+        );
+        // Keep advertised credits at zero until the host has cumulatively
+        // acknowledged the explicit replay barrier itself.
+        await this.#waitForReliableOutputDrain(this.#lifecycleAbort.signal);
+      }
     })();
     this.#recoveryReplayPromise = replay;
     void replay.then(
@@ -1097,6 +1144,26 @@ export class DenoAwarenessPeer {
       this.#recoveryReplayInProgress = false;
       this.#pacer.requestUrgent();
     });
+  }
+
+  async #waitForStableAcceptDrain(signal: AbortSignal): Promise<void> {
+    for (;;) {
+      if (signal.aborted) throw signal.reason;
+      const control = this.#controlAcceptChain;
+      const requests = [...this.#requestAcceptChains.entries()];
+      await Promise.all([control, ...requests.map(([, pending]) => pending)]);
+      if (signal.aborted) throw signal.reason;
+      if (
+        control === this.#controlAcceptChain &&
+        this.#requestAcceptChains.size === 0
+      ) return;
+    }
+  }
+
+  async #waitForRecoveryTerminalAcks(signal: AbortSignal): Promise<void> {
+    while (this.#recoveryTerminalAcks.size > 0) {
+      await sleepWithSignal(5, signal);
+    }
   }
 
   #reportEngineError(value: unknown, fallback: string): void {
@@ -1133,8 +1200,31 @@ export class DenoAwarenessPeer {
     const previous = requestId
       ? this.#requestAcceptChains.get(requestId) ?? Promise.resolve()
       : this.#controlAcceptChain;
+    let markStarted: (() => void) | null = null;
+    const started = requestId
+      ? new Promise<void>(resolve => { markStarted = resolve; })
+      : Promise.resolve();
+    if (requestId) {
+      const previousStarted = this.#requestAcceptStarts.get(requestId) ?? Promise.resolve();
+      this.#requestAcceptStarts.set(requestId, started);
+      if (frame.kind === "request_cancel") {
+        // Preserve invocation order (open/data/commit must start first), then
+        // preempt a commit blocked in admission without waiting for its full
+        // asynchronous completion. The ordered accept below still processes
+        // the cancellation only after all earlier same-request frames settle.
+        void previousStarted.then(() => {
+          const preempt = (this.#engine as SidecarEngine & {
+            preemptRequest?: (requestId: string) => void;
+          }).preemptRequest;
+          preempt?.call(this.#engine, frame.requestId);
+        }).catch(error => this.#reportEngineError(error, "Request cancellation preemption failed"));
+      }
+    }
     const next = previous
-      .then(() => this.#acceptHostFrame(frame, this.#lifecycleAbort.signal))
+      .then(() => {
+        markStarted?.();
+        return this.#acceptHostFrame(frame, this.#lifecycleAbort.signal);
+      })
       .then(() => this.#markHostFrameProcessed(frame, bootstrapHost))
       .catch(error => {
         if (!this.#reportAcceptError(frame, error)) {
@@ -1147,11 +1237,17 @@ export class DenoAwarenessPeer {
         () => {
           if (this.#requestAcceptChains.get(requestId) === next) {
             this.#requestAcceptChains.delete(requestId);
+            if (this.#requestAcceptStarts.get(requestId) === started) {
+              this.#requestAcceptStarts.delete(requestId);
+            }
           }
         },
         () => {
           if (this.#requestAcceptChains.get(requestId) === next) {
             this.#requestAcceptChains.delete(requestId);
+            if (this.#requestAcceptStarts.get(requestId) === started) {
+              this.#requestAcceptStarts.delete(requestId);
+            }
           }
         },
       );
@@ -1203,7 +1299,8 @@ export class DenoAwarenessPeer {
     if (
       frame.kind === "request_open" ||
       frame.kind === "request_data" ||
-      frame.kind === "request_commit"
+      frame.kind === "request_commit" ||
+      frame.kind === "request_start"
     ) {
       this.enqueue({
         kind: "request_reject",
@@ -1257,6 +1354,14 @@ export class DenoAwarenessPeer {
   ): Promise<void> {
     if (frame.kind !== "credential_rotate") {
       await this.#engine.accept(frame, signal);
+      if (frame.kind === "response_ack" && this.#recoveryTerminalAcks.has(frame.requestId)) {
+        const pending = (this.#engine as SidecarEngine & {
+          hasPendingTerminalAcknowledgement?: (requestId: string) => boolean;
+        }).hasPendingTerminalAcknowledgement;
+        if (pending && !pending.call(this.#engine, frame.requestId)) {
+          this.#recoveryTerminalAcks.delete(frame.requestId);
+        }
+      }
       return;
     }
     await this.#rotator.accept(frame.rotationId, frame.sealedJson);

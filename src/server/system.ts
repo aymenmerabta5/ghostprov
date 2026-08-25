@@ -16,7 +16,11 @@ import {
   type CpuTransformJobOptions,
   type CpuTransformPoolSnapshot,
 } from "../router/cpu-transform-pool";
-import { ResourceGovernor, SystemMachineProbe } from "../router/resource-governor";
+import {
+  ResourceGovernor,
+  SystemMachineProbe,
+  type ResourceLease,
+} from "../router/resource-governor";
 import { MultiSandboxRouter } from "../router/router";
 import { SandboxGateway } from "../sandbox/gateway";
 import { SandboxHeartbeat } from "../sandbox/heartbeat";
@@ -50,10 +54,30 @@ import {
   normalizeSandboxRecoveryOperation,
   observabilityEvent,
   recoveryObservabilityEvent,
+  type JsonValue,
 } from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
 import { WebSocketTelemetry } from "../ws/telemetry";
-import { closeResponsesWebSockets } from "../ws/server";
+import {
+  closeResponsesWebSockets,
+  DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
+  DEFAULT_WS_PROCESS_MAX_QUEUED_BYTES,
+  DEFAULT_WS_PROCESS_MAX_SESSIONS,
+} from "../ws/server";
+import { WebSocketProcessBudget } from "../ws/session";
+import {
+  AtomicBytePermitPool,
+  type AtomicBytePermitPoolSnapshot,
+} from "../v2/memory/atomic-byte-permits";
+import {
+  checkedMemoryAdd,
+  type V2HostEventMemorySizing,
+} from "../v2/memory/event-memory-sizing";
+import { summarizeV2Releases } from "../v2/release-observability";
+import {
+  processResponseGraphBudget,
+  type SharedByteBudget,
+} from "../ws/response-graph";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -61,6 +85,7 @@ export interface BrowserlessSystemServer {
   off(event: string, listener: (...args: any[]) => void): this;
   listen(port: number, host: string, callback: () => void): this;
   close(callback?: (error?: Error) => void): this;
+  closeAllConnections?(): void;
 }
 
 export interface BrowserlessSessionManager {
@@ -88,6 +113,125 @@ export interface BrowserlessV2RevisionSelector {
   };
 }
 
+/** One process-wide pool backed by one fixed global-governor reservation. */
+export interface BrowserlessHostEventMemory {
+  readonly permits: AtomicBytePermitPool;
+  readonly reservedBytes: number;
+  snapshot(): AtomicBytePermitPoolSnapshot;
+  close(): void;
+}
+
+/** Fixed governor backing for long-lived WebSocket continuation graph bytes. */
+export interface BrowserlessResponseGraphMemory {
+  readonly budget: SharedByteBudget;
+  readonly reservedBytes: number;
+  close(): void;
+}
+
+export interface BrowserlessWebSocketIngressMemory {
+  readonly budget: WebSocketProcessBudget;
+  readonly reservedBytes: number;
+  close(): void;
+}
+
+export function reserveWebSocketIngressMemory(
+  governor: ResourceGovernor,
+  budget: WebSocketProcessBudget,
+): BrowserlessWebSocketIngressMemory {
+  const reservedBytes = budget.snapshot().maxIngressBytes;
+  let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
+  let closed = false;
+  return {
+    budget,
+    reservedBytes,
+    close() {
+      if (closed) return;
+      const snapshot = budget.snapshot();
+      if (snapshot.sessions !== 0 || snapshot.ingressReservedBytes !== 0) {
+        throw new Error(
+          `WebSocket ingress memory closed with ${snapshot.sessions} sessions and ` +
+          `${snapshot.ingressReservedBytes} reserved bytes`,
+        );
+      }
+      closed = true;
+      reservation?.release();
+      reservation = null;
+    },
+  };
+}
+
+export function reserveResponseGraphMemory(
+  governor: ResourceGovernor,
+  budget: SharedByteBudget = processResponseGraphBudget,
+): BrowserlessResponseGraphMemory {
+  const reservedBytes = budget.limit;
+  let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
+  let closed = false;
+  return {
+    budget,
+    reservedBytes,
+    close() {
+      if (closed) return;
+      // Never make live graph bytes uncharged. Callers must first close every
+      // WebSocket session, whose ResponseGraph.clear() returns this to zero.
+      if (budget.used !== 0) {
+        throw new Error(`Response graph memory closed with ${budget.used} retained bytes`);
+      }
+      closed = true;
+      reservation?.release();
+      reservation = null;
+    },
+  };
+}
+
+export function reserveHostEventMemoryPool(
+  governor: ResourceGovernor,
+  sizing: V2HostEventMemorySizing,
+): BrowserlessHostEventMemory {
+  const reservedBytes = checkedMemoryAdd(
+    sizing.ordinaryBytes,
+    sizing.jumboBytes,
+    "V2 host event pool reservation",
+  );
+  if (reservedBytes !== sizing.totalBytes) {
+    throw new RangeError("V2 host event pool sizing total is inconsistent");
+  }
+  let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
+  let permits: AtomicBytePermitPool;
+  try {
+    permits = new AtomicBytePermitPool({
+      ordinaryBytes: sizing.ordinaryBytes,
+      jumboBytes: sizing.jumboBytes,
+    });
+  } catch (error) {
+    reservation.release();
+    reservation = null;
+    throw error;
+  }
+  let poolClosed = false;
+  return {
+    permits,
+    reservedBytes,
+    snapshot: () => permits.snapshot(),
+    close() {
+      if (!poolClosed) {
+        poolClosed = true;
+        // Reject new acquisitions immediately, but existing allocation handles
+        // remain valid so deferred downstream cleanup can still release them.
+        permits.close();
+      }
+      const leakedPermits = permits.snapshot().activePermits;
+      if (leakedPermits !== 0) {
+        // Never make live carrier memory uncharged. A later idempotent close
+        // finalizes the fixed lease after all outstanding owners release.
+        throw new Error(`Host event memory closed with ${leakedPermits} active permits`);
+      }
+      reservation?.release();
+      reservation = null;
+    },
+  };
+}
+
 export interface BrowserlessSystemDependencies {
   machineProbe?: MachineProbe;
   governor?: ResourceGovernor;
@@ -97,6 +241,7 @@ export interface BrowserlessSystemDependencies {
   runtimeFactory?: ManagedRuntimeFactory;
   registry?: SandboxRegistry;
   router?: MultiSandboxRouter;
+  webSocketProcessBudget?: WebSocketProcessBudget;
   server?: BrowserlessSystemServer;
   cpuPool?: BrowserlessCpuPool;
   assets?: V2SidecarAssets;
@@ -110,6 +255,10 @@ export interface BrowserlessSystem {
   account: PrismAccountSession;
   registry: SandboxRegistry;
   governor: ResourceGovernor;
+  /** Narrow integration hook for V2 transport event-permit transfer. */
+  hostEventMemory: BrowserlessHostEventMemory;
+  responseGraphMemory: BrowserlessResponseGraphMemory;
+  webSocketIngressMemory: BrowserlessWebSocketIngressMemory;
   router: MultiSandboxRouter;
   fleet: ProjectFleetManager;
   app: ReturnType<typeof createGhostProvApp>;
@@ -171,6 +320,7 @@ function defaultRuntimeFactory(options: {
   provisioning: PrismProvisioningClient;
   governor: ResourceGovernor;
   cpuPool: BrowserlessCpuPool;
+  hostEventMemory: BrowserlessHostEventMemory;
   revisionSelector: BrowserlessV2RevisionSelector;
   nextLeaderGeneration(projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"]): Promise<number>;
   recoveryCoordinator: FleetRecoveryCoordinator;
@@ -183,6 +333,7 @@ function defaultRuntimeFactory(options: {
     provisioning,
     governor,
     cpuPool,
+    hostEventMemory,
     revisionSelector,
     nextLeaderGeneration,
     recoveryCoordinator,
@@ -208,6 +359,7 @@ function defaultRuntimeFactory(options: {
       assets: release.assets,
       transportReservationBytes: config.v2TransportReservationBytes,
       maxResponseBytes: config.v2ResponseMaxBytes,
+      eventMemoryPool: hostEventMemory.permits,
       ySweetRefreshMs: config.v2YSweetRefreshMs,
       initialSandbox: input.initialSandbox,
       acquireSandboxForAuth: (status, signal) => acquireSandboxForAuth(
@@ -302,6 +454,7 @@ function defaultRuntimeFactory(options: {
         maxResponseBytes: transport.maxResponseBytes,
         gzip: transport.gzip,
         expectedSidecarInstanceId: transport.expectedSidecarInstanceId,
+        eventMemoryPool: transport.eventMemoryPool,
       }),
     });
   };
@@ -389,12 +542,64 @@ function closeServer(server: BrowserlessSystemServer): Promise<void> {
   });
 }
 
+async function settleServerClose(
+  server: BrowserlessSystemServer,
+  closing: Promise<void>,
+  deadlineMs: number,
+): Promise<{ closed: boolean; error?: unknown }> {
+  const observed = closing.then(
+    () => ({ kind: "closed" as const }),
+    error => ({ kind: "closed" as const, error }),
+  );
+  const wait = async (milliseconds: number) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        observed,
+        new Promise<{ kind: "timeout" }>(resolve => {
+          timer = setTimeout(() => resolve({ kind: "timeout" }), Math.max(0, milliseconds));
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+  let result = await wait(Math.max(0, deadlineMs - Date.now()));
+  if (result.kind === "closed") {
+    return "error" in result ? { closed: true, error: result.error } : { closed: true };
+  }
+  try {
+    server.closeAllConnections?.();
+  } catch (error) {
+    return { closed: false, error };
+  }
+  result = await wait(1_000);
+  if (result.kind === "closed") {
+    return "error" in result ? { closed: true, error: result.error } : { closed: true };
+  }
+  return {
+    closed: false,
+    error: new Error("HTTP server output did not close before the shutdown deadline"),
+  };
+}
+
 export async function createBrowserlessSystem(
   env: Record<string, string | undefined> = process.env,
   dependencies: BrowserlessSystemDependencies = {},
 ): Promise<BrowserlessSystem> {
   const machineProbe = dependencies.machineProbe ?? new SystemMachineProbe();
   const config = resolveMultiSandboxConfig(env, machineProbe.sample());
+  const revisionSelector: BrowserlessV2RevisionSelector = dependencies.revisionSelector ??
+    (dependencies.assets
+      ? fixedV2RevisionSelector(config.projectIds, dependencies.assets)
+      : createBundledV2SidecarRevisionSelector({
+        projectIds: config.projectIds,
+        defaultRevision: config.v2SidecarRevision,
+        projectOverrides: config.v2SidecarProjectRevisions,
+      }));
+  // A selected release must be present and authentic before account/session,
+  // server, fleet, or sandbox state is created. Never fall back to R1 here.
+  await revisionSelector.preload();
   const observabilityConfig = resolveObservabilityConfig(env);
   const logger = dependencies.logger ?? createObservabilityLogger(observabilityConfig);
   const sessionManager = dependencies.sessionManager ?? await PrismSessionManager.create({
@@ -413,9 +618,42 @@ export async function createBrowserlessSystem(
     throw error;
   }
   const governor = dependencies.governor ?? new ResourceGovernor({ probe: machineProbe });
-  const cpuPool = dependencies.cpuPool ?? new CpuTransformPool({
-    workers: governor.snapshot().cpuTransformWorkers,
-  });
+  let hostEventMemory!: BrowserlessHostEventMemory;
+  let responseGraphMemory!: BrowserlessResponseGraphMemory;
+  let webSocketIngressMemory!: BrowserlessWebSocketIngressMemory;
+  try {
+    hostEventMemory = reserveHostEventMemoryPool(governor, config.v2HostEventMemory);
+    responseGraphMemory = reserveResponseGraphMemory(governor);
+    webSocketIngressMemory = reserveWebSocketIngressMemory(
+      governor,
+      dependencies.webSocketProcessBudget ?? new WebSocketProcessBudget({
+        maxSessions: DEFAULT_WS_PROCESS_MAX_SESSIONS,
+        maxQueuedBytes: DEFAULT_WS_PROCESS_MAX_QUEUED_BYTES,
+        maxIngressBytes: DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
+      }),
+    );
+  } catch (error) {
+    try { responseGraphMemory?.close(); } catch {}
+    try { hostEventMemory?.close(); } catch {}
+    governor.close();
+    await sessionManager.close().catch(() => undefined);
+    await logger.close().catch(() => undefined);
+    throw error;
+  }
+  let cpuPool: BrowserlessCpuPool;
+  try {
+    cpuPool = dependencies.cpuPool ?? new CpuTransformPool({
+      workers: governor.snapshot().cpuTransformWorkers,
+    });
+  } catch (error) {
+    webSocketIngressMemory.close();
+    responseGraphMemory.close();
+    hostEventMemory.close();
+    governor.close();
+    await sessionManager.close().catch(() => undefined);
+    await logger.close().catch(() => undefined);
+    throw error;
+  }
   const provisioning = new PrismProvisioningClient({ account: identity.account });
   const recoveryCoordinator = new FleetRecoveryCoordinator({
     revalidateAccount: signal => sessionManager.revalidate
@@ -439,17 +677,13 @@ export async function createBrowserlessSystem(
     file: config.fleetManifestFile,
     identityFingerprint: identity.fingerprint,
   });
-  const revisionSelector: BrowserlessV2RevisionSelector = dependencies.revisionSelector ??
-    (dependencies.assets
-      ? fixedV2RevisionSelector(config.projectIds, dependencies.assets)
-      : createBundledV2SidecarRevisionSelector({ projectIds: config.projectIds }));
-  await revisionSelector.preload();
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
     identity,
     provisioning,
     governor,
     cpuPool,
+    hostEventMemory,
     revisionSelector,
     nextLeaderGeneration: project => manifest.nextLeaderGeneration(
       project,
@@ -490,25 +724,82 @@ export async function createBrowserlessSystem(
     webSocketSnapshot: webSocketTelemetry ? () => webSocketTelemetry.snapshotAndReset() : undefined,
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
     routerTrafficSnapshot: () => router.trafficSnapshotAndReset(),
+    hostEventMemorySnapshot: () => hostEventMemory.snapshot(),
+    fleetSnapshot: () => fleet.snapshot(),
   });
-  const app = createGhostProvApp({ router });
+  const app = createGhostProvApp({
+    router,
+    fleetSnapshot: () => fleet.snapshot(),
+  });
   const server = dependencies.server ?? createGhostProvServer({
     app,
     router,
     port: config.port,
     candidate: config.candidate,
     webSocketTelemetry,
+    webSocketProcessBudget: webSocketIngressMemory.budget,
   }) as BrowserlessSystemServer;
   let reconciliation: Promise<unknown> | null = null;
   let starting: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
+  let listenOperation: Promise<void> | null = null;
   const startupController = new AbortController();
+
+  const listen = (): Promise<void> => {
+    if (server.listening) return Promise.resolve();
+    if (startupController.signal.aborted || closing) {
+      return Promise.reject(new DOMException("GhostProv startup aborted", "AbortError"));
+    }
+    let operation!: Promise<void>;
+    operation = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        server.off("error", onError);
+        startupController.signal.removeEventListener("abort", onAbort);
+      };
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      };
+      const closeAbortedListener = () => {
+        if (!server.listening) return;
+        server.close(error => finish(
+          error ?? new DOMException("GhostProv startup aborted", "AbortError"),
+        ));
+      };
+      const onAbort = () => closeAbortedListener();
+      const onError = (error: Error) => finish(error);
+      startupController.signal.addEventListener("abort", onAbort, { once: true });
+      server.once("error", onError);
+      try {
+        server.listen(config.port, "127.0.0.1", () => {
+          if (startupController.signal.aborted || closing) {
+            closeAbortedListener();
+            return;
+          }
+          finish();
+        });
+      } catch (error) {
+        finish(error);
+      }
+    }).finally(() => {
+      if (listenOperation === operation) listenOperation = null;
+    });
+    listenOperation = operation;
+    return operation;
+  };
 
   const system: BrowserlessSystem = {
     config,
     account: identity.account,
     registry,
     governor,
+    hostEventMemory,
+    responseGraphMemory,
+    webSocketIngressMemory,
     router,
     fleet,
     app,
@@ -517,40 +808,47 @@ export async function createBrowserlessSystem(
     sampler,
     start() {
       if (starting) return starting;
+      if (closing || startupController.signal.aborted) {
+        return Promise.reject(new DOMException("GhostProv startup aborted", "AbortError"));
+      }
       starting = (async () => {
-        reconciliation ??= fleet.reconcile();
-        await Promise.race([
-          fleet.waitForReady(1, startupController.signal),
-          reconciliation.then(snapshot => {
-            if (
-              (snapshot as { ready: number }).ready < 1 &&
-              registry.runtimes().length === 0
-            ) {
-              throw new Error("Fleet reconciliation produced no ready runtime");
-            }
-            // Registered supervisors continue retrying failed sandbox
-            // generations in the background. Keep waiting for one to recover.
-            return new Promise<never>(() => undefined);
-          }),
-        ]);
-        sampler.start();
-        if (server.listening) return;
-        await new Promise<void>((resolve, reject) => {
-          const onError = (error: Error) => reject(error);
-          server.once("error", onError);
-          server.listen(config.port, "127.0.0.1", () => {
-            server.off("error", onError);
-            resolve();
-          });
-        });
-        const snapshot = router.snapshot();
-        logger.emit(observabilityEvent("server.started", {
-          port: config.port,
-          transport: "v2",
-          runtimes: snapshot.runtimes.length,
-          capacity: snapshot.capacity,
-          pid: process.pid,
-        }), "terminal");
+        try {
+          reconciliation ??= fleet.reconcile(startupController.signal);
+          await Promise.race([
+            fleet.waitForReady(1, startupController.signal),
+            reconciliation.then(snapshot => {
+              if (
+                (snapshot as { ready: number }).ready < 1 &&
+                registry.runtimes().length === 0
+              ) {
+                throw new Error("Fleet reconciliation produced no ready runtime");
+              }
+              // Registered supervisors continue retrying failed sandbox
+              // generations in the background. Keep waiting for one to recover.
+              return new Promise<never>(() => undefined);
+            }),
+          ]);
+          if (startupController.signal.aborted || closing) {
+            throw new DOMException("GhostProv startup aborted", "AbortError");
+          }
+          sampler.start();
+          await listen();
+          if (startupController.signal.aborted || closing) {
+            throw new DOMException("GhostProv startup aborted", "AbortError");
+          }
+          const snapshot = router.snapshot();
+          logger.emit(observabilityEvent("server.started", {
+            port: config.port,
+            transport: "v2",
+            runtimes: snapshot.runtimes.length,
+            capacity: snapshot.capacity,
+            pid: process.pid,
+            release: summarizeV2Releases(snapshot.runtimes) as unknown as JsonValue,
+          }), "terminal");
+        } catch (error) {
+          if (!closing) await system.close().catch(() => undefined);
+          throw error;
+        }
       })();
       return starting;
     },
@@ -558,13 +856,20 @@ export async function createBrowserlessSystem(
       if (closing) return closing;
       closing = (async () => {
         startupController.abort();
+        const shutdownDeadlineMs = Date.now() + config.shutdownDrainMs;
         const before = router.snapshot();
         logger.emit(observabilityEvent("server.stopping", {
           reason: "system-shutdown",
           active: before.active,
           queued: before.queued,
         }), "terminal");
-        const serverClosing = closeServer(server);
+        const pendingListen = listenOperation;
+        const serverClosing = pendingListen
+          ? (async () => {
+              await pendingListen.catch(() => undefined);
+              await closeServer(server);
+            })()
+          : closeServer(server);
         router.beginShutdown();
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
@@ -583,11 +888,29 @@ export async function createBrowserlessSystem(
           firstError ??= error;
         }
         await router.close().catch(error => { firstError ??= error; });
+        const serverClose = await settleServerClose(server, serverClosing, shutdownDeadlineMs);
+        if (serverClose.error !== undefined) firstError ??= serverClose.error;
         // Reject any governor waiters which are not owned by the router (for
         // example a body reservation or CPU transform waiting during teardown).
-        // Active leases remain idempotently releasable after close.
-        governor.close();
-        await serverClosing.catch(error => { firstError ??= error; });
+        // Never close the permit pool while a slow HTTP/SSE output may still
+        // own a carrier. A failed force-close intentionally leaves the fixed
+        // reservation intact rather than making live socket memory uncharged.
+        if (serverClose.closed) {
+          let fixedMemoryClosed = true;
+          try { webSocketIngressMemory.close(); } catch (error) {
+            fixedMemoryClosed = false;
+            firstError ??= error;
+          }
+          try { responseGraphMemory.close(); } catch (error) {
+            fixedMemoryClosed = false;
+            firstError ??= error;
+          }
+          try { hostEventMemory.close(); } catch (error) {
+            fixedMemoryClosed = false;
+            firstError ??= error;
+          }
+          if (fixedMemoryClosed) governor.close();
+        }
         await sessionManager.close().catch(error => { firstError ??= error; });
         await cpuPool.close().catch(error => { firstError ??= error; });
         await logger.close().catch(error => { firstError ??= error; });

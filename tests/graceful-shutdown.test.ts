@@ -108,4 +108,60 @@ describe("graceful router shutdown", () => {
     runtime.resolve({ id: "resp_1", status: "completed" });
     await router.close();
   });
+
+  it("aborts and tracks an in-progress HTTP body read during shutdown", async () => {
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry(),
+      governor: new ResourceGovernor({ probe }),
+      queueTimeoutMs: 1_000,
+    });
+    const ingress = await router.acquireIncomingBody(0);
+    expect(router.snapshot().active).toBe(0);
+
+    router.beginShutdown();
+    expect(ingress.signal?.aborted).toBe(true);
+    expect(ingress.signal?.reason).toBeInstanceOf(RouterShutdownError);
+    const idle = router.awaitIdle(500);
+    expect(await Promise.race([
+      idle.then(() => "idle"),
+      Bun.sleep(10).then(() => "pending"),
+    ])).toBe("pending");
+
+    ingress.release();
+    await expect(idle).resolves.toBeUndefined();
+    await router.close();
+  });
+
+  it("aborts and tracks a pre-queue governor admission during shutdown", async () => {
+    const governor = new ResourceGovernor({ probe });
+    const blocker = await governor.acquire({
+      class: "text-large",
+      requestBytes: 1,
+      reservedBytes: governor.snapshot().reservationCapacityBytes,
+      cpuPermits: 0,
+      stream: false,
+    });
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([new Runtime()]),
+      governor,
+      queueTimeoutMs: 1_000,
+    });
+    const pending = router.startRelay({ model: "gpt-5.6-sol", input: "waiting" });
+    for (let turn = 0; governor.snapshot().queued === 0 && turn < 100; turn++) {
+      await Promise.resolve();
+    }
+    expect(governor.snapshot().queued).toBe(1);
+    const idle = router.awaitIdle(500);
+    expect(await Promise.race([
+      idle.then(() => "idle"),
+      Bun.sleep(10).then(() => "pending"),
+    ])).toBe("pending");
+
+    router.beginShutdown();
+    await expect(pending).rejects.toBeInstanceOf(RouterShutdownError);
+    await expect(idle).resolves.toBeUndefined();
+    blocker.release();
+    await router.close();
+    governor.close();
+  });
 });

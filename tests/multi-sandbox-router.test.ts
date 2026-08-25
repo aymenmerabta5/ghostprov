@@ -5,6 +5,8 @@ import { ResourceGovernor } from "../src/router/resource-governor";
 import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
+import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import type { Clock } from "../src/core/ports";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -16,11 +18,20 @@ function deferred<T>() {
 class FakeRuntime implements RoutableSandboxRuntime {
   incarnation = 1;
   active = 0;
+  uncommitted = 0;
+  uncommittedPeak = 0;
   executions = 0;
+  snapshotCalls = 0;
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
-  failError: Error = new Error("pre-publication failure");
+  failError: Error = new V2PreCommitError("pre-publication failure", "test_precommit");
   failDelayMs = 0;
+  waitForAdmissionAbort = false;
+  postAdmissionDelayMs = 0;
+  admissionWindow: number | null = null;
+  lastRunSignal?: AbortSignal;
+  pulseAdmissionOnFailure = false;
+  readonly executionStartedAtMs: number[] = [];
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
   readonly listeners = new Set<() => void>();
@@ -37,16 +48,25 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
   replaceIncarnation(): void {
     this.incarnation++;
+    this.notify();
+  }
+  notify(): void {
     for (const listener of this.listeners) listener();
   }
   snapshot() {
+    this.snapshotCalls++;
     return {
       projectId: this.projectId,
       incarnation: this.incarnation,
       state: this.state,
       capacity: this.capacity,
       active: this.active,
-      available: Math.max(0, this.capacity - this.active),
+      available: Math.max(0, Math.min(
+        this.admissionWindow === null
+          ? this.capacity
+          : this.admissionWindow - this.uncommitted,
+        this.capacity - this.active,
+      )),
       quarantined: 0,
       heartbeatAgeMs: 1_000,
       credentialExpiresInMs: 3_600_000,
@@ -58,20 +78,51 @@ class FakeRuntime implements RoutableSandboxRuntime {
       failure: null,
     } as const;
   }
-  async run(body: Record<string, unknown>): Promise<RunHandle> {
+  async run(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: { onAdmissionReflected(): void },
+  ): Promise<RunHandle> {
+    this.lastRunSignal = signal;
     this.executions++;
+    this.executionStartedAtMs.push(performance.now());
     this.bodies.push(body);
     if (this.failStarts > 0) {
       this.failStarts--;
       if (this.failDelayMs > 0) await Bun.sleep(this.failDelayMs);
+      if (this.pulseAdmissionOnFailure) {
+        const previousWindow = this.admissionWindow;
+        this.admissionWindow = 0;
+        this.notify();
+        this.admissionWindow = previousWindow;
+        this.notify();
+      }
       throw this.failError;
     }
+    if (this.waitForAdmissionAbort) {
+      await new Promise<never>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
     this.active++;
+    this.uncommitted++;
+    this.uncommittedPeak = Math.max(this.uncommittedPeak, this.uncommitted);
+    options?.onAdmissionReflected();
     const gate = deferred<any>();
     this.finals.push(gate);
+    if (this.postAdmissionDelayMs > 0) await Bun.sleep(this.postAdmissionDelayMs);
+    else await Promise.resolve();
+    this.uncommitted--;
     return {
       async *events() {},
-      final: gate.promise.finally(() => { this.active--; }),
+      final: gate.promise.finally(() => {
+        this.active--;
+        this.notify();
+      }),
       stats: { bytes: 0, firstByteMs: 1, frames: 0 },
     };
   }
@@ -83,7 +134,14 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
 }
 
-function createSystem(projects = 4, slots = 30, queueTimeoutMs?: number) {
+function createSystem(
+  projects = 4,
+  slots = 30,
+  queueTimeoutMs?: number,
+  queueCapacity?: number,
+  queueByteCapacity?: number,
+  clock?: Clock,
+) {
   const runtimes = Array.from({ length: projects }, (_, index) => new FakeRuntime(
     projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
     slots,
@@ -106,6 +164,9 @@ function createSystem(projects = 4, slots = 30, queueTimeoutMs?: number) {
     governor,
     random: { next: () => 0.5, uuid: () => "id" },
     queueTimeoutMs,
+    queueCapacity,
+    queueByteCapacity,
+    clock,
   });
   return { runtimes, registry, governor, router };
 }
@@ -151,6 +212,39 @@ describe("MultiSandboxRouter", () => {
     expect(system.governor.snapshot().reservedBytes).toBe(0);
   });
 
+  it("bounds the admitted routing queue and releases an overflow lease", async () => {
+    const system = createSystem(0, 1, 1_000, 1);
+    const first = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "first", stream: true },
+      { clientId: "first", source: "websocket" },
+    );
+    await flush();
+    const reserved = system.governor.snapshot().reservedBytes;
+    expect(reserved).toBeGreaterThan(0);
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "overflow", stream: true },
+      { clientId: "second", source: "websocket" },
+    )).rejects.toMatchObject({ status: 503, code: "router_queue_full" });
+    expect(system.router.snapshot().queued).toBe(1);
+    expect(system.governor.snapshot().reservedBytes).toBe(reserved);
+
+    await system.router.close();
+    await expect(first).rejects.toMatchObject({ code: "router_shutting_down" });
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("bounds queued request bytes atomically", async () => {
+    const system = createSystem(0, 1, 1_000, 10, 1);
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "larger-than-one-byte", stream: true },
+      { clientId: "byte-overflow", source: "websocket" },
+    )).rejects.toMatchObject({ status: 503, code: "router_queue_full" });
+    expect(system.router.snapshot()).toMatchObject({ queued: 0, queuedBytes: 0 });
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("retains one absolute queue deadline across a safe startup retry", async () => {
     const system = createSystem(1, 1, 20);
     system.runtimes[0].failStarts = 1;
@@ -169,6 +263,131 @@ describe("MultiSandboxRouter", () => {
     expect(result).toMatchObject({ code: "router_capacity_timeout" });
     expect(elapsed).toBeLessThan(32);
     expect(system.runtimes[0].executions).toBe(1);
+  });
+
+  it("retries one transient pre-commit failure on the same live incarnation", async () => {
+    const system = createSystem(1, 1, 500);
+    const runtime = system.runtimes[0];
+    runtime.failStarts = 1;
+    const incarnation = runtime.incarnation;
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "transient-same-incarnation", stream: true },
+      { clientId: "transient", source: "websocket" },
+    );
+    await flush();
+    expect(runtime.executions).toBe(1);
+    await Bun.sleep(5);
+    expect(runtime.executions).toBe(1);
+
+    const handle = await pending;
+    expect(runtime.incarnation).toBe(incarnation);
+    expect(runtime.executions).toBe(2);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("wakes a blocked same-incarnation retry on a meaningful health change", async () => {
+    const system = createSystem(1, 1, 500);
+    const runtime = system.runtimes[0];
+    runtime.failStarts = 1;
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "health-recovered", stream: true },
+      { clientId: "health-recovered", source: "websocket" },
+    );
+    await flush();
+    expect(runtime.executions).toBe(1);
+    runtime.state = "draining";
+    runtime.notify();
+    runtime.state = "ready";
+    runtime.notify();
+
+    const handle = await pending;
+    expect(runtime.incarnation).toBe(1);
+    expect(runtime.executions).toBe(2);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("backs off persistent pre-commit failures without extending the deadline", async () => {
+    const system = createSystem(1, 1, 120);
+    const runtime = system.runtimes[0];
+    runtime.failStarts = 100;
+    const started = performance.now();
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "persistent-precommit", stream: true },
+      { clientId: "persistent-precommit", source: "websocket" },
+    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    const elapsed = performance.now() - started;
+    expect(runtime.executions).toBeLessThanOrEqual(3);
+    expect(runtime.executions).toBeGreaterThanOrEqual(1);
+    expect(elapsed).toBeGreaterThanOrEqual(100);
+    expect(elapsed).toBeLessThan(300);
+    await system.router.close();
+  });
+
+  it("does not let self-induced admission reflections bypass retry backoff", async () => {
+    const system = createSystem(1, 1, 2_000);
+    const runtime = system.runtimes[0];
+    runtime.failStarts = 5;
+    runtime.pulseAdmissionOnFailure = true;
+    const started = performance.now();
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "self-reflection-backoff", stream: true },
+      { clientId: "self-reflection-backoff", source: "websocket" },
+    );
+    const elapsed = performance.now() - started;
+    expect(runtime.executions).toBe(6);
+    expect(elapsed).toBeGreaterThanOrEqual(550);
+    expect(runtime.executionStartedAtMs[1]! - runtime.executionStartedAtMs[0]!)
+      .toBeGreaterThanOrEqual(20);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("bounds runtime preparation with the same absolute admission deadline", async () => {
+    const system = createSystem(1, 1, 20);
+    system.runtimes[0].waitForAdmissionAbort = true;
+    const started = performance.now();
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "stuck-preparation", stream: true },
+      { clientId: "stuck-preparation", source: "websocket" },
+    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    expect(performance.now() - started).toBeLessThan(60);
+    expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("ends the admission deadline once the runtime owns the credit", async () => {
+    const system = createSystem(1, 1, 10);
+    system.runtimes[0].postAdmissionDelayMs = 25;
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "admitted-before-deadline", stream: true },
+      { clientId: "admitted-before-deadline", source: "websocket" },
+    );
+    system.runtimes[0].completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("forwards caller cancellation after commit until the terminal settles", async () => {
+    const system = createSystem(1, 1);
+    const controller = new AbortController();
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "cancel-after-commit", stream: true },
+      { signal: controller.signal, source: "http" },
+    );
+    expect(system.runtimes[0].lastRunSignal?.aborted).toBe(false);
+    const reason = new Error("client disconnected");
+    controller.abort(reason);
+    expect(system.runtimes[0].lastRunSignal?.aborted).toBe(true);
+    expect(system.runtimes[0].lastRunSignal?.reason).toBe(reason);
+    system.runtimes[0].completeOne();
+    await handle.final;
+    await system.router.close();
   });
 
   it("allows a safe retry on a fresh incarnation of the same Prism project", async () => {
@@ -345,6 +564,7 @@ describe("MultiSandboxRouter", () => {
   it("does not route new work to a draining runtime", async () => {
     const system = createSystem(2, 1);
     system.runtimes[0].state = "draining";
+    system.runtimes[0].notify();
     const handle = await system.router.startRelay(
       { model: "gpt-5.6-sol", input: "healthy", stream: true },
       { clientId: "one", source: "http" },
@@ -353,5 +573,300 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes[1].executions).toBe(1);
     system.runtimes[1].completeOne();
     await handle.final;
+  });
+
+  it("keeps physical capacity, true active work, and capped admission credits distinct", async () => {
+    const system = createSystem(1, 90);
+    system.runtimes[0].admissionWindow = 4;
+    system.runtimes[0].notify();
+
+    expect(system.router.snapshot()).toMatchObject({
+      capacity: 90,
+      active: 0,
+      available: 4,
+      queued: 0,
+    });
+    await system.router.close();
+  });
+
+  it("hands each router reservation to runtime admission exactly once", async () => {
+    const system = createSystem(1, 90);
+    const runtime = system.runtimes[0];
+    runtime.admissionWindow = 4;
+    runtime.notify();
+    const handles = await Promise.all(Array.from({ length: 40 }, (_, index) =>
+      system.router.startRelay(
+        { model: "gpt-5.6-sol", input: `handoff-${index}`, stream: true },
+        { clientId: `handoff-${index}`, source: "websocket" },
+      )));
+
+    expect(runtime.active).toBe(40);
+    expect(runtime.uncommittedPeak).toBe(4);
+    expect(system.router.snapshot()).toMatchObject({
+      capacity: 90,
+      active: 40,
+      available: 4,
+      queued: 0,
+    });
+    while (runtime.finals.length) runtime.completeOne();
+    await Promise.all(handles.map(handle => handle.final));
+    await system.router.close();
+  });
+
+  it("tries every distinct runtime after explicit safe pre-commit failures", async () => {
+    const system = createSystem(3, 1);
+    system.runtimes[1].failStarts = 1;
+    system.runtimes[2].failStarts = 1;
+
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "three-way-failover", stream: true },
+      { clientId: "failover", source: "websocket" },
+    );
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1, 1]);
+    system.runtimes[0].completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("never treats an untyped runtime rejection as safe to duplicate", async () => {
+    const system = createSystem(2, 1);
+    system.runtimes[1].failStarts = 1;
+    system.runtimes[1].failError = new Error("untyped lifecycle failure");
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "not-proven-safe", stream: true },
+      { clientId: "not-proven-safe", source: "websocket" },
+    )).rejects.toThrow("untyped lifecycle failure");
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    await system.router.close();
+  });
+
+  it("skips an unroutable retry head and dispatches another client", async () => {
+    const system = createSystem(2, 1);
+    const [full, retrying] = system.runtimes;
+    full.active = 1;
+    full.notify();
+    retrying.failStarts = 1;
+    const controller = new AbortController();
+    const blocked = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "blocked-retry", stream: true },
+      { clientId: "blocked", source: "websocket", signal: controller.signal },
+    );
+    const blockedOutcome = blocked.then(
+      () => "resolved",
+      error => error,
+    );
+    await flush();
+
+    const healthy = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "can-use-first-runtime", stream: true },
+      { clientId: "healthy", source: "websocket" },
+    );
+    expect(retrying.executions).toBe(2);
+    controller.abort();
+    expect(await blockedOutcome).toBeInstanceOf(DOMException);
+    retrying.completeOne();
+    await healthy.final;
+    await system.router.close();
+  });
+
+  it("keeps latency work fast without starving a backlogged bulk class", async () => {
+    const system = createSystem(1, 1);
+    const runtime = system.runtimes[0];
+    const blocker = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "blocker",
+      stream: true,
+    }, { clientId: "blocker", source: "websocket" });
+    const pending = [
+      ...Array.from({ length: 20 }, (_, index) => system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: `small-${index}`,
+        tag: `small-${index}`,
+        stream: true,
+      }, { clientId: "small-client", source: "websocket" })),
+      ...Array.from({ length: 2 }, (_, index) => system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x".repeat(600 * 1024),
+        tag: `bulk-${index}`,
+        stream: true,
+      }, { clientId: "bulk-client", source: "websocket" })),
+    ];
+    await flush(100);
+    expect(system.router.snapshot().queued).toBe(22);
+
+    runtime.completeOne();
+    await blocker.final;
+    const order: string[] = [];
+    for (let index = 0; index < pending.length; index++) {
+      for (let turn = 0; runtime.bodies.length < index + 2 && turn < 100; turn++) {
+        await Promise.resolve();
+      }
+      order.push(String(runtime.bodies[index + 1]?.tag));
+      runtime.completeOne();
+    }
+    const handles = await Promise.all(pending);
+    await Promise.all(handles.map(handle => handle.final));
+
+    const bulkPositions = order
+      .map((tag, index) => tag.startsWith("bulk-") ? index : -1)
+      .filter(index => index >= 0);
+    expect(bulkPositions).toHaveLength(2);
+    expect(bulkPositions).toEqual([20, 21]);
+    expect(order[0]?.startsWith("small-")).toBe(true);
+    await system.router.close();
+  });
+
+  it("persists class byte credit across one-request lane refill", async () => {
+    const system = createSystem(1, 1, 5_000);
+    const runtime = system.runtimes[0]!;
+    const blocker = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "blocker",
+      stream: true,
+    }, { clientId: "class-blocker", source: "websocket" });
+    const controllers: AbortController[] = [];
+    const bulkInput = "x".repeat(1024 * 1024);
+    let sequence = 0;
+    const launch = (queueClass: "latency" | "bulk") => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      return system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: queueClass === "latency" ? "x" : bulkInput,
+        tag: `${queueClass}-${sequence++}`,
+        stream: true,
+      }, {
+        clientId: `${queueClass}-class-client`,
+        source: "websocket",
+        signal: controller.signal,
+      }).then(handle => ({ queueClass, handle }));
+    };
+    const waiting: Record<"latency" | "bulk", ReturnType<typeof launch>> = {
+      latency: launch("latency"),
+      bulk: launch("bulk"),
+    };
+
+    runtime.completeOne();
+    await blocker.final;
+    const order: Array<"latency" | "bulk"> = [];
+    for (let turn = 0; turn < 540; turn++) {
+      const selected = await Promise.race([waiting.latency, waiting.bulk]);
+      order.push(selected.queueClass);
+      waiting[selected.queueClass] = launch(selected.queueClass);
+      await flush(1);
+      runtime.completeOne();
+      await selected.handle.final;
+    }
+
+    const bulkPositions = order
+      .map((queueClass, index) => queueClass === "bulk" ? index : -1)
+      .filter(index => index >= 0);
+    expect(bulkPositions).toHaveLength(1);
+    expect(bulkPositions[0]).toBeGreaterThanOrEqual(500);
+    expect(bulkPositions[0]).toBeLessThanOrEqual(520);
+
+    for (const controller of controllers) controller.abort();
+    await flush();
+    while (runtime.finals.length > 0) runtime.completeOne();
+    await Promise.allSettled([waiting.latency, waiting.bulk]);
+    await system.router.close();
+  });
+
+  it("refreshes only the changed runtime and ignores no-credit Awareness churn", async () => {
+    const system = createSystem(12, 1, 1_000);
+    for (const runtime of system.runtimes) {
+      runtime.active = 1;
+      runtime.notify();
+    }
+    const pending = Array.from({ length: 96 }, (_, index) => system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: `queued-${index}`,
+      stream: true,
+    }, { clientId: `client-${index}`, source: "websocket" }).catch(error => error));
+    await flush();
+    expect(system.router.snapshot().queued).toBe(96);
+    for (const runtime of system.runtimes) runtime.snapshotCalls = 0;
+
+    for (let update = 0; update < 48; update++) {
+      system.runtimes[update % system.runtimes.length]!.notify();
+      await flush(2);
+    }
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.snapshotCalls, 0)).toBe(48);
+
+    await system.router.close();
+    await Promise.all(pending);
+  });
+
+  it("ages cached heartbeat and credential health without registry events", async () => {
+    let now = 1_000;
+    const clock: Clock = {
+      now: () => now,
+      sleep: () => Promise.resolve(),
+      waitUntil: () => Promise.resolve(),
+    };
+    const system = createSystem(1, 1, undefined, undefined, undefined, clock);
+    expect(system.router.snapshot()).toMatchObject({ capacity: 1, available: 1 });
+
+    now += 100;
+    expect(system.router.snapshot().runtimes[0]).toMatchObject({
+      heartbeatAgeMs: 1_100,
+      credentialExpiresInMs: 3_599_900,
+    });
+    now += 18_901; // cached heartbeatAgeMs crosses the 20-second health fence
+    expect(system.router.snapshot()).toMatchObject({ capacity: 0, available: 0 });
+    await system.router.close();
+  });
+
+  it("retains byte debt when unequal bulk clients each keep only one job queued", async () => {
+    const system = createSystem(1, 1);
+    const runtime = system.runtimes[0]!;
+    const blocker = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "blocker",
+      stream: true,
+    }, { clientId: "blocker", source: "websocket" });
+    const controllers: AbortController[] = [];
+    let sequence = 0;
+    const launch = (client: "smaller" | "larger", bytes: number) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      return system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "x".repeat(bytes),
+        tag: `${client}-${sequence++}`,
+        stream: true,
+      }, { clientId: client, source: "websocket", signal: controller.signal })
+        .then(handle => ({ client, bytes, handle }));
+    };
+    const waiting: Record<"smaller" | "larger", ReturnType<typeof launch>> = {
+      smaller: launch("smaller", 520 * 1024),
+      larger: launch("larger", 1024 * 1024),
+    };
+
+    runtime.completeOne();
+    await blocker.final;
+    const order: Array<"smaller" | "larger"> = [];
+    for (let turn = 0; turn < 20; turn++) {
+      const selected = await Promise.race([waiting.smaller, waiting.larger]);
+      order.push(selected.client);
+      // Refill this client before its active request completes: every client
+      // owns at most one queued request, so fairness depends on retained debt.
+      waiting[selected.client] = launch(selected.client, selected.bytes);
+      await flush(2);
+      runtime.completeOne();
+      await selected.handle.final;
+    }
+
+    const smaller = order.filter(client => client === "smaller").length;
+    const larger = order.length - smaller;
+    expect(smaller).toBeGreaterThan(larger);
+    expect(larger).toBeGreaterThanOrEqual(5);
+
+    for (const controller of controllers) controller.abort();
+    await flush();
+    while (runtime.finals.length > 0) runtime.completeOne();
+    await Promise.allSettled([waiting.smaller, waiting.larger]);
+    await system.router.close();
   });
 });

@@ -1,19 +1,11 @@
 import "dotenv/config";
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import * as path from "node:path";
+import { writeBoundSupervisorControlRequest } from "./supervisor_control";
 
 export async function requestSupervisorUpgrade(
-  env: NodeJS.ProcessEnv = process.env,
+  _env: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd(),
 ): Promise<string> {
-  const target = path.resolve(env.GP_SUPERVISOR_CONTROL_FILE ?? ".ghostprov/upgrade.request");
-  await mkdir(path.dirname(target), { recursive: true });
-  const temporary = `${target}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify({ requestedAt: new Date().toISOString() }), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(temporary, target);
-  return target;
+  return (await writeBoundSupervisorControlRequest("upgrade", cwd)).path;
 }
 
 const isMain = process.argv[1]?.endsWith("request_upgrade.ts") ||

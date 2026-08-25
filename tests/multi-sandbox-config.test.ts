@@ -2,6 +2,15 @@ import { describe, expect, it } from "bun:test";
 import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
 import type { MachineSample } from "../src/core/ports";
 import { projectId } from "../src/sandbox/types";
+import { DEFAULT_V2_SIDECAR_REVISION } from "../src/v2/sidecar/assets";
+import {
+  V2_EVENT_JUMBO_OVERHEAD_BYTES,
+  V2_EVENT_MAX_BUFFERED_EVENTS,
+  V2_EVENT_PHYSICAL_FACTOR,
+  V2_EVENT_RETAINED_FACTOR,
+  V2_EVENT_RETAINED_OVERHEAD_BYTES,
+  V2_EVENT_SOFT_BUFFER_BYTES,
+} from "../src/v2/memory/event-memory-sizing";
 
 const A = "e631d12c-d917-4434-b360-41b4715d6679";
 const B = "69288e8b-c183-45f3-9131-d64b05b98928";
@@ -15,6 +24,26 @@ const MACHINE: MachineSample = {
 };
 
 describe("multi-sandbox configuration", () => {
+  it("rejects a sidecar budget that cannot fit the legal jumbo event lane", () => {
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_CANDIDATE: "1",
+      GP_V2_SIDECAR_MEMORY_BUDGET_BYTES: String(257 * 1024 * 1024),
+    }, MACHINE)).toThrow("64 MiB atomic event");
+  });
+
+  it("rejects false response maxima until the sidecar protocol exceeds 64 MiB", () => {
+    for (const bytes of [32 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024]) {
+      expect(() => resolveMultiSandboxConfig({
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: A,
+        GP_CANDIDATE: "1",
+        GP_V2_RESPONSE_MAX_BYTES: String(bytes),
+      }, MACHINE)).toThrow("exactly 64 MiB");
+    }
+  });
+
   it("deduplicates an explicit project allowlist", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_PROJECT_IDS: `${A}, ${B},${A}`,
@@ -41,18 +70,80 @@ describe("multi-sandbox configuration", () => {
     expect(config.guestMaxProjects).toBe(1);
     expect(config.v2SandboxCapacity).toBe(128);
     expect(config.v2InitialActivePerSandbox).toBe(8);
-    expect(config.v2MaxActivePerSandbox).toBe(16);
+    expect(config.v2MaxActivePerSandbox).toBe(8);
     expect(config.v2ResponseMaxBytes).toBe(64 * 1024 * 1024);
+    expect(config.v2HostEventMemory).toEqual({
+      softBufferBytes: V2_EVENT_SOFT_BUFFER_BYTES,
+      physicalFactor: V2_EVENT_PHYSICAL_FACTOR,
+      jumboOverheadBytes: V2_EVENT_JUMBO_OVERHEAD_BYTES,
+      retainedFactor: V2_EVENT_RETAINED_FACTOR,
+      retainedOverheadBytes: V2_EVENT_RETAINED_OVERHEAD_BYTES,
+      maxBufferedEvents: V2_EVENT_MAX_BUFFERED_EVENTS,
+      ordinaryBytes: (
+        V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_PHYSICAL_FACTOR +
+        V2_EVENT_JUMBO_OVERHEAD_BYTES +
+        V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_RETAINED_FACTOR +
+        V2_EVENT_MAX_BUFFERED_EVENTS * V2_EVENT_RETAINED_OVERHEAD_BYTES
+      ) * 8,
+      jumboBytes: 64 * 1024 * 1024 * V2_EVENT_PHYSICAL_FACTOR +
+        V2_EVENT_JUMBO_OVERHEAD_BYTES,
+      totalBytes: (
+        V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_PHYSICAL_FACTOR +
+        V2_EVENT_JUMBO_OVERHEAD_BYTES +
+        V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_RETAINED_FACTOR +
+        V2_EVENT_MAX_BUFFERED_EVENTS * V2_EVENT_RETAINED_OVERHEAD_BYTES
+      ) * 8 +
+        64 * 1024 * 1024 * V2_EVENT_PHYSICAL_FACTOR +
+        V2_EVENT_JUMBO_OVERHEAD_BYTES,
+    });
     expect(config.v2TransportReservationBytes).toBe(16 * 1024 * 1024);
     expect(config.v2YSweetRefreshMs).toBe(45 * 60 * 1000);
     expect(config.v2SidecarMemoryBudgetBytes).toBe(512 * 1024 * 1024);
     expect(config.v2DiagnosticsEnabled).toBe(false);
     expect(config.v2DiagnosticsIntervalMs).toBe(1_000);
     expect(config.v2BatchingEnabled).toBe(false);
+    expect(config.v2SidecarRevision).toBe(DEFAULT_V2_SIDECAR_REVISION);
+    expect(config.v2SidecarProjectRevisions).toEqual({});
     expect(config.desiredSandboxes).toBe(1);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
     expect(config.shutdownDrainMs).toBe(300_000);
+  });
+
+  it("supports only explicit R1 rollback and exact known-project revision overrides", () => {
+    const config = resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: `${A},${B}`,
+      GP_V2_SIDECAR_REVISION: "r1",
+      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r2`,
+    }, MACHINE);
+    expect(config.v2SidecarRevision).toBe("r1");
+    expect(config.v2SidecarProjectRevisions).toEqual({ [B]: "r2" });
+    expect(Object.isFrozen(config.v2SidecarProjectRevisions)).toBe(true);
+
+    for (const revisions of [
+      `${B}=r3`,
+      `${B}=r1,${B}=r2`,
+      "*=r1",
+      "not-an-assignment",
+      "=r1",
+    ]) {
+      expect(() => resolveMultiSandboxConfig({
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: `${A},${B}`,
+        GP_V2_SIDECAR_PROJECT_REVISIONS: revisions,
+      }, MACHINE)).toThrow();
+    }
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r1`,
+    }, MACHINE)).toThrow(/unknown configured project/i);
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_SIDECAR_REVISION: "R1",
+    }, MACHINE)).toThrow(/unsupported.*R1/i);
   });
 
   it("parses bounded opt-in V2 diagnostics", () => {
@@ -95,10 +186,10 @@ describe("multi-sandbox configuration", () => {
       GP_TARGET_SANDBOXES: "1",
       GP_TARGET_CONCURRENCY: "1",
       GP_V2_INITIAL_ACTIVE_PER_SANDBOX: "4",
-      GP_V2_MAX_ACTIVE_PER_SANDBOX: "12",
+      GP_V2_MAX_ACTIVE_PER_SANDBOX: "8",
     }, MACHINE);
     expect(config.v2InitialActivePerSandbox).toBe(4);
-    expect(config.v2MaxActivePerSandbox).toBe(12);
+    expect(config.v2MaxActivePerSandbox).toBe(8);
     expect(config.desiredSandboxes).toBe(2);
     expect(config).not.toHaveProperty("targetSandboxes");
     expect(config).not.toHaveProperty("targetConcurrency");
@@ -108,6 +199,11 @@ describe("multi-sandbox configuration", () => {
       GP_V2_INITIAL_ACTIVE_PER_SANDBOX: "9",
       GP_V2_MAX_ACTIVE_PER_SANDBOX: "8",
     }, MACHINE)).toThrow("INITIAL_ACTIVE");
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_MAX_ACTIVE_PER_SANDBOX: "9",
+    }, MACHINE)).toThrow("terminal-spool capacity");
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,

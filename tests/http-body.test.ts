@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError } from "../src/http/errors";
-import { collectRequestBody, contentLengthExceeds } from "../src/http/body";
+import {
+  collectRequestBody,
+  contentLengthExceeds,
+  declaredContentLength,
+} from "../src/http/body";
 
 describe("bounded HTTP request collection", () => {
   it("combines chunks without copying beyond the final Buffer allocation", async () => {
@@ -46,5 +50,34 @@ describe("bounded HTTP request collection", () => {
     expect(contentLengthExceeds("100", 100)).toBe(false);
     expect(contentLengthExceeds(undefined, 100)).toBe(false);
     expect(contentLengthExceeds("not-a-number", 100)).toBe(false);
+    expect(declaredContentLength("100")).toBe(100);
+    expect(declaredContentLength("not-a-number")).toBeNull();
+    expect(declaredContentLength(String(Number.MAX_SAFE_INTEGER + 1))).toBeNull();
+  });
+
+  it("grows accounting before retaining each unknown-length chunk", async () => {
+    const retained: number[] = [];
+    async function* chunks() {
+      yield Buffer.alloc(3);
+      yield Buffer.alloc(5);
+    }
+    const body = await collectRequestBody(chunks(), 8, {
+      beforeRetain(bytes) { retained.push(bytes); },
+    });
+    expect(retained).toEqual([3, 8]);
+    expect(body.byteLength).toBe(8);
+  });
+
+  it("interrupts a pending body read with the shared request signal", async () => {
+    const controller = new AbortController();
+    const reason = new Error("absolute request deadline");
+    async function* chunks() {
+      yield Buffer.alloc(1);
+      await new Promise(() => undefined);
+    }
+    const collecting = collectRequestBody(chunks(), 8, { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort(reason);
+    await expect(collecting).rejects.toBe(reason);
   });
 });

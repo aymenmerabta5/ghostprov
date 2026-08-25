@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  ConsoleSink,
   formatConsoleObservabilityLine,
   ObservabilityLogger,
   type ObservabilitySink,
@@ -37,6 +38,7 @@ describe("ObservabilityLogger", () => {
       active: 20,
       available: 1_260,
       queued: 0,
+      queued_bytes: 16_384,
       cpu_percent: 12,
       rss_bytes: 500,
       event_loop_p95_ms: 4,
@@ -64,6 +66,7 @@ describe("ObservabilityLogger", () => {
     expect(JSON.parse(compact)).toMatchObject({
       event: "fleet.sample",
       runtime_states: { ready: 99, recovering: 1 },
+      queued_bytes: 16_384,
       pressure: { governor_queued: 0 },
       traffic: { requests_per_second: 20, total_p95_ms: 1_000 },
     });
@@ -159,5 +162,108 @@ describe("ObservabilityLogger", () => {
     samples.sort((left, right) => left - right);
     expect(samples[Math.ceil(samples.length * 0.95) - 1]).toBeLessThan(0.25);
     await logger.close();
+  });
+
+  it("defers deep validation and serialization while never leaking an invalid event", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({ config: config(), sinks: [sink] });
+    const invalid = Object.freeze({
+      schema: 1,
+      event: "request.failed",
+      ts: "2026-08-25T00:00:00.000Z",
+      mono_ms: 1,
+      trace_id: "trace",
+      get error_message() { throw new Error("payload getter must stay off emit"); },
+    }) as any;
+
+    expect(() => logger.emit(invalid, "terminal")).not.toThrow();
+    expect(logger.snapshot().sinkErrors).toBe(0);
+    await logger.close();
+    expect(logger.snapshot().sinkErrors).toBe(1);
+    expect(sink.lines).toHaveLength(0);
+  });
+
+  it("preserves terminals by evicting samples then progress in O(1) order", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({
+      config: config({ queueMaxEvents: 3 }),
+      sinks: [sink],
+    });
+    for (let index = 0; index < 3; index++) {
+      logger.emit(observabilityEvent("request.queued", {
+        trace_id: `progress-${index}`,
+      }), "progress");
+    }
+    logger.emit(observabilityEvent("request.failed", { trace_id: "terminal" }), "terminal");
+    await logger.close();
+
+    expect(sink.events().map(event => event.event)).toEqual([
+      "request.failed",
+      "request.queued",
+      "request.queued",
+      "logger.dropped",
+    ]);
+    expect(sink.events().at(-1)).toMatchObject({ progress: 1, terminals: 0 });
+  });
+
+  it("drains 10k and 20k queues with near-linear scaling", async () => {
+    const run = async (count: number) => {
+      const sink = new MemorySink();
+      const logger = new ObservabilityLogger({
+        config: config({
+          queueMaxEvents: count + 1,
+          queueMaxBytes: 64 * 1024 * 1024,
+        }),
+        sinks: [sink],
+      });
+      for (let index = 0; index < count; index++) {
+        logger.emit(observabilityEvent("request.completed", { trace_id: `scale-${index}` }), "terminal");
+      }
+      const started = performance.now();
+      await logger.close(30_000);
+      return { elapsed: performance.now() - started, lines: sink.lines.length };
+    };
+    const ten = await run(10_000);
+    const twenty = await run(20_000);
+    expect(ten.lines).toBe(10_000);
+    expect(twenty.lines).toBe(20_000);
+    expect(twenty.elapsed).toBeLessThan(ten.elapsed * 3.5 + 50);
+  }, 30_000);
+
+  it("bounds console writes while retaining every terminal record", async () => {
+    let now = 0;
+    const writes: string[] = [];
+    const consoleSink = new ConsoleSink({
+      now: () => now,
+      progressIntervalMs: 1_000,
+      write: value => writes.push(value),
+    });
+    const logger = new ObservabilityLogger({
+      config: config({ queueMaxEvents: 2_000, queueMaxBytes: 8 * 1024 * 1024 }),
+      sinks: [consoleSink],
+    });
+    for (let index = 0; index < 1_000; index++) {
+      logger.emit(observabilityEvent("request.completed", { trace_id: `terminal-${index}` }), "terminal");
+    }
+    for (let index = 0; index < 500; index++) {
+      logger.emit(observabilityEvent("route.selected", { trace_id: `progress-${index}` }), "progress");
+    }
+    await logger.close();
+
+    expect(writes.length).toBeLessThanOrEqual(10);
+    const output = writes.join("\n");
+    expect(output.match(/"event":"request.completed"/g)).toHaveLength(1_000);
+    expect(output.match(/"event":"route.selected"/g)?.length ?? 0).toBeLessThanOrEqual(1);
+
+    const beforeRateLimited = writes.length;
+    await consoleSink.writeBatch([
+      `${JSON.stringify(observabilityEvent("route.selected", { trace_id: "later" }))}\n`,
+    ]);
+    expect(writes).toHaveLength(beforeRateLimited);
+    now = 1_000;
+    await consoleSink.writeBatch([
+      `${JSON.stringify(observabilityEvent("route.selected", { trace_id: "later" }))}\n`,
+    ]);
+    expect(writes.at(-1)).toContain("later");
   });
 });

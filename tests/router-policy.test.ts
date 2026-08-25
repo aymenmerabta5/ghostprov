@@ -15,7 +15,6 @@ const TEXT: WorkloadDescriptor = {
   reservedBytes: 8 * 1024 ** 2,
   cpuPermits: 0,
   stream: true,
-  serializedBody: "{}",
 };
 
 const RANDOM: RandomSource = { next: () => 0.25, uuid: () => "id" };
@@ -73,11 +72,72 @@ describe("chooseRuntime", () => {
     expect(decision?.projectId).toBe(candidate("5").projectId);
   });
 
+  it("uses admission credits for eligibility without treating their cap as active work", () => {
+    const idle = candidate("1", { capacity: 128, active: 0, available: 4 });
+    const busy = candidate("2", { capacity: 128, active: 64, available: 4 });
+    expect(isRuntimeEligible(candidate("3", {
+      capacity: 128,
+      active: 0,
+      available: 0,
+    }))).toBe(false);
+    expect(chooseRuntime(TEXT, [busy, idle], RANDOM)?.projectId).toBe(idle.projectId);
+  });
+
+  it("subtracts only unreflected host reservations from advertised admission credits", () => {
+    expect(isRuntimeEligible(candidate("1", {
+      capacity: 90,
+      active: 0,
+      available: 4,
+      reserved: 3,
+    }))).toBe(true);
+    expect(isRuntimeEligible(candidate("1", {
+      capacity: 90,
+      active: 0,
+      available: 4,
+      reserved: 4,
+    }))).toBe(false);
+  });
+
   it("uses deterministic randomized tie-breaking", () => {
     const left = candidate("1");
     const right = candidate("2");
     expect(chooseRuntime(TEXT, [left, right], { ...RANDOM, next: () => 0.1 })?.projectId).toBe(left.projectId);
     expect(chooseRuntime(TEXT, [left, right], { ...RANDOM, next: () => 0.9 })?.projectId).toBe(right.projectId);
+  });
+
+  it("penalizes measured commit and scheduler backlog monotonically", () => {
+    const congested = candidate("1", {
+      available: 4,
+      commitBacklog: 3,
+      schedulerBytes: 512 * 1024,
+      schedulerOldestMs: 250,
+      throughputBytesPerSecond: 1024 * 1024,
+    });
+    const clear = candidate("2", {
+      available: 4,
+      commitBacklog: 0,
+      schedulerBytes: 0,
+      schedulerOldestMs: 0,
+      throughputBytesPerSecond: 1024 * 1024,
+    });
+    expect(chooseRuntime(TEXT, [congested, clear], RANDOM)?.projectId).toBe(clear.projectId);
+  });
+
+  it("uses measured publication throughput for a large request", () => {
+    const large: WorkloadDescriptor = {
+      ...TEXT,
+      class: "text-large",
+      requestBytes: 4 * 1024 ** 2,
+    };
+    const slow = candidate("1", {
+      available: 4,
+      throughputBytesPerSecond: 512 * 1024,
+    });
+    const fast = candidate("2", {
+      available: 4,
+      throughputBytesPerSecond: 8 * 1024 ** 2,
+    });
+    expect(chooseRuntime(large, [slow, fast], RANDOM)?.projectId).toBe(fast.projectId);
   });
 
   it("keeps 100,000 four-runtime decisions below the 2ms p95 budget", () => {

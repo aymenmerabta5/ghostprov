@@ -67,6 +67,8 @@ class FakeProvider implements AwarenessProviderLike {
   readonly awareness: Awareness;
   readonly listeners = new Map<string, Set<(...args: any[]) => void>>();
   destroyed = false;
+  connects = 0;
+  disconnects = 0;
 
   constructor(readonly doc: Y.Doc) {
     this.awareness = new Awareness(doc);
@@ -86,10 +88,11 @@ class FakeProvider implements AwarenessProviderLike {
   }
 
   connect(): void {
+    this.connects++;
     queueMicrotask(() => this.emit("sync", true));
   }
 
-  disconnect(): void {}
+  disconnect(): void { this.disconnects++; }
 
   destroy(): void {
     this.destroyed = true;
@@ -258,6 +261,108 @@ describe("Awareness channels", () => {
       token: "foreign",
       authorization: "full",
     }))).toThrow("another project");
+    await channel.close();
+  });
+
+  it("fails publish immediately on post-sync auth revocation and reconnects with rotation", async () => {
+    const first = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret-revoked",
+      authorization: "full",
+    });
+    let provider!: FakeProvider;
+    const channel = new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: first,
+      localPeerId: "host",
+      field: "ghostprovV2",
+      parseRemote: value => parseAwarenessEnvelope(value, BINDING, "sidecar"),
+      providerFactory: doc => provider = new FakeProvider(doc),
+      syncTimeoutMs: 100,
+    });
+    const failures: Error[] = [];
+    channel.onConnectionFailure(error => failures.push(error));
+    await channel.connect();
+
+    provider.emit("connection-error", { status: 401 });
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ kind: "auth" });
+    expect(() => channel.publish(hostEnvelope())).toThrow("connection failed");
+
+    const rotated = parseYSweetEnvelope({
+      url: first.url,
+      baseUrl: first.baseUrl,
+      docId: PROJECT,
+      token: "y-secret-reminted",
+      authorization: "full",
+    });
+    await channel.rotateCredential(rotated);
+    expect(provider.connects).toBe(2);
+    expect(() => channel.publish(hostEnvelope())).not.toThrow();
+    await channel.close();
+  });
+
+  it("single-flights a transient post-sync reconnect", async () => {
+    const credential = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret-transient",
+      authorization: "full",
+    });
+    let provider!: FakeProvider;
+    const channel = new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: credential,
+      localPeerId: "host",
+      field: "ghostprovV2",
+      parseRemote: value => parseAwarenessEnvelope(value, BINDING, "sidecar"),
+      providerFactory: doc => provider = new FakeProvider(doc),
+      syncTimeoutMs: 100,
+    });
+    const failures: Error[] = [];
+    channel.onConnectionFailure(error => failures.push(error));
+    await channel.connect();
+    provider.emit("connection-close", { code: 1006 });
+    expect(failures[0]).toMatchObject({ kind: "disconnected" });
+
+    const left = channel.connect();
+    const right = channel.connect();
+    expect(right).toBe(left);
+    await Promise.all([left, right]);
+    expect(provider.connects).toBe(2);
+    expect(() => channel.publish(hostEnvelope())).not.toThrow();
+    await channel.close();
+  });
+
+  it("ignores a stale close callback from the provider generation before reconnect", async () => {
+    const credential = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret-stale-close",
+      authorization: "full",
+    });
+    let provider!: FakeProvider;
+    const channel = new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: credential,
+      localPeerId: "host",
+      field: "ghostprovV2",
+      parseRemote: value => parseAwarenessEnvelope(value, BINDING, "sidecar"),
+      providerFactory: doc => provider = new FakeProvider(doc),
+      syncTimeoutMs: 100,
+    });
+    const failures: Error[] = [];
+    channel.onConnectionFailure(error => failures.push(error));
+    await channel.connect();
+    const staleClose = [...(provider.listeners.get("connection-close") ?? [])][0]!;
+    provider.emit("connection-close", { code: 1006 });
+    await channel.connect();
+    expect(failures).toHaveLength(1);
+
+    staleClose({ code: 1006 });
+    expect(failures).toHaveLength(1);
+    expect(() => channel.publish(hostEnvelope())).not.toThrow();
     await channel.close();
   });
 });

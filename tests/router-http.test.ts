@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
-import { request as httpRequest, type Server } from "node:http";
+import { Agent, request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
-import { parseFrames } from "../src/relay/sse";
+import { parseFrames, sseFrame } from "../src/relay/sse";
 import {
   MultiSandboxRouter,
   type IncomingResourceLease,
@@ -20,6 +20,9 @@ import { createGhostProvServer } from "../src/server/runtime";
 import { closeResponsesWebSockets } from "../src/ws/server";
 import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
+import { resolveHttpClientId } from "../src/http/request-lease";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import { v2EventPhysicalWorkingSetBytes } from "../src/v2/memory/event-memory-sizing";
 
 const servers: Server[] = [];
 
@@ -92,6 +95,7 @@ class FakeRouter {
     incomingLease?: IncomingResourceLease;
   }> = [];
   bodyReservations: number[] = [];
+  bodyReservationGrowths: number[] = [];
   bodyLeases: IncomingResourceLease[] = [];
   bodyReservationActive = 0;
   bodyReservationReleases = 0;
@@ -100,6 +104,9 @@ class FakeRouter {
     this.bodyReservationActive++;
     let released = false;
     const lease = {
+      ensureBytes: async (nextBytes: number) => {
+        this.bodyReservationGrowths.push(nextBytes);
+      },
       release: () => {
         if (released) return;
         released = true;
@@ -140,6 +147,24 @@ class FakeRouter {
 }
 
 describe("router HTTP composition", () => {
+  it("uses bounded privacy-safe HTTP fairness identities", () => {
+    const connection = { httpConnectionClientId: "http-connection-42" };
+    expect(resolveHttpClientId(connection)).toBe("http-connection-42");
+    expect(resolveHttpClientId(connection)).toBe("http-connection-42");
+
+    const explicit = resolveHttpClientId(connection, "customer-session-alpha");
+    expect(explicit).toMatch(/^http-explicit-\d{4}$/);
+    expect(explicit).toBe(resolveHttpClientId({}, "customer-session-alpha"));
+    expect(explicit).not.toContain("customer-session-alpha");
+    expect(resolveHttpClientId(connection, "x".repeat(129))).toBe("http-connection-42");
+
+    const buckets = new Set(Array.from({ length: 5_000 }, (_, index) => (
+      resolveHttpClientId({}, `client-${index}`)
+    )));
+    expect(buckets.size).toBeLessThanOrEqual(1_024);
+    expect(Math.max(...[...buckets].map(value => value.length))).toBeLessThanOrEqual(32);
+  });
+
   it("rejects keepalive intervals that cannot be scheduled safely", () => {
     const router = new FakeRouter();
     for (const keepAliveMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
@@ -185,6 +210,41 @@ describe("router HTTP composition", () => {
     await producer;
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(responseFinal);
+  });
+
+  it("transfers event memory into the HTTP chunk until the reader advances", async () => {
+    const frame = {
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response: final("resp_owned_http") }),
+    };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const coverage = v2EventPhysicalWorkingSetBytes(wireBytes);
+    const permits = new AtomicBytePermitPool({ ordinaryBytes: coverage, jumboBytes: 1 });
+    const owned = new V2RunHandle({});
+    await owned.acceptEvent(
+      frame,
+      wireBytes,
+      (await permits.acquire(coverage)).transfer("http-run-handle-test"),
+    );
+    owned.settle(final("resp_owned_http"));
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async () => owned,
+    };
+    const response = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(coverage);
+    expect((await reader.read()).done).toBe(true);
+    await Bun.sleep(0);
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(0);
+    reader.releaseLock();
+    permits.close();
   });
 
   it("waits for the R2 upstream prelude and preserves an initial provider 429", async () => {
@@ -315,6 +375,13 @@ describe("router HTTP composition", () => {
       upstreamRequestId: "req_late_error",
     });
     const response = await pending;
+    await realHandle.acceptEvent({
+      event: "response.output_text.delta",
+      data: JSON.stringify({
+        type: "response.output_text.delta",
+        delta: "valid prefix",
+      }),
+    });
     realHandle.fail(new V2CommittedError(
       providerError.error.message,
       providerError.error.code ?? "upstream_error",
@@ -325,9 +392,16 @@ describe("router HTTP composition", () => {
 
     expect(response.status).toBe(200);
     const frames = parseFrames(await response.text(), 0).frames;
-    expect(frames).toHaveLength(1);
-    expect(frames[0]!.event).toBe("error");
-    expect(JSON.parse(frames[0]!.data)).toEqual({
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toMatchObject({
+      event: "response.output_text.delta",
+      data: JSON.stringify({
+        type: "response.output_text.delta",
+        delta: "valid prefix",
+      }),
+    });
+    expect(frames[1]!.event).toBe("error");
+    expect(JSON.parse(frames[1]!.data)).toEqual({
       type: "error",
       error: providerError.error,
     });
@@ -465,11 +539,13 @@ describe("router HTTP composition", () => {
     });
 
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(produced).toBeLessThanOrEqual(2);
+    expect(produced).toBe(0);
     await response.body!.cancel("test cancellation");
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(relaySignal?.aborted).toBe(true);
-    expect(iteratorClosed).toBe(true);
+    // With a zero stream high-water mark the async generator never starts, so
+    // its body/finally correctly never runs; cancellation still aborts relay.
+    expect(iteratorClosed).toBe(false);
   });
 
   it("aborts and returns the SSE iterator when streaming fails", async () => {
@@ -532,6 +608,11 @@ describe("router HTTP composition", () => {
     expect(response.status).toBe(200);
     expect(image.status).toBe(200);
     expect(router.workloads.map(workload => workload.source)).toEqual(["http", "image", "image"]);
+    expect(router.workloads[0]!.clientId).toMatch(/^http-request-\d{4}$/);
+    expect(router.workloads[1]!.clientId).toMatch(/^http-request-\d{4}$/);
+    expect(router.workloads[2]!.clientId).toBe(router.workloads[1]!.clientId);
+    expect(router.workloads.map(workload => workload.clientId)).not.toContain("http");
+    expect(router.workloads.map(workload => workload.clientId)).not.toContain("images");
   });
 
   it.each(["completed", "incomplete", "failed"] as const)(
@@ -603,7 +684,89 @@ describe("router HTTP composition", () => {
     const health = await (await app.request("/health")).json();
     const sandboxes = await (await app.request("/__sandboxes")).json();
     expect(health).toMatchObject({ ok: true, capacity: 120, active: 7, available: 113, queued: 2 });
+    expect((health as any).release).toEqual({
+      knownRuntimes: 0,
+      unknownRuntimes: 0,
+      selections: [],
+    });
     expect(JSON.stringify(sandboxes)).not.toMatch(/token|cookie/i);
+  });
+
+  it("reports exact verified release identities and explicit unknown runtimes", async () => {
+    const buildHash = "a".repeat(64);
+    const schemaHash = "b".repeat(64);
+    const router = healthRouter([
+      { protocolRevision: "r2", buildHash, schemaHash },
+      {
+        token: "credential-canary",
+        sandboxSessionId: "session-canary",
+        instanceId: "instance-canary",
+      } as any,
+    ]);
+    try {
+      const app = createGhostProvApp({ router });
+      const health = await (await app.request("/health")).json() as any;
+      const sandboxes = await (await app.request("/__sandboxes")).json() as any;
+      expect(health.release).toEqual({
+        knownRuntimes: 1,
+        unknownRuntimes: 1,
+        selections: [{ protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
+      });
+      expect(sandboxes.release).toEqual(health.release);
+      expect(sandboxes.runtimes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ protocolRevision: "r2", buildHash, schemaHash }),
+        expect.objectContaining({ protocolRevision: null, buildHash: null, schemaHash: null }),
+      ]));
+      expect(JSON.stringify({ health, sandboxes })).not.toMatch(
+        /sandboxSessionId|instanceId|authorization|ySweetToken/i,
+      );
+      expect(JSON.stringify(sandboxes)).not.toContain("credential-canary");
+    } finally {
+      await router.close();
+    }
+  });
+
+  it("reports partial fleet unavailability and background recovery truth", async () => {
+    const unavailableProject = projectId("00000000-0000-4000-8000-000000000099");
+    const readyProject = projectId("00000000-0000-4000-8000-000000000098");
+    let recovered = false;
+    const router = healthRouter([{}]);
+    const fleetSnapshot = () => ({
+      desired: 2,
+      ready: recovered ? 2 : 1,
+      provisioning: 0,
+      draining: 0,
+      failed: recovered ? 0 : 1,
+      unavailable: recovered ? 0 : 1,
+      unavailableProjects: recovered ? [] : [unavailableProject],
+      projects: [unavailableProject, readyProject],
+    });
+    try {
+      const app = createGhostProvApp({ router, fleetSnapshot });
+      expect(await (await app.request("/health")).json()).toMatchObject({
+        ok: true,
+        desired: 2,
+        ready: 1,
+        unavailable: 1,
+        unavailableProjects: [unavailableProject],
+        unavailableProjectsTruncated: false,
+      });
+      expect(await (await app.request("/__sandboxes")).json()).toMatchObject({
+        desired: 2,
+        ready: 1,
+        unavailable: 1,
+        unavailableProjects: [unavailableProject],
+      });
+      recovered = true;
+      expect(await (await app.request("/health")).json()).toMatchObject({
+        desired: 2,
+        ready: 2,
+        unavailable: 0,
+        unavailableProjects: [],
+      });
+    } finally {
+      await router.close();
+    }
   });
 
   it("reports 503 and zero capacity when every ready runtime heartbeat is stale", async () => {
@@ -735,7 +898,6 @@ describe("router HTTP composition", () => {
       reservedBytes: reservationCapacity - 8 * MiB,
       cpuPermits: 0,
       stream: false,
-      serializedBody: "",
     });
     const id = projectId("00000000-0000-4000-8000-000000000099");
     const runtime: RoutableSandboxRuntime = {
@@ -799,6 +961,27 @@ describe("router HTTP composition", () => {
     }
   });
 
+  it("grows unknown ingress accounting from the small floor under one deadline", async () => {
+    const MiB = 1024 ** 2;
+    const router = healthRouter([]);
+    const ingress = await router.acquireIncomingBody(0, undefined, { maxBytes: 64 * MiB });
+    try {
+      expect(ingress.reservedBytes).toBe(8 * MiB);
+      expect(ingress.deadlineMs! - ingress.acceptedAtMs!).toBe(30_000);
+      await ingress.ensureBytes!(4 * MiB);
+      expect(ingress.reservedBytes).toBe(16 * MiB);
+      expect(router.snapshot().resources.reservedBytes).toBe(16 * MiB);
+      await ingress.ensureBytes!(6 * MiB);
+      expect(ingress.reservedBytes).toBe(16 * MiB);
+      await ingress.ensureBytes!(8 * MiB);
+      expect(ingress.reservedBytes).toBe(32 * MiB);
+    } finally {
+      ingress.release();
+      await router.close();
+    }
+    expect(router.snapshot().resources.reservedBytes).toBe(0);
+  });
+
   it("hands one image batch ingress lease to exactly one concurrent fan-out job", async () => {
     const router = new FakeRouter();
     const app = createGhostProvApp({ router });
@@ -831,6 +1014,7 @@ describe("router HTTP composition", () => {
     expect(imageCalls[1].incomingLease).toBeUndefined();
     expect(router.bodyReservationReleases).toBe(1);
     expect(router.bodyReservationActive).toBe(0);
+    expect(router.workloads.at(-1)?.clientId).toMatch(/^http-connection-\d{1,4}$/);
   });
 
   it("keeps retained image ingress memory inside the first execution reservation", async () => {
@@ -966,6 +1150,134 @@ describe("router HTTP composition", () => {
     expect(router.bodyReservations).toEqual([Buffer.byteLength(body)]);
     expect(router.bodyReservationReleases).toBe(1);
     expect(router.bodyReservationActive).toBe(0);
+  });
+
+  it("starts chunked ingress small and grows it only to observed bytes", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const body = JSON.stringify({ model: "gpt-5.6-sol", input: "tiny chunked body" });
+
+    const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: "127.0.0.1",
+        port: address.port,
+        path: "/v1/responses",
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "transfer-encoding": "chunked",
+        },
+      }, incoming => {
+        let responseBody = "";
+        incoming.setEncoding("utf8");
+        incoming.on("data", chunk => { responseBody += chunk; });
+        incoming.once("end", () => resolve({
+          status: incoming.statusCode ?? 0,
+          body: responseBody,
+        }));
+      });
+      request.once("error", reject);
+      request.write(body.slice(0, 7));
+      request.end(body.slice(7));
+    });
+
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({ status: "completed" });
+    expect(router.bodyReservations).toEqual([0]);
+    expect(router.bodyReservationGrowths.at(-1)).toBe(Buffer.byteLength(body));
+    expect(Math.max(...router.bodyReservationGrowths)).toBeLessThan(1024);
+  });
+
+  it("interrupts a stalled HTTP upload so server shutdown cannot hang", async () => {
+    const router = healthRouter([]);
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+
+    const request = httpRequest({
+      hostname: "127.0.0.1",
+      port: address.port,
+      path: "/v1/responses",
+      method: "POST",
+      headers: {
+        connection: "close",
+        "content-type": "application/json",
+        "content-length": "1024",
+      },
+    });
+    request.on("error", () => undefined);
+    request.write("{");
+    try {
+      for (let turn = 0; router.snapshot().resources.reservedBytes === 0 && turn < 100; turn++) {
+        await Bun.sleep(1);
+      }
+      expect(router.snapshot().resources.reservedBytes).toBeGreaterThan(0);
+      const serverClosed = new Promise<void>((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());
+      });
+      router.beginShutdown();
+      await Promise.race([
+        serverClosed,
+        Bun.sleep(500).then(() => { throw new Error("stalled upload blocked server shutdown"); }),
+      ]);
+      await router.awaitIdle(500);
+    } finally {
+      request.destroy();
+      await router.close();
+    }
+  });
+
+  it("keeps one bounded fairness identity across a persistent HTTP connection", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+    const body = JSON.stringify({ model: "gpt-5.6-sol", input: "identity" });
+    const send = (explicit?: string) => new Promise<void>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: "127.0.0.1",
+        port: address.port,
+        path: "/v1/responses",
+        method: "POST",
+        agent,
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          ...(explicit ? { "x-ghostprov-client-id": explicit } : {}),
+        },
+      }, response => {
+        response.resume();
+        response.once("end", resolve);
+      });
+      request.once("error", reject);
+      request.end(body);
+    });
+
+    try {
+      await send();
+      await send();
+      expect(router.workloads[0]!.clientId).toMatch(/^http-connection-\d{1,4}$/);
+      expect(router.workloads[1]!.clientId).toBe(router.workloads[0]!.clientId);
+      await send("caller-session-must-not-escape");
+      expect(router.workloads[2]!.clientId).toBe(
+        resolveHttpClientId({}, "caller-session-must-not-escape"),
+      );
+      expect(router.workloads[2]!.clientId).not.toContain("caller-session-must-not-escape");
+    } finally {
+      agent.destroy();
+    }
   });
 
   it("propagates a downstream HTTP disconnect to the relay signal", async () => {

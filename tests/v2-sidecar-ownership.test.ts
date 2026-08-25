@@ -10,6 +10,8 @@ interface FakeFile {
   bytes: Uint8Array;
   generation: number;
   locked: boolean;
+  unlocks: number;
+  closes: number;
 }
 
 class FakeHandle implements SidecarOwnershipHandle {
@@ -47,10 +49,12 @@ class FakeHandle implements SidecarOwnershipHandle {
     if (!this.#ownsLock) return;
     this.#ownsLock = false;
     this.#file.locked = false;
+    this.#file.unlocks++;
   }
 
   close(): void {
     this.#closed = true;
+    this.#file.closes++;
   }
 }
 
@@ -60,12 +64,31 @@ class FakeBackend implements SidecarOwnershipBackend {
     bytes: new TextEncoder().encode('{"stale":true}'),
     generation: 1,
     locked: false,
+    unlocks: 0,
+    closes: 0,
   };
+  readonly promotions: Array<{
+    root: string;
+    launchNonce: string;
+    pid: number;
+    processStart: string;
+    locked: boolean;
+  }> = [];
+  onPromote?: () => Promise<void>;
   #nonce = 0;
 
   now(): number { return 1_000; }
   uuid(): string { return `lease-${++this.#nonce}`; }
   async open(): Promise<SidecarOwnershipHandle> { return new FakeHandle(this.file); }
+  async promoteProcessIdentity(
+    root: string,
+    launchNonce: string,
+    pid: number,
+    processStart: string,
+  ): Promise<void> {
+    this.promotions.push({ root, launchNonce, pid, processStart, locked: this.file.locked });
+    await this.onPromote?.();
+  }
 
   replacePath(): void {
     this.file.generation++;
@@ -124,6 +147,19 @@ describe("DenoSidecarOwnershipLease", () => {
     await expect(lease.assertOwned()).rejects.toMatchObject({ code: "lost" });
   });
 
+  it("single-flights concurrent release without double unlock or close", async () => {
+    const backend = new FakeBackend();
+    const lease = await DenoSidecarOwnershipLease.acquire({
+      instanceId: "sidecar-owner",
+      backend,
+    });
+
+    await Promise.all([lease.release(), lease.release(), lease.release()]);
+
+    expect(backend.file.unlocks).toBe(1);
+    expect(backend.file.closes).toBe(1);
+  });
+
   it("serializes release behind an ownership-scoped destructive operation", async () => {
     const backend = new FakeBackend();
     const lease = await DenoSidecarOwnershipLease.acquire({
@@ -147,6 +183,61 @@ describe("DenoSidecarOwnershipLease", () => {
     await operation;
     await releasing;
     expect(backend.file.locked).toBe(false);
+  });
+
+  it("promotes the candidate PID only while holding and revalidating ownership", async () => {
+    const backend = new FakeBackend();
+    const lease = await DenoSidecarOwnershipLease.acquire({
+      instanceId: "sidecar-owner",
+      root: "/tmp/interlock-test",
+      backend,
+    });
+
+    await lease.promoteProcessIdentity("launch-nonce-1", "7001");
+
+    expect(backend.promotions).toEqual([{
+      root: "/tmp/interlock-test",
+      launchNonce: "launch-nonce-1",
+      pid: 123,
+      processStart: "7001",
+      locked: true,
+    }]);
+    await lease.release();
+  });
+
+  it("does not release ownership while atomic PID promotion is in flight", async () => {
+    const backend = new FakeBackend();
+    let finish!: () => void;
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    backend.onPromote = () => blocked;
+    const lease = await DenoSidecarOwnershipLease.acquire({
+      instanceId: "sidecar-owner",
+      backend,
+    });
+
+    const promoting = lease.promoteProcessIdentity("launch-nonce-2", "7002");
+    await Bun.sleep(0);
+    const releasing = lease.release();
+    await Bun.sleep(0);
+    expect(backend.file.locked).toBe(true);
+
+    finish();
+    await promoting;
+    await releasing;
+    expect(backend.file.locked).toBe(false);
+  });
+
+  it("fails PID promotion if ownership identity changes during the operation", async () => {
+    const backend = new FakeBackend();
+    backend.onPromote = async () => backend.replacePath();
+    const lease = await DenoSidecarOwnershipLease.acquire({
+      instanceId: "sidecar-owner",
+      backend,
+    });
+
+    await expect(lease.promoteProcessIdentity("launch-nonce-3", "7003"))
+      .rejects.toMatchObject({ name: "SidecarOwnershipError", code: "lost" });
+    await lease.release();
   });
 
   it("revalidates path identity after an ownership-scoped operation", async () => {

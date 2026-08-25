@@ -1,17 +1,39 @@
 import type { BootstrapBinding } from "../../src/v2/bootstrap/crypto.ts";
 import { protocolBindingFromBootstrap } from "../../src/v2/bootstrap/binding.ts";
 import { RequestAssembler } from "../../src/v2/sidecar/assembler.ts";
-import { ClaimJournal } from "../../src/v2/sidecar/journal.ts";
+import {
+  ClaimJournal,
+  V2_JOURNAL_MAX_BYTES,
+  V2_JOURNAL_MAX_RECORDS,
+} from "../../src/v2/sidecar/journal.ts";
 import { AdmissionController } from "../../src/v2/sidecar/admission.ts";
 import { DirectResponsesClient } from "../../src/v2/sidecar/upstream.ts";
 import { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
-import { phaseZeroBootstrap } from "./bootstrap.ts";
+import {
+  phaseZeroBootstrap,
+  resolveSidecarBootstrapHelloPath,
+} from "./bootstrap.ts";
 import { DenoAwarenessPeer } from "./awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
 import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 import { DenoSidecarOwnershipLease } from "./ownership-lease.ts";
+import {
+  SIDECAR_OWNERSHIP_ROOT,
+  sidecarJournalRoot,
+} from "./storage-paths.ts";
+import {
+  AtomicBytePermitPool,
+} from "../../src/v2/memory/atomic-byte-permits.ts";
+import { deriveV2SidecarEventMemorySizing } from "../../src/v2/memory/event-memory-sizing.ts";
+import {
+  V2_TERMINAL_SPOOL_CAPACITY,
+  V2_TERMINAL_SPOOL_RESERVATION_BYTES,
+  V2_TERMINAL_SPOOL_TOTAL_BYTES,
+} from "../../src/v2/sidecar/capacity.ts";
+
+const MAX_RESPONSE_EVENT_BYTES = V2_TERMINAL_SPOOL_RESERVATION_BYTES;
 
 interface StaticSidecarConfig {
   version: 1;
@@ -44,6 +66,7 @@ function readConfig(value: unknown): StaticSidecarConfig {
     !Number.isInteger(raw.maxActivePerSandbox) ||
     (raw.maxActivePerSandbox as number) < (raw.initialActivePerSandbox as number) ||
     (raw.maxActivePerSandbox as number) > (raw.physicalMax as number) ||
+    (raw.maxActivePerSandbox as number) > V2_TERMINAL_SPOOL_CAPACITY ||
     !Number.isInteger(raw.memoryBudgetBytes) ||
     (raw.memoryBudgetBytes as number) < 64 * 1024 * 1024 ||
     !raw.diagnostics || typeof raw.diagnostics !== "object" ||
@@ -112,6 +135,14 @@ async function run(): Promise<void> {
   const baseUrl = Deno.env.get("OPENAI_BASE_URL");
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
+  // Reject a stale/delayed launcher before it can take the global ownership
+  // lock and transiently exclude the correctly bound candidate.
+  const launchIdentity = resolveSidecarBootstrapHelloPath({
+    launchNonce: config.binding.nonce,
+    pid: Deno.pid,
+    args: Deno.args,
+    root: SIDECAR_OWNERSHIP_ROOT,
+  });
 
   const lifecycle = new AbortController();
   let resolveShutdown!: (reason: string) => void;
@@ -140,6 +171,7 @@ async function run(): Promise<void> {
   let journal: ClaimJournal | null = null;
   let engine: SidecarEngine | null = null;
   let peer: DenoAwarenessPeer | null = null;
+  let atomicBytePermits: AtomicBytePermitPool | null = null;
   let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   let maintenanceTask: Promise<void> | null = null;
   let fatalCause: Error | null = null;
@@ -148,11 +180,19 @@ async function run(): Promise<void> {
   try {
     // Ownership precedes the bootstrap hello so overlapping local launches
     // cannot race the shared journal or advertise a non-owning instance.
-    ownership = await DenoSidecarOwnershipLease.acquire({ instanceId });
+    ownership = await DenoSidecarOwnershipLease.acquire({
+      instanceId,
+      root: SIDECAR_OWNERSHIP_ROOT,
+    });
     const bootstrap = await phaseZeroBootstrap({
       binding: config.binding,
       instanceId,
       encryptedPath: "/workspace/.ghostprov-v2/bootstrap.enc.json",
+      helloPath: launchIdentity.helloPath,
+      beforeHelloPublished: () => ownership!.promoteProcessIdentity(
+        config.binding.nonce,
+        launchIdentity.processStart,
+      ),
       signal: lifecycle.signal,
     });
     if (bootstrap.instanceId !== instanceId) {
@@ -160,8 +200,17 @@ async function run(): Promise<void> {
     }
 
     const storage = new DenoJournalStorage({
+      // R1 and R2 journal schemas differ. Keeping the R2 journal disjoint
+      // preserves an exact R2 -> frozen-R1 rollback while the global lock
+      // above still prevents either revision from executing concurrently.
+      root: sidecarJournalRoot(binding.protocolRevision),
       assertExclusiveOwnership: () => ownership!.assertOwned(),
       withExclusiveOwnership: operation => ownership!.withOwnership(operation),
+      maxTerminalSpoolBytes: V2_TERMINAL_SPOOL_RESERVATION_BYTES,
+      maxTerminalBytes: V2_TERMINAL_SPOOL_TOTAL_BYTES,
+      maxActiveSpools: V2_TERMINAL_SPOOL_CAPACITY,
+      maxJournalBytes: V2_JOURNAL_MAX_BYTES,
+      maxJournalRecords: V2_JOURNAL_MAX_RECORDS,
     });
     diagnostics = new SidecarResourceSampler(config.diagnostics);
     diagnostics.start();
@@ -177,22 +226,36 @@ async function run(): Promise<void> {
       hardFrames: 1_024,
       hardBytes: 1_024 * 1024,
     });
+    const eventMemory = deriveV2SidecarEventMemorySizing({
+      totalBytes: config.memoryBudgetBytes,
+      responseMaxBytes: MAX_RESPONSE_EVENT_BYTES,
+    });
+    const { ordinaryBytes } = eventMemory;
+    atomicBytePermits = new AtomicBytePermitPool({
+      ordinaryBytes,
+      jumboBytes: eventMemory.jumboBytes,
+      maxWaiters: config.acceptedMax,
+    });
     journal = new ClaimJournal({
       storage,
       flushIntervalMs: 2,
       maxBatch: 64,
+      maxJournalBytes: V2_JOURNAL_MAX_BYTES,
+      maxJournalRecords: V2_JOURNAL_MAX_RECORDS,
       assertExclusiveOwnership: () => ownership!.assertOwned(),
       withExclusiveOwnership: operation => ownership!.withOwnership(operation),
     });
     const admission = new AdmissionController({
-      physicalMax: config.physicalMax,
+      physicalMax: Math.min(config.physicalMax, config.maxActivePerSandbox),
       acceptedMax: config.acceptedMax,
-      hostCeiling: config.physicalMax,
-      memoryBudgetBytes: config.memoryBudgetBytes,
+      hostCeiling: Math.min(config.physicalMax, config.maxActivePerSandbox),
+      memoryBudgetBytes: ordinaryBytes,
     });
     const upstream = new DirectResponsesClient({
       baseUrl,
       apiKey: { reveal: () => apiKey },
+      maxEventBytes: MAX_RESPONSE_EVENT_BYTES,
+      atomicBytePermits,
     });
     let resolveDrain!: (reason: string) => void;
     const drainRequested = new Promise<string>(resolve => { resolveDrain = resolve; });
@@ -206,7 +269,10 @@ async function run(): Promise<void> {
 
     engine = new SidecarEngine({
       binding,
-      assembler: new RequestAssembler({ maxReservedBytes: config.memoryBudgetBytes }),
+      assembler: new RequestAssembler({
+        maxReservedBytes: ordinaryBytes,
+        atomicBytePermits,
+      }),
       journal,
       admission,
       upstream,
@@ -219,6 +285,7 @@ async function run(): Promise<void> {
       },
       diagnostics: diagnosticObserver,
       outputBackpressure,
+      atomicBytePermits,
       deferAcceptUntilStarted: true,
       batching: config.batching,
       emit: (frame, priority, streamId) => peer?.enqueue(frame, priority, streamId),
@@ -286,6 +353,17 @@ async function run(): Promise<void> {
     if (peer) await cleanup(() => peer!.closeGracefully());
     outputBackpressure?.close();
     if (journal) await cleanup(() => journal!.close());
+    if (atomicBytePermits) {
+      await cleanup(() => {
+        atomicBytePermits!.close();
+        if (atomicBytePermits!.snapshot().activePermits !== 0) {
+          throw new SidecarLifecycleError(
+            "Sidecar atomic byte permits leaked during shutdown",
+            "event_memory_leak",
+          );
+        }
+      });
+    }
     if (diagnostics) await cleanup(() => diagnostics!.close());
     if (ownership) await cleanup(() => ownership!.release());
     await cleanup(() => Deno.removeSignalListener("SIGTERM", onTerm));

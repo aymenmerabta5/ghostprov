@@ -1,5 +1,9 @@
 export type ObservabilityPriority = "terminal" | "progress" | "sample";
 
+/** Bounded router scheduler classes safe to expose in request telemetry. */
+export const ROUTER_QUEUE_CLASSES = ["latency", "bulk"] as const;
+export type RouterQueueClass = typeof ROUTER_QUEUE_CLASSES[number];
+
 export const RECOVERY_OBSERVABILITY_EVENT_NAMES = [
   "sandbox.recovery.started",
   "sandbox.recovery.retry_scheduled",

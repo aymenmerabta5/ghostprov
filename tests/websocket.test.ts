@@ -3,7 +3,11 @@ import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import {
   attachResponsesWebSocket,
+  DEFAULT_WS_MAX_PAYLOAD_BYTES,
+  DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
   decodeWebSocketRawData,
+  MAX_WS_PAYLOAD_BYTES,
+  webSocketIngressReservationBytes,
   type AttachResponsesWebSocketOptions,
   type WebSocketRelayStarter,
 } from "../src/ws/server";
@@ -13,9 +17,19 @@ import {
   WebSocketProcessBudget,
 } from "../src/ws/session";
 import { WebSocketTelemetry } from "../src/ws/telemetry";
-import { ResponseGraph } from "../src/ws/response-graph";
+import { ResponseGraph, SharedByteBudget } from "../src/ws/response-graph";
 import { ApiError } from "../src/http/errors";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
+import { RouterQueueFullError } from "../src/router/router";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import {
+  V2CommittedError,
+  V2RunHandle,
+} from "../src/v2/transport/run-handle";
+import {
+  attachAtomicBytePermit,
+  releaseAtomicBytePermit,
+} from "../src/v2/memory/permit-carrier";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
@@ -47,6 +61,7 @@ function completed(id: string, output: unknown[] = []) {
 async function startServer(
   startRelay: WebSocketRelayStarter,
   options: Omit<AttachResponsesWebSocketOptions, "startRelay"> = {},
+  clientHeaders?: Record<string, string>,
 ) {
   const server = createServer((_req, res) => { res.writeHead(404).end(); });
   attachResponsesWebSocket(server, { startRelay, ...options });
@@ -54,7 +69,10 @@ async function startServer(
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("missing test address");
-  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+  const socket = new WebSocket(
+    `ws://127.0.0.1:${address.port}/v1/responses`,
+    clientHeaders ? { headers: clientHeaders } : undefined,
+  );
   sockets.push(socket);
   await new Promise<void>((resolve, reject) => {
     socket.once("open", resolve);
@@ -78,6 +96,224 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("Responses WebSocket server", () => {
+  it("bounds thirty default parser reservations and one explicit jumbo mix", () => {
+    const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
+    const jumboBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
+    expect(normalBytes).toBe(17 * 1024 * 1024);
+    expect(jumboBytes).toBe(257 * 1024 * 1024);
+
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 256,
+      maxQueuedBytes: 512 * 1024 * 1024,
+      maxIngressBytes: DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
+    });
+    const defaults = Array.from({ length: 30 }, () => budget.openSession(normalBytes));
+    expect(defaults.every(Boolean)).toBe(true);
+    expect(budget.openSession(normalBytes)).toBeNull();
+    for (const lease of defaults) {
+      expect(lease!.tryReserve(DEFAULT_WS_MAX_PAYLOAD_BYTES)).toBe(true);
+    }
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 30,
+      ingressReservedBytes: 510 * 1024 * 1024,
+      queuedBytes: 120 * 1024 * 1024,
+      maxIngressBytes: 512 * 1024 * 1024,
+    });
+    for (const lease of defaults) lease!.close();
+
+    const jumbo = budget.openSession(jumboBytes);
+    expect(jumbo).not.toBeNull();
+    const alongsideJumbo = Array.from({ length: 15 }, () => budget.openSession(normalBytes));
+    expect(alongsideJumbo.every(Boolean)).toBe(true);
+    expect(budget.openSession(normalBytes)).toBeNull();
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 16,
+      ingressReservedBytes: 512 * 1024 * 1024,
+    });
+    jumbo!.close();
+    for (const lease of alongsideJumbo) lease!.close();
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 0,
+      ingressReservedBytes: 0,
+      queuedBytes: 0,
+    });
+  });
+
+  it("requires explicit jumbo ingress before assembling more than four MiB", async () => {
+    const input = "x".repeat(5 * 1024 * 1024);
+    let normalCalls = 0;
+    const normal = await startServer(async () => {
+      normalCalls++;
+      return relayHandle(Promise.resolve(completed("unexpected")));
+    });
+    const normalClosed = new Promise<number>(resolve => normal.once("close", resolve));
+    normal.send(JSON.stringify({ type: "response.create", input }));
+    expect(await normalClosed).toBe(1009);
+    expect(normalCalls).toBe(0);
+
+    let jumboCalls = 0;
+    const jumbo = await startServer(async () => {
+      jumboCalls++;
+      return relayHandle(Promise.resolve(completed("resp_jumbo_ingress")));
+    }, {}, { "x-ghostprov-ws-jumbo": "1" });
+    const messages = collect(jumbo);
+    jumbo.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input,
+    }));
+    await waitFor(() => messages.some(message => message.type === "response.completed"), 5_000);
+    expect(jumboCalls).toBe(1);
+  }, 15_000);
+
+  it("rejects an upgrade before parser construction when ingress is exhausted", async () => {
+    const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 8,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: normalBytes,
+    });
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    attachResponsesWebSocket(server, {
+      processBudget: budget,
+      startRelay: async () => relayHandle(new Promise(() => {})),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const url = `ws://127.0.0.1:${address.port}/v1/responses`;
+
+    const first = new WebSocket(url);
+    sockets.push(first);
+    await new Promise<void>((resolve, reject) => {
+      first.once("open", resolve);
+      first.once("error", reject);
+    });
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 1,
+      ingressReservedBytes: normalBytes,
+    });
+
+    const rejected = new WebSocket(url);
+    sockets.push(rejected);
+    rejected.on("error", () => undefined);
+    const status = await new Promise<number>(resolve => {
+      rejected.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+    });
+    expect(status).toBe(503);
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 1,
+      ingressReservedBytes: normalBytes,
+    });
+    first.close();
+    await waitFor(() => budget.snapshot().sessions === 0);
+    expect(budget.snapshot().ingressReservedBytes).toBe(0);
+  });
+
+  it("reaps thirty dead-idle peers and recovers every ingress reservation", async () => {
+    const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 30,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: normalBytes * 30,
+    });
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    attachResponsesWebSocket(server, {
+      processBudget: budget,
+      heartbeatIntervalMs: 50,
+      pongTimeoutMs: 100,
+      idleTimeoutMs: 200,
+      startRelay: async () => relayHandle(new Promise(() => {})),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const url = `ws://127.0.0.1:${address.port}/v1/responses`;
+
+    const dead = Array.from({ length: 30 }, () => new WebSocket(url));
+    sockets.push(...dead);
+    await Promise.all(dead.map(socket => new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    })));
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 30,
+      ingressReservedBytes: normalBytes * 30,
+    });
+    await waitFor(() => budget.snapshot().sessions === 0, 2_000);
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
+
+    const replacement = new WebSocket(url);
+    sockets.push(replacement);
+    await new Promise<void>((resolve, reject) => {
+      replacement.once("open", resolve);
+      replacement.once("error", reject);
+    });
+    expect(budget.snapshot().sessions).toBe(1);
+    replacement.close();
+    await waitFor(() => budget.snapshot().sessions === 0);
+  }, 10_000);
+
+  it("expires a responsive but application-idle peer and clears its timer", async () => {
+    const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: normalBytes,
+    });
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    attachResponsesWebSocket(server, {
+      processBudget: budget,
+      heartbeatIntervalMs: 10,
+      pongTimeoutMs: 30,
+      idleTimeoutMs: 60,
+      startRelay: async () => relayHandle(new Promise(() => {})),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const closed = new Promise<number>(resolve => socket.once("close", resolve));
+    expect(await closed).toBe(1006);
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
+  });
+
+  it("does not idle-expire a live silent relay", async () => {
+    let started = false;
+    const socket = await startServer(async () => {
+      started = true;
+      return relayHandle(new Promise(() => {}));
+    }, {
+      heartbeatIntervalMs: 10,
+      pongTimeoutMs: 30,
+      idleTimeoutMs: 50,
+    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "silent but active",
+    }));
+    await waitFor(() => started);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    socket.close();
+  });
+
   it("sends direct event objects, makes streaming implicit, and echoes only named stream IDs", async () => {
     const bodies: Record<string, unknown>[] = [];
     const startRelay: WebSocketRelayStarter = async body => {
@@ -228,6 +464,50 @@ describe("Responses WebSocket server", () => {
     expect(bodies[1]).not.toHaveProperty("previous_response_id");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call_output");
+  });
+
+  it("holds lineage capacity only until router handoff completes", async () => {
+    const shared = new SharedByteBudget(16 * 1024 * 1024);
+    const graph = new ResponseGraph({
+      maxBytes: 8 * 1024 * 1024,
+      sharedBudget: shared,
+    });
+    const root = graph.resolve({
+      type: "response.create",
+      store: false,
+      input: "root",
+    });
+    graph.record(root, {
+      id: "resp_lineage_root",
+      status: "completed",
+      output: [{ type: "message", content: "x".repeat(1024 * 1024) }],
+    });
+    const storedBytes = shared.used;
+    const handoff = deferred<RunHandle>();
+    let started = false;
+    const socket = await startServer(async () => {
+      started = true;
+      return handoff.promise;
+    }, { graphFactory: () => graph });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "lineage",
+      model: "gpt-5.6-sol",
+      store: false,
+      previous_response_id: "resp_lineage_root",
+      input: "next",
+    }));
+    await waitFor(() => started);
+    expect(shared.used).toBeGreaterThan(storedBytes);
+
+    handoff.resolve(relayHandle(Promise.resolve({
+      status: "completed",
+      output: [],
+    })));
+    await waitFor(() => messages.some(message => message.type === "response.completed"));
+    expect(shared.used).toBe(storedBytes);
+    socket.close();
   });
 
   it("caps active responses per connection and drains queued lanes", async () => {
@@ -492,6 +772,73 @@ describe("Responses WebSocket server", () => {
     });
   });
 
+  it("delivers an accepted prefix before a definitive provider error", async () => {
+    const relay = new V2RunHandle({ maxBufferedBytes: 4_096 });
+    let started = false;
+    const socket = await startServer(async () => {
+      started = true;
+      return relay;
+    });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "prefix",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "prefix then fail",
+    }));
+    await waitFor(() => started);
+    await relay.acceptEvent({
+      event: "response.output_text.delta",
+      data: JSON.stringify({
+        type: "response.output_text.delta",
+        delta: "valid prefix",
+      }),
+    });
+    relay.fail(new V2CommittedError(
+      "provider rate limit",
+      "rate_limit_exceeded",
+      false,
+    ));
+
+    await waitFor(() => messages.some(message => message.type === "error"));
+    expect(messages.map(message => message.type)).toEqual([
+      "response.output_text.delta",
+      "error",
+    ]);
+    expect(messages[0]).toMatchObject({ stream_id: "prefix", delta: "valid prefix" });
+    expect(messages[1]).toMatchObject({
+      status: 429,
+      stream_id: "prefix",
+      error: { code: "rate_limit_exceeded" },
+    });
+  });
+
+  it("maps router queue pressure to a WebSocket 503 overload", async () => {
+    const socket = await startServer(async () => {
+      throw new RouterQueueFullError("private queue accounting");
+    });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "queue-full",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "queue-full",
+    }));
+
+    await waitFor(() => messages.some(message => message.stream_id === "queue-full"));
+    expect(messages.find(message => message.stream_id === "queue-full")).toMatchObject({
+      type: "error",
+      status: 503,
+      error: {
+        message: "GhostProv routing is temporarily overloaded",
+        type: "overloaded_error",
+        code: "router_queue_full",
+      },
+    });
+  });
+
   it("recycles completed named-stream slots", async () => {
     let calls = 0;
     const socket = await startServer(async () => {
@@ -570,6 +917,57 @@ class FakeSocket {
 }
 
 describe("Responses WebSocket bounded delivery", () => {
+  it("holds transferred event memory until the socket send callback settles", async () => {
+    const socket = new FakeSocket();
+    socket.holdCallbacks = true;
+    const permits = new AtomicBytePermitPool({ ordinaryBytes: 4_096, jumboBytes: 1 });
+    const frame = attachAtomicBytePermit({
+      event: "response.created",
+      data: JSON.stringify({ type: "response.created", response: { id: "resp_owned" } }),
+    }, (await permits.acquire(4_096)).transfer("websocket-test"));
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      sendTimeoutMs: 10_000,
+      startRelay: async () => relayHandle(new Promise(() => {}), [frame]),
+    });
+
+    session.receive(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "owned output",
+    }));
+    await waitFor(() => socket.sent.length === 1);
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(4_096);
+    socket.flush();
+    await waitFor(() => permits.snapshot().ordinaryUsedBytes === 0);
+    session.close();
+    permits.close();
+  });
+
+  it("keeps graph storage decoupled from its caller's transport permit", async () => {
+    const permits = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    const final = attachAtomicBytePermit(
+      completed("resp_cached", [{ type: "message", content: "remember" }]),
+      (await permits.acquire(8_192)).transfer("graph-test"),
+    );
+    const graph = new ResponseGraph();
+    const resolved = graph.resolve({
+      type: "response.create",
+      store: false,
+      input: "remember",
+    });
+    graph.record(resolved, final);
+    expect(graph.stats().nodes).toBe(1);
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(8_192);
+    graph.clear();
+    // Graph storage is covered by its fixed governor region, not this permit.
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(8_192);
+    releaseAtomicBytePermit(final);
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(0);
+    permits.close();
+  });
+
+
   it("enforces a process-wide session budget and releases it on close", () => {
     const budget = new WebSocketProcessBudget({
       maxSessions: 1,

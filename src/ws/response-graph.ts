@@ -20,6 +20,20 @@ export interface ResolvedRelayRequest {
   exposeEncryptedReasoning: boolean;
 }
 
+interface MaterializationReservation {
+  release(): void;
+}
+
+const MATERIALIZATION_RESERVATIONS = new WeakMap<object, MaterializationReservation>();
+
+export function releaseResponseGraphMaterialization(value: unknown): void {
+  if (!value || typeof value !== "object") return;
+  const reservation = MATERIALIZATION_RESERVATIONS.get(value);
+  if (!reservation) return;
+  MATERIALIZATION_RESERVATIONS.delete(value);
+  reservation.release();
+}
+
 interface ResponseNode {
   id: string;
   parentId?: string;
@@ -40,6 +54,16 @@ export class PreviousResponseNotFoundError extends Error {
   }
 }
 
+export class ResponseGraphCapacityError extends Error {
+  readonly name = "ResponseGraphCapacityError";
+  readonly code = "response_graph_capacity";
+  readonly status = 503;
+
+  constructor(message = "WebSocket continuation materialization capacity is exhausted") {
+    super(message);
+  }
+}
+
 export class SharedByteBudget {
   used = 0;
 
@@ -48,6 +72,7 @@ export class SharedByteBudget {
   }
 
   canReserve(bytes: number): boolean {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) return false;
     return this.used + bytes <= this.limit;
   }
 
@@ -115,6 +140,7 @@ export class ResponseGraph {
   private readonly maxNodes: number;
   private readonly maxBytes: number;
   private readonly sharedBudget: SharedByteBudget;
+  private readonly activeMaterializations = new Map<string, number>();
   private bytes = 0;
   private clock = 0;
 
@@ -132,47 +158,64 @@ export class ResponseGraph {
     delete relayBody.background;
     delete relayBody.stream;
 
-    const inputDelta = normalizeInput(event.input);
     const localContinuation = event.store === false && typeof event.previous_response_id === "string";
     let parentId: string | undefined;
-    if (localContinuation) {
-      parentId = event.previous_response_id as string;
-      const parent = this.nodes.get(parentId);
-      if (!parent) throw new PreviousResponseNotFoundError(parentId);
-      parent.lastAccess = ++this.clock;
-      const history = this.materialize(parent);
-      history.push(...clone(inputDelta));
-      relayBody.input = history;
-      delete relayBody.previous_response_id;
-      if (relayBody.model == null && parent.model) relayBody.model = parent.model;
-    } else {
-      relayBody.input = clone(inputDelta);
-      if (event.previous_response_id == null) delete relayBody.previous_response_id;
+    let materialization: { lineage: ResponseNode[]; reservation: MaterializationReservation } | null = null;
+    try {
+      if (localContinuation) {
+        parentId = event.previous_response_id as string;
+        const parent = this.nodes.get(parentId);
+        if (!parent) throw new PreviousResponseNotFoundError(parentId);
+        parent.lastAccess = ++this.clock;
+        materialization = this.reserveLineage(parent);
+      }
+
+      // No payload-scale lineage clone occurs before reserveLineage succeeds.
+      const inputDelta = normalizeInput(event.input);
+      if (localContinuation) {
+        const history = this.materialize(materialization!.lineage);
+        history.push(...clone(inputDelta));
+        relayBody.input = history;
+        delete relayBody.previous_response_id;
+        const parent = materialization!.lineage[0]!;
+        if (relayBody.model == null && parent.model) relayBody.model = parent.model;
+      } else {
+        relayBody.input = clone(inputDelta);
+        if (event.previous_response_id == null) delete relayBody.previous_response_id;
+      }
+
+      if (relayBody.model == null) delete relayBody.model;
+      if (event.instructions === undefined) delete relayBody.instructions;
+      relayBody.stream = true;
+
+      const requestedIncludes = Array.isArray(event.include) ? event.include : [];
+      const exposeEncryptedReasoning = requestedIncludes.includes("reasoning.encrypted_content");
+      if (event.store === false) {
+        relayBody.include = Array.from(new Set([...requestedIncludes, "reasoning.encrypted_content"]));
+      }
+
+      if (materialization) {
+        MATERIALIZATION_RESERVATIONS.set(relayBody, materialization.reservation);
+      }
+
+      return {
+        relayBody,
+        parentId,
+        clientPreviousResponseId: typeof event.previous_response_id === "string"
+          ? event.previous_response_id
+          : undefined,
+        inputDelta,
+        cacheLocally: event.store === false,
+        exposeEncryptedReasoning,
+      };
+    } catch (error) {
+      materialization?.reservation.release();
+      throw error;
     }
-
-    if (relayBody.model == null) delete relayBody.model;
-    if (event.instructions === undefined) delete relayBody.instructions;
-    relayBody.stream = true;
-
-    const requestedIncludes = Array.isArray(event.include) ? event.include : [];
-    const exposeEncryptedReasoning = requestedIncludes.includes("reasoning.encrypted_content");
-    if (event.store === false) {
-      relayBody.include = Array.from(new Set([...requestedIncludes, "reasoning.encrypted_content"]));
-    }
-
-    return {
-      relayBody,
-      parentId,
-      clientPreviousResponseId: typeof event.previous_response_id === "string"
-        ? event.previous_response_id
-        : undefined,
-      inputDelta,
-      cacheLocally: event.store === false,
-      exposeEncryptedReasoning,
-    };
   }
 
   record(resolved: ResolvedRelayRequest, final: any): void {
+    releaseResponseGraphMaterialization(resolved.relayBody);
     if (!resolved.cacheLocally || typeof final?.id !== "string") return;
     const output = Array.isArray(final.output) ? clone(final.output) : [];
     const node: ResponseNode = {
@@ -225,7 +268,9 @@ export class ResponseGraph {
   }
 
   clear(): void {
-    for (const node of this.nodes.values()) this.sharedBudget.release(node.bytes);
+    for (const node of this.nodes.values()) {
+      this.sharedBudget.release(node.bytes);
+    }
     this.nodes.clear();
     this.bytes = 0;
   }
@@ -234,13 +279,26 @@ export class ResponseGraph {
     return { nodes: this.nodes.size, bytes: this.bytes };
   }
 
-  private materialize(node: ResponseNode): unknown[] {
+  private reserveLineage(node: ResponseNode): {
+    lineage: ResponseNode[];
+    reservation: MaterializationReservation;
+  } {
     const lineage: ResponseNode[] = [];
+    const seen = new Set<string>();
+    let lineageBytes = 0;
     let current: ResponseNode | undefined = node;
     while (current) {
+      if (seen.has(current.id)) {
+        throw new ResponseGraphCapacityError("Response graph lineage contains a cycle");
+      }
+      seen.add(current.id);
       lineage.push(current);
       if (lineage.length > this.maxNodes) {
-        throw new Error("Response graph lineage exceeds its node limit");
+        throw new ResponseGraphCapacityError("Response graph lineage exceeds its node limit");
+      }
+      lineageBytes += current.bytes;
+      if (!Number.isSafeInteger(lineageBytes) || lineageBytes > this.maxBytes) {
+        throw new ResponseGraphCapacityError("Response graph lineage exceeds its byte limit");
       }
       if (!current.parentId) break;
       const parent = this.nodes.get(current.parentId);
@@ -248,6 +306,30 @@ export class ResponseGraph {
       current = parent;
     }
 
+    if (!this.sharedBudget.reserve(lineageBytes)) throw new ResponseGraphCapacityError();
+    for (const entry of lineage) {
+      this.activeMaterializations.set(
+        entry.id,
+        (this.activeMaterializations.get(entry.id) ?? 0) + 1,
+      );
+    }
+    let released = false;
+    const reservation: MaterializationReservation = {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.sharedBudget.release(lineageBytes);
+        for (const entry of lineage) {
+          const remaining = (this.activeMaterializations.get(entry.id) ?? 1) - 1;
+          if (remaining <= 0) this.activeMaterializations.delete(entry.id);
+          else this.activeMaterializations.set(entry.id, remaining);
+        }
+      },
+    };
+    return { lineage, reservation };
+  }
+
+  private materialize(lineage: readonly ResponseNode[]): unknown[] {
     const history: unknown[] = [];
     for (let index = lineage.length - 1; index >= 0; index--) {
       const entry = lineage[index]!;
@@ -263,7 +345,11 @@ export class ResponseGraph {
       !this.sharedBudget.canReserve(incomingBytes)
     ) {
       const candidate = [...this.nodes.values()]
-        .filter(node => node.children.size === 0 && !protectedIds.has(node.id))
+        .filter(node =>
+          node.children.size === 0 &&
+          !protectedIds.has(node.id) &&
+          !this.activeMaterializations.has(node.id)
+        )
         .sort((left, right) => left.lastAccess - right.lastAccess)[0];
       if (!candidate) return false;
       this.removeNode(candidate.id);

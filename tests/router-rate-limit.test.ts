@@ -25,6 +25,8 @@ class Runtime implements RoutableSandboxRuntime {
   readonly projectId: ProjectId;
   calls = 0;
   active = 0;
+  incarnation = 1;
+  readonly listeners = new Set<() => void>();
   readonly finals: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
   readonly rateLimits: Array<RunHandle["rateLimit"]> = [];
   readonly startErrors: unknown[] = [];
@@ -38,9 +40,18 @@ class Runtime implements RoutableSandboxRuntime {
   async start(): Promise<void> {}
   async drain(): Promise<void> {}
   async stop(): Promise<void> {}
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  replaceIncarnation(): void {
+    this.incarnation++;
+    for (const listener of this.listeners) listener();
+  }
   snapshot() {
     return {
       projectId: this.projectId,
+      incarnation: this.incarnation,
       state: "ready",
       capacity: this.capacity,
       active: this.active,
@@ -262,6 +273,36 @@ describe("V2 upstream rate-limit observation", () => {
     expect(Object.keys(value.snapshot().runtimes[0]!.upstreamRateLimits ?? {}).sort())
       .toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
     expect(runtime.calls).toBe(2);
+    await value.close();
+  });
+
+  it("clears observations on revival and drops late evidence from the old incarnation", async () => {
+    const runtime = new Runtime();
+    runtime.rateLimits.push(
+      { remainingTokens: 0, retryAfterMs: 100 },
+      { remainingTokens: 0, retryAfterMs: 200 },
+    );
+    const value = router(runtime);
+    const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first-old" });
+    const late = await value.startRelay({ model: "gpt-5.6-sol", input: "late-old" });
+    runtime.finals[0]!.resolve({
+      status: "failed",
+      error: { message: FULL_TPM_MESSAGE, code: "rate_limit_exceeded" },
+    });
+    await first.final;
+    await Promise.resolve();
+    expect(value.snapshot().runtimes[0]!.upstreamRateLimit).not.toBeNull();
+
+    runtime.replaceIncarnation();
+    expect(value.snapshot().runtimes[0]!.upstreamRateLimit).toBeNull();
+    runtime.finals[1]!.resolve({
+      status: "failed",
+      error: { message: FULL_TPM_MESSAGE, code: "rate_limit_exceeded" },
+    });
+    await late.final;
+    await Promise.resolve();
+    expect(value.snapshot().runtimes[0]!.upstreamRateLimit).toBeNull();
+    expect(value.snapshot().runtimes[0]!.upstreamOrganization).toBeNull();
     await value.close();
   });
 

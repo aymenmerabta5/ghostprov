@@ -9,12 +9,78 @@ export const GP_V2_R1_SCHEMA_VERSION = 1 as const;
 export const GP_V2_R2_SCHEMA_VERSION = 2 as const;
 /** @deprecated Use the explicit revision-specific constant. */
 export const GP_V2_SCHEMA_VERSION = GP_V2_R1_SCHEMA_VERSION;
-export const GP_V2_FRAME_MAX_BYTES = 16 * 1024;
-export const GP_V2_WINDOW_MAX_FRAMES = 128;
-export const GP_V2_WINDOW_MAX_BYTES = 512 * 1024;
-export const GP_V2_FLIGHT_MAX_FRAMES = 32;
-export const GP_V2_FLIGHT_MAX_BYTES = 128 * 1024;
-export const GP_V2_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
+
+export type ProtocolRevision = "r1" | "r2";
+
+export interface V2ProtocolTransportLimits {
+  readonly frameMaxBytes: number;
+  readonly windowMaxFrames: number;
+  readonly windowMaxBytes: number;
+  readonly flightMaxFrames: number;
+  readonly flightMaxBytes: number;
+  readonly hostFlightMaxFrames: number;
+  readonly hostFlightMaxBytes: number;
+  readonly sidecarFlightMaxFrames: number;
+  readonly sidecarFlightMaxBytes: number;
+  readonly requestMaxBytes: number;
+}
+
+/** Frozen R1 limits. These values are part of the immutable R1 wire contract. */
+export const GP_V2_R1_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freeze({
+  frameMaxBytes: 16 * 1024,
+  windowMaxFrames: 128,
+  windowMaxBytes: 512 * 1024,
+  flightMaxFrames: 32,
+  flightMaxBytes: 128 * 1024,
+  hostFlightMaxFrames: 32,
+  hostFlightMaxBytes: 128 * 1024,
+  sidecarFlightMaxFrames: 32,
+  sidecarFlightMaxBytes: 128 * 1024,
+  requestMaxBytes: 64 * 1024 * 1024,
+});
+
+/**
+ * R2 keeps the proven frame/window bounds but fills one larger immutable
+ * ACK-clocked flight. Thirty-two 8 KiB request-data frames remain below the
+ * existing 512 KiB encoded window even after base64url/JSON expansion.
+ */
+export const GP_V2_R2_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freeze({
+  frameMaxBytes: 16 * 1024,
+  windowMaxFrames: 128,
+  windowMaxBytes: 512 * 1024,
+  flightMaxFrames: 32,
+  flightMaxBytes: 512 * 1024,
+  hostFlightMaxFrames: 32,
+  hostFlightMaxBytes: 512 * 1024,
+  // Response egress stays conservative until per-request output/control
+  // isolation makes a larger peer-wide response flight safe.
+  sidecarFlightMaxFrames: 32,
+  sidecarFlightMaxBytes: 128 * 1024,
+  requestMaxBytes: 64 * 1024 * 1024,
+});
+
+export function protocolTransportLimits(
+  revision: ProtocolRevision,
+): V2ProtocolTransportLimits {
+  switch (revision) {
+    case "r1": return GP_V2_R1_TRANSPORT_LIMITS;
+    case "r2": return GP_V2_R2_TRANSPORT_LIMITS;
+    default: throw new TypeError(`Unsupported V2 protocol revision: ${String(revision)}`);
+  }
+}
+
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_FRAME_MAX_BYTES = GP_V2_R1_TRANSPORT_LIMITS.frameMaxBytes;
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_WINDOW_MAX_FRAMES = GP_V2_R1_TRANSPORT_LIMITS.windowMaxFrames;
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_WINDOW_MAX_BYTES = GP_V2_R1_TRANSPORT_LIMITS.windowMaxBytes;
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_FLIGHT_MAX_FRAMES = GP_V2_R1_TRANSPORT_LIMITS.flightMaxFrames;
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_FLIGHT_MAX_BYTES = GP_V2_R1_TRANSPORT_LIMITS.flightMaxBytes;
+/** @deprecated Frozen R1 alias retained for source and sidecar compatibility. */
+export const GP_V2_REQUEST_MAX_BYTES = GP_V2_R1_TRANSPORT_LIMITS.requestMaxBytes;
 
 export type AwarenessLane = "data" | "control";
 
@@ -27,8 +93,6 @@ export interface FrameIdentity {
   epoch: number;
   sequence: number;
 }
-
-export type ProtocolRevision = "r1" | "r2";
 
 interface ProtocolBindingBase {
   projectId: string;
@@ -113,10 +177,31 @@ export interface R2RequestCommitFrame {
   partCount: number;
 }
 
+/**
+ * Immutable R2 execution identity repeated at every phase boundary. The
+ * repetition is intentional: no stale/mixed phase frame can borrow identity
+ * from an earlier Awareness publication.
+ */
+export type R2ExecutionFence = Omit<R2RequestCommitFrame, "kind">;
+
+/** Host authorization to cross the irreversible upstream execution boundary. */
+export interface R2RequestStartFrame extends R2ExecutionFence {
+  kind: "request_start";
+}
+
+/**
+ * Sidecar proof that the complete body is assembled, durably CLAIMED, and
+ * covered by a bounded admission lease. It is not proof that fetch started.
+ */
+export interface R2RequestPreparedFrame extends R2ExecutionFence {
+  kind: "request_prepared";
+}
+
 export type RequestCommitFrame = R1RequestCommitFrame | R2RequestCommitFrame;
-export type HostFrame = SharedHostFrame | RequestCommitFrame;
+export type HostFrame = SharedHostFrame | RequestCommitFrame | R2RequestStartFrame;
 
 export type SidecarFrame =
+  | R2RequestPreparedFrame
   | {
     kind: "upstream_prelude";
     requestId: string;
@@ -177,6 +262,7 @@ export type SidecarFrame =
   }
   | { kind: "request_cancelled"; requestId: string }
   | { kind: "credential_ack"; rotationId: string }
+  | { kind: "recovery_complete" }
   | { kind: "drained"; active: number; queued: number }
   | { kind: "pong"; sentAtMs: number };
 
@@ -321,6 +407,16 @@ export const GP_V2_SCHEMA_DESCRIPTOR = GP_V2_R1_SCHEMA_DESCRIPTOR;
 export const GP_V2_R2_SCHEMA_DESCRIPTOR = Object.freeze({
   ...GP_V2_R1_SCHEMA_DESCRIPTOR,
   version: GP_V2_R2_SCHEMA_VERSION,
+  frameMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.frameMaxBytes,
+  windowMaxFrames: GP_V2_R2_TRANSPORT_LIMITS.windowMaxFrames,
+  windowMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.windowMaxBytes,
+  flightMaxFrames: GP_V2_R2_TRANSPORT_LIMITS.flightMaxFrames,
+  flightMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.flightMaxBytes,
+  hostFlightMaxFrames: GP_V2_R2_TRANSPORT_LIMITS.hostFlightMaxFrames,
+  hostFlightMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.hostFlightMaxBytes,
+  sidecarFlightMaxFrames: GP_V2_R2_TRANSPORT_LIMITS.sidecarFlightMaxFrames,
+  sidecarFlightMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.sidecarFlightMaxBytes,
+  requestMaxBytes: GP_V2_R2_TRANSPORT_LIMITS.requestMaxBytes,
   envelopeFields: [
     "protocol",
     "protocolRevision",
@@ -348,8 +444,45 @@ export const GP_V2_R2_SCHEMA_DESCRIPTOR = Object.freeze({
   ],
   frameFields: {
     ...GP_V2_R1_SCHEMA_DESCRIPTOR.frameFields,
+    recovery_complete: [],
     upstream_prelude: ["requestId", "status", "contentType", "upstreamRequestId"],
     request_commit: [
+      "requestId",
+      "protocolRevision",
+      "schemaVersion",
+      "projectId",
+      "sessionId",
+      "leaderGeneration",
+      "buildHash",
+      "schemaHash",
+      "launchNonce",
+      "hostInstanceId",
+      "targetInstanceId",
+      "requestDigest",
+      "decodedBytes",
+      "encodedBytes",
+      "encoding",
+      "partCount",
+    ],
+    request_start: [
+      "requestId",
+      "protocolRevision",
+      "schemaVersion",
+      "projectId",
+      "sessionId",
+      "leaderGeneration",
+      "buildHash",
+      "schemaHash",
+      "launchNonce",
+      "hostInstanceId",
+      "targetInstanceId",
+      "requestDigest",
+      "decodedBytes",
+      "encodedBytes",
+      "encoding",
+      "partCount",
+    ],
+    request_prepared: [
       "requestId",
       "protocolRevision",
       "schemaVersion",
@@ -373,7 +506,13 @@ export const GP_V2_R2_SCHEMA_DESCRIPTOR = Object.freeze({
   },
   sidecarFrameKinds: [
     ...GP_V2_R1_SCHEMA_DESCRIPTOR.sidecarFrameKinds,
+    "request_prepared",
     "upstream_prelude",
+    "recovery_complete",
+  ],
+  hostFrameKinds: [
+    ...GP_V2_R1_SCHEMA_DESCRIPTOR.hostFrameKinds,
+    "request_start",
   ],
 });
 

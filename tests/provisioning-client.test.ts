@@ -182,6 +182,38 @@ describe("PrismProvisioningClient", () => {
     expect(account.calls[0].path).toBe(`/api/projects/${PROJECT}/sandbox/resources-token`);
   });
 
+  it("rejects a mismatched Y-Sweet document before syncing it into the sandbox", async () => {
+    const sandbox = parseProvisionedSandbox({
+      url: "/s/sandboxes/proxy",
+      token: "sandbox-token",
+      sandbox_id: SANDBOX,
+      sandbox_session_id: SESSION,
+    });
+    const foreignProject = "69288e8b-c183-45f3-9131-d64b05b98928";
+    const responses = successResponses().slice(1, 4);
+    responses[2] = json(200, {
+      url: `wss://prism.test/y/d/${foreignProject}/ws`,
+      baseUrl: `https://prism.test/y/d/${foreignProject}`,
+      docId: foreignProject,
+      token: "foreign-y-token",
+      authorization: "full",
+    });
+    const account = new ScriptedAccountSession(responses);
+
+    await expect(
+      client(account).provisionAcquired(projectId(PROJECT), sandbox),
+    ).rejects.toMatchObject({
+      name: "ProvisioningError",
+      kind: "protocol",
+      message: "Y-Sweet mint returned a credential for another project",
+    });
+    expect(account.calls.map(call => call.path)).toEqual([
+      `/api/projects/${PROJECT}/sandbox/resources-token`,
+      "/s/sandboxes/proxy/resources-token",
+      "/api/y",
+    ]);
+  });
+
   it("accepts the proven legacy readiness shape", async () => {
     const responses = successResponses();
     responses.splice(-2, 2, json(200, {

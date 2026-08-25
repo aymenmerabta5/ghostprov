@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
-import type { MachineSample } from "../src/core/ports";
+import type { Clock, MachineSample } from "../src/core/ports";
 import { ProjectFleetManager } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
 import type { ManagedRuntimeFactory } from "../src/fleet/types";
@@ -65,6 +65,57 @@ class FakeProjects {
   async deleteManaged(id: ProjectId): Promise<void> { this.deleted.push(id); }
 }
 
+class InvalidMetadataProjects extends FakeProjects {
+  constructor(
+    remote: PrismProjectSummary[],
+    readonly invalidId: ProjectId,
+    readonly invalidResult: PrismProjectSummary,
+  ) {
+    super(remote);
+  }
+
+  override async get(id: ProjectId): Promise<PrismProjectSummary> {
+    if (id !== this.invalidId) return super.get(id);
+    this.getCalls.push(id);
+    return this.invalidResult;
+  }
+}
+
+class SelectivelyHungProjects extends FakeProjects {
+  constructor(remote: PrismProjectSummary[], readonly hungId: ProjectId) {
+    super(remote);
+  }
+
+  override async get(id: ProjectId): Promise<PrismProjectSummary> {
+    if (id !== this.hungId) return super.get(id);
+    this.getCalls.push(id);
+    return new Promise<PrismProjectSummary>(() => undefined);
+  }
+}
+
+class DeferredMissingProjects extends FakeProjects {
+  readonly missingStarted: Promise<void>;
+  #markMissingStarted!: () => void;
+  #releaseMissing!: () => void;
+  readonly #missingGate: Promise<void>;
+
+  constructor(remote: PrismProjectSummary[], readonly missingId: ProjectId) {
+    super(remote);
+    this.missingStarted = new Promise(resolve => { this.#markMissingStarted = resolve; });
+    this.#missingGate = new Promise(resolve => { this.#releaseMissing = resolve; });
+  }
+
+  releaseMissing(): void { this.#releaseMissing(); }
+
+  override async get(id: ProjectId, _signal?: AbortSignal): Promise<PrismProjectSummary> {
+    if (id !== this.missingId) return super.get(id);
+    this.getCalls.push(id);
+    this.#markMissingStarted();
+    await this.#missingGate;
+    throw new Error(`missing project ${id}`);
+  }
+}
+
 class FakeRuntime implements RoutableSandboxRuntime {
   state = "configured";
   starts = 0;
@@ -116,6 +167,270 @@ class FakeFactory implements ManagedRuntimeFactory {
   }
 }
 
+class WrongProjectFactory extends FakeFactory {
+  override create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+  }): FakeRuntime {
+    if (input.projectId !== A) return super.create(input);
+    this.created.push(input);
+    const runtime = new FakeRuntime(C);
+    this.runtimes.set(C, runtime);
+    return runtime;
+  }
+}
+
+class BlockingStartRuntime extends FakeRuntime {
+  readonly started: Promise<void>;
+  #markStarted!: () => void;
+  readonly #gate: Promise<void>;
+  #release!: () => void;
+
+  constructor(project: ProjectId) {
+    super(project);
+    this.started = new Promise(resolve => { this.#markStarted = resolve; });
+    this.#gate = new Promise(resolve => { this.#release = resolve; });
+  }
+
+  override async start(): Promise<void> {
+    this.starts++;
+    this.state = "provisioning";
+    this.#markStarted();
+    this.emit();
+    await this.#gate;
+    if (this.state === "stopped") return;
+    this.state = "ready";
+    this.emit();
+  }
+
+  override async stop(): Promise<void> {
+    this.state = "stopped";
+    this.#release();
+    this.emit();
+  }
+}
+
+class BlockingStartFactory extends FakeFactory {
+  readonly blocked = new BlockingStartRuntime(A);
+
+  override create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+  }): FakeRuntime {
+    if (input.projectId !== A) return super.create(input);
+    this.created.push(input);
+    this.runtimes.set(A, this.blocked);
+    return this.blocked;
+  }
+}
+
+class LateStartRuntime extends FakeRuntime {
+  readonly started: Promise<void>;
+  #markStarted!: () => void;
+  readonly #gate: Promise<void>;
+  #release!: () => void;
+
+  constructor(project: ProjectId) {
+    super(project);
+    this.started = new Promise(resolve => { this.#markStarted = resolve; });
+    this.#gate = new Promise(resolve => { this.#release = resolve; });
+  }
+
+  override async start(): Promise<void> {
+    this.starts++;
+    this.state = "provisioning";
+    this.#markStarted();
+    this.emit();
+    await this.#gate;
+    this.state = "ready";
+    this.emit();
+  }
+
+  releaseLateStart(): void { this.#release(); }
+
+  override async stop(): Promise<void> {
+    this.state = "stopped";
+    this.emit();
+  }
+}
+
+class LateThenHealthyFactory extends FakeFactory {
+  readonly old = new LateStartRuntime(A);
+  #returnedOld = false;
+
+  override create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+  }): FakeRuntime {
+    if (input.projectId !== A || this.#returnedOld) return super.create(input);
+    this.#returnedOld = true;
+    this.created.push(input);
+    this.runtimes.set(A, this.old);
+    return this.old;
+  }
+}
+
+class FailingDrainRuntime extends FakeRuntime {
+  override async drain(): Promise<void> {
+    this.drains++;
+    throw new Error("graceful drain failed");
+  }
+}
+
+class UnstoppableRuntime extends FailingDrainRuntime {
+  override async stop(): Promise<void> {
+    throw new Error("forced stop failed");
+  }
+}
+
+class HungDrainRuntime extends FakeRuntime {
+  override async drain(): Promise<void> {
+    this.drains++;
+    return new Promise<void>(() => undefined);
+  }
+}
+
+class TrackingStartRuntime extends FakeRuntime {
+  #release: (() => void) | null = null;
+
+  constructor(
+    project: ProjectId,
+    readonly owner: TrackingStartFactory,
+  ) {
+    super(project);
+  }
+
+  override async start(): Promise<void> {
+    this.starts++;
+    this.state = "provisioning";
+    this.owner.active++;
+    this.owner.peak = Math.max(this.owner.peak, this.owner.active);
+    this.owner.started.push(this.projectId);
+    this.emit();
+    await new Promise<void>(resolve => { this.#release = resolve; });
+    this.owner.active--;
+    if (this.state === "stopped") return;
+    this.state = "ready";
+    this.emit();
+  }
+
+  release(): void {
+    const release = this.#release;
+    this.#release = null;
+    release?.();
+  }
+
+  override async stop(): Promise<void> {
+    this.state = "stopped";
+    this.release();
+    this.emit();
+  }
+}
+
+class TrackingStartFactory extends FakeFactory {
+  active = 0;
+  peak = 0;
+  readonly started: ProjectId[] = [];
+
+  override create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+  }): FakeRuntime {
+    this.created.push(input);
+    const runtime = new TrackingStartRuntime(input.projectId, this);
+    this.runtimes.set(input.projectId, runtime);
+    return runtime;
+  }
+
+  release(project: ProjectId): void {
+    (this.runtimes.get(project) as TrackingStartRuntime | undefined)?.release();
+  }
+}
+
+class BlockingClock implements Clock {
+  sleeps = 0;
+  aborts = 0;
+
+  now(): number { return 1_000; }
+
+  sleep(_ms: number, signal?: AbortSignal): Promise<void> {
+    this.sleeps++;
+    if (signal?.aborted) {
+      this.aborts++;
+      return Promise.reject(new DOMException("aborted", "AbortError"));
+    }
+    return new Promise<void>((_resolve, reject) => {
+      const onAbort = () => {
+        this.aborts++;
+        signal?.removeEventListener("abort", onAbort);
+        reject(new DOMException("aborted", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  waitUntil(deadlineMs: number, signal?: AbortSignal): Promise<void> {
+    return this.sleep(Math.max(0, deadlineMs - this.now()), signal);
+  }
+}
+
+interface StepWaiter {
+  ms: number;
+  resolve(): void;
+  reject(error: unknown): void;
+  signal?: AbortSignal;
+  onAbort(): void;
+}
+
+class StepClock implements Clock {
+  nowMs = 1_000;
+  readonly delays: number[] = [];
+  maxPending = 0;
+  readonly #pending: StepWaiter[] = [];
+
+  now(): number { return this.nowMs; }
+
+  sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    this.delays.push(ms);
+    return new Promise<void>((resolve, reject) => {
+      const waiter: StepWaiter = {
+        ms,
+        resolve,
+        reject,
+        signal,
+        onAbort: () => {
+          const index = this.#pending.indexOf(waiter);
+          if (index >= 0) this.#pending.splice(index, 1);
+          reject(new DOMException("aborted", "AbortError"));
+        },
+      };
+      if (signal?.aborted) {
+        waiter.onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.#pending.push(waiter);
+      this.maxPending = Math.max(this.maxPending, this.#pending.length);
+    });
+  }
+
+  waitUntil(deadlineMs: number, signal?: AbortSignal): Promise<void> {
+    return this.sleep(Math.max(0, deadlineMs - this.nowMs), signal);
+  }
+
+  releaseNext(): void {
+    const waiter = this.#pending.shift();
+    if (!waiter) throw new Error("no clock sleep is pending");
+    waiter.signal?.removeEventListener("abort", waiter.onAbort);
+    this.nowMs += waiter.ms;
+    waiter.resolve();
+  }
+}
+
 async function state(): Promise<{ root: string; cookieFile: string; manifest: FleetManifestStore }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-fleet-manager-"));
   roots.push(root);
@@ -133,6 +448,7 @@ function config(cookieFile: string, input: {
   explicit: readonly ProjectId[];
   sessionMode?: "authenticated" | "auto" | "anonymous";
   guestMax?: number;
+  provisionConcurrency?: number;
 }) {
   const explicit = input.explicit;
   return resolveMultiSandboxConfig({
@@ -142,7 +458,7 @@ function config(cookieFile: string, input: {
     GP_ALLOW_ANONYMOUS: input.sessionMode === "auto" ? "1" : "0",
     GP_GUEST_MAX_PROJECTS: String(input.guestMax ?? 4),
     GP_MAX_PROJECTS: "8",
-    GP_PROVISION_CONCURRENCY: "2",
+    GP_PROVISION_CONCURRENCY: String(input.provisionConcurrency ?? 2),
     GP_CANDIDATE: "1",
   }, MACHINE);
 }
@@ -154,6 +470,12 @@ function manager(input: {
   registry?: SandboxRegistry;
   factory?: FakeFactory;
   identityKind?: "authenticated" | "anonymous";
+  clock?: Clock;
+  retryInitialDelayMs?: number;
+  retryMaxDelayMs?: number;
+  random?: () => number;
+  metadataAttemptTimeoutMs?: number;
+  runtimeCleanupTimeoutMs?: number;
 }) {
   const factory = input.factory ?? new FakeFactory();
   const registry = input.registry ?? new SandboxRegistry();
@@ -167,16 +489,54 @@ function manager(input: {
       manifest: input.manifest,
       registry,
       runtimeFactory: factory,
+      clock: input.clock,
+      retryInitialDelayMs: input.retryInitialDelayMs,
+      retryMaxDelayMs: input.retryMaxDelayMs,
+      random: input.random ?? (() => 0.5),
+      metadataAttemptTimeoutMs: input.metadataAttemptTimeoutMs,
+      runtimeCleanupTimeoutMs: input.runtimeCleanupTimeoutMs,
     }),
   };
 }
 
+function waitForRegistryReady(
+  registry: SandboxRegistry,
+  count: number,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (registry.readyRuntimes().length >= count) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`registry did not reach ${count} ready runtimes`));
+    }, timeoutMs);
+    const unsubscribe = registry.subscribe(() => {
+      if (registry.readyRuntimes().length < count) return;
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve();
+    });
+  });
+}
+
+async function waitForCondition(
+  condition: () => boolean,
+  label: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await Bun.sleep(5);
+  }
+}
+
 describe("ProjectFleetManager", () => {
-  it("fails an unavailable explicit project before provisioning or project creation", async () => {
+  it("fails an all-missing explicit fleet before provisioning or project creation", async () => {
     const files = await state();
     const projects = new FakeProjects([project(B, "Unlisted project")]);
     const harness = manager({
-      config: config(files.cookieFile, { explicit: [A] }),
+      config: config(files.cookieFile, { explicit: [A, C] }),
       manifest: files.manifest,
       projects,
     });
@@ -187,6 +547,339 @@ describe("ProjectFleetManager", () => {
     expect(harness.factory.created).toEqual([]);
     expect(projects.created).toEqual([]);
     expect(harness.registry.runtimes()).toEqual([]);
+    expect(harness.value.snapshot()).toMatchObject({
+      desired: 2,
+      ready: 0,
+      failed: 2,
+      unavailable: 2,
+      unavailableProjects: [A, C],
+      projects: [A, C],
+    });
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("starts a verified project while one explicit project is unavailable", async () => {
+    const files = await state();
+    const projects = new FakeProjects([project(B)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects,
+    });
+
+    const snapshot = await harness.value.reconcile();
+
+    expect(snapshot).toMatchObject({
+      desired: 2,
+      ready: 1,
+      failed: 1,
+      unavailable: 1,
+      unavailableProjects: [A],
+      projects: [A, B],
+    });
+    expect(harness.factory.created.map(value => value.projectId)).toEqual([B]);
+    expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+    expect(projects.created).toEqual([]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("rejects deleted and wrong-project metadata without adopting a substitute", async () => {
+    for (const invalid of [
+      { ...project(A), deleted: true },
+      project(C, "Wrong returned project"),
+    ]) {
+      const files = await state();
+      const projects = new InvalidMetadataProjects([project(B)], A, invalid);
+      const harness = manager({
+        config: config(files.cookieFile, { explicit: [A, B] }),
+        manifest: files.manifest,
+        projects,
+      });
+
+      await expect(harness.value.reconcile()).resolves.toMatchObject({
+        ready: 1,
+        unavailable: 1,
+        unavailableProjects: [A],
+      });
+      expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+      expect(harness.registry.get(C)).toBeUndefined();
+      expect(projects.created).toEqual([]);
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("fences a runtime factory that returns a different project ID", async () => {
+    const files = await state();
+    const factory = new WrongProjectFactory();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A), project(B)]),
+      factory,
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({
+      ready: 1,
+      unavailable: 1,
+      unavailableProjects: [A],
+    });
+    expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+    expect(harness.registry.get(C)).toBeUndefined();
+    expect(factory.runtimes.get(C)?.state).toBe("stopped");
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("registers a healthy project before another metadata read settles", async () => {
+    const files = await state();
+    const projects = new DeferredMissingProjects([project(B)], A);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B], provisionConcurrency: 1 }),
+      manifest: files.manifest,
+      projects,
+    });
+
+    const healthyReady = waitForRegistryReady(harness.registry, 1);
+    const reconciling = harness.value.reconcile();
+    try {
+      await projects.missingStarted;
+      await healthyReady;
+      expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+    } finally {
+      projects.releaseMissing();
+    }
+    await expect(reconciling).resolves.toMatchObject({ ready: 1, unavailable: 1 });
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("never exceeds provisioning concurrency while metadata completes independently", async () => {
+    const files = await state();
+    const factory = new TrackingStartFactory();
+    const harness = manager({
+      config: config(files.cookieFile, {
+        explicit: [A, B, C],
+        provisionConcurrency: 1,
+      }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A), project(B), project(C)]),
+      factory,
+    });
+
+    const reconciling = harness.value.reconcile();
+    await waitForCondition(() => factory.started.length === 1, "first runtime start");
+    expect(factory.peak).toBe(1);
+    factory.release(factory.started[0]);
+    await waitForCondition(() => factory.started.length === 2, "second runtime start");
+    expect(factory.peak).toBe(1);
+    factory.release(factory.started[1]);
+    await waitForCondition(() => factory.started.length === 3, "third runtime start");
+    expect(factory.peak).toBe(1);
+    factory.release(factory.started[2]);
+
+    await expect(reconciling).resolves.toMatchObject({ ready: 3 });
+    expect(factory.peak).toBe(1);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("aborts an isolated in-flight metadata read during shutdown", async () => {
+    const files = await state();
+    const projects = new DeferredMissingProjects([project(B)], A);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects,
+    });
+
+    const healthyReady = waitForRegistryReady(harness.registry, 1);
+    const reconciling = harness.value.reconcile().catch(error => error);
+    await projects.missingStarted;
+    await healthyReady;
+    expect(harness.registry.readyRuntimes()).toHaveLength(1);
+
+    await harness.value.shutdown("test-shutdown");
+
+    expect(await reconciling).toMatchObject({ name: "AbortError" });
+    expect(harness.registry.runtimes()).toEqual([]);
+  });
+
+  it("interrupts a hung runtime start and completes shutdown", async () => {
+    const files = await state();
+    const factory = new BlockingStartFactory();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A), project(B)]),
+      factory,
+    });
+    const healthyReady = waitForRegistryReady(harness.registry, 1);
+    const reconciling = harness.value.reconcile().catch(error => error);
+    await Promise.all([factory.blocked.started, healthyReady]);
+
+    await expect(Promise.race([
+      harness.value.shutdown("test-shutdown"),
+      Bun.sleep(2_000).then(() => { throw new Error("fleet shutdown hung on runtime.start"); }),
+    ])).resolves.toBeUndefined();
+
+    expect(await reconciling).toMatchObject({ name: "AbortError" });
+    expect(factory.blocked.state).toBe("stopped");
+    expect(harness.registry.runtimes()).toEqual([]);
+  });
+
+  it("never lets late old-start cleanup remove a newer exact generation", async () => {
+    const files = await state();
+    const factory = new LateThenHealthyFactory();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A), project(B)]),
+      factory,
+    });
+    const controller = new AbortController();
+    const first = harness.value.reconcile(controller.signal).catch(error => error);
+    await Promise.all([factory.old.started, waitForRegistryReady(harness.registry, 1)]);
+    controller.abort();
+    expect(await first).toMatchObject({ name: "AbortError" });
+    expect(harness.registry.get(A)).toBeUndefined();
+
+    await harness.value.reconcile();
+    const replacement = harness.registry.get(A);
+    expect(replacement).toBeDefined();
+    expect(replacement).not.toBe(factory.old);
+    factory.old.releaseLateStart();
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+
+    expect(harness.registry.get(A)).toBe(replacement);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("recovers unavailable metadata in the background without another caller reconcile", async () => {
+    const files = await state();
+    const projects = new FakeProjects([project(B)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects,
+      retryInitialDelayMs: 1,
+      retryMaxDelayMs: 8,
+    });
+    await harness.value.reconcile();
+
+    projects.remote.push(project(A));
+    const recovered = harness.value.waitForReady(2);
+    await expect(Promise.race([
+      recovered,
+      Bun.sleep(2_000).then(() => { throw new Error("metadata retry did not recover"); }),
+    ])).resolves.toMatchObject({
+      ready: 2,
+      failed: 0,
+      unavailable: 0,
+      unavailableProjects: [],
+    });
+
+    expect(projects.getCalls.filter(id => id === A).length).toBeGreaterThanOrEqual(2);
+    expect(projects.getCalls.filter(id => id === B)).toHaveLength(1);
+    expect(harness.factory.created.map(value => value.projectId).sort()).toEqual([A, B].sort());
+    expect(projects.created).toEqual([]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("times out one hung metadata read while other missing projects keep recovering", async () => {
+    const files = await state();
+    const projects = new SelectivelyHungProjects([project(C)], B);
+    const harness = manager({
+      config: config(files.cookieFile, {
+        explicit: [A, B, C],
+        provisionConcurrency: 1,
+      }),
+      manifest: files.manifest,
+      projects,
+      retryInitialDelayMs: 1,
+      retryMaxDelayMs: 8,
+      metadataAttemptTimeoutMs: 20,
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({
+      ready: 1,
+      unavailable: 2,
+      unavailableProjects: [A, B],
+    });
+    expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([C]);
+
+    projects.remote.push(project(A));
+    await expect(Promise.race([
+      harness.value.waitForReady(2),
+      Bun.sleep(2_000).then(() => { throw new Error("independent metadata recovery stalled"); }),
+    ])).resolves.toMatchObject({ ready: 2, unavailable: 1 });
+    expect(harness.registry.get(B)).toBeUndefined();
+    expect(projects.created).toEqual([]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("uses one jittered bounded retry loop and resets backoff after progress", async () => {
+    const files = await state();
+    const clock = new StepClock();
+    const projects = new FakeProjects([project(B)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B, C] }),
+      manifest: files.manifest,
+      projects,
+      clock,
+      retryInitialDelayMs: 10,
+      retryMaxDelayMs: 25,
+      random: () => 1,
+    });
+    await harness.value.reconcile();
+    await waitForCondition(() => clock.delays.length === 1, "first metadata retry");
+    expect(clock.delays).toEqual([12]);
+    expect(clock.maxPending).toBe(1);
+
+    clock.releaseNext();
+    await waitForCondition(() => clock.delays.length === 2, "second metadata retry");
+    expect(clock.delays).toEqual([12, 24]);
+    expect(clock.maxPending).toBe(1);
+
+    clock.releaseNext();
+    await waitForCondition(() => clock.delays.length === 3, "bounded metadata retry");
+    expect(clock.delays).toEqual([12, 24, 25]);
+    expect(clock.maxPending).toBe(1);
+
+    projects.remote.push(project(A));
+    clock.releaseNext();
+    await waitForCondition(
+      () => harness.registry.readyRuntimes().length === 2 && clock.delays.length === 4,
+      "partial retry progress",
+    );
+    expect(clock.delays).toEqual([12, 24, 25, 12]);
+    expect(clock.maxPending).toBe(1);
+    expect(harness.value.snapshot()).toMatchObject({ ready: 2, unavailable: 1 });
+    expect(projects.getCalls.filter(id => id === B)).toHaveLength(1);
+
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("aborts the single metadata retry task during shutdown", async () => {
+    const files = await state();
+    const clock = new BlockingClock();
+    const projects = new FakeProjects([project(B)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B] }),
+      manifest: files.manifest,
+      projects,
+      clock,
+      retryInitialDelayMs: 10,
+      retryMaxDelayMs: 100,
+    });
+    await harness.value.reconcile();
+    for (let turn = 0; clock.sleeps === 0 && turn < 10; turn++) await Promise.resolve();
+    expect(clock.sleeps).toBe(1);
+    const callsBeforeShutdown = [...projects.getCalls];
+
+    await harness.value.shutdown("test-shutdown");
+
+    expect(clock.aborts).toBe(1);
+    expect(projects.getCalls).toEqual(callsBeforeShutdown);
+    expect(harness.registry.runtimes()).toEqual([]);
+    expect(harness.value.snapshot()).toMatchObject({ desired: 0, unavailable: 0 });
   });
 
   it("routes only exact configured projects and ignores unlisted manifest workers", async () => {
@@ -288,6 +981,31 @@ describe("ProjectFleetManager", () => {
     expect(projects.deleted).toEqual([]);
   });
 
+  it("force-stops an excess runtime before publishing configured readiness", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.reserveWorker({ index: 1, projectId: C, title: "Old worker", nowMs: 1 });
+    await files.manifest.markCreated(C, 2);
+    const excess = new FailingDrainRuntime(C);
+    await excess.start();
+    const registry = new SandboxRegistry([excess]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [B] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(B)]),
+      registry,
+    });
+
+    const snapshot = await harness.value.reconcile();
+
+    expect(excess.drains).toBe(1);
+    expect(excess.state).toBe("stopped");
+    expect(registry.get(C)).toBeUndefined();
+    expect(snapshot).toMatchObject({ ready: 1, unavailable: 0, projects: [B] });
+    expect(registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+    await harness.value.shutdown("test-complete");
+  });
+
   it("reconciles only explicitly configured guest projects", async () => {
     const files = await state();
     const projects = new FakeProjects([project(A), project(B)]);
@@ -334,6 +1052,49 @@ describe("ProjectFleetManager", () => {
     await expect(harness.value.reconcile()).rejects.toThrow("shutting down");
     expect(projects.created).toEqual([]);
     expect(harness.registry.runtimes()).toEqual([]);
+  });
+
+  it("reports an incomplete shutdown and retains truthful runtime state", async () => {
+    const files = await state();
+    const runtime = new UnstoppableRuntime(A);
+    await runtime.start();
+    const registry = new SandboxRegistry([runtime]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      registry,
+    });
+
+    await expect(harness.value.shutdown("test-shutdown"))
+      .rejects.toThrow("Fleet shutdown was incomplete");
+
+    expect(registry.get(A)).toBe(runtime);
+    expect(harness.value.snapshot()).toMatchObject({ desired: 1, ready: 1 });
+  });
+
+  it("bounds a non-cooperative graceful drain before forcing shutdown", async () => {
+    const files = await state();
+    const runtime = new HungDrainRuntime(A);
+    await runtime.start();
+    const registry = new SandboxRegistry([runtime]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      registry,
+      runtimeCleanupTimeoutMs: 10,
+    });
+
+    await expect(Promise.race([
+      harness.value.shutdown("test-shutdown"),
+      Bun.sleep(2_000).then(() => { throw new Error("fleet shutdown hung on drain"); }),
+    ])).resolves.toBeUndefined();
+
+    expect(runtime.drains).toBe(1);
+    expect(runtime.state).toBe("stopped");
+    expect(registry.runtimes()).toEqual([]);
+    expect(harness.value.snapshot()).toMatchObject({ desired: 0, ready: 0 });
   });
 
   it("does not report ready until a runtime has a successful fresh heartbeat", async () => {

@@ -8,6 +8,13 @@ export interface RouteCandidate {
   state: string;
   capacity: number;
   active: number;
+  /**
+   * Runtime-advertised admission credits after transport, sidecar, and local
+   * safety constraints. Unlike `capacity - active`, this is authoritative for
+   * V2 and may fall independently while a transport is congested.
+   */
+  available?: number;
+  /** Host reservations not yet reflected in runtime admission credits. */
   reserved: number;
   quarantined: number;
   queueDepth: number;
@@ -17,6 +24,14 @@ export interface RouteCandidate {
   heartbeatAgeMs: number | null;
   credentialExpiresInMs: number | null;
   memoryPressure: number;
+  /** Requests accepted by the transport but not yet commit-acknowledged. */
+  commitBacklog?: number;
+  /** Encoded frames waiting behind the current Awareness flight. */
+  schedulerBytes?: number;
+  /** Age of the oldest frame waiting in the transport scheduler. */
+  schedulerOldestMs?: number;
+  /** Measured host-to-sidecar publication throughput for this runtime. */
+  throughputBytesPerSecond?: number | null;
 }
 
 export interface RouteDecision {
@@ -50,22 +65,42 @@ export function isRuntimeHealthy(candidate: RuntimeHealthCandidate): boolean {
 export function isRuntimeEligible(candidate: RouteCandidate): boolean {
   if (!isRuntimeHealthy(candidate)) return false;
   const usable = candidate.capacity - candidate.quarantined;
-  return usable > candidate.active + candidate.reserved;
+  const advertised = Number.isFinite(candidate.available)
+    ? Math.max(0, candidate.available!)
+    : Math.max(0, usable - candidate.active);
+  return advertised > candidate.reserved;
 }
 
 function score(workload: WorkloadDescriptor, candidate: RouteCandidate): number {
   const usable = Math.max(1, candidate.capacity - candidate.quarantined);
-  const work = candidate.active + candidate.reserved + 1;
-  const loadDelay = (work / usable) * candidate.completionEwmaMs;
+  const advertised = Number.isFinite(candidate.available)
+    ? Math.max(0, candidate.available!)
+    : Math.max(0, usable - candidate.active);
+  const effectiveCredits = Math.max(0, advertised - candidate.reserved);
+  const commitBacklog = Math.max(0, candidate.commitBacklog ?? candidate.queueDepth);
+  // Admission credits are a small transport window (currently often four),
+  // not the inverse of active work. Score true active streams plus only the
+  // host reservations which have not yet appeared in the transport snapshot.
+  const effectiveWork = candidate.active + candidate.reserved + 1;
+  const loadDelay = (effectiveWork / usable) * candidate.completionEwmaMs;
   const queuedWaves = candidate.queueDepth / usable;
-  const payloadPenalty = Math.min(
-    candidate.completionEwmaMs,
-    (workload.requestBytes / (2 * 1024 ** 2)) * 100,
-  );
+  const throughput = candidate.throughputBytesPerSecond ?? 0;
+  const payloadPenalty = throughput > 0
+    ? Math.min(candidate.completionEwmaMs, workload.requestBytes / throughput * 1_000)
+    : Math.min(
+        candidate.completionEwmaMs,
+        (workload.requestBytes / (2 * 1024 ** 2)) * Math.max(25, candidate.ackEwmaMs),
+      );
+  const commitPenalty = commitBacklog * Math.max(1, candidate.ackEwmaMs) /
+    Math.max(1, effectiveCredits);
+  const schedulerPenalty = Math.max(0, candidate.schedulerOldestMs ?? 0) +
+    (throughput > 0
+      ? Math.max(0, candidate.schedulerBytes ?? 0) / throughput * 1_000
+      : 0);
   const failurePenalty = Math.max(0, candidate.recentFailureRate) * candidate.completionEwmaMs * 5;
   const memoryPenalty = Math.max(0, candidate.memoryPressure) * candidate.completionEwmaMs;
   return candidate.ackEwmaMs + loadDelay + queuedWaves * candidate.completionEwmaMs +
-    payloadPenalty + failurePenalty + memoryPenalty;
+    payloadPenalty + commitPenalty + schedulerPenalty + failurePenalty + memoryPenalty;
 }
 
 export function chooseRuntime(

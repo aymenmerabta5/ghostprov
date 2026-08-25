@@ -239,7 +239,15 @@ export class PrismProvisioningClient {
       maxAttempts,
       signal,
     );
-    return parseYSweetEnvelope(await parseJsonResponse(response, "Y-Sweet mint"));
+    const envelope = parseYSweetEnvelope(await parseJsonResponse(response, "Y-Sweet mint"));
+    if (envelope.docId !== projectId) {
+      throw new ProvisioningError(
+        "Y-Sweet mint returned a credential for another project",
+        "protocol",
+        response.status,
+      );
+    }
+    return envelope;
   }
 
   async waitForWorkspaceSync(sandbox: ProvisionedSandbox, signal?: AbortSignal): Promise<void> {

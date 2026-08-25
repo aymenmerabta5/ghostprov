@@ -3,6 +3,7 @@ import {
   PreviousResponseNotFoundError,
   ResponseGraph,
   SharedByteBudget,
+  releaseResponseGraphMaterialization,
   type ResponseCreateEvent,
 } from "../src/ws/response-graph";
 
@@ -44,6 +45,7 @@ describe("ResponseGraph", () => {
     expect(next.relayBody).not.toHaveProperty("instructions");
     expect(next.relayBody.input).toEqual([user("first"), assistant("one"), ...nextInput]);
     expect(next.relayBody.include).toContain("reasoning.encrypted_content");
+    releaseResponseGraphMaterialization(next.relayBody);
   });
 
   it("supports two cross-lane forks from the same cached parent", () => {
@@ -57,6 +59,8 @@ describe("ResponseGraph", () => {
     expect(left.relayBody.input).toEqual([user("root"), assistant("root answer"), user("left")]);
     expect(right.relayBody.input).toEqual([user("root"), assistant("root answer"), user("right")]);
     expect(graph.stats().nodes).toBe(1);
+    releaseResponseGraphMaterialization(left.relayBody);
+    releaseResponseGraphMaterialization(right.relayBody);
   });
 
   it("rejects an unknown store:false previous_response_id", () => {
@@ -88,6 +92,7 @@ describe("ResponseGraph", () => {
 
     const continuation = graph.resolve(request([user("continue")], { previous_response_id: "resp_reasoning" }));
     expect(JSON.stringify(continuation.relayBody.input)).toContain("secret");
+    releaseResponseGraphMaterialization(continuation.relayBody);
 
     const visible = graph.resolve(request([], { include: ["reasoning.encrypted_content"] }));
     expect(graph.sanitizeOutbound(final, visible)).toEqual(final);
@@ -104,7 +109,9 @@ describe("ResponseGraph", () => {
     expect(() => graph.resolve(request([], { previous_response_id: "resp_1" }))).toThrow(
       PreviousResponseNotFoundError,
     );
-    expect(graph.resolve(request([], { previous_response_id: "resp_3" })).parentId).toBe("resp_3");
+    const latest = graph.resolve(request([], { previous_response_id: "resp_3" }));
+    expect(latest.parentId).toBe("resp_3");
+    releaseResponseGraphMaterialization(latest.relayBody);
     graph.clear();
     expect(shared.used).toBe(0);
   });
@@ -120,7 +127,9 @@ describe("ResponseGraph", () => {
 
     graph.evict("left");
     expect(() => graph.resolve(request([], { previous_response_id: "left" }))).toThrow();
-    expect(graph.resolve(request([], { previous_response_id: "right" })).parentId).toBe("right");
+    const retained = graph.resolve(request([], { previous_response_id: "right" }));
+    expect(retained.parentId).toBe("right");
+    releaseResponseGraphMaterialization(retained.relayBody);
   });
 
   it("never evicts the parent required by a continuation being recorded", () => {
@@ -130,7 +139,9 @@ describe("ResponseGraph", () => {
     const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
     graph.record(child, { id: "child", output: [assistant("child")] });
 
-    expect(graph.resolve(request([], { previous_response_id: "root" })).parentId).toBe("root");
+    const retained = graph.resolve(request([], { previous_response_id: "root" }));
+    expect(retained.parentId).toBe("root");
+    releaseResponseGraphMaterialization(retained.relayBody);
     expect(() => graph.resolve(request([], { previous_response_id: "child" }))).toThrow(
       PreviousResponseNotFoundError,
     );
@@ -164,6 +175,41 @@ describe("ResponseGraph", () => {
     const retainedHeap = Math.max(0, process.memoryUsage().heapUsed - before);
     expect(graph.stats().bytes).toBeLessThan(3 * MiB);
     expect(retainedHeap).toBeLessThan(25 * MiB);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
+  it("pre-reserves sixteen large continuation lineages before cloning", () => {
+    const MiB = 1024 * 1024;
+    const shared = new SharedByteBudget(70 * MiB);
+    const graph = new ResponseGraph({
+      maxNodes: 32,
+      maxBytes: 8 * MiB,
+      sharedBudget: shared,
+    });
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, {
+      id: "resp_large_root",
+      model: "gpt-5.6-sol",
+      output: [assistant("x".repeat(2 * MiB))],
+    });
+    const storedBytes = shared.used;
+    expect(storedBytes * 17).toBeLessThanOrEqual(shared.limit);
+    expect(storedBytes * 18).toBeGreaterThan(shared.limit);
+
+    const active = Array.from({ length: 16 }, (_, index) => graph.resolve(request(
+      [user(`child-${index}`)],
+      { previous_response_id: "resp_large_root", stream_id: `lane-${index}` },
+    )));
+    expect(shared.used).toBeLessThanOrEqual(shared.limit);
+    expect(() => graph.resolve(request([user("overflow")], {
+      previous_response_id: "resp_large_root",
+    }))).toThrow("materialization capacity");
+
+    for (const resolved of active) {
+      releaseResponseGraphMaterialization(resolved.relayBody);
+    }
+    expect(shared.used).toBe(storedBytes);
     graph.clear();
     expect(shared.used).toBe(0);
   });

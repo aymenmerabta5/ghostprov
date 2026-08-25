@@ -1,21 +1,17 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
-import type { SseFrame } from "../../relay/sse";
+import { sseFrame, type SseFrame } from "../../relay/sse";
 import type {
   AwarenessChannel,
   AwarenessPeerUpdate,
 } from "../awareness/channel";
 import {
-  GP_V2_FLIGHT_MAX_BYTES,
-  GP_V2_FLIGHT_MAX_FRAMES,
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
-  GP_V2_REQUEST_MAX_BYTES,
-  GP_V2_WINDOW_MAX_BYTES,
-  GP_V2_WINDOW_MAX_FRAMES,
   base64UrlDecode,
   base64UrlEncode,
   canonicalJson,
+  protocolTransportLimits,
   sha256Hex,
   utf8Bytes,
   utf8Text,
@@ -27,8 +23,11 @@ import {
   type ReliableFrame,
   type RequestEncoding,
   type R2AwarenessEnvelope,
+  type R2RequestPreparedFrame,
+  type R2RequestStartFrame,
   type SidecarFrame,
   type UpstreamPrelude,
+  type V2ProtocolTransportLimits,
 } from "../protocol/shared";
 import { AckClockedFlight } from "../protocol/flight";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
@@ -42,6 +41,7 @@ import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnosti
 import {
   TranscriptProof,
   validateTerminalProof,
+  type IncrementalSha256Hasher,
 } from "../protocol/transcript";
 import {
   InboundFrameCursor,
@@ -52,6 +52,13 @@ import {
   V2PreCommitError,
   V2RunHandle,
 } from "./run-handle";
+import { createNativeTranscriptHasher } from "./native-transcript-hasher";
+import {
+  AtomicBytePermit,
+  AtomicBytePermitPool,
+  estimateAtomicEventPermitBytes,
+} from "../memory/atomic-byte-permits";
+import { v2RetainedEventPermitBytes } from "../memory/event-memory-sizing";
 
 export { computeV2RetransmitDelayMs } from "../protocol/retransmit";
 
@@ -104,6 +111,11 @@ export interface V2GzipOptions {
   inputOwnership?: "owned";
 }
 
+export interface V2TransportRunOptions {
+  /** Ownership handoff after this session charges its admission credit. */
+  onAdmissionReflected?(): void;
+}
+
 export interface V2TransportSessionOptions {
   binding: ProtocolBinding;
   channel: AwarenessChannel<HostFrame, SidecarFrame>;
@@ -122,6 +134,8 @@ export interface V2TransportSessionOptions {
   hostInstanceId?: string;
   /** Primarily injectable for deterministic tests. Production defaults to five seconds. */
   livenessTimeoutMs?: number;
+  /** One process-wide pool shared by every V2 transport session. */
+  eventMemoryPool?: AtomicBytePermitPool;
 }
 
 interface EventPart {
@@ -133,36 +147,116 @@ interface EventAssembly {
   event: string;
   partCount: number;
   parts: Map<number, EventPart>;
+  rawBytes: number;
+  permit: AtomicBytePermit | null;
+}
+
+interface CompletedEvent {
+  frame: SseFrame;
+  wireBytes: number;
+  permit: AtomicBytePermit | null;
+}
+
+interface RecoveryPrefix {
+  readonly expectedEventCount: number;
+  readonly expectedByteCount: number;
+  readonly expectedDigest: string;
+  readonly hasher: IncrementalSha256Hasher;
+  hashedEventCount: number;
+  hashedByteCount: number;
+  nextEventIndex: number;
+  segmented: {
+    event: string;
+    partCount: number;
+    nextPartIndex: number;
+    nextOffset: number;
+  } | null;
+}
+
+interface PreparedRequestPlan {
+  requestDigest: string;
+  decodedBytes: number;
+  encodedBytes: number;
+  encoding: RequestEncoding;
+  partCount: number;
+  encodedPayload: Uint8Array | null;
+  nextPartIndex: number;
+  stage: "open" | "data" | "commit" | "done";
+}
+
+interface RequestManifest {
+  requestDigest: string;
+  decodedBytes: number;
+  encodedBytes: number;
+  encoding: RequestEncoding;
+  partCount: number;
 }
 
 interface RequestState {
   requestId: string;
   requestDigest: string;
-  /** Present only until the scheduler takes ownership of every request frame. */
-  preparedFrames: readonly HostFrame[] | null;
+  manifest: RequestManifest;
+  /** Lazily consumed so large base64 frame arrays are never retained. */
+  preparedRequest: PreparedRequestPlan | null;
   handle: V2RunHandle;
-  transcript: TranscriptProof;
+  transcript: TranscriptProof<false>;
   resolveRun: (handle: RunHandle) => void;
   rejectRun: (error: unknown) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+  onAdmissionReflected?: () => void;
   admitted: boolean;
   published: boolean;
   commitStaged: boolean;
   commitPublished: boolean;
+  /** Irreversible R2 boundary after request_start enters the cumulative window. */
+  startRisk: boolean;
+  startQueued: boolean;
+  startStaged: boolean;
   committed: boolean;
   cancelled: boolean;
   quarantineKind: "cancellation" | "ambiguity" | null;
   responseBytes: number;
   nextEventIndex: number;
   assemblies: Map<number, EventAssembly>;
-  completedEvents: Map<number, SseFrame>;
+  completedEvents: Map<number, CompletedEvent>;
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
   upstreamPrelude: UpstreamPrelude | null;
   diagnostics: HostRequestDiagnosticsObserver;
   firstResponseSeen: boolean;
   admissionTimer?: ReturnType<typeof setTimeout>;
+  recoveryPrefix?: RecoveryPrefix;
 }
+
+export interface V2SidecarRecoveryToken {
+  readonly id: string;
+  readonly binding: ProtocolBinding;
+  readonly previousInstanceId: string;
+}
+
+interface SidecarRecoveryState {
+  token: V2SidecarRecoveryToken;
+  markerSeen: boolean;
+  resolve(): void;
+  reject(error: unknown): void;
+  promise: Promise<void>;
+}
+
+interface TerminalReceipt {
+  terminal: Extract<SidecarFrame, { kind: "response_terminal" }>;
+  queued: boolean;
+  replayed: boolean;
+  cursor: { epoch: number; sequence: number } | null;
+}
+
+interface SidecarRecoveryCapsulePayload {
+  states: RequestState[];
+  receipts: Map<string, TerminalReceipt>;
+  ambiguityTombstones: Map<string, string>;
+  consumed: boolean;
+}
+
+const SIDECAR_RECOVERY_CAPSULES = new WeakMap<object, SidecarRecoveryCapsulePayload>();
 
 interface RotationWaiter {
   resolve: () => void;
@@ -184,6 +278,7 @@ interface LivenessProbe {
 
 const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5_000;
+const MAX_TERMINAL_RECEIPTS = 4_096;
 
 function abortError(message: string): DOMException {
   return new DOMException(message, "AbortError");
@@ -208,6 +303,49 @@ function concat(parts: readonly Uint8Array[], total: number): Uint8Array {
   return output;
 }
 
+function base64UrlDecodedBytes(value: string): number | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(value) || value.length % 4 === 1) return null;
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const remainder = value.length % 4;
+  if (remainder === 2 && (alphabet.indexOf(value.at(-1)!) & 0x0f) !== 0) return null;
+  if (remainder === 3 && (alphabet.indexOf(value.at(-1)!) & 0x03) !== 0) return null;
+  return Math.floor(value.length * 3 / 4);
+}
+
+function partialEventLogicalBytes(event: string, rawBytes: number): number {
+  return utf8Bytes(`event: ${event}\ndata: \n\n`).byteLength + rawBytes;
+}
+
+function canonicalEventWireBytes(event: string, parts: readonly Uint8Array[]): number {
+  let rawBytes = 0;
+  for (const part of parts) {
+    rawBytes += part.byteLength;
+  }
+  // TranscriptProof's frozen canonical contract is one data prefix followed by
+  // the exact event-data string, including any embedded CR/LF bytes.
+  return partialEventLogicalBytes(event, rawBytes);
+}
+
+function equivalentEventStreamContentType(left: string, right: string): boolean {
+  const normalize = (value: string): string | null => {
+    const parts = value.split(";").map(part => part.trim().toLowerCase());
+    if (parts.shift() !== "text/event-stream") return null;
+    const retained: string[] = [];
+    for (const part of parts) {
+      if (!part) continue;
+      const separator = part.indexOf("=");
+      const key = separator < 0 ? part : part.slice(0, separator).trim();
+      const raw = separator < 0 ? "" : part.slice(separator + 1).trim().replace(/^"|"$/g, "");
+      if (key === "charset" && (raw === "utf-8" || raw === "utf8")) continue;
+      retained.push(`${key}=${raw}`);
+    }
+    retained.sort();
+    return `text/event-stream;${retained.join(";")}`;
+  };
+  const normalizedLeft = normalize(left);
+  return normalizedLeft !== null && normalizedLeft === normalize(right);
+}
+
 function validBinding(
   envelope: AwarenessEnvelope<SidecarFrame>,
   binding: ProtocolBinding,
@@ -227,6 +365,15 @@ function validBinding(
     envelope.peerId === "sidecar";
 }
 
+function sameRecoveryScope(left: ProtocolBinding, right: ProtocolBinding): boolean {
+  return left.projectId === right.projectId &&
+    left.sessionId === right.sessionId &&
+    left.leaderGeneration === right.leaderGeneration &&
+    left.buildHash === right.buildHash &&
+    left.schemaHash === right.schemaHash &&
+    left.protocolRevision === right.protocolRevision;
+}
+
 type PublicationUrgency = "paced" | "urgent";
 
 function hostFrameUrgency(frame: HostFrame): PublicationUrgency {
@@ -235,6 +382,8 @@ function hostFrameUrgency(frame: HostFrame): PublicationUrgency {
     case "request_data":
     case "request_commit":
       return "paced";
+    case "request_start":
+      return "urgent";
     default:
       return "urgent";
   }
@@ -250,11 +399,13 @@ function strongestUrgency(
 
 export class V2TransportSession {
   readonly #binding: ProtocolBinding;
+  readonly #limits: V2ProtocolTransportLimits;
   readonly #channel: AwarenessChannel<HostFrame, SidecarFrame>;
   readonly #clock: Clock;
   readonly #gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
   readonly #maxResponseBytes: number;
   readonly #maxBufferedResponseBytes: number;
+  readonly #eventMemoryPool?: AtomicBytePermitPool;
   #hostCeiling: number;
   readonly #rotationTimeoutMs: number;
   readonly #unadmittedTimeoutMs: number;
@@ -270,9 +421,13 @@ export class V2TransportSession {
   readonly #pacer: PublicationPacer;
   readonly #requests = new Map<string, RequestState>();
   readonly #rotations = new Map<string, RotationWaiter>();
+  readonly #rotationStreams = new Set<string>();
   readonly #pending: RequestState[] = [];
   readonly #idleWaiters = new Set<() => void>();
   readonly #retiredSidecarInstances = new Set<string>();
+  readonly #terminalReceipts = new Map<string, TerminalReceipt>();
+  readonly #ambiguityTombstones = new Map<string, string>();
+  #sidecarRecovery: SidecarRecoveryState | null = null;
   #connected = false;
   #closed = false;
   #draining = false;
@@ -281,6 +436,8 @@ export class V2TransportSession {
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #processing: Promise<void> = Promise.resolve();
+  #lifecycleEpoch = 0;
+  #teardownPromise: Promise<void> | null = null;
   #dataRevision = 0;
   #controlRevision = 0;
   #dataDirty = false;
@@ -301,8 +458,12 @@ export class V2TransportSession {
   #quarantined = 0;
   #ambiguousQuarantined = 0;
   #retransmissions = 0;
-  #drainResolve: (() => void) | null = null;
-  #drainReject: ((error: unknown) => void) | null = null;
+  readonly #drainWaiters = new Set<{
+    resolve(): void;
+    reject(error: unknown): void;
+  }>();
+  #drainFrameQueued = false;
+  #remoteDrained = false;
   #sidecarDiagnostics: V2EnvelopeDiagnostics | null = null;
   #publications = 0;
   #pacedPublications = 0;
@@ -370,11 +531,13 @@ export class V2TransportSession {
       throw new RangeError("livenessTimeoutMs must be a positive safe integer");
     }
     this.#binding = options.binding;
+    this.#limits = protocolTransportLimits(options.binding.protocolRevision);
     this.#channel = options.channel;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#gzip = options.gzip;
     this.#maxResponseBytes = options.maxResponseBytes;
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
+    this.#eventMemoryPool = options.eventMemoryPool;
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
@@ -410,6 +573,23 @@ export class V2TransportSession {
     });
     this.#connecting = connecting;
     return connecting;
+  }
+
+  async resumeAwareness(signal?: AbortSignal): Promise<void> {
+    if (this.#closed || this.#draining || this.#protocolFailed || !this.#connected) {
+      throw new V2TransportLivenessError(
+        "V2 transport is unavailable for Awareness reconnect",
+        "unavailable",
+      );
+    }
+    await this.#channel.connect(signal);
+    if (this.#closed || this.#draining || this.#protocolFailed) {
+      throw new V2TransportLivenessError(
+        "V2 transport closed during Awareness reconnect",
+        "unavailable",
+      );
+    }
+    this.#pacer.flushNow("urgent");
   }
 
   /**
@@ -511,19 +691,32 @@ export class V2TransportSession {
   async run(
     body: Record<string, unknown>,
     signal?: AbortSignal,
+    options?: V2TransportRunOptions,
   ): Promise<RunHandle> {
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
     if (!this.#connected || this.#closed) {
       throw new V2PreCommitError("V2 transport is not connected", "not_connected");
+    }
+    if (this.#sidecarRecovery) {
+      throw new V2PreCommitError(
+        "V2 sidecar recovery is in progress",
+        "sidecar_recovering",
+      );
     }
     if (this.#draining) {
       throw new V2PreCommitError("V2 transport is draining", "draining");
     }
     const requestId = `req-${crypto.randomUUID()}`;
     const diagnostics = new HostRequestDiagnosticsObserver(() => this.#clock.now());
-    const prepared = await this.#prepareRequest(requestId, body, signal);
+    const prepared = await this.#prepareRequest(body, signal);
     diagnostics.prepared();
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
+    if (this.#sidecarRecovery || !this.#connected) {
+      throw new V2PreCommitError(
+        "V2 sidecar recovery started during request preparation",
+        "sidecar_recovering",
+      );
+    }
     if (this.#draining || this.#closed) {
       throw new V2PreCommitError("V2 transport stopped during request preparation", "draining");
     }
@@ -531,6 +724,7 @@ export class V2TransportSession {
       clock: this.#clock,
       maxBufferedBytes: this.#maxBufferedResponseBytes,
       expectUpstreamPrelude: this.#binding.protocolRevision === "r2",
+      requireTransferredEventMemory: this.#eventMemoryPool !== undefined,
     });
     handle.stats.diagnostics = diagnostics.value();
     let resolveRun!: (handle: RunHandle) => void;
@@ -543,18 +737,31 @@ export class V2TransportSession {
     const state: RequestState = {
       requestId,
       requestDigest: prepared.requestDigest,
-      preparedFrames: prepared.frames,
+      manifest: {
+        requestDigest: prepared.requestDigest,
+        decodedBytes: prepared.decodedBytes,
+        encodedBytes: prepared.encodedBytes,
+        encoding: prepared.encoding,
+        partCount: prepared.partCount,
+      },
+      preparedRequest: prepared,
       handle,
       transcript: new TranscriptProof(requestId, prepared.requestDigest, {
         maxBytes: this.#maxResponseBytes,
+        retainBytes: false,
+        hasher: createNativeTranscriptHasher(),
       }),
       resolveRun,
       rejectRun,
       signal,
+      onAdmissionReflected: options?.onAdmissionReflected,
       admitted: false,
       published: false,
       commitStaged: false,
       commitPublished: false,
+      startRisk: false,
+      startQueued: false,
+      startStaged: false,
       committed: false,
       cancelled: false,
       quarantineKind: null,
@@ -585,8 +792,275 @@ export class V2TransportSession {
     return committed;
   }
 
+  /**
+   * R2-only in-place recovery boundary. It revokes the elected sidecar and all
+   * old publications while retaining only requests for which execution may
+   * already have started. The returned token is process-local and single use.
+   */
+  async suspendSidecarRecovery(
+    _reason: string,
+    signal?: AbortSignal,
+  ): Promise<V2SidecarRecoveryToken> {
+    if (this.#binding.protocolRevision !== "r2") {
+      throw new V2TransportLivenessError(
+        "In-place sidecar recovery requires R2",
+        "unavailable",
+      );
+    }
+    if (signal?.aborted) throw abortError("V2 sidecar recovery was aborted");
+    if (this.#closed || this.#draining || !this.#connected || this.#sidecarRecovery) {
+      throw new V2TransportLivenessError(
+        "V2 transport is unavailable for sidecar recovery",
+        "unavailable",
+      );
+    }
+    const previousInstanceId = this.#expectedSidecarInstanceId ?? this.#sidecarInstanceId;
+    if (!previousInstanceId) {
+      throw new V2TransportLivenessError(
+        "V2 transport has no elected sidecar to recover",
+        "unavailable",
+      );
+    }
+    const token = Object.freeze({
+      id: crypto.randomUUID(),
+      binding: Object.freeze({ ...this.#binding }),
+      previousInstanceId,
+    });
+    const payload: SidecarRecoveryCapsulePayload = {
+      states: [],
+      receipts: new Map(),
+      ambiguityTombstones: new Map(),
+      consumed: false,
+    };
+
+    // This is the irreversible suspension boundary. Stop every future
+    // publication/update source before clearing Awareness, then drain the
+    // stable processing tail. Caller cancellation is intentionally ignored
+    // beyond this point: we must produce a capsule or fail closed, never leave
+    // a half-revoked transport with live handles.
+    this.#draining = true;
+    this.#remoteCredits = 0;
+    this.#connected = false;
+    this.#pacer.close();
+    this.#unsubscribe?.();
+    this.#unsubscribe = null;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = null;
+    if (this.#livenessProbe) {
+      this.#rejectLivenessProbe(
+        this.#livenessProbe,
+        new V2TransportLivenessError(
+          "V2 sidecar liveness probe was superseded by recovery",
+          "instance_changed",
+        ),
+        false,
+      );
+    }
+    try {
+      this.#channel.clear();
+    } catch (cause) {
+      const message = cause instanceof Error
+        ? cause.message
+        : "V2 sidecar recovery could not revoke its Awareness state";
+      await this.#beginTeardown(
+        new V2PreCommitError(message, "sidecar_recovery_suspend_failed"),
+        new V2CommittedError(message, "sidecar_recovery_suspend_failed", true),
+      ).catch(() => undefined);
+      throw cause;
+    }
+    await this.#joinProcessingTail();
+    if (this.#teardownPromise || this.#protocolFailed) {
+      throw new V2TransportLivenessError(
+        "V2 transport failed while suspending sidecar recovery",
+        "unavailable",
+      );
+    }
+    // Frame processing can classify a request as ambiguous while the
+    // suspension tail is draining. Snapshot only after that tail is stable so
+    // the replacement cannot lose any safety-budget tombstone.
+    payload.ambiguityTombstones = new Map(this.#ambiguityTombstones);
+
+    const rotationIds = new Set([
+      ...this.#rotationStreams,
+      ...this.#rotations.keys(),
+    ]);
+    for (const rotation of this.#rotations.values()) {
+      rotation.signal?.removeEventListener("abort", rotation.onAbort!);
+      if (rotation.timer) clearTimeout(rotation.timer);
+      rotation.reject(new V2TransportLivenessError(
+        "Credential rotation was interrupted by sidecar recovery",
+        "instance_changed",
+      ));
+    }
+    this.#rotations.clear();
+    this.#scheduler.removeStream("control");
+    for (const rotationId of rotationIds) {
+      this.#removeRotationStream(rotationId);
+    }
+    this.#rotationStreams.clear();
+
+    for (const state of [...this.#requests.values()]) {
+      this.#scheduler.removeStream(state.requestId);
+      if (!this.#hasExecutionRisk(state)) {
+        this.#failPreCommit(state, new V2PreCommitError(
+          "V2 sidecar stopped before execution during recovery",
+          "sidecar_recovery",
+        ));
+        continue;
+      }
+      this.#releasePartialResponseState(state);
+      state.preparedRequest = null;
+      state.terminal = null;
+      state.startQueued = false;
+      state.startStaged = false;
+      state.onAdmissionReflected = undefined;
+      const prefix = state.transcript.snapshot();
+      state.responseBytes = prefix.byteCount;
+      state.recoveryPrefix = {
+        expectedEventCount: prefix.eventCount,
+        expectedByteCount: prefix.byteCount,
+        expectedDigest: prefix.transcriptSha256,
+        hasher: createNativeTranscriptHasher(),
+        hashedEventCount: 0,
+        hashedByteCount: 0,
+        nextEventIndex: 0,
+        segmented: null,
+      };
+      this.#detachStateForRecovery(state);
+      payload.states.push(state);
+    }
+    this.#creditReservations = 0;
+    for (const [requestId, receipt] of this.#terminalReceipts) {
+      this.#scheduler.removeStream(requestId);
+      receipt.queued = false;
+      receipt.replayed = false;
+      receipt.cursor = null;
+      payload.receipts.set(requestId, receipt);
+    }
+    this.#terminalReceipts.clear();
+    this.#ambiguityTombstones.clear();
+    this.#ambiguousQuarantined = 0;
+    this.#quarantined = 0;
+    // The retired session is intentionally never reconnectable. Drop every
+    // cumulative window/cursor after ownership has moved so prompt parts and
+    // sealed credential frames cannot remain retained behind close()'s
+    // already-closed fast path.
+    const nextOutboundEpoch = this.#outbound.snapshot().epoch + 1;
+    this.#outbound.reset(nextOutboundEpoch);
+    this.#delivery.reset(nextOutboundEpoch);
+    this.#flight.reset(nextOutboundEpoch);
+    const nextInboundEpoch = this.#inbound.ack().epoch + 1;
+    this.#inbound.reset(nextInboundEpoch);
+    this.#processedInboundAck = { epoch: nextInboundEpoch, sequence: -1 };
+    this.#dataDirty = false;
+    this.#sidecarDiagnostics = null;
+
+    this.#closed = true;
+    SIDECAR_RECOVERY_CAPSULES.set(token, payload);
+    try {
+      await this.#channel.close();
+    } catch (cause) {
+      this.failSidecarRecovery(token, new V2CommittedError(
+        cause instanceof Error ? cause.message : "Old sidecar channel could not close",
+        "sidecar_recovery_suspend_failed",
+        true,
+      ));
+      throw cause;
+    }
+    return token;
+  }
+
+  adoptRecoveredSidecar(token: V2SidecarRecoveryToken): Promise<void> {
+    if (this.#binding.protocolRevision !== "r2" || this.#connected || this.#closed) {
+      throw new V2TransportLivenessError(
+        "Recovery capsule requires a fresh, disconnected R2 transport",
+        "unavailable",
+      );
+    }
+    const payload = SIDECAR_RECOVERY_CAPSULES.get(token);
+    if (!payload || payload.consumed) {
+      throw new V2TransportLivenessError(
+        "V2 sidecar recovery capsule is stale or already consumed",
+        "instance_changed",
+      );
+    }
+    if (
+      !sameRecoveryScope(this.#binding, token.binding) ||
+      this.#binding.launchNonce === token.binding.launchNonce ||
+      this.#expectedSidecarInstanceId === token.previousInstanceId
+    ) {
+      throw new V2TransportLivenessError(
+        "Recovery target does not match the same-sandbox R2 scope",
+        "instance_changed",
+      );
+    }
+    payload.consumed = true;
+    SIDECAR_RECOVERY_CAPSULES.delete(token);
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((resolveValue, rejectValue) => {
+      resolve = resolveValue;
+      reject = rejectValue;
+    });
+    void promise.catch(() => undefined);
+    this.#sidecarRecovery = {
+      token,
+      markerSeen: false,
+      resolve,
+      reject,
+      promise,
+    };
+    this.#remoteCredits = 0;
+    for (const [requestId, requestDigest] of payload.ambiguityTombstones) {
+      if (this.#ambiguityTombstones.has(requestId)) continue;
+      this.#ambiguityTombstones.set(requestId, requestDigest);
+      this.#ambiguousQuarantined++;
+      this.#quarantined++;
+    }
+    for (const [requestId, receipt] of payload.receipts) {
+      this.#terminalReceipts.set(requestId, receipt);
+    }
+    for (const state of payload.states) {
+      state.signal?.removeEventListener("abort", state.onAbort!);
+      state.onAbort = () => this.#abortRequest(state);
+      state.signal?.addEventListener("abort", state.onAbort, { once: true });
+      this.#requests.set(state.requestId, state);
+      if (state.quarantineKind) this.#quarantined++;
+      if (state.quarantineKind === "ambiguity") this.#ambiguousQuarantined++;
+      if (state.signal?.aborted) this.#abortRequest(state);
+    }
+    return promise;
+  }
+
+  failSidecarRecovery(token: V2SidecarRecoveryToken, cause: unknown): void {
+    const error = cause instanceof V2CommittedError
+      ? cause
+      : new V2CommittedError(
+          cause instanceof Error ? cause.message : "V2 sidecar recovery failed",
+          "sidecar_recovery_failed",
+          true,
+        );
+    const recovery = this.#sidecarRecovery;
+    if (recovery?.token === token) {
+      void this.#beginTeardown(
+        new V2PreCommitError(error.message, error.code),
+        error,
+      ).catch(() => undefined);
+      return;
+    }
+    const payload = SIDECAR_RECOVERY_CAPSULES.get(token);
+    if (!payload || payload.consumed) return;
+    payload.consumed = true;
+    SIDECAR_RECOVERY_CAPSULES.delete(token);
+    for (const state of payload.states) {
+      if (!state.committed) state.rejectRun(error);
+      state.handle.fail(error);
+    }
+    payload.receipts.clear();
+    payload.ambiguityTombstones.clear();
+  }
   async drain(reason: string, signal?: AbortSignal): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closed) return this.#teardownPromise ?? Promise.resolve();
     this.#draining = true;
     for (const state of [...this.#pending]) {
       if (state.admitted) continue;
@@ -596,33 +1070,120 @@ export class V2TransportSession {
       );
     }
     while (this.#requests.size > 0) {
-      if (signal?.aborted) throw abortError("V2 transport drain aborted");
-      await new Promise<void>(resolve => this.#idleWaiters.add(resolve));
+      await this.#waitForIdle(signal);
     }
-    const drained = new Promise<void>((resolve, reject) => {
-      this.#drainResolve = resolve;
-      this.#drainReject = reject;
-    });
+    this.#queueDrain(reason);
+    await this.#waitForDrained(signal);
+    await this.close();
+  }
+
+  /**
+   * Recovery-only stop: cancel every local request, publish one fenced drain
+   * immediately, continue ACKing sidecar output until drained/deadline, then
+   * close locally. No request is exposed as safely retryable after start-risk.
+   */
+  async forceStop(reason: string, signal?: AbortSignal): Promise<void> {
+    if (this.#closed) return this.#teardownPromise ?? Promise.resolve();
+    if (!this.#connected) {
+      await this.close();
+      return;
+    }
+    this.#draining = true;
+    for (const state of [...this.#requests.values()]) {
+      const requestId = state.requestId;
+      const published = state.published;
+      if (this.#hasExecutionRisk(state)) {
+        this.#failCommitted(state, new V2CommittedError(
+          "V2 request was interrupted by sandbox recovery",
+          "sandbox_recovery",
+          true,
+        ));
+      } else {
+        this.#failPreCommit(state, new V2PreCommitError(
+          "V2 request stopped before execution during sandbox recovery",
+          "sandbox_recovery",
+        ));
+      }
+      if (published) {
+        try {
+          this.#scheduler.enqueue("control", requestId, {
+            kind: "request_cancel",
+            requestId,
+            reason: "sandbox recovery",
+          });
+        } catch {
+          // The drain frame remains the authoritative process-wide stop.
+        }
+      }
+    }
+    try {
+      this.#queueDrain(reason);
+      await this.#waitForDrained(signal);
+    } finally {
+      await this.close();
+    }
+  }
+
+  #queueDrain(reason: string): void {
+    if (this.#drainFrameQueued || this.#closed) return;
     this.#scheduler.enqueue("control", "control", {
       kind: "drain",
       reason: reason.replace(/[\r\n\0]/g, " ").trim().slice(0, 256) || "shutdown",
     });
+    this.#drainFrameQueued = true;
     this.#requestPublication(this.#pump());
-    if (!signal) await drained;
-    else {
-      let onAbort!: () => void;
-      const aborted = new Promise<never>((_resolve, reject) => {
-        onAbort = () => reject(abortError("V2 transport drain aborted"));
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-      try {
-        await Promise.race([drained, aborted]);
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
-    this.#channel.clear();
-    await this.close();
+  }
+
+  #waitForIdle(signal?: AbortSignal): Promise<void> {
+    if (this.#requests.size === 0) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(abortError("V2 transport drain aborted"));
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (operation: () => void) => {
+        if (settled) return;
+        settled = true;
+        this.#idleWaiters.delete(onIdle);
+        signal?.removeEventListener("abort", onAbort);
+        operation();
+      };
+      const onIdle = () => finish(resolve);
+      const onAbort = () => finish(() => reject(abortError("V2 transport drain aborted")));
+      this.#idleWaiters.add(onIdle);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (this.#requests.size === 0) onIdle();
+    });
+  }
+
+  #waitForDrained(signal?: AbortSignal): Promise<void> {
+    if (this.#remoteDrained && this.#terminalReceipts.size === 0) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(abortError("V2 transport drain aborted"));
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (operation: () => void) => {
+        if (settled) return;
+        settled = true;
+        this.#drainWaiters.delete(waiter);
+        signal?.removeEventListener("abort", onAbort);
+        operation();
+      };
+      const waiter = {
+        resolve: () => finish(resolve),
+        reject: (error: unknown) => finish(() => reject(error)),
+      };
+      const onAbort = () => waiter.reject(abortError("V2 transport drain aborted"));
+      this.#drainWaiters.add(waiter);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  #maybeResolveDrainWaiters(): void {
+    if (!this.#remoteDrained || this.#terminalReceipts.size > 0) return;
+    for (const waiter of [...this.#drainWaiters]) waiter.resolve();
+  }
+
+  #removeRotationStream(rotationId: string): void {
+    this.#scheduler.removeStream(`rotation:${rotationId}`);
+    this.#rotationStreams.delete(rotationId);
   }
 
   rotateCredential(
@@ -630,7 +1191,7 @@ export class V2TransportSession {
     sealedJson: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (!this.#connected || this.#closed || this.#draining) {
+    if (!this.#connected || this.#closed || this.#draining || this.#sidecarRecovery) {
       return Promise.reject(new Error("V2 transport is unavailable for credential rotation"));
     }
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rotationId)) {
@@ -650,6 +1211,7 @@ export class V2TransportSession {
       waiter.onAbort = () => {
         if (this.#rotations.get(rotationId) !== waiter) return;
         this.#rotations.delete(rotationId);
+        this.#removeRotationStream(rotationId);
         if (waiter.timer) clearTimeout(waiter.timer);
         reject(abortError("Credential rotation aborted"));
       };
@@ -658,25 +1220,61 @@ export class V2TransportSession {
       waiter.timer = setTimeout(() => {
         if (this.#rotations.get(rotationId) !== waiter) return;
         this.#rotations.delete(rotationId);
+        this.#removeRotationStream(rotationId);
         signal?.removeEventListener("abort", waiter.onAbort!);
         reject(new Error(`Credential rotation ACK timed out: ${rotationId}`));
       }, this.#rotationTimeoutMs);
     });
     void pending.catch(() => undefined);
-    this.#scheduler.enqueue("control", `rotation:${rotationId}`, {
-      kind: "credential_rotate",
-      rotationId,
-      sealedJson,
-    });
+    this.#rotationStreams.add(rotationId);
+    try {
+      this.#scheduler.enqueue("control", `rotation:${rotationId}`, {
+        kind: "credential_rotate",
+        rotationId,
+        sealedJson,
+      });
+    } catch (cause) {
+      const waiter = this.#rotations.get(rotationId);
+      if (waiter) {
+        this.#rotations.delete(rotationId);
+        waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        this.#removeRotationStream(rotationId);
+        waiter.reject(cause);
+      }
+      return pending;
+    }
     this.#requestPublication(this.#pump());
     return pending;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closed && !this.#teardownPromise) return Promise.resolve();
+    return this.#beginTeardown(
+      new V2PreCommitError("V2 transport session closed", "closed"),
+      new V2CommittedError(
+        "V2 transport closed after request commitment may have been published",
+        "closed",
+        true,
+      ),
+    );
+  }
+
+  #beginTeardown(
+    preCommitError: Error,
+    committedError: V2CommittedError,
+  ): Promise<void> {
+    if (this.#teardownPromise) return this.#teardownPromise;
     this.#closed = true;
     this.#connected = false;
     this.#draining = true;
+    this.#remoteCredits = 0;
+    this.#lifecycleEpoch++;
+    if (this.#sidecarRecovery) {
+      const recovery = this.#sidecarRecovery;
+      this.#sidecarRecovery = null;
+      recovery.reject(committedError);
+    }
     if (this.#livenessProbe) {
       this.#rejectLivenessProbe(
         this.#livenessProbe,
@@ -692,30 +1290,43 @@ export class V2TransportSession {
     this.#timer = null;
     this.#unsubscribe?.();
     this.#unsubscribe = null;
-    const error = new V2PreCommitError("V2 transport session closed", "closed");
-    for (const state of [...this.#requests.values()]) {
-      if (state.committed || state.commitPublished) {
-        this.#failCommitted(state, new V2CommittedError(
-          "V2 transport closed after request commitment may have been published",
-          "closed",
-          true,
-        ));
-      } else {
-        this.#failPreCommit(state, error);
-      }
-    }
     for (const [rotationId, waiter] of this.#rotations) {
       waiter.signal?.removeEventListener("abort", waiter.onAbort!);
       if (waiter.timer) clearTimeout(waiter.timer);
-      waiter.reject(error);
+      waiter.reject(preCommitError);
       this.#rotations.delete(rotationId);
+      this.#removeRotationStream(rotationId);
     }
-    this.#drainReject?.(error);
-    this.#drainResolve = null;
-    this.#drainReject = null;
-    this.#channel.clear();
-    await this.#channel.close();
-    await this.#processing.catch(() => undefined);
+    for (const rotationId of [...this.#rotationStreams]) {
+      this.#removeRotationStream(rotationId);
+    }
+    this.#rotationStreams.clear();
+    for (const waiter of [...this.#drainWaiters]) waiter.reject(preCommitError);
+    const teardown = Promise.resolve().then(async () => {
+      await this.#joinProcessingTail();
+      for (const state of [...this.#requests.values()]) {
+        if (this.#hasExecutionRisk(state)) this.#failCommitted(state, committedError);
+        else this.#failPreCommit(state, preCommitError);
+      }
+      for (const requestId of this.#terminalReceipts.keys()) {
+        this.#scheduler.removeStream(requestId);
+      }
+      this.#scheduler.removeStream("control");
+      this.#terminalReceipts.clear();
+      this.#creditReservations = 0;
+      const nextEpoch = this.#outbound.snapshot().epoch + 1;
+      this.#outbound.reset(nextEpoch);
+      this.#delivery.reset(nextEpoch);
+      this.#flight.reset(nextEpoch);
+      this.#dataDirty = false;
+      try {
+        this.#channel.clear();
+      } finally {
+        await this.#channel.close();
+      }
+    });
+    this.#teardownPromise = teardown;
+    return teardown;
   }
 
   snapshot(): V2TransportSnapshot {
@@ -724,7 +1335,7 @@ export class V2TransportSession {
       if (state.committed) committed++;
     }
     return {
-      connected: this.#connected && !this.#closed,
+      connected: this.#connected && !this.#closed && !this.#sidecarRecovery,
       committed,
       active: this.#requests.size - this.#pending.filter(state => !state.admitted).length,
       queued: this.#pending.filter(state => !state.admitted).length,
@@ -828,21 +1439,40 @@ export class V2TransportSession {
     return true;
   }
 
+  #ownsLifecycle(epoch: number): boolean {
+    return epoch === this.#lifecycleEpoch && !this.#closed && !this.#protocolFailed;
+  }
+
+  async #joinProcessingTail(): Promise<void> {
+    for (;;) {
+      const tail = this.#processing;
+      await tail.catch(() => undefined);
+      if (tail === this.#processing) return;
+    }
+  }
+
   readonly #onAwarenessUpdate = (
     update: AwarenessPeerUpdate<SidecarFrame>,
   ): void => {
+    if (this.#closed || this.#protocolFailed) return;
+    const lifecycleEpoch = this.#lifecycleEpoch;
     // Liveness must not queue behind a response frame waiting for client-side
     // buffer space. Only the reliable data path remains serialized below.
     this.#observeSidecarLiveness(update.envelope);
     this.#processing = this.#processing
-      .then(() => this.#processEnvelope(update.envelope))
-      .catch(error => this.#failProtocol(error));
+      .then(() => this.#ownsLifecycle(lifecycleEpoch)
+        ? this.#processEnvelope(update.envelope, lifecycleEpoch)
+        : undefined)
+      .catch(error => {
+        if (this.#ownsLifecycle(lifecycleEpoch)) this.#failProtocol(error);
+      });
   };
 
   async #processEnvelope(
     envelope: AwarenessEnvelope<SidecarFrame>,
+    lifecycleEpoch: number,
   ): Promise<void> {
-    if (this.#closed || this.#protocolFailed) return;
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
     if (!validBinding(envelope, this.#binding)) {
       throw new Error("Sidecar Awareness binding is invalid");
     }
@@ -881,7 +1511,7 @@ export class V2TransportSession {
       this.#retiredSidecarInstances.add(this.#sidecarInstanceId);
       const message = "Sidecar instance changed while transport state was active";
       for (const state of [...this.#requests.values()]) {
-        if (state.committed || state.commitPublished) {
+        if (this.#hasExecutionRisk(state)) {
           this.#failCommitted(state, new V2CommittedError(message, "instance_changed", true));
         } else {
           this.#failPreCommit(state, new V2PreCommitError(message, "instance_changed"));
@@ -905,7 +1535,7 @@ export class V2TransportSession {
       this.#remoteCredits = Math.max(0, Math.min(128, envelope.credits));
     }
 
-    this.#outbound.acknowledge(envelope.ack);
+    this.#acknowledgeOutbound(envelope.ack);
     const flightCompleted = this.#flight.acknowledged(envelope.ack);
     if (flightCompleted) this.#flightCompletions++;
     const now = this.#clock.now();
@@ -926,10 +1556,13 @@ export class V2TransportSession {
       }
       delivered = this.#inbound.accept(envelope.frames);
       for (const frame of delivered) {
-        await this.#processFrame(frame);
+        await this.#processFrame(frame, lifecycleEpoch);
+        if (!this.#ownsLifecycle(lifecycleEpoch)) return;
         this.#processedInboundAck = { epoch: frame.epoch, sequence: frame.sequence };
       }
     }
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    this.#maybeCompleteSidecarRecovery();
     this.#admitPending();
     const urgency = this.#pump();
     if (flightCompleted && urgency === null) this.#channel.clear("data");
@@ -938,14 +1571,53 @@ export class V2TransportSession {
     );
   }
 
-  async #processFrame(frame: ReliableFrame<SidecarFrame>): Promise<void> {
+  async #processFrame(
+    frame: ReliableFrame<SidecarFrame>,
+    lifecycleEpoch: number,
+  ): Promise<void> {
     switch (frame.kind) {
+      case "request_prepared": {
+        const state = this.#requests.get(frame.requestId);
+        if (!state) return;
+        if (this.#binding.protocolRevision !== "r2") {
+          this.#failPreCommit(state, new V2PreCommitError(
+            "R1 sidecar emitted an R2 preparation proof",
+            "protocol",
+          ));
+          return;
+        }
+        if (!this.#preparedProofMatches(state, frame) || !state.commitPublished) {
+          const error = "Sidecar preparation proof does not match the committed request";
+          if (this.#hasExecutionRisk(state)) {
+            this.#failCommitted(state, new V2CommittedError(error, "prepared_fence", true));
+          } else {
+            this.#failPreCommit(state, new V2PreCommitError(error, "prepared_fence"));
+          }
+          return;
+        }
+        if (state.startQueued || state.startRisk) return;
+        state.startQueued = true;
+        try {
+          this.#scheduler.enqueue(
+            "commit",
+            state.requestId,
+            this.#requestStartFromPrepared(frame),
+          );
+        } catch (cause) {
+          state.startQueued = false;
+          this.#failPreCommit(state, new V2PreCommitError(
+            cause instanceof Error ? cause.message : "R2 request start could not be staged",
+            "start_stage",
+          ));
+        }
+        return;
+      }
       case "upstream_prelude": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (!state.committed) {
           const message = "Sidecar emitted upstream headers before commitment";
-          if (state.commitPublished) {
+          if (this.#hasExecutionRisk(state)) {
             this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
           } else {
             this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
@@ -960,8 +1632,14 @@ export class V2TransportSession {
         if (state.upstreamPrelude) {
           if (
             state.upstreamPrelude.status !== prelude.status ||
-            state.upstreamPrelude.contentType !== prelude.contentType ||
-            state.upstreamPrelude.upstreamRequestId !== prelude.upstreamRequestId
+            !equivalentEventStreamContentType(
+              state.upstreamPrelude.contentType,
+              prelude.contentType,
+            ) ||
+            (
+              state.upstreamPrelude.upstreamRequestId !== prelude.upstreamRequestId &&
+              !(state.recoveryPrefix && prelude.upstreamRequestId === null)
+            )
           ) {
             this.#failCommitted(state, new V2CommittedError(
               "Sidecar emitted conflicting upstream headers",
@@ -979,7 +1657,8 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (frame.requestDigest !== state.requestDigest) {
-          if (state.committed || state.commitPublished) {
+          if (this.#binding.protocolRevision === "r2") state.startRisk = true;
+          if (this.#hasExecutionRisk(state)) {
             this.#failCommitted(state, new V2CommittedError(
               "Committed ACK digest does not match the request",
               "ack_digest",
@@ -993,6 +1672,15 @@ export class V2TransportSession {
           }
           return;
         }
+        if (this.#binding.protocolRevision === "r2" && !state.startRisk) {
+          state.startRisk = true;
+          this.#failCommitted(state, new V2CommittedError(
+            "Sidecar claimed fetch-started commitment before request_start",
+            "ack_before_start",
+            true,
+          ));
+          return;
+        }
         if (state.committed) return;
         state.committed = true;
         state.diagnostics.committed(frame.diagnostics);
@@ -1003,7 +1691,9 @@ export class V2TransportSession {
       case "request_reject": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
-        if (state.committed) {
+        if (state.committed || (
+          this.#binding.protocolRevision === "r2" && state.startRisk
+        )) {
           this.#failCommitted(state, new V2CommittedError(
             frame.message,
             frame.code,
@@ -1019,7 +1709,7 @@ export class V2TransportSession {
         if (!state) return;
         if (!state.committed) {
           const message = "Sidecar emitted response data before commitment";
-          if (state.commitPublished) {
+          if (this.#hasExecutionRisk(state)) {
             this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
           } else {
             this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
@@ -1034,29 +1724,76 @@ export class V2TransportSession {
           ));
           return;
         }
+        if (this.#consumeRecoveryPrefixPart(state, frame)) return;
         if (!state.firstResponseSeen) { state.firstResponseSeen = true; state.diagnostics.firstFrame(frame.diagnostics); }
-        await this.#acceptResponsePart(state, frame);
+        await this.#acceptResponsePart(state, frame, lifecycleEpoch);
         return;
       }
       case "response_batch": {
-        const state=this.#requests.get(frame.requestId);if(!state)return;
-        if(!state.committed){const message="Sidecar emitted response data before commitment";if(state.commitPublished)this.#failCommitted(state,new V2CommittedError(message,"protocol",true));else this.#failPreCommit(state,new V2PreCommitError(message,"protocol"));return;}
-        if(this.#binding.protocolRevision==="r2"&&!state.upstreamPrelude){this.#failCommitted(state,new V2CommittedError("Sidecar emitted response data before upstream headers","missing_prelude",true));return;}
-        for(let offset=0;offset<frame.items.length;offset++){
-          const eventIndex=frame.firstEventIndex+offset;const item=frame.items[offset]!;let bytes:Uint8Array;let data:string;
-          try{bytes=base64UrlDecode(item.dataBase64Url);data=utf8Text(bytes);}catch{this.#failCommitted(state,new V2CommittedError("Response batch encoding is invalid","response_encoding",true));return;}
-          state.responseBytes+=bytes.byteLength;if(state.responseBytes>this.#maxResponseBytes){this.#failCommitted(state,new V2CommittedError("Response exceeds the configured byte limit","response_too_large",true));return;}
-          if(eventIndex<state.nextEventIndex||state.completedEvents.has(eventIndex)){this.#failCommitted(state,new V2CommittedError("Response batch event indexes conflict","response_conflict",true));return;}
-          state.completedEvents.set(eventIndex,{event:item.event,data});
-        }
-        await this.#drainCompletedEvents(state);return;
-      }
-      case "response_terminal": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (!state.committed) {
+          const message = "Sidecar emitted response data before commitment";
+          if (this.#hasExecutionRisk(state)) {
+            this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
+          } else {
+            this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
+          }
+          return;
+        }
+        if (this.#binding.protocolRevision === "r2" && !state.upstreamPrelude) {
+          this.#failCommitted(state, new V2CommittedError(
+            "Sidecar emitted response data before upstream headers",
+            "missing_prelude",
+            true,
+          ));
+          return;
+        }
+        for (let offset = 0; offset < frame.items.length; offset++) {
+          const eventIndex = frame.firstEventIndex + offset;
+          const item = frame.items[offset]!;
+          if (this.#consumeRecoveryPrefixWhole(
+            state,
+            eventIndex,
+            item.event,
+            item.dataBase64Url,
+          )) {
+            if (!this.#requests.has(state.requestId)) return;
+            continue;
+          }
+          if (!this.#acceptWholeEncodedEvent(
+            state,
+            eventIndex,
+            item.event,
+            item.dataBase64Url,
+          )) return;
+        }
+        await this.#drainCompletedEvents(state, lifecycleEpoch);
+        return;
+      }
+      case "response_terminal": {
+        const state = this.#requests.get(frame.requestId);
+        if (!state) {
+          const receipt = this.#terminalReceipts.get(frame.requestId);
+          if (!receipt || !this.#sidecarRecovery) return;
+          if (!this.#terminalMatchesReceipt(frame, receipt.terminal)) {
+            this.failSidecarRecovery(
+              this.#sidecarRecovery.token,
+              new V2CommittedError(
+                "Recovered terminal conflicts with its retained receipt",
+                "terminal_receipt_conflict",
+                true,
+              ),
+            );
+            return;
+          }
+          receipt.replayed = true;
+          this.#queueTerminalReceipt(frame.requestId, receipt);
+          return;
+        }
+        if (!state.committed) {
           const message = "Sidecar emitted a terminal before commitment";
-          if (state.commitPublished) {
+          if (this.#hasExecutionRisk(state)) {
             this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
           } else {
             this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
@@ -1080,13 +1817,15 @@ export class V2TransportSession {
           return;
         }
         state.terminal = frame;
-        await this.#tryFinalize(state);
+        await this.#tryFinalize(state, lifecycleEpoch);
         return;
       }
       case "response_error": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
-        if (state.committed) {
+        if (state.committed || (
+          this.#binding.protocolRevision === "r2" && state.startRisk
+        )) {
           this.#failCommitted(state, new V2CommittedError(
             frame.message,
             frame.code,
@@ -1101,6 +1840,15 @@ export class V2TransportSession {
       }
       case "request_cancelled": {
         const state = this.#requests.get(frame.requestId);
+        if (state && this.#sidecarRecovery && !state.cancelled) {
+          this.#failCommitted(state, new V2CommittedError(
+            "Recovered request was durably cancelled",
+            "cancelled",
+            false,
+          ));
+          this.#maybeCompleteSidecarRecovery();
+          return;
+        }
         if (!state?.cancelled) return;
         const releaseQuarantine = state.quarantineKind === "cancellation";
         this.#removeState(state);
@@ -1110,17 +1858,23 @@ export class V2TransportSession {
         }
         return;
       }
+      case "recovery_complete":
+        if (this.#sidecarRecovery) {
+          this.#sidecarRecovery.markerSeen = true;
+          this.#maybeCompleteSidecarRecovery();
+        }
+        return;
       case "drained":
         if (frame.active === 0 && frame.queued === 0) {
-          this.#drainResolve?.();
-          this.#drainResolve = null;
-          this.#drainReject = null;
+          this.#remoteDrained = true;
+          this.#maybeResolveDrainWaiters();
         }
         return;
       case "credential_ack": {
         const waiter = this.#rotations.get(frame.rotationId);
         if (!waiter) return;
         this.#rotations.delete(frame.rotationId);
+        this.#removeRotationStream(frame.rotationId);
         waiter.signal?.removeEventListener("abort", waiter.onAbort!);
         if (waiter.timer) clearTimeout(waiter.timer);
         waiter.resolve();
@@ -1131,14 +1885,359 @@ export class V2TransportSession {
     }
   }
 
+  #hasExecutionRisk(state: RequestState): boolean {
+    if (state.committed) return true;
+    return this.#binding.protocolRevision === "r2"
+      ? state.startRisk
+      : state.commitPublished;
+  }
+
+  #consumeRecoveryPrefixWhole(
+    state: RequestState,
+    eventIndex: number,
+    event: string,
+    encoded: string,
+  ): boolean {
+    const prefix = state.recoveryPrefix;
+    if (!prefix || eventIndex >= prefix.expectedEventCount) return false;
+    if (prefix.segmented || eventIndex !== prefix.nextEventIndex) {
+      this.#failRecoveryPrefix(state, "Recovered response prefix order conflicts");
+      return true;
+    }
+    let bytes: Uint8Array;
+    try { bytes = base64UrlDecode(encoded); } catch {
+      this.#failRecoveryPrefix(state, "Recovered response prefix encoding is invalid");
+      return true;
+    }
+    this.#appendRecoveryPrefixBytes(prefix, event, bytes);
+    this.#finishRecoveryPrefixIfReady(state, false);
+    return true;
+  }
+
+  #consumeRecoveryPrefixPart(
+    state: RequestState,
+    frame: Extract<ReliableFrame<SidecarFrame>, { kind: "response_event" }>,
+  ): boolean {
+    const prefix = state.recoveryPrefix;
+    if (!prefix || frame.eventIndex >= prefix.expectedEventCount) return false;
+    if (frame.eventIndex !== prefix.nextEventIndex) {
+      this.#failRecoveryPrefix(state, "Recovered response prefix order conflicts");
+      return true;
+    }
+    let segmented = prefix.segmented;
+    if (!segmented) {
+      if (frame.partIndex !== 0 || frame.offset !== 0) {
+        this.#failRecoveryPrefix(state, "Recovered response prefix begins with a gap");
+        return true;
+      }
+      segmented = prefix.segmented = {
+        event: frame.event,
+        partCount: frame.partCount,
+        nextPartIndex: 0,
+        nextOffset: 0,
+      };
+      const header = utf8Bytes(`event: ${frame.event}\ndata: `);
+      prefix.hasher.update(header);
+      prefix.hashedByteCount += header.byteLength;
+    }
+    if (
+      segmented.event !== frame.event ||
+      segmented.partCount !== frame.partCount ||
+      frame.partIndex !== segmented.nextPartIndex ||
+      frame.offset !== segmented.nextOffset
+    ) {
+      this.#failRecoveryPrefix(state, "Recovered response prefix parts conflict");
+      return true;
+    }
+    let bytes: Uint8Array;
+    try { bytes = base64UrlDecode(frame.dataBase64Url); } catch {
+      this.#failRecoveryPrefix(state, "Recovered response prefix encoding is invalid");
+      return true;
+    }
+    prefix.hasher.update(bytes);
+    prefix.hashedByteCount += bytes.byteLength;
+    segmented.nextPartIndex++;
+    segmented.nextOffset += bytes.byteLength;
+    if (segmented.nextPartIndex === segmented.partCount) {
+      const footer = utf8Bytes("\n\n");
+      prefix.hasher.update(footer);
+      prefix.hashedByteCount += footer.byteLength;
+      prefix.hashedEventCount++;
+      prefix.nextEventIndex++;
+      prefix.segmented = null;
+      this.#finishRecoveryPrefixIfReady(state, false);
+    }
+    return true;
+  }
+
+  #appendRecoveryPrefixBytes(
+    prefix: RecoveryPrefix,
+    event: string,
+    bytes: Uint8Array,
+  ): void {
+    const header = utf8Bytes(`event: ${event}\ndata: `);
+    const footer = utf8Bytes("\n\n");
+    prefix.hasher.update(header).update(bytes).update(footer);
+    prefix.hashedByteCount += header.byteLength + bytes.byteLength + footer.byteLength;
+    prefix.hashedEventCount++;
+    prefix.nextEventIndex++;
+  }
+
+  #failRecoveryPrefix(state: RequestState, message: string): void {
+    this.#failCommitted(state, new V2CommittedError(
+      message,
+      "recovery_prefix_mismatch",
+      true,
+    ));
+  }
+
+  #preparedProofMatches(
+    state: RequestState,
+    frame: ReliableFrame<R2RequestPreparedFrame>,
+  ): boolean {
+    const manifest = state.manifest;
+    return frame.protocolRevision === "r2" &&
+      frame.schemaVersion === GP_V2_R2_SCHEMA_VERSION &&
+      frame.projectId === this.#binding.projectId &&
+      frame.sessionId === this.#binding.sessionId &&
+      frame.leaderGeneration === this.#binding.leaderGeneration &&
+      frame.buildHash === this.#binding.buildHash &&
+      frame.schemaHash === this.#binding.schemaHash &&
+      frame.launchNonce === this.#binding.launchNonce &&
+      frame.hostInstanceId === this.#hostInstanceId &&
+      frame.targetInstanceId === this.#expectedSidecarInstanceId &&
+      frame.requestDigest === manifest.requestDigest &&
+      frame.decodedBytes === manifest.decodedBytes &&
+      frame.encodedBytes === manifest.encodedBytes &&
+      frame.encoding === manifest.encoding &&
+      frame.partCount === manifest.partCount;
+  }
+
+  #requestStartFromPrepared(
+    frame: ReliableFrame<R2RequestPreparedFrame>,
+  ): R2RequestStartFrame {
+    return {
+      kind: "request_start",
+      requestId: frame.requestId,
+      protocolRevision: "r2",
+      schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+      projectId: frame.projectId,
+      sessionId: frame.sessionId,
+      leaderGeneration: frame.leaderGeneration,
+      buildHash: frame.buildHash,
+      schemaHash: frame.schemaHash,
+      launchNonce: frame.launchNonce,
+      hostInstanceId: frame.hostInstanceId,
+      targetInstanceId: frame.targetInstanceId,
+      requestDigest: frame.requestDigest,
+      decodedBytes: frame.decodedBytes,
+      encodedBytes: frame.encodedBytes,
+      encoding: frame.encoding,
+      partCount: frame.partCount,
+    };
+  }
+
+  #tryAcquireEventPermit(
+    logicalBytes: number,
+    label: string,
+  ): AtomicBytePermit | null | undefined {
+    if (!this.#eventMemoryPool) return undefined;
+    try {
+      return this.#eventMemoryPool.tryAcquire(
+        estimateAtomicEventPermitBytes(logicalBytes),
+        {
+          region: logicalBytes > this.#maxBufferedResponseBytes ? "jumbo" : "auto",
+          label,
+        },
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  #tryResizeEventPermit(
+    permit: AtomicBytePermit | null,
+    logicalBytes: number,
+  ): boolean {
+    if (!this.#eventMemoryPool) return true;
+    if (!permit) return false;
+    try {
+      const targetBytes = estimateAtomicEventPermitBytes(logicalBytes);
+      // RunHandle deliberately admits an event above its soft queue bound only
+      // while that event owns the single jumbo lane. A normal resize prefers
+      // spare ordinary capacity, so force the region transition before the
+      // permit is transferred even when ordinary growth would still fit.
+      if (
+        logicalBytes > this.#maxBufferedResponseBytes &&
+        permit.region !== "jumbo"
+      ) return permit.tryPromote(targetBytes);
+      return permit.tryResize(targetBytes, {
+        allowJumbo: true,
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  #tryRetainEventPermit(
+    permit: AtomicBytePermit | null,
+    wireBytes: number,
+  ): boolean {
+    if (!this.#eventMemoryPool) return true;
+    if (!permit) return false;
+    try {
+      // Jumbo ownership is a delivery invariant, not merely a capacity
+      // fallback. Shrinking must never demote an above-soft event.
+      if (
+        wireBytes > this.#maxBufferedResponseBytes &&
+        permit.region !== "jumbo"
+      ) return false;
+      permit.shrink(v2RetainedEventPermitBytes(wireBytes));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #failEventMemory(state: RequestState, message: string): void {
+    if (!this.#requests.has(state.requestId)) return;
+    this.#failCommitted(state, new V2CommittedError(
+      message,
+      "event_memory_capacity",
+      true,
+    ));
+    this.#scheduler.enqueue("control", state.requestId, {
+      kind: "request_cancel",
+      requestId: state.requestId,
+      reason: "host event memory unavailable",
+    });
+    this.#requestPublication(this.#pump());
+  }
+
+  #acceptWholeEncodedEvent(
+    state: RequestState,
+    eventIndex: number,
+    event: string,
+    encoded: string,
+  ): boolean {
+    const recoveryPrefix = state.recoveryPrefix;
+    const nextEventIndex = recoveryPrefix
+      ? recoveryPrefix.nextEventIndex
+      : state.nextEventIndex;
+    const decodedLength = base64UrlDecodedBytes(encoded);
+    if (decodedLength === null) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Response batch encoding is invalid",
+        "response_encoding",
+        true,
+      ));
+      return false;
+    }
+    let permit = this.#tryAcquireEventPermit(
+      partialEventLogicalBytes(event, decodedLength),
+      `host-response:${state.requestId}`,
+    );
+    if (permit === null) {
+      this.#failEventMemory(state, "Host event memory is unavailable");
+      return false;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = base64UrlDecode(encoded);
+    } catch {
+      permit?.release();
+      this.#failCommitted(state, new V2CommittedError(
+        "Response batch encoding is invalid",
+        "response_encoding",
+        true,
+      ));
+      return false;
+    }
+    const wireBytes = canonicalEventWireBytes(event, [bytes]);
+    if (
+      (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) &&
+        state.responseBytes + wireBytes > this.#maxResponseBytes ||
+      !this.#tryResizeEventPermit(permit ?? null, wireBytes)
+    ) {
+      permit?.release();
+      if (
+        (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) &&
+        state.responseBytes + wireBytes > this.#maxResponseBytes
+      ) {
+        this.#failCommitted(state, new V2CommittedError(
+          "Response exceeds the configured canonical byte limit",
+          "response_too_large",
+          true,
+        ));
+      } else {
+        this.#failEventMemory(state, "Host event memory cannot grow without blocking");
+      }
+      return false;
+    }
+    let data: string;
+    try {
+      data = utf8Text(bytes);
+    } catch {
+      permit?.release();
+      this.#failCommitted(state, new V2CommittedError(
+        "Response batch event is not valid UTF-8",
+        "response_encoding",
+        true,
+      ));
+      return false;
+    }
+    if (
+      eventIndex < nextEventIndex ||
+      state.completedEvents.has(eventIndex) ||
+      state.assemblies.has(eventIndex)
+    ) {
+      permit?.release();
+      this.#failCommitted(state, new V2CommittedError(
+        "Response batch event indexes conflict",
+        "response_conflict",
+        true,
+      ));
+      return false;
+    }
+    if (!this.#tryRetainEventPermit(permit ?? null, wireBytes)) {
+      permit?.release();
+      this.#failEventMemory(state, "Host event memory cannot retain the completed event");
+      return false;
+    }
+    if (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) {
+      state.responseBytes += wireBytes;
+    }
+    state.completedEvents.set(eventIndex, {
+      frame: { event, data },
+      wireBytes,
+      permit: permit ?? null,
+    });
+    return true;
+  }
+
   async #acceptResponsePart(
     state: RequestState,
     frame: Extract<ReliableFrame<SidecarFrame>, { kind: "response_event" }>,
+    lifecycleEpoch: number,
   ): Promise<void> {
-    let bytes: Uint8Array;
-    try {
-      bytes = base64UrlDecode(frame.dataBase64Url);
-    } catch {
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    const recoveryPrefix = state.recoveryPrefix;
+    const nextEventIndex = recoveryPrefix
+      ? recoveryPrefix.nextEventIndex
+      : state.nextEventIndex;
+    if (
+      frame.eventIndex < nextEventIndex ||
+      state.completedEvents.has(frame.eventIndex)
+    ) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Response event index conflicts with completed output",
+        "response_conflict",
+        true,
+      ));
+      return;
+    }
+    const decodedLength = base64UrlDecodedBytes(frame.dataBase64Url);
+    if (decodedLength === null) {
       this.#failCommitted(state, new V2CommittedError(
         "Response event part is not valid base64url",
         "response_encoding",
@@ -1148,10 +2247,20 @@ export class V2TransportSession {
     }
     let assembly = state.assemblies.get(frame.eventIndex);
     if (!assembly) {
+      const permit = this.#tryAcquireEventPermit(
+        partialEventLogicalBytes(frame.event, decodedLength),
+        `host-response:${state.requestId}`,
+      );
+      if (permit === null) {
+        this.#failEventMemory(state, "Host event memory is unavailable");
+        return;
+      }
       assembly = {
         event: frame.event,
         partCount: frame.partCount,
         parts: new Map(),
+        rawBytes: 0,
+        permit: permit ?? null,
       };
       state.assemblies.set(frame.eventIndex, assembly);
     }
@@ -1164,6 +2273,24 @@ export class V2TransportSession {
       return;
     }
     const existing = assembly.parts.get(frame.partIndex);
+    if (!existing && !this.#tryResizeEventPermit(
+      assembly.permit,
+      partialEventLogicalBytes(assembly.event, assembly.rawBytes + decodedLength),
+    )) {
+      this.#failEventMemory(state, "Host event memory cannot grow without blocking");
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = base64UrlDecode(frame.dataBase64Url);
+    } catch {
+      this.#failCommitted(state, new V2CommittedError(
+        "Response event part is not valid base64url",
+        "response_encoding",
+        true,
+      ));
+      return;
+    }
     if (existing) {
       if (existing.offset !== frame.offset || !bytesEqual(existing.bytes, bytes)) {
         this.#failCommitted(state, new V2CommittedError(
@@ -1174,16 +2301,8 @@ export class V2TransportSession {
       }
       return;
     }
-    state.responseBytes += bytes.byteLength;
-    if (state.responseBytes > this.#maxResponseBytes) {
-      this.#failCommitted(state, new V2CommittedError(
-        "Response exceeds the configured byte limit",
-        "response_too_large",
-        true,
-      ));
-      return;
-    }
     assembly.parts.set(frame.partIndex, { offset: frame.offset, bytes });
+    assembly.rawBytes += bytes.byteLength;
     if (assembly.parts.size !== assembly.partCount) return;
 
     const parts: Uint8Array[] = [];
@@ -1201,6 +2320,22 @@ export class V2TransportSession {
       parts.push(part.bytes);
       expectedOffset += part.bytes.byteLength;
     }
+    const wireBytes = canonicalEventWireBytes(assembly.event, parts);
+    if (
+      (!recoveryPrefix || frame.eventIndex >= recoveryPrefix.expectedEventCount) &&
+      state.responseBytes + wireBytes > this.#maxResponseBytes
+    ) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Response exceeds the configured canonical byte limit",
+        "response_too_large",
+        true,
+      ));
+      return;
+    }
+    if (!this.#tryResizeEventPermit(assembly.permit, wireBytes)) {
+      this.#failEventMemory(state, "Host event memory cannot materialize the complete event");
+      return;
+    }
     let data: string;
     try {
       data = utf8Text(concat(parts, expectedOffset));
@@ -1212,24 +2347,132 @@ export class V2TransportSession {
       ));
       return;
     }
-    state.assemblies.delete(frame.eventIndex);
-    state.completedEvents.set(frame.eventIndex, { event: frame.event, data });
-    await this.#drainCompletedEvents(state);
-  }
-
-  async #drainCompletedEvents(state: RequestState): Promise<void> {
-    for (;;) {
-      const event = state.completedEvents.get(state.nextEventIndex);
-      if (!event) break;
-      state.completedEvents.delete(state.nextEventIndex);
-      const wireBytes = state.transcript.append(event);
-      state.nextEventIndex++;
-      if (!state.cancelled) { const started=this.#clock.now(); await state.handle.acceptEvent(event, wireBytes); state.diagnostics.assemblyDelivered(this.#clock.now()-started); }
+    assembly.parts.clear();
+    parts.length = 0;
+    if (!this.#tryRetainEventPermit(assembly.permit, wireBytes)) {
+      this.#failEventMemory(state, "Host event memory cannot retain the completed event");
+      return;
     }
-    await this.#tryFinalize(state);
+    state.assemblies.delete(frame.eventIndex);
+    if (!recoveryPrefix || frame.eventIndex >= recoveryPrefix.expectedEventCount) {
+      state.responseBytes += wireBytes;
+    }
+    state.completedEvents.set(frame.eventIndex, {
+      frame: { event: frame.event, data },
+      wireBytes,
+      permit: assembly.permit,
+    });
+    assembly.permit = null;
+    await this.#drainCompletedEvents(state, lifecycleEpoch);
   }
 
-  async #tryFinalize(state: RequestState): Promise<void> {
+  async #drainCompletedEvents(
+    state: RequestState,
+    lifecycleEpoch: number,
+  ): Promise<void> {
+    if (!this.#ownsLifecycle(lifecycleEpoch) || !this.#requests.has(state.requestId)) return;
+    if (!this.#finishRecoveryPrefixIfReady(state, false)) return;
+    for (;;) {
+      const completed = state.completedEvents.get(state.nextEventIndex);
+      if (!completed) break;
+      let wireBytes: number;
+      try {
+        wireBytes = state.transcript.append(completed.frame);
+      } catch (cause) {
+        // Keep the entry map-owned until failure cleanup releases its permit.
+        // Transcript validation (notably terminal JSON parsing) may throw
+        // synchronously after the event has been fully materialized.
+        this.#failCommitted(state, new V2CommittedError(
+          cause instanceof Error ? cause.message : "Response transcript validation failed",
+          "response_transcript",
+          true,
+        ));
+        return;
+      }
+      if (wireBytes !== completed.wireBytes) {
+        this.#failCommitted(state, new V2CommittedError(
+          "Canonical response byte accounting diverged",
+          "response_size_mismatch",
+          true,
+        ));
+        return;
+      }
+      if (state.cancelled) {
+        state.completedEvents.delete(state.nextEventIndex);
+        state.nextEventIndex++;
+        completed.permit?.release();
+        completed.permit = null;
+        continue;
+      }
+      let permit: AtomicBytePermit | undefined;
+      try {
+        permit = completed.permit?.transfer("host-run-handle-event");
+      } catch (cause) {
+        this.#failCommitted(state, new V2CommittedError(
+          cause instanceof Error ? cause.message : "Host event memory transfer failed",
+          "event_memory_delivery",
+          true,
+        ));
+        return;
+      }
+      completed.permit = null;
+      state.completedEvents.delete(state.nextEventIndex);
+      state.nextEventIndex++;
+      const started = this.#clock.now();
+      let accepted: boolean;
+      try {
+        accepted = state.handle.tryAcceptEvent(completed.frame, wireBytes, permit);
+      } catch (error) {
+        permit?.release();
+        this.#failCommitted(state, new V2CommittedError(
+          error instanceof Error ? error.message : "Host event delivery failed",
+          "event_memory_delivery",
+          true,
+        ));
+        return;
+      }
+      if (!accepted) {
+        permit?.release();
+        this.#failEventMemory(state, "Slow consumer exhausted its immediate event buffer");
+        return;
+      }
+      state.diagnostics.assemblyDelivered(this.#clock.now() - started);
+    }
+    await this.#tryFinalize(state, lifecycleEpoch);
+  }
+
+  #finishRecoveryPrefixIfReady(state: RequestState, terminalSeen: boolean): boolean {
+    const prefix = state.recoveryPrefix;
+    if (!prefix) return true;
+    if (prefix.nextEventIndex < prefix.expectedEventCount) {
+      if (terminalSeen) {
+        this.#failCommitted(state, new V2CommittedError(
+          "Recovered terminal omitted part of the previously delivered response prefix",
+          "recovery_prefix_missing",
+          true,
+        ));
+      }
+      return false;
+    }
+    if (
+      prefix.hashedEventCount !== prefix.expectedEventCount ||
+      prefix.hashedByteCount !== prefix.expectedByteCount ||
+      prefix.hasher.digestHex() !== prefix.expectedDigest ||
+      prefix.segmented !== null
+    ) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Recovered response prefix does not match the original transcript",
+        "recovery_prefix_mismatch",
+        true,
+      ));
+      return false;
+    }
+    state.recoveryPrefix = undefined;
+    return true;
+  }
+
+  async #tryFinalize(state: RequestState, lifecycleEpoch: number): Promise<void> {
+    if (!this.#ownsLifecycle(lifecycleEpoch) || !this.#requests.has(state.requestId)) return;
     const terminal = state.terminal;
     if (!terminal) return;
     // A terminal may arrive before one or more response frames. Check the
@@ -1251,6 +2494,10 @@ export class V2TransportSession {
     try {
       final = await validateTerminalProof(terminal, snapshot);
     } catch (cause) {
+      if (
+        !this.#ownsLifecycle(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state
+      ) return;
       this.#failCommitted(state, new V2CommittedError(
         cause instanceof Error ? cause.message : "Terminal proof validation failed",
         "terminal_proof",
@@ -1258,29 +2505,91 @@ export class V2TransportSession {
       ));
       return;
     }
+    if (
+      !this.#ownsLifecycle(lifecycleEpoch) ||
+      this.#requests.get(state.requestId) !== state ||
+      state.terminal !== terminal
+    ) return;
+    if (
+      !this.#terminalReceipts.has(state.requestId) &&
+      this.#terminalReceipts.size >= MAX_TERMINAL_RECEIPTS
+    ) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Host terminal receipt capacity is exhausted",
+        "terminal_receipt_capacity",
+        true,
+      ));
+      return;
+    }
     const wasCancelled = state.cancelled;
     const wasQuarantined = state.quarantineKind === "cancellation";
+    // Even a client-cancelled request owns a durable terminal spool. Suppress
+    // client delivery, but retain and ACK its verified terminal so recovery
+    // cannot replay that spool forever.
+    const receipt: TerminalReceipt = {
+      terminal: { ...terminal },
+      queued: false,
+      replayed: this.#sidecarRecovery !== null,
+      cursor: null,
+    };
+    this.#terminalReceipts.set(state.requestId, receipt);
     this.#removeState(state);
     if (!wasCancelled) state.handle.settle(final, terminal.rateLimit);
     if (wasQuarantined) {
       this.#quarantined = Math.max(0, this.#quarantined - 1);
       state.quarantineKind = null;
     }
-    this.#scheduler.enqueue("control", state.requestId, {
-      kind: "response_ack",
-      requestId: state.requestId,
-      terminalDigest: terminal.transcriptSha256,
-    });
+    this.#queueTerminalReceipt(state.requestId, receipt);
     this.#requestPublication(this.#pump());
   }
 
+  #queueTerminalReceipt(requestId: string, receipt: TerminalReceipt): void {
+    if (receipt.queued) return;
+    this.#scheduler.enqueue("control", requestId, {
+      kind: "response_ack",
+      requestId,
+      terminalDigest: receipt.terminal.transcriptSha256,
+    });
+    receipt.queued = true;
+  }
+
+  #terminalMatchesReceipt(
+    frame: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }>,
+    expected: Extract<SidecarFrame, { kind: "response_terminal" }>,
+  ): boolean {
+    return frame.requestId === expected.requestId &&
+      frame.requestDigest === expected.requestDigest &&
+      frame.responseId === expected.responseId &&
+      frame.eventCount === expected.eventCount &&
+      frame.byteCount === expected.byteCount &&
+      frame.transcriptSha256 === expected.transcriptSha256 &&
+      frame.terminalStatus === expected.terminalStatus &&
+      frame.finalEventIndex === expected.finalEventIndex &&
+      frame.finalSha256 === expected.finalSha256;
+  }
+
+  #acknowledgeOutbound(cursor: { epoch: number; sequence: number }): void {
+    this.#outbound.acknowledge(cursor);
+    for (const [requestId, receipt] of this.#terminalReceipts) {
+      if (
+        receipt.cursor?.epoch === cursor.epoch &&
+        receipt.cursor.sequence <= cursor.sequence
+      ) this.#terminalReceipts.delete(requestId);
+    }
+    this.#maybeResolveDrainWaiters();
+    this.#maybeCompleteSidecarRecovery();
+  }
+
   async #prepareRequest(
-    requestId: string,
     body: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<{ requestDigest: string; frames: readonly HostFrame[] }> {
-    const decoded = utf8Bytes(canonicalJson(body));
-    if (decoded.byteLength < 1 || decoded.byteLength > GP_V2_REQUEST_MAX_BYTES) {
+  ): Promise<PreparedRequestPlan> {
+    // The sidecar forwards these proven canonical bytes directly to fetch to
+    // avoid a decoded-string + parsed-object + reserialized-string peak. Force
+    // streaming here while the outer HTTP handler still owns client semantics.
+    const upstreamBody = body.stream === true ? body : { ...body, stream: true };
+    const decoded = utf8Bytes(canonicalJson(upstreamBody));
+    if (decoded.byteLength < 1 || decoded.byteLength > this.#limits.requestMaxBytes) {
       throw new V2PreCommitError("V2 request exceeds the 64 MiB limit", "request_too_large");
     }
     const requestDigest = await sha256Hex(decoded);
@@ -1302,29 +2611,65 @@ export class V2TransportSession {
         encoding = "gzip+base64";
       }
     }
-    if (encoded.byteLength < 1 || encoded.byteLength > GP_V2_REQUEST_MAX_BYTES) {
+    if (encoded.byteLength < 1 || encoded.byteLength > this.#limits.requestMaxBytes) {
       throw new V2PreCommitError("Encoded V2 request exceeds the 64 MiB limit", "request_too_large");
     }
     const partCount = Math.ceil(encoded.byteLength / REQUEST_PART_BYTES);
-    const frames: HostFrame[] = [{
-      kind: "request_open",
-      requestId,
+    return {
       requestDigest,
       decodedBytes: decoded.byteLength,
       encodedBytes: encoded.byteLength,
       encoding,
       partCount,
-    }];
-    for (let offset = 0, partIndex = 0; offset < encoded.byteLength; offset += REQUEST_PART_BYTES, partIndex++) {
-      frames.push({
+      encodedPayload: encoded,
+      nextPartIndex: 0,
+      stage: "open",
+    };
+  }
+
+  #takePreparedFrame(
+    requestId: string,
+    plan: PreparedRequestPlan,
+  ): HostFrame | null {
+    if (plan.stage === "done") return null;
+    if (plan.stage === "open") {
+      plan.stage = "data";
+      return {
+        kind: "request_open",
+        requestId,
+        requestDigest: plan.requestDigest,
+        decodedBytes: plan.decodedBytes,
+        encodedBytes: plan.encodedBytes,
+        encoding: plan.encoding,
+        partCount: plan.partCount,
+      };
+    }
+    if (plan.stage === "data") {
+      const encoded = plan.encodedPayload;
+      if (!encoded || plan.nextPartIndex >= plan.partCount) {
+        throw new Error("Prepared V2 request data state is invalid");
+      }
+      const partIndex = plan.nextPartIndex++;
+      const offset = partIndex * REQUEST_PART_BYTES;
+      const frame: HostFrame = {
         kind: "request_data",
         requestId,
         partIndex,
         offset,
-        dataBase64Url: base64UrlEncode(encoded.subarray(offset, offset + REQUEST_PART_BYTES)),
-      });
+        dataBase64Url: base64UrlEncode(
+          encoded.subarray(offset, Math.min(encoded.byteLength, offset + REQUEST_PART_BYTES)),
+        ),
+      };
+      if (plan.nextPartIndex === plan.partCount) {
+        // Every byte now lives only in a scheduled/outbound physical frame.
+        // Release the compact source before the upstream response starts.
+        plan.encodedPayload = null;
+        plan.stage = "commit";
+      }
+      return frame;
     }
-    frames.push(this.#binding.protocolRevision === "r2"
+    plan.stage = "done";
+    return this.#binding.protocolRevision === "r2"
       ? {
           kind: "request_commit",
           requestId,
@@ -1338,14 +2683,27 @@ export class V2TransportSession {
           launchNonce: this.#binding.launchNonce,
           hostInstanceId: this.#hostInstanceId,
           targetInstanceId: this.#expectedSidecarInstanceId!,
-          requestDigest,
-          decodedBytes: decoded.byteLength,
-          encodedBytes: encoded.byteLength,
-          encoding,
-          partCount,
+          requestDigest: plan.requestDigest,
+          decodedBytes: plan.decodedBytes,
+          encodedBytes: plan.encodedBytes,
+          encoding: plan.encoding,
+          partCount: plan.partCount,
         }
-      : { kind: "request_commit", requestId });
-    return { requestDigest, frames };
+      : { kind: "request_commit", requestId };
+  }
+
+  #stageNextRequestFrame(state: RequestState): void {
+    const plan = state.preparedRequest;
+    if (!plan) return;
+    const frame = this.#takePreparedFrame(state.requestId, plan);
+    if (!frame) {
+      state.preparedRequest = null;
+      return;
+    }
+    // One frame per request is enough for weighted fairness; #pump replenishes
+    // it only after the scheduler transfers ownership of the previous frame.
+    this.#scheduler.enqueue("data", state.requestId, frame);
+    if (plan.stage === "done") state.preparedRequest = null;
   }
 
   #admitPending(): void {
@@ -1356,22 +2714,18 @@ export class V2TransportSession {
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
       state.admissionTimer = undefined;
       this.#creditReservations++;
-      const frames = state.preparedFrames;
-      if (!frames) {
-        throw new Error("Admitted V2 request has no prepared frames");
-      }
-      for (const frame of frames) {
-        // Request frames share one priority queue so commit can never overtake data.
-        this.#scheduler.enqueue("data", state.requestId, frame);
-      }
-      // The scheduler now owns every frame. Do not retain the preparation
-      // array (and therefore a second path to every large base64 payload) for
-      // the lifetime of the upstream response.
-      state.preparedFrames = null;
+      const onAdmissionReflected = state.onAdmissionReflected;
+      state.onAdmissionReflected = undefined;
+      // The credit is owned by the transport before the router is notified.
+      // An observer bug must retain the conservative router reservation rather
+      // than unwind an otherwise valid transport admission.
+      try { onAdmissionReflected?.(); } catch {}
+      this.#stageNextRequestFrame(state);
     }
   }
 
   #availableCredits(): number {
+    if (this.#sidecarRecovery || !this.#connected || this.#closed || this.#draining) return 0;
     return Math.max(0, Math.min(
       this.#remoteCredits - this.#creditReservations,
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
@@ -1386,24 +2740,37 @@ export class V2TransportSession {
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const frameBudget = Math.min(
-        GP_V2_FLIGHT_MAX_FRAMES - snapshot.frames.length,
-        GP_V2_WINDOW_MAX_FRAMES - snapshot.frames.length,
+        this.#limits.hostFlightMaxFrames - snapshot.frames.length,
+        this.#limits.windowMaxFrames - snapshot.frames.length,
       );
       const byteBudget = Math.min(
-        GP_V2_FLIGHT_MAX_BYTES - snapshot.encodedBytes,
-        GP_V2_WINDOW_MAX_BYTES - snapshot.encodedBytes,
+        this.#limits.hostFlightMaxBytes - snapshot.encodedBytes,
+        this.#limits.windowMaxBytes - snapshot.encodedBytes,
       );
       if (frameBudget < 1 || byteBudget < 512) break;
       const next = this.#scheduler.take(1, Math.max(1, byteBudget - 256));
       if (next.length === 0) break;
       const reliable = this.#outbound.push(next[0]!);
+      if (reliable.kind === "response_ack") {
+        const receipt = this.#terminalReceipts.get(reliable.requestId);
+        if (receipt && receipt.terminal.transcriptSha256 === reliable.terminalDigest) {
+          receipt.cursor = { epoch: reliable.epoch, sequence: reliable.sequence };
+        }
+      }
       this.#dataDirty = true;
       urgency = strongestUrgency(urgency, hostFrameUrgency(reliable));
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
         const state = this.#requests.get(reliable.requestId);
         if (state) state.published = true;
         if (state && reliable.kind === "request_commit") state.commitStaged = true;
+        if (state && reliable.kind === "request_start") {
+          state.startStaged = true;
+          state.startRisk = true;
+        }
         if (state) state.diagnostics.published();
+        if (state && reliable.kind !== "request_commit") {
+          this.#stageNextRequestFrame(state);
+        }
       }
     }
     return urgency;
@@ -1432,8 +2799,19 @@ export class V2TransportSession {
       for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
       this.#armRetransmission();
     } catch (cause) {
+      if (this.#isReconnectableAwarenessFailure(cause)) {
+        this.#remoteCredits = 0;
+        return;
+      }
       this.#failProtocol(cause);
     }
+  }
+
+  #isReconnectableAwarenessFailure(value: unknown): boolean {
+    if (!value || typeof value !== "object") return false;
+    const error = value as { name?: unknown; kind?: unknown };
+    return error.name === "AwarenessChannelError" &&
+      (error.kind === "auth" || error.kind === "disconnected");
   }
 
   #publishLane(
@@ -1443,6 +2821,8 @@ export class V2TransportSession {
   ): void {
     const outbound = this.#outbound.snapshot();
     const committed = [...this.#requests.values()].filter(state => state.committed).length;
+    const recoveryActive = [...this.#requests.values()]
+      .filter(state => this.#hasExecutionRisk(state)).length;
     const common = {
       protocol: "gp-awareness-v2",
       schemaHash: this.#binding.schemaHash,
@@ -1455,8 +2835,8 @@ export class V2TransportSession {
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#processedInboundAck,
-      credits: this.#hostCeiling,
-      active: committed,
+      credits: this.#sidecarRecovery ? 0 : this.#hostCeiling,
+      active: this.#sidecarRecovery ? Math.max(1, recoveryActive) : committed,
       queued: this.#pending.filter(state => !state.admitted).length,
       draining: this.#draining,
       frames,
@@ -1494,9 +2874,8 @@ export class V2TransportSession {
       this.#controlPublishedBytes += encodedBytes;
     }
     if (lane === "data") {
-      // A transport may throw after handing bytes to the underlying socket.
-      // Fence the request before the call so publish failure is never treated
-      // as safely retryable once request_commit may have escaped.
+      // R1 crosses its irreversible boundary at request_commit. R2 records its
+      // later start-risk before request_start is even staged.
       for (const frame of frames) {
         if (frame.kind !== "request_commit") continue;
         const state = this.#requests.get(frame.requestId);
@@ -1568,14 +2947,72 @@ export class V2TransportSession {
     }, delay);
   }
 
+  #requireSidecarRecovery(token: V2SidecarRecoveryToken): SidecarRecoveryState {
+    const recovery = this.#sidecarRecovery;
+    if (!recovery || recovery.token !== token) {
+      throw new V2TransportLivenessError(
+        "V2 sidecar recovery token is stale or invalid",
+        "instance_changed",
+      );
+    }
+    return recovery;
+  }
+
+  #releasePartialResponseState(state: RequestState): void {
+    for (const assembly of state.assemblies.values()) assembly.permit?.release();
+    state.assemblies.clear();
+    for (const completed of state.completedEvents.values()) completed.permit?.release();
+    state.completedEvents.clear();
+  }
+
+  #detachStateForRecovery(state: RequestState): void {
+    this.#requests.delete(state.requestId);
+    const pendingIndex = this.#pending.indexOf(state);
+    if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
+    this.#scheduler.removeStream(state.requestId);
+    state.signal?.removeEventListener("abort", state.onAbort!);
+    if (state.admissionTimer) clearTimeout(state.admissionTimer);
+    state.admissionTimer = undefined;
+    if (this.#requests.size === 0) {
+      for (const resolve of this.#idleWaiters) resolve();
+      this.#idleWaiters.clear();
+    }
+  }
+
+  #maybeCompleteSidecarRecovery(): void {
+    const recovery = this.#sidecarRecovery;
+    if (!recovery || !recovery.markerSeen) return;
+    for (const state of [...this.#requests.values()]) {
+      if (!this.#finishRecoveryPrefixIfReady(state, true)) continue;
+      if (!this.#requests.has(state.requestId)) continue;
+      this.#failCommitted(state, new V2CommittedError(
+        "Recovered sidecar has no durable outcome for the retained request",
+        "sidecar_recovery_unresolved",
+        true,
+      ));
+    }
+    for (const [requestId, receipt] of this.#terminalReceipts) {
+      if (!receipt.replayed) this.#terminalReceipts.delete(requestId);
+    }
+    if (this.#requests.size > 0 || this.#terminalReceipts.size > 0) return;
+    this.#sidecarRecovery = null;
+    recovery.resolve();
+    this.#pacer.requestUrgent();
+  }
+
   #abortRequest(state: RequestState): void {
     if (!this.#requests.has(state.requestId)) return;
     this.#scheduler.removeStream(state.requestId);
-    if (state.committed || state.commitPublished || state.commitStaged) {
+    if (
+      this.#hasExecutionRisk(state) ||
+      (this.#binding.protocolRevision === "r1" && state.commitStaged)
+    ) {
       const acknowledged = state.committed;
       // A staged commit cannot be retracted from the cumulative window. The
       // already-scheduled publication may still send it after this callback.
-      if (state.commitStaged) state.commitPublished = true;
+      if (this.#binding.protocolRevision === "r1" && state.commitStaged) {
+        state.commitPublished = true;
+      }
       state.cancelled = true;
       if (!state.quarantineKind) {
         state.quarantineKind = "cancellation";
@@ -1620,6 +3057,7 @@ export class V2TransportSession {
     if (!this.#requests.has(state.requestId)) return;
     const acknowledged = state.committed;
     if (error.ambiguous) {
+      this.#ambiguityTombstones.set(state.requestId, state.requestDigest);
       if (!state.quarantineKind) {
         state.quarantineKind = "ambiguity";
         this.#quarantined++;
@@ -1627,6 +3065,17 @@ export class V2TransportSession {
       } else if (state.quarantineKind === "cancellation") {
         state.quarantineKind = "ambiguity";
         this.#ambiguousQuarantined++;
+      }
+    } else {
+      // A durable definitive outcome can win a cancellation race before the
+      // fetch-started ACK. Release both the cancellation quarantine and the
+      // still-charged admission reservation exactly once.
+      if (state.quarantineKind === "cancellation") {
+        state.quarantineKind = null;
+        this.#quarantined = Math.max(0, this.#quarantined - 1);
+      }
+      if (state.admitted && !state.committed) {
+        this.#creditReservations = Math.max(0, this.#creditReservations - 1);
       }
     }
     // commitPublished is deliberately promoted to committed-risk here so
@@ -1639,7 +3088,12 @@ export class V2TransportSession {
 
   #removeState(state: RequestState): void {
     this.#requests.delete(state.requestId);
-    state.preparedFrames = null;
+    state.preparedRequest = null;
+    state.recoveryPrefix = undefined;
+    for (const assembly of state.assemblies.values()) assembly.permit?.release();
+    state.assemblies.clear();
+    for (const completed of state.completedEvents.values()) completed.permit?.release();
+    state.completedEvents.clear();
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
     this.#scheduler.removeStream(state.requestId);
@@ -1657,27 +3111,12 @@ export class V2TransportSession {
   }
 
   #failProtocol(cause: unknown): void {
+    if (this.#protocolFailed || this.#teardownPromise) return;
     const message = cause instanceof Error ? cause.message : "V2 transport protocol failed";
     this.#protocolFailed = true;
-    this.#connected = false;
-    this.#draining = true;
-    this.#remoteCredits = 0;
-    if (this.#livenessProbe) {
-      this.#rejectLivenessProbe(
-        this.#livenessProbe,
-        new V2TransportLivenessError(
-          "V2 transport failed during its liveness probe",
-          "unavailable",
-        ),
-        false,
-      );
-    }
-    for (const state of [...this.#requests.values()]) {
-      if (state.committed || state.commitPublished) {
-        this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
-      } else {
-        this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
-      }
-    }
+    void this.#beginTeardown(
+      new V2PreCommitError(message, "protocol"),
+      new V2CommittedError(message, "protocol", true),
+    ).catch(() => undefined);
   }
 }

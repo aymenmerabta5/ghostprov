@@ -1,6 +1,17 @@
 import * as path from "node:path";
 import type { MachineSample } from "../core/ports";
 import { projectId, type ProjectId } from "../sandbox/types";
+import {
+  DEFAULT_V2_SIDECAR_REVISION,
+  resolveV2SidecarRevision,
+  type V2SidecarRevision,
+} from "../v2/sidecar/assets";
+import {
+  deriveV2HostEventMemorySizing,
+  deriveV2SidecarEventMemorySizing,
+  type V2HostEventMemorySizing,
+} from "../v2/memory/event-memory-sizing";
+import { V2_TERMINAL_SPOOL_CAPACITY } from "../v2/sidecar/capacity";
 
 export type PrismSessionMode = "authenticated" | "auto" | "anonymous";
 
@@ -23,12 +34,18 @@ export interface MultiSandboxConfig {
   v2InitialActivePerSandbox: number;
   v2MaxActivePerSandbox: number;
   v2ResponseMaxBytes: number;
+  /** Process-wide host event-memory pool, fully pre-reserved at startup. */
+  v2HostEventMemory: V2HostEventMemorySizing;
   v2TransportReservationBytes: number;
   v2YSweetRefreshMs: number;
   v2SidecarMemoryBudgetBytes: number;
   v2DiagnosticsEnabled: boolean;
   v2DiagnosticsIntervalMs: number;
   v2BatchingEnabled: boolean;
+  /** Process-wide immutable V2 release. R2 is normal operation; R1 is explicit rollback. */
+  v2SidecarRevision: V2SidecarRevision;
+  /** Exact configured-project overrides only; no prefix, cohort, or fallback matching. */
+  v2SidecarProjectRevisions: Readonly<Record<string, V2SidecarRevision>>;
   desiredSandboxes: number;
   provisionConcurrency: number;
   fleetManifestFile: string;
@@ -65,6 +82,44 @@ function binaryFlag(value: string | undefined, name: string): boolean {
   if (value === undefined || value.trim() === "" || value === "0") return false;
   if (value === "1") return true;
   throw new TypeError(`${name} must be 0 or 1`);
+}
+
+function v2SidecarProjectRevisions(
+  value: string | undefined,
+  projectIds: readonly ProjectId[],
+): Readonly<Record<string, V2SidecarRevision>> {
+  if (value === undefined || value.trim() === "") return Object.freeze({});
+  const known = new Set<string>(projectIds);
+  const overrides: Record<string, V2SidecarRevision> = {};
+  for (const rawEntry of value.split(",")) {
+    const entry = rawEntry.trim();
+    const separator = entry.indexOf("=");
+    if (
+      separator < 1 ||
+      separator !== entry.lastIndexOf("=") ||
+      separator === entry.length - 1
+    ) {
+      throw new TypeError(
+        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2 entries",
+      );
+    }
+    const rawProjectId = entry.slice(0, separator).trim();
+    const selectedProject = projectId(rawProjectId);
+    if (!known.has(selectedProject)) {
+      throw new TypeError(
+        `GP_V2_SIDECAR_PROJECT_REVISIONS names an unknown configured project: ${rawProjectId}`,
+      );
+    }
+    if (Object.hasOwn(overrides, selectedProject)) {
+      throw new TypeError(
+        `GP_V2_SIDECAR_PROJECT_REVISIONS repeats project: ${rawProjectId}`,
+      );
+    }
+    overrides[selectedProject] = resolveV2SidecarRevision(
+      entry.slice(separator + 1).trim(),
+    );
+  }
+  return Object.freeze(overrides);
 }
 
 export function resolveMultiSandboxConfig(
@@ -162,11 +217,16 @@ export function resolveMultiSandboxConfig(
   }
   const v2MaxActivePerSandbox = positiveInteger(
     env.GP_V2_MAX_ACTIVE_PER_SANDBOX,
-    16,
+    V2_TERMINAL_SPOOL_CAPACITY,
     "GP_V2_MAX_ACTIVE_PER_SANDBOX",
   );
   if (v2MaxActivePerSandbox > v2SandboxCapacity) {
     throw new RangeError("GP_V2_MAX_ACTIVE_PER_SANDBOX must not exceed physical V2 capacity");
+  }
+  if (v2MaxActivePerSandbox > V2_TERMINAL_SPOOL_CAPACITY) {
+    throw new RangeError(
+      `GP_V2_MAX_ACTIVE_PER_SANDBOX must not exceed the proven terminal-spool capacity (${V2_TERMINAL_SPOOL_CAPACITY})`,
+    );
   }
   const v2InitialActivePerSandbox = positiveInteger(
     env.GP_V2_INITIAL_ACTIVE_PER_SANDBOX,
@@ -181,8 +241,8 @@ export function resolveMultiSandboxConfig(
     64 * 1024 * 1024,
     "GP_V2_RESPONSE_MAX_BYTES",
   );
-  if (v2ResponseMaxBytes > 256 * 1024 * 1024) {
-    throw new RangeError("GP_V2_RESPONSE_MAX_BYTES must not exceed 256 MiB");
+  if (v2ResponseMaxBytes !== 64 * 1024 * 1024) {
+    throw new RangeError("GP_V2_RESPONSE_MAX_BYTES must remain exactly 64 MiB in this release");
   }
   const v2TransportReservationBytes = positiveInteger(
     env.GP_V2_TRANSPORT_RESERVATION_BYTES,
@@ -205,11 +265,25 @@ export function resolveMultiSandboxConfig(
     512 * 1024 * 1024,
     "GP_V2_SIDECAR_MEMORY_BUDGET_BYTES",
   );
-  if (v2SidecarMemoryBudgetBytes < 64 * 1024 * 1024) {
-    throw new RangeError("GP_V2_SIDECAR_MEMORY_BUDGET_BYTES must be at least 64 MiB");
+  try {
+    deriveV2SidecarEventMemorySizing({
+      totalBytes: v2SidecarMemoryBudgetBytes,
+      responseMaxBytes: 64 * 1024 * 1024,
+    });
+  } catch {
+    throw new RangeError(
+      "GP_V2_SIDECAR_MEMORY_BUDGET_BYTES must fit a 64 MiB atomic event plus ordinary memory",
+    );
   }
   const v2DiagnosticsEnabled = binaryFlag(env.GP_V2_DIAGNOSTICS, "GP_V2_DIAGNOSTICS");
   const v2BatchingEnabled = binaryFlag(env.GP_V2_BATCHING, "GP_V2_BATCHING");
+  const v2SidecarRevision = resolveV2SidecarRevision(
+    env.GP_V2_SIDECAR_REVISION?.trim() || DEFAULT_V2_SIDECAR_REVISION,
+  );
+  const v2SidecarRevisionOverrides = v2SidecarProjectRevisions(
+    env.GP_V2_SIDECAR_PROJECT_REVISIONS,
+    projectIds,
+  );
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
@@ -218,6 +292,11 @@ export function resolveMultiSandboxConfig(
     desiredSandboxes,
     positiveInteger(env.GP_PROVISION_CONCURRENCY, 4, "GP_PROVISION_CONCURRENCY"),
   );
+  const v2HostEventMemory = deriveV2HostEventMemorySizing({
+    responseMaxBytes: v2ResponseMaxBytes,
+    runtimes: projectIds.length,
+    maxActivePerRuntime: v2MaxActivePerSandbox,
+  });
 
   return {
     projectIds: Object.freeze(projectIds),
@@ -238,12 +317,15 @@ export function resolveMultiSandboxConfig(
     v2InitialActivePerSandbox,
     v2MaxActivePerSandbox,
     v2ResponseMaxBytes,
+    v2HostEventMemory,
     v2TransportReservationBytes,
     v2YSweetRefreshMs,
     v2SidecarMemoryBudgetBytes,
     v2DiagnosticsEnabled,
     v2DiagnosticsIntervalMs,
     v2BatchingEnabled,
+    v2SidecarRevision,
+    v2SidecarProjectRevisions: v2SidecarRevisionOverrides,
     desiredSandboxes,
     provisionConcurrency,
     fleetManifestFile: path.resolve(

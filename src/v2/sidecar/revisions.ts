@@ -2,6 +2,8 @@ import type { ProjectId } from "../../sandbox/types";
 import {
   DEFAULT_V2_SIDECAR_REVISION,
   loadV2SidecarAssets,
+  V2_R1,
+  V2_R2,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "./assets";
@@ -188,14 +190,13 @@ export interface BundledV2SidecarRevisionSelectorOptions {
   readonly projectOverrides?: V2ProjectRevisionOverrides<V2SidecarRevision>;
 }
 
-/** Current production registry. R2 must register its own frozen loader here. */
+/** Production registry with explicit immutable R2 and strict R1 rollback. */
 export function createBundledV2SidecarRevisionSelector(
   options: BundledV2SidecarRevisionSelectorOptions,
 ): V2SidecarRevisionSelector<V2SidecarRevision, V2SidecarAssets> {
   const loaders = new Map<V2SidecarRevision, () => Promise<V2SidecarAssets>>([
-    [DEFAULT_V2_SIDECAR_REVISION, () => loadV2SidecarAssets({
-      revision: DEFAULT_V2_SIDECAR_REVISION,
-    })],
+    [V2_R1, () => loadV2SidecarAssets({ revision: V2_R1 })],
+    [V2_R2, () => loadV2SidecarAssets({ revision: V2_R2 })],
   ]);
   return new V2SidecarRevisionSelector({
     projectIds: options.projectIds,

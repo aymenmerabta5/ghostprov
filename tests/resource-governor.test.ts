@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { MachineProbe, MachineSample } from "../src/core/ports";
 import {
   ResourceGovernor,
+  ResourceGovernorCapacityUnavailableError,
   ResourceGovernorClosedError,
   ResourceGovernorQueueFullError,
   ResourceGovernorReplacementOverloadError,
@@ -40,7 +41,6 @@ function workload(reservedBytes: number, cpuPermits: 0 | 1 = 0): WorkloadDescrip
     reservedBytes,
     cpuPermits,
     stream: true,
-    serializedBody: "{}",
   };
 }
 
@@ -101,6 +101,20 @@ describe("resource sizing", () => {
 });
 
 describe("ResourceGovernor", () => {
+  it("accounts one fixed process pool and fails it closed without queueing", () => {
+    const governor = new ResourceGovernor({ probe: new MutableProbe(sample(8, 5)) });
+    const fixed = governor.reserveFixedBytes(256 * MiB);
+    expect(governor.snapshot()).toMatchObject({
+      reservedBytes: 256 * MiB,
+      queued: 0,
+    });
+    expect(() => governor.reserveFixedBytes(
+      governor.snapshot().reservationCapacityBytes,
+    )).toThrow(ResourceGovernorCapacityUnavailableError);
+    fixed.release();
+    expect(governor.snapshot().reservedBytes).toBe(0);
+  });
+
   it("admits 120 text jobs but throttles maximum image-like reservations by bytes", () => {
     const probe = new MutableProbe(sample(32, 19.19));
     const governor = new ResourceGovernor({ probe });

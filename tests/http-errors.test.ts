@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
 import { RelayError } from "../src/relay/run-handle";
-import { RouterCapacityTimeoutError, RouterShutdownError } from "../src/router/router";
+import {
+  RouterCapacityTimeoutError,
+  RouterQueueFullError,
+  RouterShutdownError,
+} from "../src/router/router";
 import {
   ResourceGovernorClosedError,
   ResourceGovernorQueueFullError,
@@ -36,6 +40,18 @@ describe("OpenAI-compatible HTTP errors", () => {
         type: "service_unavailable_error",
         param: null,
         code: "router_capacity_timeout",
+      },
+    });
+  });
+
+  it("maps a full router queue to a sanitized overload", () => {
+    expect(normalizeApiError(new RouterQueueFullError("private queue accounting"))).toEqual({
+      status: 503,
+      error: {
+        message: "GhostProv routing is temporarily overloaded",
+        type: "overloaded_error",
+        param: null,
+        code: "router_queue_full",
       },
     });
   });

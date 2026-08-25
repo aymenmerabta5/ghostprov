@@ -3,9 +3,16 @@ import type { Clock } from "../src/core/ports";
 import {
   ClaimJournal,
   ClaimJournalError,
+  JournalStorageCapacityError,
+  JournalStorageDurabilityError,
+  V2_JOURNAL_MAX_OUTCOME_RECORD_BYTES,
+  journalStoredRecordBytes,
   type JournalRecord,
   type JournalStorage,
+  type JournalTerminalSpool,
 } from "../src/v2/sidecar/journal";
+import { sha256Hex, utf8Bytes } from "../src/v2/protocol/shared";
+import { IncrementalSha256 } from "../src/v2/protocol/transcript";
 import {
   PROVIDER_ERROR_PAYLOAD_MAX_BYTES,
   type ProviderErrorEnvelope,
@@ -82,6 +89,7 @@ class FakeJournalStorage implements JournalStorage {
   appendFailures = 0;
   appendAfterPersistFailures = 0;
   replaceFailures = 0;
+  replaceDurabilityFailures = 0;
   pruneFailures = 0;
   terminalReads = 0;
   terminalStats = 0;
@@ -104,7 +112,42 @@ class FakeJournalStorage implements JournalStorage {
     }
   }
 
+  async beginTerminalSpool(requestId: string, maxBytes: number): Promise<JournalTerminalSpool> {
+    const chunks: Uint8Array[] = [];
+    const hasher = new IncrementalSha256();
+    let byteCount = 0;
+    let active = true;
+    const storage = this;
+    return {
+      requestId,
+      maxBytes,
+      get byteCount() { return byteCount; },
+      async append(bytes) {
+        if (!active || byteCount + bytes.byteLength > maxBytes) throw new Error("spool bounds");
+        chunks.push(bytes.slice());
+        hasher.update(bytes);
+        byteCount += bytes.byteLength;
+      },
+      async promote(proof) {
+        if (!active || proof.byteCount !== byteCount) throw new Error("spool proof");
+        const value = new Uint8Array(byteCount);
+        let offset = 0;
+        for (const chunk of chunks) { value.set(chunk, offset); offset += chunk.byteLength; }
+        if (hasher.digestHex() !== proof.transcriptSha256) throw new Error("spool digest");
+        storage.terminals.set(requestId, value);
+        storage.timeline.push("terminal-spool");
+        active = false;
+        chunks.length = 0;
+      },
+      async abort() { active = false; chunks.length = 0; },
+    };
+  }
+
   async replaceRecords(records: readonly JournalRecord[]): Promise<void> {
+    if (this.replaceDurabilityFailures > 0) {
+      this.replaceDurabilityFailures--;
+      throw new JournalStorageDurabilityError("directory fsync failed after rename");
+    }
     if (this.replaceFailures > 0) {
       this.replaceFailures--;
       throw new Error("journal replacement failed");
@@ -160,8 +203,12 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 async function settle<T>(clock: ManualClock, promise: Promise<T>): Promise<T> {
-  await flushMicrotasks();
-  await clock.advanceBy(2);
+  let settled = false;
+  void promise.finally(() => { settled = true; }).catch(() => undefined);
+  for (let round = 0; round < 32 && !settled; round++) {
+    await flushMicrotasks();
+    await clock.advanceBy(2);
+  }
   return promise;
 }
 
@@ -201,6 +248,14 @@ function acknowledgedRecords(
 }
 
 describe("ClaimJournal", () => {
+  it("rejects terminal spool disk limits that cannot contain one full spool", () => {
+    expect(() => new DenoJournalStorage({
+      maxTerminalSpoolBytes: 64,
+      maxTerminalBytes: 63,
+      withExclusiveOwnership: async operation => operation(),
+    })).toThrow("terminal spool limits");
+  });
+
   it("group-commits CLAIMED before resolving and FETCH_STARTING before fetch", async () => {
     const clock = new ManualClock();
     const storage = new FakeJournalStorage();
@@ -238,6 +293,36 @@ describe("ClaimJournal", () => {
 
     expect(storage.syncedBatches).toBe(1);
     expect(storage.records.map(value => value.requestId)).toEqual(["req-a", "req-b"]);
+  });
+
+  it("bounds unacknowledged request metadata independently of transcript bytes", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      maxUnacknowledgedRequests: 1,
+    });
+    await settle(clock, journal.claim({
+      requestId: "req-first",
+      requestDigest: "a".repeat(64),
+      leaderGeneration: 3,
+    }));
+    await expect(journal.claim({
+      requestId: "req-second",
+      requestDigest: "b".repeat(64),
+      leaderGeneration: 3,
+    })).rejects.toMatchObject({ code: "capacity" });
+    await settle(clock, journal.markCancelled("req-first"));
+    await settle(clock, journal.acknowledgeOutcome("req-first"));
+    await settle(clock, journal.claim({
+      requestId: "req-second",
+      requestDigest: "b".repeat(64),
+      leaderGeneration: 3,
+    }));
+    expect(journal.status("req-second")).toBe("claimed");
   });
 
   it("flushes pending mutations before lifecycle ownership is released", async () => {
@@ -290,11 +375,176 @@ describe("ClaimJournal", () => {
     expect(await storage.readTerminal(REQUEST)).toBeNull();
   });
 
+  it("promotes an incremental spool only after its exact terminal proof", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    await settle(clock, journal.claim({ requestId: REQUEST, requestDigest: DIGEST, leaderGeneration: 3 }));
+    await settle(clock, journal.markFetchStarting(REQUEST));
+    const spool = await journal.beginTerminalSpool(REQUEST);
+    const first = utf8Bytes("event: response.created\ndata: {}\n\n");
+    const second = utf8Bytes("event: response.completed\ndata: {}\n\n");
+    await spool.append(first);
+    await spool.append(second);
+    const bytes = new Uint8Array(first.byteLength + second.byteLength);
+    bytes.set(first);
+    bytes.set(second, first.byteLength);
+    const digest = await sha256Hex(bytes);
+
+    await settle(clock, journal.markTerminalFromSpool(
+      REQUEST,
+      "resp_1",
+      digest,
+      bytes.byteLength,
+      spool,
+    ));
+    expect(storage.timeline.slice(-2)).toEqual(["terminal-spool", "sync:terminal"]);
+    expect(await storage.readTerminal(REQUEST)).toEqual(bytes);
+  });
+
+  it("keeps an oversized terminal spool request-local instead of poisoning the journal", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      maxTerminalSpoolBytes: 4,
+      terminalSpoolBufferBytes: 4,
+    });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    const spool = await journal.beginTerminalSpool(REQUEST);
+    await expect(spool.append(new Uint8Array(5))).rejects.toMatchObject({ code: "capacity" });
+    await spool.abort();
+    await settle(clock, journal.markCancelled(REQUEST));
+    expect(journal.status(REQUEST)).toBe("cancelled");
+  });
+
+  it("keeps a terminal spool proof mismatch request-local", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await settle(clock, journal.markFetchStarting(REQUEST));
+    const spool = await journal.beginTerminalSpool(REQUEST);
+    await spool.append(utf8Bytes("proof"));
+    await expect(journal.markTerminalFromSpool(
+      REQUEST,
+      "resp-proof",
+      "b".repeat(64),
+      4,
+      spool,
+    )).rejects.toMatchObject({ code: "conflict" });
+    await spool.abort();
+    await settle(clock, journal.markForcedAmbiguous(REQUEST));
+    expect(journal.status(REQUEST)).toBe("forced_ambiguous");
+  });
+
+  it("treats pre-fetch spool reservation exhaustion as nonfatal capacity", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    storage.beginTerminalSpool = async () => {
+      throw new JournalStorageCapacityError("spool reservation exhausted");
+    };
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await expect(journal.beginTerminalSpool(REQUEST)).rejects.toMatchObject({
+      code: "capacity",
+    });
+    expect(journal.status(REQUEST)).toBe("claimed");
+    await settle(clock, journal.markCancelled(REQUEST));
+    await settle(clock, journal.acknowledgeOutcome(REQUEST));
+    expect(journal.status(REQUEST)).toBe("acked");
+  });
+
+  it("cleans temp spools and orphaned promotions across crash boundaries", async () => {
+    const prepare = async () => {
+      const clock = new ManualClock();
+      const storage = new FakeJournalStorage();
+      const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+      await settle(clock, journal.claim({ requestId: REQUEST, requestDigest: DIGEST, leaderGeneration: 3 }));
+      await settle(clock, journal.markFetchStarting(REQUEST));
+      const spool = await journal.beginTerminalSpool(REQUEST);
+      const bytes = utf8Bytes("event: response.completed\ndata: {}\n\n");
+      await spool.append(bytes);
+      return { clock, storage, journal, spool, bytes, digest: await sha256Hex(bytes) };
+    };
+
+    const beforePromote = await prepare();
+    await beforePromote.spool.abort();
+    const beforeRestart = new ClaimJournal({
+      storage: beforePromote.storage,
+      clock: beforePromote.clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+    });
+    expect((await beforeRestart.recover()).ambiguous).toEqual([REQUEST]);
+    expect(beforePromote.storage.terminals.has(REQUEST)).toBe(false);
+
+    const orphan = await prepare();
+    orphan.storage.appendFailures = 1;
+    await expect(settle(orphan.clock, orphan.journal.markTerminalFromSpool(
+      REQUEST,
+      "resp_1",
+      orphan.digest,
+      orphan.bytes.byteLength,
+      orphan.spool,
+    ))).rejects.toMatchObject({ code: "storage" });
+    expect(orphan.storage.terminals.has(REQUEST)).toBe(true);
+    const orphanRestart = new ClaimJournal({
+      storage: orphan.storage,
+      clock: orphan.clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    expect((await orphanRestart.recover()).ambiguous).toEqual([REQUEST]);
+    expect(orphan.storage.terminals.has(REQUEST)).toBe(false);
+
+    const afterPromote = await prepare();
+    afterPromote.storage.appendAfterPersistFailures = 1;
+    await expect(settle(afterPromote.clock, afterPromote.journal.markTerminalFromSpool(
+      REQUEST,
+      "resp_1",
+      afterPromote.digest,
+      afterPromote.bytes.byteLength,
+      afterPromote.spool,
+    ))).rejects.toMatchObject({ code: "storage" });
+    const afterRestart = new ClaimJournal({
+      storage: afterPromote.storage,
+      clock: afterPromote.clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+    });
+    expect((await afterRestart.recover()).terminals).toEqual([REQUEST]);
+  });
+
   it("replays proven terminals and preserves unresolved fetch ambiguity", async () => {
     const terminalStorage = new FakeJournalStorage([
       record(1, "claimed"),
       record(2, "fetch_starting"),
-      record(3, "terminal", { responseId: "resp_1", terminalDigest: "c".repeat(64) }),
+      record(3, "terminal", {
+        responseId: "resp_1",
+        terminalDigest: "c".repeat(64),
+        prelude: {
+          status: 200,
+          contentType: "text/event-stream; charset=utf-8",
+          upstreamRequestId: "req_exact_prelude",
+        },
+      }),
     ]);
     terminalStorage.terminals.set(REQUEST, new TextEncoder().encode("terminal"));
     const terminalJournal = new ClaimJournal({
@@ -314,6 +564,13 @@ describe("ClaimJournal", () => {
     });
     expect(terminalStorage.terminalStats).toBe(1);
     expect(terminalStorage.terminalReads).toBe(0);
+    const opened = await terminalJournal.openRecoveredTerminal(REQUEST);
+    expect(opened?.prelude).toEqual({
+      status: 200,
+      contentType: "text/event-stream; charset=utf-8",
+      upstreamRequestId: "req_exact_prelude",
+    });
+    opened?.reader.close();
 
     const ambiguousJournal = new ClaimJournal({
       storage: new FakeJournalStorage([record(1, "claimed"), record(2, "fetch_starting")]),
@@ -377,6 +634,135 @@ describe("ClaimJournal", () => {
     const afterAck = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
     expect((await afterAck.recover()).providerErrors).toEqual([]);
     expect(afterAck.status(REQUEST)).toBe("acked");
+  });
+
+  it("reserves worst-case provider outcomes and never creates an unrestartable journal", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const maxJournalBytes = 64 * 1024;
+    const maxJournalRecords = 100;
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      maxJournalBytes,
+      maxJournalRecords,
+      maxUnacknowledgedRequests: 100,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    const maximum = providerErrorEnvelope();
+    maximum.payload = {
+      format: "text",
+      text: "x".repeat(PROVIDER_ERROR_PAYLOAD_MAX_BYTES),
+      truncated: true,
+    };
+    const accepted: string[] = [];
+    let rejectedId = "";
+    for (let index = 0; index < 20; index++) {
+      const requestId = `req-provider-cap-${index}`;
+      const digest = index.toString(16).padStart(64, "0");
+      try {
+        await settle(clock, journal.claim({ requestId, requestDigest: digest, leaderGeneration: 3 }));
+      } catch (error) {
+        expect(error).toMatchObject({ code: "capacity" });
+        rejectedId = requestId;
+        break;
+      }
+      await settle(clock, journal.markProviderError(requestId, {
+        status: 429,
+        code: "rate_limit_exceeded",
+        message: "Rate limit reached",
+        providerError: maximum,
+      }, {
+        status: 200,
+        contentType: "text/event-stream; charset=utf-8",
+        upstreamRequestId: "r".repeat(255),
+      }));
+      accepted.push(requestId);
+      expect(storage.records.reduce(
+        (total, value) => total + journalStoredRecordBytes(value),
+        0,
+      )).toBeLessThanOrEqual(maxJournalBytes);
+      expect(storage.records.length).toBeLessThanOrEqual(maxJournalRecords);
+    }
+    expect(accepted.length).toBeGreaterThan(2);
+    expect(rejectedId).not.toBe("");
+    expect(journal.status(rejectedId)).toBeNull();
+    const providerRecord = storage.records.find(value => value.state === "provider_error");
+    expect(journalStoredRecordBytes(providerRecord!))
+      .toBeLessThanOrEqual(V2_JOURNAL_MAX_OUTCOME_RECORD_BYTES);
+
+    const restarted = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      maxJournalBytes,
+      maxJournalRecords,
+      maxUnacknowledgedRequests: 100,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    const recovered = await restarted.recover();
+    expect(recovered.providerErrors.map(value => value.requestId).sort())
+      .toEqual([...accepted].sort());
+    expect(recovered.providerErrors.every(value => (
+      value.error.providerError?.payload.text.length === PROVIDER_ERROR_PAYLOAD_MAX_BYTES
+    ))).toBe(true);
+  });
+
+  it("reserves the complete future transition count before a new claim", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      maxJournalBytes: 1024 * 1024,
+      maxJournalRecords: 3,
+    });
+    await expect(journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    })).rejects.toMatchObject({ code: "capacity" });
+    expect(storage.records).toEqual([]);
+    expect(journal.status(REQUEST)).toBeNull();
+  });
+
+  it("does not resolve the first claim before the storage directory-entry fence", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    let releaseDirectorySync!: () => void;
+    const directorySync = new Promise<void>(resolve => { releaseDirectorySync = resolve; });
+    storage.appendAndSync = async records => {
+      storage.records.push(...records.map(value => ({ ...value })));
+      storage.timeline.push("file-sync");
+      await directorySync;
+      storage.timeline.push("directory-sync");
+      storage.syncedBatches++;
+    };
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    let resolved = false;
+    const claiming = journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }).then(() => { resolved = true; });
+    await flushMicrotasks();
+    await clock.advanceBy(2);
+    await flushMicrotasks();
+    expect(storage.timeline).toEqual(["file-sync"]);
+    expect(resolved).toBe(false);
+    expect(journal.status(REQUEST)).toBeNull();
+
+    releaseDirectorySync();
+    await claiming;
+    expect(storage.timeline).toEqual(["file-sync", "directory-sync"]);
+    expect(journal.status(REQUEST)).toBe("claimed");
   });
 
   it("recovers a provider error when the append persisted before process failure", async () => {
@@ -460,6 +846,47 @@ describe("ClaimJournal", () => {
         providerError,
       },
     }]);
+  });
+
+  it("accepts an idempotent outcome ACK after compaction removes the acknowledged outcome", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const options = {
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      withExclusiveOwnership: async <T>(operation: () => Promise<T>) => operation(),
+    };
+    const journal = new ClaimJournal(options);
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await settle(clock, journal.markProviderError(REQUEST, {
+      status: 429,
+      code: "rate_limit_exceeded",
+      message: "limited",
+      providerError: providerErrorEnvelope(),
+    }));
+    await settle(clock, journal.acknowledgeOutcome(REQUEST));
+    await settle(clock, journal.claim({
+      requestId: "req-compaction-trigger",
+      requestDigest: "c".repeat(64),
+      leaderGeneration: 3,
+    }));
+    const compactedAck = storage.records.find(value => value.requestId === REQUEST);
+    expect(compactedAck).toMatchObject({
+      state: "acked",
+      compacted: true,
+    });
+    expect(compactedAck).not.toHaveProperty("outcome");
+
+    const restarted = new ClaimJournal(options);
+    await restarted.recover();
+    await expect(restarted.acknowledgeOutcome(REQUEST)).resolves.toBeUndefined();
   });
 
   it("fails closed for invalid or oversized provider envelopes at append and recovery", async () => {
@@ -566,6 +993,41 @@ describe("ClaimJournal", () => {
     expect(afterAck.status("req-forced")).toBe("acked");
   });
 
+  it("serializes a forced outcome ahead of a racing provider error", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await settle(clock, journal.markFetchStarting(REQUEST));
+
+    const forced = journal.markForcedAmbiguous(REQUEST, {
+      code: "forced_drain_cancelled",
+      message: "deadline won",
+    });
+    const provider = journal.markProviderError(REQUEST, {
+      status: 429,
+      code: "rate_limit_exceeded",
+      message: "late provider error",
+      providerError: providerErrorEnvelope(),
+    });
+    const providerResult = provider.catch(error => error);
+    await settle(clock, forced);
+    expect(await providerResult).toMatchObject({ code: "conflict" });
+    expect(storage.records.filter(value => (
+      value.requestId === REQUEST &&
+      (value.state === "forced_ambiguous" || value.state === "provider_error")
+    ))).toEqual([expect.objectContaining({ state: "forced_ambiguous" })]);
+
+    const restarted = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    const recovered = await restarted.recover();
+    expect(recovered.forcedAmbiguous).toHaveLength(1);
+    expect(recovered.providerErrors).toEqual([]);
+  });
+
   it("rejects conflicting claims and corrupt transition history", async () => {
     const clock = new ManualClock();
     const storage = new FakeJournalStorage();
@@ -641,9 +1103,43 @@ describe("ClaimJournal", () => {
 
     await journal.recover();
     expect(storage.replacements).toBe(1);
-    expect(storage.records).toHaveLength(40);
+    expect(storage.records).toHaveLength(10);
+    expect(storage.records.every(value => value.compacted === true)).toBe(true);
     expect(journal.status("req-0")).toBeNull();
     expect(journal.status("req-99")).toBe("acked");
+  });
+
+  it("prunes only prior leader generations before recovery readiness", async () => {
+    const oldId = "req-old-generation";
+    const currentId = "req-current-generation";
+    const storage = new FakeJournalStorage([
+      record(1, "claimed", { requestId: oldId, leaderGeneration: 2 }),
+      record(2, "fetch_starting", { requestId: oldId, leaderGeneration: 2 }),
+      record(3, "claimed", { requestId: currentId, leaderGeneration: 3 }),
+      record(4, "fetch_starting", { requestId: currentId, leaderGeneration: 3 }),
+      record(5, "terminal", {
+        requestId: currentId,
+        leaderGeneration: 3,
+        responseId: "resp-current-generation",
+        terminalDigest: DIGEST,
+      }),
+    ]);
+    storage.terminals.set(oldId, utf8Bytes("old"));
+    storage.terminals.set(currentId, utf8Bytes("current"));
+    const journal = new ClaimJournal({
+      storage,
+      clock: new ManualClock(),
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    expect(await journal.pruneOtherGenerations(3)).toBe(1);
+    const recovered = await journal.recover();
+    expect(recovered.terminals).toEqual([currentId]);
+    expect(recovered.ambiguous).toEqual([]);
+    expect(journal.status(oldId)).toBeNull();
+    expect(storage.terminals.has(oldId)).toBe(false);
+    expect(storage.terminals.has(currentId)).toBe(true);
   });
 
   it("retains duplicate fences when optional startup compaction fails", async () => {
@@ -684,6 +1180,32 @@ describe("ClaimJournal", () => {
     });
 
     await expect(journal.recover()).rejects.toMatchObject({ code: "storage" });
+  });
+
+  it("fail-stops after an atomic replacement has uncertain directory durability", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    storage.replaceDurabilityFailures = 1;
+    await expect(journal.markCancelled(REQUEST)).rejects.toMatchObject({ code: "storage" });
+    await expect(journal.claim({
+      requestId: "req-after-uncertain-rename",
+      requestDigest: "e".repeat(64),
+      leaderGeneration: 3,
+    })).rejects.toMatchObject({ code: "storage" });
+    expect(storage.records).toHaveLength(1);
   });
 
   it("retains recent ACK digests while expiring tombstones beyond their TTL", async () => {

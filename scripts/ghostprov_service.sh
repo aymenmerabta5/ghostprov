@@ -3,8 +3,8 @@ set -euo pipefail
 
 ACTION="${1:-}"
 case "$ACTION" in
-  install|uninstall|start|stop|restart|status) ;;
-  *) echo "usage: $0 {install|uninstall|start|stop|restart|status}" >&2; exit 2 ;;
+  install|uninstall|start|stop|restart|config-restart|status) ;;
+  *) echo "usage: $0 {install|uninstall|start|stop|restart|config-restart|status}" >&2; exit 2 ;;
 esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +29,10 @@ ExecReload="$BUN_BIN" scripts/request_upgrade.ts
 ExecStop="$BUN_BIN" scripts/request_shutdown.ts
 Restart=always
 RestartSec=2s
-TimeoutStartSec=180s
-TimeoutStopSec=360s
+# supervise.ts caps lifecycle waits at 1800 seconds. systemd retains a finite
+# cgroup-owned last resort with one minute of cleanup margin.
+TimeoutStartSec=1860s
+TimeoutStopSec=1860s
 KillMode=mixed
 
 [Install]
@@ -52,11 +54,29 @@ case "$ACTION" in
     ;;
   start) systemctl --user start ghostprov.service ;;
   stop) systemctl --user stop ghostprov.service ;;
+  # A normal restart is intentionally only a rolling worker reload.  It keeps
+  # the supervisor and its startup environment alive.
   restart) systemctl --user reload ghostprov.service ;;
+  # A systemd restart runs ExecStop, waits for the supervisor/fleet to drain,
+  # and then launches a new supervisor process. dotenv therefore reloads .env.
+  # Do not report success merely because Type=simple forked: prove that a new
+  # descriptor instance and its matching worker-ready status are both fresh.
+  config-restart)
+    RESTART_REQUESTED_AT="$($BUN_BIN -e 'console.log(new Date().toISOString())')"
+    OLD_INSTANCE_NONCE="$(
+      (
+        cd -- "$WORKSPACE"
+        "$BUN_BIN" scripts/show_supervisor_status.ts descriptor 2>/dev/null | \
+          "$BUN_BIN" -e 'const value=JSON.parse(await Bun.stdin.text()); console.log(value.instanceNonce)'
+      ) || true
+    )"
+    systemctl --user restart ghostprov.service
+    (cd -- "$WORKSPACE" && "$BUN_BIN" scripts/show_supervisor_status.ts wait-ready \
+      "$RESTART_REQUESTED_AT" "${OLD_INSTANCE_NONCE:--}" 1830000)
+    echo "GhostProv full configuration restart completed with a fresh ready supervisor; .env was reloaded."
+    ;;
   status)
     systemctl --user status ghostprov.service --no-pager
-    if [[ -f "$WORKSPACE/.ghostprov/supervisor.json" ]]; then
-      cat -- "$WORKSPACE/.ghostprov/supervisor.json"
-    fi
+    (cd -- "$WORKSPACE" && "$BUN_BIN" scripts/show_supervisor_status.ts)
     ;;
 esac

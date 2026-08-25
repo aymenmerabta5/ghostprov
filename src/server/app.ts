@@ -10,7 +10,16 @@ import {
   type AnthropicModelOptions,
 } from "../anthropic/model";
 import type { IncomingResourceLease } from "../router/router";
-import { takeIncomingBodyLease } from "../http/request-lease";
+import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
+import {
+  releaseAtomicBytePermit,
+  transferAtomicBytePermit,
+} from "../v2/memory/permit-carrier";
+import {
+  safeV2ReleaseIdentity,
+  summarizeV2Releases,
+} from "../v2/release-observability";
+import type { FleetSnapshot } from "../fleet/types";
 
 export interface RouterLike {
   startRelay(
@@ -20,9 +29,14 @@ export interface RouterLike {
       source?: "http" | "websocket" | "image" | "anthropic" | "internal";
       signal?: AbortSignal;
       incomingLease?: IncomingResourceLease;
+      encodedBodyBytes?: number;
     },
   ): Promise<RunHandle>;
-  acquireIncomingBody?(bytes: number, signal?: AbortSignal): Promise<IncomingResourceLease>;
+  acquireIncomingBody?(
+    bytes: number,
+    signal?: AbortSignal,
+    options?: { maxBytes?: number },
+  ): Promise<IncomingResourceLease>;
   snapshot(): {
     capacity: number;
     active: number;
@@ -35,6 +49,7 @@ export interface RouterLike {
 
 export interface GhostProvAppOptions {
   router: RouterLike;
+  fleetSnapshot?: () => FleetSnapshot;
   imageOptions?: ImageCompatOptions;
   anthropicModels?: AnthropicModelOptions;
   keepAliveMs?: number;
@@ -61,6 +76,75 @@ const RESPONSE_TERMINAL_EVENTS = new Set([
   "response.failed",
 ]);
 const MAX_TIMER_MS = 2_147_483_647;
+const MAX_PUBLIC_UNAVAILABLE_PROJECTS = 256;
+const PUBLIC_PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const RUNTIME_PRIVATE_KEYS = new Set([
+  "token", "cookie", "authorization", "sessionid", "sandboxsessionid",
+  "instanceid", "resourcetoken", "ysweettoken",
+]);
+
+function sanitizeRuntimeValue(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): unknown {
+  if (depth > 16) return null;
+  if (Array.isArray(value)) return value.map(child => sanitizeRuntimeValue(child, depth + 1, seen));
+  if (!value || typeof value !== "object") return value;
+  if (seen.has(value)) return null;
+  seen.add(value);
+  try {
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = key.replaceAll("_", "").toLowerCase();
+      if (RUNTIME_PRIVATE_KEYS.has(normalized)) continue;
+      output[key] = sanitizeRuntimeValue(child, depth + 1, seen);
+    }
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function publicRuntimeSnapshot(value: unknown): Record<string, unknown> {
+  const raw = sanitizeRuntimeValue(value) as Record<string, unknown> ?? {};
+  const release = safeV2ReleaseIdentity(raw);
+  raw.protocolRevision = release?.protocolRevision ?? null;
+  raw.buildHash = release?.buildHash ?? null;
+  raw.schemaHash = release?.schemaHash ?? null;
+  return raw;
+}
+
+function publicFleetState(
+  value: FleetSnapshot | undefined,
+  runtimeCount: number,
+): {
+  desired: number;
+  ready: number;
+  unavailable: number;
+  unavailableProjects: string[];
+  unavailableProjectsTruncated: boolean;
+} {
+  if (!value) {
+    return {
+      desired: runtimeCount,
+      ready: runtimeCount,
+      unavailable: 0,
+      unavailableProjects: [],
+      unavailableProjectsTruncated: false,
+    };
+  }
+  const all = value.unavailableProjects
+    .filter((id): id is typeof value.unavailableProjects[number] => PUBLIC_PROJECT_ID.test(id));
+  return {
+    desired: value.desired,
+    ready: value.ready,
+    unavailable: value.unavailable,
+    unavailableProjects: all.slice(0, MAX_PUBLIC_UNAVAILABLE_PROJECTS),
+    unavailableProjectsTruncated: all.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS,
+  };
+}
 
 function terminalEventForFinal(final: unknown): string {
   if (!final || typeof final !== "object" || Array.isArray(final)) {
@@ -95,6 +179,11 @@ async function nonStreamingFinal(
   cancelRelay: (reason?: unknown) => void,
 ): Promise<any> {
   const iterator = handle.events();
+  let settledFinal: any = null;
+  const final = handle.final.then(value => {
+    settledFinal = value;
+    return value;
+  });
   const drain = (async () => {
     while (!(await iterator.next()).done) {
       // Non-streaming callers still have to consume the bounded transport
@@ -102,11 +191,65 @@ async function nonStreamingFinal(
     }
   })();
   try {
-    const [final] = await Promise.all([handle.final, drain]);
-    return final;
+    const [value] = await Promise.all([final, drain]);
+    return value;
   } catch (error) {
+    if (settledFinal) releaseAtomicBytePermit(settledFinal);
+    else void final.then(releaseAtomicBytePermit, () => undefined);
     cancelRelay(error);
     void iterator.return(undefined).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Lazily serialize a non-stream response while its terminal allocation is
+ * still charged, then hand that same charge to the exact bytes written by the
+ * Node adapter. A second pull proves the first chunk drained for Fetch-only
+ * consumers; the adapter releases it earlier on the write callback.
+ */
+function permittedJsonResponse(final: Record<string, unknown>): Response {
+  let chunk: Uint8Array | null = null;
+  let enqueued = false;
+  let closed = false;
+  const release = () => {
+    releaseAtomicBytePermit(chunk);
+    chunk = null;
+    releaseAtomicBytePermit(final);
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (closed) return;
+      if (enqueued) {
+        closed = true;
+        release();
+        controller.close();
+        return;
+      }
+      try {
+        const json = JSON.stringify(final);
+        chunk = new TextEncoder().encode(json);
+        transferAtomicBytePermit(final, chunk, "http-json-chunk");
+        controller.enqueue(chunk);
+        enqueued = true;
+      } catch (error) {
+        closed = true;
+        release();
+        controller.error(error);
+      }
+    },
+    cancel() {
+      if (closed) return;
+      closed = true;
+      release();
+    },
+  }, { highWaterMark: 0 });
+  try {
+    return new Response(stream, {
+      headers: { "content-type": "application/json; charset=UTF-8" },
+    });
+  } catch (error) {
+    release();
     throw error;
   }
 }
@@ -123,12 +266,20 @@ function responseEventStream(
   type CancelledOutcome = { kind: "cancelled" };
   const encoder = new TextEncoder();
   const iterator = handle.events();
+  let deliveredChunk: Uint8Array | null = null;
   let pendingNext: Promise<NextOutcome> | null = null;
   let sawTerminal = false;
   let nextSequence: number | null = null;
   let finished = false;
   let cancelled = false;
   let wakeCancellation: (() => void) | null = null;
+  let finalForCleanup: Record<string, unknown> | null = null;
+  let closeAfterDeliveredChunk = false;
+
+  void handle.final.then(final => {
+    if (finished || cancelled) releaseAtomicBytePermit(final);
+    else finalForCleanup = final;
+  }, () => undefined);
 
   const cancellationWaiter = (): {
     promise: Promise<CancelledOutcome>;
@@ -153,6 +304,10 @@ function responseEventStream(
   const finish = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
     if (finished) return;
     finished = true;
+    releaseAtomicBytePermit(deliveredChunk);
+    deliveredChunk = null;
+    releaseAtomicBytePermit(finalForCleanup);
+    finalForCleanup = null;
     options.close();
     if (!cancelled) controller.close();
   };
@@ -200,6 +355,14 @@ function responseEventStream(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (finished || cancelled) return;
+      // highWaterMark=0 means a new pull proves the previous chunk left the
+      // stream queue. Node's adapter releases earlier on its write callback.
+      releaseAtomicBytePermit(deliveredChunk);
+      deliveredChunk = null;
+      if (closeAfterDeliveredChunk) {
+        finish(controller);
+        return;
+      }
       try {
         const outcome = await nextOrKeepAlive();
         if (cancelled || outcome.kind === "cancelled") return;
@@ -212,7 +375,17 @@ function responseEventStream(
           const frame = outcome.result.value;
           if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) sawTerminal = true;
           nextSequence = nextResponseSequence(frame.data, nextSequence);
-          controller.enqueue(encoder.encode(sseFrame(frame.event, frame.data)));
+          let encoded: Uint8Array | null = null;
+          try {
+            encoded = encoder.encode(sseFrame(frame.event, frame.data));
+            transferAtomicBytePermit(frame, encoded, "http-sse-chunk");
+            controller.enqueue(encoded);
+            deliveredChunk = encoded;
+          } catch (error) {
+            releaseAtomicBytePermit(encoded);
+            releaseAtomicBytePermit(frame);
+            throw error;
+          }
           return;
         }
 
@@ -224,11 +397,27 @@ function responseEventStream(
           ]).finally(cancellation.dispose);
           if (cancelled || finalOutcome.kind === "cancelled") return;
           const event = terminalEventForFinal(finalOutcome.value);
-          controller.enqueue(encoder.encode(sseFrame(event, {
-            type: event,
-            ...(nextSequence === null ? {} : { sequence_number: nextSequence }),
-            response: finalOutcome.value,
-          })));
+          let encoded: Uint8Array | null = null;
+          try {
+            encoded = encoder.encode(sseFrame(event, {
+              type: event,
+              ...(nextSequence === null ? {} : { sequence_number: nextSequence }),
+              response: finalOutcome.value,
+            }));
+            transferAtomicBytePermit(
+              finalOutcome.value,
+              encoded,
+              "http-sse-final-chunk",
+            );
+            controller.enqueue(encoded);
+            deliveredChunk = encoded;
+            closeAfterDeliveredChunk = true;
+          } catch (error) {
+            releaseAtomicBytePermit(encoded);
+            releaseAtomicBytePermit(finalOutcome.value);
+            throw error;
+          }
+          return;
         }
         finish(controller);
       } catch (error) {
@@ -239,13 +428,17 @@ function responseEventStream(
       if (cancelled || finished) return;
       cancelled = true;
       finished = true;
+      releaseAtomicBytePermit(deliveredChunk);
+      deliveredChunk = null;
+      releaseAtomicBytePermit(finalForCleanup);
+      finalForCleanup = null;
       wakeCancellation?.();
       wakeCancellation = null;
       options.cancelRelay(reason);
       options.close();
       void iterator.return(undefined).catch(() => undefined);
     },
-  });
+  }, { highWaterMark: 0 });
 }
 
 function codexModel(input: {
@@ -356,6 +549,8 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
 
   app.get("/health", c => {
     const snapshot = options.router.snapshot();
+    const runtimes = snapshot.runtimes.map(publicRuntimeSnapshot);
+    const fleet = publicFleetState(options.fleetSnapshot?.(), runtimes.length);
     const healthy = snapshot.capacity > 0;
     return c.json({
       ok: healthy,
@@ -363,18 +558,24 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       active: snapshot.active,
       available: snapshot.available,
       queued: snapshot.queued,
-      runtimes: snapshot.runtimes.length,
+      runtimes: runtimes.length,
+      ...fleet,
+      release: summarizeV2Releases(runtimes),
     }, healthy ? 200 : 503);
   });
 
   app.get("/__sandboxes", c => {
     const snapshot = options.router.snapshot();
+    const runtimes = snapshot.runtimes.map(publicRuntimeSnapshot);
+    const fleet = publicFleetState(options.fleetSnapshot?.(), runtimes.length);
     return c.json({
       capacity: snapshot.capacity,
       active: snapshot.active,
       available: snapshot.available,
       queued: snapshot.queued,
-      runtimes: snapshot.runtimes,
+      runtimes,
+      ...fleet,
+      release: summarizeV2Releases(runtimes),
       resources: snapshot.resources,
     });
   });
@@ -410,13 +611,13 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     try {
       const handle = await options.router.startRelay(body, {
         source: "http",
-        clientId: c.req.header("x-ghostprov-client-id") ?? "http",
+        clientId: resolveHttpClientId(c.env, c.req.header("x-ghostprov-client-id")),
         signal: relayAbort.signal,
         incomingLease: takeIncomingBodyLease(c.env),
       });
       if (body.stream !== true) {
         const final = await nonStreamingFinal(handle, reason => relayAbort.abort(reason));
-        return c.json(final);
+        return permittedJsonResponse(final);
       }
 
       // R2 proves successful upstream HTTP headers before any response event.
@@ -460,9 +661,9 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       responsesModel: "gpt-5.6-sol",
       maxEditInputBytes: 40 * 1024 ** 2,
     },
-    startRelay: (body, signal, incomingLease) => options.router.startRelay(body, {
+    startRelay: (body, signal, clientId, incomingLease) => options.router.startRelay(body, {
       source: "image",
-      clientId: "images",
+      clientId,
       signal,
       incomingLease,
     }),

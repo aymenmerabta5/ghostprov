@@ -6,6 +6,7 @@ import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
   type RoutableSandboxSnapshot,
+  type SandboxRunOptions,
 } from "../../src/sandbox/registry";
 import { projectId, type ProjectId } from "../../src/sandbox/types";
 import type {
@@ -13,12 +14,15 @@ import type {
   AwarenessPeerUpdate,
 } from "../../src/v2/awareness/channel";
 import {
+  GP_V2_R2_SCHEMA_VERSION,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
   type AwarenessEnvelope,
   type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
+  type R2RequestCommitFrame,
+  type R2RequestStartFrame,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared";
 import { WeightedFrameScheduler, type FramePriority } from "../../src/v2/protocol/scheduler";
@@ -72,6 +76,11 @@ export class FakeScaleUpstream {
 
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
     await input.beforeFetch();
+    await input.onPrelude?.({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: `upstream_${this.runtimeIndex}_${this.calls + 1}`,
+    });
     const body = JSON.parse(new TextDecoder().decode(input.body)) as Record<string, unknown>;
     const call = ++this.calls;
     this.active++;
@@ -135,13 +144,12 @@ export class FakeScaleUpstream {
           data: JSON.stringify({ type: "response.completed", response: final }),
         },
       ];
-      const transcript = new TranscriptProof("upstream", "0".repeat(64));
+      const transcript = new TranscriptProof("upstream", "0".repeat(64), { retainBytes: false });
       for (const event of events) {
-        transcript.append(event);
+        await transcript.appendCanonicalStream(event, { onChunk: input.onTranscriptBytes });
         await input.onEvent(event);
       }
       const terminal = await transcript.createTerminal();
-      const snapshot = transcript.snapshot();
       return {
         responseId,
         status: "completed",
@@ -151,7 +159,6 @@ export class FakeScaleUpstream {
         finalEventIndex: terminal.finalEventIndex,
         finalSha256: terminal.finalSha256,
         final,
-        transcriptBytes: snapshot.canonicalBytes,
       };
     } finally {
       this.active--;
@@ -163,6 +170,8 @@ class FakeSidecarPeer {
   readonly #binding: ProtocolBinding;
   readonly #channel: AwarenessChannel<SidecarFrame, HostFrame>;
   readonly #engine: SidecarEngine;
+  readonly #instanceId: string;
+  readonly #hostInstanceId: string;
   readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
@@ -179,10 +188,14 @@ class FakeSidecarPeer {
     binding: ProtocolBinding;
     channel: AwarenessChannel<SidecarFrame, HostFrame>;
     engine: SidecarEngine;
+    instanceId: string;
+    hostInstanceId: string;
   }) {
     this.#binding = options.binding;
     this.#channel = options.channel;
     this.#engine = options.engine;
+    this.#instanceId = options.instanceId;
+    this.#hostInstanceId = options.hostInstanceId;
   }
 
   async connect(): Promise<void> {
@@ -221,6 +234,15 @@ class FakeSidecarPeer {
   };
 
   async #acceptEnvelope(envelope: AwarenessEnvelope<HostFrame>): Promise<void> {
+    if (
+      this.#binding.protocolRevision === "r2" &&
+      (!("protocolRevision" in envelope) ||
+        envelope.schemaVersion !== GP_V2_R2_SCHEMA_VERSION ||
+        envelope.protocolRevision !== "r2" ||
+        envelope.launchNonce !== this.#binding.launchNonce ||
+        envelope.instanceId !== this.#hostInstanceId ||
+        envelope.targetInstanceId !== this.#instanceId)
+    ) return;
     const lane = envelope.lane ?? "data";
     const before = this.#outbound.snapshot().frames.length;
     if (lane === "control" || envelope.lane === undefined) {
@@ -256,15 +278,14 @@ class FakeSidecarPeer {
     if (this.#closed) return;
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
-    this.#channel.publish({
+    const common = {
       protocol: "gp-awareness-v2",
-      schemaVersion: 1,
       schemaHash: this.#binding.schemaHash,
       buildHash: this.#binding.buildHash,
       projectId: this.#binding.projectId,
       sessionId: this.#binding.sessionId,
       peerId: "sidecar",
-      instanceId: `sidecar-${this.#binding.projectId}`,
+      instanceId: this.#instanceId,
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: outbound.epoch,
       revision: this.#revision++,
@@ -274,7 +295,18 @@ class FakeSidecarPeer {
       queued: transport.queued,
       draining: transport.draining,
       frames: outbound.frames,
-    });
+    } as const;
+    const envelope: AwarenessEnvelope<SidecarFrame> =
+      this.#binding.protocolRevision === "r2"
+        ? {
+            ...common,
+            protocolRevision: "r2",
+            schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+            launchNonce: this.#binding.launchNonce,
+            targetInstanceId: this.#hostInstanceId,
+          }
+        : { ...common, schemaVersion: 1 };
+    this.#channel.publish(envelope);
   }
 }
 
@@ -303,9 +335,11 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
     );
     this.#physical = options.physical;
     this.#network = new FakeAwarenessNetwork(options.faults);
+    const hostInstanceId = `host-scale-${options.index}`;
+    const sidecarInstanceId = `sidecar-scale-${options.index}`;
     const binding: ProtocolBinding = {
-  protocolRevision: "r1",
-  launchNonce: "launch-nonce-r1",
+      protocolRevision: "r2",
+      launchNonce: `launch-scale-${options.index}`,
       projectId: this.projectId,
       sessionId: `sandbox-session-${options.index}`,
       leaderGeneration: 1,
@@ -321,6 +355,8 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       hostCeiling: options.physical,
       retransmitMs: 25,
       publicationIntervalMs: 1,
+      hostInstanceId,
+      expectedSidecarInstanceId: sidecarInstanceId,
     });
     this.upstream = new FakeScaleUpstream(
       options.index,
@@ -342,9 +378,29 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       journal: new ClaimJournal({ storage, flushIntervalMs: 0, maxBatch: 128 }),
       admission,
       upstream: this.upstream,
+      assertExecutionFence: (
+        frame: R2RequestCommitFrame | R2RequestStartFrame,
+      ) => {
+        if (
+          frame.projectId !== binding.projectId ||
+          frame.sessionId !== binding.sessionId ||
+          frame.leaderGeneration !== binding.leaderGeneration ||
+          frame.buildHash !== binding.buildHash ||
+          frame.schemaHash !== binding.schemaHash ||
+          frame.launchNonce !== binding.launchNonce ||
+          frame.hostInstanceId !== hostInstanceId ||
+          frame.targetInstanceId !== sidecarInstanceId
+        ) throw new Error("fake R2 execution fence mismatch");
+      },
       emit: (frame, priority, streamId) => peer.enqueue(frame, priority, streamId),
     });
-    peer = new FakeSidecarPeer({ binding, channel: this.#sidecar, engine });
+    peer = new FakeSidecarPeer({
+      binding,
+      channel: this.#sidecar,
+      engine,
+      instanceId: sidecarInstanceId,
+      hostInstanceId,
+    });
     this.#peer = peer;
   }
 
@@ -372,8 +428,12 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
     this.#state = "stopped";
   }
 
-  run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
-    return this.#session.run(body, signal);
+  run(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    return this.#session.run(body, signal, options);
   }
 
   snapshot(): RoutableSandboxSnapshot {
@@ -385,7 +445,10 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       capacity,
       active: transport.active,
       available: this.#state === "ready"
-        ? Math.max(0, Math.min(transport.credits, capacity - transport.active - transport.quarantined))
+        ? Math.max(0, Math.min(
+            transport.admissionCredits ?? transport.credits,
+            capacity - transport.active - transport.quarantined,
+          ))
         : 0,
       quarantined: transport.quarantined,
       heartbeatAgeMs: 0,

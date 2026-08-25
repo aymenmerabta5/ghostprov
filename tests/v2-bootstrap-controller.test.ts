@@ -30,6 +30,7 @@ import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
+const R2_ASSETS = await loadV2SidecarAssets({ revision: "r2" });
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
@@ -187,9 +188,8 @@ function readyEnvelope(
   instanceId: string,
   fault: Fault,
 ): AwarenessEnvelope<SidecarFrame> {
-  return {
-    protocol: "gp-awareness-v2",
-    schemaVersion: 1,
+  const common = {
+    protocol: "gp-awareness-v2" as const,
     schemaHash: binding.schemaHash,
     buildHash: fault === "wrong-build" ? "f".repeat(64) : binding.buildHash,
     projectId: PROJECT,
@@ -202,15 +202,29 @@ function readyEnvelope(
     epoch: 1,
     revision: 1,
     ack: { epoch: 1, sequence: -1 },
-    credits: 128,
+    credits: 8,
     active: 0,
     queued: 0,
     draining: false,
     frames: [],
   };
+  return binding.protocolRevision === "r2"
+    ? {
+        ...common,
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        launchNonce: binding.nonce,
+        targetInstanceId: binding.nonce,
+      }
+    : { ...common, schemaVersion: 1 };
 }
 
-function bootstrapHarness(fault: Fault = "none") {
+function bootstrapHarness(
+  fault: Fault = "none",
+  revision?: "r1" | "r2",
+  maxActivePerSandbox = 8,
+  assets = ASSETS,
+) {
   const clock = new FakeClock();
   const random = new FakeRandom();
   const ydoc = new FakeYDoc();
@@ -248,7 +262,11 @@ function bootstrapHarness(fault: Fault = "none") {
     ydoc,
     gateway,
     awareness,
-    assets: ASSETS,
+    assets,
+    ...(revision === undefined ? {} : { revision }),
+    ...(revision === "r2" && assets.revision === "r2"
+      ? { launchNonce: "r2-launch-nonce" }
+      : {}),
     attempts: 3,
     timeoutMs: 20,
     pollMs: 5,
@@ -256,7 +274,7 @@ function bootstrapHarness(fault: Fault = "none") {
     random,
     diagnostics: { enabled: true, intervalMs: 1_000 },
     initialActivePerSandbox: 4,
-    maxActivePerSandbox: 12,
+    maxActivePerSandbox,
   });
   return {
     controller,
@@ -272,6 +290,13 @@ function bootstrapHarness(fault: Fault = "none") {
 }
 
 describe("V2BootstrapController", () => {
+  it("derives an omitted revision from exact assets and rejects a mismatched selection", () => {
+    expect(() => bootstrapHarness("none")).not.toThrow();
+    expect(() => bootstrapHarness("none", undefined, 9)).toThrow("terminal-spool capacity");
+    expect(() => bootstrapHarness("none", "r2"))
+      .toThrow(/selected V2 revision r2 does not match supplied assets r1/i);
+  });
+
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
     const harness = bootstrapHarness();
 
@@ -282,7 +307,7 @@ describe("V2BootstrapController", () => {
       buildHash: BUILD_HASH,
       schemaHash: SCHEMA_HASH,
       leaderGeneration: 4,
-      capacity: 12,
+      capacity: 8,
     });
     expect(harness.decrypted).toEqual([TOKEN]);
     expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
@@ -294,11 +319,12 @@ describe("V2BootstrapController", () => {
       ".ghostprov-v2/src",
     ]));
     expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
+    expect(harness.gateway.launchers[0]).toContain("/tmp/ghostprov-v2/sidecar.pid");
     expect(harness.awareness.connects).toBe(1);
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!)).toMatchObject({
       diagnostics: { enabled: true, intervalMs: 1_000 },
       initialActivePerSandbox: 4,
-      maxActivePerSandbox: 12,
+      maxActivePerSandbox: 8,
     });
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!)).toEqual({
       protocol: "gp-awareness-v2",
@@ -374,6 +400,83 @@ describe("V2BootstrapController", () => {
       .toContain("\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}");
   });
 
+  it("stages a candidate and never opens the incumbent PID for in-place overwrite", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+
+    const candidateWrite = launcher.indexOf(
+      "open my $gp_pid_fh, '>', $gp_candidate_pid_file",
+    );
+    const helloProof = launcher.indexOf("if ($gp_hello_seen) {");
+    const atomicPromotion = launcher.indexOf(
+      "rename $gp_candidate_pid_file, $gp_pid_file",
+    );
+
+    expect(candidateWrite).toBeGreaterThan(-1);
+    expect(helloProof).toBeGreaterThan(candidateWrite);
+    expect(atomicPromotion).toBeGreaterThan(helloProof);
+    expect(launcher).not.toContain("open my $gp_pid_fh, '>', $gp_pid_file");
+    expect(launcher).toContain("$gp_pid $gp_launch_nonce $gp_child_start\\n");
+    expect(launcher).toContain("--ghostprov-launch-nonce=$gp_launch_nonce");
+    expect(launcher).toContain("--ghostprov-process-start=$gp_child_verified_start");
+    expect(launcher.indexOf("exit 126 unless $gp_child_candidate_ready"))
+      .toBeLessThan(launcher.indexOf("exec 'setsid'"));
+    expect(launcher).toContain("$gp_fields[1] eq \"$gp_pid\"");
+    expect(launcher).toContain("$gp_fields[18] eq \"$gp_start\"");
+  });
+
+  it("keys each R2 hello to its fork and requires the locked owner before PID promotion", async () => {
+    const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+
+    expect(launcher).toContain("my $gp_require_owner = 1;");
+    expect(launcher).toContain(
+      "$gp_dir/bootstrap-hello.$gp_launch_nonce.$gp_pid",
+    );
+    expect(launcher).toContain(
+      "$gp_dir/bootstrap-hello.$gp_launch_nonce.$$",
+    );
+    const ownerBranch = launcher.indexOf("if ($gp_require_owner) {");
+    const frozenR1Branch = launcher.indexOf("  } else {", ownerBranch);
+    const launcherRename = launcher.indexOf(
+      "rename $gp_candidate_pid_file, $gp_pid_file",
+      ownerBranch,
+    );
+    expect(ownerBranch).toBeGreaterThan(-1);
+    expect(frozenR1Branch).toBeGreaterThan(ownerBranch);
+    expect(launcher.slice(ownerBranch, frozenR1Branch)).not.toContain(
+      "rename $gp_candidate_pid_file",
+    );
+    expect(launcherRename).toBeGreaterThan(frozenR1Branch);
+    expect(launcher).toContain(
+      "owned sidecar did not atomically promote its process identity",
+    );
+  });
+
+  it("reaps an exit-fast contender and removes only its exact candidate identity", async () => {
+    const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+    const helloPoll = launcher.indexOf(
+      "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_try < 900",
+    );
+    const exited = launcher.indexOf(
+      "waitpid($gp_child_pid, 1) == $gp_child_pid",
+      helloPoll,
+    );
+    const pollSleep = launcher.indexOf("0.05;", helloPoll);
+
+    expect(helloPoll).toBeGreaterThan(-1);
+    expect(exited).toBeGreaterThan(helloPoll);
+    expect(exited).toBeLessThan(pollSleep);
+    expect(launcher).toContain("sidecar exited before bootstrap hello");
+    expect(launcher).toContain(
+      "($gp_reaped || $gp_stopped || !gp_group_alive($gp_child_pid)) && gp_record_is($gp_candidate_pid_file, $gp_candidate_record)",
+    );
+  });
+
   it("surfaces a sanitized sidecar launch failure instead of a generic hello timeout", async () => {
     const harness = bootstrapHarness("sidecar-log");
 
@@ -440,6 +543,109 @@ describe("V2BootstrapController", () => {
       envelope.frames.some(frame => frame.kind === "drain" && frame.reason === "test shutdown")
     ))).toBe(true);
     expect(harness.awareness.clears).toBe(1);
+  });
+
+  it("force-stops the exact launched process once and restores the inert launcher", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+
+    await Promise.all([
+      harness.controller.forceStop("supervisor recovery"),
+      harness.controller.forceStop("duplicate recovery"),
+    ]);
+
+    expect(harness.gateway.renders).toBe(2);
+    expect(harness.gateway.launchers[1]).toContain("sidecar termination launcher");
+    expect(harness.gateway.launchers[1]).toContain("/tmp/ghostprov-v2/sidecar.pid");
+    expect(harness.gateway.launchers[1]).toContain(
+      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000001'",
+    );
+    expect(harness.gateway.launchers[1]).toContain(
+      "$gp_nonces[0] eq $gp_expected_nonce",
+    );
+    expect(harness.gateway.launchers[1]).toContain(
+      "gp_owner_record_is_locked($gp_owner_file, $gp_owner_record)",
+    );
+    expect(harness.gateway.launchers[1]).toContain(
+      "flock($gp_owner_fh, LOCK_EX | LOCK_NB)",
+    );
+    expect(harness.gateway.launchers[1]).not.toContain("  unlink $gp_pid_file;");
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+    expect(harness.awareness.clears).toBe(1);
+    await expect(harness.controller.ensureReady()).rejects.toThrow("retired");
+  });
+
+  it("binds forced termination to the successful retry rather than a stale attempt", async () => {
+    const harness = bootstrapHarness("first-wrong-nonce");
+    await harness.controller.ensureReady();
+
+    await harness.controller.forceStop("stop successful retry");
+    const termination = harness.gateway.launchers.at(-1)!;
+
+    expect(harness.gateway.nonces.slice(0, 2)).toEqual([
+      "00000000-0000-4000-8000-000000000001",
+      "00000000-0000-4000-8000-000000000002",
+    ]);
+    expect(termination).toContain(
+      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000002'",
+    );
+    expect(termination).not.toContain(
+      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000001'",
+    );
+  });
+
+  it("retires before launch without triggering a render", async () => {
+    const harness = bootstrapHarness();
+
+    await expect(harness.controller.forceStop("never launched")).resolves.toBeUndefined();
+
+    expect(harness.gateway.renders).toBe(0);
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+    expect(harness.awareness.clears).toBe(1);
+  });
+
+  it("restores the inert launcher even when remote drain proof times out", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+
+    await expect(harness.controller.drainAndStop("missing drain proof"))
+      .rejects.toBeInstanceOf(V2BootstrapError);
+
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+    expect(harness.awareness.clears).toBe(1);
+    expect(harness.ydoc.deleted).toContain(".ghostprov-v2/bootstrap.enc.json");
+  });
+
+  it("cannot publish readiness after force-stop races an abort-ignoring launch", async () => {
+    const harness = bootstrapHarness();
+    const originalRender = harness.gateway.triggerRender.bind(harness.gateway);
+    let firstRenderStarted!: () => void;
+    const started = new Promise<void>(resolve => { firstRenderStarted = resolve; });
+    let releaseFirst!: () => void;
+    const blocked = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let first = true;
+    harness.gateway.triggerRender = async request => {
+      if (first) {
+        first = false;
+        firstRenderStarted();
+        await blocked;
+      }
+      await originalRender(request);
+    };
+    const ensuring = harness.controller.ensureReady();
+    const failed = ensuring.catch(error => error);
+    await started;
+
+    const stopping = harness.controller.forceStop("recovery during launch");
+    releaseFirst();
+    await expect(stopping).resolves.toBeUndefined();
+    expect(await failed).toMatchObject({ name: "AbortError" });
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+    await expect(harness.controller.ensureReady()).rejects.toThrow("retired");
   });
 
   it("proves a bound ping round trip before handing the sidecar to transport", async () => {

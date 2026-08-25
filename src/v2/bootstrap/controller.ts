@@ -25,11 +25,12 @@ import {
 } from "../protocol/shared";
 import {
   assertV2SidecarAssets,
-  DEFAULT_V2_SIDECAR_REVISION,
   resolveV2SidecarRevision,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "../sidecar/assets";
+import { deriveV2SidecarEventMemorySizing } from "../memory/event-memory-sizing";
+import { V2_TERMINAL_SPOOL_CAPACITY } from "../sidecar/capacity";
 
 const STATIC_PATH = ".ghostprov-v2/static.json";
 const WORKER_PATH = ".ghostprov-v2/worker.json";
@@ -41,12 +42,156 @@ const HELLO_PREFIX = "GPV2_BOOTSTRAP ";
 const SIDECAR_HEX_PREFIX = "GPV2_SIDECAR_HEX ";
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
+function perlSingleQuoted(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+/**
+ * Shared Perl helpers for the launcher PID interlock. A PID is never trusted
+ * by itself: the process must still have the recorded Linux start tick, be its
+ * own process-group/session leader, and expose the exact immutable entrypoint
+ * plus launch nonce as distinct argv fields.
+ */
+function processInterlockHelpers(): string[] {
+  return [
+    "use Fcntl qw(:flock);",
+    "sub gp_read_file {",
+    "  my ($gp_path, $gp_limit) = @_;",
+    "  return undef unless open my $gp_fh, '<', $gp_path;",
+    "  local $/; my $gp_value = <$gp_fh>; close $gp_fh;",
+    "  return undef unless defined $gp_value && length($gp_value) <= $gp_limit;",
+    "  return $gp_value;",
+    "}",
+    "sub gp_record_is {",
+    "  my ($gp_path, $gp_expected_record) = @_;",
+    "  my $gp_actual_record = gp_read_file($gp_path, 4096);",
+    "  return defined($gp_actual_record) && $gp_actual_record eq $gp_expected_record;",
+    "}",
+    "sub gp_proc_fields {",
+    "  my ($gp_pid) = @_;",
+    "  my $gp_stat = gp_read_file(\"/proc/$gp_pid/stat\", 4096);",
+    "  return () unless defined $gp_stat;",
+    "  my ($gp_tail) = $gp_stat =~ /^\\d+\\s+\\(.*\\)\\s+\\S+\\s+(.*)$/s;",
+    "  return () unless defined $gp_tail;",
+    "  my @gp_fields = split /\\s+/, $gp_tail;",
+    "  return () unless @gp_fields > 18;",
+    "  return @gp_fields;",
+    "}",
+    "sub gp_process_start {",
+    "  my @gp_fields = gp_proc_fields($_[0]);",
+    "  return @gp_fields > 18 && $gp_fields[18] =~ /^\\d+$/ ? $gp_fields[18] : '';",
+    "}",
+    "sub gp_process_matches {",
+    "  my ($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
+    "  return 0 unless $gp_pid =~ /^\\d+$/ && $gp_pid > 1;",
+    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
+    "  return 0 unless defined $gp_cmd;",
+    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
+    "  return 0 unless @gp_args && $gp_args[0] =~ m{(?:^|/)deno$};",
+    "  return 0 unless grep { $_ eq $gp_expected_entrypoint } @gp_args;",
+    "  return 0 unless grep { $_ eq \"--ghostprov-launch-nonce=$gp_nonce\" } @gp_args;",
+    "  return 0 unless grep { $_ eq \"--ghostprov-process-start=$gp_start\" } @gp_args;",
+    "  my @gp_fields = gp_proc_fields($gp_pid);",
+    "  return 0 unless @gp_fields > 18;",
+    "  return 0 unless $gp_fields[1] eq \"$gp_pid\" && $gp_fields[2] eq \"$gp_pid\";",
+    "  return 0 unless $gp_fields[18] eq \"$gp_start\";",
+    "  return 1;",
+    "}",
+    "sub gp_group_alive { return kill(0, -$_[0]) ? 1 : 0; }",
+    "sub gp_identity_is_current {",
+    "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock) = @_;",
+    "  return $gp_require_lock ? gp_owner_record_is_locked($gp_identity_path, $gp_identity_record) : gp_record_is($gp_identity_path, $gp_identity_record);",
+    "}",
+    "sub gp_stop_if_current {",
+    "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock, $gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
+    "  return 0 unless gp_identity_is_current($gp_identity_path, $gp_identity_record, $gp_require_lock);",
+    "  return 0 unless gp_process_matches($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint);",
+    "  kill 'TERM', -$gp_pid;",
+    "  for (my $gp_try = 0; $gp_try < 50 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
+    "  if (gp_group_alive($gp_pid)) {",
+    "    return 0 unless gp_identity_is_current($gp_identity_path, $gp_identity_record, $gp_require_lock);",
+    "    return 0 unless gp_process_matches($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint);",
+    "    kill 'KILL', -$gp_pid;",
+    "    for (my $gp_try = 0; $gp_try < 50 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
+    "  }",
+    "  return gp_group_alive($gp_pid) ? 0 : 1;",
+    "}",
+    "sub gp_owner_record_if_locked {",
+    "  my ($gp_owner_path) = @_;",
+    "  return undef unless open my $gp_owner_fh, '+<', $gp_owner_path;",
+    "  if (flock($gp_owner_fh, LOCK_EX | LOCK_NB)) { flock($gp_owner_fh, LOCK_UN); close $gp_owner_fh; return undef; }",
+    "  seek $gp_owner_fh, 0, 0; local $/; my $gp_owner_record = <$gp_owner_fh>; close $gp_owner_fh;",
+    "  return undef unless defined $gp_owner_record && length($gp_owner_record) <= 4096;",
+    "  return $gp_owner_record;",
+    "}",
+    "sub gp_owner_record_is_locked {",
+    "  my ($gp_owner_path, $gp_expected_record) = @_;",
+    "  my $gp_actual_record = gp_owner_record_if_locked($gp_owner_path);",
+    "  return defined($gp_actual_record) && $gp_actual_record eq $gp_expected_record;",
+    "}",
+    "sub gp_unlink_pid_if_unowned_and_same {",
+    "  my ($gp_owner_path, $gp_pid_path, $gp_expected_record) = @_;",
+    "  return unless open my $gp_owner_fh, '+<', $gp_owner_path;",
+    "  if (flock($gp_owner_fh, LOCK_EX | LOCK_NB)) {",
+    "    unlink $gp_pid_path if gp_record_is($gp_pid_path, $gp_expected_record);",
+    "    flock($gp_owner_fh, LOCK_UN);",
+    "  }",
+    "  close $gp_owner_fh;",
+    "}",
+    "sub gp_hex_diag { return 'GPV2_SIDECAR_HEX ' . unpack('H*', $_[0]); }",
+  ];
+}
+
 const INERT_LAUNCHER = [
   "# GhostProv V2 launcher inactive",
   "$pdf_mode = 1;",
   "$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';",
   "",
 ].join("\n");
+
+function terminationLauncher(entrypointPath: string, launchNonce: string): string {
+  const expected = perlSingleQuoted(`/workspace/${entrypointPath}`);
+  const nonce = perlSingleQuoted(launchNonce);
+  return [
+    "# GhostProv V2 sidecar termination launcher",
+    "$pdf_mode = 1;",
+    ...processInterlockHelpers(),
+    "my $gp_pid_file = '/tmp/ghostprov-v2/sidecar.pid';",
+    "my $gp_owner_file = '/tmp/ghostprov-v2/sidecar.owner.lock';",
+    `my $gp_expected = '${expected}';`,
+    `my $gp_expected_nonce = '${nonce}';`,
+    "my $gp_stopped = 0;",
+    "my $gp_pid_record_stopped = 0;",
+    "my ($gp_stopped_pid, $gp_stopped_nonce, $gp_stopped_start);",
+    "my $gp_owner_record = gp_owner_record_if_locked($gp_owner_file);",
+    "if (defined $gp_owner_record && $gp_owner_record =~ /\"pid\"\\s*:\\s*([0-9]+)/) {",
+    "  my $gp_pid = $1;",
+    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384) // '';",
+    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
+    "  my @gp_nonces = map { /^--ghostprov-launch-nonce=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/ ? $1 : () } @gp_args;",
+    "  my $gp_start = gp_process_start($gp_pid);",
+    "  if (@gp_nonces == 1 && $gp_nonces[0] eq $gp_expected_nonce && $gp_start && gp_owner_record_is_locked($gp_owner_file, $gp_owner_record)) {",
+    "    $gp_stopped = gp_stop_if_current($gp_owner_file, $gp_owner_record, 1, $gp_pid, $gp_nonces[0], $gp_start, $gp_expected);",
+    "    ($gp_stopped_pid, $gp_stopped_nonce, $gp_stopped_start) = ($gp_pid, $gp_nonces[0], $gp_start) if $gp_stopped;",
+    "  }",
+    "}",
+    "my $gp_pid_record = gp_read_file($gp_pid_file, 4096);",
+    "if (defined $gp_pid_record) {",
+    "  my ($gp_pid, $gp_nonce, $gp_start) = $gp_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n?$/;",
+    "  if ($gp_stopped && defined($gp_start) && $gp_pid eq $gp_stopped_pid && $gp_nonce eq $gp_stopped_nonce && $gp_start eq $gp_stopped_start) {",
+    "    $gp_pid_record_stopped = 1;",
+    "  } elsif (!$gp_stopped && defined $gp_start && $gp_nonce eq $gp_expected_nonce) {",
+    "    $gp_stopped = gp_stop_if_current($gp_pid_file, $gp_pid_record, 0, $gp_pid, $gp_nonce, $gp_start, $gp_expected);",
+    "    $gp_pid_record_stopped = $gp_stopped;",
+    "  }",
+    "}",
+    "if ($gp_pid_record_stopped && defined $gp_pid_record) {",
+    "  gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_pid_record);",
+    "}",
+    "$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';",
+    "",
+  ].join("\n");
+}
 
 const MAIN_SOURCE = [
   "\\documentclass{article}",
@@ -120,7 +265,7 @@ export interface V2BootstrapControllerOptions {
   gateway: V2BootstrapGateway;
   awareness: V2BootstrapAwareness;
   assets: V2SidecarAssets;
-  /** Selected immutable V2 revision. Omission explicitly means the frozen R1 default. */
+  /** Selected immutable V2 revision. Omission derives only from the supplied assets. */
   revision?: V2SidecarRevision | string;
   /** Required for R2 so bootstrap and steady transport share one exact launch fence. */
   launchNonce?: string;
@@ -155,19 +300,41 @@ function exactKeys(
     actual.every((key, index) => key === sorted[index]);
 }
 
-function temporaryLauncher(entrypointPath: string): string {
+function temporaryLauncher(
+  entrypointPath: string,
+  launchNonce: string,
+  revision: V2SidecarRevision,
+): string {
   const workspaceEntrypoint = `/workspace/${entrypointPath}`;
+  const expected = perlSingleQuoted(workspaceEntrypoint);
+  const nonce = perlSingleQuoted(launchNonce);
+  const helloExpression = revision === "r2"
+    ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$gp_pid"'
+    : '"$gp_dir/bootstrap-hello"';
+  const childHelloExpression = revision === "r2"
+    ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$$"'
+    : '"$gp_dir/bootstrap-hello"';
   return [
     "# GhostProv V2 temporary bootstrap launcher",
     "$pdf_mode = 1;",
+    ...processInterlockHelpers(),
     "my $gp_dir = '/tmp/ghostprov-v2';",
-    "my $gp_hello = '/tmp/ghostprov-v2/bootstrap-hello';",
+    "my $gp_pid_file = '/tmp/ghostprov-v2/sidecar.pid';",
+    "my $gp_owner_file = '/tmp/ghostprov-v2/sidecar.owner.lock';",
+    `my $gp_expected = '${expected}';`,
+    `my $gp_launch_nonce = '${nonce}';`,
+    `my $gp_require_owner = ${revision === "r2" ? 1 : 0};`,
+    "my $gp_hello = '';",
+    "my $gp_candidate_pid_file = '';",
+    "my $gp_candidate_record = '';",
+    "my $gp_child_pid = 0;",
+    "my $gp_child_start = '';",
+    "my $gp_launch_error = '';",
     "my $gp_log = '/tmp/ghostprov-v2/sidecar.log';",
     "my $gp_tex = '/workspace/.ghostprov-v2/bootstrap-output.tex';",
     "my $gp_hello_seen = 0;",
     "my $gp_marker = '';",
     "mkdir $gp_dir, 0700 unless -d $gp_dir;",
-    "unlink $gp_hello if -e $gp_hello;",
     "unlink $gp_log if -e $gp_log;",
     "unlink $gp_tex if -e $gp_tex;",
     "my $gp_deno = '';",
@@ -177,26 +344,81 @@ function temporaryLauncher(entrypointPath: string): string {
     "if ($gp_deno) {",
     "  my $gp_pid = fork();",
     "  die 'GhostProv V2 fork failed' unless defined $gp_pid;",
+    "  if ($gp_pid > 0) {",
+    "    $gp_child_pid = $gp_pid;",
+    `    $gp_hello = ${helloExpression};`,
+    "    $gp_candidate_pid_file = \"$gp_dir/sidecar.pid.$gp_launch_nonce.$gp_pid.candidate\";",
+    "    for (my $gp_try = 0; $gp_try < 50 && !$gp_child_start; $gp_try++) { $gp_child_start = gp_process_start($gp_pid); select undef, undef, undef, 0.001 unless $gp_child_start; }",
+    "    if (!$gp_child_start) { $gp_launch_error = 'unable to record exact candidate process identity'; kill 'TERM', $gp_pid; }",
+    "    else {",
+    "      $gp_candidate_record = \"$gp_pid $gp_launch_nonce $gp_child_start\\n\";",
+    "      if (open my $gp_pid_fh, '>', $gp_candidate_pid_file) { print $gp_pid_fh $gp_candidate_record; close $gp_pid_fh; chmod 0600, $gp_candidate_pid_file; }",
+    "      else { $gp_launch_error = 'unable to write candidate process identity'; kill 'TERM', $gp_pid; }",
+    "    }",
+    "  }",
     "  if ($gp_pid == 0) {",
+    "    my $gp_child_candidate = \"$gp_dir/sidecar.pid.$gp_launch_nonce.$$.candidate\";",
+    "    my $gp_child_candidate_ready = 0;",
+    "    my $gp_child_verified_start = '';",
+    "    for (my $gp_try = 0; $gp_try < 500 && !$gp_child_candidate_ready; $gp_try++) {",
+    "      my $gp_child_record = gp_read_file($gp_child_candidate, 4096);",
+    "      my $gp_self_start = gp_process_start($$);",
+    "      my ($gp_recorded_start) = defined($gp_child_record) ? $gp_child_record =~ /^\\Q$$ $gp_launch_nonce \\E([0-9]+)\\n$/ : ();",
+    "      if (defined($gp_recorded_start) && $gp_self_start && $gp_recorded_start eq $gp_self_start) { $gp_child_verified_start = $gp_self_start; $gp_child_candidate_ready = 1; }",
+    "      select undef, undef, undef, 0.01 unless $gp_child_candidate_ready;",
+    "    }",
+    "    exit 126 unless $gp_child_candidate_ready;",
+    `    my $gp_child_hello = ${childHelloExpression};`,
+    "    unlink $gp_child_hello if -e $gp_child_hello;",
     "    open STDOUT, '>', $gp_log or die 'stdout';",
     "    open STDERR, '>&STDOUT' or die 'stderr';",
-    `    exec 'setsid', $gp_deno, 'run', '--cached-only', "--cert=$ENV{PROXY_CA_CERT_PATH}", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '${workspaceEntrypoint}';`,
+    `    exec 'setsid', $gp_deno, 'run', '--cached-only', "--cert=$ENV{PROXY_CA_CERT_PATH}", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '${expected}', "--ghostprov-launch-nonce=$gp_launch_nonce", "--ghostprov-process-start=$gp_child_verified_start";`,
     "    exit 127;",
     "  }",
     "}",
-    "for (my $gp_try = 0; $gp_deno && $gp_try < 900; $gp_try++) {",
+    "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_try < 900; $gp_try++) {",
     "  if (open my $gp_fh, '<', $gp_hello) {",
     "    while (my $gp_line = <$gp_fh>) { if ($gp_line =~ /^(GPV2_BOOTSTRAP [A-Za-z0-9_-]+)/) { $gp_marker = $1; $gp_hello_seen = 1; } }",
     "    close $gp_fh;",
     "    last;",
     "  }",
+    "  if ($gp_child_pid && waitpid($gp_child_pid, 1) == $gp_child_pid) { $gp_launch_error = 'sidecar exited before bootstrap hello'; last; }",
     "  select undef, undef, undef, 0.05;",
     "}",
-    "if (!$gp_hello_seen) {",
-    "  my $gp_diag = 'sidecar log is missing';",
-    "  if (open my $gp_log_fh, '<', $gp_log) { local $/; $gp_diag = <$gp_log_fh>; close $gp_log_fh; }",
+    "if ($gp_hello_seen) {",
+    "  my $gp_promoted = 0;",
+    "  if ($gp_require_owner) {",
+    "    for (my $gp_try = 0; $gp_try < 500 && !$gp_promoted; $gp_try++) {",
+    "      my $gp_owner_record = gp_owner_record_if_locked($gp_owner_file);",
+    "      my $gp_owner_matches = defined($gp_owner_record) && $gp_owner_record =~ /\"pid\"\\s*:\\s*\\Q$gp_child_pid\\E(?:\\D|$)/;",
+    "      $gp_promoted = gp_record_is($gp_pid_file, $gp_candidate_record) && gp_process_matches($gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected) && $gp_owner_matches && gp_owner_record_is_locked($gp_owner_file, $gp_owner_record);",
+    "      if (!$gp_promoted && waitpid($gp_child_pid, 1) == $gp_child_pid) { $gp_launch_error = 'sidecar exited before owned PID promotion proof'; last; }",
+    "      select undef, undef, undef, 0.01 unless $gp_promoted;",
+    "    }",
+    "    $gp_launch_error ||= 'owned sidecar did not atomically promote its process identity' unless $gp_promoted;",
+    "  } else {",
+    "    if (!gp_record_is($gp_candidate_pid_file, $gp_candidate_record) || !gp_process_matches($gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected)) {",
+    "      $gp_launch_error = 'candidate hello did not prove the exact sidecar process';",
+    "    } elsif (!rename $gp_candidate_pid_file, $gp_pid_file) {",
+    "      $gp_launch_error = 'unable to atomically promote candidate process identity';",
+    "    } elsif (!gp_record_is($gp_pid_file, $gp_candidate_record) || !gp_process_matches($gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected)) {",
+    "      $gp_launch_error = 'sidecar process changed during identity promotion';",
+    "    } else { chmod 0600, $gp_pid_file; $gp_promoted = 1; }",
+    "  }",
+    "}",
+    "if (!$gp_hello_seen || $gp_launch_error) {",
+    "  my $gp_stopped = 0;",
+    "  my $gp_reaped = $gp_child_pid && waitpid($gp_child_pid, 1) == $gp_child_pid;",
+    "  if ($gp_child_pid && $gp_child_start && $gp_candidate_record) {",
+    "    my $gp_identity_path = -e $gp_candidate_pid_file ? $gp_candidate_pid_file : $gp_pid_file;",
+    "    $gp_stopped = gp_stop_if_current($gp_identity_path, $gp_candidate_record, 0, $gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected);",
+    "    unlink $gp_candidate_pid_file if ($gp_reaped || $gp_stopped || !gp_group_alive($gp_child_pid)) && gp_record_is($gp_candidate_pid_file, $gp_candidate_record);",
+    "  }",
+    "  unlink $gp_hello if $gp_hello && -e $gp_hello;",
+    "  my $gp_diag = $gp_launch_error || 'sidecar log is missing';",
+    "  if (!$gp_launch_error && open my $gp_log_fh, '<', $gp_log) { local $/; $gp_diag = <$gp_log_fh>; close $gp_log_fh; }",
     "  $gp_diag = substr($gp_diag // '', 0, 4096);",
-    "  $gp_marker = 'GPV2_SIDECAR_HEX ' . unpack('H*', $gp_diag);",
+    "  $gp_marker = gp_hex_diag($gp_diag);",
     "}",
     "open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 bootstrap output';",
     "print $gp_tex_fh \"\\\\typeout{$gp_marker}\\n\";",
@@ -400,6 +622,30 @@ function safeReason(value: string): string {
   return normalized || "shutdown";
 }
 
+function abortable<T>(source: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return source;
+  if (signal.aborted) return Promise.reject(new DOMException("V2 bootstrap aborted", "AbortError"));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => finish(() => reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("V2 bootstrap aborted", "AbortError"),
+    ));
+    signal.addEventListener("abort", onAbort, { once: true });
+    source.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+  });
+}
+
 export class V2BootstrapController {
   readonly #projectId: ProjectId;
   readonly #workerIndex: number;
@@ -428,6 +674,12 @@ export class V2BootstrapController {
   #readyBinding: BootstrapBinding | null = null;
   #rotationKey: string | null = null;
   #ensuring: Promise<V2ReadyDescriptor> | null = null;
+  #retiring: Promise<void> | null = null;
+  #forceRetiring: Promise<void> | null = null;
+  readonly #lifecycleAbort = new AbortController();
+  #closed = false;
+  #launchAttempted = false;
+  #lastLaunchNonce: string | null = null;
   #awarenessRevision = 0;
   #hostSequence = 0;
   #sidecarAck = { epoch: 1, sequence: -1 };
@@ -439,7 +691,7 @@ export class V2BootstrapController {
     const physicalMax = options.physicalMax ?? 128;
     const acceptedMax = options.acceptedMax ?? 256;
     const initialActivePerSandbox = options.initialActivePerSandbox ?? 8;
-    const maxActivePerSandbox = options.maxActivePerSandbox ?? 16;
+    const maxActivePerSandbox = options.maxActivePerSandbox ?? V2_TERMINAL_SPOOL_CAPACITY;
     const memoryBudgetBytes = options.memoryBudgetBytes ?? 512 * 1024 * 1024;
     const diagnostics = options.diagnostics ?? { enabled: false, intervalMs: 1_000 };
     const batching = options.batching ?? false;
@@ -470,16 +722,25 @@ export class V2BootstrapController {
     if (
       !Number.isSafeInteger(maxActivePerSandbox) ||
       maxActivePerSandbox < 1 ||
-      maxActivePerSandbox > physicalMax
-    ) throw new RangeError("maxActivePerSandbox must be within physical capacity");
+      maxActivePerSandbox > physicalMax ||
+      maxActivePerSandbox > V2_TERMINAL_SPOOL_CAPACITY
+    ) {
+      throw new RangeError(
+        `maxActivePerSandbox must be within physical and terminal-spool capacity (${V2_TERMINAL_SPOOL_CAPACITY})`,
+      );
+    }
     if (
       !Number.isSafeInteger(initialActivePerSandbox) ||
       initialActivePerSandbox < 1 ||
       initialActivePerSandbox > maxActivePerSandbox
     ) throw new RangeError("initialActivePerSandbox must be within the adaptive maximum");
-    if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes < 64 * 1024 * 1024) {
-      throw new RangeError("memoryBudgetBytes must be at least 64 MiB");
+    if (!Number.isSafeInteger(memoryBudgetBytes)) {
+      throw new RangeError("memoryBudgetBytes must be a safe integer");
     }
+    deriveV2SidecarEventMemorySizing({
+      totalBytes: memoryBudgetBytes,
+      responseMaxBytes: 64 * 1024 * 1024,
+    });
     if (typeof diagnostics.enabled !== "boolean" || !Number.isSafeInteger(diagnostics.intervalMs) || diagnostics.intervalMs < 100 || diagnostics.intervalMs > 60_000) throw new RangeError("diagnostics interval must be 100 through 60000");
     if (options.ySweet.docId !== options.projectId) {
       throw new TypeError("Y-Sweet credential belongs to another project");
@@ -500,8 +761,13 @@ export class V2BootstrapController {
     this.#awareness = options.awareness;
     this.#assets = options.assets;
     this.#selectedRevision = resolveV2SidecarRevision(
-      options.revision ?? DEFAULT_V2_SIDECAR_REVISION,
+      options.revision ?? options.assets.revision,
     );
+    if (this.#assets.revision !== this.#selectedRevision) {
+      throw new TypeError(
+        `Selected V2 revision ${this.#selectedRevision} does not match supplied assets ${this.#assets.revision}`,
+      );
+    }
     if (options.launchNonce !== undefined && !SAFE_ID.test(options.launchNonce)) {
       throw new TypeError("launchNonce is invalid");
     }
@@ -527,13 +793,20 @@ export class V2BootstrapController {
     if (signal?.aborted) {
       return Promise.reject(new DOMException("V2 bootstrap aborted", "AbortError"));
     }
+    if (this.#closed) {
+      return Promise.reject(new V2BootstrapError(
+        "V2 bootstrap controller is retired",
+        "readiness",
+        1,
+      ));
+    }
     if (this.#ready) return Promise.resolve(this.#ready);
-    if (this.#ensuring) return this.#ensuring;
-    const ensuring = this.#ensureReady(signal).finally(() => {
+    if (this.#ensuring) return abortable(this.#ensuring, signal);
+    const ensuring = this.#ensureReady(this.#lifecycleAbort.signal).finally(() => {
       if (this.#ensuring === ensuring) this.#ensuring = null;
     });
     this.#ensuring = ensuring;
-    return ensuring;
+    return abortable(ensuring, signal);
   }
 
   async sealCredentialRotation(
@@ -624,47 +897,22 @@ export class V2BootstrapController {
     }
   }
 
-  async drainAndStop(reason: string, signal?: AbortSignal): Promise<void> {
-    const descriptor = this.#ready;
-    const binding = this.#readyBinding;
-    if (!descriptor || !binding) {
-      await this.#cleanupTransient(false);
-      this.#awareness.clear();
-      return;
+  drainAndStop(reason: string, signal?: AbortSignal): Promise<void> {
+    return abortable(this.#beginRetirement(false, reason), signal);
+  }
+
+  /**
+   * Forces the sandbox launcher inert and terminates the exact Deno process
+   * group recorded by the bootstrap launcher. This is the fallback when the
+   * steady transport cannot prove a clean drain.
+   */
+  forceStop(reason: string, signal?: AbortSignal): Promise<void> {
+    if (!this.#closed) return abortable(this.#beginRetirement(true, reason), signal);
+    if (!this.#forceRetiring) {
+      const forced = this.#forceRetireAfterClose(reason);
+      this.#forceRetiring = forced;
     }
-    const frame = this.#controlFrame({
-      kind: "drain",
-      reason: safeReason(reason),
-    });
-    const seen: AwarenessEnvelope<SidecarFrame>[] = [];
-    const unsubscribe = this.#awareness.subscribe(update => seen.push(update.envelope));
-    try {
-      this.#publishControl(binding, [frame], true);
-      const deadline = this.#clock.now() + this.#timeoutMs;
-      for (;;) {
-        const drained = seen.find(envelope => (
-          matchesBoundInstance(envelope, binding, descriptor.instanceId) &&
-          envelope.ack.epoch === frame.epoch &&
-          envelope.ack.sequence >= frame.sequence &&
-          envelope.frames.some(candidate => (
-            candidate.kind === "drained" && candidate.active === 0 && candidate.queued === 0
-          ))
-        ));
-        if (drained) break;
-        if (signal?.aborted) throw new DOMException("V2 drain aborted", "AbortError");
-        if (this.#clock.now() >= deadline) {
-          throw new V2BootstrapError("Sidecar did not prove drain completion", "timeout", 1);
-        }
-        await this.#clock.sleep(Math.min(this.#pollMs, deadline - this.#clock.now()), signal);
-      }
-      this.#awareness.clear();
-      this.#ready = null;
-      this.#readyBinding = null;
-      this.#rotationKey = null;
-      await this.#cleanupTransient(true);
-    } finally {
-      unsubscribe();
-    }
+    return abortable(this.#forceRetiring, signal);
   }
 
   async #ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor> {
@@ -695,10 +943,14 @@ export class V2BootstrapController {
             schemaVersion: GP_V2_R2_SCHEMA_VERSION,
           }
         : baseBinding;
+      this.#lastLaunchNonce = binding.nonce;
       this.#rotationKey = null;
       try {
         const descriptor = await this.#attempt(binding, attempt, signal);
         await this.#cleanupTransient(true);
+        if (this.#closed || signal?.aborted) {
+          throw new DOMException("V2 bootstrap retired", "AbortError");
+        }
         this.#ready = descriptor;
         this.#readyBinding = binding;
         return descriptor;
@@ -798,13 +1050,21 @@ export class V2BootstrapController {
         diagnostics: this.#diagnostics,
         batching: this.#batching,
       }));
-      await this.#ydoc.writePath(LAUNCHER_PATH, temporaryLauncher(this.#assets.entrypointPath));
+      await this.#ydoc.writePath(
+        LAUNCHER_PATH,
+        temporaryLauncher(
+          this.#assets.entrypointPath,
+          binding.nonce,
+          this.#selectedRevision,
+        ),
+      );
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
       throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
     }
 
     try {
+      this.#launchAttempted = true;
       await this.#gateway.triggerRender({
         mainDocument: MAIN_PATH,
         ...await this.#ydoc.renderSyncState(),
@@ -935,11 +1195,128 @@ export class V2BootstrapController {
     }
   }
 
-  async #cleanupTransient(required: boolean): Promise<void> {
+  #beginRetirement(force: boolean, reason: string): Promise<void> {
+    if (this.#retiring) return this.#retiring;
+    if (this.#closed) return Promise.resolve();
+    this.#closed = true;
+    this.#lifecycleAbort.abort(new DOMException("V2 bootstrap retired", "AbortError"));
+    const descriptor = this.#ready;
+    const binding = this.#readyBinding;
+    this.#ready = null;
+    this.#readyBinding = null;
+    this.#rotationKey = null;
+    const ensuring = this.#ensuring;
+    const retiring = this.#retire(
+      force,
+      safeReason(reason),
+      descriptor,
+      binding,
+      this.#launchAttempted,
+    );
+    this.#retiring = retiring;
+    if (force) this.#forceRetiring = retiring;
+    // An abort-ignoring bootstrap attempt is fenced by #closed before it can
+    // publish readiness. Re-apply inert cleanup after its eventual settlement.
+    if (ensuring) {
+      void ensuring.finally(() => this.#cleanupTransient(false)).catch(() => undefined);
+    }
+    return retiring;
+  }
+
+  #forceRetireAfterClose(reason: string): Promise<void> {
+    return this.#retire(
+      true,
+      safeReason(reason),
+      null,
+      null,
+      this.#launchAttempted,
+    );
+  }
+
+  async #retire(
+    force: boolean,
+    reason: string,
+    descriptor: V2ReadyDescriptor | null,
+    binding: BootstrapBinding | null,
+    mayHaveLaunched: boolean,
+  ): Promise<void> {
+    let unsubscribe: (() => void) | null = null;
+    let failure: unknown = null;
+    try {
+      if (force && mayHaveLaunched) {
+        const launchNonce = binding?.nonce ?? this.#lastLaunchNonce;
+        if (!launchNonce) {
+          throw new V2BootstrapError(
+            "Unable to identify the V2 sidecar launch for termination",
+            "readiness",
+            1,
+          );
+        }
+        await this.#forceTerminateSidecar(launchNonce);
+      } else if (descriptor && binding) {
+        const frame = this.#controlFrame({ kind: "drain", reason });
+        const seen: AwarenessEnvelope<SidecarFrame>[] = [];
+        unsubscribe = this.#awareness.subscribe(update => seen.push(update.envelope));
+        this.#publishControl(binding, [frame], true);
+        const deadline = this.#clock.now() + this.#timeoutMs;
+        for (;;) {
+          const drained = seen.find(envelope => (
+            matchesBoundInstance(envelope, binding, descriptor.instanceId) &&
+            envelope.ack.epoch === frame.epoch &&
+            envelope.ack.sequence >= frame.sequence &&
+            envelope.frames.some(candidate => (
+              candidate.kind === "drained" && candidate.active === 0 && candidate.queued === 0
+            ))
+          ));
+          if (drained) break;
+          if (this.#clock.now() >= deadline) {
+            throw new V2BootstrapError("Sidecar did not prove drain completion", "timeout", 1);
+          }
+          await this.#clock.sleep(Math.min(this.#pollMs, deadline - this.#clock.now()));
+        }
+      }
+    } catch (error) {
+      failure = error;
+    } finally {
+      unsubscribe?.();
+      this.#awareness.clear();
+      try {
+        await this.#cleanupTransient(true);
+      } catch (cleanupError) {
+        failure = failure === null
+          ? cleanupError
+          : new AggregateError([failure, cleanupError], "V2 sidecar retirement failed");
+      }
+    }
+    if (failure !== null) throw failure;
+  }
+
+  async #forceTerminateSidecar(launchNonce: string): Promise<void> {
+    try {
+      await this.#ydoc.writePath(
+        LAUNCHER_PATH,
+        terminationLauncher(this.#assets.entrypointPath, launchNonce),
+      );
+      await this.#gateway.syncWorkspace();
+      await this.#gateway.triggerRender({
+        mainDocument: MAIN_PATH,
+        ...await this.#ydoc.renderSyncState(),
+      });
+    } catch (cause) {
+      throw new V2BootstrapError(
+        "Unable to terminate the V2 sidecar process",
+        "render",
+        1,
+        { cause },
+      );
+    }
+  }
+
+  async #cleanupTransient(required: boolean, signal?: AbortSignal): Promise<void> {
     try {
       await this.#ydoc.tombstonePath(CIPHERTEXT_PATH);
       await this.#ydoc.writePath(LAUNCHER_PATH, INERT_LAUNCHER);
-      await this.#gateway.syncWorkspace();
+      await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
       if (required) {
         throw new V2BootstrapError("Unable to restore the inert V2 launcher", "deploy", 1, { cause });

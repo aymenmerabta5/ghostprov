@@ -6,6 +6,7 @@ import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/reg
 import { projectId } from "../src/sandbox/types";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
+import { assertSafeObservabilityEvent } from "../src/observability/redaction";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -106,9 +107,25 @@ describe("router observability", () => {
     const serialized = JSON.stringify(logger.events);
     expect(serialized).not.toContain("must never appear");
     expect(serialized).not.toContain("private-client");
+    for (const event of logger.events) {
+      expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+    }
+    expect(logger.events.find(event => event.event === "request.queued")).toMatchObject({
+      queued: 1,
+      queued_bytes: expect.any(Number),
+      queue_class: "latency",
+    });
     expect(logger.events.find(event => event.event === "route.selected")).toMatchObject({
       project_id: runtime.projectId,
       eligible_candidates: 1,
+      sandbox_admission_credits: 128,
+      sandbox_commit_backlog: 0,
+      sandbox_scheduler_bytes: 0,
+      sandbox_scheduler_oldest_ms: 0,
+      sandbox_throughput_bytes_per_sec: null,
+      queue_class: "latency",
+      fair_cost_bytes: 4 * 1024,
+      route_attempt: 1,
     });
   });
 });

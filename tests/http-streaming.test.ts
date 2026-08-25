@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, get, type Server } from "node:http";
 import { writeFetchResponse } from "../src/http/adapter";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import { attachAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 
 const servers: Server[] = [];
 
@@ -22,9 +24,15 @@ async function listen(response: () => Response): Promise<string> {
 describe("writeFetchResponse", () => {
   it("delivers the first SSE chunk before stream completion", async () => {
     const encoder = new TextEncoder();
+    const permits = new AtomicBytePermitPool({ ordinaryBytes: 1_024, jumboBytes: 1 });
+    const sourcePermit = await permits.acquire(1_024);
+    const first = attachAtomicBytePermit(
+      encoder.encode('data: {"type":"response.created"}\n\n'),
+      sourcePermit.transfer("http-test"),
+    );
     const url = await listen(() => new Response(new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"type":"response.created"}\n\n'));
+        controller.enqueue(first);
         setTimeout(() => {
           controller.enqueue(encoder.encode('data: {"type":"response.completed"}\n\n'));
           controller.close();
@@ -49,6 +57,8 @@ describe("writeFetchResponse", () => {
     expect(result.firstChunkAt).toBeGreaterThan(0);
     expect(result.endedAt - result.firstChunkAt).toBeGreaterThan(70);
     expect(result.body).toContain("response.completed");
+    expect(permits.snapshot().ordinaryUsedBytes).toBe(0);
+    permits.close();
   });
 
   it("cancels the Fetch body when the client disconnects", async () => {
@@ -99,7 +109,10 @@ describe("writeFetchResponse", () => {
               reads++;
               return { done: false as const, value: new Uint8Array([1]) };
             },
-            cancel: async () => { cancellations++; },
+            cancel: () => {
+              cancellations++;
+              return new Promise<void>(() => undefined);
+            },
             releaseLock: () => { releases++; },
           }),
         },
@@ -116,7 +129,13 @@ describe("writeFetchResponse", () => {
       request.once("close", () => resolve());
     });
 
-    await adapterFinished;
+    await Promise.race([
+      adapterFinished,
+      new Promise<never>((_resolve, reject) => setTimeout(
+        () => reject(new Error("adapter waited for nonsettling reader.cancel")),
+        500,
+      )),
+    ]);
     await clientFinished;
     expect(reads).toBe(0);
     expect(cancellations).toBe(1);

@@ -1,21 +1,24 @@
 import { describe, expect, it } from "bun:test";
 import {
   assertV2SidecarAssets,
+  assertV2SidecarReleaseSchema,
   DEFAULT_V2_SIDECAR_REVISION,
   hashV2SidecarFiles,
   loadV2SidecarAssets,
   resolveV2SidecarRevision,
   V2_R1_RELEASE,
+  V2_R2_RELEASE,
 } from "../src/v2/sidecar/assets";
+import { protocolSchemaHash } from "../src/v2/protocol/shared";
 
 describe("V2 sidecar assets", () => {
   it("produces a stable sorted build with the frozen R1 identity", async () => {
-    const first = await loadV2SidecarAssets();
-    const second = await loadV2SidecarAssets();
+    const first = await loadV2SidecarAssets({ revision: "r1" });
+    const second = await loadV2SidecarAssets({ revision: "r1" });
 
     expect(first).toEqual(second);
     expect(first.revision).toBe("r1");
-    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r1");
+    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r2");
     expect(first.buildHash).toBe(V2_R1_RELEASE.buildHash);
     expect(first.schemaHash).toBe(V2_R1_RELEASE.schemaHash);
     expect(first.files[0]!.sha256).toBe(V2_R1_RELEASE.bundleSha256);
@@ -48,8 +51,36 @@ describe("V2 sidecar assets", () => {
     await expect(assertV2SidecarAssets(first, "r1")).resolves.toBeUndefined();
   });
 
-  it("produces one executable bundle with no runtime package resolution", async () => {
+  it("selects the frozen R2 release by default while preserving explicit R1", async () => {
     const assets = await loadV2SidecarAssets();
+    expect(assets.revision).toBe("r2");
+    expect(assets.buildHash).toBe(V2_R2_RELEASE.buildHash);
+    expect(assets.schemaHash).toBe(V2_R2_RELEASE.schemaHash);
+    expect(assets.files[0]!.sha256).toBe(V2_R2_RELEASE.bundleSha256);
+    await expect(assertV2SidecarAssets(assets, "r2")).resolves.toBeUndefined();
+    await expect(loadV2SidecarAssets({ revision: "r1" }))
+      .resolves.toMatchObject({ revision: "r1", buildHash: V2_R1_RELEASE.buildHash });
+  });
+
+  it("fails closed when either pinned release schema differs from its live protocol", async () => {
+    expect(() => assertV2SidecarReleaseSchema(
+      V2_R1_RELEASE,
+      "f".repeat(64),
+    )).toThrow(/R1 schema hash.*live protocol/i);
+    expect(() => assertV2SidecarReleaseSchema(
+      V2_R2_RELEASE,
+      "f".repeat(64),
+    )).toThrow(/R2 schema hash.*live protocol/i);
+    expect(() => assertV2SidecarReleaseSchema(
+      V2_R1_RELEASE,
+      V2_R1_RELEASE.schemaHash,
+    )).not.toThrow();
+    expect(V2_R1_RELEASE.schemaHash).toBe(await protocolSchemaHash("r1"));
+    expect(V2_R2_RELEASE.schemaHash).toBe(await protocolSchemaHash("r2"));
+  });
+
+  it("produces one executable bundle with no runtime package resolution", async () => {
+    const assets = await loadV2SidecarAssets({ revision: "r1" });
     const bundle = assets.files[0]!.content;
 
     expect(bundle.length).toBeGreaterThan(1_000);
@@ -83,7 +114,7 @@ describe("V2 sidecar assets", () => {
   });
 
   it("contains no credential literals or ZIP transport", async () => {
-    const assets = await loadV2SidecarAssets();
+    const assets = await loadV2SidecarAssets({ revision: "r1" });
     const serialized = JSON.stringify(assets);
 
     expect(serialized).not.toMatch(
@@ -93,7 +124,7 @@ describe("V2 sidecar assets", () => {
   });
 
   it("detects source changes in the aggregate build hash", async () => {
-    const assets = await loadV2SidecarAssets();
+    const assets = await loadV2SidecarAssets({ revision: "r1" });
     const changed = assets.files.map((file, index) => (
       index === 0 ? { ...file, content: `${file.content}\n` } : file
     ));
@@ -103,11 +134,11 @@ describe("V2 sidecar assets", () => {
   });
 
   it("fails closed on unsupported or mismatched revision selection", async () => {
-    expect(resolveV2SidecarRevision()).toBe("r1");
+    expect(resolveV2SidecarRevision()).toBe("r2");
     expect(resolveV2SidecarRevision("r2")).toBe("r2");
     expect(() => resolveV2SidecarRevision("r3")).toThrow(/unsupported.*r3/i);
     await expect(loadV2SidecarAssets({ revision: "r2" }))
-      .rejects.toThrow(/no frozen.*r2/i);
+      .resolves.toMatchObject({ revision: "r2", buildHash: V2_R2_RELEASE.buildHash });
 
     const assets = await loadV2SidecarAssets({ revision: "r1" });
     await expect(assertV2SidecarAssets({

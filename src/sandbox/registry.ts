@@ -13,6 +13,10 @@ export interface UpstreamRateLimitObservation {
 
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
+  /** Exact verified V2 release; null until this generation proves readiness. */
+  protocolRevision?: "r1" | "r2" | null;
+  buildHash?: string | null;
+  schemaHash?: string | null;
   /** Changes when a stable supervisor installs a fresh runtime generation. */
   incarnation?: number;
   state: string;
@@ -49,13 +53,25 @@ export interface RoutableSandboxSnapshot {
   };
 }
 
+export interface SandboxRunOptions {
+  /**
+   * Called exactly once after the runtime has charged its own admission
+   * credit for this request. It is never called for pre-admission failure.
+   */
+  onAdmissionReflected?(): void;
+}
+
 export interface RoutableSandboxRuntime {
   readonly projectId: ProjectId;
   start(): Promise<void>;
   drain(reason: string): Promise<void>;
   stop(): Promise<void>;
   snapshot(): RoutableSandboxSnapshot;
-  run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle>;
+  run(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle>;
   /** One-shot pre-acquired sandbox for the next same-project generation. */
   takeReplacementSandbox?(): ProvisionedSandbox | null;
   subscribe?(listener: () => void): () => void;

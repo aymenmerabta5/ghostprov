@@ -12,6 +12,11 @@ import {
   RequestAssembler,
   RequestAssemblyError,
 } from "../src/v2/sidecar/assembler";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import {
+  atomicBytePermitOf,
+  releaseAtomicBytePermit,
+} from "../src/v2/memory/permit-carrier";
 
 const REQUEST = "req-assembly-1";
 
@@ -49,6 +54,27 @@ async function frames(
 }
 
 describe("RequestAssembler", () => {
+  it("transfers one global request-memory permit into the committed body", async () => {
+    const decoded = new TextEncoder().encode(JSON.stringify({ input: "owned request" }));
+    const requestFrames = await frames(decoded, { partBytes: 7 });
+    const declared = requestFrames[0] as Extract<ReliableFrame<HostFrame>, { kind: "request_open" }>;
+    const reservation = declared.decodedBytes + declared.encodedBytes +
+      declared.partCount * RequestAssembler.PART_METADATA_BYTES;
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: reservation, jumboBytes: 1 });
+    const assembler = new RequestAssembler({
+      maxReservedBytes: reservation,
+      atomicBytePermits: pool,
+    });
+    for (const frame of requestFrames) assembler.accept(frame);
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(reservation);
+
+    const body = await assembler.commit(REQUEST);
+    expect(atomicBytePermitOf(body)).toMatchObject({ active: true, bytes: reservation });
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
+    releaseAtomicBytePermit(body);
+    expect(pool.snapshot()).toMatchObject({ ordinaryUsedBytes: 0, activePermits: 0 });
+  });
+
   it("reassembles reordered identity parts after exact integrity proof", async () => {
     const decoded = new TextEncoder().encode(JSON.stringify({ model: "gpt-5.6-sol", input: "hello 🌍" }));
     const requestFrames = await frames(decoded, { partBytes: 7 });

@@ -35,7 +35,7 @@ describe("project documentation", () => {
   it("documents runtime concurrency defaults from the same source", () => {
     expect(readme).toContain("| `GP_V2_SANDBOX_CAPACITY` | `128`");
     expect(readme).toContain("| `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8`");
-    expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16`");
+    expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
     expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
@@ -48,7 +48,9 @@ describe("project documentation", () => {
     expect(readme).toContain("ghostprovV2Control");
     expect(readme).toContain("128 KiB");
     expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
-    expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=16");
+    expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=8");
+    expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r2");
+    expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r1");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
   });
 
@@ -177,6 +179,10 @@ describe("project documentation", () => {
       "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
       "monitor:v2": "bun scripts/monitor_v2.ts",
       "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
+      "build:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts --write",
+      "check:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts",
+      "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r2/sidecar.bundle.js",
+      "test:v2-deno-fs": "bunx deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
     });
     expect(pkg.scripts).not.toHaveProperty("test:daemon");
     expect(pkg.dependencies).not.toHaveProperty("playwright");

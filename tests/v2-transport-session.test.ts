@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { gzipSync } from "fflate";
 import type { RunHandle } from "../src/relay/run-handle";
+import { sseFrame } from "../src/relay/sse";
 import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
 import {
@@ -14,6 +15,7 @@ import {
   type SidecarFrame,
 } from "../src/v2/protocol/shared";
 import { TranscriptProof } from "../src/v2/protocol/transcript";
+import { WeightedFrameScheduler } from "../src/v2/protocol/scheduler";
 import {
   V2CommittedError,
   V2PreCommitError,
@@ -24,6 +26,9 @@ import {
   type V2GzipOptions,
 } from "../src/v2/transport/session";
 import { FakeAwarenessNetwork } from "./support/fake-awareness";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
+import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
@@ -46,7 +51,7 @@ async function promiseState(value: Promise<unknown>): Promise<"pending" | "settl
 
 function throwOnSelectedPublish(
   channel: AwarenessChannel<HostFrame, SidecarFrame>,
-  options: { data: boolean; commit: boolean; liveness: boolean },
+  options: { data: boolean; commit: boolean; liveness: boolean; clear: boolean },
 ): AwarenessChannel<HostFrame, SidecarFrame> {
   return {
     get projectId() { return channel.projectId; },
@@ -65,6 +70,43 @@ function throwOnSelectedPublish(
       }
       if (options.liveness && envelope.liveness?.kind === "ping") {
         throw new Error("synthetic liveness publication failure");
+      }
+      channel.publish(envelope, lane);
+    },
+    clear: lane => {
+      if (options.clear) throw new Error("synthetic channel clear failure");
+      channel.clear(lane);
+    },
+    subscribe: listener => channel.subscribe(listener),
+    peerIds: () => channel.peerIds(),
+    close: () => channel.close(),
+  };
+}
+
+interface ReconnectableFault {
+  armed: boolean;
+  failed: boolean;
+  reconnects: number;
+}
+
+function throwOneReconnectablePublish(
+  channel: AwarenessChannel<HostFrame, SidecarFrame>,
+  fault: ReconnectableFault,
+): AwarenessChannel<HostFrame, SidecarFrame> {
+  return {
+    get projectId() { return channel.projectId; },
+    get localPeerId() { return channel.localPeerId; },
+    async connect(signal) {
+      if (fault.failed) fault.reconnects++;
+      await channel.connect(signal);
+    },
+    publish(envelope, lane) {
+      if (fault.armed && !fault.failed && lane === "data") {
+        fault.failed = true;
+        throw new AwarenessChannelError(
+          "synthetic post-sync disconnect",
+          "disconnected",
+        );
       }
       channel.publish(envelope, lane);
     },
@@ -107,21 +149,29 @@ class TransportHarness {
     throwOnDataPublish?: boolean;
     throwOnCommitPublish?: boolean;
     throwOnLivenessPublish?: boolean;
+    throwOnClear?: boolean;
+    reconnectableFault?: ReconnectableFault;
     expectedSidecarInstanceId?: string | null;
+    eventMemoryPool?: AtomicBytePermitPool;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.autoPong = options.autoPong ?? false;
     this.network = new FakeAwarenessNetwork({ drop: options.drop });
     const host = this.network.connectHost("host", PROJECT);
-    this.host = options.throwOnDataPublish ||
+    const selected = options.throwOnDataPublish ||
       options.throwOnCommitPublish ||
-      options.throwOnLivenessPublish
+      options.throwOnLivenessPublish ||
+      options.throwOnClear
       ? throwOnSelectedPublish(host, {
           data: options.throwOnDataPublish ?? false,
           commit: options.throwOnCommitPublish ?? false,
           liveness: options.throwOnLivenessPublish ?? false,
+          clear: options.throwOnClear ?? false,
         })
       : host;
+    this.host = options.reconnectableFault
+      ? throwOneReconnectablePublish(selected, options.reconnectableFault)
+      : selected;
     this.sidecar = this.network.connectSidecar("sidecar", PROJECT);
     this.sidecar.subscribe(update => {
       const envelope = update.envelope;
@@ -159,6 +209,7 @@ class TransportHarness {
         ? {}
         : { expectedSidecarInstanceId: options.expectedSidecarInstanceId ?? "sidecar-instance-1" }),
       livenessTimeoutMs: options.livenessTimeoutMs,
+      eventMemoryPool: options.eventMemoryPool,
     });
   }
 
@@ -348,7 +399,7 @@ describe("V2TransportSession", () => {
     }
   });
 
-  it("observes a control pong while reliable response processing is backpressured", async () => {
+  it("observes a control pong after isolating a slow response consumer", async () => {
     const harness = new TransportHarness({
       autoPong: true,
       livenessTimeoutMs: 250,
@@ -369,7 +420,12 @@ describe("V2TransportSession", () => {
       dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
     })));
     await harness.settle();
-    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence))).toBe(0);
+    await expect(handle.final).rejects.toMatchObject({
+      committed: true,
+      code: "event_memory_capacity",
+    });
+    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
+      .toBe(harness.sidecarSequence - 1);
 
     const probing = harness.session.probeLiveness();
     await harness.settle();
@@ -380,13 +436,13 @@ describe("V2TransportSession", () => {
       }),
     ])).resolves.toMatchObject({ sentAtMs: expect.any(Number) });
     expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
-      .toBeLessThan(harness.sidecarSequence - 1);
+      .toBe(harness.sidecarSequence - 1);
 
     await harness.close();
     await Promise.allSettled([handle.final]);
   });
 
-  it("fails terminally instead of ACK-jumping after backpressured processing throws", async () => {
+  it("fails only the slow request without poisoning the transport", async () => {
     const harness = new TransportHarness({
       maxResponseBytes: 4_096,
       maxBufferedResponseBytes: 160,
@@ -410,13 +466,17 @@ describe("V2TransportSession", () => {
 
     controller.abort();
     for (let round = 0; round < 8; round++) await Bun.sleep(0);
-    expect(await final).toMatchObject({ committed: true, ambiguous: true });
-    expect(harness.session.snapshot()).toMatchObject({ connected: false, credits: 0 });
+    expect(await final).toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "event_memory_capacity",
+    });
+    expect(harness.session.snapshot()).toMatchObject({ connected: true });
     await harness.network.flushAll();
     const ackAfterFailure = Math.max(
       ...harness.hostEnvelopes.map(envelope => envelope.ack.sequence),
     );
-    expect(ackAfterFailure).toBeLessThan(harness.sidecarSequence - 1);
+    expect(ackAfterFailure).toBe(harness.sidecarSequence - 1);
 
     harness.publish([], { lane: "control" });
     await harness.settle();
@@ -650,6 +710,36 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  it("retains its reliable flight across a reconnectable Awareness publish failure", async () => {
+    const fault: ReconnectableFault = { armed: false, failed: false, reconnects: 0 };
+    const harness = new TransportHarness({ reconnectableFault: fault });
+    await harness.start();
+    fault.armed = true;
+    const pending = harness.session.run(BODY);
+    void pending.catch(() => undefined);
+    await Bun.sleep(harness.publicationIntervalMs + 5);
+    await harness.network.flushAll();
+
+    expect(fault.failed).toBe(true);
+    expect(harness.session.snapshot()).toMatchObject({
+      connected: true,
+      credits: 0,
+    });
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_open"))
+      .toBe(false);
+
+    await harness.session.resumeAwareness();
+    await harness.settle();
+    expect(fault.reconnects).toBe(1);
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit"))
+      .toBe(true);
+    const handle = await harness.commit(pending);
+    harness.publish(await harness.completedFrames());
+    await harness.settle();
+    await expect(handle.final).resolves.toMatchObject({ status: "completed" });
+    await harness.close();
+  });
+
   it("rejects only never-admitted work when sandbox capacity changes", async () => {
     const harness = new TransportHarness({
       publicationIntervalMs: 1,
@@ -676,6 +766,45 @@ describe("V2TransportSession", () => {
       await harness.close();
       await Promise.allSettled([pending]);
     }
+  });
+
+  it("hands reservation ownership off exactly once at transport admission", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    let reflected = 0;
+    const pending = harness.session.run(BODY, undefined, {
+      onAdmissionReflected: () => { reflected++; },
+    });
+    await harness.settle();
+
+    expect(reflected).toBe(1);
+    expect(harness.session.snapshot()).toMatchObject({
+      active: 1,
+      admissionCredits: 3,
+    });
+    await harness.settle();
+    expect(reflected).toBe(1);
+    await harness.close();
+    await Promise.allSettled([pending]);
+  });
+
+  it("never hands ownership off when a request fails before admission", async () => {
+    const harness = new TransportHarness({ unadmittedTimeoutMs: 50 });
+    await harness.start();
+    harness.credits = 0;
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    const controller = new AbortController();
+    let reflected = 0;
+    const pending = harness.session.run(BODY, controller.signal, {
+      onAdmissionReflected: () => { reflected++; },
+    });
+    await harness.settle();
+    expect(reflected).toBe(0);
+    controller.abort();
+    await expect(pending).rejects.toBeInstanceOf(DOMException);
+    expect(reflected).toBe(0);
+    await harness.close();
   });
 
   it("never applies the unadmitted timeout after scheduler admission", async () => {
@@ -900,6 +1029,10 @@ describe("V2TransportSession", () => {
       await expect(handle.final).resolves.toMatchObject({ id: "resp_1" });
       expect(await Array.fromAsync(handle.events())).toHaveLength(3);
       expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(snapshot.mock.results[0]?.value).toMatchObject({
+        canonicalBytes: null,
+        retainsBytes: false,
+      });
     } finally {
       snapshot.mockRestore();
       await harness.close();
@@ -929,7 +1062,7 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
-  it("withholds the cumulative network ACK while the client buffer is full", async () => {
+  it("fails a full client buffer immediately without stalling cumulative ACK", async () => {
     const harness = new TransportHarness({
       maxResponseBytes: 4_096,
       maxBufferedResponseBytes: 160,
@@ -949,12 +1082,295 @@ describe("V2TransportSession", () => {
     })));
     await harness.settle();
 
-    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence))).toBe(0);
-    const events = handle.events();
-    await events.next();
-    await harness.settle();
+    await expect(handle.final).rejects.toMatchObject({
+      committed: true,
+      code: "event_memory_capacity",
+    });
     expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence))).toBe(2);
     await harness.close();
+  });
+
+  it("shares one event pool across sessions without letting slow A block B", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 3 * 1024 * 1024,
+      jumboBytes: 8 * 1024 * 1024,
+    });
+    const a = new TransportHarness({
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    const b = new TransportHarness({
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    await a.start();
+    await b.start();
+    const handleA = await a.commit(a.session.run(BODY));
+    const handleB = await b.commit(b.session.run(BODY));
+    const idA = a.requestIdentity().requestId;
+    const idB = b.requestIdentity().requestId;
+    const response = (requestId: string, eventIndex: number) => ({
+      kind: "response_event" as const,
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+    });
+
+    a.publish([response(idA, 0)]);
+    b.publish([response(idB, 0)]);
+    await a.settle();
+    await b.settle();
+    expect(pool.snapshot().activePermits).toBe(2);
+
+    a.publish([response(idA, 1)]);
+    await a.settle();
+    await expect(handleA.final).rejects.toMatchObject({
+      code: "event_memory_capacity",
+      committed: true,
+    });
+    expect(b.session.snapshot().connected).toBe(true);
+    expect(pool.snapshot().activePermits).toBe(1);
+
+    const eventsB = handleB.events();
+    await expect(eventsB.next()).resolves.toMatchObject({
+      value: { event: "response.output_text.delta" },
+      done: false,
+    });
+    expect(pool.snapshot().activePermits).toBe(1);
+    await eventsB.return(undefined);
+    expect(pool.snapshot().activePermits).toBe(0);
+
+    await a.close();
+    await b.close();
+    pool.close();
+  });
+
+  it("releases an incomplete event assembly permit on session close", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 2 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      maxResponseBytes: 4_096,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    await harness.commit(harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([{
+      kind: "response_event",
+      requestId,
+      eventIndex: 0,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 2,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("partial")),
+    }]);
+    await harness.settle();
+    expect(pool.snapshot().activePermits).toBe(1);
+    await harness.close();
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    pool.close();
+  });
+
+  it("promotes an exact 600 KiB segmented event to jumbo before RunHandle transfer", async () => {
+    const targetWireBytes = 600 * 1024;
+    const eventName = "response.output_text.delta";
+    const emptyData = JSON.stringify({ type: eventName, delta: "" });
+    const fillBytes = targetWireBytes - utf8Bytes(sseFrame(eventName, emptyData)).byteLength;
+    const data = JSON.stringify({ type: eventName, delta: "x".repeat(fillBytes) });
+    expect(utf8Bytes(sseFrame(eventName, data)).byteLength).toBe(targetWireBytes);
+
+    const pool = new AtomicBytePermitPool({
+      // Deliberately leave enough ordinary space to reproduce the bug where a
+      // normal resize never moved the completed event into the jumbo lane.
+      ordinaryBytes: 12 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      maxResponseBytes: 2 * 1024 * 1024,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    const identity = harness.requestIdentity();
+    const final = { id: "resp_jumbo", object: "response", status: "completed", output: [] };
+    const completed = {
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response: final }),
+    };
+    const transcript = new TranscriptProof(identity.requestId, identity.requestDigest);
+    transcript.append({ event: eventName, data });
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+
+    const bytes = utf8Bytes(data);
+    const partBytes = 8 * 1024;
+    const partCount = Math.ceil(bytes.byteLength / partBytes);
+    const parts: SidecarFrame[] = Array.from({ length: partCount }, (_, partIndex) => {
+      const offset = partIndex * partBytes;
+      return {
+        kind: "response_event",
+        requestId: identity.requestId,
+        eventIndex: 0,
+        event: eventName,
+        partIndex,
+        partCount,
+        offset,
+        dataBase64Url: base64UrlEncode(bytes.subarray(offset, offset + partBytes)),
+      };
+    });
+    for (let offset = 0; offset < parts.length; offset += 16) {
+      harness.publish(parts.slice(offset, offset + 16));
+      await harness.settle();
+    }
+
+    expect(pool.snapshot()).toMatchObject({
+      ordinaryUsedBytes: 0,
+      jumboActive: true,
+      activePermits: 1,
+    });
+    const events = handle.events();
+    await expect(events.next()).resolves.toMatchObject({
+      value: { event: eventName, data },
+      done: false,
+    });
+    const terminalEvent = events.next();
+    await Bun.sleep(0);
+
+    harness.publish([{
+      kind: "response_event",
+      requestId: identity.requestId,
+      eventIndex: 1,
+      event: completed.event,
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes(completed.data)),
+    }, terminal]);
+    await harness.settle();
+
+    await expect(terminalEvent).resolves.toMatchObject({
+      value: completed,
+      done: false,
+    });
+    await expect(events.next()).resolves.toMatchObject({ done: true });
+    const settledFinal = await handle.final;
+    expect(settledFinal).toMatchObject({ id: "resp_jumbo" });
+    releaseAtomicBytePermit(settledFinal);
+    expect(pool.snapshot()).toMatchObject({
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      activePermits: 0,
+    });
+    await harness.close();
+    pool.close();
+  });
+
+  it("releases a completed-event permit when terminal JSON validation throws", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({ eventMemoryPool: pool });
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+
+    harness.publish([{
+      kind: "response_event",
+      requestId,
+      eventIndex: 0,
+      event: "response.completed",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("{not-json")),
+    }]);
+    await harness.settle();
+
+    await expect(handle.final).rejects.toMatchObject({
+      committed: true,
+      code: "response_transcript",
+    });
+    expect(harness.session.snapshot().connected).toBe(true);
+    expect(pool.snapshot()).toMatchObject({
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      activePermits: 0,
+    });
+    await harness.close();
+    pool.close();
+  });
+
+  it("enforces the exact canonical SSE response limit including newline framing", async () => {
+    const final = { id: "resp_exact", object: "response", status: "completed", output: [] };
+    const events = [{
+      event: "response.created",
+      data: '{\r\n"type":"response.created",\r"response":{"id":"resp_exact"}\n}',
+    }, {
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response: final }),
+    }];
+    const canonicalBytes = events.reduce(
+      (total, event) => total + utf8Bytes(
+        `event: ${event.event}\ndata: ${event.data}\n\n`,
+      ).byteLength,
+      0,
+    );
+    const run = async (limit: number) => {
+      const pool = new AtomicBytePermitPool({
+        ordinaryBytes: 4 * 1024 * 1024,
+        jumboBytes: 4 * 1024 * 1024,
+      });
+      const harness = new TransportHarness({
+        maxResponseBytes: limit,
+        eventMemoryPool: pool,
+      });
+      await harness.start();
+      const handle = await harness.commit(harness.session.run(BODY));
+      const identity = harness.requestIdentity();
+      const transcript = new TranscriptProof(identity.requestId, identity.requestDigest);
+      const frames: SidecarFrame[] = events.map((event, eventIndex) => {
+        transcript.append(event);
+        return {
+          kind: "response_event",
+          requestId: identity.requestId,
+          eventIndex,
+          event: event.event,
+          partIndex: 0,
+          partCount: 1,
+          offset: 0,
+          dataBase64Url: base64UrlEncode(utf8Bytes(event.data)),
+        };
+      });
+      frames.push(await transcript.createTerminal());
+      harness.publish(frames);
+      await harness.settle();
+      return { harness, handle, pool };
+    };
+
+    const exact = await run(canonicalBytes);
+    const exactFinal = await exact.handle.final;
+    expect(exactFinal).toMatchObject({ id: "resp_exact" });
+    for await (const _event of exact.handle.events()) { /* release carried permits */ }
+    releaseAtomicBytePermit(exactFinal);
+    await exact.harness.close();
+    expect(exact.pool.snapshot().activePermits).toBe(0);
+    exact.pool.close();
+
+    const tooSmall = await run(canonicalBytes - 1);
+    await expect(tooSmall.handle.final).rejects.toMatchObject({ code: "response_too_large" });
+    await tooSmall.harness.close();
+    expect(tooSmall.pool.snapshot().activePermits).toBe(0);
+    tooSmall.pool.close();
   });
 
   it("distinguishes pre-commit rejection from committed ambiguity", async () => {
@@ -1126,6 +1542,85 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  it("aborts an active-request drain wait without leaving a stale idle waiter", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY));
+    void handle.final.catch(() => undefined);
+    const controller = new AbortController();
+    const firstDrain = harness.session.drain("abort active wait", controller.signal);
+    expect(await promiseState(firstDrain)).toBe("pending");
+    controller.abort();
+    await expect(firstDrain).rejects.toMatchObject({ name: "AbortError" });
+
+    harness.publish(await harness.completedFrames());
+    await harness.settle();
+    await handle.final;
+    const secondDrain = harness.session.drain("retry after abort");
+    await harness.settle();
+    harness.publish([{ kind: "drained", active: 0, queued: 0 }]);
+    await harness.settle();
+    await expect(secondDrain).resolves.toBeUndefined();
+    await harness.sidecar.close();
+  });
+
+  it("does not poison drain retry when enqueue throws before the drain flag is set", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const original = WeightedFrameScheduler.prototype.enqueue;
+    const enqueue = spyOn(WeightedFrameScheduler.prototype, "enqueue").mockImplementation(
+      function (this: WeightedFrameScheduler<HostFrame>, priority, streamId, frame, weight) {
+        if ((frame as HostFrame).kind === "drain") {
+          throw new Error("synthetic drain enqueue failure");
+        }
+        return original.call(this, priority, streamId, frame, weight);
+      },
+    );
+    await expect(harness.session.drain("first attempt")).rejects.toThrow(
+      "synthetic drain enqueue failure",
+    );
+    enqueue.mockRestore();
+
+    const retry = harness.session.drain("second attempt");
+    await harness.settle();
+    expect([...harness.hostFrames.values()]).toContainEqual(expect.objectContaining({
+      kind: "drain",
+      reason: "second attempt",
+    }));
+    harness.publish([{ kind: "drained", active: 0, queued: 0 }]);
+    await harness.settle();
+    await expect(retry).resolves.toBeUndefined();
+    await harness.sidecar.close();
+  });
+
+  it("joins an active teardown from closed drain and force-stop fast paths", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+    const originalClose = harness.host.close.bind(harness.host);
+    (harness.host as { close(): Promise<void> }).close = async () => {
+      await closeGate;
+      await originalClose();
+    };
+    const closing = harness.session.close();
+    const draining = harness.session.drain("join teardown");
+    const stopping = harness.session.forceStop("join teardown");
+    expect(await promiseState(draining)).toBe("pending");
+    expect(await promiseState(stopping)).toBe("pending");
+    releaseClose();
+    await Promise.all([closing, draining, stopping]);
+    await harness.sidecar.close();
+  });
+
+  it("still closes the channel when teardown presence clearing throws", async () => {
+    const harness = new TransportHarness({ throwOnClear: true });
+    await harness.start();
+    await expect(harness.session.close()).rejects.toThrow("synthetic channel clear failure");
+    expect(harness.sidecar.peerIds()).toEqual([]);
+    await harness.sidecar.close();
+  });
+
   it("settles credential rotation only after a matching sidecar ACK", async () => {
     const harness = new TransportHarness();
     await harness.start();
@@ -1159,6 +1654,41 @@ describe("V2TransportSession", () => {
 
     expect(result).toBe("rejected");
     await harness.close();
+  });
+
+  it("removes a timed-out credential rotation queued behind an active flight", async () => {
+    const harness = new TransportHarness({ rotationTimeoutMs: 5 });
+    await harness.start();
+    const request = harness.session.run(BODY);
+    void request.catch(() => undefined);
+    await Bun.sleep(harness.publicationIntervalMs + 5);
+    await harness.network.flushAll();
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit"))
+      .toBe(true);
+
+    const sealedCanary = "sealed-rotation-secret-canary";
+    await expect(harness.session.rotateCredential(
+      "rotation-blocked-timeout",
+      sealedCanary,
+    )).rejects.toThrow("timed out");
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "credential_rotate"))
+      .toBe(false);
+
+    // ACK the request flight after the rotation waiter has expired. A leaked
+    // scheduler stream would now publish its stale sealed credential.
+    harness.publish([], { lane: "control", ackSequence: harness.hostAck });
+    await harness.settle();
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "credential_rotate"))
+      .toBe(false);
+    expect(JSON.stringify(harness.hostEnvelopes)).not.toContain(sealedCanary);
+    expect(harness.session.snapshot().diagnostics?.host).toMatchObject({
+      schedulerFrames: 0,
+      schedulerBytes: 0,
+    });
+
+    await harness.session.close();
+    await expect(request).rejects.toBeInstanceOf(V2CommittedError);
+    await harness.sidecar.close();
   });
 
   it("removes drain abort listeners and rejects cleanly when closed mid-drain", async () => {

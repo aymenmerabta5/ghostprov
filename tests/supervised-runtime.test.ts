@@ -5,6 +5,7 @@ import { parseProvisionedSandbox, type ProvisionedSandbox } from "../src/prism/p
 import type {
   RoutableSandboxRuntime,
   RoutableSandboxSnapshot,
+  SandboxRunOptions,
 } from "../src/sandbox/registry";
 import {
   RecoveryPermitPool,
@@ -13,6 +14,7 @@ import {
   type SandboxSupervisorEvent,
 } from "../src/sandbox/supervised-runtime";
 import { projectId, type ProjectId } from "../src/sandbox/types";
+import { V2PreCommitError } from "../src/v2/transport/run-handle";
 
 const PROJECT = projectId("00000000-0000-4000-8000-000000000042");
 
@@ -93,6 +95,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
   stopBehavior?: () => void | Promise<void>;
   drainBehavior?: () => void | Promise<void>;
   replacementSandbox: ProvisionedSandbox | null = null;
+  runCalls = 0;
+  runFailure: unknown = null;
 
   constructor(
     readonly projectId: ProjectId = PROJECT,
@@ -117,7 +121,20 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.setState("stopped");
   }
 
-  async run(): Promise<RunHandle> { throw new Error("not used"); }
+  async run(
+    _body?: Record<string, unknown>,
+    _signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    this.runCalls++;
+    if (this.runFailure) throw this.runFailure;
+    options?.onAdmissionReflected?.();
+    return {
+      async *events() {},
+      final: Promise.resolve({ id: "resp_supervised", status: "completed" }),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    };
+  }
   takeReplacementSandbox(): ProvisionedSandbox | null {
     const value = this.replacementSandbox;
     this.replacementSandbox = null;
@@ -184,6 +201,107 @@ function supervisor(input: {
 }
 
 describe("SupervisedSandboxRuntime", () => {
+  it("forwards admission ownership to the selected child exactly once", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime() });
+    await runtime.start();
+    let reflected = 0;
+    const handle = await runtime.run(
+      { input: "handoff" },
+      undefined,
+      { onAdmissionReflected: () => { reflected++; } },
+    );
+    expect(reflected).toBe(1);
+    await handle.final;
+    await runtime.stop();
+  });
+
+  it("returns an explicit pre-commit guard before the supervisor is live", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime() });
+
+    await expect(runtime.run({ input: "not-live" })).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      committed: false,
+      code: "supervisor_not_live",
+    });
+    expect(initial.runCalls).toBe(0);
+  });
+
+  it("returns an explicit pre-commit guard while recovering without dispatching", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    let release!: (runtime: RoutableSandboxRuntime) => void;
+    const pending = new Promise<RoutableSandboxRuntime>(resolve => { release = resolve; });
+    const replacement = new FakeRuntime();
+    const runtime = supervisor({ clock, initial, create: () => pending });
+    await runtime.start();
+    initial.setState("failed");
+    await waitFor(() => runtime.supervisorSnapshot().phase === "recovering");
+
+    await expect(runtime.run({ input: "recovering" })).rejects.toEqual(
+      expect.objectContaining({
+        name: "V2PreCommitError",
+        committed: false,
+        code: "supervisor_recovering",
+      }),
+    );
+    expect(initial.runCalls).toBe(0);
+    release(replacement);
+    await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+    await runtime.stop();
+  });
+
+  it("returns an explicit pre-commit guard while a first child is absent", async () => {
+    const clock = new ManualClock();
+    const child = new FakeRuntime();
+    const runtime = new SupervisedSandboxRuntime({
+      projectId: PROJECT,
+      createChild: () => child,
+      clock,
+      random: { next: () => 0 },
+      checkIntervalMs: 1_000,
+      startupTimeoutMs: 10_000,
+      initialBackoffMs: 1_000,
+      maxBackoffMs: 60_000,
+    });
+    const starting = runtime.start();
+
+    const guarded = runtime.run({ input: "no-child" });
+    await expect(guarded).rejects.toBeInstanceOf(V2PreCommitError);
+    await expect(guarded).rejects.toMatchObject({
+      committed: false,
+      code: "supervisor_no_child",
+    });
+    await starting;
+    await runtime.stop();
+  });
+
+  it("never wraps a child error after dispatch may have escaped", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    const escaped = Object.assign(new Error("child transport failed"), {
+      committed: true,
+      ambiguous: true,
+      code: "transport",
+    });
+    initial.runFailure = escaped;
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime() });
+    await runtime.start();
+
+    let observed: unknown;
+    try {
+      await runtime.run({ input: "escaped" });
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBe(escaped);
+    expect(initial.runCalls).toBe(1);
+    await runtime.stop();
+  });
+
   it("replaces an unexpectedly failed child immediately and emits recovery changes", async () => {
     const clock = new ManualClock();
     const initial = new FakeRuntime();

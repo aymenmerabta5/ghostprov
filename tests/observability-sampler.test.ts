@@ -43,6 +43,8 @@ describe("FleetSampler", () => {
       reset() {},
     };
     let cpu = { user: 0, system: 0 };
+    const unavailableProject = projectId("00000000-0000-4000-8000-000000000002");
+    let fleetRecovered = false;
     const transport: V2TransportDiagnostics = {
       windowFrames: 1,
       windowBytes: 100,
@@ -83,6 +85,7 @@ describe("FleetSampler", () => {
         active: 16,
         available: 496,
         queued: 0,
+        queuedBytes: 1_234,
         resources: {
           totalBytes: 32 * 1024 ** 3,
           startupFreeBytes: 20 * 1024 ** 3,
@@ -101,6 +104,9 @@ describe("FleetSampler", () => {
         },
         runtimes: [{
           projectId: projectId("00000000-0000-4000-8000-000000000001"),
+          protocolRevision: "r2" as const,
+          buildHash: "a".repeat(64),
+          schemaHash: "b".repeat(64),
           incarnation: 3,
           state: "ready",
           capacity: 128,
@@ -214,9 +220,46 @@ describe("FleetSampler", () => {
         totalMs: { count: 48, p50: 500, p95: 2_000, max: 3_000 },
         firstByteMs: { count: 47, p50: 100, p95: 400, max: 600 },
       }),
+      hostEventMemorySnapshot: () => ({
+        ordinaryCapacityBytes: 64 * 1024 ** 2,
+        ordinaryUsedBytes: 2 * 1024 ** 2,
+        ordinaryAvailableBytes: 62 * 1024 ** 2,
+        jumboCapacityBytes: 257 * 1024 ** 2,
+        jumboUsedBytes: 0,
+        jumboAvailableBytes: 257 * 1024 ** 2,
+        jumboActive: false,
+        activePermits: 4,
+        waiters: 1,
+        ordinaryWaiters: 1,
+        jumboWaiters: 0,
+        promotionWaiters: 0,
+        closed: false,
+      }),
+      fleetSnapshot: () => ({
+        desired: 2,
+        ready: fleetRecovered ? 2 : 1,
+        provisioning: 0,
+        draining: 0,
+        failed: fleetRecovered ? 0 : 1,
+        unavailable: fleetRecovered ? 0 : 1,
+        unavailableProjects: fleetRecovered ? [] : [unavailableProject],
+        projects: [
+          projectId("00000000-0000-4000-8000-000000000001"),
+          unavailableProject,
+        ],
+      }),
     });
 
     sampler.sample();
+    const partial = logger.events.at(-1)!;
+    expect(partial).toMatchObject({
+      desired: 2,
+      ready: 1,
+      unavailable: 1,
+      unavailable_projects: [unavailableProject],
+      unavailable_projects_truncated: false,
+    });
+    fleetRecovered = true;
     clock.value += 5_000;
     sampler.sample();
 
@@ -225,6 +268,11 @@ describe("FleetSampler", () => {
       event: "fleet.sample",
       capacity: 512,
       active: 16,
+      queued_bytes: 1_234,
+      desired: 2,
+      ready: 2,
+      unavailable: 0,
+      unavailable_projects: [],
       event_loop_p50_ms: 2,
       event_loop_p95_ms: 5,
       event_loop_max_ms: 8,
@@ -232,8 +280,19 @@ describe("FleetSampler", () => {
       array_buffer_bytes: 100,
     });
     expect((event.resources as any).transform_workers).toBe(6);
+    expect((event.resources as any).event_memory).toMatchObject({
+      ordinary_capacity_bytes: 64 * 1024 ** 2,
+      ordinary_used_bytes: 2 * 1024 ** 2,
+      jumbo_capacity_bytes: 257 * 1024 ** 2,
+      jumbo_active: false,
+      active_permits: 4,
+      waiters: 1,
+    });
     expect((event.runtimes as any[])[0]).toMatchObject({
       project_id: "00000000-0000-4000-8000-000000000001",
+      protocol_revision: "r2",
+      build_hash: "a".repeat(64),
+      schema_hash: "b".repeat(64),
       incarnation: 3,
       awareness_rtt_ms: 15,
       sidecar_peer_age_ms: 250,
@@ -279,6 +338,16 @@ describe("FleetSampler", () => {
       consecutive_failures: 2,
       retry_in_ms: 1_000,
       queued: 3,
+    });
+    expect(event.release).toEqual({
+      knownRuntimes: 1,
+      unknownRuntimes: 0,
+      selections: [{
+        protocolRevision: "r2",
+        buildHash: "a".repeat(64),
+        schemaHash: "b".repeat(64),
+        runtimes: 1,
+      }],
     });
     expect(event.traffic).toMatchObject({
       accepted: 50,

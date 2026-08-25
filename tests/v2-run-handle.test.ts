@@ -2,8 +2,22 @@ import { describe, expect, it } from "bun:test";
 import type { Clock } from "../src/core/ports";
 import {
   V2CommittedError,
+  V2EventMemoryError,
   V2RunHandle,
 } from "../src/v2/transport/run-handle";
+import { sseFrame } from "../src/relay/sse";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import {
+  deriveV2HostEventMemorySizing,
+  V2_EVENT_MAX_BUFFERED_EVENTS,
+  V2_EVENT_SOFT_BUFFER_BYTES,
+  v2EventPhysicalWorkingSetBytes,
+  v2RetainedEventPermitBytes,
+} from "../src/v2/memory/event-memory-sizing";
+import {
+  atomicBytePermitOf,
+  releaseAtomicBytePermit,
+} from "../src/v2/memory/permit-carrier";
 
 class FakeClock implements Clock {
   value = 1_000;
@@ -70,8 +84,8 @@ describe("V2RunHandle", () => {
   });
 
   it("drains a long response in order through its head-index queue", async () => {
-    const handle = new V2RunHandle({ maxBufferedBytes: 4 * 1024 * 1024 });
-    const frames = Array.from({ length: 4_096 }, (_, index) => ({
+    const handle = new V2RunHandle({ maxBufferedBytes: V2_EVENT_SOFT_BUFFER_BYTES });
+    const frames = Array.from({ length: 128 }, (_, index) => ({
       event: "delta",
       data: String(index),
     }));
@@ -99,17 +113,37 @@ describe("V2RunHandle", () => {
     await expect(events.next()).resolves.toEqual({ value: undefined, done: true });
   });
 
-  it("admits one logical event larger than the target buffer without deadlocking", async () => {
-    const handle = new V2RunHandle({ maxBufferedBytes: 32 });
+  it("admits an event above the soft buffer only with transferred jumbo coverage", async () => {
+    const handle = new V2RunHandle({
+      maxBufferedBytes: 32,
+      requireTransferredEventMemory: true,
+    });
     const large = { event: "delta", data: "x".repeat(100) };
+    const bytes = new TextEncoder().encode(sseFrame(large.event, large.data)).byteLength;
+    const coverage = v2EventPhysicalWorkingSetBytes(bytes, 32);
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: coverage,
+      jumboBytes: coverage,
+    });
 
-    await expect(handle.acceptEvent(large)).resolves.toBeUndefined();
-    const blocked = handle.acceptEvent({ event: "delta", data: "next" });
-    expect(await promiseState(blocked)).toBe("pending");
+    await expect(handle.acceptEvent(large, bytes)).rejects.toBeInstanceOf(V2EventMemoryError);
+    const ordinary = await pool.acquire(coverage, { region: "ordinary" });
+    await expect(handle.acceptEvent(large, bytes, ordinary.transfer("run-handle")))
+      .rejects.toMatchObject({ code: "jumbo_required" });
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(0);
+
+    const source = await pool.acquireJumbo(coverage);
+    const transferred = source.transfer("run-handle");
+    expect(source.active).toBe(false);
+    await expect(handle.acceptEvent(large, bytes, transferred)).resolves.toBeUndefined();
+    expect(pool.snapshot().jumboUsedBytes).toBe(coverage);
     const events = handle.events();
-    await events.next();
-    await expect(blocked).resolves.toBeUndefined();
-    handle.settle({ id: "resp_1", status: "completed" });
+    await expect(events.next()).resolves.toEqual({ value: large, done: false });
+    // Yield ownership remains charged until the consumer resumes or returns.
+    expect(pool.snapshot().jumboUsedBytes).toBe(coverage);
+    await events.return(undefined);
+    expect(pool.snapshot().jumboUsedBytes).toBe(0);
+    pool.close();
   });
 
   it("rejects the final idempotently and closes blocked producers", async () => {
@@ -123,6 +157,192 @@ describe("V2RunHandle", () => {
 
     await expect(handle.final).rejects.toBe(error);
     await expect(blocked).rejects.toBe(error);
-    expect(await Array.fromAsync(handle.events())).toHaveLength(1);
+    expect(await Array.fromAsync(handle.events())).toHaveLength(0);
+  });
+
+  it("drains an accepted prefix before a definitive provider failure", async () => {
+    const frame = {
+      event: "response.output_text.delta",
+      data: JSON.stringify({ type: "response.output_text.delta", delta: "valid prefix" }),
+    };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const retained = v2RetainedEventPermitBytes(wireBytes);
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: retained, jumboBytes: 1 });
+    const handle = new V2RunHandle({ requireTransferredEventMemory: true });
+    expect(handle.tryAcceptEvent(frame, wireBytes, pool.tryAcquire(retained)!)).toBe(true);
+    const error = new V2CommittedError(
+      "provider rate limit",
+      "rate_limit_exceeded",
+      false,
+    );
+    handle.fail(error);
+
+    await expect(handle.final).rejects.toBe(error);
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(retained);
+    const events = handle.events();
+    await expect(events.next()).resolves.toEqual({ value: frame, done: false });
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(retained);
+    await expect(events.next()).resolves.toEqual({ value: undefined, done: true });
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    pool.close();
+  });
+
+  it("releases transferred permits for no-consumer disposal and cancellation", async () => {
+    const frame = { event: "delta", data: "small" };
+    const bytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const coverage = v2EventPhysicalWorkingSetBytes(bytes);
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: coverage * 2, jumboBytes: 1 });
+
+    const explicit = new V2RunHandle({});
+    await explicit.acceptEvent(
+      frame,
+      bytes,
+      (await pool.acquire(coverage)).transfer("explicit"),
+    );
+    explicit.discardUnconsumedEvents();
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(0);
+
+    const failed = new V2RunHandle({});
+    await failed.acceptEvent(
+      { ...frame },
+      bytes,
+      (await pool.acquire(coverage)).transfer("failed"),
+    );
+    failed.cancel(new Error("test cancellation"));
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(0);
+    pool.close();
+  });
+
+  it("bounds the aggregate peak of sixteen slow consumers in one pool", () => {
+    const frame = {
+      event: "response.output_text.delta",
+      data: JSON.stringify({ type: "response.output_text.delta", delta: "held" }),
+    };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const coverage = v2EventPhysicalWorkingSetBytes(wireBytes);
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: coverage * 16,
+      jumboBytes: coverage,
+    });
+    const handles = Array.from({ length: 16 }, () => new V2RunHandle({
+      maxBufferedBytes: 4_096,
+      requireTransferredEventMemory: true,
+    }));
+    handles.forEach((handle, index) => {
+      const permit = pool.tryAcquire(coverage, { label: `slow-${index}` })!;
+      expect(handle.tryAcceptEvent({ ...frame }, wireBytes, permit)).toBe(true);
+    });
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 16,
+      ordinaryUsedBytes: coverage * 16,
+    });
+    for (const handle of handles) handle.discardUnconsumedEvents();
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+    });
+  });
+
+  it("keeps one jumbo terminal charge until event and final owners both release", async () => {
+    const output = [{ type: "message", content: "x".repeat(1024 * 1024) }];
+    const final = { id: "resp_shared", status: "completed", output };
+    const frame = {
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response: final }),
+    };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const retained = v2RetainedEventPermitBytes(wireBytes);
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 1, jumboBytes: retained });
+    const handle = new V2RunHandle({
+      requireTransferredEventMemory: true,
+    });
+
+    expect(handle.tryAcceptEvent(
+      frame,
+      wireBytes,
+      pool.tryAcquire(retained, { region: "jumbo" })!,
+    )).toBe(true);
+    handle.settle(final);
+    expect(atomicBytePermitOf(final)).toMatchObject({
+      active: true,
+      bytes: retained,
+      region: "jumbo",
+    });
+
+    const events = handle.events();
+    await expect(events.next()).resolves.toEqual({ value: frame, done: false });
+    expect(pool.snapshot()).toMatchObject({ activePermits: 1, jumboUsedBytes: retained });
+    await events.return(undefined);
+    // Returning the event iterator releases only the event/output reference.
+    expect(pool.snapshot()).toMatchObject({ activePermits: 1, jumboUsedBytes: retained });
+    releaseAtomicBytePermit(final);
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, jumboUsedBytes: 0 });
+    pool.close();
+  });
+
+  it("enforces the retained event-count boundary independently of bytes", async () => {
+    const frame = { event: "delta", data: "x" };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const retained = v2RetainedEventPermitBytes(wireBytes);
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: retained * 3, jumboBytes: 1 });
+    const handle = new V2RunHandle({
+      maxBufferedEvents: 2,
+      requireTransferredEventMemory: true,
+    });
+    expect(handle.tryAcceptEvent({ ...frame }, wireBytes, pool.tryAcquire(retained)!)).toBe(true);
+    expect(handle.tryAcceptEvent({ ...frame }, wireBytes, pool.tryAcquire(retained)!)).toBe(true);
+    const third = pool.tryAcquire(retained)!;
+    expect(handle.tryAcceptEvent({ ...frame }, wireBytes, third)).toBe(false);
+    expect(third.active).toBe(true);
+
+    const events = handle.events();
+    await events.next();
+    expect(handle.tryAcceptEvent({ ...frame }, wireBytes, third)).toBe(true);
+    handle.settle({ id: "resp_count", status: "completed" });
+    await events.return(undefined);
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(0);
+    pool.close();
+  });
+
+  it("fits sixteen full tiny-event queues inside derived ordinary capacity", () => {
+    const MiB = 1024 * 1024;
+    const sizing = deriveV2HostEventMemorySizing({
+      runtimes: 1,
+      maxActivePerRuntime: 16,
+      responseMaxBytes: 64 * MiB,
+    });
+    const frame = { event: "delta", data: "x" };
+    const wireBytes = new TextEncoder().encode(sseFrame(frame.event, frame.data)).byteLength;
+    const retained = v2RetainedEventPermitBytes(wireBytes);
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: sizing.ordinaryBytes,
+      jumboBytes: sizing.jumboBytes,
+    });
+    const handles = Array.from({ length: 16 }, () => new V2RunHandle({
+      requireTransferredEventMemory: true,
+    }));
+
+    for (const handle of handles) {
+      for (let index = 0; index < V2_EVENT_MAX_BUFFERED_EVENTS; index++) {
+        const permit = pool.tryAcquire(retained);
+        expect(permit).not.toBeNull();
+        expect(handle.tryAcceptEvent({ ...frame }, wireBytes, permit!)).toBe(true);
+      }
+    }
+    expect(pool.snapshot().ordinaryUsedBytes).toBeLessThanOrEqual(sizing.ordinaryBytes);
+    for (const handle of handles) handle.discardUnconsumedEvents();
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    pool.close();
+  });
+
+  it("rejects unsafe buffer enlargement and checked physical-size overflow", () => {
+    expect(() => new V2RunHandle({
+      maxBufferedBytes: V2_EVENT_SOFT_BUFFER_BYTES + 1,
+    })).toThrow("maxBufferedBytes");
+    expect(() => new V2RunHandle({
+      maxBufferedEvents: V2_EVENT_MAX_BUFFERED_EVENTS + 1,
+    })).toThrow("maxBufferedEvents");
+    expect(() => v2EventPhysicalWorkingSetBytes(Number.MAX_SAFE_INTEGER))
+      .toThrow("safe integer");
   });
 });

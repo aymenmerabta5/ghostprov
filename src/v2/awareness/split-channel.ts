@@ -18,8 +18,11 @@ implements AwarenessChannel<TLocal, TRemote> {
   readonly localPeerId: string;
   readonly #data: AwarenessChannel<TLocal, TRemote>;
   readonly #control: AwarenessChannel<TLocal, TRemote>;
+  readonly #failureListeners = new Set<(error: Error) => void>();
+  readonly #unsubscribeFailures: Array<() => void> = [];
   #closed = false;
   #connected = false;
+  #everConnected = false;
   #connecting: Promise<void> | null = null;
 
   constructor(options: SplitAwarenessChannelOptions<TLocal, TRemote>) {
@@ -30,6 +33,16 @@ implements AwarenessChannel<TLocal, TRemote> {
     this.localPeerId = options.data.localPeerId;
     this.#data = options.data;
     this.#control = options.control;
+    for (const channel of [this.#data, this.#control]) {
+      const unsubscribe = channel.onConnectionFailure?.(error => {
+        if (this.#closed) return;
+        this.#connected = false;
+        for (const listener of this.#failureListeners) {
+          try { listener(error); } catch {}
+        }
+      });
+      if (unsubscribe) this.#unsubscribeFailures.push(unsubscribe);
+    }
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -41,8 +54,10 @@ implements AwarenessChannel<TLocal, TRemote> {
       this.#control.connect(signal),
     ]).then(() => {
       this.#connected = true;
+      this.#everConnected = true;
     }).catch(async error => {
-      await this.close();
+      this.#connected = false;
+      if (!this.#everConnected) await this.close();
       throw error;
     }).finally(() => {
       if (this.#connecting === connecting) this.#connecting = null;
@@ -87,16 +102,29 @@ implements AwarenessChannel<TLocal, TRemote> {
     ])].sort();
   }
 
-  rotateCredential(envelope: YSweetEnvelope): void {
+  onConnectionFailure(listener: (error: Error) => void): () => void {
     if (this.#closed) throw new Error("Split Awareness channel is closed");
-    this.#data.rotateCredential?.(envelope);
-    this.#control.rotateCredential?.(envelope);
+    this.#failureListeners.add(listener);
+    return () => this.#failureListeners.delete(listener);
+  }
+
+  async rotateCredential(envelope: YSweetEnvelope): Promise<void> {
+    if (this.#closed) throw new Error("Split Awareness channel is closed");
+    await Promise.all([
+      Promise.resolve(this.#data.rotateCredential?.(envelope)),
+      Promise.resolve(this.#control.rotateCredential?.(envelope)),
+    ]);
+    if (this.#closed) throw new Error("Split Awareness channel is closed");
+    this.#connected = true;
+    this.#everConnected = true;
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     this.#connected = false;
+    for (const unsubscribe of this.#unsubscribeFailures.splice(0)) unsubscribe();
+    this.#failureListeners.clear();
     await Promise.allSettled([
       this.#data.close(),
       this.#control.close(),

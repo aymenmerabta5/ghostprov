@@ -1,7 +1,11 @@
 import { createServer as createHttpServer, type Server } from "node:http";
 import type { Hono } from "hono";
 import { writeFetchResponse } from "../http/adapter";
-import { collectRequestBody, contentLengthExceeds } from "../http/body";
+import {
+  collectRequestBody,
+  contentLengthExceeds,
+  declaredContentLength,
+} from "../http/body";
 import { ApiError, apiErrorResponse } from "../http/errors";
 import {
   isAnthropicRequestPath,
@@ -15,6 +19,7 @@ import {
 import { attachResponsesWebSocket } from "../ws/server";
 import type { RouterLike } from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
+import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
 
@@ -25,6 +30,7 @@ export interface GhostProvServerOptions {
   candidate?: boolean;
   maxBodyBytes?: number;
   webSocketTelemetry?: WebSocketTelemetry;
+  webSocketProcessBudget?: WebSocketProcessBudget;
 }
 
 export { requestBodyLimitForUrl } from "../http/request-policy";
@@ -46,7 +52,15 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
   if (options.candidate && options.port === 8787) {
     throw new RangeError("Candidate server cannot bind protected port 8787");
   }
+  const connectionIds = new WeakMap<object, string>();
+  let nextConnectionId = 0;
   const server = createHttpServer((request, response) => {
+    let connectionClientId = connectionIds.get(request.socket);
+    if (!connectionClientId) {
+      connectionClientId = `http-connection-${nextConnectionId}`;
+      nextConnectionId = (nextConnectionId + 1) % 10_000;
+      connectionIds.set(request.socket, connectionClientId);
+    }
     const relayAbort = new AbortController();
     const abortRelay = () => relayAbort.abort();
     const abortOnIncompleteClose = () => {
@@ -78,15 +92,23 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
               await writeFetchResponse(response, fetchResponse);
               return;
             }
-            const declared = Number(request.headers["content-length"]);
-            const reservationBytes = Number.isFinite(declared) && declared >= 0
-              ? declared
-              : maxBodyBytes;
+            const declared = declaredContentLength(request.headers["content-length"]);
+            // Unknown/chunked bodies start with the governor's small ingress
+            // floor and grow before each chunk is retained. Reserving the full
+            // 64 MiB ceiling here used to consume roughly 130 MiB per tiny
+            // request and destroyed useful concurrency.
+            const reservationBytes = declared ?? 0;
             bodyLease = await options.router.acquireIncomingBody?.(
               reservationBytes,
               relayAbort.signal,
+              { maxBytes: maxBodyBytes },
             ) ?? null;
-            const collected = await collectRequestBody(request, maxBodyBytes);
+            const collected = await collectRequestBody(request, maxBodyBytes, {
+              signal: bodyLease?.signal ?? relayAbort.signal,
+              beforeRetain: bodyLease?.ensureBytes
+                ? bytes => bodyLease!.ensureBytes!(bytes)
+                : undefined,
+            });
             if (collected.length) body = new Uint8Array(collected);
           }
           const fetchRequest = new Request(`http://${host}${request.url ?? "/"}`, {
@@ -97,6 +119,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
           });
           const bindings: HttpRequestBindings = {
             incomingBodyLease: bodyLease ?? undefined,
+            httpConnectionClientId: connectionClientId,
           };
           fetchResponse = await options.app.fetch(fetchRequest, bindings);
         } finally {
@@ -121,10 +144,12 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
   });
   attachResponsesWebSocket(server, {
     telemetry: options.webSocketTelemetry,
+    processBudget: options.webSocketProcessBudget,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {
       source: "websocket",
       clientId: relayOptions.clientId,
       signal: relayOptions.signal,
+      encodedBodyBytes: relayOptions.encodedBodyBytes,
     }),
   });
   return server;

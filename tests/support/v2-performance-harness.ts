@@ -1,4 +1,5 @@
 import type { Clock } from "../../src/core/ports";
+import { gzipSync } from "node:zlib";
 import type { RunHandle } from "../../src/relay/run-handle";
 import type { SseFrame } from "../../src/relay/sse";
 import { ResourceGovernor } from "../../src/router/resource-governor";
@@ -7,6 +8,7 @@ import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
   type RoutableSandboxSnapshot,
+  type SandboxRunOptions,
 } from "../../src/sandbox/registry";
 import { projectId, type ProjectId } from "../../src/sandbox/types";
 import { parseYSweetEnvelope } from "../../src/prism/protocol";
@@ -15,7 +17,11 @@ import {
   YSweetAwarenessChannel,
   type AwarenessProviderLike,
 } from "../../src/v2/awareness/y-sweet-channel";
-import { createCredentialRotationKey } from "../../src/v2/bootstrap/crypto";
+import {
+  createCredentialRotationKey,
+  sealCredentialRotation,
+  type BootstrapCredentialPayload,
+} from "../../src/v2/bootstrap/crypto";
 import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler";
 import type { V2TransportDiagnostics } from "../../src/v2/diagnostics/types";
@@ -30,7 +36,9 @@ import {
   type AwarenessLane,
   type HostFrame,
   type ProtocolBinding,
+  type ProtocolRevision,
   type ReliableFrame,
+  type RequestEncoding,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared";
 import { AdmissionController } from "../../src/v2/sidecar/admission";
@@ -62,6 +70,8 @@ const PROJECT = projectId("9a41e916-8c9f-4c27-97bb-c8d87d20d001");
 const HOST_INSTANCE = "host-perf-harness";
 const SIDECAR_INSTANCE = "sidecar-perf-harness";
 const LAUNCH_NONCE = "launch-perf-harness";
+const DEFAULT_LINK_BANDWIDTH_BYTES_PER_SECOND = 25 * MiB;
+const DEFAULT_SERIALIZATION_BYTES_PER_SECOND = 250 * MiB;
 
 export const V2_PERFORMANCE_RTTS_MS = [50, 300, 1_000] as const;
 export const V2_PERFORMANCE_CONCURRENCY = [1, 4, 16, 32, 40] as const;
@@ -75,6 +85,7 @@ export const V2_PERFORMANCE_PAYLOAD_BYTES = Object.freeze({
 
 export type V2HarnessDirection = "host-to-sidecar" | "sidecar-to-host";
 export type V2HarnessFaultAction = "drop" | "duplicate" | "reorder";
+export type V2PerformanceCorpus = "compressible" | "mixed" | "incompressible";
 
 export interface V2HarnessFaultRule {
   direction: V2HarnessDirection;
@@ -93,9 +104,16 @@ export interface V2HarnessTransientDisconnect {
 }
 
 export interface V2PerformanceHarnessOptions {
+  /** Defaults to R2. R1 selects source-level wire limits, not the frozen bundle. */
+  protocolRevision?: ProtocolRevision;
   rttMs: number;
   requestBytes: number;
   concurrency: number;
+  corpus?: V2PerformanceCorpus;
+  linkBandwidthBytesPerSecond?: number;
+  serializationBytesPerSecond?: number;
+  /** Rotate the sidecar Y-Sweet credential after request data starts moving. */
+  rotateCredentialDuringTransfer?: boolean;
   faults?: readonly V2HarnessFaultRule[];
   transientDisconnects?: readonly V2HarnessTransientDisconnect[];
   /** Prevents accidental large cross-products in normal CI. */
@@ -112,11 +130,20 @@ export interface V2HarnessTimingSummary {
 export interface V2HarnessRequestResult {
   index: number;
   requestBytes: number;
+  encodedRequestBytes: number;
+  requestEncoding: RequestEncoding;
   requestDigest: string;
   upstreamDigest: string;
-  commitMs: number;
-  firstEventMs: number;
-  totalMs: number;
+  /** Deterministic virtual network/serialization model; excludes host CPU. */
+  modeledCommitMs: number;
+  modeledFirstEventMs: number;
+  modeledTotalMs: number;
+  /** Measured wall time through the real host preparation and protocol code. */
+  wallCommitMs: number;
+  wallFirstEventMs: number;
+  wallTotalMs: number;
+  /** Wall time through the first encoded Yjs request publication. */
+  hostPreparationWallMs: number;
   ackRoundsAtCommit: number;
   eventCount: number;
   transcriptDigest: string;
@@ -144,27 +171,53 @@ export interface V2HarnessWireSnapshot {
   attemptedPublications: number;
   deliveredUpdates: number;
   attemptedBytes: number;
+  /** Host data-lane bytes for request open/data/commit flights only. */
+  hostRequestDataAttemptedBytes: number;
   deliveredBytes: number;
   droppedUpdates: number;
   disconnectedDrops: number;
   duplicateDeliveries: number;
   reorderedUpdates: number;
   usefulRequestBytes: number;
+  postCompressionRequestBytes: number;
   uniqueRequestDataBytes: number;
   hostDataPublications: number;
   sidecarDataPublications: number;
 }
 
 export interface V2PerformanceHarnessReport {
+  /** This harness executes mutable TypeScript production components. */
+  implementation: "mutable-source-components";
+  protocolRevision: ProtocolRevision;
+  corpus: V2PerformanceCorpus;
   rttMs: number;
   requestBytes: number;
   concurrency: number;
   virtualElapsedMs: number;
+  link: {
+    bandwidthBytesPerSecond: number;
+    serializationBytesPerSecond: number;
+  };
+  operations: {
+    credentialRotations: number;
+  };
   requests: readonly V2HarnessRequestResult[];
   timings: {
-    commitMs: V2HarnessTimingSummary;
-    firstEventMs: V2HarnessTimingSummary;
-    totalMs: V2HarnessTimingSummary;
+    modeledLink: {
+      commitMs: V2HarnessTimingSummary;
+      firstEventMs: V2HarnessTimingSummary;
+      totalMs: V2HarnessTimingSummary;
+    };
+    measuredWall: {
+      commitMs: V2HarnessTimingSummary;
+      firstEventMs: V2HarnessTimingSummary;
+      totalMs: V2HarnessTimingSummary;
+      hostPreparationMs: V2HarnessTimingSummary;
+    };
+  };
+  preparation: {
+    gzipCalls: number;
+    gzipWallMs: number;
   };
   upstream: {
     calls: number;
@@ -216,9 +269,16 @@ interface WireRequestTrace {
   requestDigest: string;
   decodedBytes: number;
   encodedBytes: number;
+  encoding: RequestEncoding;
   uniqueDataBytes: number;
   parts: Set<number>;
   flights: Set<string>;
+  firstPublicationWallMs: number | null;
+}
+
+interface PreparationWallMetrics {
+  gzipCalls: number;
+  gzipWallMs: number;
 }
 
 interface HubEndpointMetadata {
@@ -309,12 +369,16 @@ class FaultyAwarenessHub {
   readonly #requestTraces = new Map<string, WireRequestTrace>();
   readonly #digestToRequest = new Map<string, string>();
   readonly #activity = new Set<() => void>();
+  readonly #linkAvailableAt = new Map<string, number>();
+  readonly #bandwidthBytesPerSecond: number;
+  readonly #serializationBytesPerSecond: number;
   #nextUpdateId = 1;
   #pump: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
   #attemptedPublications = 0;
   #deliveredUpdates = 0;
   #attemptedBytes = 0;
+  #hostRequestDataAttemptedBytes = 0;
   #deliveredBytes = 0;
   #droppedUpdates = 0;
   #disconnectedDrops = 0;
@@ -328,6 +392,10 @@ class FaultyAwarenessHub {
     this.#rttMs = options.rttMs;
     this.#faults = options.faults ?? [];
     this.#disconnects = options.transientDisconnects ?? [];
+    this.#bandwidthBytesPerSecond = options.linkBandwidthBytesPerSecond ??
+      DEFAULT_LINK_BANDWIDTH_BYTES_PER_SECOND;
+    this.#serializationBytesPerSecond = options.serializationBytesPerSecond ??
+      DEFAULT_SERIALIZATION_BYTES_PER_SECOND;
   }
 
   create(
@@ -386,21 +454,25 @@ class FaultyAwarenessHub {
 
   snapshot(): V2HarnessWireSnapshot {
     let usefulRequestBytes = 0;
+    let postCompressionRequestBytes = 0;
     let uniqueRequestDataBytes = 0;
     for (const trace of this.#requestTraces.values()) {
       usefulRequestBytes += trace.decodedBytes;
+      postCompressionRequestBytes += trace.encodedBytes;
       uniqueRequestDataBytes += trace.uniqueDataBytes;
     }
     return {
       attemptedPublications: this.#attemptedPublications,
       deliveredUpdates: this.#deliveredUpdates,
       attemptedBytes: this.#attemptedBytes,
+      hostRequestDataAttemptedBytes: this.#hostRequestDataAttemptedBytes,
       deliveredBytes: this.#deliveredBytes,
       droppedUpdates: this.#droppedUpdates,
       disconnectedDrops: this.#disconnectedDrops,
       duplicateDeliveries: this.#duplicateDeliveries,
       reorderedUpdates: this.#reorderedUpdates,
       usefulRequestBytes,
+      postCompressionRequestBytes,
       uniqueRequestDataBytes,
       hostDataPublications: this.#hostDataPublications,
       sidecarDataPublications: this.#sidecarDataPublications,
@@ -440,9 +512,12 @@ class FaultyAwarenessHub {
     this.#ordinals.set(key, ordinal);
     this.#attemptedPublications++;
     this.#attemptedBytes += update.byteLength;
+    const dueAtMs = this.#deliveryDueAt(key, update.byteLength);
     if (direction === "host-to-sidecar" && lane === "data") {
       this.#hostDataPublications++;
-      this.#trackHostDataEnvelope(source);
+      if (this.#trackHostDataEnvelope(source)) {
+        this.#hostRequestDataAttemptedBytes += update.byteLength;
+      }
     } else if (direction === "sidecar-to-host" && lane === "data") {
       this.#sidecarDataPublications++;
     }
@@ -455,7 +530,7 @@ class FaultyAwarenessHub {
     ));
     if (disconnected) {
       this.#disconnectedDrops++;
-      this.#scheduleClockOnly();
+      this.#scheduleClockOnly(dueAtMs);
       return;
     }
 
@@ -468,13 +543,13 @@ class FaultyAwarenessHub {
       .flatMap(value => value.actions));
     if (actions.has("drop")) {
       this.#droppedUpdates++;
-      this.#scheduleClockOnly();
+      this.#scheduleClockOnly(dueAtMs);
       return;
     }
 
     const queued: QueuedUpdate = {
       id: this.#nextUpdateId++,
-      dueAtMs: this.#clock.now() + this.#rttMs / 2,
+      dueAtMs,
       target,
       update: update.slice(),
       bytes: update.byteLength,
@@ -506,10 +581,20 @@ class FaultyAwarenessHub {
     this.#schedulePump();
   }
 
-  #scheduleClockOnly(): void {
+  #deliveryDueAt(key: string, bytes: number): number {
+    const now = this.#clock.now();
+    const startsAt = Math.max(now, this.#linkAvailableAt.get(key) ?? now);
+    const serviceMs = bytes * 1_000 / this.#bandwidthBytesPerSecond +
+      bytes * 1_000 / this.#serializationBytesPerSecond;
+    const completedAt = startsAt + serviceMs;
+    this.#linkAvailableAt.set(key, completedAt);
+    return completedAt + this.#rttMs / 2;
+  }
+
+  #scheduleClockOnly(dueAtMs: number): void {
     this.#queue.push({
       id: this.#nextUpdateId++,
-      dueAtMs: this.#clock.now() + this.#rttMs,
+      dueAtMs,
       target: null,
       update: new Uint8Array(),
       bytes: 0,
@@ -543,10 +628,15 @@ class FaultyAwarenessHub {
     if (this.#queue.length > 0) this.#schedulePump();
   }
 
-  #trackHostDataEnvelope(source: HarnessAwarenessProvider): void {
+  #trackHostDataEnvelope(source: HarnessAwarenessProvider): boolean {
     const envelope = source.awareness.getLocalState()
       ?.ghostprovV2Data as AwarenessEnvelope<HostFrame> | undefined;
-    if (!envelope || envelope.frames.length === 0) return;
+    if (!envelope || envelope.frames.length === 0) return false;
+    const containsRequestData = envelope.frames.some(frame =>
+      frame.kind === "request_open" ||
+      frame.kind === "request_data" ||
+      frame.kind === "request_commit" ||
+      frame.kind === "request_start");
     const flightKey = `${envelope.epoch}:${envelope.frames[0]!.sequence}-${envelope.frames.at(-1)!.sequence}`;
     const requestIds = new Set<string>();
     for (const frame of envelope.frames) {
@@ -560,9 +650,11 @@ class FaultyAwarenessHub {
             requestDigest: frame.requestDigest,
             decodedBytes: frame.decodedBytes,
             encodedBytes: frame.encodedBytes,
+            encoding: frame.encoding,
             uniqueDataBytes: 0,
             parts: new Set(),
             flights: new Set(),
+            firstPublicationWallMs: performance.now(),
           };
           this.#requestTraces.set(frame.requestId, trace);
           this.#digestToRequest.set(frame.requestDigest, frame.requestId);
@@ -579,6 +671,7 @@ class FaultyAwarenessHub {
     for (const requestId of requestIds) {
       this.#requestTraces.get(requestId)?.flights.add(flightKey);
     }
+    return containsRequestData;
   }
 }
 
@@ -658,13 +751,12 @@ class DigestingUpstream {
           data: JSON.stringify({ type: "response.completed", response: final }),
         },
       ];
-      const transcript = new TranscriptProof("upstream", "0".repeat(64));
+      const transcript = new TranscriptProof("upstream", "0".repeat(64), { retainBytes: false });
       for (const event of events) {
-        transcript.append(event);
+        await transcript.appendCanonicalStream(event, { onChunk: input.onTranscriptBytes });
         await input.onEvent(event);
       }
       const terminal = await transcript.createTerminal();
-      const snapshot = transcript.snapshot();
       this.proofs.set(index, {
         requestDigest,
         transcriptDigest: terminal.transcriptSha256,
@@ -679,7 +771,6 @@ class DigestingUpstream {
         finalEventIndex: terminal.finalEventIndex,
         finalSha256: terminal.finalSha256,
         final,
-        transcriptBytes: snapshot.canonicalBytes,
       };
     } finally {
       this.active--;
@@ -734,8 +825,15 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   readonly #engine: SidecarEngine;
   readonly #journal: ClaimJournal;
   readonly #sampler: SidecarResourceSampler;
+  readonly #binding: ProtocolBinding;
+  readonly #credential: BootstrapCredentialPayload;
+  readonly #peerErrors: Error[];
+  readonly #preparationWall: PreparationWallMetrics;
   readonly #physical: number;
+  readonly #listeners = new Set<() => void>();
   #state = "configured";
+  #lastRoutingSignal = "";
+  #credentialRotations = 0;
   #unsubscribeActivity: (() => void) | null = null;
 
   private constructor(options: {
@@ -746,6 +844,10 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     upstream: DigestingUpstream;
     journal: ClaimJournal;
     sampler: SidecarResourceSampler;
+    binding: ProtocolBinding;
+    credential: BootstrapCredentialPayload;
+    peerErrors: Error[];
+    preparationWall: PreparationWallMetrics;
     physical: number;
   }) {
     this.#hub = options.hub;
@@ -755,8 +857,15 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     this.upstream = options.upstream;
     this.#journal = options.journal;
     this.#sampler = options.sampler;
+    this.#binding = options.binding;
+    this.#credential = options.credential;
+    this.#peerErrors = options.peerErrors;
+    this.#preparationWall = options.preparationWall;
     this.#physical = options.physical;
-    this.#unsubscribeActivity = this.#hub.onActivity(() => this.sample());
+    this.#unsubscribeActivity = this.#hub.onActivity(() => {
+      this.sample();
+      this.#notifyIfRoutingChanged();
+    });
   }
 
   static async create(
@@ -769,15 +878,24 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     // Wall timers remain production timers. Keep normal runs clear of
     // artificial retransmissions; fault cases use a short bounded RTO so CI
     // does not wait for the virtual RTT in wall-clock time.
-    const retransmitMs = faulted ? 5 : 1_000;
-    const binding: ProtocolBinding = {
-      protocolRevision: "r2",
+    const retransmitMs = faulted
+      ? 5
+      : Math.max(1_000, Math.ceil(options.requestBytes / MiB) * 500);
+    const protocolRevision = options.protocolRevision ?? "r2";
+    const bindingBase = {
       projectId: PROJECT,
       sessionId: "sandbox-session-perf",
       leaderGeneration: 7,
       buildHash: "a".repeat(64),
-      schemaHash: await protocolSchemaHash("r2"),
+      schemaHash: await protocolSchemaHash(protocolRevision),
       launchNonce: LAUNCH_NONCE,
+    };
+    const binding: ProtocolBinding = protocolRevision === "r2"
+      ? { ...bindingBase, protocolRevision: "r2" }
+      : { ...bindingBase, protocolRevision: "r1" };
+    const preparationWall: PreparationWallMetrics = {
+      gzipCalls: 0,
+      gzipWallMs: 0,
     };
     const ySweet = parseYSweetEnvelope({
       url: `wss://prism.test/y/d/${PROJECT}/ws`,
@@ -811,6 +929,15 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       retransmitMs,
       publicationIntervalMs: 1,
       unadmittedTimeoutMs: options.timeoutMs ?? 20_000,
+      gzip: async bytes => {
+        const startedAt = performance.now();
+        preparationWall.gzipCalls++;
+        try {
+          return Uint8Array.from(gzipSync(bytes, { level: 1 }));
+        } finally {
+          preparationWall.gzipWallMs += performance.now() - startedAt;
+        }
+      },
       expectedSidecarInstanceId: SIDECAR_INSTANCE,
       hostInstanceId: HOST_INSTANCE,
     });
@@ -822,11 +949,19 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       maxBatch: Math.max(64, options.concurrency * 2),
     });
     const aggregate = options.requestBytes * options.concurrency;
+    // Assembly owns decoded + encoded bytes plus a dense part index. Keep
+    // explicit metadata/headroom so an exact 64 MiB request is not rejected by
+    // the harness budget before the production protocol boundary is tested.
+    const sidecarMemoryBudget = Math.max(
+      64 * MiB,
+      aggregate * 3,
+      options.concurrency * 4 * MiB,
+    );
     const admission = new AdmissionController({
       physicalMax: options.concurrency,
       acceptedMax: Math.min(128, options.concurrency * 2),
       hostCeiling: options.concurrency,
-      memoryBudgetBytes: Math.max(64 * MiB, aggregate * 2, options.concurrency * 4 * MiB),
+      memoryBudgetBytes: sidecarMemoryBudget,
     });
     const sampler = new SidecarResourceSampler({
       enabled: false,
@@ -843,7 +978,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     const engine = new SidecarEngine({
       binding,
       assembler: new RequestAssembler({
-        maxReservedBytes: Math.max(64 * MiB, aggregate * 2),
+        maxReservedBytes: sidecarMemoryBudget,
       }),
       journal,
       admission,
@@ -853,15 +988,17 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       assertExecutionFence: frame => peer.assertExecutionFence(frame),
       emit: (frame, priority, streamId) => peer.enqueue(frame, priority, streamId),
     });
+    const credential: BootstrapCredentialPayload = {
+      url: ySweet.url,
+      baseUrl: ySweet.baseUrl,
+      docId: ySweet.docId,
+      token: ySweet.token.reveal(),
+      authorization: "full",
+      rotationKey: createCredentialRotationKey(),
+    };
+    const peerErrors: Error[] = [];
     peer = new DenoAwarenessPeer({
-      credential: {
-        url: ySweet.url,
-        baseUrl: ySweet.baseUrl,
-        docId: ySweet.docId,
-        token: ySweet.token.reveal(),
-        authorization: "full",
-        rotationKey: createCredentialRotationKey(),
-      },
+      credential,
       binding,
       instanceId: SIDECAR_INSTANCE,
       engine,
@@ -873,6 +1010,8 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       closeTimeoutMs: 2_000,
       initialActivePerSandbox: options.concurrency,
       maxActivePerSandbox: options.concurrency,
+      onAcceptError: error => peerErrors.push(error),
+      onEngineError: error => peerErrors.push(error),
     });
     const runtime = new PerformanceRuntime({
       hub,
@@ -882,6 +1021,10 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       upstream,
       journal,
       sampler,
+      binding,
+      credential,
+      peerErrors,
+      preparationWall,
       physical: options.concurrency,
     });
     return runtime;
@@ -901,6 +1044,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       "V2 harness initial credits",
     );
     this.#state = "ready";
+    this.#notifyIfRoutingChanged();
   }
 
   async drain(reason: string): Promise<void> {
@@ -921,11 +1065,89 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     ]);
     this.#unsubscribeActivity?.();
     this.#unsubscribeActivity = null;
+    this.#listeners.clear();
     this.#state = "stopped";
   }
 
-  run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
-    return this.#session.run(body, signal);
+  run(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    return this.#session.run(body, signal, options);
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  async rotateCredential(): Promise<void> {
+    const rotationId = `perf-rotation-${this.#credentialRotations + 1}`;
+    const rotationBindingBase = {
+      projectId: this.#binding.projectId,
+      sandboxSessionId: this.#binding.sessionId,
+      leaderGeneration: this.#binding.leaderGeneration,
+      buildHash: this.#binding.buildHash,
+      schemaHash: this.#binding.schemaHash,
+      instanceId: SIDECAR_INSTANCE,
+      rotationId,
+    };
+    const rotationBinding = this.#binding.protocolRevision === "r2"
+      ? {
+          ...rotationBindingBase,
+          protocolRevision: "r2" as const,
+          schemaVersion: 2 as const,
+          launchNonce: this.#binding.launchNonce,
+        }
+      : rotationBindingBase;
+    const sealed = await sealCredentialRotation({
+      rotationKey: this.#credential.rotationKey,
+      binding: rotationBinding,
+      credential: {
+        url: this.#credential.url,
+        baseUrl: this.#credential.baseUrl,
+        docId: this.#credential.docId,
+        token: `rotated-perf-token-${rotationId}-${"x".repeat(32)}`,
+        authorization: this.#credential.authorization,
+      },
+    });
+    await this.#session.rotateCredential(rotationId, JSON.stringify(sealed));
+    this.#credentialRotations++;
+  }
+
+  get credentialRotations(): number {
+    return this.#credentialRotations;
+  }
+
+  peerErrorMessages(): readonly string[] {
+    return this.#peerErrors.map(error => `${error.name}:${error.message}`);
+  }
+
+  preparationWallMetrics(): PreparationWallMetrics {
+    return { ...this.#preparationWall };
+  }
+
+  #notifyIfRoutingChanged(): void {
+    const transport = this.#session.snapshot();
+    const capacity = this.#state === "ready" ? this.#physical : 0;
+    const available = this.#state === "ready"
+      ? Math.max(0, Math.min(
+        transport.admissionCredits ?? transport.credits,
+        capacity - transport.active - transport.quarantined,
+      ))
+      : 0;
+    const signal = [
+      this.#state,
+      capacity,
+      transport.active,
+      available,
+      transport.queued,
+      transport.quarantined,
+    ].join(":");
+    if (signal === this.#lastRoutingSignal) return;
+    this.#lastRoutingSignal = signal;
+    for (const listener of this.#listeners) listener();
   }
 
   snapshot(): RoutableSandboxSnapshot {
@@ -939,7 +1161,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       active: transport.active,
       available: this.#state === "ready"
         ? Math.max(0, Math.min(
-          transport.credits,
+          transport.admissionCredits ?? transport.credits,
           capacity - transport.active - transport.quarantined,
         ))
         : 0,
@@ -977,15 +1199,48 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   }
 }
 
-function deterministicPadding(length: number): string {
+function compressiblePadding(length: number): string {
   if (length <= 0) return "";
   const pattern = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
   return pattern.repeat(Math.ceil(length / pattern.length)).slice(0, length);
 }
 
+const JSON_SAFE_PRINTABLE = Array.from({ length: 95 }, (_, index) => index + 32)
+  .filter(code => code !== 0x22 && code !== 0x5c)
+  .map(code => String.fromCharCode(code))
+  .join("");
+
+function corpusPadding(
+  length: number,
+  index: number,
+  corpus: V2PerformanceCorpus,
+): string {
+  if (corpus === "compressible") return compressiblePadding(length);
+  const chunks: string[] = [];
+  let state = (0x9e37_79b9 ^ (index + 1) * 0x85eb_ca6b) >>> 0;
+  for (let offset = 0; offset < length;) {
+    const size = Math.min(8_192, length - offset);
+    if (corpus === "mixed" && Math.floor(offset / 16_384) % 2 === 0) {
+      chunks.push(compressiblePadding(size));
+    } else {
+      const characters = new Array<string>(size);
+      for (let position = 0; position < size; position++) {
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        characters[position] = JSON_SAFE_PRINTABLE[(state >>> 0) % JSON_SAFE_PRINTABLE.length]!;
+      }
+      chunks.push(characters.join(""));
+    }
+    offset += size;
+  }
+  return chunks.join("");
+}
+
 export function createExactSizedV2Request(
   requestBytes: number,
   index = 0,
+  corpus: V2PerformanceCorpus = "compressible",
 ): Record<string, unknown> {
   if (!Number.isSafeInteger(requestBytes) || requestBytes < 1) {
     throw new RangeError("requestBytes must be a positive safe integer");
@@ -1005,7 +1260,7 @@ export function createExactSizedV2Request(
   if (requestBytes < fixedBytes) {
     throw new RangeError(`requestBytes must be at least ${fixedBytes}`);
   }
-  request.input = prefix + deterministicPadding(requestBytes - fixedBytes);
+  request.input = prefix + corpusPadding(requestBytes - fixedBytes, index, corpus);
   const actual = utf8Bytes(canonicalJson(request)).byteLength;
   if (actual !== requestBytes) {
     throw new Error(`Exact request construction failed: ${actual} != ${requestBytes}`);
@@ -1075,6 +1330,22 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
   ) {
     throw new RangeError("concurrency must be 1 through 128");
   }
+  if (
+    options.corpus !== undefined &&
+    options.corpus !== "compressible" &&
+    options.corpus !== "mixed" &&
+    options.corpus !== "incompressible"
+  ) {
+    throw new RangeError("corpus is invalid");
+  }
+  for (const [label, value] of [
+    ["linkBandwidthBytesPerSecond", options.linkBandwidthBytesPerSecond],
+    ["serializationBytesPerSecond", options.serializationBytesPerSecond],
+  ] as const) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+      throw new RangeError(`${label} must be positive`);
+    }
+  }
   const aggregateLimit = options.maxAggregateRequestBytes ?? 64 * MiB;
   if (!Number.isSafeInteger(aggregateLimit) || aggregateLimit < 1) {
     throw new RangeError("maxAggregateRequestBytes must be a positive safe integer");
@@ -1087,6 +1358,12 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
     (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)
   ) {
     throw new RangeError("timeoutMs must be a positive safe integer");
+  }
+  if (
+    options.rotateCredentialDuringTransfer !== undefined &&
+    typeof options.rotateCredentialDuringTransfer !== "boolean"
+  ) {
+    throw new RangeError("rotateCredentialDuringTransfer must be boolean");
   }
   for (const fault of options.faults ?? []) {
     if (!Number.isSafeInteger(fault.ordinal) || fault.ordinal < 1) {
@@ -1118,6 +1395,7 @@ export async function runV2PerformanceHarness(
   const runtime = await PerformanceRuntime.create(options, clock, hub);
   const registry = new SandboxRegistry([runtime]);
   const governor = new ResourceGovernor({
+    now: () => clock.now(),
     probe: {
       sample: () => ({
         totalBytes: 64 * 1024 ** 3,
@@ -1144,33 +1422,44 @@ export async function runV2PerformanceHarness(
   });
   try {
     await runtime.start();
+    const corpus = options.corpus ?? "incompressible";
     const bodies = Array.from({ length: options.concurrency }, (_, index) =>
-      createExactSizedV2Request(options.requestBytes, index));
+      createExactSizedV2Request(options.requestBytes, index, corpus));
     const expectedDigests = await Promise.all(bodies.map(body =>
       sha256Hex(utf8Bytes(canonicalJson(body)))));
-    const starts = bodies.map(() => clock.now());
+    const modeledStarts = bodies.map(() => clock.now());
+    const wallStarts = bodies.map(() => performance.now());
     const committed = bodies.map(async (body, index) => {
       const handle = await router.startRelay(body, {
         clientId: `perf-client-${index}`,
         source: "http",
       });
-      const commitMs = clock.now() - starts[index]!;
+      const modeledCommitMs = clock.now() - modeledStarts[index]!;
+      const wallCommitMs = performance.now() - wallStarts[index]!;
       const trace = hub.requestTraceByDigest(expectedDigests[index]!);
+      if (!trace) throw new Error(`Missing wire request trace for request ${index}`);
       const events = (async () => {
-        let firstEventMs: number | null = null;
+        let modeledFirstEventMs: number | null = null;
+        let wallFirstEventMs: number | null = null;
         const transcript = new TranscriptProof(
           `perf-observed-${index}`,
           expectedDigests[index]!,
         );
         let eventCount = 0;
         for await (const event of handle.events()) {
-          if (firstEventMs === null) firstEventMs = clock.now() - starts[index]!;
+          if (modeledFirstEventMs === null) {
+            modeledFirstEventMs = clock.now() - modeledStarts[index]!;
+            wallFirstEventMs = performance.now() - wallStarts[index]!;
+          }
           transcript.append(event);
           eventCount++;
         }
         const terminal = await transcript.createTerminal();
         return {
-          firstEventMs: firstEventMs ?? clock.now() - starts[index]!,
+          modeledFirstEventMs:
+            modeledFirstEventMs ?? clock.now() - modeledStarts[index]!,
+          wallFirstEventMs:
+            wallFirstEventMs ?? performance.now() - wallStarts[index]!,
           eventCount,
           transcriptDigest: terminal.transcriptSha256,
           finalDigest: terminal.finalSha256,
@@ -1179,16 +1468,59 @@ export async function runV2PerformanceHarness(
       return {
         index,
         handle,
-        commitMs,
-        ackRoundsAtCommit: trace?.flights.size ?? 0,
+        modeledCommitMs,
+        wallCommitMs,
+        hostPreparationWallMs:
+          Math.max(0, trace.firstPublicationWallMs! - wallStarts[index]!),
+        encodedRequestBytes: trace.encodedBytes,
+        requestEncoding: trace.encoding,
+        ackRoundsAtCommit: trace.flights.size,
         events,
       };
     });
-    const handles = await withTimeout(
-      Promise.all(committed),
-      timeoutMs,
-      "V2 harness commitment",
-    );
+    const credentialRotation = options.rotateCredentialDuringTransfer
+      ? (async () => {
+          await waitFor(
+            () => hub.snapshot().uniqueRequestDataBytes > 0,
+            timeoutMs,
+            "V2 harness request data before credential rotation",
+          );
+          await runtime.rotateCredential();
+        })()
+      : Promise.resolve();
+    let handles: Awaited<(typeof committed)[number]>[];
+    try {
+      handles = await withTimeout(
+        Promise.all(committed),
+        timeoutMs,
+        "V2 harness commitment",
+      );
+    } catch (cause) {
+      throw new Error(`V2 harness commitment failed: ${JSON.stringify({
+        protocolRevision: options.protocolRevision ?? "r2",
+        transport: runtime.transportSnapshot(),
+        wire: hub.snapshot(),
+        upstream: {
+          calls: runtime.upstream.calls,
+          active: runtime.upstream.active,
+        },
+        router: router.snapshot(),
+      })}`, { cause });
+    }
+    try {
+      await withTimeout(
+        credentialRotation,
+        timeoutMs,
+        "V2 harness credential rotation",
+      );
+    } catch (cause) {
+      throw new Error(`V2 harness credential rotation failed: ${JSON.stringify({
+        transport: runtime.transportSnapshot(),
+        wire: hub.snapshot(),
+        router: router.snapshot(),
+        peerErrors: runtime.peerErrorMessages(),
+      })}`, { cause });
+    }
     await waitFor(
       () => runtime.upstream.active === options.concurrency,
       timeoutMs,
@@ -1207,11 +1539,17 @@ export async function runV2PerformanceHarness(
       return {
         index: value.index,
         requestBytes: options.requestBytes,
+        encodedRequestBytes: value.encodedRequestBytes,
+        requestEncoding: value.requestEncoding,
         requestDigest,
         upstreamDigest: upstream.requestDigest,
-        commitMs: value.commitMs,
-        firstEventMs: observed.firstEventMs,
-        totalMs: clock.now() - starts[value.index]!,
+        modeledCommitMs: value.modeledCommitMs,
+        modeledFirstEventMs: observed.modeledFirstEventMs,
+        modeledTotalMs: clock.now() - modeledStarts[value.index]!,
+        wallCommitMs: value.wallCommitMs,
+        wallFirstEventMs: observed.wallFirstEventMs,
+        wallTotalMs: performance.now() - wallStarts[value.index]!,
+        hostPreparationWallMs: value.hostPreparationWallMs,
         ackRoundsAtCommit: value.ackRoundsAtCommit,
         eventCount: observed.eventCount,
         transcriptDigest: observed.transcriptDigest,
@@ -1238,15 +1576,40 @@ export async function runV2PerformanceHarness(
     const host = transport.diagnostics!.host;
     const sidecar = transport.diagnostics!.sidecar?.transport ?? null;
     return {
+      implementation: "mutable-source-components",
+      protocolRevision: options.protocolRevision ?? "r2",
+      corpus,
       rttMs: options.rttMs,
       requestBytes: options.requestBytes,
       concurrency: options.concurrency,
       virtualElapsedMs: clock.now(),
+      link: {
+        bandwidthBytesPerSecond: options.linkBandwidthBytesPerSecond ??
+          DEFAULT_LINK_BANDWIDTH_BYTES_PER_SECOND,
+        serializationBytesPerSecond: options.serializationBytesPerSecond ??
+          DEFAULT_SERIALIZATION_BYTES_PER_SECOND,
+      },
+      operations: {
+        credentialRotations: runtime.credentialRotations,
+      },
       requests,
       timings: {
-        commitMs: summary(requests.map(value => value.commitMs)),
-        firstEventMs: summary(requests.map(value => value.firstEventMs)),
-        totalMs: summary(requests.map(value => value.totalMs)),
+        modeledLink: {
+          commitMs: summary(requests.map(value => value.modeledCommitMs)),
+          firstEventMs: summary(requests.map(value => value.modeledFirstEventMs)),
+          totalMs: summary(requests.map(value => value.modeledTotalMs)),
+        },
+        measuredWall: {
+          commitMs: summary(requests.map(value => value.wallCommitMs)),
+          firstEventMs: summary(requests.map(value => value.wallFirstEventMs)),
+          totalMs: summary(requests.map(value => value.wallTotalMs)),
+          hostPreparationMs: summary(
+            requests.map(value => value.hostPreparationWallMs),
+          ),
+        },
+      },
+      preparation: {
+        ...runtime.preparationWallMetrics(),
       },
       upstream: {
         calls: runtime.upstream.calls,

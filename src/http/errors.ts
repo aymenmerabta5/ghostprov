@@ -203,6 +203,21 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
   if (
+    structured?.name === "RouterQueueFullError" &&
+    structured.status === 503 &&
+    structured.code === "router_queue_full"
+  ) {
+    return {
+      status: 503,
+      error: {
+        message: "GhostProv routing is temporarily overloaded",
+        type: "overloaded_error",
+        param: null,
+        code: "router_queue_full",
+      },
+    };
+  }
+  if (
     isRateLimited(error) ||
     structured?.code === "rate_limit_exceeded" ||
     structured?.code === "rate_limit"

@@ -3,6 +3,7 @@ import {
   GP_V2_FRAME_MAX_BYTES,
   GP_V2_PROTOCOL,
   GP_V2_REQUEST_MAX_BYTES,
+  GP_V2_R1_TRANSPORT_LIMITS,
   GP_V2_SCHEMA_DESCRIPTOR,
   GP_V2_SCHEMA_VERSION,
   GP_V2_WINDOW_MAX_BYTES,
@@ -185,6 +186,13 @@ describe("V2 shared protocol", () => {
       frames: Array.from({ length: 129 }, (_, index) => ping(index)),
     };
     expect(() => parseAwarenessEnvelope(tooMany, BINDING, "host")).toThrow("128-frame");
+
+    const overFrozenR1Flight = {
+      ...validEnvelope(),
+      frames: Array.from({ length: 33 }, (_, index) => ping(index)),
+    };
+    expect(() => parseAwarenessEnvelope(overFrozenR1Flight, BINDING, "host"))
+      .toThrow(`${GP_V2_R1_TRANSPORT_LIMITS.flightMaxFrames}-frame flight`);
   });
 
   it("validates byte-part fields and rejects conflicting structural keys", () => {
@@ -198,7 +206,14 @@ describe("V2 shared protocol", () => {
       sequence: 0,
     } as const;
     expect(parseFrame(frame, "host", "r1")).toEqual(frame);
+    expect(() => parseFrame(frame, "host", "r3" as any)).toThrow("Unsupported");
     expect(() => parseFrame({ ...frame, dataBase64Url: "not+url/base64" }, "host", "r1")).toThrow("base64url");
+    expect(() => parseFrame({ ...frame, dataBase64Url: "A" }, "host", "r1"))
+      .toThrow("valid base64url");
+    expect(() => parseFrame({ ...frame, dataBase64Url: "AB" }, "host", "r1"))
+      .toThrow("canonical base64url tail bits");
+    expect(parseFrame({ ...frame, dataBase64Url: "AA" }, "host", "r1"))
+      .toMatchObject({ dataBase64Url: "AA" });
     expect(() => parseFrame({ ...frame, extra: 1 }, "host", "r1")).toThrow("unknown field");
   });
 
@@ -212,6 +227,31 @@ describe("V2 shared protocol", () => {
     expect(parseFrame(frame, "sidecar", "r1")).toEqual(frame);
     expect(() => parseFrame({ ...frame, unexpected: true }, "sidecar", "r1"))
       .toThrow("unknown field");
+  });
+
+  it("accepts valid empty SSE data in event and batch frames", () => {
+    const event = {
+      kind: "response_event",
+      requestId: "req-empty-data",
+      eventIndex: 0,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: "",
+      epoch: 3,
+      sequence: 0,
+    } as const;
+    const batch = {
+      kind: "response_batch",
+      requestId: "req-empty-data",
+      firstEventIndex: 0,
+      items: [{ event: "response.output_text.delta", dataBase64Url: "" }],
+      epoch: 3,
+      sequence: 1,
+    } as const;
+    expect(parseFrame(event, "sidecar", "r1")).toEqual(event);
+    expect(parseFrame(batch, "sidecar", "r1")).toEqual(batch);
   });
 
   it("canonicalizes object keys recursively without changing array order", () => {

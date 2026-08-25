@@ -15,6 +15,7 @@ export interface AwarenessChannel<TLocal, TRemote> {
   clear(lane?: AwarenessLane): void;
   subscribe(listener: (update: AwarenessPeerUpdate<TRemote>) => void): () => void;
   peerIds(): readonly string[];
-  rotateCredential?(envelope: YSweetEnvelope): void;
+  rotateCredential?(envelope: YSweetEnvelope): void | Promise<void>;
+  onConnectionFailure?(listener: (error: Error) => void): () => void;
   close(): Promise<void>;
 }

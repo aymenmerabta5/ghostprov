@@ -13,9 +13,11 @@ import type {
 import type {
   RoutableSandboxRuntime,
   RoutableSandboxSnapshot,
+  SandboxRunOptions,
 } from "./registry";
 import { describeSandboxFailure } from "./failure";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
+import { V2PreCommitError } from "../v2/transport/run-handle";
 
 const DEFAULT_CHECK_INTERVAL_MS = 1_000;
 // Three ten-second heartbeat failures may each consume the five-second
@@ -184,6 +186,9 @@ export function sandboxRecoveryBackoffMs(
 function emptySnapshot(projectId: ProjectId): RoutableSandboxSnapshot {
   return {
     projectId,
+    protocolRevision: null,
+    buildHash: null,
+    schemaHash: null,
     state: "configured",
     capacity: 0,
     active: 0,
@@ -327,12 +332,28 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     return this.#beginShutdown("stop", "supervisor-stop");
   }
 
-  run(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
+  run(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    if (!this.#intendedLive) return Promise.reject(new V2PreCommitError(
+      `Sandbox ${this.projectId} supervisor is not live`,
+      "supervisor_not_live",
+    ));
+    if (this.#phase === "recovering") return Promise.reject(new V2PreCommitError(
+      `Sandbox ${this.projectId} is recovering`,
+      "supervisor_recovering",
+    ));
     const child = this.#child;
-    if (!this.#intendedLive || this.#phase === "recovering" || !child) {
-      return Promise.reject(new Error(`Sandbox ${this.projectId} is not ready`));
-    }
-    return child.run(body, signal);
+    if (!child) return Promise.reject(new V2PreCommitError(
+      `Sandbox ${this.projectId} has no active child`,
+      "supervisor_no_child",
+    ));
+    // Do not catch or reclassify anything after this boundary: child.run may
+    // have published transport state, so only its own commitment proof can
+    // decide whether alternate-runtime failover is safe.
+    return child.run(body, signal, options);
   }
 
   snapshot(): RoutableSandboxSnapshot {

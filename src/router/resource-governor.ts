@@ -219,6 +219,19 @@ export class ResourceGovernorClosedError extends Error {
   }
 }
 
+/** Startup-only fixed reservations fail immediately rather than entering FIFO admission. */
+export class ResourceGovernorCapacityUnavailableError extends Error {
+  readonly name = "ResourceGovernorCapacityUnavailableError";
+  readonly code = "resource_capacity_unavailable";
+
+  constructor(
+    readonly requestedBytes: number,
+    readonly availableBytes: number,
+  ) {
+    super("Required fixed host memory cannot fit current resource headroom");
+  }
+}
+
 function abortError(): DOMException {
   return new DOMException("Resource acquisition aborted", "AbortError");
 }
@@ -301,6 +314,33 @@ export class ResourceGovernor {
     this.#rejectStaleByteWaiters();
     if (this.#byteWaiters.length > 0) return null;
     return this.#tryGrant(workload.reservedBytes);
+  }
+
+  /**
+   * Reserve a process-lifetime pool in the same accounting domain as request
+   * leases. This is deliberately synchronous and unqueued: startup either
+   * proves the complete pool fits or fails closed before serving traffic.
+   */
+  reserveFixedBytes(reservedBytes: number): ResourceLease {
+    if (this.#closed) throw new ResourceGovernorClosedError();
+    if (!Number.isSafeInteger(reservedBytes) || reservedBytes < 1) {
+      throw new RangeError("reservedBytes must be a positive safe integer");
+    }
+    this.#refreshPressureWithoutDrain();
+    this.#assertReservationBytes(reservedBytes);
+    this.#rejectStaleByteWaiters();
+    const availableBytes = Math.max(
+      0,
+      this.#sizing.reservationCapacityBytes - this.#reservedBytes,
+    );
+    if (this.#paused || this.#byteWaiters.length > 0 || reservedBytes > availableBytes) {
+      throw new ResourceGovernorCapacityUnavailableError(reservedBytes, availableBytes);
+    }
+    const lease = this.#tryGrant(reservedBytes);
+    if (!lease) {
+      throw new ResourceGovernorCapacityUnavailableError(reservedBytes, availableBytes);
+    }
+    return lease;
   }
 
   #tryGrant(reservedBytes: number): ResourceLease | null {
@@ -650,10 +690,14 @@ export class ResourceGovernor {
   }
 
   #assertWorkload(workload: WorkloadDescriptor): void {
-    if (!Number.isSafeInteger(workload.reservedBytes) || workload.reservedBytes < 0) {
+    this.#assertReservationBytes(workload.reservedBytes);
+  }
+
+  #assertReservationBytes(reservedBytes: number): void {
+    if (!Number.isSafeInteger(reservedBytes) || reservedBytes < 0) {
       throw new RangeError("workload.reservedBytes must be a non-negative safe integer");
     }
-    if (workload.reservedBytes > this.#maximumReservationCapacityBytes) {
+    if (reservedBytes > this.#maximumReservationCapacityBytes) {
       throw new ResourceReservationTooLargeError();
     }
   }

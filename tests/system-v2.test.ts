@@ -51,6 +51,52 @@ class FakeServer implements BrowserlessSystemServer {
   }
 }
 
+class DeferredCloseServer extends FakeServer {
+  closeCallback: ((error?: Error) => void) | null = null;
+
+  override close(callback?: (error?: Error) => void): this {
+    this.order.push("server-stop-admission");
+    this.listening = false;
+    this.closeCallback = callback ?? null;
+    return this;
+  }
+
+  finishClose(): void {
+    const callback = this.closeCallback;
+    this.closeCallback = null;
+    callback?.();
+  }
+}
+
+class DeferredListenServer extends FakeServer {
+  listenCallback: (() => void) | null = null;
+  closeCalls = 0;
+
+  override listen(_port: number, _host: string, callback: () => void): this {
+    this.listening = true;
+    this.listenCallback = callback;
+    return this;
+  }
+
+  override close(callback?: (error?: Error) => void): this {
+    this.closeCalls++;
+    this.order.push("server-stop-admission");
+    this.listening = false;
+    queueMicrotask(() => callback?.());
+    return this;
+  }
+
+  fireLateListenCallback(): void {
+    this.listenCallback?.();
+  }
+}
+
+class ThrowingListenServer extends FakeServer {
+  override listen(_port: number, _host: string, _callback: () => void): this {
+    throw new Error("synthetic listen failure");
+  }
+}
+
 class FakeSampler {
   starts = 0;
   closes = 0;
@@ -221,6 +267,28 @@ async function harness(): Promise<{
 }
 
 describe("V2 browserless system composition", () => {
+  it("fails closed on a selected release before account or server side effects", async () => {
+    const value = await harness();
+    let accountResolves = 0;
+    value.dependencies.sessionManager = {
+      resolve: async () => {
+        accountResolves++;
+        throw new Error("account resolution must not run");
+      },
+      close: async () => {},
+    };
+    value.dependencies.revisionSelector = {
+      preload: async () => { throw new Error("selected R2 artifact is corrupt"); },
+      loadedForProject: () => { throw new Error("not preloaded"); },
+    };
+
+    await expect(createBrowserlessSystem(value.env, value.dependencies))
+      .rejects.toThrow("selected R2 artifact is corrupt");
+    expect(accountResolves).toBe(0);
+    expect(value.server.listening).toBe(false);
+    expect(value.sampler.starts).toBe(0);
+  });
+
   it("selects the exact immutable release pair for each configured project", () => {
     const asset = (revision: string, fill: string) => Object.freeze({
       revision,
@@ -298,6 +366,21 @@ describe("V2 browserless system composition", () => {
     expect(value.server.listening).toBe(true);
     expect(value.sampler.starts).toBe(1);
     expect(system.registry.readyRuntimes()).toHaveLength(1);
+    expect(system.hostEventMemory.reservedBytes).toBe(system.config.v2HostEventMemory.totalBytes);
+    expect(system.hostEventMemory.snapshot()).toMatchObject({
+      ordinaryCapacityBytes: system.config.v2HostEventMemory.ordinaryBytes,
+      jumboCapacityBytes: system.config.v2HostEventMemory.jumboBytes,
+      closed: false,
+    });
+    expect(system.responseGraphMemory.reservedBytes)
+      .toBe(system.responseGraphMemory.budget.limit);
+    expect(system.responseGraphMemory.budget.used).toBe(0);
+    expect(system.governor.snapshot().reservedBytes)
+      .toBeGreaterThanOrEqual(
+        system.hostEventMemory.reservedBytes +
+        system.responseGraphMemory.reservedBytes +
+        system.webSocketIngressMemory.reservedBytes,
+      );
     value.factory.releaseAll();
     await system.fleet.waitForReady(4);
     expect(system.registry.readyRuntimes()).toHaveLength(4);
@@ -305,7 +388,97 @@ describe("V2 browserless system composition", () => {
     expect(value.sampler.closes).toBe(1);
     expect(value.sessionCloses()).toBe(1);
     expect(system.governor.snapshot().closed).toBe(true);
+    expect(system.hostEventMemory.snapshot().closed).toBe(true);
+    expect(system.responseGraphMemory.budget.used).toBe(0);
+    expect(system.webSocketIngressMemory.budget.snapshot()).toMatchObject({
+      sessions: 0,
+      ingressReservedBytes: 0,
+    });
   }, 30_000);
+
+  it("binds with one exact healthy project when another explicit project metadata read fails", async () => {
+    const value = await harness();
+    value.factory.releaseAll();
+    const projects = value.dependencies.projects!;
+    value.dependencies.projects = {
+      get: async (id, signal) => {
+        if (id === IDS[0]) throw new Error("transient project metadata outage");
+        return projects.get(id, signal);
+      },
+    };
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: [IDS[0], IDS[1]].join(","),
+    }, value.dependencies);
+
+    await system.start();
+
+    expect(value.server.listening).toBe(true);
+    expect(system.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([IDS[1]]);
+    expect(system.fleet.snapshot()).toMatchObject({
+      desired: 2,
+      ready: 1,
+      failed: 1,
+      unavailable: 1,
+      unavailableProjects: [IDS[0]],
+      projects: [IDS[0], IDS[1]],
+    });
+    expect(await (await system.app.request("/health")).json()).toMatchObject({
+      ok: true,
+      desired: 2,
+      ready: 1,
+      unavailable: 1,
+      unavailableProjects: [IDS[0]],
+    });
+    await system.close();
+  }, 30_000);
+
+  it("fails startup when every exact configured project metadata read fails", async () => {
+    const value = await harness();
+    value.dependencies.projects = {
+      get: async () => { throw new Error("project metadata unavailable"); },
+    };
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: [IDS[0], IDS[1]].join(","),
+    }, value.dependencies);
+
+    await expect(system.start()).rejects.toMatchObject({
+      name: "FleetReconciliationError",
+      kind: "explicit_project_missing",
+    });
+    expect(value.server.listening).toBe(false);
+    expect(system.registry.runtimes()).toEqual([]);
+    expect(system.fleet.snapshot()).toMatchObject({
+      desired: 0,
+      ready: 0,
+      failed: 0,
+      unavailable: 0,
+    });
+    await system.close();
+  }, 30_000);
+
+  it("fails closed when one legal jumbo event cannot fit host headroom", async () => {
+    const value = await harness();
+    const constrained: MachineProbe = {
+      sample: () => ({
+        totalBytes: 512 * 1024 ** 2,
+        freeBytes: 96 * 1024 ** 2,
+        rssBytes: 384 * 1024 ** 2,
+        heapBytes: 64 * 1024 ** 2,
+        externalBytes: 16 * 1024 ** 2,
+        logicalProcessors: 4,
+      }),
+    };
+    value.dependencies.machineProbe = constrained;
+    value.dependencies.governor = new ResourceGovernor({ probe: constrained });
+
+    await expect(createBrowserlessSystem(value.env, value.dependencies))
+      .rejects.toThrow(/memory|capacity/i);
+    expect(value.server.listening).toBe(false);
+    expect(value.sessionCloses()).toBe(1);
+    expect(value.dependencies.governor.snapshot().closed).toBe(true);
+  });
 
   it("never accepts protected port 8787 for a candidate", async () => {
     const value = await harness();
@@ -373,5 +546,82 @@ describe("V2 browserless system composition", () => {
       "account-close",
       "cpu-pool-close",
     ]);
+  });
+
+  it("cancels a pending listen and cannot resurrect a listener after close", async () => {
+    const value = await harness();
+    const server = new DeferredListenServer(value.order);
+    value.dependencies.server = server;
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: IDS[0],
+    }, value.dependencies);
+
+    const starting = system.start();
+    for (const deadline = performance.now() + 5_000;
+      !server.listenCallback && performance.now() < deadline;) await Bun.sleep(5);
+    expect(server.listenCallback).not.toBeNull();
+    const closing = system.close();
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+    await closing;
+    server.fireLateListenCallback();
+    await Bun.sleep(0);
+
+    expect(server.listening).toBe(false);
+    expect(server.closeCalls).toBe(1);
+    expect(system.registry.runtimes()).toEqual([]);
+    expect(value.sessionCloses()).toBe(1);
+  });
+
+  it("cleans the partial system exactly once after a synchronous listen failure", async () => {
+    const value = await harness();
+    const server = new ThrowingListenServer(value.order);
+    value.dependencies.server = server;
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: IDS[0],
+    }, value.dependencies);
+
+    await expect(system.start()).rejects.toThrow("synthetic listen failure");
+    await system.close();
+
+    expect(server.listening).toBe(false);
+    expect(system.registry.runtimes()).toEqual([]);
+    expect(value.sessionCloses()).toBe(1);
+    expect(system.governor.snapshot().closed).toBe(true);
+  });
+
+  it("keeps host event permits alive until a slow HTTP server output closes", async () => {
+    const value = await harness();
+    const server = new DeferredCloseServer(value.order);
+    value.dependencies.server = server;
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: IDS[0],
+      GP_SHUTDOWN_DRAIN_MS: "1000",
+    }, value.dependencies);
+    await system.start();
+    const permit = system.hostEventMemory.permits.tryAcquire(1024, {
+      region: "ordinary",
+      label: "slow-sse-output",
+    });
+    expect(permit).not.toBeNull();
+
+    const closing = system.close();
+    for (const deadline = performance.now() + 5_000;
+      !server.closeCallback && performance.now() < deadline;) await Bun.sleep(5);
+    expect(server.closeCallback).not.toBeNull();
+    expect(system.hostEventMemory.snapshot()).toMatchObject({
+      closed: false,
+      activePermits: 1,
+    });
+
+    permit!.release();
+    server.finishClose();
+    await closing;
+    expect(system.hostEventMemory.snapshot()).toMatchObject({
+      closed: true,
+      activePermits: 0,
+    });
   });
 });

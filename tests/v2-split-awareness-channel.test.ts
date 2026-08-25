@@ -39,6 +39,7 @@ function envelope<T>(peerId: string, revision: number): AwarenessEnvelope<T> {
 class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> {
   readonly published: AwarenessEnvelope<TLocal>[] = [];
   readonly listeners = new Set<(update: AwarenessPeerUpdate<TRemote>) => void>();
+  readonly failureListeners = new Set<(error: Error) => void>();
   rotations: YSweetEnvelope[] = [];
   clears = 0;
   connects = 0;
@@ -77,6 +78,11 @@ class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> 
     this.rotations.push(value);
   }
 
+  onConnectionFailure(listener: (error: Error) => void): () => void {
+    this.failureListeners.add(listener);
+    return () => this.failureListeners.delete(listener);
+  }
+
   async close(): Promise<void> {
     this.closes++;
   }
@@ -85,6 +91,10 @@ class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> 
     for (const listener of this.listeners) {
       listener({ peerClientId: this.remotePeerId, envelope: value });
     }
+  }
+
+  fail(error = new Error("lane disconnected")): void {
+    for (const listener of this.failureListeners) listener(error);
   }
 }
 
@@ -127,7 +137,7 @@ describe("SplitAwarenessChannel", () => {
       token: "rotated-secret",
       authorization: "full",
     });
-    split.rotateCredential?.(credential);
+    await split.rotateCredential?.(credential);
     expect(data.rotations).toEqual([credential]);
     expect(control.rotations).toEqual([credential]);
     await split.close();
@@ -144,5 +154,30 @@ describe("SplitAwarenessChannel", () => {
     await expect(split.connect()).rejects.toThrow("lane connect failed");
     expect(data.closes).toBe(1);
     expect(control.closes).toBe(1);
+  });
+
+  it("propagates a post-sync lane failure and reconnects through credential rotation", async () => {
+    const data = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:data", "sidecar:data");
+    const control = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:control", "sidecar:control");
+    const split = new SplitAwarenessChannel({ data, control });
+    const failures: Error[] = [];
+    split.onConnectionFailure?.(error => failures.push(error));
+    await split.connect();
+
+    data.fail(new Error("data lane token expired"));
+    expect(failures).toHaveLength(1);
+    const credential = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "reminted-secret",
+      authorization: "full",
+    });
+    await split.rotateCredential?.(credential);
+    expect(data.rotations).toEqual([credential]);
+    expect(control.rotations).toEqual([credential]);
+    expect(data.closes).toBe(0);
+    expect(control.closes).toBe(0);
+    await split.close();
   });
 });

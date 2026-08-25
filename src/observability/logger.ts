@@ -2,6 +2,7 @@ import type { ObservabilityConfig } from "./config";
 import {
   observabilityEvent,
   type ObservabilityEvent,
+  type ObservabilityEventName,
   type ObservabilityPriority,
 } from "./events";
 import { assertSafeObservabilityEvent } from "./redaction";
@@ -14,6 +15,7 @@ export interface ObservabilitySink {
 
 export interface LoggerSnapshot {
   queuedEvents: number;
+  /** Conservative queue reservations; serialization happens off the emit path. */
   queuedBytes: number;
   droppedSamples: number;
   droppedProgress: number;
@@ -27,9 +29,35 @@ export interface LoggerLike {
   close(deadlineMs?: number): Promise<void>;
 }
 
-interface QueuedLine {
-  line: string;
-  bytes: number;
+interface QueuedEvent {
+  event: ObservabilityEvent;
+  reservedBytes: number;
+}
+
+/** O(1) head removal with infrequent amortized compaction. */
+class HeadIndexedQueue<T> {
+  #items: Array<T | undefined> = [];
+  #head = 0;
+
+  get length(): number { return this.#items.length - this.#head; }
+
+  push(value: T): void { this.#items.push(value); }
+
+  peek(): T | undefined { return this.#items[this.#head]; }
+
+  shift(): T | undefined {
+    if (this.#head >= this.#items.length) return undefined;
+    const value = this.#items[this.#head];
+    this.#items[this.#head++] = undefined;
+    if (this.#head === this.#items.length) {
+      this.#items.length = 0;
+      this.#head = 0;
+    } else if (this.#head >= 1_024 && this.#head * 2 >= this.#items.length) {
+      this.#items = this.#items.slice(this.#head);
+      this.#head = 0;
+    }
+    return value;
+  }
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -38,11 +66,20 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-/**
- * Fleet JSONL remains complete on disk, while the console gets a fixed-size
- * rollup. Printing every per-runtime diagnostic object to a terminal can block
- * the event loop under a large fleet even though file logging is asynchronous.
- */
+function compactRelease(value: unknown): unknown {
+  const release = record(value);
+  if (!release || !Array.isArray(release.selections)) return null;
+  const selections = release.selections.slice(0, 8);
+  return {
+    knownRuntimes: release.knownRuntimes,
+    unknownRuntimes: release.unknownRuntimes,
+    selections,
+    selectionCount: release.selections.length,
+    truncated: release.selections.length > selections.length,
+  };
+}
+
+/** Full JSONL remains on disk; this only compacts the console representation. */
 export function formatConsoleObservabilityLine(line: string): string {
   const trimmed = line.trimEnd();
   if (!trimmed.includes('"event":"fleet.sample"')) return trimmed;
@@ -68,6 +105,10 @@ export function formatConsoleObservabilityLine(line: string): string {
       active: event.active,
       available: event.available,
       queued: event.queued,
+      queued_bytes: event.queued_bytes,
+      desired: event.desired,
+      ready: event.ready,
+      unavailable: event.unavailable,
       cpu_percent: event.cpu_percent,
       rss_bytes: event.rss_bytes,
       event_loop_p95_ms: event.event_loop_p95_ms,
@@ -85,26 +126,93 @@ export function formatConsoleObservabilityLine(line: string): string {
         failed: traffic.failed,
         total_p95_ms: trafficTotal?.p95_ms,
       } : null,
+      release: compactRelease(event.release),
     });
   } catch {
     return trimmed;
   }
 }
 
-class ConsoleSink implements ObservabilitySink {
-  async writeBatch(lines: readonly string[]): Promise<void> {
-    for (const line of lines) console.log(formatConsoleObservabilityLine(line));
+const CONSOLE_ALWAYS = new Set<ObservabilityEventName>([
+  "server.started",
+  "server.stopping",
+  "request.completed",
+  "request.failed",
+  "monitor.error",
+  "logger.dropped",
+  "logger.error",
+  "sandbox.recovery.started",
+  "sandbox.recovery.completed",
+  "sandbox.recovery.aborted",
+  "prism.circuit.changed",
+]);
+
+function lineEvent(line: string): ObservabilityEventName | null {
+  const match = /"event":"([a-z._]+)"/.exec(line);
+  return match?.[1] as ObservabilityEventName ?? null;
+}
+
+export interface ConsoleSinkOptions {
+  now?: () => number;
+  write?: (batch: string) => void;
+  progressIntervalMs?: number;
+}
+
+/**
+ * At most one sampled/progress record per interval. Terminal/error records are
+ * never sampled, but a complete sink batch uses one console write rather than
+ * one synchronous write per request.
+ */
+export class ConsoleSink implements ObservabilitySink {
+  readonly #now: () => number;
+  readonly #write: (batch: string) => void;
+  readonly #progressIntervalMs: number;
+  #nextProgressAtMs = 0;
+
+  constructor(options: ConsoleSinkOptions = {}) {
+    this.#now = options.now ?? Date.now;
+    this.#write = options.write ?? (batch => console.log(batch));
+    this.#progressIntervalMs = options.progressIntervalMs ?? 1_000;
+    if (!Number.isSafeInteger(this.#progressIntervalMs) || this.#progressIntervalMs < 100) {
+      throw new RangeError("console progress interval must be at least 100ms");
+    }
   }
+
+  async writeBatch(lines: readonly string[]): Promise<void> {
+    const output: string[] = [];
+    let sampled = false;
+    const now = this.#now();
+    for (const line of lines) {
+      const event = lineEvent(line);
+      if (event && CONSOLE_ALWAYS.has(event)) {
+        output.push(formatConsoleObservabilityLine(line));
+      } else if (!sampled && now >= this.#nextProgressAtMs) {
+        sampled = true;
+        this.#nextProgressAtMs = now + this.#progressIntervalMs;
+        output.push(formatConsoleObservabilityLine(line));
+      }
+    }
+    if (output.length) this.#write(output.join("\n"));
+  }
+
   async close(): Promise<void> {}
 }
+
+const RESERVATION_BYTES: Readonly<Record<ObservabilityPriority, number>> = {
+  terminal: 2 * 1024,
+  progress: 1024,
+  sample: 64 * 1024,
+};
+const BATCH_MAX_EVENTS = 256;
+const BATCH_MAX_RESERVED_BYTES = 256 * 1024;
 
 export class ObservabilityLogger implements LoggerLike {
   readonly #config: ObservabilityConfig;
   readonly #sinks: readonly ObservabilitySink[];
-  readonly #queues: Record<ObservabilityPriority, QueuedLine[]> = {
-    terminal: [],
-    progress: [],
-    sample: [],
+  readonly #queues: Record<ObservabilityPriority, HeadIndexedQueue<QueuedEvent>> = {
+    terminal: new HeadIndexedQueue(),
+    progress: new HeadIndexedQueue(),
+    sample: new HeadIndexedQueue(),
   };
   #queuedBytes = 0;
   #droppedSamples = 0;
@@ -125,6 +233,15 @@ export class ObservabilityLogger implements LoggerLike {
 
   emit(event: ObservabilityEvent, priority: ObservabilityPriority = "progress"): void {
     if (this.#closed || this.#config.level === "off") return;
+    let eventName: unknown;
+    try { eventName = event?.event; } catch {
+      this.#sinkErrors++;
+      return;
+    }
+    if (typeof eventName !== "string") {
+      this.#sinkErrors++;
+      return;
+    }
     if (this.#config.level === "error" && ![
       "request.failed",
       "monitor.error",
@@ -133,21 +250,19 @@ export class ObservabilityLogger implements LoggerLike {
       "sandbox.recovery.completed",
       "sandbox.recovery.aborted",
       "prism.circuit.changed",
-    ].includes(event.event)) return;
-    try {
-      assertSafeObservabilityEvent(event);
-      const line = `${JSON.stringify(event)}\n`;
-      const item = { line, bytes: Buffer.byteLength(line) };
-      if (!this.#makeRoom(item, priority)) {
-        this.#recordDrop(priority);
-        return;
-      }
-      this.#queues[priority].push(item);
-      this.#queuedBytes += item.bytes;
-      this.#scheduleFlush();
-    } catch {
-      this.#sinkErrors++;
+    ].includes(eventName)) return;
+    const normalizedPriority: ObservabilityPriority = priority in this.#queues
+      ? priority
+      : "progress";
+    const reservedBytes = RESERVATION_BYTES[normalizedPriority];
+    const item = { event, reservedBytes };
+    if (!this.#makeRoom(item, normalizedPriority)) {
+      this.#recordDrop(normalizedPriority);
+      return;
     }
+    this.#queues[normalizedPriority].push(item);
+    this.#queuedBytes += reservedBytes;
+    this.#scheduleFlush();
   }
 
   snapshot(): LoggerSnapshot {
@@ -180,12 +295,13 @@ export class ObservabilityLogger implements LoggerLike {
       this.#queues.sample.length;
   }
 
-  #fits(item: QueuedLine): boolean {
+  #fits(item: QueuedEvent): boolean {
     return this.#eventCount() + 1 <= this.#config.queueMaxEvents &&
-      this.#queuedBytes + item.bytes <= this.#config.queueMaxBytes;
+      this.#queuedBytes + item.reservedBytes <= this.#config.queueMaxBytes;
   }
 
-  #makeRoom(item: QueuedLine, priority: ObservabilityPriority): boolean {
+  /** sample -> progress -> reject; queued terminals are never evicted. */
+  #makeRoom(item: QueuedEvent, priority: ObservabilityPriority): boolean {
     while (!this.#fits(item)) {
       if (this.#evict("sample")) continue;
       if (priority === "terminal" && this.#evict("progress")) continue;
@@ -197,7 +313,7 @@ export class ObservabilityLogger implements LoggerLike {
   #evict(priority: "sample" | "progress"): boolean {
     const item = this.#queues[priority].shift();
     if (!item) return false;
-    this.#queuedBytes -= item.bytes;
+    this.#queuedBytes = Math.max(0, this.#queuedBytes - item.reservedBytes);
     this.#recordDrop(priority);
     return true;
   }
@@ -219,20 +335,24 @@ export class ObservabilityLogger implements LoggerLike {
     this.#timer.unref?.();
   }
 
-  #takeBatch(): string[] {
-    const lines: string[] = [];
-    let bytes = 0;
+  #takeBatch(): QueuedEvent[] {
+    const events: QueuedEvent[] = [];
+    let reservedBytes = 0;
     for (const priority of ["terminal", "progress", "sample"] as const) {
-      while (this.#queues[priority].length && lines.length < 256) {
-        const next = this.#queues[priority][0]!;
-        if (lines.length && bytes + next.bytes > 256 * 1024) return lines;
+      for (;;) {
+        const next = this.#queues[priority].peek();
+        if (!next) break;
+        if (events.length >= BATCH_MAX_EVENTS) return events;
+        if (events.length && reservedBytes + next.reservedBytes > BATCH_MAX_RESERVED_BYTES) {
+          return events;
+        }
         this.#queues[priority].shift();
-        this.#queuedBytes -= next.bytes;
-        lines.push(next.line);
-        bytes += next.bytes;
+        this.#queuedBytes = Math.max(0, this.#queuedBytes - next.reservedBytes);
+        events.push(next);
+        reservedBytes += next.reservedBytes;
       }
     }
-    return lines;
+    return events;
   }
 
   #dropReport(): string | null {
@@ -250,7 +370,22 @@ export class ObservabilityLogger implements LoggerLike {
     return `${JSON.stringify(report)}\n`;
   }
 
-  async #write(lines: string[]): Promise<void> {
+  #serialize(events: readonly QueuedEvent[]): string[] {
+    const lines: string[] = [];
+    for (const item of events) {
+      try {
+        // Privacy validation and payload serialization stay off request emit().
+        assertSafeObservabilityEvent(item.event);
+        lines.push(`${JSON.stringify(item.event)}\n`);
+      } catch {
+        this.#sinkErrors++;
+      }
+    }
+    return lines;
+  }
+
+  async #write(events: readonly QueuedEvent[]): Promise<void> {
+    const lines = this.#serialize(events);
     const report = this.#dropReport();
     if (report) lines.push(report);
     if (!lines.length) return;

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 
@@ -27,8 +28,17 @@ const server = createServer((request, response) => {
     });
     return;
   }
+  if (url.pathname === "/abort-after-headers") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write('{"partial":true');
+    setTimeout(() => response.destroy(), 5);
+    return;
+  }
   response.setHeader("content-type", "application/json");
-  response.end(JSON.stringify({ generation }));
+  response.end(JSON.stringify({
+    generation,
+    testSupervisorEnv: process.env.GP_TEST_SUPERVISOR_ENV_AUTOLOAD ?? null,
+  }));
 });
 const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", socket => {
@@ -45,17 +55,25 @@ server.on("upgrade", (request, socket, head) => {
 
 let closing = false;
 let intentionalDisconnect = false;
+let listenTimer: ReturnType<typeof setTimeout> | null = null;
 function close(exitCode: number): void {
   if (closing) return;
   closing = true;
-  const finish = () => server.close(() => {
+  if (listenTimer) clearTimeout(listenTimer);
+  listenTimer = null;
+  const complete = () => {
       process.send?.({ type: "ghostprov.stopped", pid: process.pid, exitCode });
       if (process.connected) {
         intentionalDisconnect = true;
         process.disconnect?.();
       }
       process.exitCode = exitCode;
-    });
+    };
+  const finish = () => {
+    if (server.listening) server.close(complete);
+    else complete();
+  };
+  if (!server.listening) return finish();
   for (const socket of wss.clients) socket.close(1012, "restart");
   wss.close(() => finish());
 }
@@ -71,6 +89,15 @@ process.once("SIGTERM", () => close(0));
 process.once("SIGINT", () => close(0));
 process.once("disconnect", () => { if (!intentionalDisconnect) close(1); });
 
-server.listen(port, "127.0.0.1", () => {
-  process.send?.({ type: "ghostprov.ready", pid: process.pid, port });
-});
+const readyDelayMs = Math.min(10_000, Math.max(0, Number(
+  generation > 1
+    ? process.env.GP_TEST_SUPERVISOR_RESTART_READY_DELAY_MS
+    : process.env.GP_TEST_SUPERVISOR_INITIAL_READY_DELAY_MS,
+) || 0));
+listenTimer = setTimeout(() => {
+  listenTimer = null;
+  if (closing) return;
+  server.listen(port, "127.0.0.1", () => {
+    process.send?.({ type: "ghostprov.ready", pid: process.pid, port, generation });
+  });
+}, readyDelayMs);

@@ -16,7 +16,12 @@ import {
 } from "./token-count";
 import type { AnthropicContextManagementResponse } from "./types";
 import type { IncomingResourceLease } from "../router/router";
-import { takeIncomingBodyLease } from "../http/request-lease";
+import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
+import { permittedJsonResponse } from "../http/permitted-json";
+import {
+  releaseAtomicBytePermit,
+  transferAtomicBytePermit,
+} from "../v2/memory/permit-carrier";
 
 export type AnthropicRelayStarter = (
   body: Record<string, unknown>,
@@ -199,6 +204,11 @@ async function nonStreamingFinal(
     final = Promise.reject(error);
   }
   const finalOutcome = settle(final);
+  const releaseFinalOutcome = (): void => {
+    void finalOutcome.then(result => {
+      if (result.ok) releaseAtomicBytePermit(result.value);
+    });
+  };
   const drainOutcome = settle(drain);
   const work = Promise.race([
     finalOutcome.then(result => ({ source: "final" as const, result })),
@@ -217,11 +227,13 @@ async function nonStreamingFinal(
   cancelled.dispose();
 
   if ("cancelled" in winner) {
+    releaseFinalOutcome();
     returnIterator();
     void Promise.all([finalOutcome, drainOutcome]);
     throw winner.error;
   }
   if (!winner.completed) {
+    releaseFinalOutcome();
     if (!controller.signal.aborted) controller.abort(winner.error);
     returnIterator();
     await boundedCleanup([finalOutcome, drainOutcome]);
@@ -269,7 +281,7 @@ export function registerAnthropicRoutes(
         beta,
         betaContextManagement(body, beta),
       );
-      const clientId = c.req.header("x-ghostprov-client-id") ?? "http";
+      const clientId = resolveHttpClientId(c.env, c.req.header("x-ghostprov-client-id"));
       const handle = await dependencies.startRelay(
         translated.relayBody,
         linked.controller.signal,
@@ -279,11 +291,18 @@ export function registerAnthropicRoutes(
 
       if (!translated.stream) {
         const final = await nonStreamingFinal(handle, linked.controller);
-        return c.json(
-          responseToAnthropic(final, context),
-          200,
-          { "request-id": requestId },
-        );
+        let response: ReturnType<typeof responseToAnthropic> | null = null;
+        try {
+          response = responseToAnthropic(final, context);
+          transferAtomicBytePermit(final, response, "anthropic-json-output");
+          return permittedJsonResponse(response, {
+            headers: { "request-id": requestId },
+          });
+        } catch (error) {
+          releaseAtomicBytePermit(final);
+          releaseAtomicBytePermit(response);
+          throw error;
+        }
       }
 
       // Do not commit an Anthropic SSE 200 until R2 has proven successful

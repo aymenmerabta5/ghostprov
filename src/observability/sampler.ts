@@ -9,6 +9,14 @@ import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../v2/diagnostics/types";
 import type { FleetRecoverySnapshot } from "../prism/recovery-coordinator";
+import type { AtomicBytePermitPoolSnapshot } from "../v2/memory/atomic-byte-permits";
+import {
+  safeV2ReleaseIdentity,
+  summarizeV2Releases,
+} from "../v2/release-observability";
+import type { FleetSnapshot } from "../fleet/types";
+
+const MAX_UNAVAILABLE_PROJECT_SAMPLES = 256;
 
 function ratio(numerator: number, denominator: number): number {
   return denominator > 0 ? Math.round((numerator / denominator) * 1_000) / 1_000 : 0;
@@ -163,6 +171,8 @@ export interface FleetSamplerOptions {
   webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
   recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
   routerTrafficSnapshot?: () => RouterTrafficSnapshot;
+  hostEventMemorySnapshot?: () => AtomicBytePermitPoolSnapshot;
+  fleetSnapshot?: () => FleetSnapshot;
 }
 
 export class FleetSampler {
@@ -178,6 +188,8 @@ export class FleetSampler {
   readonly #webSocketSnapshot?: () => WebSocketTelemetrySnapshot;
   readonly #recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
   readonly #routerTrafficSnapshot?: () => RouterTrafficSnapshot;
+  readonly #hostEventMemorySnapshot?: () => AtomicBytePermitPoolSnapshot;
+  readonly #fleetSnapshot?: () => FleetSnapshot;
   #lastCpu: NodeJS.CpuUsage;
   #lastSampleAtMs: number;
   #timer: ReturnType<typeof setInterval> | null = null;
@@ -200,6 +212,8 @@ export class FleetSampler {
     this.#webSocketSnapshot = options.webSocketSnapshot;
     this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
     this.#routerTrafficSnapshot = options.routerTrafficSnapshot;
+    this.#hostEventMemorySnapshot = options.hostEventMemorySnapshot;
+    this.#fleetSnapshot = options.fleetSnapshot;
     this.#lastCpu = this.#cpuUsage();
     this.#lastSampleAtMs = this.#clock.now();
   }
@@ -237,9 +251,32 @@ export class FleetSampler {
         transform_workers: transforms?.workers ?? router.resources.cpuTransformWorkers,
         transform_active: transforms?.active ?? 0,
         transform_queued: transforms?.queued ?? 0,
+        event_memory: this.#hostEventMemorySnapshot
+          ? (() => {
+              const value = this.#hostEventMemorySnapshot!();
+              return {
+                ordinary_capacity_bytes: value.ordinaryCapacityBytes,
+                ordinary_used_bytes: value.ordinaryUsedBytes,
+                ordinary_available_bytes: value.ordinaryAvailableBytes,
+                jumbo_capacity_bytes: value.jumboCapacityBytes,
+                jumbo_used_bytes: value.jumboUsedBytes,
+                jumbo_available_bytes: value.jumboAvailableBytes,
+                jumbo_active: value.jumboActive,
+                active_permits: value.activePermits,
+                waiters: value.waiters,
+                promotion_waiters: value.promotionWaiters,
+                closed: value.closed,
+              };
+            })()
+          : null,
       };
-      const runtimes: JsonValue = router.runtimes.map(runtime => ({
+      const runtimes: JsonValue = router.runtimes.map(runtime => {
+        const release = safeV2ReleaseIdentity(runtime);
+        return {
         project_id: runtime.projectId,
+        protocol_revision: release?.protocolRevision ?? null,
+        build_hash: release?.buildHash ?? null,
+        schema_hash: release?.schemaHash ?? null,
         incarnation: runtime.incarnation ?? 0,
         state: runtime.state,
         capacity: runtime.capacity,
@@ -269,14 +306,25 @@ export class FleetSampler {
           host: transportJson(runtime.diagnostics.host),
           sidecar: sidecarJson(runtime.diagnostics.sidecar),
         } : null,
-      }));
+      };
+      });
       const circuit = this.#recoveryCircuitSnapshot?.();
       const traffic = this.#routerTrafficSnapshot?.();
+      const fleet = this.#fleetSnapshot?.();
+      const unavailableProjects = (fleet?.unavailableProjects ?? [])
+        .slice(0, MAX_UNAVAILABLE_PROJECT_SAMPLES);
       this.#logger.emit(observabilityEvent("fleet.sample", {
         capacity: router.capacity,
         active: router.active,
         available: router.available,
         queued: router.queued,
+        queued_bytes: router.queuedBytes ?? 0,
+        desired: fleet?.desired ?? router.runtimes.length,
+        ready: fleet?.ready ?? router.runtimes.filter(runtime => runtime.state === "ready").length,
+        unavailable: fleet?.unavailable ?? 0,
+        unavailable_projects: unavailableProjects,
+        unavailable_projects_truncated:
+          (fleet?.unavailableProjects.length ?? 0) > unavailableProjects.length,
         rss_bytes: memory.rss,
         heap_bytes: memory.heapUsed,
         external_bytes: memory.external,
@@ -302,6 +350,7 @@ export class FleetSampler {
         } : null,
         traffic: traffic ? trafficJson(traffic, this.#intervalMs) : null,
         websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
+        release: summarizeV2Releases(router.runtimes) as unknown as JsonValue,
       }), "sample");
       this.#eventLoop.reset();
     } finally {

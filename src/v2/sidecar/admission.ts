@@ -68,22 +68,24 @@ export class AdmissionController {
   acquire(
     reservedBytes: number,
     signal?: AbortSignal,
+    memoryAlreadyReserved = false,
   ): Promise<{ release(): void }> {
     if (signal?.aborted) return Promise.reject(abortError());
-    this.#validateReservation(reservedBytes);
+    this.#validateReservation(reservedBytes, memoryAlreadyReserved);
+    const accountedBytes = memoryAlreadyReserved ? 0 : reservedBytes;
     if (this.#closed) {
       return Promise.reject(new AdmissionError("Admission is closed", "closed"));
     }
-    const immediate = this.tryAcquire(reservedBytes);
+    const immediate = this.tryAcquire(reservedBytes, memoryAlreadyReserved);
     if (immediate) return Promise.resolve(immediate);
     if (
       this.#active + this.#waiters.length >= this.#acceptedMax ||
-      this.#reservedBytes + reservedBytes > this.#memoryBudgetBytes
+      this.#reservedBytes + accountedBytes > this.#memoryBudgetBytes
     ) {
       return Promise.reject(new AdmissionError("Accepted request queue is full", "capacity"));
     }
     return new Promise((resolve, reject) => {
-      const waiter: Waiter = { reservedBytes, resolve, reject, signal };
+      const waiter: Waiter = { reservedBytes: accountedBytes, resolve, reject, signal };
       waiter.onAbort = () => {
         const index = this.#waiters.indexOf(waiter);
         if (index < 0) return;
@@ -93,19 +95,23 @@ export class AdmissionController {
       };
       signal?.addEventListener("abort", waiter.onAbort, { once: true });
       this.#waiters.push(waiter);
-      this.#reservedBytes += reservedBytes;
+      this.#reservedBytes += accountedBytes;
     });
   }
 
-  tryAcquire(reservedBytes: number): { release(): void } | null {
-    this.#validateReservation(reservedBytes);
+  tryAcquire(
+    reservedBytes: number,
+    memoryAlreadyReserved = false,
+  ): { release(): void } | null {
+    this.#validateReservation(reservedBytes, memoryAlreadyReserved);
+    const accountedBytes = memoryAlreadyReserved ? 0 : reservedBytes;
     if (this.#closed) throw new AdmissionError("Admission is closed", "closed");
     this.refresh();
     if (
       this.#active >= this.#effectiveLimit() ||
-      this.#reservedBytes + reservedBytes > this.#memoryBudgetBytes
+      this.#reservedBytes + accountedBytes > this.#memoryBudgetBytes
     ) return null;
-    return this.#grant(reservedBytes, false);
+    return this.#grant(accountedBytes, false);
   }
 
   #grant(reservedBytes: number, alreadyReserved: boolean): { release(): void } {
@@ -185,8 +191,12 @@ export class AdmissionController {
     return Math.min(this.#physicalMax, this.#hostCeiling, this.#adaptiveLimit);
   }
 
-  #validateReservation(value: number): void {
-    if (!Number.isSafeInteger(value) || value < 1 || value > this.#memoryBudgetBytes) {
+  #validateReservation(value: number, memoryAlreadyReserved = false): void {
+    if (
+      !Number.isSafeInteger(value) ||
+      value < 1 ||
+      (!memoryAlreadyReserved && value > this.#memoryBudgetBytes)
+    ) {
       throw new AdmissionError("Reservation exceeds the sidecar memory budget", "bounds");
     }
   }

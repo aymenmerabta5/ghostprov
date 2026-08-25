@@ -3,6 +3,9 @@ import { AckClockedFlight } from "../src/v2/protocol/flight";
 import {
   GP_V2_FLIGHT_MAX_BYTES,
   GP_V2_FLIGHT_MAX_FRAMES,
+  GP_V2_R1_TRANSPORT_LIMITS,
+  GP_V2_R2_TRANSPORT_LIMITS,
+  protocolTransportLimits,
   type FrameIdentity,
 } from "../src/v2/protocol/shared";
 
@@ -53,5 +56,20 @@ describe("AckClockedFlight", () => {
   it("publishes the bounded flight targets independently of hard windows", () => {
     expect(GP_V2_FLIGHT_MAX_FRAMES).toBe(32);
     expect(GP_V2_FLIGHT_MAX_BYTES).toBe(128 * 1024);
+    expect(GP_V2_R1_TRANSPORT_LIMITS).toMatchObject({
+      flightMaxFrames: 32,
+      flightMaxBytes: 128 * 1024,
+      hostFlightMaxBytes: 128 * 1024,
+      sidecarFlightMaxBytes: 128 * 1024,
+    });
+    expect(GP_V2_R2_TRANSPORT_LIMITS).toMatchObject({
+      flightMaxFrames: 32,
+      flightMaxBytes: 512 * 1024,
+      hostFlightMaxBytes: 512 * 1024,
+      sidecarFlightMaxBytes: 128 * 1024,
+    });
+    expect(protocolTransportLimits("r1")).toBe(GP_V2_R1_TRANSPORT_LIMITS);
+    expect(protocolTransportLimits("r2")).toBe(GP_V2_R2_TRANSPORT_LIMITS);
+    expect(() => protocolTransportLimits("r3" as any)).toThrow("Unsupported");
   });
 });

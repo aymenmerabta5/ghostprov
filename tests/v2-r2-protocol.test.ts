@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import {
+  GP_V2_R2_TRANSPORT_LIMITS,
   GP_V2_R2_SCHEMA_VERSION,
   protocolSchemaHash,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
+  type R2RequestCommitFrame,
+  type R2RequestPreparedFrame,
+  type R2RequestStartFrame,
   type ReliableFrame,
   type SidecarFrame,
 } from "../src/v2/protocol/shared";
@@ -33,8 +37,8 @@ const BINDING: ProtocolBinding = {
 };
 
 function commitment(
-  overrides: Partial<Extract<HostFrame, { kind: "request_commit" }>> = {},
-): ReliableFrame<Extract<HostFrame, { kind: "request_commit" }>> {
+  overrides: Partial<R2RequestCommitFrame> = {},
+): ReliableFrame<R2RequestCommitFrame> {
   return {
     kind: "request_commit",
     requestId: "req-r2-1",
@@ -56,7 +60,21 @@ function commitment(
     epoch: 1,
     sequence: 0,
     ...overrides,
-  } as ReliableFrame<Extract<HostFrame, { kind: "request_commit" }>>;
+  };
+}
+
+function start(
+  overrides: Partial<R2RequestStartFrame> = {},
+): ReliableFrame<R2RequestStartFrame> {
+  const commit = commitment();
+  return { ...commit, kind: "request_start", ...overrides };
+}
+
+function prepared(
+  overrides: Partial<R2RequestPreparedFrame> = {},
+): ReliableFrame<R2RequestPreparedFrame> {
+  const commit = commitment();
+  return { ...commit, kind: "request_prepared", ...overrides };
 }
 
 function hostEnvelope(
@@ -89,6 +107,57 @@ function hostEnvelope(
 }
 
 describe("V2-R2 fenced wire protocol", () => {
+  it("accepts only the explicit R2 fixed-flight bounds", () => {
+    const ping = (sequence: number): ReliableFrame<HostFrame> => ({
+      kind: "ping",
+      sentAtMs: 1_000 + sequence,
+      epoch: 1,
+      sequence,
+    });
+    expect(parseAwarenessEnvelope(hostEnvelope({
+      frames: Array.from(
+        { length: GP_V2_R2_TRANSPORT_LIMITS.flightMaxFrames },
+        (_, index) => ping(index),
+      ),
+    }), BINDING, "host").frames).toHaveLength(32);
+    expect(() => parseAwarenessEnvelope(hostEnvelope({
+      frames: Array.from(
+        { length: GP_V2_R2_TRANSPORT_LIMITS.flightMaxFrames + 1 },
+        (_, index) => ping(index),
+      ),
+    }), BINDING, "host")).toThrow("32-frame flight");
+
+    const responseFrames = Array.from({ length: 12 }, (_, sequence) => ({
+      kind: "response_event" as const,
+      requestId: "req-r2-response",
+      eventIndex: sequence,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: "eA".repeat(6_000),
+      epoch: 1,
+      sequence,
+    }));
+    const sidecarEnvelope = (frames: readonly ReliableFrame<SidecarFrame>[]) => ({
+      ...hostEnvelope({ frames: [] }),
+      peerId: "sidecar",
+      instanceId: "sidecar-r2-1",
+      targetInstanceId: "host-r2-1",
+      frames,
+    }) as AwarenessEnvelope<SidecarFrame>;
+    expect(parseAwarenessEnvelope(
+      sidecarEnvelope(responseFrames.slice(0, 10)),
+      BINDING,
+      "sidecar",
+    ).frames).toHaveLength(10);
+    expect(() => parseAwarenessEnvelope(
+      sidecarEnvelope(responseFrames),
+      BINDING,
+      "sidecar",
+    )).toThrow("131072-byte flight");
+  });
+
   it("parses only an exact complete R2 envelope and commit fence", () => {
     expect(parseAwarenessEnvelope(hostEnvelope(), BINDING, "host")).toEqual(hostEnvelope());
     expect(parseFrame(commitment(), "host", "r2")).toEqual(commitment());
@@ -107,6 +176,43 @@ describe("V2-R2 fenced wire protocol", () => {
         "host",
       )).toThrow(V2ProtocolError);
     }
+  });
+
+  it("parses exact full-fence prepared/start phases and cross-checks both envelopes", () => {
+    const requestStart = start();
+    expect(parseFrame(requestStart, "host", "r2")).toEqual(requestStart);
+    expect(parseAwarenessEnvelope(
+      hostEnvelope({ frames: [requestStart] }),
+      BINDING,
+      "host",
+    ).frames).toEqual([requestStart]);
+
+    const requestPrepared = prepared();
+    const sidecarEnvelope = {
+      ...hostEnvelope({ frames: [] }),
+      peerId: "sidecar",
+      instanceId: "sidecar-r2-1",
+      targetInstanceId: "host-r2-1",
+      frames: [requestPrepared],
+    } as AwarenessEnvelope<SidecarFrame>;
+    expect(parseFrame(requestPrepared, "sidecar", "r2")).toEqual(requestPrepared);
+    expect(parseAwarenessEnvelope(sidecarEnvelope, BINDING, "sidecar").frames)
+      .toEqual([requestPrepared]);
+
+    expect(() => parseAwarenessEnvelope(hostEnvelope({
+      frames: [start({ targetInstanceId: "other-sidecar" })],
+    }), BINDING, "host")).toThrow("request_start fence");
+    expect(() => parseAwarenessEnvelope({
+      ...sidecarEnvelope,
+      frames: [prepared({ hostInstanceId: "other-host" })],
+    }, BINDING, "sidecar")).toThrow("request_prepared fence");
+    expect(() => parseAwarenessEnvelope({
+      ...sidecarEnvelope,
+      frames: [prepared({ targetInstanceId: "other-sidecar" })],
+    }, BINDING, "sidecar")).toThrow("request_prepared fence");
+
+    expect(() => parseFrame(requestStart, "host", "r1")).toThrow("not part of R1");
+    expect(() => parseFrame(requestPrepared, "sidecar", "r1")).toThrow("not part of R1");
   });
 
   it("never auto-falls back between the frozen R1 and fenced R2 parsers", () => {
@@ -153,6 +259,16 @@ describe("V2-R2 fenced wire protocol", () => {
     };
     expect(parseFrame(prelude, "sidecar", "r2")).toEqual(prelude);
     expect(() => parseFrame(prelude, "sidecar", "r1")).toThrow("not part of R1");
+  });
+
+  it("accepts the reliable recovery barrier only on R2", () => {
+    const marker: ReliableFrame<SidecarFrame> = {
+      kind: "recovery_complete",
+      epoch: 1,
+      sequence: 0,
+    };
+    expect(parseFrame(marker, "sidecar", "r2")).toEqual(marker);
+    expect(() => parseFrame(marker, "sidecar", "r1")).toThrow("R2-only");
   });
 
   it("retains the authenticated R2 launch nonce in the steady binding", async () => {

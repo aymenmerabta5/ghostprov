@@ -2,12 +2,36 @@ import { Gunzip } from "fflate";
 import {
   GP_V2_REQUEST_MAX_BYTES,
   base64UrlDecode,
-  sha256Hex,
   type HostFrame,
   type RequestCommitFrame,
   type ReliableFrame,
   type RequestEncoding,
 } from "../protocol/shared";
+import {
+  AtomicBytePermit,
+  AtomicBytePermitPool,
+} from "../memory/atomic-byte-permits";
+import { attachAtomicBytePermit } from "../memory/permit-carrier";
+import { IncrementalSha256 } from "../protocol/transcript";
+
+const VERIFIED_REQUEST_DIGESTS = new WeakMap<Uint8Array, string>();
+const REQUEST_DIGEST_SLICE_BYTES = 4 * 1024 * 1024;
+
+async function requestDigestWithoutCopy(bytes: Uint8Array): Promise<string> {
+  const hasher = new IncrementalSha256();
+  for (let offset = 0; offset < bytes.byteLength; offset += REQUEST_DIGEST_SLICE_BYTES) {
+    hasher.update(bytes.subarray(offset, offset + REQUEST_DIGEST_SLICE_BYTES));
+    if (offset + REQUEST_DIGEST_SLICE_BYTES < bytes.byteLength) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    }
+  }
+  return hasher.digestHex();
+}
+
+/** Digest already proven by RequestAssembler without another full-body copy. */
+export function verifiedRequestDigestOf(body: Uint8Array): string | null {
+  return VERIFIED_REQUEST_DIGESTS.get(body) ?? null;
+}
 
 export type RequestAssemblyErrorCode =
   | "bounds"
@@ -41,6 +65,7 @@ interface RequestState {
   lastActivityAtMs: number;
   receivedParts: number;
   parts: Array<RequestPart | undefined>;
+  permit: AtomicBytePermit | null;
 }
 
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
@@ -64,6 +89,7 @@ export class RequestAssembler {
   readonly #maxPartsPerRequest: number;
   readonly #incompleteTtlMs: number;
   readonly #now: () => number;
+  readonly #atomicBytePermits?: AtomicBytePermitPool;
   readonly #requests = new Map<string, RequestState>();
   #reservedBytes = 0;
 
@@ -73,12 +99,14 @@ export class RequestAssembler {
     maxPartsPerRequest?: number;
     incompleteTtlMs?: number;
     now?: () => number;
+    atomicBytePermits?: AtomicBytePermitPool;
   } = {}) {
     this.#maxReservedBytes = options.maxReservedBytes ?? 256 * 1024 * 1024;
     this.#maxRequests = options.maxRequests ?? 256;
     this.#maxPartsPerRequest = options.maxPartsPerRequest ?? 8_192;
     this.#incompleteTtlMs = options.incompleteTtlMs ?? 15 * 60_000;
     this.#now = options.now ?? (() => Date.now());
+    this.#atomicBytePermits = options.atomicBytePermits;
     if (!validPositive(this.#maxReservedBytes, Number.MAX_SAFE_INTEGER)) {
       throw new RangeError("maxReservedBytes must be a positive safe integer");
     }
@@ -151,9 +179,21 @@ export class RequestAssembler {
       const decoded = state.encoding === "identity"
         ? this.#identity(state)
         : this.#gunzip(state);
-      if (await sha256Hex(decoded) !== state.requestDigest) {
+      if (await requestDigestWithoutCopy(decoded) !== state.requestDigest) {
         decoded.fill(0);
         throw new RequestAssemblyError("Request digest does not match", "digest");
+      }
+      VERIFIED_REQUEST_DIGESTS.set(decoded, state.requestDigest);
+      if (state.permit) {
+        const permit = state.permit.transfer("sidecar-active-request");
+        state.permit = null;
+        try {
+          attachAtomicBytePermit(decoded, permit);
+        } catch (error) {
+          permit.release();
+          decoded.fill(0);
+          throw error;
+        }
       }
       return decoded;
     } finally {
@@ -167,6 +207,8 @@ export class RequestAssembler {
     for (const part of state.parts) part?.bytes.fill(0);
     this.#requests.delete(requestId);
     this.#reservedBytes -= state.reservationBytes;
+    state.permit?.release();
+    state.permit = null;
   }
 
   snapshot(): { requests: number; reservedBytes: number } {
@@ -229,7 +271,22 @@ export class RequestAssembler {
     if (this.#reservedBytes + reservationBytes > this.#maxReservedBytes) {
       throw new RequestAssemblyError("Assembler reservation budget is exhausted", "bounds");
     }
-    this.#requests.set(frame.requestId, {
+    let permit: AtomicBytePermit | null = null;
+    if (this.#atomicBytePermits) {
+      try {
+        permit = this.#atomicBytePermits.tryAcquire(reservationBytes, {
+          region: "ordinary",
+          label: `sidecar-request:${frame.requestId}`,
+        });
+      } catch {
+        permit = null;
+      }
+      if (!permit) {
+        throw new RequestAssemblyError("Global request memory is unavailable", "bounds");
+      }
+    }
+    try {
+      this.#requests.set(frame.requestId, {
       requestId: frame.requestId,
       requestDigest: frame.requestDigest,
       decodedBytes: frame.decodedBytes,
@@ -240,7 +297,12 @@ export class RequestAssembler {
       lastActivityAtMs: this.#now(),
       receivedParts: 0,
       parts: new Array<RequestPart | undefined>(frame.partCount),
-    });
+        permit,
+      });
+    } catch (error) {
+      permit?.release();
+      throw error;
+    }
     this.#reservedBytes += reservationBytes;
   }
 

@@ -1,5 +1,9 @@
 import { ApiError } from "../http/errors";
 import type { RunHandle } from "../relay/run-handle";
+import {
+  releaseAtomicBytePermit,
+  transferAtomicBytePermit,
+} from "../v2/memory/permit-carrier";
 
 export type ImageRelayStarter = (
   body: Record<string, unknown>,
@@ -111,7 +115,7 @@ function extractImage(finalValue: unknown): ExtractedImage {
   if (typeof call.revised_prompt === "string" && call.revised_prompt.length > 0) {
     image.revised_prompt = call.revised_prompt;
   }
-  return {
+  const extracted: ExtractedImage = {
     createdAt: typeof final.created_at === "number" && Number.isFinite(final.created_at)
       ? final.created_at
       : Math.floor(Date.now() / 1000),
@@ -122,6 +126,8 @@ function extractImage(finalValue: unknown): ExtractedImage {
     size: typeof call.size === "string" ? call.size : undefined,
     usage: usageFromFinal(final),
   };
+  transferAtomicBytePermit(final, image, "image-compat-output");
+  return extracted;
 }
 
 function addUsage(total: ImagesUsage, value: ImagesUsage): void {
@@ -167,6 +173,15 @@ async function finalWithDrainedEvents(
   signal?: AbortSignal,
 ): Promise<unknown> {
   const iterator = handle.events();
+  let settledFinal: unknown = null;
+  const final = Promise.resolve(handle.final).then(value => {
+    settledFinal = value;
+    return value;
+  });
+  const releaseFinal = (): void => {
+    if (settledFinal) releaseAtomicBytePermit(settledFinal);
+    else void final.then(releaseAtomicBytePermit, () => undefined);
+  };
   const returnIterator = (): void => {
     try {
       void Promise.resolve(iterator.return(undefined)).catch(() => undefined);
@@ -180,12 +195,13 @@ async function finalWithDrainedEvents(
       // V2's bounded event buffer must still be consumed concurrently.
     }
   })();
-  const work = Promise.all([Promise.resolve(handle.final), drain])
+  const work = Promise.all([final, drain])
     .then(([final]) => final);
   if (!signal) {
     try {
       return await work;
     } catch (error) {
+      releaseFinal();
       returnIterator();
       throw error;
     }
@@ -203,6 +219,7 @@ async function finalWithDrainedEvents(
   try {
     return await Promise.race([work, cancelled]);
   } catch (error) {
+    releaseFinal();
     returnIterator();
     // A non-cooperative handle must not create an unhandled rejection after
     // downstream cancellation wins the race.
@@ -227,9 +244,23 @@ export async function executeImageBatch(
   const rejected = settled.find(
     (result): result is PromiseRejectedResult => result.status === "rejected",
   );
-  if (rejected) throw rejected.reason;
+  const fulfilled = settled.filter(
+    (result): result is PromiseFulfilledResult<unknown> => result.status === "fulfilled",
+  );
+  if (rejected) {
+    for (const result of fulfilled) releaseAtomicBytePermit(result.value);
+    throw rejected.reason;
+  }
 
-  return aggregate(settled.map(result => extractImage(
-    (result as PromiseFulfilledResult<unknown>).value,
-  )));
+  const extracted: ExtractedImage[] = [];
+  try {
+    for (const result of fulfilled) extracted.push(extractImage(result.value));
+    return aggregate(extracted);
+  } catch (error) {
+    // Some finals may already have transferred ownership into image outputs;
+    // release both carrier locations idempotently to cover a mixed batch.
+    for (const result of fulfilled) releaseAtomicBytePermit(result.value);
+    for (const item of extracted) releaseAtomicBytePermit(item.image);
+    throw error;
+  }
 }
