@@ -500,6 +500,7 @@ describe("Claude Code forwarding verifier", () => {
   it("posts a forced Responses stream and preserves frames plus authoritative final", async () => {
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
     const router = createForwardingRouter("http://127.0.0.1:19001", {
+      apiKey: "GHOST_IS_KING",
       fetch: async (input, init) => {
         requests.push({ url: String(input), init });
         return sseResponse(completedFrames(), 7);
@@ -521,6 +522,8 @@ describe("Claude Code forwarding verifier", () => {
     expect(requests[0]?.init?.method).toBe("POST");
     expect(new Headers(requests[0]?.init?.headers).get("accept")).toBe("text/event-stream");
     expect(new Headers(requests[0]?.init?.headers).get("content-type")).toBe("application/json");
+    expect(new Headers(requests[0]?.init?.headers).get("authorization"))
+      .toBe("Bearer GHOST_IS_KING");
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({ ...body, stream: true });
     expect(events).toEqual(completedFrames().map(([event, data]) => ({
       event,

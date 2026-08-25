@@ -55,6 +55,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.cookieFile).toMatch(/prism-cookies\.json$/);
     expect(config.port).toBe(18787);
     expect(config.candidate).toBe(true);
+    expect(config.apiKey).toBe("GHOST_IS_KING");
   });
 
   it("defaults to authenticated V2-ready fleet policy", () => {
@@ -65,6 +66,7 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE);
 
     expect(config).not.toHaveProperty("transport");
+    expect(config.apiKey).toBe("GHOST_IS_KING");
     expect(config.sessionMode).toBe("authenticated");
     expect(config.allowAnonymous).toBe(false);
     expect(config.guestMaxProjects).toBe(1);
@@ -108,6 +110,21 @@ describe("multi-sandbox configuration", () => {
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
     expect(config.shutdownDrainMs).toBe(300_000);
+  });
+
+  it("accepts a configured inbound key and rejects unsafe key text", () => {
+    expect(resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GHOSTPROV_API_KEY: "custom-local-key",
+    }, MACHINE).apiKey).toBe("custom-local-key");
+    for (const value of ["line\nbreak", "x".repeat(4_097)]) {
+      expect(() => resolveMultiSandboxConfig({
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: A,
+        GHOSTPROV_API_KEY: value,
+      }, MACHINE)).toThrow("GHOSTPROV_API_KEY");
+    }
   });
 
   it("supports only explicit R1 rollback and exact known-project revision overrides", () => {

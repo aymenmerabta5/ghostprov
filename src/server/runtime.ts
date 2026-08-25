@@ -13,6 +13,7 @@ import {
   requestPath,
 } from "../http/request-policy";
 import {
+  AnthropicRequestError,
   anthropicErrorResponse,
   newAnthropicRequestId,
 } from "../anthropic/errors";
@@ -22,10 +23,13 @@ import type { WebSocketTelemetry } from "../ws/telemetry";
 import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
+import { apiKeyAuthorized, isProtectedApiPath } from "../http/api-key";
 
 export interface GhostProvServerOptions {
   app: Hono;
   router: RouterLike;
+  /** Omitted only by narrow unit-test/library seams. Production always sets it. */
+  apiKey?: string;
   port: number;
   candidate?: boolean;
   maxBodyBytes?: number;
@@ -72,6 +76,30 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
       const path = requestPath(request.url);
       const anthropicPath = isAnthropicRequestPath(path);
       try {
+        if (
+          options.apiKey &&
+          isProtectedApiPath(path) &&
+          !apiKeyAuthorized({
+            authorization: request.headers.authorization,
+            xApiKey: request.headers["x-api-key"],
+          }, options.apiKey, anthropicPath ? "anthropic" : "openai")
+        ) {
+          request.resume();
+          const unauthorized = anthropicPath
+            ? anthropicErrorResponse(
+                new AnthropicRequestError(401, "Invalid API key"),
+                newAnthropicRequestId(),
+              )
+            : apiErrorResponse(new ApiError(401, "Invalid API key", {
+                type: "authentication_error",
+                code: "invalid_api_key",
+              }));
+          if (!anthropicPath) {
+            unauthorized.headers.set("www-authenticate", 'Bearer realm="ghostprov"');
+          }
+          await writeFetchResponse(response, unauthorized);
+          return;
+        }
         const host = request.headers.host ?? `127.0.0.1:${options.port}`;
         const headers = new Headers();
         for (const [name, value] of Object.entries(request.headers)) {
@@ -143,6 +171,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     });
   });
   attachResponsesWebSocket(server, {
+    apiKey: options.apiKey,
     telemetry: options.webSocketTelemetry,
     processBudget: options.webSocketProcessBudget,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {

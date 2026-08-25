@@ -12,10 +12,13 @@ import {
   type V2HostEventMemorySizing,
 } from "../v2/memory/event-memory-sizing";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../v2/sidecar/capacity";
+import { resolveGhostProvApiKey } from "../http/api-key";
 
 export type PrismSessionMode = "authenticated" | "auto" | "anonymous";
 
 export interface MultiSandboxConfig {
+  /** Shared inbound credential for the OpenAI and Anthropic compatibility APIs. */
+  apiKey: string;
   projectIds: readonly ProjectId[];
   prismOrigin: string;
   cookieFile: string;
@@ -126,6 +129,7 @@ export function resolveMultiSandboxConfig(
   env: Record<string, string | undefined>,
   machine: MachineSample,
 ): MultiSandboxConfig {
+  const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   const sessionMode = enumValue<PrismSessionMode>(
     env.GP_PRISM_SESSION,
     "authenticated",
@@ -299,6 +303,7 @@ export function resolveMultiSandboxConfig(
   });
 
   return {
+    apiKey,
     projectIds: Object.freeze(projectIds),
     prismOrigin: (env.PRISM_ORIGIN ?? "https://prism.openai.com").replace(/\/+$/, ""),
     cookieFile: path.resolve(cookieFile),

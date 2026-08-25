@@ -9,15 +9,21 @@
  * Turn 2: replay the loop like Codex does (append function_call_output) and
  *   assert the model answers normally — proves the multi-request agent loop.
  */
+import { resolveGhostProvApiKey } from "../src/http/api-key";
+
 const BASE = process.env.GP_BASE ?? "http://localhost:8787";
 const MODEL = process.env.GP_MODEL ?? "gpt-5.6-luna";
+const API_KEY = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
 
 interface Frame { event: string; data: string; }
 
 async function stream(body: Record<string, unknown>): Promise<Frame[]> {
   const res = await fetch(`${BASE}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${API_KEY}`,
+    },
     body: JSON.stringify({ ...body, stream: true, store: false }),
   });
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}: ${await res.text()}`);

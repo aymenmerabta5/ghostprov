@@ -97,12 +97,15 @@ One sequential Codex task normally uses one lane. High utilization requires mult
 ## HTTP Responses
 
 ```powershell
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
+$env:OPENAI_API_KEY = "GHOST_IS_KING"
 curl.exe -X POST http://127.0.0.1:18787/v1/responses `
+  -H "Authorization: Bearer GHOST_IS_KING" `
   -H "content-type: application/json" `
   -d '{"model":"gpt-5.6-sol","store":false,"input":"Reply with hello"}'
 ```
 
-Use `stream:true` for incremental SSE. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
+Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. Health and sandbox-monitor endpoints remain available without credentials. Use `stream:true` for incremental SSE. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
 ## Anthropic Messages and Claude Code
 
@@ -110,11 +113,11 @@ The production Anthropic adapter is part of the same `createGhostProvApp` and us
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787"
-$env:ANTHROPIC_API_KEY = "ghostprov-local"
+$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"
 claude
 ```
 
-The equivalent values are `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and `ANTHROPIC_API_KEY=ghostprov-local`. The key must be nonempty so Claude Code's Anthropic SDK initializes; GhostProv does not require a local secret by default. The SDK adds the required `anthropic-version: 2023-06-01` header itself, so normal Claude Code setup does not configure that header separately.
+The equivalent values are `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and `ANTHROPIC_API_KEY=GHOST_IS_KING`. Anthropic routes require either an exact `x-api-key: <GHOSTPROV_API_KEY>` or `Authorization: Bearer <GHOSTPROV_API_KEY>`. The SDK adds the required `anthropic-version: 2023-06-01` header itself, so normal Claude Code setup does not configure that header separately.
 
 Supported Anthropic routes are:
 
@@ -123,7 +126,7 @@ Supported Anthropic routes are:
 - `POST /v1/messages?beta=true`
 - `POST /v1/messages/count_tokens?beta=true`
 
-The beta query and nonempty `anthropic-beta` headers enable current beta response fields. Unknown beta names and additive Claude Code/Stainless headers are tolerated. Local routes accept `x-api-key`, `Authorization: Bearer ...`, both headers, or neither; a future shared authentication layer may tighten that policy.
+The beta query and nonempty `anthropic-beta` headers enable current beta response fields. Unknown beta names and additive Claude Code/Stainless headers are tolerated. Authentication runs before request parsing or sandbox admission.
 
 Claude model names are selected by tier, case-insensitively:
 
@@ -153,11 +156,11 @@ In a second terminal, point Claude Code at the verifier rather than the producti
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18788"
-$env:ANTHROPIC_API_KEY = "ghostprov-local-verification"
+$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"
 claude
 ```
 
-The verifier refuses listener ports `18787` and `8787`, non-loopback upstreams, credentials, paths, queries, fragments, and self-forwarding. It never enumerates, starts, stops, restarts, or signals the upstream process. Ctrl+C closes only the verifier listener and its outbound requests. Live Claude Code calls through this verifier belong to the separate live-verification task; automated tests import it without opening a listener or contacting the upstream.
+The verifier refuses listener ports `18787` and `8787`, non-loopback upstream URL credentials, paths, queries, fragments, and self-forwarding. It forwards only the configured `GHOSTPROV_API_KEY` bearer credential to the loopback GhostProv upstream. It never enumerates, starts, stops, restarts, or signals the upstream process. Ctrl+C closes only the verifier listener and its outbound requests. Live Claude Code calls through this verifier belong to the separate live-verification task; automated tests import it without opening a listener or contacting the upstream.
 
 Reliability defaults allow eight concurrent forwards and reserve four times the 2 MiB per SSE event parser cap, enforcing a 64 MiB aggregate parser-memory ceiling. Admission permits at most 32 forward waiters and 32 incoming-body waiters, with a 128 MiB aggregate incoming-body byte budget; excess waiters receive a typed sanitized overload. Every admitted request has a 300-second forward deadline covering response headers through stream completion, and each streamed run has a 1 MiB per-run output queue with upstream backpressure.
 
@@ -325,6 +328,7 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
+| `GHOSTPROV_API_KEY` | `GHOST_IS_KING` | Shared inbound key required by every OpenAI/Anthropic `/v1/*` route and Responses WebSocket upgrade |
 | `GP_SUPERVISOR_READY_TIMEOUT_MS` | `120000` | Maximum internal-worker startup time |
 | `GP_SHUTDOWN_DRAIN_MS` | `300000` | Maximum wait for active terminal proofs during graceful shutdown |
 | `GP_SUPERVISOR_GRACE_MS` | `330000` | Graceful drain before force-stopping only the owned worker |
@@ -383,6 +387,7 @@ bun audit --production
 The isolated suite includes:
 
 - `tests/account-session.test.ts`
+- `tests/api-key-auth.test.ts`
 - `tests/anthropic-foundations.test.ts`
 - `tests/anthropic-http.test.ts`
 - `tests/anthropic-request-contract.test.ts`

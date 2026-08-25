@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { RunHandle } from "../relay/run-handle";
 import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
-import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
+import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
 import type { ImageCompatOptions } from "../images/compat";
 import { registerAnthropicRoutes } from "../anthropic/routes";
@@ -20,6 +20,13 @@ import {
   summarizeV2Releases,
 } from "../v2/release-observability";
 import type { FleetSnapshot } from "../fleet/types";
+import { apiKeyAuthorized } from "../http/api-key";
+import { isAnthropicRequestPath } from "../http/request-policy";
+import {
+  AnthropicRequestError,
+  anthropicErrorResponse,
+  newAnthropicRequestId,
+} from "../anthropic/errors";
 
 export interface RouterLike {
   startRelay(
@@ -49,6 +56,8 @@ export interface RouterLike {
 
 export interface GhostProvAppOptions {
   router: RouterLike;
+  /** Omitted only by narrow unit-test/library seams. Production always sets it. */
+  apiKey?: string;
   fleetSnapshot?: () => FleetSnapshot;
   imageOptions?: ImageCompatOptions;
   anthropicModels?: AnthropicModelOptions;
@@ -545,6 +554,29 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const keepAliveMs = options.keepAliveMs ?? 15_000;
   if (!Number.isSafeInteger(keepAliveMs) || keepAliveMs < 1 || keepAliveMs > MAX_TIMER_MS) {
     throw new RangeError(`keepAliveMs must be an integer from 1 through ${MAX_TIMER_MS}`);
+  }
+
+  if (options.apiKey) {
+    app.use("/v1/*", async (c, next) => {
+      const anthropic = isAnthropicRequestPath(c.req.path);
+      const authorized = apiKeyAuthorized({
+        authorization: c.req.header("authorization"),
+        xApiKey: c.req.header("x-api-key"),
+      }, options.apiKey!, anthropic ? "anthropic" : "openai");
+      if (authorized) return next();
+      if (anthropic) {
+        return anthropicErrorResponse(
+          new AnthropicRequestError(401, "Invalid API key"),
+          newAnthropicRequestId(),
+        );
+      }
+      const response = apiErrorResponse(new ApiError(401, "Invalid API key", {
+        type: "authentication_error",
+        code: "invalid_api_key",
+      }));
+      response.headers.set("www-authenticate", 'Bearer realm="ghostprov"');
+      return response;
+    });
   }
 
   app.get("/health", c => {

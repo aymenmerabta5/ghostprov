@@ -9,6 +9,7 @@ import {
   type WebSocketRelayStarter,
 } from "./session";
 import type { ResponseGraph } from "./response-graph";
+import { apiKeyAuthorized } from "../http/api-key";
 
 export type { WebSocketRelayStarter } from "./session";
 
@@ -69,6 +70,8 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   "startRelay" | "graph" | "clientId" | "processLease" | "parserReservationBytes" | "onActivity"
 > {
   startRelay: WebSocketRelayStarter;
+  /** Shared OpenAI-compatible bearer credential for the upgrade request. */
+  apiKey?: string;
   /** Hard parser-level limit enforced before a complete message reaches JS. */
   maxPayloadBytes?: number;
   /** Test/integration hook; production defaults to a fresh ID per connection. */
@@ -192,6 +195,27 @@ export function attachResponsesWebSocket(
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (url.pathname !== "/v1/responses") {
         socket.destroy();
+        return;
+      }
+      if (
+        options.apiKey &&
+        !apiKeyAuthorized({ authorization: request.headers.authorization }, options.apiKey, "openai")
+      ) {
+        const body = JSON.stringify({
+          error: {
+            message: "Invalid API key",
+            type: "authentication_error",
+            param: null,
+            code: "invalid_api_key",
+          },
+        });
+        socket.end(
+          "HTTP/1.1 401 Unauthorized\r\n" +
+          "Connection: close\r\n" +
+          "Content-Type: application/json\r\n" +
+          'WWW-Authenticate: Bearer realm="ghostprov"\r\n' +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        );
         return;
       }
       const jumboHeader = request.headers["x-ghostprov-ws-jumbo"];

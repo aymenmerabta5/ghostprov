@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
 import { Buffer } from "node:buffer";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 
 if (process.env.GP_LIVE_VERIFY !== "1") {
   throw new Error("Live verification mutates Prism state. Set GP_LIVE_VERIFY=1 explicitly.");
@@ -8,6 +9,7 @@ if (process.env.GP_LIVE_VERIFY !== "1") {
 const base = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:8787/v1").replace(/\/$/, "");
 const model = process.env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
 const timeoutMs = Number(process.env.GP_LIVE_TIMEOUT_MS ?? 10 * 60_000);
+const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
 
 function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -30,7 +32,7 @@ async function verifyHttpStreaming(): Promise<void> {
   const started = performance.now();
   const response = await fetch(`${base}/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer live-verify" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
       store: false,
@@ -60,7 +62,7 @@ async function verifyImageGeneration(): Promise<void> {
   const started = performance.now();
   const response = await fetch(`${base}/images/generations`, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer live-verify" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model: "gpt-image-2",
       prompt: "A minimal solid red circle centered on a white background.",
@@ -95,7 +97,7 @@ async function verifyImageGeneration(): Promise<void> {
   form.append("image", new File([png], "generated.png", { type: "image/png" }));
   const editResponse = await fetch(`${base}/images/edits`, {
     method: "POST",
-    headers: { authorization: "Bearer live-verify" },
+    headers: { authorization: `Bearer ${apiKey}` },
     body: form,
   });
   const editText = await editResponse.text();
@@ -114,7 +116,7 @@ interface WsHarness {
 async function openWebSocket(): Promise<WsHarness> {
   const url = new URL(`${base}/responses`);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(url, { headers: { authorization: "Bearer live-verify" } });
+  const socket = new WebSocket(url, { headers: { authorization: `Bearer ${apiKey}` } });
   await new Promise<void>((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);

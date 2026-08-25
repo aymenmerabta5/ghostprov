@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { createBrowserlessSystem } from "../src/server/system";
 import { resolveLiveV2Options } from "./live_v2_options";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 
 const PRIMARY = "http://127.0.0.1:8787";
 
@@ -22,11 +23,14 @@ async function health(root: string): Promise<Record<string, any>> {
   return body;
 }
 
-async function verifyHttp(base: string, model: string): Promise<number> {
+async function verifyHttp(base: string, model: string, apiKey: string): Promise<number> {
   const started = performance.now();
   const response = await fetch(`${base}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
       model,
       store: false,
@@ -43,10 +47,12 @@ async function verifyHttp(base: string, model: string): Promise<number> {
   return performance.now() - started;
 }
 
-async function verifyWebSocket(base: string, model: string): Promise<number> {
+async function verifyWebSocket(base: string, model: string, apiKey: string): Promise<number> {
   const url = new URL("/v1/responses", base);
   url.protocol = "ws:";
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(url, {
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
   await new Promise<void>((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);
@@ -75,12 +81,15 @@ async function verifyWebSocket(base: string, model: string): Promise<number> {
   }
 }
 
-async function verifyImage(base: string): Promise<number | null> {
+async function verifyImage(base: string, apiKey: string): Promise<number | null> {
   if (process.env.GP_LIVE_IMAGE !== "1") return null;
   const started = performance.now();
   const response = await fetch(`${base}/v1/images/generations`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
       model: "gpt-image-2",
       prompt: "A single blue circle on a white background.",
@@ -102,6 +111,7 @@ export async function main(
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   const options = resolveLiveV2Options(env);
+  const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   if (options.projectCount !== 1) {
     throw new Error("Single-project canary requires GP_LIVE_PROJECT_COUNT=1");
   }
@@ -124,9 +134,9 @@ export async function main(
         const started = performance.now();
         await system.start();
         await system.fleet.waitForReady(1);
-        const httpMs = await verifyHttp(candidateRoot, model);
-        const wsMs = await verifyWebSocket(candidateRoot, model);
-        const imageMs = await verifyImage(candidateRoot);
+        const httpMs = await verifyHttp(candidateRoot, model, apiKey);
+        const wsMs = await verifyWebSocket(candidateRoot, model, apiKey);
+        const imageMs = await verifyImage(candidateRoot, apiKey);
         cycles.push({
           cycle,
           startupMs: Math.round(performance.now() - started - httpMs - wsMs - (imageMs ?? 0)),

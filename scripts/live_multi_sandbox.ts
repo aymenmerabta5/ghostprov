@@ -1,3 +1,5 @@
+import { resolveGhostProvApiKey } from "../src/http/api-key";
+
 interface RuntimeSnapshot {
   state: string;
   capacity: number;
@@ -82,8 +84,9 @@ async function runStage(options: {
   timeoutMs: number;
   concurrency: number;
   capacity: number;
+  apiKey: string;
 }): Promise<{ summary: Record<string, unknown>; ids: string[] }> {
-  const { candidate, candidateRoot, model, timeoutMs, concurrency, capacity } = options;
+  const { candidate, candidateRoot, model, timeoutMs, concurrency, capacity, apiKey } = options;
   const peakRuntimeActive = [0, 0, 0, 0];
   let runtimeActiveAtPeak = [0, 0, 0, 0];
   let peakPhysicalActive = 0;
@@ -127,7 +130,7 @@ async function runStage(options: {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: "Bearer live-proof",
+          authorization: `Bearer ${apiKey}`,
           "x-ghostprov-client-id": `load-${index % 8}`,
         },
         body: JSON.stringify({
@@ -190,6 +193,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   const primaryRoot = "http://127.0.0.1:8787";
   const model = env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
   const timeoutMs = Number(env.GP_LIVE_TIMEOUT_MS ?? 20 * 60_000);
+  const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new Error("GP_LIVE_TIMEOUT_MS must be positive");
 
   const primaryBefore = await health(primaryRoot);
@@ -197,7 +201,15 @@ export async function main(env: Record<string, string | undefined> = process.env
   const stages: Record<string, unknown>[] = [];
   const allIds = new Set<string>();
   for (const concurrency of [16, 32, 64, 96, 120]) {
-    const stage = await runStage({ candidate, candidateRoot, model, timeoutMs, concurrency, capacity: ready.capacity });
+    const stage = await runStage({
+      candidate,
+      candidateRoot,
+      model,
+      timeoutMs,
+      concurrency,
+      capacity: ready.capacity,
+      apiKey,
+    });
     for (const id of stage.ids) {
       if (allIds.has(id)) throw new Error(`Duplicate response ID across stages: ${id}`);
       allIds.add(id);

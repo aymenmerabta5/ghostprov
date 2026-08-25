@@ -1,6 +1,9 @@
 /** Concurrency test: fire N parallel requests at /v1/responses, report timings. */
+import { resolveGhostProvApiKey } from "../src/http/api-key";
+
 const N = Number(process.argv[2] ?? "2");
 const SERVER = "http://localhost:8787";
+const API_KEY = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
 
 function body(i: number): string {
   return JSON.stringify({
@@ -18,7 +21,10 @@ async function one(i: number): Promise<{ i: number; ms: number; status: number; 
   try {
     const r = await fetch(`${SERVER}/v1/responses`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${API_KEY}`,
+      },
       body: body(i),
     });
     const j: any = await r.json().catch(() => null);

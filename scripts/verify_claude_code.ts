@@ -19,6 +19,7 @@ import {
   listen,
   trackVerifierUpgrades,
 } from "./claude-code-verifier/shutdown";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 
 export { closeVerifierServer, trackVerifierUpgrades };
 
@@ -53,6 +54,8 @@ export interface ForwardingRouter extends RouterLike {
 
 export interface ForwardingRouterDependencies {
   fetch?: FetchLike;
+  /** Shared bearer credential for the protected loopback GhostProv upstream. */
+  apiKey?: string;
   maxBufferedBytes?: number;
   maxEventBytes?: number;
   maxReadChunkBytes?: number;
@@ -287,6 +290,10 @@ export function createForwardingRouter(
 ): ForwardingRouter {
   const origin = validateUpstream(upstream).upstream;
   const fetchImpl = dependencies.fetch ?? globalThis.fetch;
+  const apiKey = dependencies.apiKey?.trim();
+  if (dependencies.apiKey !== undefined && !apiKey) {
+    throw new TypeError("Verifier apiKey must be nonempty when configured");
+  }
   const maxBufferedBytes = positiveSafeInteger(
     dependencies.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES,
     "maxBufferedBytes",
@@ -405,6 +412,7 @@ export function createForwardingRouter(
         headers: {
           accept: "text/event-stream",
           "content-type": "application/json",
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
         },
         body: requestBody,
       }));
@@ -552,11 +560,13 @@ export async function main(
   environment: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   const options = optionsFromEnvironment(environment);
-  const router = createForwardingRouter(options.upstream);
-  const app = createGhostProvApp({ router });
+  const apiKey = resolveGhostProvApiKey(environment.GHOSTPROV_API_KEY);
+  const router = createForwardingRouter(options.upstream, { apiKey });
+  const app = createGhostProvApp({ router, apiKey });
   const server = createGhostProvServer({
     app,
     router,
+    apiKey,
     port: options.port,
     candidate: true,
   });

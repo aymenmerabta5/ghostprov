@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { createFakeV2System } from "../tests/support/fake-v2-system";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 
 export function resolveSmokeProtectedRoot(
   env: Record<string, string | undefined>,
@@ -44,12 +45,14 @@ async function primaryHealthy(root: string): Promise<void> {
 
 export async function main(): Promise<void> {
   const protectedRoot = resolveSmokeProtectedRoot(process.env);
+  const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
   await primaryHealthy(protectedRoot);
   const system = await createFakeV2System({ runtimes: 1, physicalPerRuntime: 8 });
-  const app = createGhostProvApp({ router: system.router });
+  const app = createGhostProvApp({ router: system.router, apiKey });
   const server = createGhostProvServer({
     app,
     router: system.router,
+    apiKey,
     port: 18_787,
     candidate: true,
   });
@@ -66,7 +69,10 @@ export async function main(): Promise<void> {
     const base = `http://127.0.0.1:${port}`;
     const response = await fetch(`${base}/v1/responses`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
       body: JSON.stringify({ model: "gpt-5.6-sol", input: "V2_SMOKE_HTTP", store: false }),
     });
     const final = await response.json() as any;
@@ -74,7 +80,9 @@ export async function main(): Promise<void> {
 
     const wsUrl = new URL("/v1/responses", base);
     wsUrl.protocol = "ws:";
-    const socket = new WebSocket(wsUrl);
+    const socket = new WebSocket(wsUrl, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
     await new Promise<void>((resolve, reject) => {
       socket.once("open", resolve);
       socket.once("error", reject);

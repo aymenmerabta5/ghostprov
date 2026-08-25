@@ -753,11 +753,13 @@ export async function createBrowserlessSystem(
   });
   const app = createGhostProvApp({
     router,
+    apiKey: config.apiKey,
     fleetSnapshot: () => fleet.snapshot(),
   });
   const server = dependencies.server ?? createGhostProvServer({
     app,
     router,
+    apiKey: config.apiKey,
     port: config.port,
     candidate: config.candidate,
     webSocketTelemetry,

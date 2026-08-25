@@ -96,6 +96,48 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("Responses WebSocket server", () => {
+  it("requires the configured bearer key before allocating an upgrade", async () => {
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 8,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: 64 * 1024 * 1024,
+    });
+    attachResponsesWebSocket(server, {
+      apiKey: "GHOST_IS_KING",
+      processBudget: budget,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const url = `ws://127.0.0.1:${address.port}/v1/responses`;
+
+    for (const headers of [undefined, { authorization: "Bearer wrong" }]) {
+      const rejected = new WebSocket(url, headers ? { headers } : undefined);
+      rejected.on("error", () => undefined);
+      const status = await new Promise<number>(resolve => {
+        rejected.once("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        });
+      });
+      expect(status).toBe(401);
+      expect(budget.snapshot().sessions).toBe(0);
+    }
+
+    const accepted = new WebSocket(url, {
+      headers: { authorization: "Bearer GHOST_IS_KING" },
+    });
+    sockets.push(accepted);
+    await new Promise<void>((resolve, reject) => {
+      accepted.once("open", resolve);
+      accepted.once("error", reject);
+    });
+    expect(budget.snapshot().sessions).toBe(1);
+  });
+
   it("bounds thirty default parser reservations and one explicit jumbo mix", () => {
     const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
     const jumboBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);

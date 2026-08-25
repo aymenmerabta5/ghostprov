@@ -52,6 +52,7 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r2");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r1");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
+    expect(envExample).toContain("GHOSTPROV_API_KEY=GHOST_IS_KING");
   });
 
   it("documents the Images compatibility surface and honest capability boundaries", () => {
@@ -70,7 +71,8 @@ describe("project documentation", () => {
       "POST /v1/messages?beta=true",
       "POST /v1/messages/count_tokens?beta=true",
       "ANTHROPIC_BASE_URL=http://127.0.0.1:18787",
-      "ANTHROPIC_API_KEY=ghostprov-local",
+      "ANTHROPIC_API_KEY=GHOST_IS_KING",
+      "GHOSTPROV_API_KEY",
       "must not end in `/v1`",
       "Opus → `gpt-5.6-sol`",
       "Sonnet → `gpt-5.6-terra`",
@@ -85,8 +87,7 @@ describe("project documentation", () => {
       "bun run verify:claude-code",
       "127.0.0.1:18788",
     ]) expect(readme).toContain(value);
-    expect(envExample).toContain("ANTHROPIC_BASE_URL=http://127.0.0.1:18787");
-    expect(envExample).toContain("ANTHROPIC_API_KEY=ghostprov-local");
+    expect(envExample).toContain("GHOSTPROV_API_KEY=GHOST_IS_KING");
     expect(envExample).toContain("GP_CLAUDE_VERIFY_PORT=18788");
     expect(envExample).toContain("GP_CLAUDE_VERIFY_UPSTREAM=http://127.0.0.1:18787");
     expect(pkg.scripts["verify:claude-code"]).toBe("bun scripts/verify_claude_code.ts");
@@ -100,7 +101,7 @@ describe("project documentation", () => {
       secondTerminal,
     );
     const verifierKey = readme.indexOf(
-      '$env:ANTHROPIC_API_KEY = "ghostprov-local-verification"',
+      '$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"',
       verifierBase,
     );
     const verifierClaude = readme.indexOf("claude", verifierKey);
