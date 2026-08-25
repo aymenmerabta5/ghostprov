@@ -529,7 +529,7 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("defaults omitted service tiers to fast and preserves explicit tiers", async () => {
+  it("defaults non-image work to fast, preserves explicit text tiers, and strips image tiers", async () => {
     const system = createSystem(1, 1);
     const implicit = await system.router.startRelay({
       model: "gpt-5.6-sol",
@@ -547,6 +547,25 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes[0].bodies[1]).toMatchObject({ service_tier: "priority" });
     system.runtimes[0].completeOne();
     await explicit.final;
+
+    const implicitImage = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "implicit image tier",
+      tools: [{ type: "image_generation", model: "gpt-image-2", quality: "medium" }],
+    });
+    expect(system.runtimes[0].bodies[2]).not.toHaveProperty("service_tier");
+    system.runtimes[0].completeOne();
+    await implicitImage.final;
+
+    const explicitImage = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "explicit image tier",
+      service_tier: "priority",
+      tools: [{ type: "image_generation", model: "gpt-image-2", quality: "medium" }],
+    });
+    expect(system.runtimes[0].bodies[3]).not.toHaveProperty("service_tier");
+    system.runtimes[0].completeOne();
+    await explicitImage.final;
   });
 
   it("never reroutes a rejection after a handle was published", async () => {

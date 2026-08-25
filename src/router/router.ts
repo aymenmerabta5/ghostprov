@@ -161,6 +161,17 @@ interface IncomingRequestTracker {
   controller: AbortController;
 }
 
+function usesImageGeneration(body: Record<string, unknown>): boolean {
+  if (typeof body.model === "string" && body.model.startsWith("gpt-image-")) return true;
+  if (!Array.isArray(body.tools)) return false;
+  return body.tools.some(tool => (
+    tool !== null &&
+    typeof tool === "object" &&
+    !Array.isArray(tool) &&
+    (tool as Record<string, unknown>).type === "image_generation"
+  ));
+}
+
 export interface MultiSandboxRouterSnapshot {
   capacity: number;
   active: number;
@@ -416,9 +427,15 @@ export class MultiSandboxRouter {
       : acceptedAtMs + this.#queueTimeoutMs;
     const traceId = this.#random.uuid();
     const source = options.source ?? "internal";
-    const relayBody = body.service_tier === undefined
-      ? { ...body, service_tier: "fast" }
-      : body;
+    const imageGeneration = usesImageGeneration(body);
+    const injectFastTier = body.service_tier === undefined && !imageGeneration;
+    let relayBody: Record<string, unknown>;
+    if (imageGeneration && "service_tier" in body) {
+      const { service_tier: _unsupportedImageTier, ...withoutImageTier } = body;
+      relayBody = withoutImageTier;
+    } else {
+      relayBody = injectFastTier ? { ...body, service_tier: "fast" } : body;
+    }
     const incomingBodyBytes = source === "http" ? options.incomingLease?.bodyBytes : undefined;
     const encodedBodyBytes = options.encodedBodyBytes ?? incomingBodyBytes;
     if (
@@ -430,8 +447,11 @@ export class MultiSandboxRouter {
     const workload = classifyWorkload(relayBody, encodedBodyBytes === undefined
       ? undefined
       : {
-          // Covers the injected service_tier key/value and object punctuation.
-          encodedBytes: Math.min(Number.MAX_SAFE_INTEGER, encodedBodyBytes + 64),
+          // Covers an injected service_tier key/value and object punctuation.
+          encodedBytes: Math.min(
+            Number.MAX_SAFE_INTEGER,
+            encodedBodyBytes + (injectFastTier ? 64 : 0),
+          ),
         });
     // Multipart image input and its base64 relay representation remain live
     // together until the compatibility request finishes. The first fan-out

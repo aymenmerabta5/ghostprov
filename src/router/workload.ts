@@ -158,6 +158,10 @@ export function classifyWorkload(
     reservedBytes: Math.ceil(reservedBytes),
     cpuPermits,
     stream,
-    model: typeof body.model === "string" ? body.model : undefined,
+    model: imageTool && typeof imageTool.model === "string"
+      ? imageTool.model
+      : typeof body.model === "string"
+        ? body.model
+        : undefined,
   };
 }

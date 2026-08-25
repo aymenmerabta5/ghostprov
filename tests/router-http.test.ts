@@ -1069,7 +1069,7 @@ describe("router HTTP composition", () => {
       tools: [{ type: "image_generation" }],
     };
     const incoming = await router.acquireIncomingBody(1024);
-    const execution = classifyWorkload({ ...body, service_tier: "fast" });
+    const execution = classifyWorkload(body);
 
     try {
       const relay = await router.startRelay(body, {

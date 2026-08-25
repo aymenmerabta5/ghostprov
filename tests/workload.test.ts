@@ -29,7 +29,9 @@ describe("workload classification", () => {
       tools: [{ type: "image_generation", model: "gpt-image-2", action: "edit" }],
     });
     expect(generation.class).toBe("image-generation");
+    expect(generation.model).toBe("gpt-image-2");
     expect(edit.class).toBe("image-edit");
+    expect(edit.model).toBe("gpt-image-2");
     expect(edit.reservedBytes).toBeGreaterThan(generation.reservedBytes);
     expect(edit.cpuPermits).toBe(1);
   });
