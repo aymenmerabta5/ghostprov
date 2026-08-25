@@ -7,8 +7,9 @@ import {
 } from "../protocol/shared";
 
 export const V2_R1 = "r1" as const;
+export const V2_R2 = "r2" as const;
 export const DEFAULT_V2_SIDECAR_REVISION = V2_R1;
-export const V2_SIDECAR_REVISIONS = Object.freeze([V2_R1] as const);
+export const V2_SIDECAR_REVISIONS = Object.freeze([V2_R1, V2_R2] as const);
 
 export type V2SidecarRevision = (typeof V2_SIDECAR_REVISIONS)[number];
 
@@ -78,9 +79,9 @@ const OBSOLETE_PATHS = Object.freeze([
   `${ASSET_PREFIX}/sidecar.bundle.js`,
   `${ASSET_PREFIX}/src`,
 ]);
-const RELEASES: Readonly<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
+const RELEASES: Readonly<Partial<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
   readonly bundlePath: string;
-}>> = Object.freeze({
+}>>> = Object.freeze({
   r1: Object.freeze({
     ...V2_R1_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r1/sidecar.bundle.js"),
@@ -139,6 +140,9 @@ export function resolveV2SidecarRevision(value?: string): V2SidecarRevision {
 
 async function loadFrozenBundle(revision: V2SidecarRevision): Promise<string> {
   const release = RELEASES[revision];
+  if (!release) {
+    throw new Error(`No frozen V2-${revision.toUpperCase()} sidecar release is registered`);
+  }
   let content: string;
   try {
     content = await readFile(release.bundlePath, "utf8");
@@ -311,6 +315,9 @@ export async function loadV2SidecarAssets(
 ): Promise<V2SidecarAssets> {
   const revision = resolveV2SidecarRevision(options.revision);
   const release = RELEASES[revision];
+  if (!release) {
+    throw new Error(`No frozen V2-${revision.toUpperCase()} sidecar release is registered`);
+  }
   const schemaHash = release.schemaHash;
   const content = await loadFrozenBundle(revision);
   const logicalFiles = [{

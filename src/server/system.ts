@@ -287,6 +287,7 @@ function defaultRuntimeFactory(options: {
         awareness: bootstrap.awareness,
         assets: bootstrap.assets,
         revision: release.revision,
+        launchNonce: bootstrap.binding.launchNonce,
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
         initialActivePerSandbox: config.v2InitialActivePerSandbox,

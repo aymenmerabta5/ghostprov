@@ -143,7 +143,7 @@ describe("SidecarEngine", () => {
     expect(batchIndex).toBeGreaterThanOrEqual(0);
     expect(terminalIndex).toBeGreaterThan(batchIndex);
   });
-  it("ACKs only after durable claim and permit, then never retries after fetch start", async () => {
+  it("ACKs R1 after durable claim and permit, then never retries after fetch start", async () => {
     let harness!: SidecarHarness;
     const behavior = async (input: DirectResponsesExecution): Promise<UpstreamTerminal> => {
       await input.beforeFetch();

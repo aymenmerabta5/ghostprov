@@ -8,6 +8,8 @@ import type {
 import {
   GP_V2_FLIGHT_MAX_BYTES,
   GP_V2_FLIGHT_MAX_FRAMES,
+  GP_V2_R1_SCHEMA_VERSION,
+  GP_V2_R2_SCHEMA_VERSION,
   GP_V2_REQUEST_MAX_BYTES,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
@@ -24,7 +26,9 @@ import {
   type ProtocolBinding,
   type ReliableFrame,
   type RequestEncoding,
+  type R2AwarenessEnvelope,
   type SidecarFrame,
+  type UpstreamPrelude,
 } from "../protocol/shared";
 import { AckClockedFlight } from "../protocol/flight";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
@@ -114,6 +118,8 @@ export interface V2TransportSessionOptions {
   unadmittedTimeoutMs?: number;
   /** Sidecar instance proven by the bootstrap handshake. Required for liveness probes. */
   expectedSidecarInstanceId?: string;
+  /** Deterministic tests may inject this; production uses a fresh UUID. */
+  hostInstanceId?: string;
   /** Primarily injectable for deterministic tests. Production defaults to five seconds. */
   livenessTimeoutMs?: number;
 }
@@ -152,6 +158,7 @@ interface RequestState {
   assemblies: Map<number, EventAssembly>;
   completedEvents: Map<number, SseFrame>;
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
+  upstreamPrelude: UpstreamPrelude | null;
   diagnostics: HostRequestDiagnosticsObserver;
   firstResponseSeen: boolean;
   admissionTimer?: ReturnType<typeof setTimeout>;
@@ -205,8 +212,13 @@ function validBinding(
   envelope: AwarenessEnvelope<SidecarFrame>,
   binding: ProtocolBinding,
 ): boolean {
+  const revisionMatches = binding.protocolRevision === "r2"
+    ? envelope.schemaVersion === GP_V2_R2_SCHEMA_VERSION &&
+      envelope.protocolRevision === "r2" &&
+      envelope.launchNonce === binding.launchNonce
+    : envelope.schemaVersion === GP_V2_R1_SCHEMA_VERSION;
   return envelope.protocol === "gp-awareness-v2" &&
-    envelope.schemaVersion === 1 &&
+    revisionMatches &&
     envelope.projectId === binding.projectId &&
     envelope.sessionId === binding.sessionId &&
     envelope.leaderGeneration === binding.leaderGeneration &&
@@ -248,7 +260,7 @@ export class V2TransportSession {
   readonly #unadmittedTimeoutMs: number;
   readonly #expectedSidecarInstanceId: string | null;
   readonly #livenessTimeoutMs: number;
-  readonly #hostInstanceId = `host-${crypto.randomUUID()}`;
+  readonly #hostInstanceId: string;
   readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
   #processedInboundAck = { epoch: 1, sequence: -1 };
@@ -344,6 +356,15 @@ export class V2TransportSession {
     ) {
       throw new TypeError("expectedSidecarInstanceId is invalid");
     }
+    if (options.hostInstanceId !== undefined && !SAFE_INSTANCE_ID.test(options.hostInstanceId)) {
+      throw new TypeError("hostInstanceId is invalid");
+    }
+    if (!SAFE_INSTANCE_ID.test(options.binding.launchNonce)) {
+      throw new TypeError("binding launchNonce is invalid");
+    }
+    if (options.binding.protocolRevision === "r2" && !options.expectedSidecarInstanceId) {
+      throw new TypeError("R2 transport requires expectedSidecarInstanceId");
+    }
     const livenessTimeoutMs = options.livenessTimeoutMs ?? DEFAULT_LIVENESS_TIMEOUT_MS;
     if (!Number.isSafeInteger(livenessTimeoutMs) || livenessTimeoutMs < 1) {
       throw new RangeError("livenessTimeoutMs must be a positive safe integer");
@@ -358,6 +379,7 @@ export class V2TransportSession {
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
     this.#expectedSidecarInstanceId = options.expectedSidecarInstanceId ?? null;
+    this.#hostInstanceId = options.hostInstanceId ?? `host-${crypto.randomUUID()}`;
     this.#livenessTimeoutMs = livenessTimeoutMs;
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
@@ -508,6 +530,7 @@ export class V2TransportSession {
     const handle = new V2RunHandle({
       clock: this.#clock,
       maxBufferedBytes: this.#maxBufferedResponseBytes,
+      expectUpstreamPrelude: this.#binding.protocolRevision === "r2",
     });
     handle.stats.diagnostics = diagnostics.value();
     let resolveRun!: (handle: RunHandle) => void;
@@ -540,6 +563,7 @@ export class V2TransportSession {
       assemblies: new Map(),
       completedEvents: new Map(),
       terminal: null,
+      upstreamPrelude: null,
       diagnostics,
       firstResponseSeen: false,
     };
@@ -729,6 +753,10 @@ export class V2TransportSession {
 
   #observeSidecarLiveness(envelope: AwarenessEnvelope<SidecarFrame>): void {
     if (this.#closed || this.#protocolFailed || !validBinding(envelope, this.#binding)) return;
+    if (
+      this.#binding.protocolRevision === "r2" &&
+      (envelope as R2AwarenessEnvelope<SidecarFrame>).targetInstanceId !== this.#hostInstanceId
+    ) return;
     const lane: AwarenessLane = envelope.lane ?? "data";
     if (lane === "control" && envelope.frames.length > 0) return;
     const expectedInstanceId = this.#expectedSidecarInstanceId;
@@ -818,11 +846,16 @@ export class V2TransportSession {
     if (!validBinding(envelope, this.#binding)) {
       throw new Error("Sidecar Awareness binding is invalid");
     }
+    if (
+      this.#binding.protocolRevision === "r2" &&
+      (envelope as R2AwarenessEnvelope<SidecarFrame>).targetInstanceId !== this.#hostInstanceId
+    ) return;
     const lane: AwarenessLane = envelope.lane ?? "data";
     if (
       this.#expectedSidecarInstanceId &&
       envelope.instanceId !== this.#expectedSidecarInstanceId
     ) {
+      if (this.#binding.protocolRevision === "r2") return;
       // An old data-state replay cannot take over the transport and may arrive
       // after the bootstrap-bound peer is already live. Ignore that stale
       // epoch; a foreign current/new epoch or any control state fails closed.
@@ -907,6 +940,41 @@ export class V2TransportSession {
 
   async #processFrame(frame: ReliableFrame<SidecarFrame>): Promise<void> {
     switch (frame.kind) {
+      case "upstream_prelude": {
+        const state = this.#requests.get(frame.requestId);
+        if (!state) return;
+        if (!state.committed) {
+          const message = "Sidecar emitted upstream headers before commitment";
+          if (state.commitPublished) {
+            this.#failCommitted(state, new V2CommittedError(message, "protocol", true));
+          } else {
+            this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
+          }
+          return;
+        }
+        const prelude = {
+          status: frame.status,
+          contentType: frame.contentType,
+          upstreamRequestId: frame.upstreamRequestId,
+        };
+        if (state.upstreamPrelude) {
+          if (
+            state.upstreamPrelude.status !== prelude.status ||
+            state.upstreamPrelude.contentType !== prelude.contentType ||
+            state.upstreamPrelude.upstreamRequestId !== prelude.upstreamRequestId
+          ) {
+            this.#failCommitted(state, new V2CommittedError(
+              "Sidecar emitted conflicting upstream headers",
+              "prelude_conflict",
+              true,
+            ));
+          }
+          return;
+        }
+        state.upstreamPrelude = prelude;
+        state.handle.acceptUpstreamPrelude(prelude);
+        return;
+      }
       case "request_ack": {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
@@ -958,6 +1026,14 @@ export class V2TransportSession {
           }
           return;
         }
+        if (this.#binding.protocolRevision === "r2" && !state.upstreamPrelude) {
+          this.#failCommitted(state, new V2CommittedError(
+            "Sidecar emitted response data before upstream headers",
+            "missing_prelude",
+            true,
+          ));
+          return;
+        }
         if (!state.firstResponseSeen) { state.firstResponseSeen = true; state.diagnostics.firstFrame(frame.diagnostics); }
         await this.#acceptResponsePart(state, frame);
         return;
@@ -965,6 +1041,7 @@ export class V2TransportSession {
       case "response_batch": {
         const state=this.#requests.get(frame.requestId);if(!state)return;
         if(!state.committed){const message="Sidecar emitted response data before commitment";if(state.commitPublished)this.#failCommitted(state,new V2CommittedError(message,"protocol",true));else this.#failPreCommit(state,new V2PreCommitError(message,"protocol"));return;}
+        if(this.#binding.protocolRevision==="r2"&&!state.upstreamPrelude){this.#failCommitted(state,new V2CommittedError("Sidecar emitted response data before upstream headers","missing_prelude",true));return;}
         for(let offset=0;offset<frame.items.length;offset++){
           const eventIndex=frame.firstEventIndex+offset;const item=frame.items[offset]!;let bytes:Uint8Array;let data:string;
           try{bytes=base64UrlDecode(item.dataBase64Url);data=utf8Text(bytes);}catch{this.#failCommitted(state,new V2CommittedError("Response batch encoding is invalid","response_encoding",true));return;}
@@ -984,6 +1061,14 @@ export class V2TransportSession {
           } else {
             this.#failPreCommit(state, new V2PreCommitError(message, "protocol"));
           }
+          return;
+        }
+        if (this.#binding.protocolRevision === "r2" && !state.upstreamPrelude) {
+          this.#failCommitted(state, new V2CommittedError(
+            "Sidecar emitted terminal proof before upstream headers",
+            "missing_prelude",
+            true,
+          ));
           return;
         }
         if (state.terminal && state.terminal.transcriptSha256 !== frame.transcriptSha256) {
@@ -1007,6 +1092,7 @@ export class V2TransportSession {
             frame.code,
             frame.ambiguous,
             frame.rateLimit,
+            frame.providerError,
           ));
         } else {
           this.#failPreCommit(state, new V2PreCommitError(frame.message, frame.code));
@@ -1238,7 +1324,27 @@ export class V2TransportSession {
         dataBase64Url: base64UrlEncode(encoded.subarray(offset, offset + REQUEST_PART_BYTES)),
       });
     }
-    frames.push({ kind: "request_commit", requestId });
+    frames.push(this.#binding.protocolRevision === "r2"
+      ? {
+          kind: "request_commit",
+          requestId,
+          protocolRevision: "r2",
+          schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+          projectId: this.#binding.projectId,
+          sessionId: this.#binding.sessionId,
+          leaderGeneration: this.#binding.leaderGeneration,
+          buildHash: this.#binding.buildHash,
+          schemaHash: this.#binding.schemaHash,
+          launchNonce: this.#binding.launchNonce,
+          hostInstanceId: this.#hostInstanceId,
+          targetInstanceId: this.#expectedSidecarInstanceId!,
+          requestDigest,
+          decodedBytes: decoded.byteLength,
+          encodedBytes: encoded.byteLength,
+          encoding,
+          partCount,
+        }
+      : { kind: "request_commit", requestId });
     return { requestDigest, frames };
   }
 
@@ -1337,9 +1443,8 @@ export class V2TransportSession {
   ): void {
     const outbound = this.#outbound.snapshot();
     const committed = [...this.#requests.values()].filter(state => state.committed).length;
-    const envelope: AwarenessEnvelope<HostFrame> = {
+    const common = {
       protocol: "gp-awareness-v2",
-      schemaVersion: 1,
       schemaHash: this.#binding.schemaHash,
       buildHash: this.#binding.buildHash,
       projectId: this.#binding.projectId,
@@ -1362,7 +1467,20 @@ export class V2TransportSession {
             sentAtMs: this.#livenessProbe.sentAtMs,
           } satisfies AwarenessLiveness }
         : {}),
-    };
+    } as const;
+    const envelope: AwarenessEnvelope<HostFrame> =
+      this.#binding.protocolRevision === "r2"
+        ? {
+            ...common,
+            protocolRevision: "r2",
+            schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+            launchNonce: this.#binding.launchNonce,
+            targetInstanceId: this.#expectedSidecarInstanceId!,
+          }
+        : {
+            ...common,
+            schemaVersion: GP_V2_R1_SCHEMA_VERSION,
+          };
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;

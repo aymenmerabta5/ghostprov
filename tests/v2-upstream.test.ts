@@ -75,10 +75,14 @@ describe("DirectResponsesClient", () => {
     const terminal = await client.execute({
       body,
       beforeFetch: async () => { order.push("fetch_starting"); },
+      onPrelude: async prelude => {
+        expect(prelude).toMatchObject({ status: 200, contentType: "text/event-stream" });
+        order.push("prelude");
+      },
       onEvent: async event => { events.push(event); },
     });
 
-    expect(order).toEqual(["fetch_starting", "fetch"]);
+    expect(order).toEqual(["fetch_starting", "fetch", "prelude"]);
     expect(bodies).toEqual([{
       model: "gpt-5.6-sol",
       input: "hello",
@@ -111,6 +115,7 @@ describe("DirectResponsesClient", () => {
       await client.execute({
         body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
         beforeFetch: async () => {},
+        onPrelude: async () => {},
         onEvent: async () => {},
       });
       throw new Error("expected transport failure");
@@ -132,6 +137,7 @@ describe("DirectResponsesClient", () => {
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => {},
+      onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({
       message,
@@ -163,6 +169,7 @@ describe("DirectResponsesClient", () => {
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => {},
+      onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({
       message: FULL_TPM_MESSAGE,
@@ -189,22 +196,126 @@ describe("DirectResponsesClient", () => {
       }]]),
     });
 
-    await expect(client.execute({
-      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
-      beforeFetch: async () => {},
-      onEvent: async event => { events.push(event); },
-    })).rejects.toMatchObject({
-      message: FULL_TPM_MESSAGE,
-      ambiguous: false,
-      status: 429,
-      code: "rate_limit_exceeded",
-      rateLimit: {
-        retryAfterMs: 914,
-        limitTokens: 40_000_000,
-        remainingTokens: 0,
-      },
-    });
+    try {
+      await client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async event => { events.push(event); },
+      });
+      throw new Error("expected streamed provider error");
+    } catch (error) {
+      expect(error).toMatchObject({
+        message: FULL_TPM_MESSAGE,
+        ambiguous: false,
+        status: 429,
+        code: "rate_limit_exceeded",
+        rateLimit: {
+          retryAfterMs: 914,
+          limitTokens: 40_000_000,
+          remainingTokens: 0,
+        },
+        providerError: {
+          version: 1,
+          origin: "sse",
+          status: 429,
+          error: {
+            message: FULL_TPM_MESSAGE,
+            type: "error",
+            param: null,
+            code: "rate_limit_exceeded",
+          },
+          model: "gpt-5.6-sol",
+        },
+      });
+      const providerError = (error as UpstreamExecutionError).providerError!;
+      expect(providerError.organizationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.parse(providerError.payload.text)).toEqual({
+        type: "error",
+        message: FULL_TPM_MESSAGE,
+        code: "rate_limit_exceeded",
+      });
+    }
     expect(events).toEqual([]);
+  });
+
+  it("keeps a plain-text streamed rate-limit payload instead of replacing it", async () => {
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("api-secret"),
+      fetch: async () => new Response(
+        `event: error\ndata: ${FULL_TPM_MESSAGE}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    try {
+      await client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      });
+      throw new Error("expected plain-text provider error");
+    } catch (error) {
+      expect(error).toMatchObject({
+        status: 429,
+        code: "rate_limit_exceeded",
+        providerError: {
+          origin: "sse",
+          status: 429,
+          payload: {
+            format: "text",
+            text: FULL_TPM_MESSAGE,
+            truncated: false,
+          },
+        },
+      });
+    }
+  });
+
+  it("preserves bounded safe SSE provider fields including param and status", async () => {
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("api-secret"),
+      fetch: async () => sseResponse([["error", {
+        type: "invalid_request_error",
+        status: 422,
+        message: "Invalid tool schema",
+        param: "tools[0].parameters",
+        code: "invalid_tool_schema",
+        authorization: "Bearer must-not-cross",
+      }]]),
+    });
+
+    try {
+      await client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-terra","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      });
+      throw new Error("expected streamed provider error");
+    } catch (error) {
+      expect(error).toMatchObject({
+        status: 422,
+        code: "invalid_tool_schema",
+        providerError: {
+          origin: "sse",
+          status: 422,
+          model: "gpt-5.6-terra",
+          error: {
+            message: "Invalid tool schema",
+            type: "invalid_request_error",
+            param: "tools[0].parameters",
+            code: "invalid_tool_schema",
+          },
+        },
+      });
+      const payload = (error as UpstreamExecutionError).providerError!.payload.text;
+      expect(payload).not.toContain("must-not-cross");
+      expect(JSON.parse(payload).authorization).toBe("[REDACTED]");
+    }
   });
 
   it("keeps a beforeFetch failure non-ambiguous and never calls fetch", async () => {
@@ -218,8 +329,29 @@ describe("DirectResponsesClient", () => {
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => { throw new Error("journal failed"); },
+      onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({ ambiguous: false, code: "before_fetch" });
+    expect(calls).toBe(0);
+  });
+
+  it("propagates an R2 election loss without wrapping it as a provider outcome", async () => {
+    let calls = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => { calls++; return completeSse(); },
+    });
+    const fence = Object.assign(new Error("election lost"), {
+      name: "V2ExecutionFenceError",
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => { throw fence; },
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    })).rejects.toBe(fence);
     expect(calls).toBe(0);
   });
 
@@ -240,6 +372,7 @@ describe("DirectResponsesClient", () => {
       await client.execute({
         body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
         beforeFetch: async () => {},
+        onPrelude: async () => {},
         onEvent: async () => {},
       });
       throw new Error("expected HTTP error");
@@ -247,6 +380,39 @@ describe("DirectResponsesClient", () => {
       expect(error).toMatchObject({ ambiguous: false, code: "invalid_value", status: 400 });
       expect(String(error)).not.toContain("x".repeat(64));
     }
+  });
+
+  it("keeps a known HTTP failure definitive when its error body cannot be read", async () => {
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new Error("broken private error body"));
+        },
+      }), { status: 502 }),
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    })).rejects.toMatchObject({
+      ambiguous: false,
+      status: 502,
+      code: "upstream_error",
+      providerError: {
+        origin: "http",
+        status: 502,
+        error: {
+          message: "Upstream Responses request failed (502)",
+          type: "upstream_error",
+          param: null,
+          code: null,
+        },
+      },
+    });
   });
 
   it("captures TPM headers from a 429 for observation-only host telemetry", async () => {
@@ -257,8 +423,10 @@ describe("DirectResponsesClient", () => {
         error: {
           message: "Rate limit reached. Please try again in 109ms.",
           type: "rate_limit_error",
+          param: "input",
           code: "rate_limit_exceeded",
         },
+        api_key: "must-not-cross",
       }, {
         status: 429,
         headers: {
@@ -266,24 +434,56 @@ describe("DirectResponsesClient", () => {
           "x-ratelimit-limit-tokens": "40000000",
           "x-ratelimit-remaining-tokens": "0",
           "x-ratelimit-reset-tokens": "6m0s",
+          "x-request-id": "req_provider_123",
+          "set-cookie": "session=must-not-cross",
         },
       }),
     });
 
-    await expect(client.execute({
-      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
-      beforeFetch: async () => {},
-      onEvent: async () => {},
-    })).rejects.toMatchObject({
-      status: 429,
-      code: "rate_limit_exceeded",
-      rateLimit: {
-        retryAfterMs: 109,
-        limitTokens: 40_000_000,
-        remainingTokens: 0,
-        resetTokensMs: 360_000,
-      },
-    });
+    try {
+      await client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      });
+      throw new Error("expected HTTP provider error");
+    } catch (error) {
+      expect(error).toMatchObject({
+        status: 429,
+        code: "rate_limit_exceeded",
+        rateLimit: {
+          retryAfterMs: 109,
+          limitTokens: 40_000_000,
+          remainingTokens: 0,
+          resetTokensMs: 360_000,
+        },
+        providerError: {
+          version: 1,
+          origin: "http",
+          status: 429,
+          upstreamRequestId: "req_provider_123",
+          model: "gpt-5.6-sol",
+          organizationFingerprint: null,
+          error: {
+            message: "Rate limit reached. Please try again in 109ms.",
+            type: "rate_limit_error",
+            param: "input",
+            code: "rate_limit_exceeded",
+          },
+          headers: {
+            "retry-after": "0.109",
+            "x-ratelimit-limit-tokens": "40000000",
+            "x-ratelimit-remaining-tokens": "0",
+            "x-ratelimit-reset-tokens": "6m0s",
+          },
+        },
+      });
+      const envelope = (error as UpstreamExecutionError).providerError!;
+      expect(envelope.headers).not.toHaveProperty("set-cookie");
+      expect(envelope.payload.text).not.toContain("must-not-cross");
+      expect(JSON.parse(envelope.payload.text).api_key).toBe("[REDACTED]");
+    }
   });
 
   it("keeps rate-limit headers on a streamed response.failed terminal", async () => {
@@ -317,6 +517,7 @@ describe("DirectResponsesClient", () => {
     const terminal = await client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => {},
+      onPrelude: async () => {},
       onEvent: async () => {},
     });
     expect(terminal).toMatchObject({
@@ -342,6 +543,7 @@ describe("DirectResponsesClient", () => {
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => {},
+      onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({ ambiguous: true, code: "missing_terminal" });
   });
@@ -360,6 +562,7 @@ describe("DirectResponsesClient", () => {
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
       beforeFetch: async () => {},
+      onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({ ambiguous: true, code: "event_too_large" });
   });

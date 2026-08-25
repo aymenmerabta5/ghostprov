@@ -1,4 +1,5 @@
 import {
+  GP_V2_R2_SCHEMA_VERSION,
   base64UrlDecode,
   base64UrlEncode,
   canonicalJson,
@@ -6,7 +7,7 @@ import {
   utf8Text,
 } from "../protocol/shared";
 
-export interface BootstrapBinding {
+interface BootstrapBindingBase {
   projectId: string;
   sandboxSessionId: string;
   leaderGeneration: number;
@@ -14,6 +15,20 @@ export interface BootstrapBinding {
   schemaHash: string;
   nonce: string;
 }
+
+/** Exact frozen R1 bootstrap binding. */
+export interface R1BootstrapBinding extends BootstrapBindingBase {
+  protocolRevision?: never;
+  schemaVersion?: never;
+}
+
+/** Exact R2 bootstrap binding authenticated by the bootstrap ciphertext. */
+export interface R2BootstrapBinding extends BootstrapBindingBase {
+  protocolRevision: "r2";
+  schemaVersion: typeof GP_V2_R2_SCHEMA_VERSION;
+}
+
+export type BootstrapBinding = R1BootstrapBinding | R2BootstrapBinding;
 
 export interface BootstrapKeyPair {
   publicJwk: JsonWebKey;
@@ -38,7 +53,7 @@ export interface SealedBootstrapCredential {
   ciphertext: string;
 }
 
-export interface CredentialRotationBinding {
+interface CredentialRotationBindingBase {
   projectId: string;
   sandboxSessionId: string;
   leaderGeneration: number;
@@ -47,6 +62,22 @@ export interface CredentialRotationBinding {
   instanceId: string;
   rotationId: string;
 }
+
+export interface R1CredentialRotationBinding extends CredentialRotationBindingBase {
+  protocolRevision?: never;
+  schemaVersion?: never;
+  launchNonce?: never;
+}
+
+export interface R2CredentialRotationBinding extends CredentialRotationBindingBase {
+  protocolRevision: "r2";
+  schemaVersion: typeof GP_V2_R2_SCHEMA_VERSION;
+  launchNonce: string;
+}
+
+export type CredentialRotationBinding =
+  | R1CredentialRotationBinding
+  | R2CredentialRotationBinding;
 
 export type RotatableCredentialPayload = Omit<BootstrapCredentialPayload, "rotationKey">;
 
@@ -79,6 +110,13 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const HKDF_INFO = utf8Bytes("ghostprov-v2-bootstrap/v1");
 
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sorted = [...expected].sort();
+  return actual.length === sorted.length &&
+    actual.every((key, index) => key === sorted[index]);
+}
+
 function buffer(value: Uint8Array): ArrayBuffer {
   return value.buffer.slice(
     value.byteOffset,
@@ -87,6 +125,19 @@ function buffer(value: Uint8Array): ArrayBuffer {
 }
 
 function validateBinding(value: BootstrapBinding): BootstrapBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BootstrapCryptoError("Bootstrap binding is invalid", "binding");
+  }
+  const r2 = value.protocolRevision === "r2";
+  if (!exactKeys(value, [
+    "projectId", "sandboxSessionId", "leaderGeneration", "buildHash", "schemaHash", "nonce",
+    ...(r2 ? ["protocolRevision", "schemaVersion"] : []),
+  ])) {
+    throw new BootstrapCryptoError("Bootstrap binding fields are invalid", "binding");
+  }
+  if (r2 && value.schemaVersion !== GP_V2_R2_SCHEMA_VERSION) {
+    throw new BootstrapCryptoError("Bootstrap protocol revision is invalid", "binding");
+  }
   if (!UUID.test(value.projectId)) {
     throw new BootstrapCryptoError("Bootstrap project binding is invalid", "binding");
   }
@@ -102,7 +153,7 @@ function validateBinding(value: BootstrapBinding): BootstrapBinding {
   if (!SAFE_ID.test(value.nonce)) {
     throw new BootstrapCryptoError("Bootstrap nonce is invalid", "binding");
   }
-  return {
+  const base = {
     projectId: value.projectId,
     sandboxSessionId: value.sandboxSessionId,
     leaderGeneration: value.leaderGeneration,
@@ -110,6 +161,9 @@ function validateBinding(value: BootstrapBinding): BootstrapBinding {
     schemaHash: value.schemaHash,
     nonce: value.nonce,
   };
+  return r2
+    ? { ...base, protocolRevision: "r2", schemaVersion: GP_V2_R2_SCHEMA_VERSION }
+    : base;
 }
 
 function validateUrl(value: string, protocols: readonly string[], label: string): string {
@@ -374,18 +428,39 @@ export async function openBootstrapCredential(input: {
 function validateRotationBinding(
   value: CredentialRotationBinding,
 ): CredentialRotationBinding {
-  const bootstrap = validateBinding({
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BootstrapCryptoError("Credential rotation binding is invalid", "binding");
+  }
+  const r2 = value.protocolRevision === "r2";
+  if (!exactKeys(value, [
+    "projectId", "sandboxSessionId", "leaderGeneration", "buildHash", "schemaHash",
+    "instanceId", "rotationId",
+    ...(r2 ? ["protocolRevision", "schemaVersion", "launchNonce"] : []),
+  ])) {
+    throw new BootstrapCryptoError("Credential rotation binding fields are invalid", "binding");
+  }
+  const bootstrapBase = {
     projectId: value.projectId,
     sandboxSessionId: value.sandboxSessionId,
     leaderGeneration: value.leaderGeneration,
     buildHash: value.buildHash,
     schemaHash: value.schemaHash,
     nonce: value.rotationId,
-  });
+  };
+  const bootstrap = validateBinding(r2
+    ? {
+        ...bootstrapBase,
+        protocolRevision: "r2",
+        schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+      }
+    : bootstrapBase);
   if (!SAFE_ID.test(value.instanceId)) {
     throw new BootstrapCryptoError("Credential rotation instance is invalid", "binding");
   }
-  return {
+  if (r2 && !SAFE_ID.test(value.launchNonce)) {
+    throw new BootstrapCryptoError("Credential rotation launch nonce is invalid", "binding");
+  }
+  const base = {
     projectId: bootstrap.projectId,
     sandboxSessionId: bootstrap.sandboxSessionId,
     leaderGeneration: bootstrap.leaderGeneration,
@@ -394,6 +469,14 @@ function validateRotationBinding(
     instanceId: value.instanceId,
     rotationId: bootstrap.nonce,
   };
+  return r2
+    ? {
+        ...base,
+        protocolRevision: "r2",
+        schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+        launchNonce: value.launchNonce,
+      }
+    : base;
 }
 
 function rotationKeyBytes(value: string): Uint8Array {
@@ -408,6 +491,26 @@ function rotationKeyBytes(value: string): Uint8Array {
     throw new BootstrapCryptoError("Credential rotation key must be 256 bits", "key");
   }
   return bytes;
+}
+
+function bootstrapBindingForRotation(
+  binding: CredentialRotationBinding,
+): BootstrapBinding {
+  const base = {
+    projectId: binding.projectId,
+    sandboxSessionId: binding.sandboxSessionId,
+    leaderGeneration: binding.leaderGeneration,
+    buildHash: binding.buildHash,
+    schemaHash: binding.schemaHash,
+    nonce: binding.rotationId,
+  };
+  return binding.protocolRevision === "r2"
+    ? {
+        ...base,
+        protocolRevision: "r2",
+        schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+      }
+    : base;
 }
 
 async function importRotationKey(
@@ -440,14 +543,10 @@ export async function sealCredentialRotation(input: {
   credential: RotatableCredentialPayload;
 }): Promise<SealedCredentialRotation> {
   const binding = validateRotationBinding(input.binding);
-  const credential = validateRotatableCredential(input.credential, {
-    projectId: binding.projectId,
-    sandboxSessionId: binding.sandboxSessionId,
-    leaderGeneration: binding.leaderGeneration,
-    buildHash: binding.buildHash,
-    schemaHash: binding.schemaHash,
-    nonce: binding.rotationId,
-  });
+  const credential = validateRotatableCredential(
+    input.credential,
+    bootstrapBindingForRotation(binding),
+  );
   const imported = await importRotationKey(input.rotationKey, ["encrypt"]);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = utf8Bytes(canonicalJson(credential));
@@ -523,14 +622,10 @@ export async function openCredentialRotation(input: {
     } catch {
       throw new BootstrapCryptoError("Credential rotation payload is invalid", "payload");
     }
-    return validateRotatableCredential(decoded as RotatableCredentialPayload, {
-      projectId: expected.projectId,
-      sandboxSessionId: expected.sandboxSessionId,
-      leaderGeneration: expected.leaderGeneration,
-      buildHash: expected.buildHash,
-      schemaHash: expected.schemaHash,
-      nonce: expected.rotationId,
-    });
+    return validateRotatableCredential(
+      decoded as RotatableCredentialPayload,
+      bootstrapBindingForRotation(expected),
+    );
   } catch (error) {
     if (error instanceof BootstrapCryptoError) throw error;
     throw new BootstrapCryptoError("Credential rotation decryption failed", "ciphertext");

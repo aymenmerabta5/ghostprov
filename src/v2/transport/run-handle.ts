@@ -1,8 +1,9 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
 import type { SseFrame } from "../../relay/sse";
-import { utf8Bytes } from "../protocol/shared";
+import { utf8Bytes, type UpstreamPrelude } from "../protocol/shared";
 import type { RateLimitHint } from "../rate-limit";
+import type { ProviderErrorEnvelope } from "../provider-error";
 
 export class V2PreCommitError extends Error {
   readonly name = "V2PreCommitError";
@@ -22,6 +23,7 @@ export class V2CommittedError extends Error {
     readonly code: string,
     readonly ambiguous: boolean,
     readonly rateLimit?: RateLimitHint,
+    readonly providerError?: ProviderErrorEnvelope,
   ) {
     super(message);
   }
@@ -35,10 +37,12 @@ interface BufferedEvent {
 export interface V2RunHandleOptions {
   maxBufferedBytes: number;
   clock?: Clock;
+  expectUpstreamPrelude?: boolean;
 }
 
 export class V2RunHandle implements RunHandle {
   readonly final: Promise<Record<string, unknown>>;
+  readonly upstreamPrelude?: Promise<UpstreamPrelude>;
   rateLimit?: RateLimitHint;
   readonly stats: RunHandle["stats"] = {
     bytes: 0,
@@ -57,6 +61,9 @@ export class V2RunHandle implements RunHandle {
   readonly #spaceWaiters = new Set<() => void>();
   readonly #resolveFinal: (value: Record<string, unknown>) => void;
   readonly #rejectFinal: (error: unknown) => void;
+  #resolveUpstreamPrelude?: (value: UpstreamPrelude) => void;
+  #rejectUpstreamPrelude?: (error: unknown) => void;
+  #upstreamPreludeSettled = false;
   #bufferedBytes = 0;
   #closed = false;
   #failure: Error | null = null;
@@ -78,6 +85,25 @@ export class V2RunHandle implements RunHandle {
     this.#resolveFinal = resolveFinal;
     this.#rejectFinal = rejectFinal;
     void this.final.catch(() => undefined);
+    if (options.expectUpstreamPrelude) {
+      this.upstreamPrelude = new Promise<UpstreamPrelude>((resolve, reject) => {
+        this.#resolveUpstreamPrelude = resolve;
+        this.#rejectUpstreamPrelude = reject;
+      });
+      void this.upstreamPrelude.catch(() => undefined);
+    }
+  }
+
+  acceptUpstreamPrelude(prelude: UpstreamPrelude): void {
+    if (!this.upstreamPrelude || this.#upstreamPreludeSettled || this.#closed) return;
+    if (
+      !Number.isSafeInteger(prelude.status) || prelude.status < 200 || prelude.status > 299 ||
+      typeof prelude.contentType !== "string" || prelude.contentType.length < 1 ||
+      prelude.contentType.length > 256 ||
+      !(prelude.upstreamRequestId === null || typeof prelude.upstreamRequestId === "string")
+    ) throw new TypeError("Upstream prelude is invalid");
+    this.#upstreamPreludeSettled = true;
+    this.#resolveUpstreamPrelude?.({ ...prelude });
   }
 
   async acceptEvent(frame: SseFrame, knownWireBytes?: number): Promise<void> {
@@ -130,6 +156,11 @@ export class V2RunHandle implements RunHandle {
 
   settle(final: Record<string, unknown>, rateLimit?: RateLimitHint): void {
     if (this.#closed) return;
+    if (this.upstreamPrelude && !this.#upstreamPreludeSettled) {
+      const error = new Error("V2 response completed without an upstream prelude");
+      this.#upstreamPreludeSettled = true;
+      this.#rejectUpstreamPrelude?.(error);
+    }
     this.rateLimit = rateLimit;
     this.#closed = true;
     this.#resolveFinal(final);
@@ -138,6 +169,10 @@ export class V2RunHandle implements RunHandle {
 
   fail(error: Error): void {
     if (this.#closed) return;
+    if (this.upstreamPrelude && !this.#upstreamPreludeSettled) {
+      this.#upstreamPreludeSettled = true;
+      this.#rejectUpstreamPrelude?.(error);
+    }
     this.#closed = true;
     this.#failure = error;
     this.#rejectFinal(error);

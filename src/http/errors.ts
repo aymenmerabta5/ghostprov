@@ -3,6 +3,11 @@ import {
   rateLimitHintFromError,
   rateLimitProblemFromError,
 } from "../v2/rate-limit";
+import {
+  providerErrorEnvelopeFrom,
+  providerErrorPayloadJson,
+  type ProviderErrorEnvelope,
+} from "../v2/provider-error";
 
 export interface ApiErrorOptions {
   type?: string;
@@ -20,6 +25,7 @@ export interface OpenAIErrorShape {
 export interface NormalizedApiError {
   status: number;
   error: OpenAIErrorShape;
+  providerError?: ProviderErrorEnvelope;
 }
 
 export class ApiError extends Error {
@@ -92,6 +98,15 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
         param: null,
         code: "request_aborted",
       },
+    };
+  }
+
+  const providerError = providerErrorEnvelopeFrom(error);
+  if (providerError) {
+    return {
+      status: providerError.status,
+      error: { ...providerError.error },
+      providerError,
     };
   }
 
@@ -239,40 +254,64 @@ export function apiErrorResponse(error: unknown): Response {
   const normalized = normalizeApiError(error);
   const metadata = rateLimitMetadata(error);
   const headers = new Headers();
+  const providerError = normalized.providerError;
+  if (providerError) {
+    for (const [name, value] of Object.entries(providerError.headers)) {
+      if (value !== undefined) headers.set(name, value);
+    }
+    if (providerError.upstreamRequestId) {
+      headers.set("x-request-id", providerError.upstreamRequestId);
+    }
+  }
   if (normalized.status === 429) {
     const retryAfterMs = metadata.retryAfterMs;
-    if (retryAfterMs !== null) {
+    if (retryAfterMs !== null && !headers.has("retry-after")) {
       headers.set("retry-after", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
     }
     const resetTokensMs = metadata.resetTokensMs;
-    if (resetTokensMs !== null) headers.set("x-ratelimit-reset-tokens", `${Math.ceil(resetTokensMs)}ms`);
+    if (resetTokensMs !== null && !headers.has("x-ratelimit-reset-tokens")) {
+      headers.set("x-ratelimit-reset-tokens", `${Math.ceil(resetTokensMs)}ms`);
+    }
     const resetProjectTokensMs = metadata.resetProjectTokensMs;
-    if (resetProjectTokensMs !== null) {
+    if (resetProjectTokensMs !== null && !headers.has("x-ratelimit-reset-project-tokens")) {
       headers.set("x-ratelimit-reset-project-tokens", `${Math.ceil(resetProjectTokensMs)}ms`);
     }
-    if (metadata.limitTokens !== null) {
+    if (metadata.limitTokens !== null && !headers.has("x-ratelimit-limit-tokens")) {
       headers.set("x-ratelimit-limit-tokens", String(Math.floor(metadata.limitTokens)));
     }
-    if (metadata.remainingTokens !== null) {
+    if (metadata.remainingTokens !== null && !headers.has("x-ratelimit-remaining-tokens")) {
       headers.set("x-ratelimit-remaining-tokens", String(Math.floor(metadata.remainingTokens)));
     }
-    if (metadata.limitProjectTokens !== null) {
+    if (metadata.limitProjectTokens !== null && !headers.has("x-ratelimit-limit-project-tokens")) {
       headers.set("x-ratelimit-limit-project-tokens", String(Math.floor(metadata.limitProjectTokens)));
     }
-    if (metadata.remainingProjectTokens !== null) {
+    if (metadata.remainingProjectTokens !== null && !headers.has("x-ratelimit-remaining-project-tokens")) {
       headers.set("x-ratelimit-remaining-project-tokens", String(Math.floor(metadata.remainingProjectTokens)));
     }
   }
-  return Response.json({ error: normalized.error }, { status: normalized.status, headers });
+  const original = providerError?.origin === "http"
+    ? providerErrorPayloadJson(providerError)
+    : null;
+  return Response.json(original ?? { error: normalized.error }, {
+    status: normalized.status,
+    headers,
+  });
 }
 
-export function apiErrorEvent(error: unknown): {
-  type: "error";
-  message: string;
-  param: string | null;
-  code: string | null;
-} {
+export function apiErrorEvent(error: unknown): Record<string, unknown> | string {
   const normalized = normalizeApiError(error);
+  if (normalized.providerError) {
+    const original = providerErrorPayloadJson(normalized.providerError);
+    if (original) return original;
+    if (
+      normalized.providerError.payload.format === "text" &&
+      !normalized.providerError.payload.truncated
+    ) return normalized.providerError.payload.text;
+    return {
+      type: "error",
+      error: normalized.error,
+    };
+  }
   return {
     type: "error",
     message: normalized.error.message,

@@ -388,6 +388,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     return {
       events: () => handle.events(),
       final,
+      get rateLimit() { return handle.rateLimit; },
+      get upstreamPrelude() { return handle.upstreamPrelude; },
       stats: handle.stats,
     };
   }
@@ -571,6 +573,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         leaderGeneration: this.#options.leaderGeneration,
         buildHash: this.#options.assets.buildHash,
         schemaHash: this.#options.assets.schemaHash,
+        launchNonce: crypto.randomUUID(),
+        protocolRevision: this.#options.assets.revision,
       };
       const awareness = this.#options.createAwareness(binding, credentials);
       this.#awareness = awareness;
@@ -591,7 +595,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (
         descriptor.buildHash !== binding.buildHash ||
         descriptor.schemaHash !== binding.schemaHash ||
-        descriptor.leaderGeneration !== binding.leaderGeneration
+        descriptor.leaderGeneration !== binding.leaderGeneration ||
+        descriptor.protocolRevision !== binding.protocolRevision ||
+        descriptor.launchNonce !== binding.launchNonce
       ) throw new Error("V2 bootstrap descriptor does not match its binding");
       if (generation !== this.#generation) return;
       this.#descriptor = descriptor;

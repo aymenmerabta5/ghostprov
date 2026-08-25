@@ -165,6 +165,8 @@ export async function main(
     await ydoc.connect();
     const assets = await loadV2SidecarAssets();
     const binding: ProtocolBinding = {
+  protocolRevision: "r1",
+  launchNonce: "launch-nonce-r1",
       projectId: options.projectId,
       sessionId,
       leaderGeneration: 1,

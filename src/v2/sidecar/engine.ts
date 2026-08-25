@@ -7,6 +7,7 @@ import {
   utf8Text,
   type HostFrame,
   type ProtocolBinding,
+  type R2RequestCommitFrame,
   type ReliableFrame,
   type SidecarFrame,
 } from "../protocol/shared";
@@ -73,7 +74,12 @@ interface ActiveRequest {
     | { kind: "client" }
     | { kind: "drain"; message: string }
     | null;
+  executionFence: R2RequestCommitFrame | null;
   detachParentAbort?: () => void;
+}
+
+export class V2ExecutionFenceError extends Error {
+  readonly name = "V2ExecutionFenceError";
 }
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
@@ -131,6 +137,9 @@ export class SidecarEngine {
   readonly #onDrainRequested?: (reason: string) => void;
   readonly #onFatalError?: (error: Error) => void;
   readonly #assertOwnership?: () => Promise<void>;
+  readonly #assertExecutionFence?: (
+    frame: R2RequestCommitFrame,
+  ) => void | Promise<void>;
   readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #batcher: ResponseBatcher | null;
   readonly #outputBackpressure?: OutputBackpressure;
@@ -174,6 +183,9 @@ export class SidecarEngine {
     onDrainRequested?: (reason: string) => void;
     onFatalError?: (error: Error) => void;
     assertOwnership?: () => Promise<void>;
+    assertExecutionFence?: (
+      frame: R2RequestCommitFrame,
+    ) => void | Promise<void>;
     diagnostics?: SidecarDiagnosticsObserver;
     batching?: boolean;
     outputBackpressure?: OutputBackpressure;
@@ -194,6 +206,10 @@ export class SidecarEngine {
     this.#onDrainRequested = options.onDrainRequested;
     this.#onFatalError = options.onFatalError;
     this.#assertOwnership = options.assertOwnership;
+    this.#assertExecutionFence = options.assertExecutionFence;
+    if (options.binding.protocolRevision === "r2" && !options.assertExecutionFence) {
+      throw new TypeError("R2 sidecar engine requires assertExecutionFence");
+    }
     this.#diagnostics = options.diagnostics;
     this.#emitFrame = options.emit;
     this.#batcher = options.batching ? new ResponseBatcher({ emit: (frame, priority) => this.#emitFrame(frame, priority, frame.requestId) }) : null;
@@ -282,12 +298,19 @@ export class SidecarEngine {
       if (recovered.leaderGeneration !== this.#binding.leaderGeneration) continue;
       await this.#outputBackpressure?.wait(signal);
       this.#emitCommittedAck(recovered.requestId, recovered.requestDigest);
+      if (recovered.error.providerError?.origin === "sse") {
+        this.#emitRecoveredPrelude(
+          recovered.requestId,
+          recovered.error.providerError.upstreamRequestId,
+        );
+      }
       this.#emitError(
         recovered.requestId,
         recovered.error.code,
         recovered.error.message,
         false,
         recovered.error.rateLimit,
+        recovered.error.providerError,
       );
     }
     for (const requestId of this.#recoveredCancelled) {
@@ -332,6 +355,7 @@ export class SidecarEngine {
         this.#assembler.accept(frame);
         return;
       case "request_commit":
+        await this.#proveExecutionBoundary(frame);
         this.#diagnostics?.commitReceived(frame.requestId);
         this.#committing++;
         const commitController = new AbortController();
@@ -344,7 +368,7 @@ export class SidecarEngine {
         }
         this.#commitControllers.set(frame.requestId, commitController);
         try {
-          await this.#commit(frame.requestId, commitController.signal);
+          await this.#commit(frame, commitController.signal);
         } finally {
           if (this.#commitControllers.get(frame.requestId) === commitController) {
             this.#commitControllers.delete(frame.requestId);
@@ -505,7 +529,11 @@ export class SidecarEngine {
     };
   }
 
-  async #commit(requestId: string, signal?: AbortSignal): Promise<void> {
+  async #commit(
+    commitment: Extract<ReliableFrame<HostFrame>, { kind: "request_commit" }>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const requestId = commitment.requestId;
     if (this.#draining) {
       this.#assembler.cancel(requestId);
       this.#reject(requestId, "draining", "Sidecar is draining");
@@ -526,7 +554,7 @@ export class SidecarEngine {
 
     let body: Uint8Array;
     try {
-      body = await this.#assembler.commit(requestId);
+      body = await this.#assembler.commit(commitment);
       this.#diagnostics?.assemblyCompleted(requestId);
     } catch (error) {
       this.#reject(
@@ -548,7 +576,7 @@ export class SidecarEngine {
         this.#reject(requestId, "draining", "Sidecar is draining");
         return;
       }
-      await this.#proveOwnership();
+      await this.#proveExecutionBoundary(commitment);
       const claimStarted = performance.now();
       await this.#journal.claim({
         requestId,
@@ -639,54 +667,66 @@ export class SidecarEngine {
         cancellation: "none",
         forcedDrainReported: false,
         deferredCancellationOutcome: null,
+        executionFence: "protocolRevision" in commitment && commitment.protocolRevision === "r2"
+          ? commitment
+          : null,
         detachParentAbort,
       };
       this.#active.set(requestId, request);
-      try {
-        const diagnostics = this.#diagnostics?.requestAck(requestId);
-        this.#emit({
-          kind: "request_ack",
-          requestId,
-          requestDigest: digest,
-          committed: true,
-          ...(diagnostics ? { diagnostics } : {}),
-        }, "terminal", requestId);
-      } catch (error) {
-        this.#active.delete(requestId);
-        detachParentAbort?.();
-        lease.release();
-        body.fill(0);
-        throw error;
+      if (request.executionFence === null) {
+        try {
+          this.#emitRequestAck(request);
+        } catch (error) {
+          this.#active.delete(requestId);
+          detachParentAbort?.();
+          lease.release();
+          body.fill(0);
+          throw error;
+        }
       }
       void this.#execute(request);
     } catch (error) {
       body.fill(0);
+      if (this.#isFatalExecutionBoundaryError(error)) throw error;
       this.#reject(
         requestId,
         "claim",
         error instanceof Error ? error.message : "Durable claim failed",
       );
-      if (this.#reportFatalJournalError(error) || this.#isOwnershipError(error)) {
+      if (this.#reportFatalJournalError(error)) {
         throw error;
       }
     }
   }
 
   async #execute(request: ActiveRequest): Promise<void> {
+    let fatalBoundaryFailure = false;
     try {
       const terminal = await this.#upstream.execute({
         body: request.body,
         signal: request.controller.signal,
         beforeFetch: async () => {
-          await this.#proveOwnership();
+          await this.#proveExecutionBoundary(request.executionFence);
           try {
             await this.#journal.markFetchStarting(request.requestId);
           } catch (error) {
             this.#reportFatalJournalError(error);
             throw error;
           }
-          await this.#proveOwnership();
+          await this.#proveExecutionBoundary(request.executionFence);
+          if (request.executionFence !== null) this.#emitRequestAck(request);
           this.#diagnostics?.fetchStarted(request.requestId);
+        },
+        onPrelude: async prelude => {
+          if (this.#binding.protocolRevision !== "r2") return;
+          await this.#outputBackpressure?.wait(request.controller.signal);
+          this.#emit({
+            kind: "upstream_prelude",
+            requestId: request.requestId,
+            status: prelude.status,
+            contentType: prelude.contentType,
+            upstreamRequestId: prelude.upstreamRequestId,
+          }, "terminal", request.requestId);
         },
         onEvent: async event => {
           const eventIndex = request.eventIndex++;
@@ -741,6 +781,10 @@ export class SidecarEngine {
         }
         return;
       }
+      if (this.#isFatalExecutionBoundaryError(error)) {
+        fatalBoundaryFailure = true;
+        return;
+      }
       this.#reportFatalJournalError(error);
       const upstream = error instanceof UpstreamExecutionError ? error : null;
       const ambiguous = upstream?.ambiguous ?? true;
@@ -751,6 +795,7 @@ export class SidecarEngine {
             code: upstream.code,
             message: upstream.message,
             ...(upstream.rateLimit ? { rateLimit: upstream.rateLimit } : {}),
+            ...(upstream.providerError ? { providerError: upstream.providerError } : {}),
           });
         } catch (journalError) {
           this.#reportFatalJournalError(journalError);
@@ -763,6 +808,7 @@ export class SidecarEngine {
         upstream?.message ?? "Sidecar execution failed after commitment",
         ambiguous,
         upstream?.rateLimit,
+        upstream?.providerError,
       );
     } finally {
       request.detachParentAbort?.();
@@ -770,7 +816,10 @@ export class SidecarEngine {
       request.lease.release();
       this.#active.delete(request.requestId);
       const deferred = request.deferredCancellationOutcome;
-      if (deferred?.kind === "client") {
+      if (fatalBoundaryFailure) {
+        // Election/ownership loss is process-fatal and deliberately silent.
+        // Never turn it into a client cancellation or ambiguous outcome.
+      } else if (deferred?.kind === "client") {
         this.#emit({
           kind: "request_cancelled",
           requestId: request.requestId,
@@ -891,12 +940,19 @@ export class SidecarEngine {
     }
     this.#emitCommittedAck(requestId, recovered.requestDigest);
     if (recovered.outcome.kind === "provider_error") {
+      if (recovered.outcome.error.providerError?.origin === "sse") {
+        this.#emitRecoveredPrelude(
+          requestId,
+          recovered.outcome.error.providerError.upstreamRequestId,
+        );
+      }
       this.#emitError(
         requestId,
         recovered.outcome.error.code,
         recovered.outcome.error.message,
         false,
         recovered.outcome.error.rateLimit,
+        recovered.outcome.error.providerError,
       );
       return;
     }
@@ -971,6 +1027,7 @@ export class SidecarEngine {
 
     if (signal?.aborted) throw abortError(signal);
     this.#emitCommittedAck(requestId, identity.requestDigest);
+    this.#emitRecoveredPrelude(requestId, null);
     try {
       let eventIndex = 0;
       for (const event of parsed.frames) {
@@ -1022,12 +1079,35 @@ export class SidecarEngine {
     }, "terminal", requestId);
   }
 
+  #emitRequestAck(request: ActiveRequest): void {
+    const diagnostics = this.#diagnostics?.requestAck(request.requestId);
+    this.#emit({
+      kind: "request_ack",
+      requestId: request.requestId,
+      requestDigest: request.requestDigest,
+      committed: true,
+      ...(diagnostics ? { diagnostics } : {}),
+    }, "terminal", request.requestId);
+  }
+
+  #emitRecoveredPrelude(requestId: string, upstreamRequestId: string | null): void {
+    if (this.#binding.protocolRevision !== "r2") return;
+    this.#emit({
+      kind: "upstream_prelude",
+      requestId,
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId,
+    }, "terminal", requestId);
+  }
+
   #emitError(
     requestId: string,
     code: string,
     message: string,
     ambiguous: boolean,
     rateLimit?: import("../rate-limit").RateLimitHint,
+    providerError?: import("../provider-error").ProviderErrorEnvelope,
   ): void {
     this.#batcher?.flush(requestId,"terminal");
     this.#emit({
@@ -1037,6 +1117,7 @@ export class SidecarEngine {
       message: this.#safeMessage(message),
       ambiguous,
       ...(rateLimit ? { rateLimit } : {}),
+      ...(providerError ? { providerError } : {}),
     }, "terminal", requestId);
   }
 
@@ -1055,6 +1136,13 @@ export class SidecarEngine {
     return value instanceof Error && value.name === "SidecarOwnershipError";
   }
 
+  #isFatalExecutionBoundaryError(value: unknown): boolean {
+    return value instanceof Error && (
+      value.name === "V2ExecutionFenceError" ||
+      this.#isOwnershipError(value)
+    );
+  }
+
   async #proveOwnership(): Promise<void> {
     if (!this.#assertOwnership) return;
     try {
@@ -1065,6 +1153,23 @@ export class SidecarEngine {
         : new Error("Sidecar ownership validation failed");
       this.#onFatalError?.(fatal);
       throw fatal;
+    }
+  }
+
+  async #proveExecutionBoundary(
+    frame: R2RequestCommitFrame | null | Extract<ReliableFrame<HostFrame>, { kind: "request_commit" }>,
+  ): Promise<void> {
+    await this.#proveOwnership();
+    if (!frame || !("protocolRevision" in frame) || frame.protocolRevision !== "r2") return;
+    try {
+      await this.#assertExecutionFence!(frame);
+    } catch (error) {
+      const fenced = new V2ExecutionFenceError(
+        "R2 execution fence is not currently elected",
+        { cause: error },
+      );
+      this.#onFatalError?.(fenced);
+      throw fenced;
     }
   }
 

@@ -286,6 +286,11 @@ export function registerAnthropicRoutes(
         );
       }
 
+      // Do not commit an Anthropic SSE 200 until R2 has proven successful
+      // upstream headers. Initial provider failures then use the normal
+      // Anthropic HTTP error mapping; failures after this point stay in-band.
+      if (handle.upstreamPrelude) await handle.upstreamPrelude;
+
       const stream = createAnthropicPullStream({
         handle,
         translator: new AnthropicStreamTranslator(context),

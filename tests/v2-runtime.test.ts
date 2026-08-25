@@ -24,7 +24,7 @@ import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import type {
   V2TransportSnapshot,
 } from "../src/v2/transport/session";
-import { V2CommittedError } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import {
   V2SandboxRuntime,
   type V2RuntimeBootstrap,
@@ -308,6 +308,8 @@ function runtimeHarness(options: {
   const awareness = new FakeAwareness();
   const descriptor: V2ReadyDescriptor = {
     instanceId: "sidecar-instance-1",
+    protocolRevision: "r1",
+    launchNonce: "runtime-launch-placeholder",
     buildHash: ASSETS.buildHash,
     schemaHash: ASSETS.schemaHash,
     leaderGeneration: 4,
@@ -353,7 +355,10 @@ function runtimeHarness(options: {
     },
     createYDoc: () => ydoc,
     createAwareness: (_binding: ProtocolBinding) => awareness,
-    createBootstrap: () => bootstrap,
+    createBootstrap: input => {
+      (descriptor as { launchNonce: string }).launchNonce = input.binding.launchNonce;
+      return bootstrap;
+    },
     createTransport: () => transport,
   });
   return {
@@ -389,6 +394,34 @@ function runtimeHarness(options: {
 }
 
 describe("V2SandboxRuntime", () => {
+  it("dynamically forwards prelude and late rate metadata from the transport handle", async () => {
+    const harness = runtimeHarness();
+    const realHandle = new V2RunHandle({
+      maxBufferedBytes: 4_096,
+      expectUpstreamPrelude: true,
+    });
+    harness.transport.run = async () => realHandle;
+    await harness.runtime.start();
+
+    const wrapped = await harness.runtime.run({ model: "gpt-5.6-sol", input: "metadata" });
+    realHandle.acceptUpstreamPrelude({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: "req_runtime_prelude",
+    });
+    await expect(wrapped.upstreamPrelude).resolves.toMatchObject({
+      upstreamRequestId: "req_runtime_prelude",
+    });
+    expect(wrapped.rateLimit).toBeUndefined();
+    realHandle.settle(
+      { id: "resp_runtime_metadata", status: "failed" },
+      { retryAfterMs: 914, remainingTokens: 0 },
+    );
+    await expect(wrapped.final).resolves.toMatchObject({ id: "resp_runtime_metadata" });
+    expect(wrapped.rateLimit).toEqual({ retryAfterMs: 914, remainingTokens: 0 });
+    await harness.runtime.stop();
+  });
+
   it("reaches ready only after provision, heartbeat, YDoc, bootstrap, and transport", async () => {
     const harness = runtimeHarness();
 

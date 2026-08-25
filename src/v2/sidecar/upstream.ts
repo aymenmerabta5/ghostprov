@@ -8,6 +8,7 @@ import {
   utf8Bytes,
   utf8Text,
   type TerminalStatus,
+  type UpstreamPrelude,
 } from "../protocol/shared";
 import {
   rateLimitHintFromError,
@@ -15,6 +16,10 @@ import {
   rateLimitProblemFromError,
   type RateLimitHint,
 } from "../rate-limit";
+import {
+  createProviderErrorEnvelope,
+  type ProviderErrorEnvelope,
+} from "../provider-error";
 
 export interface SecretSource {
   reveal(): string;
@@ -24,6 +29,7 @@ export interface DirectResponsesExecution {
   body: Uint8Array;
   signal?: AbortSignal;
   beforeFetch(): Promise<void>;
+  onPrelude(prelude: UpstreamPrelude): Promise<void>;
   onEvent(event: SseFrame): Promise<void>;
 }
 
@@ -50,6 +56,7 @@ export class UpstreamExecutionError extends Error {
     readonly ambiguous: boolean,
     readonly status?: number,
     readonly rateLimit?: RateLimitHint,
+    readonly providerError?: ProviderErrorEnvelope,
   ) {
     super(message);
   }
@@ -98,40 +105,65 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 /** OpenAI may terminate a 200 SSE response with `event: error` instead of response.failed. */
-function streamedUpstreamError(
+async function streamedUpstreamError(
   frame: SseFrame,
   headerHint?: RateLimitHint,
-): UpstreamExecutionError | null {
+  headers?: Headers,
+  model?: unknown,
+): Promise<UpstreamExecutionError | null> {
   if (frame.event !== "error") return null;
   let decoded: unknown;
   try {
     decoded = JSON.parse(frame.data);
   } catch {
+    const problem = rateLimitProblemFromError(frame.data);
+    const message = problem?.message ?? "Upstream Responses stream emitted an invalid error event";
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: problem?.status ?? 500,
+      value: {
+        error: {
+          message,
+          type: problem?.type ?? "upstream_error",
+          param: null,
+          code: problem?.code ?? "upstream_error",
+        },
+      },
+      payload: frame.data,
+      headers,
+      model,
+    });
     return new UpstreamExecutionError(
-      "Upstream Responses stream emitted an invalid error event",
-      "upstream_error",
+      providerError.error.message,
+      providerError.error.code ?? "upstream_error",
       false,
+      providerError.status,
+      rateLimitHintFromError(frame.data, headerHint),
+      providerError,
     );
   }
-  const rateLimited = rateLimitTransportError(decoded, headerHint);
-  if (rateLimited) return rateLimited;
+  const problem = rateLimitProblemFromError(decoded);
   const root = record(decoded);
-  const nested = record(root?.error);
-  const candidate = nested ?? root;
-  const message = sanitizeMessage(
-    candidate?.message,
-    "Upstream Responses stream reported an error",
-  );
-  const status = typeof root?.status === "number" &&
-    Number.isInteger(root.status) && root.status >= 400 && root.status <= 599
+  const explicitStatus = typeof root?.status === "number" &&
+      Number.isInteger(root.status) && root.status >= 400 && root.status <= 599
     ? root.status
     : undefined;
+  const providerError = await createProviderErrorEnvelope({
+    origin: "sse",
+    status: explicitStatus ?? problem?.status,
+    value: decoded,
+    payload: frame.data,
+    headers,
+    model,
+    fallbackMessage: "Upstream Responses stream reported an error",
+  });
   return new UpstreamExecutionError(
-    message,
-    safeCode(candidate?.code ?? candidate?.type, "upstream_error"),
+    providerError.error.message,
+    safeCode(providerError.error.code ?? providerError.error.type, "upstream_error"),
     false,
-    status,
+    providerError.status,
     rateLimitHintFromError(decoded, headerHint),
+    providerError,
   );
 }
 
@@ -148,28 +180,82 @@ function parseBody(bytes: Uint8Array): Record<string, unknown> {
   return decoded as Record<string, unknown>;
 }
 
-async function httpError(response: Response): Promise<UpstreamExecutionError> {
-  let body: any = null;
+const HTTP_ERROR_READ_MAX_BYTES = 64 * 1024;
+
+async function boundedErrorBody(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
   try {
-    body = await response.json();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = HTTP_ERROR_READ_MAX_BYTES - total;
+      if (remaining <= 0) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+      const kept = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      chunks.push(kept);
+      total += kept.byteLength;
+      if (kept.byteLength !== value.byteLength) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+async function httpError(response: Response, model?: unknown): Promise<UpstreamExecutionError> {
+  let rawBody = "";
+  try {
+    rawBody = await boundedErrorBody(response);
+  } catch {
+    // The HTTP status is already a definitive upstream outcome. A broken error
+    // body must not turn it into an ambiguous execution or trigger replay.
+  }
+  let body: unknown = rawBody;
+  try {
+    body = JSON.parse(rawBody);
   } catch {}
-  const upstream = body?.error && typeof body.error === "object" ? body.error : null;
+  const root = record(body);
+  const upstream = record(root?.error);
   const fallback = `Upstream Responses request failed (${response.status})`;
-  const message = sanitizeMessage(upstream?.message, fallback);
   const rateLimit = rateLimitHintFromError({
     status: response.status,
     error: {
       code: upstream?.code,
       type: upstream?.type,
-      message,
+      message: upstream?.message,
+      param: upstream?.param,
     },
   }, rateLimitHintFromHeaders(response.headers));
+  const providerError = await createProviderErrorEnvelope({
+    origin: "http",
+    status: response.status,
+    value: body,
+    payload: body,
+    headers: response.headers,
+    model,
+    fallbackMessage: fallback,
+  });
   return new UpstreamExecutionError(
-    message,
-    safeCode(upstream?.code ?? upstream?.type, `http_${response.status}`),
+    providerError.error.message,
+    safeCode(providerError.error.code ?? providerError.error.type, `http_${response.status}`),
     false,
     response.status,
     rateLimit,
+    providerError,
   );
 }
 
@@ -199,7 +285,7 @@ export class DirectResponsesClient {
   }
 
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
-    const body = { ...parseBody(input.body), stream: true };
+    const body: Record<string, unknown> = { ...parseBody(input.body), stream: true };
     let requestBody: string;
     try {
       requestBody = JSON.stringify(body);
@@ -208,7 +294,11 @@ export class DirectResponsesClient {
     }
     try {
       await input.beforeFetch();
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.name === "V2ExecutionFenceError" || error.name === "SidecarOwnershipError")
+      ) throw error;
       throw new UpstreamExecutionError(
         "Upstream request was not started because durable preparation failed",
         "before_fetch",
@@ -237,7 +327,7 @@ export class DirectResponsesClient {
         true,
       );
     }
-    if (!response.ok) throw await httpError(response);
+    if (!response.ok) throw await httpError(response, body.model);
     const responseRateLimit = rateLimitHintFromHeaders(response.headers);
     if (!response.body) {
       throw new UpstreamExecutionError(
@@ -254,6 +344,26 @@ export class DirectResponsesClient {
       throw new UpstreamExecutionError(
         "Upstream response is not an event stream",
         "content_type",
+        true,
+        response.status,
+        responseRateLimit,
+      );
+    }
+    const rawRequestId = response.headers.get("x-request-id");
+    const upstreamRequestId = rawRequestId && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(rawRequestId)
+      ? rawRequestId
+      : null;
+    try {
+      await input.onPrelude({
+        status: response.status,
+        contentType: contentType.slice(0, 256),
+        upstreamRequestId,
+      });
+    } catch {
+      await response.body.cancel().catch(() => undefined);
+      throw new UpstreamExecutionError(
+        "Upstream response headers could not be delivered",
+        "prelude",
         true,
         response.status,
         responseRateLimit,
@@ -279,7 +389,12 @@ export class DirectResponsesClient {
             responseRateLimit,
           );
         }
-        const upstreamError = streamedUpstreamError(frame, responseRateLimit);
+        const upstreamError = await streamedUpstreamError(
+          frame,
+          responseRateLimit,
+          response.headers,
+          body.model,
+        );
         if (upstreamError) throw upstreamError;
         transcript.append(frame);
         await input.onEvent(frame);

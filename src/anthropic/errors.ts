@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { normalizeApiError } from "../http/errors";
+import { providerErrorEnvelopeFrom } from "../v2/provider-error";
 
 export type AnthropicErrorEnvelope = {
   type: "error";
@@ -124,7 +125,13 @@ function errorHeaders(error: unknown): Headers {
   const value = record(error);
   const response = record(value?.response);
   const details = record(value?.details);
-  const candidates = [value?.headers, response?.headers, details?.headers];
+  const provider = providerErrorEnvelopeFrom(error);
+  const candidates = [
+    value?.headers,
+    response?.headers,
+    details?.headers,
+    provider?.headers,
+  ];
   for (const candidate of candidates) {
     const retryAfter = safeRetryAfter(headerValue(candidate, "retry-after"));
     if (retryAfter) {

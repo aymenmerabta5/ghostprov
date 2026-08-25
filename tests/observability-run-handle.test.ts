@@ -4,6 +4,7 @@ import type { RunHandle } from "../src/relay/run-handle";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { traceRunHandle } from "../src/observability/traced-run-handle";
+import { V2RunHandle } from "../src/v2/transport/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -27,6 +28,41 @@ class MemoryLogger implements LoggerLike {
 }
 
 describe("traceRunHandle", () => {
+  it("dynamically forwards prelude and late rate metadata from a real V2 handle", async () => {
+    const original = new V2RunHandle({
+      maxBufferedBytes: 4_096,
+      expectUpstreamPrelude: true,
+    });
+    const traced = traceRunHandle(original, {
+      logger: new MemoryLogger(),
+      clock: new FakeClock(),
+      traceId: "trace-provider-metadata",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+
+    original.acceptUpstreamPrelude({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: "req_trace_prelude",
+    });
+    await expect(traced.upstreamPrelude).resolves.toMatchObject({
+      upstreamRequestId: "req_trace_prelude",
+    });
+    expect(traced.rateLimit).toBeUndefined();
+    original.settle(
+      { id: "resp_trace", status: "failed" },
+      { retryAfterMs: 136, remainingTokens: 0 },
+    );
+    await expect(traced.final).resolves.toMatchObject({ id: "resp_trace" });
+    expect(traced.rateLimit).toEqual({ retryAfterMs: 136, remainingTokens: 0 });
+  });
+
   it("logs first consumption and one terminal without changing the handle", async () => {
     const final = deferred<any>();
     const stats: RunHandle["stats"] = { bytes: 25, firstByteMs: 8, frames: 1, diagnostics: { hostPrepareMs:10,hostSchedulerWaitMs:5,hostPublishToAckMs:20,sidecarFirstFrameToCommitMs:4,sidecarClaimSyncMs:2,sidecarAdmissionWaitMs:1,sidecarCommitProcessingMs:3,transportCommitResidualMs:17,upstreamFirstEventMs:100,sidecarFirstEventSchedulerMs:4,hostAckToFirstFrameMs:25,hostAssemblyToDeliveryMs:1,peakTransport:null } };

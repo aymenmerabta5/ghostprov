@@ -154,4 +154,15 @@ describe("V2SidecarRevisionSelector", () => {
       selector.loadedForProject(PROJECT_1).assets,
     );
   });
+
+  it("recognizes R2 policy but fails closed until a frozen R2 loader is registered", () => {
+    expect(() => createBundledV2SidecarRevisionSelector({
+      projectIds: [PROJECT_1],
+      defaultRevision: "r2",
+    })).toThrow(/no immutable.*r2/i);
+    expect(() => createBundledV2SidecarRevisionSelector({
+      projectIds: [PROJECT_1, PROJECT_2],
+      projectOverrides: { [PROJECT_2]: "r2" },
+    })).toThrow(/no immutable.*r2/i);
+  });
 });

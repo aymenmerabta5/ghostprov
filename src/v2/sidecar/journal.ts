@@ -1,4 +1,8 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
+import {
+  parseProviderErrorEnvelope,
+  type ProviderErrorEnvelope,
+} from "../provider-error";
 import { canonicalJson } from "../protocol/shared";
 import {
   MAX_RATE_LIMIT_DELAY_MS,
@@ -18,6 +22,7 @@ export interface JournalProviderError {
   code: string;
   message: string;
   rateLimit?: RateLimitHint;
+  providerError?: ProviderErrorEnvelope;
 }
 
 export interface JournalForcedAmbiguous {
@@ -179,7 +184,7 @@ function normalizedProviderError(value: JournalProviderError): JournalProviderEr
     throw new ClaimJournalError("Provider error is invalid", "transition");
   }
   for (const key of Object.keys(value)) {
-    if (!["status", "code", "message", "rateLimit"].includes(key)) {
+    if (!["status", "code", "message", "rateLimit", "providerError"].includes(key)) {
       throw new ClaimJournalError("Provider error has unknown fields", "transition");
     }
   }
@@ -190,11 +195,31 @@ function normalizedProviderError(value: JournalProviderError): JournalProviderEr
   const code = SAFE_CODE.test(value.code) ? value.code : "upstream_error";
   const message = safeMessage(value.message, "Upstream provider request failed");
   const rateLimit = normalizedRateLimit(value.rateLimit);
+  let providerError: ProviderErrorEnvelope | undefined;
+  if (value.providerError !== undefined) {
+    const parsed = parseProviderErrorEnvelope(value.providerError);
+    if (!parsed) {
+      throw new ClaimJournalError("Provider error envelope is invalid", "transition");
+    }
+    try {
+      // Do not retain caller-owned nested objects in a record that represents a
+      // durable boundary. Re-validate the clone so exotic/non-cloneable input
+      // can never be silently persisted without the envelope's byte bounds.
+      const cloned = structuredClone(parsed);
+      providerError = parseProviderErrorEnvelope(cloned) ?? undefined;
+    } catch {
+      providerError = undefined;
+    }
+    if (!providerError) {
+      throw new ClaimJournalError("Provider error envelope is invalid", "transition");
+    }
+  }
   return {
     ...(status === undefined ? {} : { status }),
     code,
     message,
     ...(rateLimit ? { rateLimit } : {}),
+    ...(providerError ? { providerError } : {}),
   };
 }
 

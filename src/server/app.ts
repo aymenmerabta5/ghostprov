@@ -419,12 +419,31 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
         return c.json(final);
       }
 
+      // R2 proves successful upstream HTTP headers before any response event.
+      // Waiting here lets an initial provider non-2xx remain an actual HTTP
+      // error instead of first committing a misleading outer 200. Legacy
+      // handles have no prelude and retain their established behavior.
+      let upstreamPrelude: Awaited<NonNullable<RunHandle["upstreamPrelude"]>> | undefined;
+      try {
+        upstreamPrelude = await handle.upstreamPrelude;
+      } catch (error) {
+        relayAbort.abort(error);
+        throw error;
+      }
+
       const stream = responseEventStream(handle, keepAliveMs, {
         cancelRelay: reason => relayAbort.abort(reason),
         close: cleanupSignal,
       });
       streamOwnsCleanup = true;
-      return new Response(stream, { headers: SSE_HEADERS });
+      const headers = new Headers(SSE_HEADERS);
+      if (upstreamPrelude?.upstreamRequestId) {
+        headers.set("x-request-id", upstreamPrelude.upstreamRequestId);
+      }
+      return new Response(stream, {
+        status: upstreamPrelude?.status ?? 200,
+        headers,
+      });
     } catch (error) {
       const normalized = normalizeApiError(error);
       if (normalized.status !== 499) {

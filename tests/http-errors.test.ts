@@ -13,6 +13,7 @@ import {
   CpuTransformQueueFullError,
   CpuTransformTimeoutError,
 } from "../src/router/cpu-transform-pool";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 
 describe("OpenAI-compatible HTTP errors", () => {
   it("maps router shutdown admission to a typed service-unavailable response", () => {
@@ -177,6 +178,124 @@ describe("OpenAI-compatible HTTP errors", () => {
       param: null,
       code: "rate_limit_exceeded",
     }});
+  });
+
+  it("preserves a bounded HTTP provider response and its selected headers", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 429,
+      model: "gpt-5.6-sol",
+      headers: new Headers({
+        "retry-after": "0.136",
+        "x-ratelimit-limit-tokens": "40000000",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_upstream_42",
+        "set-cookie": "must-not-cross",
+      }),
+      value: {
+        error: {
+          message: "Rate limit reached for gpt-5.6-sol in organization org-Test123",
+          type: "rate_limit_error",
+          param: "input",
+          code: "rate_limit_exceeded",
+        },
+      },
+    });
+    const error = Object.assign(new Error(providerError.error.message), {
+      providerError,
+    });
+    const normalized = normalizeApiError(error);
+    expect(normalized).toMatchObject({
+      status: 429,
+      error: {
+        message: providerError.error.message,
+        type: "rate_limit_error",
+        param: "input",
+        code: "rate_limit_exceeded",
+      },
+    });
+
+    const response = apiErrorResponse(error);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("0.136");
+    expect(response.headers.get("x-ratelimit-limit-tokens")).toBe("40000000");
+    expect(response.headers.get("x-request-id")).toBe("req_upstream_42");
+    expect(response.headers.has("set-cookie")).toBe(false);
+    expect(await response.json()).toEqual({
+      error: {
+        message: providerError.error.message,
+        type: "rate_limit_error",
+        param: "input",
+        code: "rate_limit_exceeded",
+      },
+    });
+    expect(apiErrorEvent(error)).toEqual({
+      error: {
+        message: providerError.error.message,
+        type: "rate_limit_error",
+        param: "input",
+        code: "rate_limit_exceeded",
+      },
+    });
+  });
+
+  it("replays the safe original SSE error data rather than a generic 500", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 422,
+      value: {
+        type: "invalid_request_error",
+        message: "Invalid tool schema",
+        param: "tools[0].parameters",
+        code: "invalid_tool_schema",
+      },
+    });
+    expect(apiErrorEvent({ providerError })).toEqual({
+      type: "invalid_request_error",
+      message: "Invalid tool schema",
+      param: "tools[0].parameters",
+      code: "invalid_tool_schema",
+    });
+  });
+
+  it("preserves provider type in a nested safe SSE fallback when payload was redacted", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 401,
+      value: {
+        type: "authentication_error",
+        message: "Session expired",
+        param: null,
+        code: "invalid_api_key",
+        authorization: "Bearer must-not-cross",
+      },
+    });
+    expect(providerError.payload.truncated).toBe(true);
+    expect(apiErrorEvent({ providerError })).toEqual({
+      type: "error",
+      error: {
+        message: "Session expired",
+        type: "authentication_error",
+        param: null,
+        code: "invalid_api_key",
+      },
+    });
+  });
+
+  it("replays a bounded safe plain-text provider SSE payload", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      value: {
+        type: "rate_limit_error",
+        message: "Rate limit reached",
+        param: null,
+        code: "rate_limit_exceeded",
+      },
+      payload: "Rate limit reached; authorization=must-not-cross",
+    });
+    expect(apiErrorEvent({ providerError }))
+      .toBe("Rate limit reached; authorization=[REDACTED]");
   });
 
   it("produces an SSE-safe event from the same normalized error", () => {

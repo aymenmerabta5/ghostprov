@@ -15,10 +15,13 @@ import {
   base64UrlDecode,
   canonicalJson,
   utf8Text,
+  GP_V2_R1_SCHEMA_VERSION,
+  GP_V2_R2_SCHEMA_VERSION,
   type AwarenessEnvelope,
   type HostFrame,
   type ReliableFrame,
   type SidecarFrame,
+  type R2AwarenessEnvelope,
 } from "../protocol/shared";
 import {
   assertV2SidecarAssets,
@@ -78,6 +81,8 @@ export type V2BootstrapAwareness = AwarenessChannel<HostFrame, SidecarFrame>;
 
 export interface V2ReadyDescriptor {
   instanceId: string;
+  protocolRevision: V2SidecarRevision;
+  launchNonce: string;
   buildHash: string;
   schemaHash: string;
   leaderGeneration: number;
@@ -117,6 +122,8 @@ export interface V2BootstrapControllerOptions {
   assets: V2SidecarAssets;
   /** Selected immutable V2 revision. Omission explicitly means the frozen R1 default. */
   revision?: V2SidecarRevision | string;
+  /** Required for R2 so bootstrap and steady transport share one exact launch fence. */
+  launchNonce?: string;
   attempts?: number;
   timeoutMs?: number;
   pollMs?: number;
@@ -315,8 +322,15 @@ function matchesReadiness(
   binding: BootstrapBinding,
   instanceId: string,
 ): boolean {
+  const r2 = binding.protocolRevision === "r2";
+  const r2Envelope = envelope as R2AwarenessEnvelope<SidecarFrame>;
   return envelope.protocol === "gp-awareness-v2" &&
-    envelope.schemaVersion === 1 &&
+    envelope.schemaVersion === (r2 ? GP_V2_R2_SCHEMA_VERSION : GP_V2_R1_SCHEMA_VERSION) &&
+    (!r2 || (
+      r2Envelope.protocolRevision === "r2" &&
+      r2Envelope.launchNonce === binding.nonce &&
+      r2Envelope.targetInstanceId === binding.nonce
+    )) &&
     envelope.projectId === binding.projectId &&
     envelope.sessionId === binding.sandboxSessionId &&
     envelope.leaderGeneration === binding.leaderGeneration &&
@@ -335,8 +349,15 @@ function matchesBoundInstance(
   binding: BootstrapBinding,
   instanceId: string,
 ): boolean {
+  const r2 = binding.protocolRevision === "r2";
+  const r2Envelope = envelope as R2AwarenessEnvelope<SidecarFrame>;
   return envelope.protocol === "gp-awareness-v2" &&
-    envelope.schemaVersion === 1 &&
+    envelope.schemaVersion === (r2 ? GP_V2_R2_SCHEMA_VERSION : GP_V2_R1_SCHEMA_VERSION) &&
+    (!r2 || (
+      r2Envelope.protocolRevision === "r2" &&
+      r2Envelope.launchNonce === binding.nonce &&
+      r2Envelope.targetInstanceId === binding.nonce
+    )) &&
     envelope.projectId === binding.projectId &&
     envelope.sessionId === binding.sandboxSessionId &&
     envelope.leaderGeneration === binding.leaderGeneration &&
@@ -390,6 +411,7 @@ export class V2BootstrapController {
   readonly #awareness: V2BootstrapAwareness;
   readonly #assets: V2SidecarAssets;
   readonly #selectedRevision: V2SidecarRevision;
+  readonly #launchNonce: string | null;
   readonly #attempts: number;
   readonly #timeoutMs: number;
   readonly #pollMs: number;
@@ -480,6 +502,13 @@ export class V2BootstrapController {
     this.#selectedRevision = resolveV2SidecarRevision(
       options.revision ?? DEFAULT_V2_SIDECAR_REVISION,
     );
+    if (options.launchNonce !== undefined && !SAFE_ID.test(options.launchNonce)) {
+      throw new TypeError("launchNonce is invalid");
+    }
+    if ((this.#selectedRevision as string) === "r2" && options.launchNonce === undefined) {
+      throw new TypeError("R2 bootstrap requires an explicit launchNonce");
+    }
+    this.#launchNonce = options.launchNonce ?? null;
     this.#attempts = attempts;
     this.#timeoutMs = timeoutMs;
     this.#pollMs = pollMs;
@@ -517,17 +546,31 @@ export class V2BootstrapController {
     if (!descriptor || !binding || !rotationKey) {
       throw new V2BootstrapError("Sidecar is not ready for credential rotation", "readiness", 1);
     }
+    const rotationBinding = binding.protocolRevision === "r2"
+      ? {
+          projectId: binding.projectId,
+          sandboxSessionId: binding.sandboxSessionId,
+          leaderGeneration: binding.leaderGeneration,
+          buildHash: binding.buildHash,
+          schemaHash: binding.schemaHash,
+          instanceId: descriptor.instanceId,
+          rotationId,
+          protocolRevision: "r2" as const,
+          schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+          launchNonce: binding.nonce,
+        }
+      : {
+          projectId: binding.projectId,
+          sandboxSessionId: binding.sandboxSessionId,
+          leaderGeneration: binding.leaderGeneration,
+          buildHash: binding.buildHash,
+          schemaHash: binding.schemaHash,
+          instanceId: descriptor.instanceId,
+          rotationId,
+        };
     const sealed = await sealCredentialRotation({
       rotationKey,
-      binding: {
-        projectId: binding.projectId,
-        sandboxSessionId: binding.sandboxSessionId,
-        leaderGeneration: binding.leaderGeneration,
-        buildHash: binding.buildHash,
-        schemaHash: binding.schemaHash,
-        instanceId: descriptor.instanceId,
-        rotationId,
-      },
+      binding: rotationBinding,
       credential: {
         url: ySweet.url,
         baseUrl: ySweet.baseUrl,
@@ -637,14 +680,21 @@ export class V2BootstrapController {
     let lastError: V2BootstrapError | null = null;
     for (let attempt = 1; attempt <= this.#attempts; attempt++) {
       if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");
-      const binding: BootstrapBinding = {
+      const baseBinding = {
         projectId: this.#projectId,
         sandboxSessionId: this.#sandboxSessionId,
         leaderGeneration: this.#leaderGeneration,
         buildHash: this.#assets.buildHash,
         schemaHash: this.#assets.schemaHash,
-        nonce: this.#random.uuid(),
+        nonce: this.#launchNonce ?? this.#random.uuid(),
       };
+      const binding: BootstrapBinding = (this.#selectedRevision as string) === "r2"
+        ? {
+            ...baseBinding,
+            protocolRevision: "r2",
+            schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+          }
+        : baseBinding;
       this.#rotationKey = null;
       try {
         const descriptor = await this.#attempt(binding, attempt, signal);
@@ -865,6 +915,8 @@ export class V2BootstrapController {
       if (envelope) {
         return {
           instanceId,
+          protocolRevision: this.#selectedRevision,
+          launchNonce: binding.nonce,
           buildHash: binding.buildHash,
           schemaHash: binding.schemaHash,
           leaderGeneration: binding.leaderGeneration,
@@ -908,15 +960,14 @@ export class V2BootstrapController {
     frames: readonly ReliableFrame<HostFrame>[],
     draining: boolean,
   ): void {
-    this.#awareness.publish({
+    const common = {
       protocol: "gp-awareness-v2",
-      schemaVersion: 1,
       schemaHash: binding.schemaHash,
       buildHash: binding.buildHash,
       projectId: this.#projectId,
       sessionId: binding.sandboxSessionId,
       peerId: "host-bootstrap",
-      instanceId: `host-${binding.nonce}`,
+      instanceId: binding.nonce,
       leaderGeneration: binding.leaderGeneration,
       epoch: 1,
       revision: this.#awarenessRevision++,
@@ -926,6 +977,18 @@ export class V2BootstrapController {
       queued: 0,
       draining,
       frames,
-    });
+    } as const;
+    this.#awareness.publish(binding.protocolRevision === "r2"
+      ? {
+          ...common,
+          protocolRevision: "r2",
+          schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+          launchNonce: binding.nonce,
+          targetInstanceId: this.#ready?.instanceId ?? "sidecar-unbound",
+        }
+      : {
+          ...common,
+          schemaVersion: GP_V2_R1_SCHEMA_VERSION,
+        });
   }
 }

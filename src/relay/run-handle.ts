@@ -1,6 +1,7 @@
 import type { SseFrame } from "./sse";
 import type { V2TransportDiagnostics } from "../v2/diagnostics/types";
 import type { RateLimitHint } from "../v2/rate-limit";
+import type { UpstreamPrelude } from "../v2/protocol/shared";
 
 export interface RunDiagnostics {
   hostPrepareMs: number | null; hostSchedulerWaitMs: number | null; hostPublishToAckMs: number | null;
@@ -14,6 +15,8 @@ export interface RunHandle {
   final: Promise<any>;
   /** Latest upstream rate-limit headers, kept out of the public Responses body. */
   rateLimit?: RateLimitHint;
+  /** Resolves once successful upstream HTTP headers are proven by the sidecar. */
+  upstreamPrelude?: Promise<UpstreamPrelude>;
   stats: {
     bytes: number;
     firstByteMs: number | null;

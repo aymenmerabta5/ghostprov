@@ -277,6 +277,8 @@ describe("V2BootstrapController", () => {
 
     await expect(harness.controller.ensureReady()).resolves.toEqual({
       instanceId: "sidecar-instance-1",
+      protocolRevision: "r1",
+      launchNonce: "00000000-0000-4000-8000-000000000001",
       buildHash: BUILD_HASH,
       schemaHash: SCHEMA_HASH,
       leaderGeneration: 4,

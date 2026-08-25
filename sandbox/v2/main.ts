@@ -108,7 +108,7 @@ async function run(): Promise<void> {
   const config = readConfig(JSON.parse(
     await Deno.readTextFile("/workspace/.ghostprov-v2/static.json"),
   ));
-  const binding = protocolBindingFromBootstrap(config.binding);
+  const binding = protocolBindingFromBootstrap(config.binding, "r2");
   const baseUrl = Deno.env.get("OPENAI_BASE_URL");
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
@@ -213,6 +213,10 @@ async function run(): Promise<void> {
       onDrainRequested: reason => requestDrain(reason),
       onFatalError: error => requestDrain("journal_error", error),
       assertOwnership: () => ownership!.assertOwned(),
+      assertExecutionFence: frame => {
+        if (!peer) throw new Error("R2 Awareness peer is not initialized");
+        peer.assertExecutionFence(frame);
+      },
       diagnostics: diagnosticObserver,
       outputBackpressure,
       deferAcceptUntilStarted: true,

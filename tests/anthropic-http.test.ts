@@ -18,6 +18,7 @@ import {
   requestBodyLimitForUrl,
 } from "../src/server/runtime";
 import type { IncomingResourceLease } from "../src/router/router";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import {
   finalResponse,
   messageOutput,
@@ -987,6 +988,52 @@ describe("Anthropic HTTP routes", () => {
     expect(JSON.stringify(body)).not.toContain("secret upstream response body");
     expect(response.headers.get("retry-after")).toBe("7");
     expect(response.headers.get("x-should-retry")).toBe("true");
+    expect(response.headers.get("authorization")).toBeNull();
+  });
+
+  it("awaits the R2 prelude before committing Anthropic SSE headers", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 429,
+      model: "gpt-5.6-sol",
+      headers: new Headers({
+        "retry-after": "7",
+        authorization: "Bearer must-not-cross",
+      }),
+      value: {
+        error: {
+          message: "Rate limit reached in organization org-Test123",
+          type: "rate_limit_error",
+          param: null,
+          code: "rate_limit_exceeded",
+        },
+      },
+    });
+    const upstream = Object.assign(new Error(providerError.error.message), {
+      providerError,
+    });
+    const router = new FakeRouter(() => ({
+      async *events() {},
+      final: new Promise(() => undefined),
+      upstreamPrelude: Promise.reject(upstream),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }));
+
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ stream: true })),
+    });
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(response.headers.get("retry-after")).toBe("7");
+    expect(body).toMatchObject({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Rate limit exceeded" },
+    });
+    expect(JSON.stringify(body)).not.toContain("org-Test123");
     expect(response.headers.get("authorization")).toBeNull();
   });
 

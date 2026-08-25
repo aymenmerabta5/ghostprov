@@ -27,6 +27,8 @@ import {
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink";
 
 export const TEST_BINDING: ProtocolBinding = {
+  protocolRevision: "r1",
+  launchNonce: "launch-nonce-r1",
   projectId: "e631d12c-d917-4434-b360-41b4715d6679",
   sessionId: "sandbox-session-1",
   leaderGeneration: 3,

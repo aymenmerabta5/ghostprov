@@ -449,7 +449,12 @@ The isolated suite includes:
 - `tests/v2-long-run-stability.test.ts`
 - `tests/v2-monitor.test.ts`
 - `tests/v2-output-sink.test.ts`
+- `tests/v2-performance-harness.test.ts`
+- `tests/v2-performance-large.test.ts`
 - `tests/v2-protocol.test.ts`
+- `tests/v2-provider-error.test.ts`
+- `tests/v2-r2-execution-fence.test.ts`
+- `tests/v2-r2-protocol.test.ts`
 - `tests/v2-rate-limit-protocol.test.ts`
 - `tests/v2-public-api.test.ts`
 - `tests/v2-publication-pacer.test.ts`

@@ -15,6 +15,7 @@ import {
 import { WebSocketTelemetry } from "../src/ws/telemetry";
 import { ResponseGraph } from "../src/ws/response-graph";
 import { ApiError } from "../src/http/errors";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
@@ -438,15 +439,19 @@ describe("Responses WebSocket server", () => {
     const rateMessage = "Rate limit reached for gpt-5.6-sol in organization " +
       "org-ExampleOrganization123 on tokens per min (TPM): Limit 40000000, " +
       "Used 40000000, Requested 609930. Please try again in 914ms.";
-    const failures = [
-      Object.assign(new Error(rateMessage), {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      model: "gpt-5.6-sol",
+      value: {
+        type: "rate_limit_error",
+        message: rateMessage,
+        param: "input",
         code: "rate_limit_exceeded",
-        rateLimit: {
-          retryAfterMs: 914,
-          limitTokens: 40_000_000,
-          remainingTokens: 0,
-        },
-      }),
+      },
+    });
+    const failures = [
+      Object.assign(new Error(rateMessage), { providerError }),
       new ApiError(401, "The upstream session is not authorized", {
         type: "authentication_error",
         param: null,
@@ -473,6 +478,7 @@ describe("Responses WebSocket server", () => {
       error: {
         message: rateMessage,
         type: "rate_limit_error",
+        param: "input",
         code: "rate_limit_exceeded",
       },
     });

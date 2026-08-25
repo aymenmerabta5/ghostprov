@@ -1,8 +1,14 @@
 import type { V2EnvelopeDiagnostics, V2FirstEventDiagnostics, V2RequestAckDiagnostics, V2TerminalDiagnostics } from "../diagnostics/types";
 import type { RateLimitHint } from "../rate-limit";
+import type { ProviderErrorEnvelope } from "../provider-error";
 
 export const GP_V2_PROTOCOL = "gp-awareness-v2" as const;
-export const GP_V2_SCHEMA_VERSION = 1 as const;
+/** Frozen wire revision used by the immutable R1 sidecar release. */
+export const GP_V2_R1_SCHEMA_VERSION = 1 as const;
+/** Fenced wire revision. R2 never accepts an R1 envelope implicitly. */
+export const GP_V2_R2_SCHEMA_VERSION = 2 as const;
+/** @deprecated Use the explicit revision-specific constant. */
+export const GP_V2_SCHEMA_VERSION = GP_V2_R1_SCHEMA_VERSION;
 export const GP_V2_FRAME_MAX_BYTES = 16 * 1024;
 export const GP_V2_WINDOW_MAX_FRAMES = 128;
 export const GP_V2_WINDOW_MAX_BYTES = 512 * 1024;
@@ -22,18 +28,39 @@ export interface FrameIdentity {
   sequence: number;
 }
 
-export interface ProtocolBinding {
+export type ProtocolRevision = "r1" | "r2";
+
+interface ProtocolBindingBase {
   projectId: string;
   sessionId: string;
   leaderGeneration: number;
   buildHash: string;
   schemaHash: string;
+  /** Bootstrap launch nonce retained for the complete sidecar lifetime. */
+  launchNonce: string;
 }
+
+export interface R1ProtocolBinding extends ProtocolBindingBase {
+  protocolRevision: "r1";
+}
+
+export interface R2ProtocolBinding extends ProtocolBindingBase {
+  protocolRevision: "r2";
+}
+
+/** Selected explicitly from immutable sidecar assets; never inferred from wire input. */
+export type ProtocolBinding = R1ProtocolBinding | R2ProtocolBinding;
 
 export type RequestEncoding = "identity" | "gzip+base64";
 export type TerminalStatus = "completed" | "failed" | "incomplete";
 
-export type HostFrame =
+export interface UpstreamPrelude {
+  status: number;
+  contentType: string;
+  upstreamRequestId: string | null;
+}
+
+type SharedHostFrame =
   | {
     kind: "request_open";
     requestId: string;
@@ -50,14 +77,53 @@ export type HostFrame =
     offset: number;
     dataBase64Url: string;
   }
-  | { kind: "request_commit"; requestId: string }
   | { kind: "request_cancel"; requestId: string; reason: string }
   | { kind: "response_ack"; requestId: string; terminalDigest?: string }
   | { kind: "credential_rotate"; rotationId: string; sealedJson: string }
   | { kind: "drain"; reason: string }
   | { kind: "ping"; sentAtMs: number };
 
+export interface R1RequestCommitFrame {
+  kind: "request_commit";
+  requestId: string;
+}
+
+/**
+ * Commit-last R2 proof. The immutable request manifest is repeated here so a
+ * stale/mixed open cannot cross the execution boundary, and the complete
+ * launch/host/sidecar fence can be re-proved immediately before claim/fetch.
+ */
+export interface R2RequestCommitFrame {
+  kind: "request_commit";
+  requestId: string;
+  protocolRevision: "r2";
+  schemaVersion: typeof GP_V2_R2_SCHEMA_VERSION;
+  projectId: string;
+  sessionId: string;
+  leaderGeneration: number;
+  buildHash: string;
+  schemaHash: string;
+  launchNonce: string;
+  hostInstanceId: string;
+  targetInstanceId: string;
+  requestDigest: string;
+  decodedBytes: number;
+  encodedBytes: number;
+  encoding: RequestEncoding;
+  partCount: number;
+}
+
+export type RequestCommitFrame = R1RequestCommitFrame | R2RequestCommitFrame;
+export type HostFrame = SharedHostFrame | RequestCommitFrame;
+
 export type SidecarFrame =
+  | {
+    kind: "upstream_prelude";
+    requestId: string;
+    status: number;
+    contentType: string;
+    upstreamRequestId: string | null;
+  }
   | {
     kind: "response_batch"; requestId: string; firstEventIndex: number;
     items: readonly { event: string; dataBase64Url: string }[];
@@ -107,6 +173,7 @@ export type SidecarFrame =
     message: string;
     ambiguous: boolean;
     rateLimit?: RateLimitHint;
+    providerError?: ProviderErrorEnvelope;
   }
   | { kind: "request_cancelled"; requestId: string }
   | { kind: "credential_ack"; rotationId: string }
@@ -124,9 +191,8 @@ export type AwarenessLiveness =
   | { kind: "ping"; sentAtMs: number }
   | { kind: "pong"; sentAtMs: number };
 
-export interface AwarenessEnvelope<T> {
+interface AwarenessEnvelopeBase<T> {
   protocol: typeof GP_V2_PROTOCOL;
-  schemaVersion: typeof GP_V2_SCHEMA_VERSION;
   schemaHash: string;
   buildHash: string;
   projectId: string;
@@ -147,7 +213,22 @@ export interface AwarenessEnvelope<T> {
   diagnostics?: V2EnvelopeDiagnostics;
 }
 
-export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
+/** Exact frozen R1 envelope. It intentionally has no R2 fence fields. */
+export interface R1AwarenessEnvelope<T> extends AwarenessEnvelopeBase<T> {
+  schemaVersion: typeof GP_V2_R1_SCHEMA_VERSION;
+}
+
+/** Exact fenced R2 envelope. `instanceId` is sender; target is unambiguous. */
+export interface R2AwarenessEnvelope<T> extends AwarenessEnvelopeBase<T> {
+  schemaVersion: typeof GP_V2_R2_SCHEMA_VERSION;
+  protocolRevision: "r2";
+  launchNonce: string;
+  targetInstanceId: string;
+}
+
+export type AwarenessEnvelope<T> = R1AwarenessEnvelope<T> | R2AwarenessEnvelope<T>;
+
+export const GP_V2_R1_SCHEMA_DESCRIPTOR = Object.freeze({
   protocol: GP_V2_PROTOCOL,
   version: GP_V2_SCHEMA_VERSION,
   frameMaxBytes: GP_V2_FRAME_MAX_BYTES,
@@ -235,9 +316,70 @@ export const GP_V2_SCHEMA_DESCRIPTOR = Object.freeze({
   },
 });
 
+export const GP_V2_SCHEMA_DESCRIPTOR = GP_V2_R1_SCHEMA_DESCRIPTOR;
+
+export const GP_V2_R2_SCHEMA_DESCRIPTOR = Object.freeze({
+  ...GP_V2_R1_SCHEMA_DESCRIPTOR,
+  version: GP_V2_R2_SCHEMA_VERSION,
+  envelopeFields: [
+    "protocol",
+    "protocolRevision",
+    "schemaVersion",
+    "schemaHash",
+    "buildHash",
+    "projectId",
+    "sessionId",
+    "peerId",
+    "instanceId",
+    "targetInstanceId",
+    "launchNonce",
+    "leaderGeneration",
+    "epoch",
+    "revision",
+    "ack",
+    "credits",
+    "active",
+    "queued",
+    "draining",
+    "frames",
+    "lane?",
+    "liveness?",
+    "diagnostics?",
+  ],
+  frameFields: {
+    ...GP_V2_R1_SCHEMA_DESCRIPTOR.frameFields,
+    upstream_prelude: ["requestId", "status", "contentType", "upstreamRequestId"],
+    request_commit: [
+      "requestId",
+      "protocolRevision",
+      "schemaVersion",
+      "projectId",
+      "sessionId",
+      "leaderGeneration",
+      "buildHash",
+      "schemaHash",
+      "launchNonce",
+      "hostInstanceId",
+      "targetInstanceId",
+      "requestDigest",
+      "decodedBytes",
+      "encodedBytes",
+      "encoding",
+      "partCount",
+    ],
+    response_error: [
+      "requestId", "code", "message", "ambiguous", "rateLimit?", "providerError?",
+    ],
+  },
+  sidecarFrameKinds: [
+    ...GP_V2_R1_SCHEMA_DESCRIPTOR.sidecarFrameKinds,
+    "upstream_prelude",
+  ],
+});
+
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
-let schemaHashPromise: Promise<string> | null = null;
+const schemaHashPromises: Partial<Record<ProtocolRevision, Promise<string>>> = {};
 
 function canonicalValue(value: unknown, seen: WeakSet<object>): string {
   if (value === null) return "null";
@@ -324,7 +466,13 @@ export function base64UrlDecode(value: string): Uint8Array {
   return output;
 }
 
-export function protocolSchemaHash(): Promise<string> {
-  schemaHashPromise ??= sha256Hex(canonicalJson(GP_V2_SCHEMA_DESCRIPTOR));
-  return schemaHashPromise;
+export function protocolSchemaHash(revision: ProtocolRevision): Promise<string> {
+  const existing = schemaHashPromises[revision];
+  if (existing) return existing;
+  const descriptor = revision === "r1"
+    ? GP_V2_R1_SCHEMA_DESCRIPTOR
+    : GP_V2_R2_SCHEMA_DESCRIPTOR;
+  const created = sha256Hex(canonicalJson(descriptor));
+  schemaHashPromises[revision] = created;
+  return created;
 }

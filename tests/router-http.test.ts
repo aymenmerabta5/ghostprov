@@ -18,7 +18,8 @@ import { projectId } from "../src/sandbox/types";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { closeResponsesWebSockets } from "../src/ws/server";
-import { V2RunHandle } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 
 const servers: Server[] = [];
 
@@ -184,6 +185,152 @@ describe("router HTTP composition", () => {
     await producer;
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(responseFinal);
+  });
+
+  it("waits for the R2 upstream prelude and preserves an initial provider 429", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 429,
+      model: "gpt-5.6-sol",
+      headers: new Headers({
+        "retry-after": "0.136",
+        "x-ratelimit-limit-tokens": "40000000",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_prelude_429",
+      }),
+      value: {
+        error: {
+          message: "Rate limit reached for gpt-5.6-sol in organization org-Test123",
+          type: "rate_limit_error",
+          param: null,
+          code: "rate_limit_exceeded",
+        },
+      },
+    });
+    const upstream = Object.assign(new Error(providerError.error.message), {
+      providerError,
+    });
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (): Promise<RunHandle> => ({
+        async *events() {},
+        final: new Promise(() => undefined),
+        upstreamPrelude: Promise.reject(upstream),
+        stats: { bytes: 0, firstByteMs: null, frames: 0 },
+      }),
+    };
+
+    const response = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("0.136");
+    expect(response.headers.get("x-ratelimit-limit-tokens")).toBe("40000000");
+    expect(response.headers.get("x-request-id")).toBe("req_prelude_429");
+    expect(await response.json()).toEqual({ error: providerError.error });
+  });
+
+  it("does not expose streaming response headers before the R2 success prelude", async () => {
+    let resolvePrelude!: (value: {
+      status: number;
+      contentType: string;
+      upstreamRequestId: string | null;
+    }) => void;
+    const prelude = new Promise<{
+      status: number;
+      contentType: string;
+      upstreamRequestId: string | null;
+    }>(resolve => { resolvePrelude = resolve; });
+    const responseFinal = final("resp_prelude_success");
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (): Promise<RunHandle> => ({
+        async *events() {
+          yield {
+            event: "response.completed",
+            data: JSON.stringify({ type: "response.completed", response: responseFinal }),
+          };
+        },
+        final: Promise.resolve(responseFinal),
+        upstreamPrelude: prelude,
+        stats: { bytes: 0, firstByteMs: null, frames: 1 },
+      }),
+    };
+    const pending = Promise.resolve(createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    }));
+    const early = await Promise.race([
+      pending.then(() => "response" as const),
+      new Promise<"waiting">(resolve => setTimeout(() => resolve("waiting"), 20)),
+    ]);
+    expect(early).toBe("waiting");
+
+    resolvePrelude({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: "req_prelude_success",
+    });
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-request-id")).toBe("req_prelude_success");
+    expect((await response.text())).toContain("event: response.completed");
+  });
+
+  it("keeps a provider SSE error exact after the successful prelude committed HTTP 200", async () => {
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      model: "gpt-5.6-sol",
+      value: {
+        type: "error",
+        error: {
+          message: "Rate limit reached in organization org-Late123",
+          type: "rate_limit_error",
+          param: null,
+          code: "rate_limit_exceeded",
+        },
+      },
+    });
+    const realHandle = new V2RunHandle({
+      maxBufferedBytes: 4_096,
+      expectUpstreamPrelude: true,
+    });
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async () => realHandle,
+    };
+    const pending = Promise.resolve(createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    }));
+    realHandle.acceptUpstreamPrelude({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: "req_late_error",
+    });
+    const response = await pending;
+    realHandle.fail(new V2CommittedError(
+      providerError.error.message,
+      providerError.error.code ?? "upstream_error",
+      false,
+      { retryAfterMs: 136, remainingTokens: 0 },
+      providerError,
+    ));
+
+    expect(response.status).toBe(200);
+    const frames = parseFrames(await response.text(), 0).frames;
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.event).toBe("error");
+    expect(JSON.parse(frames[0]!.data)).toEqual({
+      type: "error",
+      error: providerError.error,
+    });
   });
 
   it("aborts non-streaming relay work when event draining fails before final settles", async () => {

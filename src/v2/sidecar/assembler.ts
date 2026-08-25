@@ -4,6 +4,7 @@ import {
   base64UrlDecode,
   sha256Hex,
   type HostFrame,
+  type RequestCommitFrame,
   type ReliableFrame,
   type RequestEncoding,
 } from "../protocol/shared";
@@ -107,7 +108,8 @@ export class RequestAssembler {
     );
   }
 
-  async commit(requestId: string): Promise<Uint8Array> {
+  async commit(commitment: string | RequestCommitFrame): Promise<Uint8Array> {
+    const requestId = typeof commitment === "string" ? commitment : commitment.requestId;
     const state = this.#requests.get(requestId);
     if (!state) throw new RequestAssemblyError("Request was not opened", "gap");
     if (this.#isExpired(state)) {
@@ -115,6 +117,23 @@ export class RequestAssembler {
       throw new RequestAssemblyError("Request assembly expired", "gap");
     }
     try {
+      if (
+        typeof commitment !== "string" &&
+        "protocolRevision" in commitment &&
+        commitment.protocolRevision === "r2" &&
+        (
+          commitment.requestDigest !== state.requestDigest ||
+          commitment.decodedBytes !== state.decodedBytes ||
+          commitment.encodedBytes !== state.encodedBytes ||
+          commitment.encoding !== state.encoding ||
+          commitment.partCount !== state.partCount
+        )
+      ) {
+        throw new RequestAssemblyError(
+          "Request commit manifest conflicts with request open",
+          "conflict",
+        );
+      }
       if (state.receivedParts !== state.partCount) {
         throw new RequestAssemblyError("Request has missing parts", "gap");
       }

@@ -10,7 +10,7 @@ describe("V2 bootstrap binding conversion", () => {
       buildHash: "a".repeat(64),
       schemaHash: "b".repeat(64),
       nonce: "bootstrap-nonce",
-    });
+    }, "r1");
 
     expect(binding).toEqual({
       projectId: "e631d12c-d917-4434-b360-41b4715d6679",
@@ -18,6 +18,8 @@ describe("V2 bootstrap binding conversion", () => {
       leaderGeneration: 4,
       buildHash: "a".repeat(64),
       schemaHash: "b".repeat(64),
+      protocolRevision: "r1",
+      launchNonce: "bootstrap-nonce",
     });
     expect(binding).not.toHaveProperty("sandboxSessionId");
     expect(binding).not.toHaveProperty("nonce");

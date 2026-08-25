@@ -26,7 +26,7 @@ describe("V2 rate-limit protocol metadata", () => {
         limitTokens: 40_000_000,
         remainingTokens: 0,
       },
-    }, "sidecar")).toMatchObject({
+    }, "sidecar", "r1")).toMatchObject({
       rateLimit: {
         retryAfterMs: 109,
         resetTokensMs: 360_000,
@@ -40,10 +40,10 @@ describe("V2 rate-limit protocol metadata", () => {
     expect(() => parseFrame({
       ...terminal,
       rateLimit: { remainingTokens: -1 },
-    }, "sidecar")).toThrow(V2ProtocolError);
+    }, "sidecar", "r1")).toThrow(V2ProtocolError);
     expect(() => parseFrame({
       ...terminal,
       rateLimit: { resetTokensMs: 3_600_001 },
-    }, "sidecar")).toThrow(V2ProtocolError);
+    }, "sidecar", "r1")).toThrow(V2ProtocolError);
   });
 });

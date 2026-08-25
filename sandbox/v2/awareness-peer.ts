@@ -6,6 +6,8 @@ import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
   GP_V2_FLIGHT_MAX_BYTES,
   GP_V2_FLIGHT_MAX_FRAMES,
+  GP_V2_R1_SCHEMA_VERSION,
+  GP_V2_R2_SCHEMA_VERSION,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
   type AwarenessLane,
@@ -13,6 +15,8 @@ import {
   type HostFrame,
   type ProtocolBinding,
   type ReliableFrame,
+  type R2AwarenessEnvelope,
+  type R2RequestCommitFrame,
   type SidecarFrame,
 } from "../../src/v2/protocol/shared.ts";
 import { AckClockedFlight } from "../../src/v2/protocol/flight.ts";
@@ -183,6 +187,7 @@ export class DenoAwarenessPeer {
   #dataDirty = false;
   #hostPeerId: string | null = null;
   #hostInstanceId: string | null = null;
+  #steadyHostActive = false;
   readonly #hostClientId: Record<AwarenessLane, number | null> = {
     data: null,
     control: null,
@@ -232,6 +237,10 @@ export class DenoAwarenessPeer {
   constructor(options: DenoAwarenessPeerOptions) {
     this.#binding = options.binding;
     this.#instanceId = options.instanceId;
+    if (
+      options.binding.protocolRevision === "r2" &&
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(options.binding.launchNonce)
+    ) throw new TypeError("R2 launch nonce is invalid");
     this.#engine = options.engine;
     this.#rotator = new SidecarCredentialRotator({
       credential: options.credential,
@@ -274,6 +283,55 @@ export class DenoAwarenessPeer {
     });
     this.#dataProvider.awareness.on("change", this.#onDataAwarenessChange);
     this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
+    this.#controlProvider.on("connection-close", this.#onControlConnectionUnavailable);
+    this.#controlProvider.on("connection-error", this.#onControlConnectionUnavailable);
+  }
+
+  /**
+   * Re-proves the dynamic half of an R2 execution fence. The engine invokes
+   * this before durable claim and at the upstream fetch boundary, not merely
+   * when the transport first observes the commit frame.
+   */
+  assertExecutionFence(frame: R2RequestCommitFrame): void {
+    if (this.#binding.protocolRevision !== "r2") {
+      throw new Error("R2 execution fence cannot be used by an R1 peer");
+    }
+    if (
+      frame.protocolRevision !== "r2" ||
+      frame.schemaVersion !== GP_V2_R2_SCHEMA_VERSION ||
+      frame.projectId !== this.#binding.projectId ||
+      frame.sessionId !== this.#binding.sessionId ||
+      frame.leaderGeneration !== this.#binding.leaderGeneration ||
+      frame.buildHash !== this.#binding.buildHash ||
+      frame.schemaHash !== this.#binding.schemaHash ||
+      frame.launchNonce !== this.#binding.launchNonce ||
+      frame.targetInstanceId !== this.#instanceId ||
+      this.#closed ||
+      this.#closing ||
+      !this.#steadyHostActive ||
+      this.#hostClientId.control === null ||
+      this.#hostInstanceId === null ||
+      frame.hostInstanceId !== this.#hostInstanceId
+    ) {
+      throw new Error("R2 execution fence is no longer elected");
+    }
+    const raw = this.#controlProvider.awareness.getStates()
+      .get(this.#hostClientId.control)?.ghostprovV2Control;
+    try {
+      const current = parseAwarenessEnvelopeWithDiagnostics(
+        raw,
+        this.#binding,
+        "host",
+      ).envelope as R2AwarenessEnvelope<HostFrame>;
+      if (
+        current.peerId !== "host" ||
+        current.instanceId !== this.#hostInstanceId ||
+        current.targetInstanceId !== this.#instanceId ||
+        current.lane !== "control"
+      ) throw new Error("R2 control election state is not current");
+    } catch (error) {
+      throw new Error("R2 execution fence is no longer elected", { cause: error });
+    }
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -444,6 +502,8 @@ export class DenoAwarenessPeer {
     };
     cleanup(() => this.#dataProvider.awareness.off("change", this.#onDataAwarenessChange));
     cleanup(() => this.#controlProvider.awareness.off("change", this.#onControlAwarenessChange));
+    cleanup(() => this.#controlProvider.off("connection-close", this.#onControlConnectionUnavailable));
+    cleanup(() => this.#controlProvider.off("connection-error", this.#onControlConnectionUnavailable));
     for (const provider of [this.#dataProvider, this.#controlProvider]) {
       cleanup(() => provider.awareness.setLocalState(null));
       cleanup(() => provider.disconnect());
@@ -551,6 +611,13 @@ export class DenoAwarenessPeer {
     change,
   );
 
+  readonly #onControlConnectionUnavailable = (): void => {
+    if (this.#binding.protocolRevision !== "r2") return;
+    this.#steadyHostActive = false;
+    this.#hostClientId.control = null;
+    this.#hostRevision.control = -1;
+  };
+
   #onAwarenessChange(
     lane: AwarenessLane,
     provider: DenoAwarenessProviderLike,
@@ -561,7 +628,13 @@ export class DenoAwarenessPeer {
       if (clientId === this.#hostClientId[lane]) {
         this.#hostClientId[lane] = null;
         this.#hostRevision[lane] = -1;
-        if (this.#hostClientId.data === null && this.#hostClientId.control === null) {
+        if (this.#binding.protocolRevision === "r2" && lane === "control") {
+          this.#steadyHostActive = false;
+        }
+        if (
+          this.#binding.protocolRevision === "r1" &&
+          this.#hostClientId.data === null && this.#hostClientId.control === null
+        ) {
           this.#hostPeerId = null;
           this.#hostInstanceId = null;
         }
@@ -574,7 +647,13 @@ export class DenoAwarenessPeer {
         if (clientId === this.#hostClientId[lane]) {
           this.#hostClientId[lane] = null;
           this.#hostRevision[lane] = -1;
-          if (this.#hostClientId.data === null && this.#hostClientId.control === null) {
+          if (this.#binding.protocolRevision === "r2" && lane === "control") {
+            this.#steadyHostActive = false;
+          }
+          if (
+            this.#binding.protocolRevision === "r1" &&
+            this.#hostClientId.data === null && this.#hostClientId.control === null
+          ) {
             this.#hostPeerId = null;
             this.#hostInstanceId = null;
           }
@@ -587,27 +666,116 @@ export class DenoAwarenessPeer {
         envelope = parsed.envelope as AwarenessEnvelope<HostFrame>;
         if (parsed.malformed) this.#diagnostics?.malformed();
       } catch {
+        if (
+          this.#binding.protocolRevision === "r2" &&
+          lane === "control" &&
+          clientId === this.#hostClientId.control
+        ) {
+          this.#hostClientId.control = null;
+          this.#hostRevision.control = -1;
+          this.#steadyHostActive = false;
+        }
         continue;
       }
-      if (envelope.lane !== undefined && envelope.lane !== lane) continue;
+      if (
+        this.#binding.protocolRevision === "r2" &&
+        (envelope as R2AwarenessEnvelope<HostFrame>).targetInstanceId !== this.#instanceId
+      ) {
+        if (lane === "control" && clientId === this.#hostClientId.control) {
+          this.#hostClientId.control = null;
+          this.#hostRevision.control = -1;
+          this.#steadyHostActive = false;
+        }
+        continue;
+      }
+      if (envelope.lane !== undefined && envelope.lane !== lane) {
+        if (
+          this.#binding.protocolRevision === "r2" &&
+          lane === "control" &&
+          clientId === this.#hostClientId.control
+        ) {
+          this.#hostClientId.control = null;
+          this.#hostRevision.control = -1;
+          this.#steadyHostActive = false;
+        }
+        continue;
+      }
       const steadyHost = envelope.peerId === "host";
       const bootstrapHost = envelope.peerId === "host-bootstrap";
-      if (!steadyHost && !bootstrapHost) continue;
+      if (!steadyHost && !bootstrapHost) {
+        if (
+          this.#binding.protocolRevision === "r2" &&
+          lane === "control" &&
+          clientId === this.#hostClientId.control
+        ) {
+          this.#hostClientId.control = null;
+          this.#hostRevision.control = -1;
+          this.#steadyHostActive = false;
+        }
+        continue;
+      }
       if (bootstrapHost) {
         // Bootstrap can ping/drain before a transport exists, but it must never
         // pin the steady host identity or trigger recovered response delivery.
-        if (this.#hostInstanceId !== null) continue;
+        if (this.#hostInstanceId !== null) {
+          if (
+            this.#binding.protocolRevision === "r2" &&
+            lane === "control" &&
+            clientId === this.#hostClientId.control
+          ) {
+            this.#hostClientId.control = null;
+            this.#hostRevision.control = -1;
+            this.#steadyHostActive = false;
+          }
+          continue;
+        }
+        if (envelope.frames.some(frame => frame.kind !== "ping" && frame.kind !== "drain")) {
+          continue;
+        }
+        if (
+          this.#binding.protocolRevision === "r2" &&
+          envelope.instanceId !== this.#binding.launchNonce
+        ) continue;
         if (envelope.revision <= this.#bootstrapRevision[lane]) continue;
         this.#bootstrapRevision[lane] = envelope.revision;
       } else {
-        if (this.#hostPeerId && envelope.peerId !== this.#hostPeerId) continue;
-        if (this.#hostInstanceId && envelope.instanceId !== this.#hostInstanceId) continue;
-        if (envelope.revision <= this.#hostRevision[lane]) continue;
-        this.#hostPeerId = envelope.peerId;
-        this.#hostInstanceId = envelope.instanceId;
-        this.#hostClientId[lane] = clientId;
-        this.#hostRevision[lane] = envelope.revision;
-        this.#observeBoundHostTransport(envelope);
+        if (this.#binding.protocolRevision === "r2") {
+          // R2 election is proven only by a currently present, exact control
+          // state. Data is executable only while that live control proof is
+          // active. The pinned ID survives removal solely to permit a
+          // same-host reconnect; a replacement ID can never take over.
+          if (this.#hostInstanceId === null) {
+            if (lane !== "control") continue;
+            this.#hostPeerId = envelope.peerId;
+            this.#hostInstanceId = envelope.instanceId;
+          }
+          if (
+            envelope.peerId !== this.#hostPeerId ||
+            envelope.instanceId !== this.#hostInstanceId
+          ) {
+            if (lane === "control" && clientId === this.#hostClientId.control) {
+              this.#hostClientId.control = null;
+              this.#hostRevision.control = -1;
+              this.#steadyHostActive = false;
+            }
+            continue;
+          }
+          if (envelope.revision <= this.#hostRevision[lane]) continue;
+          if (lane === "control") this.#steadyHostActive = true;
+          else if (!this.#steadyHostActive) continue;
+          this.#hostClientId[lane] = clientId;
+          this.#hostRevision[lane] = envelope.revision;
+          this.#observeBoundHostTransport(envelope);
+        } else {
+          if (this.#hostPeerId && envelope.peerId !== this.#hostPeerId) continue;
+          if (this.#hostInstanceId && envelope.instanceId !== this.#hostInstanceId) continue;
+          if (envelope.revision <= this.#hostRevision[lane]) continue;
+          this.#hostPeerId = envelope.peerId;
+          this.#hostInstanceId = envelope.instanceId;
+          this.#hostClientId[lane] = clientId;
+          this.#hostRevision[lane] = envelope.revision;
+          this.#observeBoundHostTransport(envelope);
+        }
       }
       if (envelope.liveness?.kind === "ping") {
         // Liveness is deliberately best-effort and out of band. Answer it
@@ -762,9 +930,8 @@ export class DenoAwarenessPeer {
     const current = this.#controlProvider.awareness.getLocalState()
       ?.ghostprovV2Control as AwarenessEnvelope<SidecarFrame> | undefined;
     const transport = this.#engine.snapshot();
-    const envelope: AwarenessEnvelope<SidecarFrame> = {
+    const common = {
       protocol: "gp-awareness-v2",
-      schemaVersion: 1,
       schemaHash: this.#binding.schemaHash,
       buildHash: this.#binding.buildHash,
       projectId: this.#binding.projectId,
@@ -785,7 +952,17 @@ export class DenoAwarenessPeer {
       lane: "control",
       liveness: { kind: "pong", sentAtMs },
       ...(current?.diagnostics ? { diagnostics: current.diagnostics } : {}),
-    };
+    } as const;
+    const envelope: AwarenessEnvelope<SidecarFrame> =
+      this.#binding.protocolRevision === "r2"
+        ? {
+            ...common,
+            protocolRevision: "r2",
+            schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+            launchNonce: this.#binding.launchNonce,
+            targetInstanceId: this.#hostInstanceId ?? this.#binding.launchNonce,
+          }
+        : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
     const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
     this.#publications++;
     this.#urgentPublications++;
@@ -808,9 +985,8 @@ export class DenoAwarenessPeer {
     else if (reason === "urgent") this.#urgentPublications++;
     const adaptive = this.#adaptiveCapacity.snapshot();
     this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: this.#delivery.ackProgressAgeMs(performance.now()), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0 });
-    const envelope: AwarenessEnvelope<SidecarFrame> = {
+    const common = {
       protocol: "gp-awareness-v2",
-      schemaVersion: 1,
       schemaHash: this.#binding.schemaHash,
       buildHash: this.#binding.buildHash,
       projectId: this.#binding.projectId,
@@ -837,7 +1013,17 @@ export class DenoAwarenessPeer {
       ...(lane === "control" && this.#diagnostics?.enabled
         ? { diagnostics: this.#diagnostics.envelope() }
         : {}),
-    };
+    } as const;
+    const envelope: AwarenessEnvelope<SidecarFrame> =
+      this.#binding.protocolRevision === "r2"
+        ? {
+            ...common,
+            protocolRevision: "r2",
+            schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+            launchNonce: this.#binding.launchNonce,
+            targetInstanceId: this.#hostInstanceId ?? this.#binding.launchNonce,
+          }
+        : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
     const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
     this.#publishedBytes += encodedBytes;
     if (lane === "data") {
@@ -1007,6 +1193,13 @@ export class DenoAwarenessPeer {
     const error = value instanceof Error
       ? value
       : new Error("Sidecar frame processing failed");
+    if (error.name === "V2ExecutionFenceError") {
+      // A fence that became stale between transport acceptance and execution
+      // must produce neither an ACK nor an in-band rejection. Draining forces
+      // a fresh, explicitly bound launch rather than migrating committed work.
+      this.#onAcceptError?.(error, frame);
+      return true;
+    }
     if (
       frame.kind === "request_open" ||
       frame.kind === "request_data" ||

@@ -1,8 +1,9 @@
 import {
   GP_V2_FRAME_MAX_BYTES,
   GP_V2_PROTOCOL,
+  GP_V2_R1_SCHEMA_VERSION,
+  GP_V2_R2_SCHEMA_VERSION,
   GP_V2_REQUEST_MAX_BYTES,
-  GP_V2_SCHEMA_VERSION,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
   base64UrlDecode,
@@ -11,11 +12,14 @@ import {
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
+  type ProtocolRevision,
   type ReliableFrame,
+  type R2RequestCommitFrame,
   type SidecarFrame,
 } from "./shared";
 import { parseDiagnosticObject, parseFirstEventDiagnostics, parseRequestAckDiagnostics, parseTerminalDiagnostics } from "../diagnostics/types";
 import { MAX_RATE_LIMIT_DELAY_MS, type RateLimitHint } from "../rate-limit";
+import { parseProviderErrorEnvelope } from "../provider-error";
 
 export type FrameDirection = "host" | "sidecar";
 
@@ -220,7 +224,10 @@ function frameBytes(value: unknown): number {
   return encoded.byteLength;
 }
 
-function parseHostFrame(raw: Record<string, unknown>): ReliableFrame<HostFrame> {
+function parseHostFrame(
+  raw: Record<string, unknown>,
+  protocolRevision: ProtocolRevision,
+): ReliableFrame<HostFrame> {
   const kind = raw.kind;
   const identity = frameIdentity(raw);
   switch (kind) {
@@ -256,9 +263,45 @@ function parseHostFrame(raw: Record<string, unknown>): ReliableFrame<HostFrame> 
         dataBase64Url: base64url(raw.dataBase64Url, "dataBase64Url"),
         ...identity,
       };
-    case "request_commit":
-      exactKeys(raw, ["kind", "requestId", "epoch", "sequence"], "request_commit frame");
-      return { kind, requestId: safeId(raw.requestId, "requestId"), ...identity };
+    case "request_commit": {
+      if (protocolRevision === "r1") {
+        exactKeys(raw, ["kind", "requestId", "epoch", "sequence"], "request_commit frame");
+        return { kind, requestId: safeId(raw.requestId, "requestId"), ...identity };
+      }
+      exactKeys(raw, [
+        "kind", "requestId", "protocolRevision", "schemaVersion", "projectId",
+        "sessionId", "leaderGeneration", "buildHash", "schemaHash", "launchNonce",
+        "hostInstanceId", "targetInstanceId", "requestDigest", "decodedBytes",
+        "encodedBytes", "encoding", "partCount", "epoch", "sequence",
+      ], "request_commit frame");
+      if (raw.protocolRevision !== "r2" || raw.schemaVersion !== GP_V2_R2_SCHEMA_VERSION) {
+        fail("request_commit protocol revision is invalid", "revision");
+      }
+      const encoding = raw.encoding;
+      if (encoding !== "identity" && encoding !== "gzip+base64") {
+        fail("request encoding is invalid", "encoding");
+      }
+      return {
+        kind,
+        requestId: safeId(raw.requestId, "requestId"),
+        protocolRevision: "r2",
+        schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+        projectId: project(raw.projectId),
+        sessionId: safeId(raw.sessionId, "sessionId"),
+        leaderGeneration: integer(raw.leaderGeneration, "leaderGeneration", 1),
+        buildHash: digest(raw.buildHash, "buildHash"),
+        schemaHash: digest(raw.schemaHash, "schemaHash"),
+        launchNonce: safeId(raw.launchNonce, "launchNonce"),
+        hostInstanceId: safeId(raw.hostInstanceId, "hostInstanceId"),
+        targetInstanceId: safeId(raw.targetInstanceId, "targetInstanceId"),
+        requestDigest: digest(raw.requestDigest, "requestDigest"),
+        decodedBytes: integer(raw.decodedBytes, "decodedBytes", 1, GP_V2_REQUEST_MAX_BYTES),
+        encodedBytes: integer(raw.encodedBytes, "encodedBytes", 1, GP_V2_REQUEST_MAX_BYTES),
+        encoding,
+        partCount: integer(raw.partCount, "partCount", 1, 65_536),
+        ...identity,
+      };
+    }
     case "request_cancel":
       exactKeys(raw, ["kind", "requestId", "reason", "epoch", "sequence"], "request_cancel frame");
       return {
@@ -302,10 +345,32 @@ function parseHostFrame(raw: Record<string, unknown>): ReliableFrame<HostFrame> 
   }
 }
 
-function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarFrame> {
+function parseSidecarFrame(
+  raw: Record<string, unknown>,
+  protocolRevision: ProtocolRevision,
+): ReliableFrame<SidecarFrame> {
   const kind = raw.kind;
   const identity = frameIdentity(raw);
   switch (kind) {
+    case "upstream_prelude":
+      if (protocolRevision !== "r2") {
+        fail("upstream_prelude is not part of R1", "revision");
+      }
+      exactKeys(raw, [
+        "kind", "requestId", "status", "contentType", "upstreamRequestId", "epoch", "sequence",
+      ], "upstream_prelude frame");
+      if (
+        raw.upstreamRequestId !== null &&
+        (typeof raw.upstreamRequestId !== "string" || raw.upstreamRequestId.length > 256)
+      ) fail("upstreamRequestId is invalid", "string");
+      return {
+        kind,
+        requestId: safeId(raw.requestId, "requestId"),
+        status: integer(raw.status, "status", 200, 299),
+        contentType: string(raw.contentType, "contentType", 256),
+        upstreamRequestId: raw.upstreamRequestId as string | null,
+        ...identity,
+      };
     case "request_ack":
       exactKeys(raw, [
         "kind", "requestId", "requestDigest", "committed", "epoch", "sequence",
@@ -397,9 +462,18 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
       exactKeys(raw, [
         "kind", "requestId", "code", "message", "ambiguous", "epoch", "sequence",
         ...(raw.rateLimit === undefined ? [] : ["rateLimit"]),
+        ...(protocolRevision === "r2" && raw.providerError !== undefined ? ["providerError"] : []),
       ], "response_error frame");
       if (typeof raw.ambiguous !== "boolean") fail("ambiguous must be boolean", "boolean");
       const rateLimit = parseRateLimitHint(raw.rateLimit);
+      const providerError = raw.providerError === undefined
+        ? null
+        : protocolRevision === "r2"
+          ? parseProviderErrorEnvelope(raw.providerError)
+          : null;
+      if (raw.providerError !== undefined && !providerError) {
+        fail("providerError is invalid", "provider_error");
+      }
       return {
         kind,
         requestId: safeId(raw.requestId, "requestId"),
@@ -407,6 +481,7 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
         message: string(raw.message, "error message", 512),
         ambiguous: raw.ambiguous,
         ...(rateLimit ? { rateLimit } : {}),
+        ...(providerError ? { providerError } : {}),
         ...identity,
       };
     case "request_cancelled":
@@ -434,18 +509,23 @@ function parseSidecarFrame(raw: Record<string, unknown>): ReliableFrame<SidecarF
 export function parseFrame(
   value: unknown,
   direction: "host",
+  protocolRevision: ProtocolRevision,
 ): ReliableFrame<HostFrame>;
 export function parseFrame(
   value: unknown,
   direction: "sidecar",
+  protocolRevision: ProtocolRevision,
 ): ReliableFrame<SidecarFrame>;
 export function parseFrame(
   value: unknown,
   direction: FrameDirection,
+  protocolRevision: ProtocolRevision,
 ): ReliableFrame<HostFrame> | ReliableFrame<SidecarFrame> {
   frameBytes(value);
   const raw = object(value, "frame");
-  return direction === "host" ? parseHostFrame(raw) : parseSidecarFrame(raw);
+  return direction === "host"
+    ? parseHostFrame(raw, protocolRevision)
+    : parseSidecarFrame(raw, protocolRevision);
 }
 
 export function parseAwarenessEnvelope(
@@ -464,16 +544,31 @@ export function parseAwarenessEnvelope(
   direction: FrameDirection,
 ): AwarenessEnvelope<HostFrame | SidecarFrame> {
   const raw = object(value, "Awareness envelope");
+  const r2 = expected.protocolRevision === "r2";
   exactKeys(raw, [
-    "protocol", "schemaVersion", "schemaHash", "buildHash", "projectId", "sessionId",
-    "peerId", "instanceId", "leaderGeneration", "epoch", "ack", "credits", "active",
+    "protocol",
+    ...(r2 ? ["protocolRevision"] : []),
+    "schemaVersion", "schemaHash", "buildHash", "projectId", "sessionId",
+    "peerId", "instanceId",
+    ...(r2 ? ["targetInstanceId", "launchNonce"] : []),
+    "leaderGeneration", "epoch", "ack", "credits", "active",
     "revision", "queued", "draining", "frames",
     ...(raw.lane === undefined ? [] : ["lane"]),
     ...(raw.liveness === undefined ? [] : ["liveness"]),
     ...(raw.diagnostics === undefined ? [] : ["diagnostics"]),
   ], "Awareness envelope");
   if (raw.protocol !== GP_V2_PROTOCOL) fail("Awareness protocol is invalid", "protocol");
-  if (raw.schemaVersion !== GP_V2_SCHEMA_VERSION) fail("Awareness schema version is invalid", "schema");
+  if (r2) {
+    if (
+      raw.protocolRevision !== "r2" ||
+      raw.schemaVersion !== GP_V2_R2_SCHEMA_VERSION
+    ) fail("Awareness protocol revision is invalid", "revision");
+    if (safeId(raw.launchNonce, "launchNonce") !== expected.launchNonce) {
+      fail("Awareness launch binding mismatch", "binding");
+    }
+  } else if (raw.schemaVersion !== GP_V2_R1_SCHEMA_VERSION) {
+    fail("Awareness schema version is invalid", "schema");
+  }
   if (project(raw.projectId) !== expected.projectId) fail("Awareness project binding mismatch", "binding");
   if (safeId(raw.sessionId, "sessionId") !== expected.sessionId) fail("Awareness session binding mismatch", "binding");
   if (digest(raw.schemaHash, "schemaHash") !== expected.schemaHash) fail("Awareness schema binding mismatch", "binding");
@@ -498,8 +593,8 @@ export function parseAwarenessEnvelope(
     encodedBytes += frameBytes(frame);
     const frameObject = object(frame, "frame");
     const parsed = direction === "host"
-      ? parseHostFrame(frameObject)
-      : parseSidecarFrame(frameObject);
+      ? parseHostFrame(frameObject, expected.protocolRevision)
+      : parseSidecarFrame(frameObject, expected.protocolRevision);
     if (parsed.epoch !== epoch) fail("Frame epoch differs from envelope epoch", "epoch");
     if (parsed.sequence <= previousSequence) fail("Frame sequences must be strictly increasing", "sequence");
     previousSequence = parsed.sequence;
@@ -525,15 +620,63 @@ export function parseAwarenessEnvelope(
     liveness = parseLiveness(raw.liveness, direction);
   }
   const diagnostics = parseDiagnosticObject(raw.diagnostics);
+  const peerId = safeId(raw.peerId, "peerId");
+  const instanceId = safeId(raw.instanceId, "instanceId");
+  if (r2) {
+    const targetInstanceId = safeId(raw.targetInstanceId, "targetInstanceId");
+    if (direction === "host") {
+      for (const frame of frames) {
+        if (frame.kind !== "request_commit") continue;
+        const commit = frame as ReliableFrame<R2RequestCommitFrame>;
+        if (
+          commit.protocolRevision !== "r2" ||
+          commit.schemaVersion !== GP_V2_R2_SCHEMA_VERSION ||
+          commit.projectId !== expected.projectId ||
+          commit.sessionId !== expected.sessionId ||
+          commit.leaderGeneration !== expected.leaderGeneration ||
+          commit.buildHash !== expected.buildHash ||
+          commit.schemaHash !== expected.schemaHash ||
+          commit.launchNonce !== expected.launchNonce ||
+          commit.hostInstanceId !== instanceId ||
+          commit.targetInstanceId !== targetInstanceId
+        ) fail("request_commit fence does not match its envelope", "commitment");
+      }
+    }
+    return {
+      protocol: GP_V2_PROTOCOL,
+      protocolRevision: "r2",
+      schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+      schemaHash: expected.schemaHash,
+      buildHash: expected.buildHash,
+      projectId: expected.projectId,
+      sessionId: expected.sessionId,
+      peerId,
+      instanceId,
+      targetInstanceId,
+      launchNonce: expected.launchNonce,
+      leaderGeneration,
+      epoch,
+      revision,
+      ack,
+      credits: integer(raw.credits, "credits"),
+      active: integer(raw.active, "active"),
+      queued: integer(raw.queued, "queued"),
+      draining: raw.draining,
+      frames: Object.freeze(frames),
+      ...(lane ? { lane } : {}),
+      ...(liveness ? { liveness } : {}),
+      ...(diagnostics ? { diagnostics } : {}),
+    };
+  }
   return {
     protocol: GP_V2_PROTOCOL,
-    schemaVersion: GP_V2_SCHEMA_VERSION,
+    schemaVersion: GP_V2_R1_SCHEMA_VERSION,
     schemaHash: expected.schemaHash,
     buildHash: expected.buildHash,
     projectId: expected.projectId,
     sessionId: expected.sessionId,
-    peerId: safeId(raw.peerId, "peerId"),
-    instanceId: safeId(raw.instanceId, "instanceId"),
+    peerId,
+    instanceId,
     leaderGeneration,
     epoch,
     revision,

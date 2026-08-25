@@ -6,10 +6,48 @@ import {
   type JournalRecord,
   type JournalStorage,
 } from "../src/v2/sidecar/journal";
+import {
+  PROVIDER_ERROR_PAYLOAD_MAX_BYTES,
+  type ProviderErrorEnvelope,
+} from "../src/v2/provider-error";
 import { DenoJournalStorage } from "../sandbox/v2/journal-storage";
 
 const REQUEST = "req-journal-1";
 const DIGEST = "a".repeat(64);
+
+function providerErrorEnvelope(): ProviderErrorEnvelope {
+  return {
+    version: 1,
+    origin: "http",
+    status: 429,
+    error: {
+      message: "Rate limit reached for gpt-5.6-sol",
+      type: "rate_limit_error",
+      param: null,
+      code: "rate_limit_exceeded",
+    },
+    headers: {
+      "retry-after": "0.914",
+      "x-ratelimit-limit-tokens": "40000000",
+      "x-ratelimit-remaining-tokens": "0",
+    },
+    upstreamRequestId: "req_upstream_1",
+    model: "gpt-5.6-sol",
+    organizationFingerprint: "b".repeat(64),
+    payload: {
+      format: "json",
+      text: JSON.stringify({
+        error: {
+          message: "Rate limit reached for gpt-5.6-sol",
+          type: "rate_limit_error",
+          param: null,
+          code: "rate_limit_exceeded",
+        },
+      }),
+      truncated: false,
+    },
+  };
+}
 
 class ManualClock implements Clock {
   value = 1_000;
@@ -297,6 +335,7 @@ describe("ClaimJournal", () => {
     const clock = new ManualClock();
     const storage = new FakeJournalStorage();
     const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    const providerError = providerErrorEnvelope();
     await settle(clock, journal.claim({
       requestId: REQUEST,
       requestDigest: DIGEST,
@@ -308,7 +347,9 @@ describe("ClaimJournal", () => {
       code: "rate_limit_exceeded",
       message: "Rate limit reached in organization org-test; authorization=secret-canary",
       rateLimit: { retryAfterMs: 914, limitTokens: 40_000_000, remainingTokens: 0 },
+      providerError,
     }));
+    providerError.payload.text = "caller-mutated-after-durable-mark";
 
     const restarted = new ClaimJournal({
       storage,
@@ -327,6 +368,7 @@ describe("ClaimJournal", () => {
         code: "rate_limit_exceeded",
         message: "Rate limit reached in organization org-test; authorization=[REDACTED]",
         rateLimit: { retryAfterMs: 914, limitTokens: 40_000_000, remainingTokens: 0 },
+        providerError: providerErrorEnvelope(),
       },
     }]);
     expect((await restarted.readRecoveredOutcome(REQUEST))?.outcome.kind).toBe("provider_error");
@@ -348,18 +390,134 @@ describe("ClaimJournal", () => {
     }));
     await settle(clock, journal.markFetchStarting(REQUEST));
     storage.appendAfterPersistFailures = 1;
+    const providerError = providerErrorEnvelope();
     await expect(settle(clock, journal.markProviderError(REQUEST, {
       status: 429,
       code: "rate_limit_exceeded",
       message: "Rate limit reached for org-test",
       rateLimit: { retryAfterMs: 136 },
+      providerError,
     }))).rejects.toMatchObject({ code: "storage" });
 
     const restarted = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
     const recovered = await restarted.recover();
     expect(recovered.providerErrors).toHaveLength(1);
     expect(recovered.providerErrors[0]?.error.code).toBe("rate_limit_exceeded");
+    expect(recovered.providerErrors[0]?.error.providerError).toEqual(providerError);
     expect(recovered.ambiguous).toEqual([]);
+  });
+
+  it("preserves a bounded provider envelope through exclusive compaction and restart", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await settle(clock, journal.markFetchStarting(REQUEST));
+    const providerError = providerErrorEnvelope();
+    await settle(clock, journal.markProviderError(REQUEST, {
+      status: 429,
+      code: "rate_limit_exceeded",
+      message: "Rate limit reached for org-test",
+      rateLimit: { retryAfterMs: 914, limitTokens: 40_000_000, remainingTokens: 0 },
+      providerError,
+    }));
+
+    expect(storage.replacements).toBeGreaterThan(0);
+    const persisted = storage.records.find(value => value.state === "provider_error");
+    expect(persisted?.outcome?.kind).toBe("provider_error");
+    if (persisted?.outcome?.kind === "provider_error") {
+      expect(persisted.outcome.error.providerError).toEqual(providerError);
+    }
+
+    const restarted = new ClaimJournal({
+      storage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      compactAfterRecords: 1,
+      withExclusiveOwnership: async operation => operation(),
+    });
+    expect((await restarted.recover()).providerErrors).toEqual([{
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+      error: {
+        status: 429,
+        code: "rate_limit_exceeded",
+        message: "Rate limit reached for org-test",
+        rateLimit: { retryAfterMs: 914, limitTokens: 40_000_000, remainingTokens: 0 },
+        providerError,
+      },
+    }]);
+  });
+
+  it("fails closed for invalid or oversized provider envelopes at append and recovery", async () => {
+    const clock = new ManualClock();
+    const storage = new FakeJournalStorage();
+    const journal = new ClaimJournal({ storage, clock, flushIntervalMs: 2, maxBatch: 64 });
+    await settle(clock, journal.claim({
+      requestId: REQUEST,
+      requestDigest: DIGEST,
+      leaderGeneration: 3,
+    }));
+    await settle(clock, journal.markFetchStarting(REQUEST));
+    const invalid = {
+      ...providerErrorEnvelope(),
+      unexpected: true,
+    } as unknown as ProviderErrorEnvelope;
+    await expect(journal.markProviderError(REQUEST, {
+      status: 429,
+      code: "rate_limit_exceeded",
+      message: "Rate limit reached for org-test",
+      providerError: invalid,
+    })).rejects.toMatchObject({ code: "transition" });
+
+    const oversized = providerErrorEnvelope();
+    oversized.payload.text = "x".repeat(PROVIDER_ERROR_PAYLOAD_MAX_BYTES + 1);
+    await expect(journal.markProviderError(REQUEST, {
+      status: 429,
+      code: "rate_limit_exceeded",
+      message: "Rate limit reached for org-test",
+      rateLimit: { retryAfterMs: 914 },
+      providerError: oversized,
+    })).rejects.toMatchObject({ code: "transition" });
+    expect(journal.status(REQUEST)).toBe("fetch_starting");
+    expect(storage.records).toHaveLength(2);
+
+    const corruptStorage = new FakeJournalStorage([
+      record(1, "claimed"),
+      record(2, "fetch_starting"),
+      record(3, "provider_error", {
+        outcome: {
+          kind: "provider_error",
+          error: {
+            status: 429,
+            code: "rate_limit_exceeded",
+            message: "Rate limit reached for org-test",
+            rateLimit: { retryAfterMs: 914 },
+            providerError: oversized,
+          },
+        },
+      }),
+    ]);
+    const restarted = new ClaimJournal({
+      storage: corruptStorage,
+      clock,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+    });
+    await expect(restarted.recover()).rejects.toMatchObject({ code: "corrupt" });
   });
 
   it("keeps client cancellation and forced ambiguity distinct across restart", async () => {

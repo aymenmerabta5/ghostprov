@@ -104,13 +104,15 @@ describe("V2 sidecar assets", () => {
 
   it("fails closed on unsupported or mismatched revision selection", async () => {
     expect(resolveV2SidecarRevision()).toBe("r1");
-    expect(() => resolveV2SidecarRevision("r2")).toThrow(/unsupported.*r2/i);
-    await expect(loadV2SidecarAssets({ revision: "r2" })).rejects.toThrow(/unsupported.*r2/i);
+    expect(resolveV2SidecarRevision("r2")).toBe("r2");
+    expect(() => resolveV2SidecarRevision("r3")).toThrow(/unsupported.*r3/i);
+    await expect(loadV2SidecarAssets({ revision: "r2" }))
+      .rejects.toThrow(/no frozen.*r2/i);
 
     const assets = await loadV2SidecarAssets({ revision: "r1" });
     await expect(assertV2SidecarAssets({
       ...assets,
-      revision: "r2" as never,
+      revision: "r2",
     }, "r1")).rejects.toThrow(/revision mismatch/i);
   });
 });

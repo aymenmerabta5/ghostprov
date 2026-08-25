@@ -63,7 +63,7 @@ export class SidecarCredentialRotator {
     } catch {
       throw new SidecarCredentialRotationError("Credential rotation is malformed", "crypto");
     }
-    const expectedBinding: CredentialRotationBinding = {
+    const baseBinding = {
       projectId: this.#binding.projectId,
       sandboxSessionId: this.#binding.sessionId,
       leaderGeneration: this.#binding.leaderGeneration,
@@ -72,6 +72,15 @@ export class SidecarCredentialRotator {
       instanceId: this.#instanceId,
       rotationId,
     };
+    const expectedBinding: CredentialRotationBinding =
+      this.#binding.protocolRevision === "r2"
+        ? {
+            ...baseBinding,
+            protocolRevision: "r2",
+            schemaVersion: 2,
+            launchNonce: this.#binding.launchNonce,
+          }
+        : baseBinding;
     try {
       const next = await openCredentialRotation({
         rotationKey: this.#credential.rotationKey,

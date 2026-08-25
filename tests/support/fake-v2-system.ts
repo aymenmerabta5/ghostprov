@@ -304,6 +304,8 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
     this.#physical = options.physical;
     this.#network = new FakeAwarenessNetwork(options.faults);
     const binding: ProtocolBinding = {
+  protocolRevision: "r1",
+  launchNonce: "launch-nonce-r1",
       projectId: this.projectId,
       sessionId: `sandbox-session-${options.index}`,
       leaderGeneration: 1,

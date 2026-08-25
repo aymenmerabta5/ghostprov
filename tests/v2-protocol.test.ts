@@ -22,6 +22,8 @@ import {
 
 const PROJECT = "e631d12c-d917-4434-b360-41b4715d6679";
 const BINDING: ProtocolBinding = {
+  protocolRevision: "r1",
+  launchNonce: "launch-nonce-r1",
   projectId: PROJECT,
   sessionId: "session-1",
   leaderGeneration: 7,
@@ -66,8 +68,8 @@ describe("V2 shared protocol", () => {
     expect(GP_V2_WINDOW_MAX_FRAMES).toBe(128);
     expect(GP_V2_WINDOW_MAX_BYTES).toBe(512 * 1024);
     expect(GP_V2_REQUEST_MAX_BYTES).toBe(64 * 1024 * 1024);
-    expect(await protocolSchemaHash()).toMatch(/^[a-f0-9]{64}$/);
-    expect(await protocolSchemaHash()).toBe(await protocolSchemaHash());
+    expect(await protocolSchemaHash("r1")).toMatch(/^[a-f0-9]{64}$/);
+    expect(await protocolSchemaHash("r1")).toBe(await protocolSchemaHash("r1"));
     expect(canonicalJson(GP_V2_SCHEMA_DESCRIPTOR)).toContain(
       '"response_event":["requestId","eventIndex","event","partIndex","partCount","offset","dataBase64Url","diagnostics?"]',
     );
@@ -176,7 +178,7 @@ describe("V2 shared protocol", () => {
       epoch: 3,
       sequence: 0,
     };
-    expect(() => parseFrame(oversized, "host")).toThrow("frame exceeds");
+    expect(() => parseFrame(oversized, "host", "r1")).toThrow("frame exceeds");
 
     const tooMany = {
       ...validEnvelope(),
@@ -195,9 +197,9 @@ describe("V2 shared protocol", () => {
       epoch: 3,
       sequence: 0,
     } as const;
-    expect(parseFrame(frame, "host")).toEqual(frame);
-    expect(() => parseFrame({ ...frame, dataBase64Url: "not+url/base64" }, "host")).toThrow("base64url");
-    expect(() => parseFrame({ ...frame, extra: 1 }, "host")).toThrow("unknown field");
+    expect(parseFrame(frame, "host", "r1")).toEqual(frame);
+    expect(() => parseFrame({ ...frame, dataBase64Url: "not+url/base64" }, "host", "r1")).toThrow("base64url");
+    expect(() => parseFrame({ ...frame, extra: 1 }, "host", "r1")).toThrow("unknown field");
   });
 
   it("accepts only a bound reliable cancellation-complete frame from the sidecar", () => {
@@ -207,8 +209,8 @@ describe("V2 shared protocol", () => {
       epoch: 3,
       sequence: 0,
     } as const;
-    expect(parseFrame(frame, "sidecar")).toEqual(frame);
-    expect(() => parseFrame({ ...frame, unexpected: true }, "sidecar"))
+    expect(parseFrame(frame, "sidecar", "r1")).toEqual(frame);
+    expect(() => parseFrame({ ...frame, unexpected: true }, "sidecar", "r1"))
       .toThrow("unknown field");
   });
 

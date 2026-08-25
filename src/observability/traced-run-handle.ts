@@ -106,6 +106,8 @@ export function traceRunHandle(
       }
     },
     final,
+    get rateLimit() { return handle.rateLimit; },
+    get upstreamPrelude() { return handle.upstreamPrelude; },
     stats: handle.stats,
   };
 }

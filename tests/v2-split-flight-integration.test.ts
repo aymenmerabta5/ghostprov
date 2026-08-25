@@ -25,6 +25,8 @@ import { V2TransportSession } from "../src/v2/transport/session";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
+  protocolRevision: "r1",
+  launchNonce: "launch-nonce-r1",
   projectId: PROJECT,
   sessionId: "sandbox-session-1",
   leaderGeneration: 4,
