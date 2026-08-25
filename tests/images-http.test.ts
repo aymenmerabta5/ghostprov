@@ -119,7 +119,7 @@ describe("Images compatibility HTTP routes", () => {
     expect(calls).toBe(0);
   });
 
-  it("normalizes structured upstream failures", async () => {
+  it("does not revive legacy daemon envelopes for unknown relay failures", async () => {
     const details = {
       code: "http_400",
       message: JSON.stringify({ error: {
@@ -140,11 +140,13 @@ describe("Images compatibility HTTP routes", () => {
       body: JSON.stringify({ prompt: "blocked" }),
     });
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ error: {
-      code: "content_policy_violation",
-      param: "prompt",
+    expect(response.status).toBe(502);
+    const output = await response.json();
+    expect(output).toMatchObject({ error: {
+      type: "upstream_error",
+      code: "upstream_error",
     }});
+    expect(JSON.stringify(output)).not.toContain("content_policy_violation");
   });
 
   it("rejects malformed JSON with the standard error shape", async () => {

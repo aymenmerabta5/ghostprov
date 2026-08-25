@@ -20,11 +20,18 @@ import {
   type ReliableFrame,
   type SidecarFrame,
 } from "../protocol/shared";
-import type { V2SidecarAssets } from "../sidecar/assets";
+import {
+  assertV2SidecarAssets,
+  DEFAULT_V2_SIDECAR_REVISION,
+  resolveV2SidecarRevision,
+  type V2SidecarAssets,
+  type V2SidecarRevision,
+} from "../sidecar/assets";
 
 const STATIC_PATH = ".ghostprov-v2/static.json";
 const WORKER_PATH = ".ghostprov-v2/worker.json";
 const CIPHERTEXT_PATH = ".ghostprov-v2/bootstrap.enc.json";
+const REVISION_PATH = ".ghostprov-v2/revision.json";
 const LAUNCHER_PATH = ".latexmkrc";
 const MAIN_PATH = "main.tex";
 const HELLO_PREFIX = "GPV2_BOOTSTRAP ";
@@ -108,6 +115,8 @@ export interface V2BootstrapControllerOptions {
   gateway: V2BootstrapGateway;
   awareness: V2BootstrapAwareness;
   assets: V2SidecarAssets;
+  /** Selected immutable V2 revision. Omission explicitly means the frozen R1 default. */
+  revision?: V2SidecarRevision | string;
   attempts?: number;
   timeoutMs?: number;
   pollMs?: number;
@@ -139,7 +148,8 @@ function exactKeys(
     actual.every((key, index) => key === sorted[index]);
 }
 
-function temporaryLauncher(): string {
+function temporaryLauncher(entrypointPath: string): string {
+  const workspaceEntrypoint = `/workspace/${entrypointPath}`;
   return [
     "# GhostProv V2 temporary bootstrap launcher",
     "$pdf_mode = 1;",
@@ -163,7 +173,7 @@ function temporaryLauncher(): string {
     "  if ($gp_pid == 0) {",
     "    open STDOUT, '>', $gp_log or die 'stdout';",
     "    open STDERR, '>&STDOUT' or die 'stderr';",
-    "    exec 'setsid', $gp_deno, 'run', '--cached-only', \"--cert=$ENV{PROXY_CA_CERT_PATH}\", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '/workspace/.ghostprov-v2/sidecar.bundle.js';",
+    `    exec 'setsid', $gp_deno, 'run', '--cached-only', "--cert=$ENV{PROXY_CA_CERT_PATH}", '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM', '--allow-net', '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2', '--allow-write=/tmp/ghostprov-v2', '${workspaceEntrypoint}';`,
     "    exit 127;",
     "  }",
     "}",
@@ -379,6 +389,7 @@ export class V2BootstrapController {
   readonly #gateway: V2BootstrapGateway;
   readonly #awareness: V2BootstrapAwareness;
   readonly #assets: V2SidecarAssets;
+  readonly #selectedRevision: V2SidecarRevision;
   readonly #attempts: number;
   readonly #timeoutMs: number;
   readonly #pollMs: number;
@@ -395,7 +406,7 @@ export class V2BootstrapController {
   #readyBinding: BootstrapBinding | null = null;
   #rotationKey: string | null = null;
   #ensuring: Promise<V2ReadyDescriptor> | null = null;
-  #revision = 0;
+  #awarenessRevision = 0;
   #hostSequence = 0;
   #sidecarAck = { epoch: 1, sequence: -1 };
 
@@ -466,6 +477,9 @@ export class V2BootstrapController {
     this.#gateway = options.gateway;
     this.#awareness = options.awareness;
     this.#assets = options.assets;
+    this.#selectedRevision = resolveV2SidecarRevision(
+      options.revision ?? DEFAULT_V2_SIDECAR_REVISION,
+    );
     this.#attempts = attempts;
     this.#timeoutMs = timeoutMs;
     this.#pollMs = pollMs;
@@ -650,13 +664,47 @@ export class V2BootstrapController {
   }
 
   async #deployAssets(): Promise<void> {
+    await assertV2SidecarAssets(this.#assets, this.#selectedRevision);
     for (const obsoletePath of this.#assets.obsoletePaths) {
       await this.#ydoc.tombstonePath(obsoletePath);
     }
-    for (const asset of this.#assets.files) {
-      if (await this.#ydoc.readPath(asset.path) !== asset.content) {
+    for (const asset of [...this.#assets.files, this.#assets.manifest]) {
+      const existing = await this.#ydoc.readPath(asset.path);
+      if (existing === null) {
         await this.#ydoc.writePath(asset.path, asset.content);
+      } else if (existing !== asset.content) {
+        throw new V2BootstrapError(
+          `Immutable V2 sidecar asset collision: ${asset.path}`,
+          "deploy",
+          1,
+        );
       }
+      if (await this.#ydoc.readPath(asset.path) !== asset.content) {
+        throw new V2BootstrapError(
+          `V2 sidecar asset did not persist exactly: ${asset.path}`,
+          "deploy",
+          1,
+        );
+      }
+    }
+    const selectedRevision = canonicalJson({
+      protocol: "gp-awareness-v2",
+      version: 1,
+      revision: this.#selectedRevision,
+      buildHash: this.#assets.buildHash,
+      schemaHash: this.#assets.schemaHash,
+      manifestPath: this.#assets.manifest.path,
+      entrypointPath: this.#assets.entrypointPath,
+    });
+    if (await this.#ydoc.readPath(REVISION_PATH) !== selectedRevision) {
+      await this.#ydoc.writePath(REVISION_PATH, selectedRevision);
+    }
+    if (await this.#ydoc.readPath(REVISION_PATH) !== selectedRevision) {
+      throw new V2BootstrapError(
+        "Selected V2 sidecar revision did not persist exactly",
+        "deploy",
+        1,
+      );
     }
     const existingMarker = await this.#ydoc.readPath(WORKER_PATH);
     if (existingMarker === null) {
@@ -700,7 +748,7 @@ export class V2BootstrapController {
         diagnostics: this.#diagnostics,
         batching: this.#batching,
       }));
-      await this.#ydoc.writePath(LAUNCHER_PATH, temporaryLauncher());
+      await this.#ydoc.writePath(LAUNCHER_PATH, temporaryLauncher(this.#assets.entrypointPath));
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
       throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
@@ -871,7 +919,7 @@ export class V2BootstrapController {
       instanceId: `host-${binding.nonce}`,
       leaderGeneration: binding.leaderGeneration,
       epoch: 1,
-      revision: this.#revision++,
+      revision: this.#awarenessRevision++,
       ack: this.#sidecarAck,
       credits: 0,
       active: 0,

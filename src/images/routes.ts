@@ -8,10 +8,31 @@ import {
   type ImageCompatOptions,
 } from "./compat";
 import { executeImageBatch, type ImageRelayStarter } from "./service";
+import type { IncomingResourceLease } from "../router/router";
+import { takeIncomingBodyLease } from "../http/request-lease";
 
 export interface ImageRouteDependencies {
   options: ImageCompatOptions;
-  startRelay: ImageRelayStarter;
+  startRelay: (
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    incomingLease?: IncomingResourceLease,
+  ) => ReturnType<ImageRelayStarter>;
+}
+
+function relayStarterForRequest(
+  dependencies: ImageRouteDependencies,
+  env: unknown,
+): ImageRelayStarter {
+  let incomingLease = takeIncomingBodyLease(env);
+  return (body, signal) => {
+    // Promise.all invokes each mapper synchronously up to this call. Clearing
+    // before dispatch makes exactly one fan-out job the handoff owner even
+    // when all relay promises are pending concurrently.
+    const handoff = incomingLease;
+    incomingLease = undefined;
+    return dependencies.startRelay(body, signal, handoff);
+  };
 }
 
 function invalidBody(message: string, code: string): ApiError {
@@ -39,9 +60,10 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
         throw invalidBody("Request body is not valid JSON.", "invalid_json");
       }
       const parsed = parseGenerationRequest(value, dependencies.options);
+      const bodies = buildGenerationBodies(parsed);
       const response = await executeImageBatch(
-        buildGenerationBodies(parsed),
-        dependencies.startRelay,
+        bodies,
+        relayStarterForRequest(dependencies, c.env),
         c.req.raw.signal,
       );
       return c.json(response);
@@ -59,9 +81,10 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
         throw invalidBody("Request body is not valid multipart form data.", "invalid_multipart_form");
       }
       const parsed = await parseEditRequest(form, dependencies.options);
+      const bodies = buildEditBodies(parsed);
       const response = await executeImageBatch(
-        buildEditBodies(parsed),
-        dependencies.startRelay,
+        bodies,
+        relayStarterForRequest(dependencies, c.env),
         c.req.raw.signal,
       );
       return c.json(response);

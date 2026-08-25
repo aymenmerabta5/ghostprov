@@ -6,11 +6,7 @@ import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
 import type { MachineSample } from "../src/core/ports";
 import { ProjectFleetManager } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
-import type {
-  ManagedProjectInspection,
-  ManagedProjectInspector,
-  ManagedRuntimeFactory,
-} from "../src/fleet/types";
+import type { ManagedRuntimeFactory } from "../src/fleet/types";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
   SandboxRegistry,
@@ -23,7 +19,6 @@ import type { PrismProjectSummary } from "../src/prism/projects-client";
 const A = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const B = projectId("69288e8b-c183-45f3-9131-d64b05b98928");
 const C = projectId("11111111-1111-4111-8111-111111111111");
-const D = projectId("22222222-2222-4222-8222-222222222222");
 const FINGERPRINT = "a".repeat(64);
 const roots: string[] = [];
 
@@ -47,10 +42,18 @@ function project(id: ProjectId, title = `GhostProv Worker ${id === A ? 1 : id ==
 class FakeProjects {
   readonly created: Array<{ projectId: ProjectId; title: string }> = [];
   readonly deleted: ProjectId[] = [];
+  readonly getCalls: ProjectId[] = [];
 
   constructor(readonly remote: PrismProjectSummary[]) {}
 
   async list(): Promise<readonly PrismProjectSummary[]> { return [...this.remote]; }
+
+  async get(id: ProjectId): Promise<PrismProjectSummary> {
+    this.getCalls.push(id);
+    const found = this.remote.find(value => value.projectId === id && !value.deleted);
+    if (!found) throw new Error(`missing project ${id}`);
+    return found;
+  }
 
   async create(input: { projectId: ProjectId; title: string }): Promise<PrismProjectSummary> {
     this.created.push(input);
@@ -60,14 +63,6 @@ class FakeProjects {
   }
 
   async deleteManaged(id: ProjectId): Promise<void> { this.deleted.push(id); }
-}
-
-class FakeInspector implements ManagedProjectInspector {
-  constructor(readonly values = new Map<ProjectId, ManagedProjectInspection>()) {}
-
-  async inspect(id: ProjectId): Promise<ManagedProjectInspection> {
-    return this.values.get(id) ?? { writable: false, empty: false, marker: null };
-  }
 }
 
 class FakeRuntime implements RoutableSandboxRuntime {
@@ -135,19 +130,16 @@ async function state(): Promise<{ root: string; cookieFile: string; manifest: Fl
 }
 
 function config(cookieFile: string, input: {
-  desired: number;
-  explicit?: readonly ProjectId[];
+  explicit: readonly ProjectId[];
   sessionMode?: "authenticated" | "auto" | "anonymous";
   guestMax?: number;
 }) {
+  const explicit = input.explicit;
   return resolveMultiSandboxConfig({
     PRISM_COOKIE_FILE: cookieFile,
-    PRISM_PROJECT_IDS: input.explicit?.join(","),
-    GP_TRANSPORT: "v2",
+    PRISM_PROJECT_IDS: explicit.join(","),
     GP_PRISM_SESSION: input.sessionMode ?? "authenticated",
     GP_ALLOW_ANONYMOUS: input.sessionMode === "auto" ? "1" : "0",
-    GP_AUTO_CREATE_PROJECTS: "1",
-    GP_TARGET_SANDBOXES: String(input.desired),
     GP_GUEST_MAX_PROJECTS: String(input.guestMax ?? 4),
     GP_MAX_PROJECTS: "8",
     GP_PROVISION_CONCURRENCY: "2",
@@ -159,15 +151,12 @@ function manager(input: {
   config: ReturnType<typeof config>;
   manifest: FleetManifestStore;
   projects: FakeProjects;
-  inspector?: FakeInspector;
   registry?: SandboxRegistry;
   factory?: FakeFactory;
   identityKind?: "authenticated" | "anonymous";
-  randomIds?: ProjectId[];
 }) {
   const factory = input.factory ?? new FakeFactory();
   const registry = input.registry ?? new SandboxRegistry();
-  const ids = [...(input.randomIds ?? [D])];
   return {
     factory,
     registry,
@@ -175,17 +164,32 @@ function manager(input: {
       config: input.config,
       identity: { kind: input.identityKind ?? "authenticated", fingerprint: FINGERPRINT },
       projects: input.projects,
-      inspector: input.inspector ?? new FakeInspector(),
       manifest: input.manifest,
       registry,
       runtimeFactory: factory,
-      random: { next: () => 0.5, uuid: () => ids.shift() ?? D },
     }),
   };
 }
 
 describe("ProjectFleetManager", () => {
-  it("reuses explicit, manifest, and marked projects before creating the exact deficit", async () => {
+  it("fails an unavailable explicit project before provisioning or project creation", async () => {
+    const files = await state();
+    const projects = new FakeProjects([project(B, "Unlisted project")]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects,
+    });
+
+    await expect(harness.value.reconcile()).rejects.toMatchObject({
+      kind: "explicit_project_missing",
+    });
+    expect(harness.factory.created).toEqual([]);
+    expect(projects.created).toEqual([]);
+    expect(harness.registry.runtimes()).toEqual([]);
+  });
+
+  it("routes only exact configured projects and ignores unlisted manifest workers", async () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
     await files.manifest.reserveWorker({ index: 2, projectId: B, title: "GhostProv Worker 2", nowMs: 1 });
@@ -195,25 +199,21 @@ describe("ProjectFleetManager", () => {
       project(B, "GhostProv Worker 2"),
       project(C, "GhostProv Worker 3"),
     ]);
-    const inspector = new FakeInspector(new Map([
-      [C, { writable: true, empty: false, marker: { protocol: "gp-awareness-v2", workerIndex: 3 } }],
-    ]));
     const harness = manager({
-      config: config(files.cookieFile, { desired: 4, explicit: [A] }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
       projects,
-      inspector,
-      randomIds: [D],
     });
 
     const snapshot = await harness.value.reconcile();
 
-    expect(snapshot.projects).toEqual([A, B, C, D]);
-    expect(projects.created).toEqual([{ projectId: D, title: "GhostProv Worker 4" }]);
-    expect(harness.registry.runtimes()).toHaveLength(4);
+    expect(snapshot.projects).toEqual([A]);
+    expect(projects.created).toEqual([]);
+    expect(harness.registry.runtimes()).toHaveLength(1);
     const records = (await files.manifest.load()).workers;
     expect(records.find(worker => worker.projectId === A)?.managed).toBe(false);
-    expect(records.filter(worker => worker.projectId !== A).every(worker => worker.managed)).toBe(true);
+    expect(harness.factory.created.map(value => value.projectId)).toEqual([A]);
+    expect(projects.getCalls).toEqual([A]);
   });
 
   it("is restart-idempotent after a persisted creating intent", async () => {
@@ -222,7 +222,7 @@ describe("ProjectFleetManager", () => {
     await files.manifest.reserveWorker({ index: 1, projectId: A, title: "GhostProv Worker 1", nowMs: 1 });
     const projects = new FakeProjects([project(A, "GhostProv Worker 1")]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 1 }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
       projects,
     });
@@ -233,7 +233,7 @@ describe("ProjectFleetManager", () => {
     expect((await files.manifest.load()).workers[0].state).toBe("ready");
   });
 
-  it("does not reuse a non-managed explicit project after it leaves the allowlist", async () => {
+  it("does not reuse a manifest project after it leaves the allowlist", async () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
     await files.manifest.reserveWorker({
@@ -244,18 +244,20 @@ describe("ProjectFleetManager", () => {
       managed: false,
     });
     await files.manifest.markCreated(A, 2);
-    const projects = new FakeProjects([project(A, "User explicit project")]);
+    const projects = new FakeProjects([
+      project(A, "User explicit project"),
+      project(B, "Replacement explicit project"),
+    ]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 1 }),
+      config: config(files.cookieFile, { explicit: [B] }),
       manifest: files.manifest,
       projects,
-      randomIds: [B],
     });
 
     const snapshot = await harness.value.reconcile();
 
     expect(snapshot.projects).toEqual([B]);
-    expect(projects.created).toEqual([{ projectId: B, title: "GhostProv Worker 2" }]);
+    expect(projects.created).toEqual([]);
   });
 
   it("drains excess local runtimes without deleting Prism projects", async () => {
@@ -272,7 +274,7 @@ describe("ProjectFleetManager", () => {
     await right.start();
     const registry = new SandboxRegistry([left, right]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 1 }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
       projects,
       registry,
@@ -286,32 +288,45 @@ describe("ProjectFleetManager", () => {
     expect(projects.deleted).toEqual([]);
   });
 
-  it("applies the guest cap after auto mode resolves anonymously", async () => {
+  it("reconciles only explicitly configured guest projects", async () => {
     const files = await state();
-    const projects = new FakeProjects([]);
+    const projects = new FakeProjects([project(A), project(B)]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 4, sessionMode: "auto", guestMax: 1 }),
+      config: config(files.cookieFile, { explicit: [A], sessionMode: "auto", guestMax: 1 }),
       identityKind: "anonymous",
       manifest: files.manifest,
       projects,
-      randomIds: [A, B, C, D],
     });
 
     const snapshot = await harness.value.reconcile();
 
     expect(snapshot.desired).toBe(1);
-    expect(projects.created).toHaveLength(1);
+    expect(projects.getCalls).toEqual([A]);
     expect(harness.registry.runtimes()).toHaveLength(1);
+  });
+
+  it("fails closed when auto session resolution exceeds the anonymous project cap", async () => {
+    const files = await state();
+    const projects = new FakeProjects([project(A), project(B)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B], sessionMode: "auto", guestMax: 1 }),
+      identityKind: "anonymous",
+      manifest: files.manifest,
+      projects,
+    });
+
+    await expect(harness.value.reconcile()).rejects.toThrow("anonymous fleet limit");
+    expect(projects.getCalls).toEqual([]);
+    expect(harness.factory.created).toEqual([]);
   });
 
   it("rejects reconciliation after shutdown without creating projects", async () => {
     const files = await state();
-    const projects = new FakeProjects([]);
+    const projects = new FakeProjects([project(A)]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 1 }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
       projects,
-      randomIds: [A],
     });
 
     await harness.value.shutdown("test-shutdown");
@@ -331,7 +346,7 @@ describe("ProjectFleetManager", () => {
     runtime.heartbeatAgeMs = null;
     const registry = new SandboxRegistry([runtime]);
     const harness = manager({
-      config: config(files.cookieFile, { desired: 1, explicit: [A] }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
       projects: new FakeProjects([project(A)]),
       registry,

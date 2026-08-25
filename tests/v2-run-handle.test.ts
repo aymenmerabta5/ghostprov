@@ -55,6 +55,33 @@ describe("V2RunHandle", () => {
     });
   });
 
+  it("reuses a transcript-proven wire size without re-materializing SSE bytes", async () => {
+    const handle = new V2RunHandle({ maxBufferedBytes: 4_096 });
+    const frame = { event: "delta", data: "hello" };
+    const wireBytes = new TextEncoder().encode(
+      `event: ${frame.event}\ndata: ${frame.data}\n\n`,
+    ).byteLength;
+
+    await handle.acceptEvent(frame, wireBytes);
+    handle.settle({ id: "resp_1", status: "completed" });
+
+    expect(await Array.fromAsync(handle.events())).toEqual([frame]);
+    expect(handle.stats.bytes).toBe(wireBytes);
+  });
+
+  it("drains a long response in order through its head-index queue", async () => {
+    const handle = new V2RunHandle({ maxBufferedBytes: 4 * 1024 * 1024 });
+    const frames = Array.from({ length: 4_096 }, (_, index) => ({
+      event: "delta",
+      data: String(index),
+    }));
+    for (const frame of frames) await handle.acceptEvent(frame);
+    handle.settle({ id: "resp_1", status: "completed" });
+
+    const received = await Array.fromAsync(handle.events());
+    expect(received).toEqual(frames);
+  });
+
   it("backpressures the producer until buffered events are consumed", async () => {
     const handle = new V2RunHandle({ maxBufferedBytes: 160 });
     const first = { event: "delta", data: "a".repeat(100) };

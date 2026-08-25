@@ -76,20 +76,38 @@ function successfulFetch(onRequest?: (path: string, init?: RequestInit) => void)
           heartbeatAgeMs: 500,
           credentialExpiresInMs: 3_000_000,
           memoryPressure: 0.1,
+          upstreamRateLimit: {
+            hint: { limitTokens: 40_000_000, remainingTokens: 0, retryAfterMs: 914 },
+            problem: {
+              model: "gpt-5.6-sol",
+              organization: "org-Example123",
+              limitKind: "tokens_per_min",
+              tokenLimit: 40_000_000,
+              usedTokens: 40_000_000,
+              requestedTokens: 609_930,
+              retryAfterMs: 914,
+            },
+            requestedModel: "gpt-5.6-sol",
+            observedAgoMs: 25,
+          },
+          upstreamRateLimits: {
+            "gpt-5.6-sol": {
+              hint: { limitTokens: 40_000_000, remainingTokens: 0, retryAfterMs: 914 },
+              problem: {
+                model: "gpt-5.6-sol",
+                organization: "org-Example123",
+                limitKind: "tokens_per_min",
+                tokenLimit: 40_000_000,
+                usedTokens: 40_000_000,
+                requestedTokens: 609_930,
+                retryAfterMs: 914,
+              },
+              requestedModel: "gpt-5.6-sol",
+              observedAgoMs: 25,
+            },
+          },
           output: "must never be copied",
         }],
-        rateLimit: {
-          "gpt-5.6-sol": {
-            state: "cold",
-            retryAfterMs: null,
-            tokenLimit: null,
-            remainingTokens: null,
-            active: 8,
-            coldMaxActive: 16,
-            lastRateLimit: null,
-          },
-        },
-        rateLimitQueued: { "gpt-5.6-sol": 2 },
       });
     }
     return json({ error: "unexpected endpoint" }, 404);
@@ -145,16 +163,18 @@ describe("V2 external monitor", () => {
       completion_ewma_ms: 2_000,
       ambiguous_quarantined: 1,
       ambiguity_limit: 4,
+      rate_limit_observations: [{
+        model: "gpt-5.6-sol",
+        organization: "org-Example123",
+        limit: 40_000_000,
+        used: 40_000_000,
+        requested: 609_930,
+        remaining: 0,
+        retry_after_ms: 914,
+        observed_ago_ms: 25,
+      }],
     });
-    expect(event.rate_limit).toMatchObject({
-      "gpt-5.6-sol": {
-        state: "cold",
-        active: 8,
-        queued: 2,
-        cold_max_active: 16,
-        budget_limit: null,
-      },
-    });
+    expect(event).not.toHaveProperty("rate_limit");
     expect(JSON.stringify(event)).not.toMatch(/prompt|output|forbiddenToken|sk-secret/i);
     expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
   });

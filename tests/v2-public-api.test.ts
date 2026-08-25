@@ -7,10 +7,11 @@ import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { createFakeV2System } from "./support/fake-v2-system";
 
-async function harness() {
+async function harness(finalExtensions: Readonly<Record<string, unknown>> = {}) {
   const system = await createFakeV2System({
     runtimes: 1,
     physicalPerRuntime: 16,
+    finalExtensions,
   });
   const app = createGhostProvApp({ router: system.router, keepAliveMs: 60_000 });
   const server = createGhostProvServer({
@@ -72,6 +73,42 @@ async function openSocket(baseUrl: string) {
 }
 
 describe("V2 public API compatibility", () => {
+  it("keeps streaming and non-streaming finals identical with provider extensions", async () => {
+    const extensions = {
+      transport: { provider: "future-transport", region: "test" },
+      provider_extension: { nested: [1, "two", true] },
+      gp_sse: "provider-owned-extension",
+    };
+    const streaming = await harness(extensions);
+    const nonStreaming = await harness(extensions);
+    try {
+      const body = { model: "gpt-5.6-sol", input: "extension-parity", store: false };
+      const streamResponse = await fetch(`${streaming.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...body, stream: true }),
+      });
+      const completed = parseFrames(await streamResponse.text(), 0).frames
+        .find(frame => frame.event === "response.completed");
+      expect(completed).toBeDefined();
+      const streamedFinal = JSON.parse(completed!.data).response;
+
+      const response = await fetch(`${nonStreaming.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...body, stream: false }),
+      });
+      const nonStreamedFinal = await response.json();
+
+      expect(streamResponse.status).toBe(200);
+      expect(response.status).toBe(200);
+      expect(nonStreamedFinal).toEqual(streamedFinal);
+      expect(nonStreamedFinal).toMatchObject(extensions);
+    } finally {
+      await Promise.all([streaming.close(), nonStreaming.close()]);
+    }
+  });
+
   it("streams ordered Responses SSE and preserves reasoning/service fields", async () => {
     const value = await harness();
     try {

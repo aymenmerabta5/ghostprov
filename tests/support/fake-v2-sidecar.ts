@@ -38,11 +38,16 @@ export class FakeSidecarStorage implements JournalStorage {
   readonly records: JournalRecord[];
   readonly terminals = new Map<string, Uint8Array>();
   readonly timeline: string[];
+  terminalReads = 0;
+  terminalExistenceChecks = 0;
 
   constructor(
     timeline: string[],
     records: JournalRecord[] = [],
     terminals: Map<string, Uint8Array> = new Map(),
+    readonly beforeAppend?: () => Promise<void>,
+    readonly terminalReadError?: Error,
+    readonly beforeReadRecords?: () => Promise<void>,
   ) {
     this.timeline = timeline;
     this.records = [...records];
@@ -50,6 +55,7 @@ export class FakeSidecarStorage implements JournalStorage {
   }
 
   async appendAndSync(records: readonly JournalRecord[]): Promise<void> {
+    await this.beforeAppend?.();
     this.records.push(...records.map(record => ({ ...record })));
     this.timeline.push(`sync:${records.map(record => record.state).join(",")}`);
   }
@@ -58,13 +64,22 @@ export class FakeSidecarStorage implements JournalStorage {
     this.timeline.push("terminal-spool");
   }
   async readTerminal(id: string): Promise<Uint8Array | null> {
+    this.terminalReads++;
+    if (this.terminalReadError) throw this.terminalReadError;
     return this.terminals.get(id)?.slice() ?? null;
+  }
+  async terminalExists(id: string): Promise<boolean> {
+    this.terminalExistenceChecks++;
+    return this.terminals.has(id);
   }
   async deleteTerminal(id: string): Promise<void> {
     this.terminals.delete(id);
     this.timeline.push("terminal-delete");
   }
-  async readRecords(): Promise<readonly JournalRecord[]> { return this.records; }
+  async readRecords(): Promise<readonly JournalRecord[]> {
+    await this.beforeReadRecords?.();
+    return this.records;
+  }
 }
 
 class FakeAdmission implements SidecarAdmission {
@@ -163,8 +178,17 @@ export interface SidecarHarnessOptions {
   records?: JournalRecord[];
   terminals?: Map<string, Uint8Array>;
   onDrainRequested?: (reason: string) => void;
+  onFatalError?: (error: Error) => void;
+  assertOwnership?: () => Promise<void>;
   batching?: boolean;
   outputBackpressure?: OutputBackpressure;
+  drainTimeoutMs?: number;
+  drainAbortSettlementMs?: number;
+  deferAcceptUntilStarted?: boolean;
+  emit?: (frame: SidecarFrame) => void;
+  beforeAppend?: () => Promise<void>;
+  terminalReadError?: Error;
+  beforeReadRecords?: () => Promise<void>;
 }
 
 export class SidecarHarness {
@@ -183,6 +207,9 @@ export class SidecarHarness {
       this.timeline,
       options.records,
       options.terminals,
+      options.beforeAppend,
+      options.terminalReadError,
+      options.beforeReadRecords,
     );
     this.journal = new ClaimJournal({
       storage: this.storage,
@@ -201,11 +228,17 @@ export class SidecarHarness {
       admission: this.admission,
       upstream: this.upstream,
       onDrainRequested: options.onDrainRequested,
+      onFatalError: options.onFatalError,
+      assertOwnership: options.assertOwnership,
       batching: options.batching,
       outputBackpressure: options.outputBackpressure,
+      drainTimeoutMs: options.drainTimeoutMs,
+      drainAbortSettlementMs: options.drainAbortSettlementMs,
+      deferAcceptUntilStarted: options.deferAcceptUntilStarted,
       emit: frame => {
         this.frames.push(frame);
         this.timeline.push(`emit:${frame.kind}`);
+        options.emit?.(frame);
       },
     });
   }
@@ -247,7 +280,8 @@ export class SidecarHarness {
 
   async settle(): Promise<void> {
     for (let index = 0; index < 100; index++) {
-      if (this.engine.snapshot().active === 0) return;
+      const snapshot = this.engine.snapshot();
+      if (snapshot.active === 0 && snapshot.replaying === 0) return;
       await new Promise(resolve => setTimeout(resolve, 0));
     }
     throw new Error("sidecar harness did not settle");

@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
-import { attachResponsesWebSocket, type WebSocketRelayStarter } from "../src/ws/server";
+import {
+  attachResponsesWebSocket,
+  decodeWebSocketRawData,
+  type AttachResponsesWebSocketOptions,
+  type WebSocketRelayStarter,
+} from "../src/ws/server";
 import type { RunHandle } from "../src/relay/run-handle";
+import {
+  ResponsesWebSocketSession,
+  WebSocketProcessBudget,
+} from "../src/ws/session";
+import { WebSocketTelemetry } from "../src/ws/telemetry";
+import { ResponseGraph } from "../src/ws/response-graph";
+import { ApiError } from "../src/http/errors";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
@@ -31,7 +43,10 @@ function completed(id: string, output: unknown[] = []) {
   return { id, object: "response", model: "gpt-5.6-sol", status: "completed", output };
 }
 
-async function startServer(startRelay: WebSocketRelayStarter, options: { maxActive?: number; maxNamedStreams?: number } = {}) {
+async function startServer(
+  startRelay: WebSocketRelayStarter,
+  options: Omit<AttachResponsesWebSocketOptions, "startRelay"> = {},
+) {
   const server = createServer((_req, res) => { res.writeHead(404).end(); });
   attachResponsesWebSocket(server, { startRelay, ...options });
   servers.push(server);
@@ -258,7 +273,13 @@ describe("Responses WebSocket server", () => {
   });
 
   it("returns direct validation errors without closing other lanes", async () => {
-    const startRelay: WebSocketRelayStarter = async () => relayHandle(Promise.resolve(completed("ok")));
+    const gates = new Map<string, ReturnType<typeof deferred<any>>>();
+    const startRelay: WebSocketRelayStarter = async body => {
+      const label = (body.input as any[]).at(-1)?.content?.[0]?.text ?? "unknown";
+      const gate = deferred<any>();
+      gates.set(label, gate);
+      return relayHandle(gate.promise);
+    };
     const socket = await startServer(startRelay, { maxNamedStreams: 2 });
     const messages = collect(socket);
     socket.send("not json");
@@ -273,6 +294,7 @@ describe("Responses WebSocket server", () => {
     expect(messages.some(message => message.error?.param === "stream")).toBe(true);
     expect(messages.some(message => message.error?.code === "websocket_stream_limit_reached")).toBe(true);
     expect(socket.readyState).toBe(WebSocket.OPEN);
+    for (const [label, gate] of gates) gate.resolve(completed(`resp_${label}`));
   });
 
   it("aborts queued relay startup and releases session state on disconnect", async () => {
@@ -289,5 +311,554 @@ describe("Responses WebSocket server", () => {
       aborted.promise,
       new Promise((_, reject) => setTimeout(() => reject(new Error("abort not observed")), 1_000)),
     ]);
+  });
+
+  it("rejects an oversized message at the WebSocket parser boundary", async () => {
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed("unexpected")));
+    }, { maxPayloadBytes: 256 });
+    const closed = new Promise<number>(resolve => {
+      socket.once("close", code => resolve(code));
+    });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "oversized",
+      input: "x".repeat(1_024),
+    }));
+
+    expect(await closed).toBe(1009);
+    expect(calls).toBe(0);
+  });
+
+  it("bounds pending request count while retaining accepted FIFO work", async () => {
+    const gates: Array<ReturnType<typeof deferred<any>>> = [];
+    const socket = await startServer(async () => {
+      const gate = deferred<any>();
+      gates.push(gate);
+      return relayHandle(gate.promise);
+    }, {
+      maxActive: 1,
+      maxPendingRequests: 2,
+      maxPendingRequestBytes: 1024 * 1024,
+    });
+    const messages = collect(socket);
+    const create = (stream_id: string) => socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id,
+      model: "gpt-5.6-sol",
+      store: false,
+      input: stream_id,
+    }));
+
+    create("one");
+    create("two");
+    create("three");
+    await waitFor(() => messages.some(message =>
+      message.error?.code === "websocket_request_queue_full"));
+    expect(gates).toHaveLength(1);
+    expect(messages.find(message => message.error?.code === "websocket_request_queue_full"))
+      .toMatchObject({
+        status: 503,
+        stream_id: "three",
+        error: { type: "overloaded_error" },
+      });
+
+    gates[0]!.resolve(completed("resp_one"));
+    await waitFor(() => gates.length === 2);
+    gates[1]!.resolve(completed("resp_two"));
+    await waitFor(() => messages.filter(message => message.type === "response.completed").length === 2);
+  });
+
+  it("bounds aggregate bytes retained by pending requests", async () => {
+    const gate = deferred<any>();
+    const first = JSON.stringify({
+      type: "response.create",
+      stream_id: "large-one",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "x".repeat(256),
+    });
+    const second = JSON.stringify({
+      type: "response.create",
+      stream_id: "large-two",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "y".repeat(128),
+    });
+    const socket = await startServer(
+      async () => relayHandle(gate.promise),
+      {
+        maxActive: 1,
+        maxPendingRequests: 8,
+        maxPendingRequestBytes: Buffer.byteLength(first) + Buffer.byteLength(second) - 1,
+      },
+    );
+    const messages = collect(socket);
+
+    socket.send(first);
+    socket.send(second);
+    await waitFor(() => messages.some(message => message.stream_id === "large-two"));
+    expect(messages.find(message => message.stream_id === "large-two"))
+      .toMatchObject({
+        status: 503,
+        error: {
+          type: "overloaded_error",
+          code: "websocket_request_queue_full",
+        },
+      });
+    gate.resolve(completed("resp_large_one"));
+  });
+
+  it("uses one stable relay client identity per WebSocket session", async () => {
+    const clientIds: string[] = [];
+    const socket = await startServer(async (_body, options) => {
+      clientIds.push(options.clientId);
+      return relayHandle(Promise.resolve(completed(`resp_${clientIds.length}`)));
+    });
+    const messages = collect(socket);
+    for (const stream_id of ["identity-a", "identity-b"]) {
+      socket.send(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+    }
+    await waitFor(() => messages.filter(message => message.type === "response.completed").length === 2);
+    expect(clientIds).toHaveLength(2);
+    expect(clientIds[0]).toMatch(/^ws-/);
+    expect(clientIds[1]).toBe(clientIds[0]);
+  });
+
+  it("preserves normalized provider status and error identity", async () => {
+    const rateMessage = "Rate limit reached for gpt-5.6-sol in organization " +
+      "org-ExampleOrganization123 on tokens per min (TPM): Limit 40000000, " +
+      "Used 40000000, Requested 609930. Please try again in 914ms.";
+    const failures = [
+      Object.assign(new Error(rateMessage), {
+        code: "rate_limit_exceeded",
+        rateLimit: {
+          retryAfterMs: 914,
+          limitTokens: 40_000_000,
+          remainingTokens: 0,
+        },
+      }),
+      new ApiError(401, "The upstream session is not authorized", {
+        type: "authentication_error",
+        param: null,
+        code: "invalid_api_key",
+      }),
+    ];
+    const socket = await startServer(async () => relayHandle(
+      Promise.reject(failures.shift()!),
+    ));
+    const messages = collect(socket);
+    for (const stream_id of ["limited", "unauthorized"]) {
+      socket.send(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+    }
+
+    await waitFor(() => messages.filter(message => message.type === "error").length === 2);
+    expect(messages.find(message => message.stream_id === "limited")).toMatchObject({
+      status: 429,
+      error: {
+        message: rateMessage,
+        type: "rate_limit_error",
+        code: "rate_limit_exceeded",
+      },
+    });
+    expect(messages.find(message => message.stream_id === "unauthorized")).toMatchObject({
+      status: 401,
+      error: {
+        message: "The upstream session is not authorized",
+        type: "authentication_error",
+        code: "invalid_api_key",
+      },
+    });
+  });
+
+  it("recycles completed named-stream slots", async () => {
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed(`resp_recycled_${calls}`)));
+    }, { maxNamedStreams: 2 });
+    const messages = collect(socket);
+
+    for (let index = 0; index < 5; index++) {
+      const stream_id = `sequential-${index}`;
+      socket.send(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+      await waitFor(() => messages.some(message =>
+        message.type === "response.completed" && message.stream_id === stream_id));
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    expect(calls).toBe(5);
+    expect(messages.some(message => message.error?.code === "websocket_stream_limit_reached"))
+      .toBe(false);
+  });
+});
+
+describe("WebSocket raw message decoding", () => {
+  it("joins fragmented Buffer data and decodes ArrayBuffer data without commas", () => {
+    const fragments = [Buffer.from('{"type":"response.'), Buffer.from('create"}')];
+    expect(decodeWebSocketRawData(fragments)).toEqual({
+      bytes: fragments[0]!.byteLength + fragments[1]!.byteLength,
+      text: '{"type":"response.create"}',
+    });
+    const bytes = new TextEncoder().encode('{"input":"hello"}');
+    const arrayBuffer = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
+    expect(decodeWebSocketRawData(arrayBuffer)).toEqual({
+      bytes: bytes.byteLength,
+      text: '{"input":"hello"}',
+    });
+  });
+});
+
+class FakeSocket {
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSED = 3;
+  readyState = this.OPEN;
+  bufferedAmount = 0;
+  readonly sent: string[] = [];
+  readonly callbacks: Array<(error?: Error) => void> = [];
+  closeCode: number | null = null;
+  holdCallbacks = false;
+  sendError: Error | null = null;
+
+  send(data: string, callback: (error?: Error) => void): void {
+    this.sent.push(data);
+    if (this.holdCallbacks) this.callbacks.push(callback);
+    else queueMicrotask(() => callback(this.sendError ?? undefined));
+  }
+
+  close(code: number): void {
+    this.closeCode = code;
+    this.readyState = this.CLOSED;
+  }
+
+  terminate(): void { this.readyState = this.CLOSED; }
+
+  flush(error?: Error): void {
+    for (const callback of this.callbacks.splice(0)) callback(error);
+  }
+}
+
+describe("Responses WebSocket bounded delivery", () => {
+  it("enforces a process-wide session budget and releases it on close", () => {
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 1024 * 1024,
+    });
+    const first = new ResponsesWebSocketSession(
+      new FakeSocket() as unknown as WebSocket,
+      {
+        processBudget: budget,
+        startRelay: async () => relayHandle(new Promise(() => {})),
+      },
+    );
+    expect(budget.snapshot().sessions).toBe(1);
+    expect(() => new ResponsesWebSocketSession(
+      new FakeSocket() as unknown as WebSocket,
+      {
+        processBudget: budget,
+        startRelay: async () => relayHandle(new Promise(() => {})),
+      },
+    )).toThrow("session capacity");
+
+    first.close();
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, queuedBytes: 0 });
+    const replacement = new ResponsesWebSocketSession(
+      new FakeSocket() as unknown as WebSocket,
+      {
+        processBudget: budget,
+        startRelay: async () => relayHandle(new Promise(() => {})),
+      },
+    );
+    expect(budget.snapshot().sessions).toBe(1);
+    replacement.close();
+  });
+
+  it("enforces aggregate retained bytes across independent sessions", async () => {
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 2,
+      maxQueuedBytes: 1_024,
+    });
+    const firstSocket = new FakeSocket();
+    const secondSocket = new FakeSocket();
+    const firstGate = deferred<any>();
+    let secondCalls = 0;
+    const first = new ResponsesWebSocketSession(firstSocket as unknown as WebSocket, {
+      processBudget: budget,
+      startRelay: async () => relayHandle(firstGate.promise),
+    });
+    const second = new ResponsesWebSocketSession(secondSocket as unknown as WebSocket, {
+      processBudget: budget,
+      startRelay: async () => {
+        secondCalls++;
+        return relayHandle(Promise.resolve(completed("unexpected")));
+      },
+    });
+    const firstRaw = JSON.stringify({
+      type: "response.create",
+      stream_id: "budget-one",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "x".repeat(650),
+    });
+    const secondRaw = JSON.stringify({
+      type: "response.create",
+      stream_id: "budget-two",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "y".repeat(650),
+    });
+
+    first.receive(firstRaw);
+    second.receive(secondRaw);
+    await waitFor(() => secondSocket.sent.length > 0);
+    expect(secondCalls).toBe(0);
+    expect(JSON.parse(secondSocket.sent[0]!)).toMatchObject({
+      status: 503,
+      stream_id: "budget-two",
+      error: {
+        type: "overloaded_error",
+        code: "websocket_request_queue_full",
+      },
+    });
+    expect(budget.snapshot().queuedBytes).toBeLessThanOrEqual(1_024);
+    first.close();
+    second.close();
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, queuedBytes: 0 });
+  });
+
+  it("does not repopulate graph or process budget after a delayed final settles", async () => {
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 1024 * 1024,
+    });
+    const graph = new ResponseGraph();
+    const final = deferred<any>();
+    let started = false;
+    const session = new ResponsesWebSocketSession(
+      new FakeSocket() as unknown as WebSocket,
+      {
+        graph,
+        processBudget: budget,
+        startRelay: async () => {
+          started = true;
+          return relayHandle(final.promise);
+        },
+      },
+    );
+    session.receive(JSON.stringify({
+      type: "response.create",
+      stream_id: "delayed-final",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "remember nothing after close",
+    }));
+    await waitFor(() => started);
+    expect(budget.snapshot().queuedBytes).toBeGreaterThan(0);
+
+    session.close();
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, queuedBytes: 0 });
+    final.resolve(completed("resp_too_late", [{ type: "message", content: "late" }]));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(budget.snapshot()).toMatchObject({ sessions: 0, queuedBytes: 0 });
+  });
+
+  it("keeps unrelated lanes alive when one response frame is oversized", async () => {
+    const socket = new FakeSocket();
+    const signals: AbortSignal[] = [];
+    let calls = 0;
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      maxActive: 2,
+      maxSendQueueBytes: 512,
+      startRelay: async (_body, options) => {
+        signals.push(options.signal);
+        calls++;
+        if (calls === 1) {
+          return relayHandle(new Promise(() => {}), [{
+            event: "response.output_text.delta",
+            data: JSON.stringify({
+              type: "response.output_text.delta",
+              delta: "x".repeat(4_096),
+            }),
+          }]);
+        }
+        return relayHandle(Promise.resolve(completed("resp_healthy")));
+      },
+    });
+
+    for (const stream_id of ["oversized-lane", "healthy-lane"]) {
+      session.receive(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+    }
+
+    await waitFor(() => socket.sent.some(value =>
+      JSON.parse(value).stream_id === "healthy-lane" &&
+      JSON.parse(value).type === "response.completed"));
+    await waitFor(() => socket.sent.some(value =>
+      JSON.parse(value).error?.code === "websocket_output_queue_full"));
+    expect(socket.closeCode).toBeNull();
+    expect(signals[0]!.aborted).toBe(true);
+    expect(signals[1]!.aborted).toBe(false);
+    expect(socket.sent.map(value => JSON.parse(value))).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        status: 503,
+        stream_id: "oversized-lane",
+        error: expect.objectContaining({
+          type: "overloaded_error",
+          code: "websocket_output_queue_full",
+        }),
+      }),
+      expect.objectContaining({
+        type: "response.completed",
+        stream_id: "healthy-lane",
+      }),
+    ]));
+    session.close();
+  });
+
+  it("waits for socket capacity before consuming the next response event", async () => {
+    const socket = new FakeSocket();
+    socket.bufferedAmount = 1_024;
+    const telemetry = new WebSocketTelemetry();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      telemetry,
+      maxBufferedBytes: 128,
+      sendTimeoutMs: 1_000,
+      startRelay: async () => relayHandle(Promise.resolve(completed("resp_slow")), [{
+        event: "response.created",
+        data: JSON.stringify({ type: "response.created", response: { id: "resp_slow" } }),
+      }]),
+    });
+
+    session.receive(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "slow socket",
+    }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(socket.sent).toHaveLength(0);
+
+    socket.bufferedAmount = 0;
+    await waitFor(() => socket.sent.length === 2);
+    expect(socket.sent.map(value => JSON.parse(value).type))
+      .toEqual(["response.created", "response.completed"]);
+    expect(telemetry.snapshotAndReset().delayedByBackpressure).toBe(1);
+    session.close();
+  });
+
+  it("isolates bounded send-queue overflow to the offending named stream", async () => {
+    const socket = new FakeSocket();
+    socket.holdCallbacks = true;
+    const signals: AbortSignal[] = [];
+    const telemetry = new WebSocketTelemetry();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      telemetry,
+      maxActive: 3,
+      maxSendQueueItems: 2,
+      maxSendQueueBytes: 1024 * 1024,
+      sendTimeoutMs: 10_000,
+      startRelay: async (_body, options) => {
+        signals.push(options.signal);
+        return relayHandle(new Promise(() => {}), [{
+          event: "response.created",
+          data: JSON.stringify({ type: "response.created", response: { id: "pending" } }),
+        }]);
+      },
+    });
+
+    for (const stream_id of ["a", "b", "c"]) {
+      session.receive(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+    }
+    await waitFor(() => signals.length === 3 && signals.some(signal => signal.aborted));
+    expect(socket.closeCode).toBeNull();
+    expect(signals).toHaveLength(3);
+    expect(signals[0]!.aborted).toBe(false);
+    expect(signals[1]!.aborted).toBe(false);
+    expect(signals[2]!.aborted).toBe(true);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      rejectedSends: 1,
+      deliveryErrors: 0,
+      sendQueueDepthPeak: 2,
+    });
+    socket.holdCallbacks = false;
+    socket.flush();
+    await waitFor(() => socket.sent.some(value =>
+      JSON.parse(value).error?.code === "websocket_output_queue_full"));
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({
+      type: "error",
+      status: 503,
+      stream_id: "c",
+      error: {
+        type: "overloaded_error",
+        code: "websocket_output_queue_full",
+      },
+    });
+    session.close();
+  });
+
+  it("aborts relay work when the socket send callback fails", async () => {
+    const socket = new FakeSocket();
+    socket.sendError = new Error("socket write failed");
+    let signal: AbortSignal | undefined;
+    const telemetry = new WebSocketTelemetry();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      telemetry,
+      startRelay: async (_body, options) => {
+        signal = options.signal;
+        return relayHandle(new Promise(() => {}), [{
+          event: "response.created",
+          data: JSON.stringify({ type: "response.created", response: { id: "failing" } }),
+        }]);
+      },
+    });
+
+    session.receive(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "fail send",
+    }));
+    await waitFor(() => socket.closeCode !== null);
+    expect(socket.closeCode).toBe(1011);
+    expect(signal?.aborted).toBe(true);
+    expect(telemetry.snapshotAndReset().deliveryErrors).toBe(1);
   });
 });

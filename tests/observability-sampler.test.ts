@@ -118,24 +118,74 @@ describe("FleetSampler", () => {
           queueDepth: 0,
           memoryPressure: 0.1,
           failure: null,
+          upstreamRateLimit: {
+            hint: { limitTokens: 40_000_000, remainingTokens: 0, retryAfterMs: 914 },
+            problem: {
+              status: 429,
+              message: "Rate limit reached",
+              type: "rate_limit_error",
+              code: "rate_limit_exceeded",
+              param: null,
+              model: "gpt-5.6-sol",
+              organization: "org-Example123",
+              limitKind: "tokens_per_min",
+              tokenLimit: 40_000_000,
+              usedTokens: 40_000_000,
+              requestedTokens: 609_930,
+              retryAfterMs: 914,
+            },
+            requestedModel: "gpt-5.6-sol",
+            observedAgoMs: 25,
+          },
+          upstreamRateLimits: {
+            "gpt-5.6-sol": {
+              hint: { limitTokens: 40_000_000, remainingTokens: 0, retryAfterMs: 914 },
+              problem: {
+                status: 429,
+                message: "Rate limit reached",
+                type: "rate_limit_error",
+                code: "rate_limit_exceeded",
+                param: null,
+                model: "gpt-5.6-sol",
+                organization: "org-Example123",
+                limitKind: "tokens_per_min",
+                tokenLimit: 40_000_000,
+                usedTokens: 40_000_000,
+                requestedTokens: 609_930,
+                retryAfterMs: 914,
+              },
+              requestedModel: "gpt-5.6-sol",
+              observedAgoMs: 25,
+            },
+          },
           recovery: { attempt: 2, consecutiveFailures: 1, retryInMs: 1_000 },
           diagnostics: {
             host: { ...transport, logicalEventsTotal: 0, responseBatchFramesTotal: 0, batchedEventsTotal: 0 },
-            sidecar: { version: 1, resource: null, transport, malformedCount: 0 },
+            sidecar: {
+              version: 1,
+              resource: {
+                processRssBytes: 1_000,
+                heapUsedBytes: 500,
+                heapTotalBytes: 800,
+                externalBytes: 100,
+                arrayBufferBytes: 25,
+                systemTotalBytes: 4_000,
+                systemFreeBytes: 2_000,
+                processCpuPercent: 20,
+                normalizedLoad1: 0.25,
+                eventLoopSamples: 8,
+                eventLoopP50Ms: 1,
+                eventLoopP95Ms: 3,
+                eventLoopMaxMs: 5,
+                gcSamples: 2,
+                gcDurationP95Ms: 4,
+                gcDurationMaxMs: 6,
+              },
+              transport,
+              malformedCount: 0,
+            },
           },
         }],
-        rateLimit: {
-          "gpt-5.6-sol": {
-            state: "cold",
-            retryAfterMs: null,
-            tokenLimit: null,
-            remainingTokens: null,
-            active: 8,
-            coldMaxActive: 16,
-            lastRateLimit: null,
-          },
-        },
-        rateLimitQueued: { "gpt-5.6-sol": 3 },
       }),
       cpuPoolSnapshot: () => ({ workers: 6, active: 1, queued: 0, maxActive: 2, closed: false }),
       eventLoop,
@@ -178,6 +228,8 @@ describe("FleetSampler", () => {
       event_loop_p50_ms: 2,
       event_loop_p95_ms: 5,
       event_loop_max_ms: 8,
+      external_bytes: 200,
+      array_buffer_bytes: 100,
     });
     expect((event.resources as any).transform_workers).toBe(6);
     expect((event.runtimes as any[])[0]).toMatchObject({
@@ -189,8 +241,25 @@ describe("FleetSampler", () => {
       ambiguous_quarantined: 1,
       ambiguity_limit: 4,
       completion_ewma_ms: 2_000,
+      rate_limit_observations: [{
+        model: "gpt-5.6-sol",
+        organization: "org-Example123",
+        limit: 40_000_000,
+        used: 40_000_000,
+        requested: 609_930,
+        remaining: 0,
+        retry_after_ms: 914,
+        observed_ago_ms: 25,
+      }],
       diagnostics: {
         sidecar: {
+          resource: {
+            process_cpu_percent: 20,
+            array_buffer_bytes: 25,
+            event_loop_samples: 8,
+            gc_samples: 2,
+            gc_duration_p95_ms: 4,
+          },
           transport: {
             logical_events_total: 40,
             response_batch_frames_total: 8,
@@ -218,14 +287,7 @@ describe("FleetSampler", () => {
       requests_per_second: 9.6,
       total: { p50_ms: 500, p95_ms: 2_000, max_ms: 3_000 },
     });
-    expect(event.rate_limit).toMatchObject({
-      "gpt-5.6-sol": {
-        state: "cold",
-        active: 8,
-        queued: 3,
-        cold_max_active: 16,
-      },
-    });
+    expect(event).not.toHaveProperty("rate_limit");
     expect(JSON.stringify(event)).not.toMatch(/token|cookie|prompt|output|url/i);
   });
 });

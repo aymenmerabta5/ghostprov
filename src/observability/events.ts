@@ -30,7 +30,7 @@ export const SANDBOX_RECOVERY_CAUSES = [
 ] as const;
 export type SandboxRecoveryCause = typeof SANDBOX_RECOVERY_CAUSES[number];
 
-export const SANDBOX_RECOVERY_TRANSPORTS = ["v1", "v2"] as const;
+export const SANDBOX_RECOVERY_TRANSPORTS = ["v2"] as const;
 export type SandboxRecoveryTransport = typeof SANDBOX_RECOVERY_TRANSPORTS[number];
 
 export const SANDBOX_RECOVERY_OPERATIONS = [
@@ -43,8 +43,6 @@ export const SANDBOX_RECOVERY_OPERATIONS = [
   "replace",
   "refresh_resources",
   "render",
-  "zip",
-  "delete_file",
   "wait_for_sync",
   "sync",
   "stop",
@@ -60,13 +58,11 @@ export const SANDBOX_RECOVERY_ERROR_NAMES = [
   "AwarenessChannelError",
   "BootstrapCryptoError",
   "ChildStartupTimeoutError",
-  "DaemonControllerError",
   "Error",
   "PrismProjectError",
   "PrismSessionError",
   "ProvisioningError",
   "SandboxGatewayError",
-  "SandboxLifecycleFailure",
   "SidecarCredentialRotationError",
   "UnhealthyChildError",
   "V2BootstrapError",

@@ -11,6 +11,7 @@ import { DenoJournalStorage } from "./journal-storage.ts";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
 import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
+import { DenoSidecarOwnershipLease } from "./ownership-lease.ts";
 
 interface StaticSidecarConfig {
   version: 1;
@@ -64,102 +65,249 @@ function readConfig(value: unknown): StaticSidecarConfig {
   };
 }
 
+class SidecarLifecycleError extends Error {
+  readonly name = "SidecarLifecycleError";
+  constructor(message: string, readonly code: string, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
+const CLEANUP_TIMEOUT_MS = 15_000;
+
+async function settleCleanup(
+  operation: () => void | Promise<void>,
+  deadline: number,
+  label: string,
+): Promise<void> {
+  const remaining = Math.max(0, deadline - performance.now());
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      Promise.resolve().then(operation).then(
+        () => ({ kind: "complete" as const }),
+        error => ({ kind: "failed" as const, error }),
+      ),
+      new Promise<{ kind: "timeout" }>(resolve => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), remaining);
+        (timer as any).unref?.();
+      }),
+    ]);
+    if (result.kind === "timeout") {
+      throw new SidecarLifecycleError(
+        `${label} exceeded the sidecar cleanup deadline`,
+        "cleanup_timeout",
+      );
+    }
+    if (result.kind === "failed") throw result.error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function run(): Promise<void> {
   const config = readConfig(JSON.parse(
     await Deno.readTextFile("/workspace/.ghostprov-v2/static.json"),
   ));
-  const bootstrap = await phaseZeroBootstrap({
-    binding: config.binding,
-    encryptedPath: "/workspace/.ghostprov-v2/bootstrap.enc.json",
-  });
   const binding = protocolBindingFromBootstrap(config.binding);
   const baseUrl = Deno.env.get("OPENAI_BASE_URL");
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
 
-  const storage = new DenoJournalStorage();
-  const diagnostics = new SidecarResourceSampler(config.diagnostics);
-  diagnostics.start();
-  const diagnosticObserver = new SidecarDiagnosticsObserver({ enabled: config.diagnostics.enabled, sampler: diagnostics });
-  const outputBackpressure = new OutputBackpressure({ highFrames:256,highBytes:256*1024,lowFrames:64,lowBytes:64*1024,hardFrames:1024,hardBytes:1024*1024 });
-  const journal = new ClaimJournal({
-    storage,
-    flushIntervalMs: 2,
-    maxBatch: 64,
-  });
-  const admission = new AdmissionController({
-    physicalMax: config.physicalMax,
-    acceptedMax: config.acceptedMax,
-    hostCeiling: config.physicalMax,
-    memoryBudgetBytes: config.memoryBudgetBytes,
-  });
-  const upstream = new DirectResponsesClient({
-    baseUrl,
-    apiKey: { reveal: () => apiKey },
-  });
-  let resolveAwarenessDrain!: (reason: string) => void;
-  const awarenessDrain = new Promise<string>(resolve => {
-    resolveAwarenessDrain = resolve;
-  });
-  let awarenessDrainRequested = false;
-  let peer: DenoAwarenessPeer | null = null;
-  const engine = new SidecarEngine({
-    binding,
-    assembler: new RequestAssembler({
-      maxReservedBytes: config.memoryBudgetBytes,
-    }),
-    journal,
-    admission,
-    upstream,
-    onDrainRequested: reason => {
-      if (awarenessDrainRequested) return;
-      awarenessDrainRequested = true;
-      resolveAwarenessDrain(`awareness:${reason}`);
-    },
-    diagnostics: diagnosticObserver,
-    outputBackpressure,
-    batching: config.batching,
-    emit: (frame, priority, streamId) => {
-      peer?.enqueue(frame, priority, streamId);
-    },
-  });
-  peer = new DenoAwarenessPeer({
-    credential: bootstrap.credential,
-    binding,
-    instanceId: bootstrap.instanceId,
-    engine,
-    diagnostics: diagnosticObserver,
-    outputBackpressure,
-    initialActivePerSandbox: config.initialActivePerSandbox,
-    maxActivePerSandbox: config.maxActivePerSandbox,
-  });
-
-  await engine.start();
-  await peer.connect();
-
-  let resolveSignal!: (reason: string) => void;
-  const shutdownSignal = new Promise<string>(resolve => {
-    resolveSignal = resolve;
-  });
-  const onTerm = () => resolveSignal("SIGTERM");
-  const onInt = () => resolveSignal("SIGINT");
+  const lifecycle = new AbortController();
+  let resolveShutdown!: (reason: string) => void;
+  const shutdown = new Promise<string>(resolve => { resolveShutdown = resolve; });
+  let signalReason: string | null = null;
+  const requestSignal = (reason: string) => {
+    if (signalReason) return;
+    signalReason = reason;
+    lifecycle.abort(new DOMException(`Sidecar received ${reason}`, "AbortError"));
+    resolveShutdown(reason);
+  };
+  const onTerm = () => requestSignal("SIGTERM");
+  const onInt = () => requestSignal("SIGINT");
   Deno.addSignalListener("SIGTERM", onTerm);
-  Deno.addSignalListener("SIGINT", onInt);
   try {
-    const reason = await Promise.race([shutdownSignal, awarenessDrain]);
-    await engine.drain(reason);
-    await peer.close();
-  } finally {
-    await diagnostics.close();
-    outputBackpressure.close();
+    Deno.addSignalListener("SIGINT", onInt);
+  } catch (error) {
     Deno.removeSignalListener("SIGTERM", onTerm);
-    Deno.removeSignalListener("SIGINT", onInt);
+    throw error;
   }
+
+  const instanceId = crypto.randomUUID();
+  let ownership: DenoSidecarOwnershipLease | null = null;
+  let diagnostics: SidecarResourceSampler | null = null;
+  let outputBackpressure: OutputBackpressure | null = null;
+  let journal: ClaimJournal | null = null;
+  let engine: SidecarEngine | null = null;
+  let peer: DenoAwarenessPeer | null = null;
+  let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  let maintenanceTask: Promise<void> | null = null;
+  let fatalCause: Error | null = null;
+  let failure: unknown = null;
+
+  try {
+    // Ownership precedes the bootstrap hello so overlapping local launches
+    // cannot race the shared journal or advertise a non-owning instance.
+    ownership = await DenoSidecarOwnershipLease.acquire({ instanceId });
+    const bootstrap = await phaseZeroBootstrap({
+      binding: config.binding,
+      instanceId,
+      encryptedPath: "/workspace/.ghostprov-v2/bootstrap.enc.json",
+      signal: lifecycle.signal,
+    });
+    if (bootstrap.instanceId !== instanceId) {
+      throw new SidecarLifecycleError("Bootstrap changed the owned instance", "instance_mismatch");
+    }
+
+    const storage = new DenoJournalStorage({
+      assertExclusiveOwnership: () => ownership!.assertOwned(),
+      withExclusiveOwnership: operation => ownership!.withOwnership(operation),
+    });
+    diagnostics = new SidecarResourceSampler(config.diagnostics);
+    diagnostics.start();
+    const diagnosticObserver = new SidecarDiagnosticsObserver({
+      enabled: config.diagnostics.enabled,
+      sampler: diagnostics,
+    });
+    outputBackpressure = new OutputBackpressure({
+      highFrames: 256,
+      highBytes: 256 * 1024,
+      lowFrames: 64,
+      lowBytes: 64 * 1024,
+      hardFrames: 1_024,
+      hardBytes: 1_024 * 1024,
+    });
+    journal = new ClaimJournal({
+      storage,
+      flushIntervalMs: 2,
+      maxBatch: 64,
+      assertExclusiveOwnership: () => ownership!.assertOwned(),
+      withExclusiveOwnership: operation => ownership!.withOwnership(operation),
+    });
+    const admission = new AdmissionController({
+      physicalMax: config.physicalMax,
+      acceptedMax: config.acceptedMax,
+      hostCeiling: config.physicalMax,
+      memoryBudgetBytes: config.memoryBudgetBytes,
+    });
+    const upstream = new DirectResponsesClient({
+      baseUrl,
+      apiKey: { reveal: () => apiKey },
+    });
+    let resolveDrain!: (reason: string) => void;
+    const drainRequested = new Promise<string>(resolve => { resolveDrain = resolve; });
+    let drainLatched = false;
+    const requestDrain = (reason: string, cause?: Error) => {
+      if (cause && !fatalCause) fatalCause = cause;
+      if (drainLatched) return;
+      drainLatched = true;
+      resolveDrain(`awareness:${reason}`);
+    };
+
+    engine = new SidecarEngine({
+      binding,
+      assembler: new RequestAssembler({ maxReservedBytes: config.memoryBudgetBytes }),
+      journal,
+      admission,
+      upstream,
+      onDrainRequested: reason => requestDrain(reason),
+      onFatalError: error => requestDrain("journal_error", error),
+      assertOwnership: () => ownership!.assertOwned(),
+      diagnostics: diagnosticObserver,
+      outputBackpressure,
+      deferAcceptUntilStarted: true,
+      batching: config.batching,
+      emit: (frame, priority, streamId) => peer?.enqueue(frame, priority, streamId),
+    });
+    peer = new DenoAwarenessPeer({
+      credential: bootstrap.credential,
+      binding,
+      instanceId,
+      engine,
+      diagnostics: diagnosticObserver,
+      outputBackpressure,
+      initialActivePerSandbox: config.initialActivePerSandbox,
+      maxActivePerSandbox: config.maxActivePerSandbox,
+      onAcceptError: (error, frame) => requestDrain(`accept_${frame.kind}`, error),
+      onEngineError: error => requestDrain("engine_error", error),
+    });
+
+    maintenanceTimer = setInterval(() => {
+      if (maintenanceTask) return;
+      const task = ownership!.withOwnership(async () => {
+        engine!.maintenance();
+      }).catch(error => {
+        requestDrain(
+          "ownership_lost",
+          error instanceof Error ? error : new Error("Sidecar ownership was lost"),
+        );
+      });
+      maintenanceTask = task;
+      void task.finally(() => {
+        if (maintenanceTask === task) maintenanceTask = null;
+      });
+    }, 60_000);
+    (maintenanceTimer as any).unref?.();
+
+    // Scan-only recovery makes readiness independent of replay delivery.
+    await engine.start(lifecycle.signal);
+    await peer.connect(lifecycle.signal);
+    peer.publishEngineState();
+    const reason = await Promise.race([shutdown, drainRequested]);
+    peer.freezeInbound();
+    await engine.drain(reason);
+    if (engine.snapshot().forcedDrain) {
+      fatalCause ??= new SidecarLifecycleError(
+        "Sidecar could not settle forced drain cancellation",
+        "forced_drain",
+      );
+    }
+    if (fatalCause) throw fatalCause;
+  } catch (error) {
+    const expectedSignalAbort = signalReason !== null &&
+      error instanceof DOMException && error.name === "AbortError";
+    if (!expectedSignalAbort || fatalCause !== null) failure = fatalCause ?? error;
+  } finally {
+    const cleanupErrors: unknown[] = [];
+    const cleanupDeadline = performance.now() + CLEANUP_TIMEOUT_MS;
+    const cleanup = async (operation: () => void | Promise<void>) => {
+      try {
+        await settleCleanup(operation, cleanupDeadline, "Sidecar cleanup operation");
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+    if (maintenanceTimer !== null) clearInterval(maintenanceTimer);
+    if (maintenanceTask) await cleanup(() => maintenanceTask!);
+    if (peer) await cleanup(() => peer!.closeGracefully());
+    outputBackpressure?.close();
+    if (journal) await cleanup(() => journal!.close());
+    if (diagnostics) await cleanup(() => diagnostics!.close());
+    if (ownership) await cleanup(() => ownership!.release());
+    await cleanup(() => Deno.removeSignalListener("SIGTERM", onTerm));
+    await cleanup(() => Deno.removeSignalListener("SIGINT", onInt));
+    if (cleanupErrors.length) {
+      failure = failure === null
+        ? new AggregateError(cleanupErrors, "Sidecar cleanup failed")
+        : new AggregateError([failure, ...cleanupErrors], "Sidecar failed and cleanup was incomplete");
+    }
+  }
+  if (failure === null && fatalCause !== null) failure = fatalCause;
+  if (failure !== null) throw failure;
 }
 
 try {
   await run();
-} catch {
-  console.error("GhostProv V2 sidecar failed");
+} catch (error) {
+  const value = error instanceof Error ? error : new Error("Unknown sidecar failure");
+  const code = "code" in value && typeof (value as { code?: unknown }).code === "string"
+    ? String((value as { code: string }).code).slice(0, 64)
+    : "fatal";
+  console.error(JSON.stringify({
+    event: "ghostprov_v2_sidecar_fatal",
+    error_name: value.name.slice(0, 64),
+    error_code: code,
+    cause_name: value.cause instanceof Error ? value.cause.name.slice(0, 64) : null,
+  }));
   Deno.exit(1);
 }

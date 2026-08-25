@@ -17,6 +17,7 @@ import {
   createGhostProvServer,
   requestBodyLimitForUrl,
 } from "../src/server/runtime";
+import type { IncomingResourceLease } from "../src/router/router";
 import {
   finalResponse,
   messageOutput,
@@ -42,6 +43,7 @@ type RelayOptions = {
   clientId?: string;
   source?: "http" | "websocket" | "image" | "anthropic" | "internal";
   signal?: AbortSignal;
+  incomingLease?: IncomingResourceLease;
 };
 
 type RelayCall = {
@@ -1434,6 +1436,56 @@ describe("Anthropic runtime body limits", () => {
     expect(body).toMatchObject({ type: "error", error: { type: "request_too_large" } });
     expect(router.calls).toHaveLength(0);
   }, 15_000);
+
+  it("hands the Anthropic ingress lease to its one relay admission", async () => {
+    const base = new FakeRouter();
+    let releases = 0;
+    const lease: IncomingResourceLease = {
+      release() { releases++; },
+    };
+    const router: RouterLike = {
+      snapshot: () => base.snapshot(),
+      startRelay: (body, options) => base.startRelay(body, options),
+      acquireIncomingBody: async () => lease,
+    };
+    const port = await listen(createGhostProvApp({ router }), router);
+    const body = JSON.stringify(messageRequest());
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        ...ANTHROPIC_HEADERS,
+        "content-length": String(Buffer.byteLength(body)),
+      },
+      body,
+    });
+
+    expect(response.status).toBe(200);
+    expect(base.calls).toHaveLength(1);
+    expect(base.calls[0].options.incomingLease).toBe(lease);
+    expect(releases).toBe(1);
+  });
+
+  it("releases a zero-body lease when Anthropic parsing fails before handoff", async () => {
+    const base = new FakeRouter();
+    let releases = 0;
+    const router: RouterLike = {
+      snapshot: () => base.snapshot(),
+      startRelay: (body, options) => base.startRelay(body, options),
+      acquireIncomingBody: async () => ({
+        release() { releases++; },
+      }),
+    };
+    const port = await listen(createGhostProvApp({ router }), router);
+    const response = await nodeRequest({
+      port,
+      path: "/v1/messages",
+      headers: { ...ANTHROPIC_HEADERS, "content-length": 0 },
+    });
+
+    expect(response.status).toBe(400);
+    expect(base.calls).toHaveLength(0);
+    expect(releases).toBe(1);
+  });
 
   it("aborts a blocked incoming-body lease when the client disconnects", async () => {
     let leaseStarted!: () => void;

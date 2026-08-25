@@ -32,9 +32,68 @@ interface QueuedLine {
   bytes: number;
 }
 
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/**
+ * Fleet JSONL remains complete on disk, while the console gets a fixed-size
+ * rollup. Printing every per-runtime diagnostic object to a terminal can block
+ * the event loop under a large fleet even though file logging is asynchronous.
+ */
+export function formatConsoleObservabilityLine(line: string): string {
+  const trimmed = line.trimEnd();
+  if (!trimmed.includes('"event":"fleet.sample"')) return trimmed;
+  try {
+    const event = record(JSON.parse(trimmed));
+    if (!event || event.event !== "fleet.sample") return trimmed;
+    const runtimeStates: Record<string, number> = {};
+    if (Array.isArray(event.runtimes)) {
+      for (const candidate of event.runtimes) {
+        const runtime = record(candidate);
+        const state = typeof runtime?.state === "string" ? runtime.state : "unknown";
+        runtimeStates[state] = (runtimeStates[state] ?? 0) + 1;
+      }
+    }
+    const resources = record(event.resources);
+    const traffic = record(event.traffic);
+    const trafficTotal = record(traffic?.total);
+    return JSON.stringify({
+      schema: event.schema,
+      event: event.event,
+      ts: event.ts,
+      capacity: event.capacity,
+      active: event.active,
+      available: event.available,
+      queued: event.queued,
+      cpu_percent: event.cpu_percent,
+      rss_bytes: event.rss_bytes,
+      event_loop_p95_ms: event.event_loop_p95_ms,
+      runtime_states: runtimeStates,
+      pressure: resources ? {
+        memory_paused: resources.memory_paused,
+        governor_queued: resources.governor_queued,
+        cpu_queued: resources.cpu_queued,
+        transform_queued: resources.transform_queued,
+      } : null,
+      logger: event.logger,
+      traffic: traffic ? {
+        requests_per_second: traffic.requests_per_second,
+        success_rate: traffic.success_rate,
+        failed: traffic.failed,
+        total_p95_ms: trafficTotal?.p95_ms,
+      } : null,
+    });
+  } catch {
+    return trimmed;
+  }
+}
+
 class ConsoleSink implements ObservabilitySink {
   async writeBatch(lines: readonly string[]): Promise<void> {
-    for (const line of lines) console.log(line.trimEnd());
+    for (const line of lines) console.log(formatConsoleObservabilityLine(line));
   }
   async close(): Promise<void> {}
 }

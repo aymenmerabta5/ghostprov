@@ -41,9 +41,6 @@ export function resolveV2BootstrapProbeOptions(
   if (env.GP_CANDIDATE !== "1") {
     throw new Error("Set GP_CANDIDATE=1; the V2 bootstrap probe is candidate-only");
   }
-  if (env.GP_TRANSPORT !== "v2") {
-    throw new Error("Set GP_TRANSPORT=v2 for the V2 bootstrap probe");
-  }
   const rawProject = env.GP_LIVE_V2_PROJECT_ID?.trim();
   if (!rawProject) throw new Error("GP_LIVE_V2_PROJECT_ID is required");
   if (rawProject.includes(",")) {

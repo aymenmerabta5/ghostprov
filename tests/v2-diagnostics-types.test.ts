@@ -13,13 +13,18 @@ export function safeDiagnostics(): V2EnvelopeDiagnostics {
       heapUsedBytes: 50,
       heapTotalBytes: 80,
       externalBytes: 10,
+      arrayBufferBytes: 4,
       systemTotalBytes: null,
       systemFreeBytes: null,
       processCpuPercent: null,
       normalizedLoad1: null,
+      eventLoopSamples: 10,
       eventLoopP50Ms: 1,
       eventLoopP95Ms: 2,
       eventLoopMaxMs: 3,
+      gcSamples: 2,
+      gcDurationP95Ms: 4,
+      gcDurationMaxMs: 5,
     },
     transport: {
       windowFrames: 1,
@@ -70,5 +75,24 @@ describe("V2 diagnostic types", () => {
     })).toBeNull();
     expect(parseDiagnosticObject({ ...safeDiagnostics(), unknown: 1 })).toBeNull();
     expect(parseDiagnosticObject({ ...safeDiagnostics(), padding: "x".repeat(3_000) })).toBeNull();
+  });
+
+  it("normalizes metrics absent from an older sidecar envelope", () => {
+    const value = safeDiagnostics();
+    const legacyResource = { ...value.resource } as Record<string, unknown>;
+    for (const key of [
+      "arrayBufferBytes",
+      "eventLoopSamples",
+      "gcSamples",
+      "gcDurationP95Ms",
+      "gcDurationMaxMs",
+    ]) delete legacyResource[key];
+    expect(parseDiagnosticObject({ ...value, resource: legacyResource })?.resource).toMatchObject({
+      arrayBufferBytes: null,
+      eventLoopSamples: 0,
+      gcSamples: 0,
+      gcDurationP95Ms: 0,
+      gcDurationMaxMs: 0,
+    });
   });
 });

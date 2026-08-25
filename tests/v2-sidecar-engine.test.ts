@@ -16,6 +16,35 @@ import {
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
 describe("SidecarEngine", () => {
+  it("aborts startup without waiting for a stalled journal recovery", async () => {
+    const harness = new SidecarHarness({
+      beforeReadRecords: () => new Promise<void>(() => undefined),
+    });
+    const controller = new AbortController();
+    const starting = harness.engine.start(controller.signal);
+    controller.abort();
+
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("can hold synchronized frames until staged startup completes", async () => {
+    const harness = new SidecarHarness({ deferAcceptUntilStarted: true });
+    let accepted = false;
+    const waiting = harness.engine.accept({
+      kind: "ping",
+      sentAtMs: 99,
+      epoch: 1,
+      sequence: 0,
+    }).then(() => { accepted = true; });
+
+    await Bun.sleep(0);
+    expect(accepted).toBe(false);
+    await harness.engine.start();
+    await waiting;
+
+    expect(harness.frames).toEqual([{ kind: "pong", sentAtMs: 99 }]);
+  });
+
   it("retains the legacy reliable bootstrap ping without touching journal or upstream", async () => {
     const harness = new SidecarHarness();
     await harness.engine.start();
@@ -143,6 +172,81 @@ describe("SidecarEngine", () => {
     expect(harness.journal.canRetry(harness.requestId)).toBe(false);
   });
 
+  it("durably replays a definitive provider error without changing it to ambiguity", async () => {
+    const rateLimit = { retryAfterMs: 123, limitTokens: 40_000_000 };
+    const first = new SidecarHarness({
+      behavior: async input => {
+        await input.beforeFetch();
+        throw new UpstreamExecutionError(
+          "Rate limit reached",
+          "rate_limit_exceeded",
+          false,
+          429,
+          rateLimit,
+        );
+      },
+    });
+    await first.sendRequest(BODY);
+    await first.settle();
+    expect(first.journal.status(first.requestId)).toBe("provider_error");
+
+    const restarted = new SidecarHarness({ records: first.storage.records });
+    await restarted.engine.start();
+    await restarted.engine.replayRecovered();
+
+    expect(restarted.upstream.calls).toBe(0);
+    expect(restarted.frames).toEqual([
+      expect.objectContaining({ kind: "request_ack", requestId: first.requestId }),
+      expect.objectContaining({
+        kind: "response_error",
+        requestId: first.requestId,
+        code: "rate_limit_exceeded",
+        message: "Rate limit reached",
+        ambiguous: false,
+        rateLimit,
+      }),
+    ]);
+    await restarted.engine.acknowledgeDeliveredOutcomes([first.requestId]);
+    expect(restarted.journal.status(first.requestId)).toBe("acked");
+  });
+
+  it("durably replays client cancellation without executing upstream again", async () => {
+    const first = new SidecarHarness({
+      behavior: async input => {
+        await input.beforeFetch();
+        if (input.signal?.aborted) {
+          throw new UpstreamExecutionError("cancelled", "cancelled", true);
+        }
+        return new Promise<UpstreamTerminal>((_resolve, reject) => {
+          input.signal?.addEventListener("abort", () => reject(
+            new UpstreamExecutionError("cancelled", "cancelled", true),
+          ), { once: true });
+        });
+      },
+    });
+    await first.sendRequest(BODY);
+    await first.engine.accept({
+      kind: "request_cancel",
+      requestId: first.requestId,
+      reason: "client stopped",
+      epoch: 1,
+      sequence: 3,
+    });
+    await first.settle();
+    expect(first.journal.status(first.requestId)).toBe("cancelled");
+
+    const restarted = new SidecarHarness({ records: first.storage.records });
+    await restarted.engine.start();
+    await restarted.engine.replayRecovered();
+    expect(restarted.upstream.calls).toBe(0);
+    expect(restarted.frames).toEqual([
+      expect.objectContaining({ kind: "request_ack", requestId: first.requestId }),
+      { kind: "request_cancelled", requestId: first.requestId },
+    ]);
+    await restarted.engine.acknowledgeDeliveredOutcomes([first.requestId]);
+    expect(restarted.journal.status(first.requestId)).toBe("acked");
+  });
+
   it("persists terminal before publishing and deletes it only after matching host ACK", async () => {
     const harness = new SidecarHarness();
     await harness.sendRequest(BODY);
@@ -227,6 +331,7 @@ describe("SidecarEngine", () => {
     });
 
     await restarted.engine.start();
+    await restarted.engine.replayRecovered();
 
     expect(restarted.upstream.calls).toBe(0);
     expect(restarted.frames).toContainEqual(expect.objectContaining({
@@ -234,6 +339,106 @@ describe("SidecarEngine", () => {
       responseId: "resp_1",
     }));
     expect(restarted.frames.filter(frame => frame.kind === "response_event").length).toBeGreaterThan(0);
+    expect(restarted.frames.findIndex(frame => frame.kind === "request_ack")).toBeLessThan(
+      restarted.frames.findIndex(frame => frame.kind === "response_event"),
+    );
+  });
+
+  it("validates the complete recovered terminal before exposing any event", async () => {
+    const first = new SidecarHarness();
+    await first.sendRequest(BODY);
+    await first.settle();
+    const terminals = new Map(first.storage.terminals);
+    const tampered = terminals.get(first.requestId)!.slice();
+    tampered[0] = "!".charCodeAt(0);
+    terminals.set(first.requestId, tampered);
+    const restarted = new SidecarHarness({
+      records: first.storage.records,
+      terminals,
+    });
+
+    await restarted.engine.start();
+    await restarted.engine.replayRecovered();
+
+    expect(restarted.frames.some(frame => frame.kind === "response_event")).toBe(false);
+    expect(restarted.frames).toEqual([
+      expect.objectContaining({ kind: "request_ack", requestId: first.requestId }),
+      expect.objectContaining({
+        kind: "response_error",
+        requestId: first.requestId,
+        code: "terminal_recovery_failed",
+        ambiguous: true,
+      }),
+    ]);
+  });
+
+  it("turns a recovered spool read failure into a deterministic committed error", async () => {
+    const first = new SidecarHarness();
+    await first.sendRequest(BODY);
+    await first.settle();
+    const fatals: Error[] = [];
+    const restarted = new SidecarHarness({
+      records: first.storage.records,
+      terminals: first.storage.terminals,
+      terminalReadError: new Error("disk unavailable"),
+      onFatalError: error => fatals.push(error),
+    });
+
+    await restarted.engine.start();
+    await restarted.engine.replayRecovered();
+
+    expect(fatals).toHaveLength(1);
+    expect(restarted.frames).toEqual([
+      expect.objectContaining({ kind: "request_ack", requestId: first.requestId }),
+      expect.objectContaining({
+        kind: "response_error",
+        code: "terminal_recovery_failed",
+        ambiguous: true,
+      }),
+    ]);
+  });
+
+  it("scans recovery without output and preserves proven terminals if delivery aborts", async () => {
+    const first = new SidecarHarness();
+    await first.sendRequest(BODY);
+    await first.settle();
+    const backpressure = new OutputBackpressure({
+      highFrames: 1,
+      highBytes: 1,
+      lowFrames: 0,
+      lowBytes: 0,
+      hardFrames: 2,
+      hardBytes: 2,
+    });
+    backpressure.update({ frames: 1, bytes: 0 });
+    const restarted = new SidecarHarness({
+      records: first.storage.records,
+      terminals: first.storage.terminals,
+      outputBackpressure: backpressure,
+    });
+
+    const startedAt = performance.now();
+    await restarted.engine.start();
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(restarted.frames).toEqual([]);
+    expect(restarted.engine.snapshot()).toMatchObject({ ready: true, ambiguous: 0 });
+    expect(restarted.storage.terminalExistenceChecks).toBeGreaterThan(0);
+    expect(restarted.storage.terminalReads).toBe(0);
+
+    const controller = new AbortController();
+    const replay = restarted.engine.replayRecovered(controller.signal);
+    for (let attempt = 0; attempt < 50 && backpressure.snapshot().waiters === 0; attempt++) {
+      await Bun.sleep(1);
+    }
+    expect(backpressure.snapshot().waiters).toBe(1);
+    controller.abort();
+    await expect(replay).rejects.toMatchObject({ name: "AbortError" });
+    expect(restarted.storage.terminalReads).toBe(1);
+    expect(backpressure.snapshot().waiters).toBe(0);
+    expect(restarted.engine.snapshot()).toMatchObject({ ambiguous: 0, replaying: 0 });
+    expect(restarted.frames.some(frame => frame.kind === "response_error")).toBe(false);
+    backpressure.close();
   });
 
   it("reports unresolved FETCH_STARTING as ambiguous and never replays it", async () => {
@@ -260,6 +465,7 @@ describe("SidecarEngine", () => {
     const harness = new SidecarHarness({ records });
 
     await harness.engine.start();
+    await harness.engine.replayRecovered();
 
     expect(harness.upstream.calls).toBe(0);
     expect(harness.frames).toContainEqual(expect.objectContaining({
@@ -267,6 +473,9 @@ describe("SidecarEngine", () => {
       requestId: "req-ambiguous",
       ambiguous: true,
     }));
+    expect(harness.frames.findIndex(frame => frame.kind === "request_ack")).toBeLessThan(
+      harness.frames.findIndex(frame => frame.kind === "response_error"),
+    );
     expect(harness.engine.snapshot().ambiguous).toBe(1);
   });
 
@@ -278,6 +487,116 @@ describe("SidecarEngine", () => {
 
     await harness.sendRequest(BODY);
     await harness.settle();
+    expect(harness.upstream.calls).toBe(0);
+    expect(harness.frames).toContainEqual(expect.objectContaining({
+      kind: "request_reject",
+      code: "draining",
+    }));
+  });
+
+  it("bounds drain and aborts an execution that exceeds the deadline", async () => {
+    let aborted = false;
+    const harness = new SidecarHarness({
+      drainTimeoutMs: 10,
+      drainAbortSettlementMs: 10,
+      behavior: async input => {
+        await input.beforeFetch();
+        return new Promise<UpstreamTerminal>((_resolve, reject) => {
+          input.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(new UpstreamExecutionError("drain timeout", "timeout", true));
+          }, { once: true });
+        });
+      },
+    });
+    await harness.sendRequest(BODY);
+
+    const startedAt = performance.now();
+    await harness.engine.drain("deadline test");
+    await harness.settle();
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(aborted).toBe(true);
+    expect(harness.engine.snapshot()).toMatchObject({
+      draining: true,
+      active: 0,
+      forcedDrain: true,
+      ambiguous: 1,
+    });
+    expect(harness.frames).toContainEqual(expect.objectContaining({
+      kind: "response_error",
+      code: "forced_drain_cancelled",
+      ambiguous: true,
+    }));
+    expect(harness.frames.some(frame => frame.kind === "request_cancelled")).toBe(false);
+    expect(harness.journal.status(harness.requestId)).toBe("forced_ambiguous");
+
+    const restarted = new SidecarHarness({ records: harness.storage.records });
+    await restarted.engine.start();
+    await restarted.engine.replayRecovered();
+    expect(restarted.frames).toEqual([
+      expect.objectContaining({ kind: "request_ack", requestId: harness.requestId }),
+      expect.objectContaining({
+        kind: "response_error",
+        code: "forced_drain_cancelled",
+        ambiguous: true,
+      }),
+    ]);
+  });
+
+  it("reports a non-clean forced drain when upstream ignores cancellation", async () => {
+    const harness = new SidecarHarness({
+      drainTimeoutMs: 10,
+      drainAbortSettlementMs: 10,
+      behavior: async input => {
+        await input.beforeFetch();
+        return new Promise<UpstreamTerminal>(() => undefined);
+      },
+    });
+    await harness.sendRequest(BODY);
+
+    const startedAt = performance.now();
+    await harness.engine.drain("forced deadline test");
+
+    expect(performance.now() - startedAt).toBeGreaterThanOrEqual(15);
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(harness.frames).toContainEqual(expect.objectContaining({
+      kind: "response_error",
+      requestId: harness.requestId,
+      code: "forced_drain_cancelled",
+      ambiguous: true,
+    }));
+    expect(harness.frames.at(-1)).toEqual({ kind: "drained", active: 1, queued: 0 });
+  });
+
+  it("never reports a clean drain while a pre-fetch commit is still settling", async () => {
+    let appendStarted!: () => void;
+    const started = new Promise<void>(resolve => { appendStarted = resolve; });
+    let releaseAppend!: () => void;
+    const appendBlocked = new Promise<void>(resolve => { releaseAppend = resolve; });
+    let firstAppend = true;
+    const harness = new SidecarHarness({
+      drainTimeoutMs: 10,
+      drainAbortSettlementMs: 10,
+      beforeAppend: async () => {
+        if (!firstAppend) return;
+        firstAppend = false;
+        appendStarted();
+        await appendBlocked;
+      },
+    });
+    const sending = harness.sendRequest(BODY);
+    await started;
+
+    await harness.engine.drain("commit deadline test");
+
+    expect(harness.engine.snapshot()).toMatchObject({ forcedDrain: true, active: 0 });
+    expect(harness.frames.some(frame => frame.kind === "request_ack")).toBe(false);
+    expect(harness.frames.at(-1)).toEqual({ kind: "drained", active: 1, queued: 0 });
+    expect(harness.upstream.calls).toBe(0);
+
+    releaseAppend();
+    await sending;
     expect(harness.upstream.calls).toBe(0);
     expect(harness.frames).toContainEqual(expect.objectContaining({
       kind: "request_reject",

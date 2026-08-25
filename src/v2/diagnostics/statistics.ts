@@ -21,13 +21,19 @@ export class BoundedDistribution {
     this.#count = Math.min(this.#count + 1, this.#values.length);
   }
 
-  snapshotAndReset(): DistributionSnapshot {
+  /** A bounded rolling snapshot. Reading diagnostics must not mutate them. */
+  snapshot(): DistributionSnapshot {
     const sorted = Array.from(this.#values.subarray(0, this.#count)).sort((a, b) => a - b);
     const percentile = (p: number) => sorted.length
       ? sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)]!
       : 0;
-    const snapshot = { count: sorted.length, p50: percentile(0.5), p95: percentile(0.95), max: percentile(1) };
-    this.#count = 0; this.#cursor = 0;
+    return { count: sorted.length, p50: percentile(0.5), p95: percentile(0.95), max: percentile(1) };
+  }
+
+  snapshotAndReset(): DistributionSnapshot {
+    const snapshot = this.snapshot();
+    this.#count = 0;
+    this.#cursor = 0;
     return snapshot;
   }
 }

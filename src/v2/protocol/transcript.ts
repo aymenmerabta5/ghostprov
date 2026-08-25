@@ -1,4 +1,4 @@
-import { sanitizeFinal, type SseFrame } from "../../relay/sse";
+import type { SseFrame } from "../../relay/sse";
 import {
   canonicalJson,
   sha256Hex,
@@ -99,7 +99,15 @@ export class TranscriptProof {
     this.#maxBytes = maxBytes;
   }
 
-  append(frame: SseFrame): void {
+  get eventCount(): number {
+    return this.#eventCount;
+  }
+
+  get byteCount(): number {
+    return this.#byteCount;
+  }
+
+  append(frame: SseFrame): number {
     if (!frame.event || typeof frame.data !== "string") {
       throw new V2TerminalProofError("SSE frame is invalid", "frame");
     }
@@ -138,6 +146,7 @@ export class TranscriptProof {
     }
     this.#eventCount++;
     this.#byteCount += bytes.byteLength;
+    return bytes.byteLength;
   }
 
   async createTerminal(
@@ -226,5 +235,5 @@ export async function validateTerminalProof(
   if (terminal.transcriptSha256 !== transcriptDigest) {
     throw new V2TerminalProofError("Terminal transcript digest does not match", "transcript_digest");
   }
-  return sanitizeFinal(snapshot.final);
+  return snapshot.final;
 }

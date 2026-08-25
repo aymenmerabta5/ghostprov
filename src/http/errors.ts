@@ -39,71 +39,6 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function parseJson(value: unknown): unknown {
-  if (typeof value !== "string") return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
-function statusFromDaemonCode(value: unknown): number | null {
-  if (typeof value !== "string") return null;
-  const match = /^(?:http|rate_limited)_(\d{3})$/.exec(value);
-  if (!match) return null;
-  const status = Number(match[1]);
-  return status >= 400 && status <= 599 ? status : null;
-}
-
-function normalizeOpenAIError(value: unknown, fallbackMessage: string): OpenAIErrorShape {
-  const candidate = record(value);
-  return {
-    message: typeof candidate?.message === "string" && candidate.message.length > 0
-      ? candidate.message
-      : fallbackMessage,
-    type: typeof candidate?.type === "string" && candidate.type.length > 0
-      ? candidate.type
-      : "upstream_error",
-    param: typeof candidate?.param === "string" ? candidate.param : null,
-    code: typeof candidate?.code === "string" ? candidate.code : null,
-  };
-}
-
-function daemonEnvelope(error: unknown): Record<string, unknown> | null {
-  const candidate = record(error);
-  const details = record(candidate?.details);
-  if (details) return details;
-
-  const message = error instanceof Error
-    ? error.message
-    : typeof candidate?.message === "string"
-      ? candidate.message
-      : "";
-  const marker = "upstream failed:";
-  const index = message.indexOf(marker);
-  if (index === -1) return null;
-  return record(parseJson(message.slice(index + marker.length).trim()));
-}
-
-function normalizeDaemonError(error: unknown): NormalizedApiError | null {
-  const envelope = daemonEnvelope(error);
-  if (!envelope) return null;
-
-  const status = statusFromDaemonCode(envelope.code) ?? 502;
-  const parsedBody = parseJson(envelope.message);
-  const body = record(parsedBody);
-  const upstreamError = body?.error ?? parsedBody;
-  const fallbackMessage = typeof envelope.message === "string" && envelope.message.length > 0
-    ? envelope.message
-    : "Upstream request failed";
-
-  return {
-    status,
-    error: normalizeOpenAIError(upstreamError, fallbackMessage),
-  };
-}
-
 function relayKind(error: unknown): string | null {
   const candidate = record(error);
   return typeof candidate?.kind === "string" ? candidate.kind : null;
@@ -161,6 +96,65 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
   }
 
   const structured = record(error);
+  if (structured?.name === "ResourceReservationTooLargeError") {
+    return {
+      status: 413,
+      error: {
+        message: "Request body is too large for this GhostProv host",
+        type: "invalid_request_error",
+        param: "body",
+        code: "request_too_large",
+      },
+    };
+  }
+  if (
+    structured?.name === "ResourceGovernorQueueFullError" ||
+    structured?.name === "ResourceGovernorReplacementOverloadError" ||
+    structured?.name === "ResourceGovernorTimeoutError" ||
+    structured?.name === "ResourceGovernorClosedError"
+  ) {
+    const code = structured.name === "ResourceGovernorQueueFullError" ||
+        structured.name === "ResourceGovernorReplacementOverloadError"
+      ? structured.name === "ResourceGovernorReplacementOverloadError"
+        ? "resource_replacement_overloaded"
+        : "resource_admission_overloaded"
+      : structured.name === "ResourceGovernorTimeoutError"
+        ? "resource_admission_timeout"
+        : "resource_governor_closed";
+    return {
+      status: 503,
+      error: {
+        message: structured.name === "ResourceGovernorTimeoutError"
+          ? "GhostProv resource admission timed out"
+          : structured.name === "ResourceGovernorClosedError"
+            ? "GhostProv resource admission is shutting down"
+            : "GhostProv resource admission is temporarily overloaded",
+        type: structured.name === "ResourceGovernorQueueFullError" ||
+            structured.name === "ResourceGovernorReplacementOverloadError"
+          ? "overloaded_error"
+          : "service_unavailable_error",
+        param: null,
+        code,
+      },
+    };
+  }
+  if (
+    structured?.name === "CpuTransformQueueFullError" ||
+    structured?.name === "CpuTransformTimeoutError"
+  ) {
+    const timedOut = structured.name === "CpuTransformTimeoutError";
+    return {
+      status: 503,
+      error: {
+        message: timedOut
+          ? "GhostProv request preparation timed out"
+          : "GhostProv request preparation is temporarily overloaded",
+        type: timedOut ? "service_unavailable_error" : "overloaded_error",
+        param: null,
+        code: timedOut ? "cpu_transform_timeout" : "cpu_transform_overloaded",
+      },
+    };
+  }
   if (
     structured?.name === "RouterShutdownError" &&
     structured.status === 503 &&
@@ -194,30 +188,6 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
   if (
-    structured?.name === "RouterRateLimitedError" &&
-    structured.status === 429 &&
-    structured.code === "rate_limit_exceeded"
-  ) {
-    const problem = record(structured.problem);
-    return {
-      status: 429,
-      error: {
-        message: typeof problem?.message === "string"
-          ? problem.message
-          : error instanceof Error
-            ? error.message
-            : "Upstream token rate limit is cooling down",
-        type: typeof problem?.type === "string" ? problem.type : "rate_limit_error",
-        param: typeof problem?.param === "string" ? problem.param : null,
-        code: typeof problem?.code === "string" ? problem.code : "rate_limit_exceeded",
-      },
-    };
-  }
-
-  const daemon = normalizeDaemonError(error);
-  if (daemon) return daemon;
-
-  if (
     isRateLimited(error) ||
     structured?.code === "rate_limit_exceeded" ||
     structured?.code === "rate_limit"
@@ -241,7 +211,7 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
 
   switch (kind) {
     case "exhausted":
-      return { status: 429, error: { message, type: "rate_limit_error", param: null, code: "rate_limit_exceeded" } };
+      return { status: 503, error: { message, type: "overloaded_error", param: null, code: "capacity_exhausted" } };
     case "no-bridge":
       return { status: 503, error: { message, type: "service_unavailable_error", param: null, code: "bridge_unavailable" } };
     case "timeout":

@@ -26,7 +26,6 @@ describe("multi-sandbox configuration", () => {
     expect(config.cookieFile).toMatch(/prism-cookies\.json$/);
     expect(config.port).toBe(18787);
     expect(config.candidate).toBe(true);
-    expect(config.slotsPerProject).toBe(30);
   });
 
   it("defaults to authenticated V2-ready fleet policy", () => {
@@ -36,7 +35,7 @@ describe("multi-sandbox configuration", () => {
       GP_CANDIDATE: "1",
     }, MACHINE);
 
-    expect(config.transport).toBe("auto");
+    expect(config).not.toHaveProperty("transport");
     expect(config.sessionMode).toBe("authenticated");
     expect(config.allowAnonymous).toBe(false);
     expect(config.guestMaxProjects).toBe(1);
@@ -54,7 +53,6 @@ describe("multi-sandbox configuration", () => {
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
     expect(config.shutdownDrainMs).toBe(300_000);
-    expect(config.rateLimitColdMaxActive).toBe(16);
   });
 
   it("parses bounded opt-in V2 diagnostics", () => {
@@ -76,57 +74,34 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow("GP_V2_DIAGNOSTICS");
   });
 
-  it("parses dashboard-declared shared TPM model groups without guessing others", () => {
-    const config = resolveMultiSandboxConfig({
-      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      PRISM_PROJECT_IDS: A,
-      GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-luna,gpt-5.5",
-      GP_RATE_LIMIT_COLD_MAX_ACTIVE: "24",
-      GP_SHUTDOWN_DRAIN_MS: "600000",
-    }, MACHINE);
-    expect(config.rateLimitSharedModelGroups).toEqual([
-      ["gpt-5.6-sol", "gpt-5.6-terra"],
-      ["gpt-5.6-luna", "gpt-5.5"],
-    ]);
-    expect(config.rateLimitColdMaxActive).toBe(24);
-    expect(config.shutdownDrainMs).toBe(600_000);
+  it("rejects project creation and project-less V2 configuration", () => {
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      PRISM_PROJECT_IDS: A,
-      GP_RATE_LIMIT_SHARED_MODEL_GROUPS: "gpt-5.6-sol,gpt-5.6-terra;gpt-5.6-sol,gpt-5.6-luna",
-    }, MACHINE)).toThrow("multiple groups");
-    expect(() => resolveMultiSandboxConfig({
-      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      PRISM_PROJECT_IDS: A,
-      GP_RATE_LIMIT_COLD_MAX_ACTIVE: "129",
-    }, MACHINE)).toThrow("GP_RATE_LIMIT_COLD_MAX_ACTIVE");
-  });
-
-  it("allows a project-less managed V2 fleet and derives its size", () => {
-    const config = resolveMultiSandboxConfig({
-      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      GP_TRANSPORT: "v2",
       GP_AUTO_CREATE_PROJECTS: "1",
       GP_TARGET_CONCURRENCY: "1024",
       GP_MAX_PROJECTS: "16",
       GP_CANDIDATE: "1",
-    }, MACHINE);
-
-    expect(config.projectIds).toEqual([]);
-    expect(config.desiredSandboxes).toBe(16);
+    }, MACHINE)).toThrow("GP_AUTO_CREATE_PROJECTS");
+    expect(() => resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      GP_CANDIDATE: "1",
+    }, MACHINE)).toThrow("PRISM_PROJECT_IDS");
   });
 
   it("bounds transport-active capacity below the physical engine ceiling", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: `${A},${B}`,
-      GP_TARGET_SANDBOXES: "2",
+      GP_TARGET_SANDBOXES: "1",
+      GP_TARGET_CONCURRENCY: "1",
       GP_V2_INITIAL_ACTIVE_PER_SANDBOX: "4",
       GP_V2_MAX_ACTIVE_PER_SANDBOX: "12",
     }, MACHINE);
     expect(config.v2InitialActivePerSandbox).toBe(4);
     expect(config.v2MaxActivePerSandbox).toBe(12);
     expect(config.desiredSandboxes).toBe(2);
+    expect(config).not.toHaveProperty("targetSandboxes");
+    expect(config).not.toHaveProperty("targetConcurrency");
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
@@ -140,15 +115,13 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow("physical");
   });
 
-  it("requires explicit guest mode and caps it independently", () => {
+  it("requires explicit guest mode and enforces its configured-project cap", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-guest.json",
+      PRISM_PROJECT_IDS: `${A},${B}`,
       GP_PRISM_SESSION: "anonymous",
-      GP_TRANSPORT: "v2",
-      GP_TARGET_SANDBOXES: "4",
       GP_GUEST_MAX_PROJECTS: "2",
       GP_MAX_PROJECTS: "8",
-      GP_AUTO_CREATE_PROJECTS: "1",
       GP_CANDIDATE: "1",
     }, MACHINE);
 
@@ -156,11 +129,21 @@ describe("multi-sandbox configuration", () => {
     expect(config.desiredSandboxes).toBe(2);
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-guest.json",
+      PRISM_PROJECT_IDS: `${A},${B}`,
       GP_PRISM_SESSION: "anonymous",
-      GP_TRANSPORT: "v1",
-      PRISM_PROJECT_IDS: A,
-      GP_CANDIDATE: "1",
-    }, MACHINE)).toThrow("anonymous Prism sessions require GP_TRANSPORT=v2");
+      GP_GUEST_MAX_PROJECTS: "1",
+      GP_MAX_PROJECTS: "8",
+    }, MACHINE)).toThrow("GP_GUEST_MAX_PROJECTS=1");
+  });
+
+  it("rejects every non-explicit project reuse policy", () => {
+    for (const projectReuse of ["managed", "eligible-owned"]) {
+      expect(() => resolveMultiSandboxConfig({
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: A,
+        GP_PROJECT_REUSE: projectReuse,
+      }, MACHINE)).toThrow("must be explicit");
+    }
   });
 
   it("preserves legacy PRISM_DOC_ID as a single-project allowlist", () => {
@@ -199,22 +182,14 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE: "session=value",
       GP_HEARTBEAT_MS: "10000",
       GP_MAX_PROJECTS: "4",
-      GP_SLOTS: "24",
     }, MACHINE);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.maxProjects).toBe(4);
-    expect(config.slotsPerProject).toBe(24);
     expect(() => resolveMultiSandboxConfig({
       PRISM_PROJECT_IDS: A,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_COOKIE: "session=value",
       GP_HEARTBEAT_MS: "10001",
     }, MACHINE)).toThrow("10000");
-    expect(() => resolveMultiSandboxConfig({
-      PRISM_PROJECT_IDS: A,
-      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      PRISM_COOKIE: "session=value",
-      GP_SLOTS: "31",
-    }, MACHINE)).toThrow("30");
   });
 });

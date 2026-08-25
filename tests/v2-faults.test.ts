@@ -47,6 +47,7 @@ describe("V2 deterministic fault recovery", () => {
     const restarted = new SidecarHarness({ records: first.storage.records });
 
     await restarted.engine.start();
+    await restarted.engine.replayRecovered();
 
     expect(first.upstream.calls).toBe(1);
     expect(restarted.upstream.calls).toBe(0);
@@ -66,6 +67,7 @@ describe("V2 deterministic fault recovery", () => {
     });
 
     await restarted.engine.start();
+    await restarted.engine.replayRecovered();
 
     expect(restarted.upstream.calls).toBe(0);
     expect(restarted.frames.some(frame => frame.kind === "response_terminal")).toBe(true);

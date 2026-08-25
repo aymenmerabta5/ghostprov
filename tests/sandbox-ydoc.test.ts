@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import {
   SandboxYDoc,
   YDocSessionError,
+  type YProviderEvent,
   type YProviderFactory,
   type YProviderLike,
 } from "../src/sandbox/ydoc";
@@ -13,14 +14,14 @@ const A = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const B = projectId("69288e8b-c183-45f3-9131-d64b05b98928");
 
 class FakeProvider implements YProviderLike {
-  private listeners = new Map<string, Array<(...args: any[]) => void>>();
+  private listeners = new Map<YProviderEvent, Array<(...args: any[]) => void>>();
   destroyed = false;
-  on(event: string, listener: (...args: any[]) => void): void {
+  on(event: YProviderEvent, listener: (...args: any[]) => void): void {
     const values = this.listeners.get(event) ?? [];
     values.push(listener);
     this.listeners.set(event, values);
   }
-  emit(event: string, ...args: any[]): void {
+  emit(event: YProviderEvent, ...args: any[]): void {
     for (const listener of this.listeners.get(event) ?? []) listener(...args);
   }
   destroy(): void { this.destroyed = true; }
@@ -33,6 +34,7 @@ class FakeProviderFactory implements YProviderFactory {
   constructor(
     private readonly autoSync = true,
     private readonly seedRoot = true,
+    private readonly closeFirstAfterSync = false,
   ) {}
   create(envelope: YSweetEnvelope, doc: Y.Doc): YProviderLike {
     this.tokens.push(envelope.token.reveal());
@@ -48,7 +50,13 @@ class FakeProviderFactory implements YProviderFactory {
     }
     const provider = new FakeProvider();
     this.providers.push(provider);
-    if (this.autoSync) queueMicrotask(() => provider.emit("sync", true));
+    if (this.autoSync) {
+      const closeAfterSync = this.closeFirstAfterSync && this.providers.length === 1;
+      queueMicrotask(() => {
+        provider.emit("sync", true);
+        if (closeAfterSync) provider.emit("connection-close");
+      });
+    }
     return provider;
   }
 }
@@ -96,12 +104,49 @@ describe("SandboxYDoc", () => {
     const factory = new FakeProviderFactory();
     const { doc } = createDoc(A, factory, "token-1", "token-2");
     await doc.connect();
-    factory.providers[0].emit("connectionClose");
+    factory.providers[0].emit("connection-close");
+
+    expect(doc.snapshot().connected).toBe(false);
 
     await doc.writeFile("after-close.txt", "ready");
 
     expect(factory.tokens).toEqual(["token-1", "token-2"]);
     expect(await doc.readFile("after-close.txt")).toBe("ready");
+    expect(doc.snapshot().connected).toBe(true);
+  });
+
+  it("does not report a local write as successful when its provider disconnects", async () => {
+    const factory = new FakeProviderFactory();
+    const { doc } = createDoc(A, factory, "token-1", "token-2");
+    await doc.connect();
+    factory.docs[0].once("update", () => {
+      factory.providers[0].emit("connection-close");
+    });
+
+    await expect(doc.writeFile("offline.txt", "not-proven")).rejects.toMatchObject({
+      name: "YDocSessionError",
+      kind: "sync",
+    } satisfies Partial<YDocSessionError>);
+    expect(doc.snapshot().connected).toBe(false);
+
+    await doc.writeFile("after-remint.txt", "proven");
+    expect(factory.tokens).toEqual(["token-1", "token-2"]);
+    expect(await doc.readFile("after-remint.txt")).toBe("proven");
+  });
+
+  it("does not install a provider that closes synchronously after sync", async () => {
+    const factory = new FakeProviderFactory(true, true, true);
+    const { doc } = createDoc(A, factory, "token-1", "token-2");
+
+    await expect(doc.connect()).rejects.toMatchObject({
+      name: "YDocSessionError",
+      kind: "sync",
+    } satisfies Partial<YDocSessionError>);
+    expect(factory.providers[0].destroyed).toBe(true);
+    expect(doc.snapshot().connected).toBe(false);
+
+    await doc.connect();
+    expect(factory.tokens).toEqual(["token-1", "token-2"]);
     expect(doc.snapshot().connected).toBe(true);
   });
 
@@ -179,17 +224,17 @@ describe("SandboxYDoc", () => {
     const { doc } = createDoc(A, factory);
     await doc.connect();
 
-    await doc.writeFile("gp_daemon.py", "daemon");
+    await doc.writeFile("managed-asset.txt", "asset");
     const folder = await doc.ensureFolder("gp");
     expect(await doc.ensureFolder("gp")).toBe(folder);
 
     const entries = [...factory.docs[0].getMap<Y.Map<any>>("content").values()];
     const roots = entries.filter(entry => entry.get("filename") === "root" && entry.get("type") === "folder");
-    const daemon = entries.find(entry => entry.get("filename") === "gp_daemon.py");
+    const asset = entries.find(entry => entry.get("filename") === "managed-asset.txt");
     const gp = entries.find(entry => entry.get("filename") === "gp");
     expect(roots).toHaveLength(1);
     expect(roots[0].get("id")).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(daemon?.get("inFolder")).toBe(roots[0].get("id"));
+    expect(asset?.get("inFolder")).toBe(roots[0].get("id"));
     expect(gp?.get("inFolder")).toBe(roots[0].get("id"));
     expect(factory.docs[0].getMap("settings").get("init")).toBe(true);
     expect(factory.docs[0].getMap("settings").get("deleted")).toBe(false);
@@ -254,9 +299,9 @@ describe("SandboxYDoc", () => {
     const { doc } = createDoc(A, factory, "token-1", "token-2");
     await doc.connect();
     const first = factory.providers[0];
-    first.emit("connectionClose");
+    first.emit("connection-close");
     await doc.connect();
-    first.emit("connectionClose");
+    first.emit("connection-close");
     expect(doc.snapshot().connected).toBe(true);
     expect(factory.tokens).toEqual(["token-1", "token-2"]);
   });

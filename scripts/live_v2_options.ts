@@ -4,7 +4,6 @@ export interface LiveV2Options {
   scale: boolean;
   soak: boolean;
   deleteProjects: false;
-  autoCreateProjects: false;
   timeoutMs: number;
 }
 
@@ -13,7 +12,9 @@ export function resolveLiveV2Options(
   requirements: { requireScale?: boolean } = {},
 ): LiveV2Options {
   if (env.GP_LIVE_V2 !== "1") throw new Error("Set GP_LIVE_V2=1 to run V2 live canaries");
-  if (env.GP_TRANSPORT !== "v2") throw new Error("Set GP_TRANSPORT=v2 for V2 live canaries");
+  if (env.GP_AUTO_CREATE_PROJECTS === "1") {
+    throw new Error("GP_AUTO_CREATE_PROJECTS is unsupported; configure existing projects explicitly");
+  }
   const projectCount = Number(env.GP_LIVE_PROJECT_COUNT ?? 1);
   if (!Number.isSafeInteger(projectCount) || projectCount < 1 || projectCount > 4) {
     throw new Error("GP_LIVE_PROJECT_COUNT must be an integer from 1 through 4");
@@ -37,7 +38,6 @@ export function resolveLiveV2Options(
     scale,
     soak: env.GP_LIVE_V2_SOAK === "1",
     deleteProjects: false,
-    autoCreateProjects: false,
     timeoutMs,
   });
 }

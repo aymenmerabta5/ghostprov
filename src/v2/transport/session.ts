@@ -94,11 +94,17 @@ export interface V2TransportLivenessResult {
   sentAtMs: number;
 }
 
+export interface V2GzipOptions {
+  signal?: AbortSignal;
+  /** The supplied view is a disposable, complete buffer owned by the caller. */
+  inputOwnership?: "owned";
+}
+
 export interface V2TransportSessionOptions {
   binding: ProtocolBinding;
   channel: AwarenessChannel<HostFrame, SidecarFrame>;
   clock?: Clock;
-  gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+  gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
   maxResponseBytes: number;
   maxBufferedResponseBytes?: number;
   hostCeiling?: number;
@@ -126,7 +132,8 @@ interface EventAssembly {
 interface RequestState {
   requestId: string;
   requestDigest: string;
-  frames: readonly HostFrame[];
+  /** Present only until the scheduler takes ownership of every request frame. */
+  preparedFrames: readonly HostFrame[] | null;
   handle: V2RunHandle;
   transcript: TranscriptProof;
   resolveRun: (handle: RunHandle) => void;
@@ -233,7 +240,7 @@ export class V2TransportSession {
   readonly #binding: ProtocolBinding;
   readonly #channel: AwarenessChannel<HostFrame, SidecarFrame>;
   readonly #clock: Clock;
-  readonly #gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+  readonly #gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
   readonly #maxResponseBytes: number;
   readonly #maxBufferedResponseBytes: number;
   #hostCeiling: number;
@@ -492,7 +499,7 @@ export class V2TransportSession {
     }
     const requestId = `req-${crypto.randomUUID()}`;
     const diagnostics = new HostRequestDiagnosticsObserver(() => this.#clock.now());
-    const prepared = await this.#prepareRequest(requestId, body);
+    const prepared = await this.#prepareRequest(requestId, body, signal);
     diagnostics.prepared();
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
     if (this.#draining || this.#closed) {
@@ -513,7 +520,7 @@ export class V2TransportSession {
     const state: RequestState = {
       requestId,
       requestDigest: prepared.requestDigest,
-      frames: prepared.frames,
+      preparedFrames: prepared.frames,
       handle,
       transcript: new TranscriptProof(requestId, prepared.requestDigest, {
         maxBytes: this.#maxResponseBytes,
@@ -1129,9 +1136,9 @@ export class V2TransportSession {
       const event = state.completedEvents.get(state.nextEventIndex);
       if (!event) break;
       state.completedEvents.delete(state.nextEventIndex);
-      state.transcript.append(event);
+      const wireBytes = state.transcript.append(event);
       state.nextEventIndex++;
-      if (!state.cancelled) { const started=this.#clock.now(); await state.handle.acceptEvent(event); state.diagnostics.assemblyDelivered(this.#clock.now()-started); }
+      if (!state.cancelled) { const started=this.#clock.now(); await state.handle.acceptEvent(event, wireBytes); state.diagnostics.assemblyDelivered(this.#clock.now()-started); }
     }
     await this.#tryFinalize(state);
   }
@@ -1139,8 +1146,11 @@ export class V2TransportSession {
   async #tryFinalize(state: RequestState): Promise<void> {
     const terminal = state.terminal;
     if (!terminal) return;
-    const snapshot = state.transcript.snapshot();
-    if (snapshot.eventCount > terminal.eventCount) {
+    // A terminal may arrive before one or more response frames. Check the
+    // cheap counters first: snapshot() materializes the entire transcript and
+    // doing that after every newly completed event is quadratic.
+    const eventCount = state.transcript.eventCount;
+    if (eventCount > terminal.eventCount) {
       this.#failCommitted(state, new V2CommittedError(
         "Response contains more events than its terminal proof",
         "terminal_count",
@@ -1148,8 +1158,9 @@ export class V2TransportSession {
       ));
       return;
     }
-    if (snapshot.eventCount < terminal.eventCount) return;
+    if (eventCount < terminal.eventCount) return;
     if (state.assemblies.size > 0 || state.completedEvents.size > 0) return;
+    const snapshot = state.transcript.snapshot();
     let final: Record<string, unknown>;
     try {
       final = await validateTerminalProof(terminal, snapshot);
@@ -1180,6 +1191,7 @@ export class V2TransportSession {
   async #prepareRequest(
     requestId: string,
     body: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{ requestDigest: string; frames: readonly HostFrame[] }> {
     const decoded = utf8Bytes(canonicalJson(body));
     if (decoded.byteLength < 1 || decoded.byteLength > GP_V2_REQUEST_MAX_BYTES) {
@@ -1189,7 +1201,12 @@ export class V2TransportSession {
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
     if (this.#gzip) {
-      const compressed = await this.#gzip(decoded.slice());
+      // Compression owns this scratch copy, so a worker pool may transfer its
+      // complete ArrayBuffer without detaching the canonical request bytes.
+      const compressed = await this.#gzip(decoded.slice(), {
+        signal,
+        inputOwnership: "owned",
+      });
       const identityParts = Math.ceil(decoded.byteLength / REQUEST_PART_BYTES);
       const compressedParts = compressed.byteLength > 0
         ? Math.ceil(compressed.byteLength / REQUEST_PART_BYTES)
@@ -1233,10 +1250,18 @@ export class V2TransportSession {
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
       state.admissionTimer = undefined;
       this.#creditReservations++;
-      for (const frame of state.frames) {
+      const frames = state.preparedFrames;
+      if (!frames) {
+        throw new Error("Admitted V2 request has no prepared frames");
+      }
+      for (const frame of frames) {
         // Request frames share one priority queue so commit can never overtake data.
         this.#scheduler.enqueue("data", state.requestId, frame);
       }
+      // The scheduler now owns every frame. Do not retain the preparation
+      // array (and therefore a second path to every large base64 payload) for
+      // the lifetime of the upstream response.
+      state.preparedFrames = null;
     }
   }
 
@@ -1496,6 +1521,7 @@ export class V2TransportSession {
 
   #removeState(state: RequestState): void {
     this.#requests.delete(state.requestId);
+    state.preparedFrames = null;
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
     this.#scheduler.removeStream(state.requestId);

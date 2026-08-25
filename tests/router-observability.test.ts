@@ -21,8 +21,14 @@ class MemoryLogger implements LoggerLike {
 }
 
 class Runtime implements RoutableSandboxRuntime {
-  readonly projectId = projectId("00000000-0000-4000-8000-000000000001");
+  readonly projectId;
   readonly terminal = deferred<any>();
+  constructor(
+    id = "00000000-0000-4000-8000-000000000001",
+    readonly active = 0,
+  ) {
+    this.projectId = projectId(id);
+  }
   async start(): Promise<void> {}
   async drain(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -31,8 +37,8 @@ class Runtime implements RoutableSandboxRuntime {
       projectId: this.projectId,
       state: "ready" as const,
       capacity: 128,
-      active: 0,
-      available: 128,
+      active: this.active,
+      available: 128 - this.active,
       quarantined: 0,
       heartbeatAgeMs: 10,
       credentialExpiresInMs: 3_600_000,
@@ -57,7 +63,10 @@ describe("router observability", () => {
   it("emits ordered lifecycle phases with no request content", async () => {
     const logger = new MemoryLogger();
     const runtime = new Runtime();
-    const registry = new SandboxRegistry([runtime]);
+    // This second runtime is alive but full. It must remain visible in fleet
+    // capacity while not inflating route.selected.eligible_candidates.
+    const fullRuntime = new Runtime("00000000-0000-4000-8000-000000000002", 128);
+    const registry = new SandboxRegistry([runtime, fullRuntime]);
     const governor = new ResourceGovernor({
       probe: { sample: () => ({
         totalBytes: 32 * 1024 ** 3,

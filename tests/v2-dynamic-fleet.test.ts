@@ -35,6 +35,11 @@ class Projects {
   readonly created: ProjectId[] = [];
   readonly deleted: ProjectId[] = [];
   async list(): Promise<readonly PrismProjectSummary[]> { return [...this.remote]; }
+  async get(id: ProjectId): Promise<PrismProjectSummary> {
+    const found = this.remote.find(value => value.projectId === id && !value.deleted);
+    if (!found) throw new Error(`missing project ${id}`);
+    return found;
+  }
   async create(input: { projectId: ProjectId; title: string }): Promise<PrismProjectSummary> {
     const value = {
       projectId: input.projectId,
@@ -139,13 +144,11 @@ describe("dynamic V2 fleet scale", () => {
       const root = await mkdtemp(path.join(os.tmpdir(), `ghostprov-dynamic-${size}-`));
       roots.push(root);
       const cookieFile = path.join(root, "cookies.json");
+      const configuredIds = Array.from({ length: size }, (_, index) => id(index + 1));
       const config = resolveMultiSandboxConfig({
         PRISM_COOKIE_FILE: cookieFile,
-        GP_TRANSPORT: "v2",
+        PRISM_PROJECT_IDS: configuredIds.join(","),
         GP_PRISM_SESSION: "authenticated",
-        GP_AUTO_CREATE_PROJECTS: "1",
-        GP_TARGET_SANDBOXES: String(size),
-        GP_TARGET_CONCURRENCY: String(size * 4),
         GP_MAX_PROJECTS: "32",
         GP_PROVISION_CONCURRENCY: "32",
         GP_CANDIDATE: "1",
@@ -162,20 +165,22 @@ describe("dynamic V2 fleet scale", () => {
         identityFingerprint: FINGERPRINT,
       });
       const projects = new Projects();
+      projects.remote.push(...configuredIds.map((projectId, index) => ({
+        projectId,
+        title: `Configured project ${index + 1}`,
+        owner: "owner",
+        deleted: false,
+        createdAt: "2026-08-22T10:00:00.000Z",
+      })));
       const factory = new Factory();
       const registry = new SandboxRegistry();
-      let nextId = 1;
       const fleet = new ProjectFleetManager({
         config,
         identity: { kind: "authenticated", fingerprint: FINGERPRINT },
         projects,
-        inspector: {
-          inspect: async () => ({ writable: false, empty: false, marker: null }),
-        },
         manifest,
         registry,
         runtimeFactory: factory,
-        random: { next: () => 0.5, uuid: () => id(nextId++) },
       });
 
       const first = await fleet.reconcile();
@@ -185,7 +190,7 @@ describe("dynamic V2 fleet scale", () => {
       expect(second.ready).toBe(size);
       expect(registry.runtimes()).toHaveLength(size);
       expect(factory.created).toHaveLength(size);
-      expect(projects.created).toHaveLength(size);
+      expect(projects.created).toHaveLength(0);
       expect(projects.deleted).toEqual([]);
 
       const probe = {

@@ -11,4 +11,11 @@ describe("OutputBackpressure",()=>{
  it("removes an aborted waiter",async()=>{
   const gate=new OutputBackpressure({highFrames:1,highBytes:1,lowFrames:0,lowBytes:0,hardFrames:2,hardBytes:2});gate.update(state(1));const c=new AbortController();const waiting=gate.wait(c.signal);c.abort();await expect(waiting).rejects.toMatchObject({name:"AbortError"});
  });
+ it("closes idempotently and rejects every paused waiter",async()=>{
+  const gate=new OutputBackpressure({highFrames:1,highBytes:1,lowFrames:0,lowBytes:0,hardFrames:2,hardBytes:2});gate.update(state(1));
+  const first=gate.wait();const second=gate.wait();gate.close();gate.close();
+  await expect(first).rejects.toThrow("output backpressure closed");await expect(second).rejects.toThrow("output backpressure closed");
+  expect(gate.snapshot()).toMatchObject({closed:true,paused:false,waiters:0});
+  await expect(gate.wait()).rejects.toThrow("output backpressure closed");
+ });
 });

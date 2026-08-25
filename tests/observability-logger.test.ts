@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { ObservabilityLogger, type ObservabilitySink } from "../src/observability/logger";
+import {
+  formatConsoleObservabilityLine,
+  ObservabilityLogger,
+  type ObservabilitySink,
+} from "../src/observability/logger";
 import { observabilityEvent, recoveryObservabilityEvent } from "../src/observability/events";
 import type { ObservabilityConfig } from "../src/observability/config";
 
@@ -27,6 +31,47 @@ class MemorySink implements ObservabilitySink {
 }
 
 describe("ObservabilityLogger", () => {
+  it("keeps console fleet samples fixed-size while preserving full JSONL elsewhere", () => {
+    const full = `${JSON.stringify(observabilityEvent("fleet.sample", {
+      capacity: 1_280,
+      active: 20,
+      available: 1_260,
+      queued: 0,
+      cpu_percent: 12,
+      rss_bytes: 500,
+      event_loop_p95_ms: 4,
+      resources: {
+        memory_paused: false,
+        governor_queued: 0,
+        cpu_queued: 0,
+        transform_queued: 0,
+      },
+      logger: { queued_events: 1, queued_bytes: 100 },
+      traffic: {
+        requests_per_second: 20,
+        success_rate: 1,
+        failed: 0,
+        total: { p95_ms: 1_000 },
+      },
+      runtimes: Array.from({ length: 100 }, (_, index) => ({
+        project_id: `private-${index}`,
+        state: index === 99 ? "recovering" : "ready",
+        diagnostics: { padding: "x".repeat(500) },
+      })),
+    }))}\n`;
+    const compact = formatConsoleObservabilityLine(full);
+    expect(compact.length).toBeLessThan(1_000);
+    expect(JSON.parse(compact)).toMatchObject({
+      event: "fleet.sample",
+      runtime_states: { ready: 99, recovering: 1 },
+      pressure: { governor_queued: 0 },
+      traffic: { requests_per_second: 20, total_p95_ms: 1_000 },
+    });
+    expect(compact).not.toContain("private-99");
+    expect(formatConsoleObservabilityLine('{"event":"request.completed"}\n'))
+      .toBe('{"event":"request.completed"}');
+  });
+
   it("preserves terminal events and drops samples first under a bounded queue", async () => {
     const sink = new MemorySink();
     const logger = new ObservabilityLogger({

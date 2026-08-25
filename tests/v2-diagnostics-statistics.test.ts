@@ -7,6 +7,8 @@ describe("BoundedDistribution", () => {
     for (const value of [1, 2, 3, 4, 100]) values.record(value);
     values.record(Number.NaN);
     values.record(-1);
+    expect(values.snapshot()).toEqual({ count: 4, p50: 3, p95: 100, max: 100 });
+    expect(values.snapshot()).toEqual({ count: 4, p50: 3, p95: 100, max: 100 });
     expect(values.snapshotAndReset()).toEqual({ count: 4, p50: 3, p95: 100, max: 100 });
     expect(values.snapshotAndReset()).toEqual({ count: 0, p50: 0, p95: 0, max: 0 });
     expect(values.estimatedBytes).toBeLessThanOrEqual(64);

@@ -662,12 +662,14 @@ describe("SupervisedSandboxRuntime", () => {
     const late = new Promise<FakeRuntime>(resolve => { resolveLate = resolve; });
     const lateChild = new FakeRuntime();
     const replacement = new FakeRuntime();
+    const events: SandboxSupervisorEvent[] = [];
     let creates = 0;
     const runtime = supervisor({
       clock,
       initial,
       create: () => ++creates === 1 ? late : replacement,
       startupTimeoutMs: 2_000,
+      onRecoveryEvent: event => events.push(event),
     });
     await runtime.start();
 
@@ -682,6 +684,20 @@ describe("SupervisedSandboxRuntime", () => {
 
     expect(creates).toBe(2);
     expect(runtime.snapshot().incarnation).toBe(2);
+    const retry = events.find(event => event.type === "retry_scheduled")!;
+    const completed = events.at(-1)!;
+    expect(retry).toMatchObject({
+      attempt: 1,
+      attemptDurationMs: 2_000,
+      totalDurationMs: 2_000,
+      retryDelayMs: 1_000,
+    });
+    expect(completed).toMatchObject({
+      type: "completed",
+      attempt: 2,
+      attemptDurationMs: 0,
+      totalDurationMs: 3_000,
+    });
     await runtime.stop();
   });
 

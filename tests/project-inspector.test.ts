@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import {
   ProjectInspectionError,
   YDocProjectInspector,
+  type ProjectInspectorProviderEvent,
   type ProjectInspectorProviderFactory,
   type ProjectInspectorProviderLike,
 } from "../src/fleet/project-inspector";
@@ -69,8 +70,40 @@ function projectUpdate(entries: readonly Entry[]): Uint8Array {
 class SeededProvider implements ProjectInspectorProviderLike {
   destroyed = false;
 
-  on(event: string, listener: (...args: any[]) => void): void {
+  on(event: ProjectInspectorProviderEvent, listener: (...args: any[]) => void): void {
     if (event === "sync") queueMicrotask(() => listener(true));
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+  }
+}
+
+class ClosingProvider implements ProjectInspectorProviderLike {
+  destroyed = false;
+
+  on(event: ProjectInspectorProviderEvent, listener: (...args: any[]) => void): void {
+    if (event === "connection-close") queueMicrotask(() => listener());
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+  }
+}
+
+class SyncThenClosingProvider implements ProjectInspectorProviderLike {
+  destroyed = false;
+  #syncListener: ((value: boolean) => void) | null = null;
+
+  on(event: ProjectInspectorProviderEvent, listener: (...args: any[]) => void): void {
+    if (event === "sync") {
+      this.#syncListener = listener;
+      return;
+    }
+    queueMicrotask(() => {
+      this.#syncListener?.(true);
+      listener();
+    });
   }
 
   destroy(): void {
@@ -147,6 +180,31 @@ describe("YDocProjectInspector", () => {
     expect(factory.providers[0]?.destroyed).toBe(true);
   });
 
+  it("keeps an interrupted revision-addressed V2 deployment eligible for same-project reuse", async () => {
+    const schema = "b".repeat(64);
+    const build = "a".repeat(64);
+    const root = `.ghostprov-v2/revisions/r1/${schema}/${build}`;
+    const { inspector, factory } = createInspector([
+      { path: "main.tex", content: "GhostProv V2 sidecar bootstrap." },
+      { path: ".latexmkrc", content: "# temporary bootstrap launcher" },
+      { path: ".ghostprov-v2/static.json", content: "{}" },
+      { path: ".ghostprov-v2/bootstrap.enc.json", content: "{}" },
+      { path: ".ghostprov-v2/bootstrap-output.tex", content: "" },
+      { path: ".ghostprov-v2/revision.json", content: JSON.stringify({ revision: "r1" }) },
+      { path: `${root}/manifest.json`, content: "{}" },
+      { path: `${root}/sidecar.bundle.js`, content: "// frozen bundle" },
+      // The worker marker is deliberately absent: deployment was interrupted
+      // before ownership was committed.
+    ]);
+
+    await expect(inspector.inspect(PROJECT)).resolves.toEqual({
+      writable: true,
+      empty: true,
+      marker: null,
+    });
+    expect(factory.writes).toBe(0);
+  });
+
   it("requires exact full authorization and reports unrelated live files as non-empty", async () => {
     const { inspector } = createInspector([
       { path: "main.tex" },
@@ -189,5 +247,41 @@ describe("YDocProjectInspector", () => {
       kind: "auth",
     } satisfies Partial<ProjectInspectionError>);
     expect(factory.providers).toHaveLength(0);
+  });
+
+  it("rejects the installed provider connection-close event before sync", async () => {
+    const provider = new ClosingProvider();
+    const inspector = new YDocProjectInspector({
+      mintYSweet: async project => envelope(project),
+      providerFactory: {
+        create: () => provider,
+      },
+      syncTimeoutMs: 100,
+    });
+
+    await expect(inspector.inspect(PROJECT)).rejects.toMatchObject({
+      name: "ProjectInspectionError",
+      kind: "sync",
+      message: "Project Y-Sweet connection closed before sync",
+    } satisfies Partial<ProjectInspectionError>);
+    expect(provider.destroyed).toBe(true);
+  });
+
+  it("rejects a connection that closes synchronously after reporting sync", async () => {
+    const provider = new SyncThenClosingProvider();
+    const inspector = new YDocProjectInspector({
+      mintYSweet: async project => envelope(project),
+      providerFactory: {
+        create: () => provider,
+      },
+      syncTimeoutMs: 100,
+    });
+
+    await expect(inspector.inspect(PROJECT)).rejects.toMatchObject({
+      name: "ProjectInspectionError",
+      kind: "sync",
+      message: "Project Y-Sweet connection closed before sync",
+    } satisfies Partial<ProjectInspectionError>);
+    expect(provider.destroyed).toBe(true);
   });
 });

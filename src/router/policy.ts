@@ -41,7 +41,13 @@ export function isRuntimeHealthy(candidate: RuntimeHealthCandidate): boolean {
   return true;
 }
 
-function eligible(candidate: RouteCandidate): boolean {
+/**
+ * Reports whether a runtime can accept one more reservation right now.
+ * Keep this predicate shared with observability so `eligible_candidates`
+ * never counts stale, draining, credential-expiring, quarantined-full, or
+ * otherwise capacity-exhausted runtimes.
+ */
+export function isRuntimeEligible(candidate: RouteCandidate): boolean {
   if (!isRuntimeHealthy(candidate)) return false;
   const usable = candidate.capacity - candidate.quarantined;
   return usable > candidate.active + candidate.reserved;
@@ -70,7 +76,7 @@ export function chooseRuntime(
   let best = Number.POSITIVE_INFINITY;
   const tied: RouteCandidate[] = [];
   for (const candidate of candidates) {
-    if (!eligible(candidate)) continue;
+    if (!isRuntimeEligible(candidate)) continue;
     const predicted = score(workload, candidate);
     if (predicted < best - 0.0001) {
       best = predicted;

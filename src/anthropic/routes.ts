@@ -15,11 +15,14 @@ import {
   validateAnthropicCountTokenRequest,
 } from "./token-count";
 import type { AnthropicContextManagementResponse } from "./types";
+import type { IncomingResourceLease } from "../router/router";
+import { takeIncomingBodyLease } from "../http/request-lease";
 
 export type AnthropicRelayStarter = (
   body: Record<string, unknown>,
   signal: AbortSignal,
   clientId: string,
+  incomingLease?: IncomingResourceLease,
 ) => Promise<RunHandle>;
 
 export type AnthropicRouteDependencies = {
@@ -271,6 +274,7 @@ export function registerAnthropicRoutes(
         translated.relayBody,
         linked.controller.signal,
         clientId,
+        takeIncomingBodyLease(c.env),
       );
 
       if (!translated.stream) {

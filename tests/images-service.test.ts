@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { ApiError } from "../src/http/errors";
 import { executeImageBatch } from "../src/images/service";
 import type { RunHandle } from "../src/relay/run-handle";
+import { V2RunHandle } from "../src/v2/transport/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -161,6 +162,63 @@ describe("image batch execution", () => {
     }, abort.signal);
 
     expect(signals).toEqual([abort.signal, abort.signal]);
+  });
+
+  it("drains a bounded large image event stream while awaiting its final", async () => {
+    const bounded = new V2RunHandle({ maxBufferedBytes: 128 });
+    const producer = (async () => {
+      for (let sequence = 0; sequence < 64; sequence++) {
+        await bounded.acceptEvent({
+          event: "response.output_text.delta",
+          data: JSON.stringify({
+            type: "response.output_text.delta",
+            sequence_number: sequence,
+            delta: "large-image-terminal",
+          }),
+        });
+      }
+      bounded.settle(imageFinal("LARGE"));
+    })();
+
+    const response = await Promise.race([
+      executeImageBatch([{}], async () => bounded),
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error("image event drain deadlocked")),
+        500,
+      )),
+    ]);
+    await producer;
+    expect(response.data).toEqual([{ b64_json: "LARGE" }]);
+  });
+
+  it("returns the image iterator promptly when downstream cancellation wins", async () => {
+    let returned = 0;
+    const iterator = {
+      next: () => new Promise<IteratorResult<any>>(() => undefined),
+      return: () => {
+        returned++;
+        return Promise.resolve({ done: true as const, value: undefined });
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<any>;
+    const controller = new AbortController();
+    const pending = executeImageBatch([{}], async () => ({
+      events: () => iterator,
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }), controller.signal);
+    await Promise.resolve();
+    controller.abort(new Error("private cancellation detail"));
+
+    await expect(Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error("image cancellation did not settle")),
+        100,
+      )),
+    ])).rejects.toMatchObject({ name: "AbortError" });
+    expect(returned).toBe(1);
   });
 
   it.each([

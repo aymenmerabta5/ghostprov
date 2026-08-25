@@ -48,7 +48,11 @@ export class V2RunHandle implements RunHandle {
   readonly #clock: Clock;
   readonly #startedAtMs: number;
   readonly #maxBufferedBytes: number;
-  readonly #buffer: BufferedEvent[] = [];
+  // Keep a head cursor rather than shifting the array for every event. Array
+  // shift is O(n), which made draining a long response quadratic and retained
+  // all later entries while V8 moved them down one slot at a time.
+  readonly #buffer: Array<BufferedEvent | undefined> = [];
+  #bufferHead = 0;
   readonly #eventWaiters = new Set<() => void>();
   readonly #spaceWaiters = new Set<() => void>();
   readonly #resolveFinal: (value: Record<string, unknown>) => void;
@@ -76,14 +80,21 @@ export class V2RunHandle implements RunHandle {
     void this.final.catch(() => undefined);
   }
 
-  async acceptEvent(frame: SseFrame): Promise<void> {
+  async acceptEvent(frame: SseFrame, knownWireBytes?: number): Promise<void> {
     if (!frame || typeof frame.event !== "string" || !frame.event || typeof frame.data !== "string") {
       throw new TypeError("SSE frame is invalid");
     }
-    const bytes = utf8Bytes(`event: ${frame.event}\ndata: ${frame.data}\n\n`).byteLength;
+    if (
+      knownWireBytes !== undefined &&
+      (!Number.isSafeInteger(knownWireBytes) || knownWireBytes < 1)
+    ) {
+      throw new RangeError("knownWireBytes must be a positive safe integer");
+    }
+    const bytes = knownWireBytes ??
+      utf8Bytes(`event: ${frame.event}\ndata: ${frame.data}\n\n`).byteLength;
     while (
       !this.#closed &&
-      this.#buffer.length > 0 &&
+      this.#bufferHead < this.#buffer.length &&
       this.#bufferedBytes + bytes > this.#maxBufferedBytes
     ) {
       await new Promise<void>(resolve => this.#spaceWaiters.add(resolve));
@@ -105,7 +116,7 @@ export class V2RunHandle implements RunHandle {
     if (this.#eventsClaimed) throw new Error("V2 run events may only be consumed once");
     this.#eventsClaimed = true;
     for (;;) {
-      const entry = this.#buffer.shift();
+      const entry = this.#takeBufferedEvent();
       if (entry) {
         this.#bufferedBytes -= entry.bytes;
         this.#wake(this.#spaceWaiters);
@@ -145,5 +156,23 @@ export class V2RunHandle implements RunHandle {
   #wakeAll(): void {
     this.#wake(this.#eventWaiters);
     this.#wake(this.#spaceWaiters);
+  }
+
+  #takeBufferedEvent(): BufferedEvent | undefined {
+    if (this.#bufferHead >= this.#buffer.length) return undefined;
+    const entry = this.#buffer[this.#bufferHead];
+    // Clear the consumed slot immediately so the frame can be collected even
+    // when the backing array remains allocated for later events.
+    this.#buffer[this.#bufferHead] = undefined;
+    this.#bufferHead++;
+    if (this.#bufferHead === this.#buffer.length) {
+      this.#buffer.length = 0;
+      this.#bufferHead = 0;
+    } else if (this.#bufferHead >= 1_024 && this.#bufferHead * 2 >= this.#buffer.length) {
+      // Compaction is infrequent and amortized; the common dequeue is O(1).
+      this.#buffer.splice(0, this.#bufferHead);
+      this.#bufferHead = 0;
+    }
+    return entry;
   }
 }

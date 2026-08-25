@@ -1,30 +1,51 @@
 import { describe, expect, it } from "bun:test";
 import {
+  assertV2SidecarAssets,
+  DEFAULT_V2_SIDECAR_REVISION,
   hashV2SidecarFiles,
   loadV2SidecarAssets,
+  resolveV2SidecarRevision,
+  V2_R1_RELEASE,
 } from "../src/v2/sidecar/assets";
-import { protocolSchemaHash } from "../src/v2/protocol/shared";
 
 describe("V2 sidecar assets", () => {
-  it("produces a stable sorted build with the shared schema hash", async () => {
+  it("produces a stable sorted build with the frozen R1 identity", async () => {
     const first = await loadV2SidecarAssets();
     const second = await loadV2SidecarAssets();
 
     expect(first).toEqual(second);
-    expect(first.buildHash).toMatch(/^[a-f0-9]{64}$/);
-    expect(first.schemaHash).toBe(await protocolSchemaHash());
+    expect(first.revision).toBe("r1");
+    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r1");
+    expect(first.buildHash).toBe(V2_R1_RELEASE.buildHash);
+    expect(first.schemaHash).toBe(V2_R1_RELEASE.schemaHash);
+    expect(first.files[0]!.sha256).toBe(V2_R1_RELEASE.bundleSha256);
     expect(first.files.map(file => file.path)).toEqual(
       [...first.files.map(file => file.path)].sort(),
     );
-    expect(first.files.map(file => file.path)).toEqual([
-      ".ghostprov-v2/sidecar.bundle.js",
-    ]);
+    expect(first.files.map(file => file.logicalPath)).toEqual(["sidecar.bundle.js"]);
+    expect(first.entrypointPath).toBe(first.files[0]!.path);
+    expect(first.entrypointPath).toBe(
+      `.ghostprov-v2/revisions/r1/${first.schemaHash}/${first.buildHash}/sidecar.bundle.js`,
+    );
+    expect(first.manifest.path).toBe(
+      `.ghostprov-v2/revisions/r1/${first.schemaHash}/${first.buildHash}/manifest.json`,
+    );
+    expect(JSON.parse(first.manifest.content)).toMatchObject({
+      format: "ghostprov-v2-sidecar-assets",
+      version: 1,
+      revision: "r1",
+      buildHash: first.buildHash,
+      schemaHash: first.schemaHash,
+      entrypoint: "sidecar.bundle.js",
+    });
     expect((first as any).obsoletePaths).toEqual([
       ".ghostprov-v2/bootstrap.tex",
       ".ghostprov-v2/deno.json",
       ".ghostprov-v2/sandbox",
+      ".ghostprov-v2/sidecar.bundle.js",
       ".ghostprov-v2/src",
     ]);
+    await expect(assertV2SidecarAssets(first, "r1")).resolves.toBeUndefined();
   });
 
   it("produces one executable bundle with no runtime package resolution", async () => {
@@ -35,6 +56,30 @@ describe("V2 sidecar assets", () => {
     expect(bundle).toContain("Deno.");
     expect(bundle).not.toMatch(/\b(?:from|import)\s*\(?["'](?:npm:|https:)/);
     expect(bundle).not.toContain("registry.npmjs.org");
+  });
+
+  it("loads R1 only from its checked-in release artifact, never mutable current sources", async () => {
+    const loaderSource = await Bun.file(
+      `${import.meta.dir}/../src/v2/sidecar/assets.ts`,
+    ).text();
+    const releaseArtifact = await Bun.file(
+      `${import.meta.dir}/../src/v2/sidecar/releases/r1/sidecar.bundle.js`,
+    ).text();
+    const before = await loadV2SidecarAssets({ revision: "r1" });
+
+    // Structural guard: later R2/current-source work cannot silently become R1.
+    expect(loaderSource).not.toContain("Bun.build");
+    expect(loaderSource).not.toContain("sandbox/v2/main.ts");
+    expect(before.files[0]!.content).toBe(releaseArtifact);
+
+    // An arbitrary alternate current-source result has a different identity,
+    // while a fresh R1 load remains pinned to the checked-in release.
+    const alternate = [{
+      ...before.files[0]!,
+      content: `${before.files[0]!.content}\n// alternate current-source build\n`,
+    }];
+    expect(await hashV2SidecarFiles(alternate)).not.toBe(V2_R1_RELEASE.buildHash);
+    await expect(loadV2SidecarAssets({ revision: "r1" })).resolves.toEqual(before);
   });
 
   it("contains no credential literals or ZIP transport", async () => {
@@ -53,5 +98,19 @@ describe("V2 sidecar assets", () => {
       index === 0 ? { ...file, content: `${file.content}\n` } : file
     ));
     expect(await hashV2SidecarFiles(changed)).not.toBe(assets.buildHash);
+    await expect(assertV2SidecarAssets({ ...assets, files: changed }, "r1"))
+      .rejects.toThrow(/content hash mismatch|aggregate build hash mismatch/i);
+  });
+
+  it("fails closed on unsupported or mismatched revision selection", async () => {
+    expect(resolveV2SidecarRevision()).toBe("r1");
+    expect(() => resolveV2SidecarRevision("r2")).toThrow(/unsupported.*r2/i);
+    await expect(loadV2SidecarAssets({ revision: "r2" })).rejects.toThrow(/unsupported.*r2/i);
+
+    const assets = await loadV2SidecarAssets({ revision: "r1" });
+    await expect(assertV2SidecarAssets({
+      ...assets,
+      revision: "r2" as never,
+    }, "r1")).rejects.toThrow(/revision mismatch/i);
   });
 });

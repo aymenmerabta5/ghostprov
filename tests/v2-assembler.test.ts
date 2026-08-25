@@ -100,6 +100,11 @@ describe("RequestAssembler", () => {
     overlap.accept(firstPart);
     expect(() => overlap.accept({ ...secondPart, offset: 4 })).toThrow("overlap");
 
+    const reverseOverlap = new RequestAssembler();
+    reverseOverlap.accept(open);
+    reverseOverlap.accept({ ...secondPart, offset: 4 });
+    expect(() => reverseOverlap.accept(firstPart)).toThrow("overlap");
+
     const digest = new RequestAssembler();
     digest.accept({ ...open, requestDigest: "0".repeat(64) });
     for (const frame of requestFrames.slice(1)) digest.accept(frame);
@@ -122,7 +127,7 @@ describe("RequestAssembler", () => {
     expect(assembler.snapshot().reservedBytes).toBe(0);
   });
 
-  it("reserves the larger encoded size for hostile compressed declarations", () => {
+  it("reserves encoded and decoded representations for hostile compressed declarations", () => {
     const assembler = new RequestAssembler({ maxReservedBytes: 32 });
     expect(() => assembler.accept({
       kind: "request_open",
@@ -136,6 +141,66 @@ describe("RequestAssembler", () => {
       sequence: 0,
     })).toThrow("reservation budget");
     expect(assembler.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("rejects part-count metadata amplification before allocating the index", () => {
+    const assembler = new RequestAssembler();
+    expect(() => assembler.accept({
+      kind: "request_open",
+      requestId: REQUEST,
+      requestDigest: "a".repeat(64),
+      decodedBytes: 1,
+      encodedBytes: 1,
+      encoding: "identity",
+      partCount: 65_536,
+      epoch: 1,
+      sequence: 0,
+    })).toThrow("exceeds bounds");
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
+  });
+
+  it("bounds tiny abandoned requests by count as well as declared bytes", async () => {
+    const decoded = new TextEncoder().encode("x");
+    const [first] = await frames(decoded);
+    const open = first as Extract<ReliableFrame<HostFrame>, { kind: "request_open" }>;
+    const assembler = new RequestAssembler({ maxRequests: 1 });
+    assembler.accept({ ...open, requestId: "req-a" });
+    expect(() => assembler.accept({ ...open, requestId: "req-b" })).toThrow(
+      "request capacity",
+    );
+    assembler.cancel("req-a");
+    expect(() => assembler.accept({ ...open, requestId: "req-b" })).not.toThrow();
+  });
+
+  it("accounts for dense part metadata and enforces the configured part bound", async () => {
+    const decoded = new TextEncoder().encode("ab");
+    const [first] = await frames(decoded, { partBytes: 1 });
+    const open = first as Extract<ReliableFrame<HostFrame>, { kind: "request_open" }>;
+    const assembler = new RequestAssembler({ maxPartsPerRequest: 2 });
+    assembler.accept(open);
+    expect(assembler.snapshot().reservedBytes).toBe(
+      decoded.byteLength * 2 + 2 * RequestAssembler.PART_METADATA_BYTES,
+    );
+    assembler.cancel(REQUEST);
+    expect(() => assembler.accept({ ...open, partCount: 3, encodedBytes: 3 })).toThrow(
+      "exceeds bounds",
+    );
+  });
+
+  it("sweeps incomplete assemblies after their bounded inactivity TTL", async () => {
+    let now = 1_000;
+    const decoded = new TextEncoder().encode("stale");
+    const [open] = await frames(decoded);
+    const assembler = new RequestAssembler({
+      incompleteTtlMs: 10,
+      now: () => now,
+    });
+    assembler.accept(open!);
+    now = 1_009;
+    expect(assembler.sweepExpired()).toEqual([]);
+    now = 1_010;
+    expect(assembler.sweepExpired()).toEqual([REQUEST]);
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
   });
 
   it("rejects a decompression bomb when output exceeds its declaration", async () => {
@@ -155,7 +220,10 @@ describe("RequestAssembler", () => {
     const requestFrames = await frames(decoded);
     const assembler = new RequestAssembler();
     assembler.accept(requestFrames[0]);
-    expect(assembler.snapshot()).toEqual({ requests: 1, reservedBytes: decoded.byteLength });
+    expect(assembler.snapshot()).toEqual({
+      requests: 1,
+      reservedBytes: decoded.byteLength * 2 + RequestAssembler.PART_METADATA_BYTES,
+    });
     assembler.cancel(REQUEST);
     expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
   });

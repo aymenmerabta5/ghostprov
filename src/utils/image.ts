@@ -8,7 +8,7 @@
  *
  * All helpers preserve verbatim forwarding guarantees: relayCreate simply JSON.stringify's the body,
  * so input_image objects, image_generation tool definitions, and image_generation_call outputs all survive
- * via the Yjs+render+zip loop unchanged.
+ * through the configured Responses transport unchanged.
  */
 
 import type { ImageDetail, InputImage, OutputItem, ImageGenerationCall } from "../relay/types";

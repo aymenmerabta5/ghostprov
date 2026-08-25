@@ -12,7 +12,7 @@ describe("V2 diagnostics observer-effect budgets",()=>{
  });
  it("omits every diagnostic field while disabled",async()=>{
   const sampler=new SidecarResourceSampler({enabled:false,intervalMs:1_000});
-  expect(sampler.snapshot()).toEqual({processRssBytes:0,heapUsedBytes:0,heapTotalBytes:0,externalBytes:0,systemTotalBytes:null,systemFreeBytes:null,processCpuPercent:null,normalizedLoad1:null,eventLoopP50Ms:0,eventLoopP95Ms:0,eventLoopMaxMs:0});
+  expect(sampler.snapshot()).toEqual({processRssBytes:0,heapUsedBytes:0,heapTotalBytes:0,externalBytes:0,arrayBufferBytes:null,systemTotalBytes:null,systemFreeBytes:null,processCpuPercent:null,normalizedLoad1:null,eventLoopSamples:0,eventLoopP50Ms:0,eventLoopP95Ms:0,eventLoopMaxMs:0,gcSamples:0,gcDurationP95Ms:0,gcDurationMaxMs:0});
   await sampler.close();
  });
 });

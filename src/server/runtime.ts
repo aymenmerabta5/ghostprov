@@ -15,6 +15,8 @@ import {
 import { attachResponsesWebSocket } from "../ws/server";
 import type { RouterLike } from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
+import type { IncomingResourceLease } from "../router/router";
+import type { HttpRequestBindings } from "../http/request-lease";
 
 export interface GhostProvServerOptions {
   app: Hono;
@@ -61,7 +63,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
         for (const [name, value] of Object.entries(request.headers)) {
           if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(",") : String(value));
         }
-        let bodyLease: { release(): void } | null = null;
+        let bodyLease: IncomingResourceLease | null = null;
         let fetchResponse: Response;
         try {
           let body: Uint8Array | undefined;
@@ -93,7 +95,10 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
             body: body as unknown as BodyInit,
             signal: relayAbort.signal,
           });
-          fetchResponse = await options.app.fetch(fetchRequest);
+          const bindings: HttpRequestBindings = {
+            incomingBodyLease: bodyLease ?? undefined,
+          };
+          fetchResponse = await options.app.fetch(fetchRequest, bindings);
         } finally {
           bodyLease?.release();
         }
@@ -118,7 +123,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     telemetry: options.webSocketTelemetry,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {
       source: "websocket",
-      clientId: "websocket",
+      clientId: relayOptions.clientId,
       signal: relayOptions.signal,
     }),
   });

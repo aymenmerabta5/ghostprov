@@ -7,8 +7,10 @@ import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { YSweetEnvelope } from "../prism/protocol";
 import type { ProjectId } from "./types";
 
+export type YProviderEvent = "sync" | "connection-close";
+
 export interface YProviderLike {
-  on(event: string, listener: (...args: any[]) => void): void;
+  on(event: YProviderEvent, listener: (...args: any[]) => void): void;
   destroy(): void;
 }
 
@@ -87,6 +89,8 @@ interface Connection {
   index: Map<string, { uuid: string; map: Y.Map<any> }>;
   generation: number;
   connectedAtMs: number;
+  disconnected: boolean;
+  destroyed: boolean;
 }
 
 function readContent(map: Y.Map<any>): string | null {
@@ -426,9 +430,11 @@ export class SandboxYDoc {
   async appendFile(filename: string, content: string, chunkBytes = 256 * 1024): Promise<void> {
     if (!Number.isInteger(chunkBytes) || chunkBytes < 1) throw new RangeError("chunkBytes must be positive");
     const connection = await this.#getConnection();
+    this.#assertConnectionActive(connection);
     let entry = this.#findEntry(connection, filename);
     if (!entry) {
       await this.writeFile(filename, "");
+      this.#assertConnectionActive(connection);
       entry = this.#findEntry(connection, filename);
     }
     if (!entry) throw new YDocSessionError(`entry vanished after create: ${filename}`);
@@ -439,10 +445,12 @@ export class SandboxYDoc {
     }
     connection.doc.transact(() => text.delete(0, text.length));
     for (let offset = 0; offset < content.length; offset += chunkBytes) {
+      this.#assertConnectionActive(connection);
       const chunk = content.slice(offset, offset + chunkBytes);
       connection.doc.transact(() => text.insert(text.length, chunk));
       if (this.#appendDelayMs > 0) await this.#clock.sleep(this.#appendDelayMs);
     }
+    this.#assertConnectionActive(connection);
   }
 
   async deleteFile(filename: string): Promise<boolean> {
@@ -587,7 +595,22 @@ export class SandboxYDoc {
 
   async #withConnection<T>(operation: (connection: Connection) => T | Promise<T>): Promise<T> {
     const connection = await this.#getConnection();
-    return operation(connection);
+    this.#assertConnectionActive(connection);
+    const result = await operation(connection);
+    this.#assertConnectionActive(connection);
+    return result;
+  }
+
+  #assertConnectionActive(connection: Connection): void {
+    if (this.#stopped) throw new YDocSessionError("Yjs session is stopped", "stopped");
+    if (
+      connection.disconnected ||
+      connection.destroyed ||
+      connection.generation !== this.#generation ||
+      this.#connection !== connection
+    ) {
+      throw new YDocSessionError("Yjs connection closed during operation", "sync");
+    }
   }
 
   async #getConnection(): Promise<Connection> {
@@ -596,6 +619,11 @@ export class SandboxYDoc {
     if (!this.#connecting) {
       this.#connecting = this.#connectGeneration(++this.#generation)
         .then(connection => {
+          if (connection.disconnected || connection.generation !== this.#generation || this.#stopped) {
+            this.#destroyConnection(connection);
+            if (this.#stopped) throw new YDocSessionError("Yjs session is stopped", "stopped");
+            throw new YDocSessionError("Yjs connection closed before activation", "sync");
+          }
           this.#connection = connection;
           return connection;
         })
@@ -616,6 +644,7 @@ export class SandboxYDoc {
     }
     const doc = new Y.Doc({ guid: this.projectId });
     const provider = this.#providerFactory.create(envelope, doc);
+    let providerClosed = false;
     const synced = await new Promise<boolean>(resolve => {
       const timer = setTimeout(() => resolve(false), this.#syncTimeoutMs);
       let settled = false;
@@ -626,13 +655,20 @@ export class SandboxYDoc {
         resolve(value);
       };
       provider.on("sync", value => { if (value === true) finish(true); });
-      provider.on("connectionClose", () => finish(false));
+      provider.on("connection-close", () => {
+        // Promise resolution resumes on a later microtask. Preserve a close
+        // emitted synchronously after sync so a dead provider is never
+        // installed as the active generation in that gap.
+        providerClosed = true;
+        finish(false);
+      });
     });
-    if (!synced || generation !== this.#generation || this.#stopped) {
+    if (!synced || providerClosed || generation !== this.#generation || this.#stopped) {
       try { provider.destroy(); } catch {}
       try { doc.destroy(); } catch {}
       if (this.#stopped) throw new YDocSessionError("Yjs session is stopped", "stopped");
       if (generation !== this.#generation) throw new YDocSessionError("Yjs connection superseded", "sync");
+      if (providerClosed) throw new YDocSessionError("Yjs connection closed before synchronization", "sync");
       throw new YDocSessionError(`Yjs sync failed within ${this.#syncTimeoutMs}ms`, "sync");
     }
     const content = doc.getMap("content");
@@ -645,11 +681,15 @@ export class SandboxYDoc {
       index: new Map(),
       generation,
       connectedAtMs: this.#clock.now(),
+      disconnected: false,
+      destroyed: false,
     };
-    provider.on("connectionClose", () => {
-      if (this.#connection !== connection) return;
-      this.#connection = null;
-      this.#destroyConnection(connection);
+    provider.on("connection-close", () => {
+      connection.disconnected = true;
+      if (this.#connection === connection) this.#connection = null;
+      // y-websocket emits connection-close before it clears its current socket.
+      // Destroying it inline would recursively re-enter that same close path.
+      queueMicrotask(() => this.#destroyConnection(connection));
     });
     return connection;
   }
@@ -696,6 +736,9 @@ export class SandboxYDoc {
   }
 
   #destroyConnection(connection: Connection): void {
+    if (connection.destroyed) return;
+    connection.destroyed = true;
+    connection.disconnected = true;
     try { connection.provider.destroy(); } catch {}
     try { connection.doc.destroy(); } catch {}
   }

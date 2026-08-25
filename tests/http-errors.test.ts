@@ -1,8 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../src/http/errors";
 import { RelayError } from "../src/relay/run-handle";
-import { SlotRunnerError } from "../src/relay/slot-runner";
 import { RouterCapacityTimeoutError, RouterShutdownError } from "../src/router/router";
+import {
+  ResourceGovernorClosedError,
+  ResourceGovernorQueueFullError,
+  ResourceGovernorReplacementOverloadError,
+  ResourceGovernorTimeoutError,
+  ResourceReservationTooLargeError,
+} from "../src/router/resource-governor";
+import {
+  CpuTransformQueueFullError,
+  CpuTransformTimeoutError,
+} from "../src/router/cpu-transform-pool";
 
 describe("OpenAI-compatible HTTP errors", () => {
   it("maps router shutdown admission to a typed service-unavailable response", () => {
@@ -29,6 +39,72 @@ describe("OpenAI-compatible HTTP errors", () => {
     });
   });
 
+  it("maps resource admission failures without exposing host accounting", () => {
+    const cases = [
+      [
+        new ResourceGovernorQueueFullError(),
+        503,
+        "overloaded_error",
+        "resource_admission_overloaded",
+      ],
+      [
+        new ResourceGovernorReplacementOverloadError(),
+        503,
+        "overloaded_error",
+        "resource_replacement_overloaded",
+      ],
+      [
+        new ResourceGovernorTimeoutError(),
+        503,
+        "service_unavailable_error",
+        "resource_admission_timeout",
+      ],
+      [
+        new ResourceGovernorClosedError(),
+        503,
+        "service_unavailable_error",
+        "resource_governor_closed",
+      ],
+      [
+        new ResourceReservationTooLargeError(),
+        413,
+        "invalid_request_error",
+        "request_too_large",
+      ],
+    ] as const;
+
+    for (const [error, status, type, code] of cases) {
+      const normalized = normalizeApiError(error);
+      expect(normalized).toMatchObject({
+        status,
+        error: { type, code },
+      });
+      expect(normalized.error.message).not.toContain("capacity");
+      expect(normalized.error.message).not.toContain("bytes");
+    }
+  });
+
+  it("maps CPU preparation pressure as sanitized local service errors", () => {
+    expect(normalizeApiError(new CpuTransformQueueFullError())).toEqual({
+      status: 503,
+      error: {
+        message: "GhostProv request preparation is temporarily overloaded",
+        type: "overloaded_error",
+        param: null,
+        code: "cpu_transform_overloaded",
+      },
+    });
+    expect(normalizeApiError(new CpuTransformTimeoutError(123_456))).toEqual({
+      status: 503,
+      error: {
+        message: "GhostProv request preparation timed out",
+        type: "service_unavailable_error",
+        param: null,
+        code: "cpu_transform_timeout",
+      },
+    });
+  });
+
   it("preserves typed validation status and fields", async () => {
     const response = apiErrorResponse(new ApiError(400, "prompt is required", {
       param: "prompt",
@@ -47,59 +123,9 @@ describe("OpenAI-compatible HTTP errors", () => {
     });
   });
 
-  it("unwraps daemon http_400 envelopes without relying on instanceof", async () => {
-    const upstream = {
-      error: {
-        message: "Unknown parameter: 'tools[0].n'.",
-        type: "invalid_request_error",
-        param: "tools[0].n",
-        code: "unknown_parameter",
-      },
-    };
-    const daemon = {
-      code: "http_400",
-      message: JSON.stringify(upstream),
-    };
-    const error = Object.assign(
-      new Error(`upstream failed: ${JSON.stringify(daemon)}`),
-      { kind: "upstream" },
-    );
-
-    const response = apiErrorResponse(error);
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual(upstream);
-  });
-
-  it("prefers structured daemon details when the human message is truncated", async () => {
-    const details = {
-      code: "http_422",
-      message: JSON.stringify({
-        error: {
-          message: "The request body could not be processed",
-          type: "invalid_request_error",
-          param: "input",
-          code: "unprocessable_entity",
-        },
-      }),
-    };
-    const response = apiErrorResponse(Object.assign(
-      new Error("upstream failed: {truncated"),
-      { kind: "upstream", details },
-    ));
-
-    expect(response.status).toBe(422);
-    expect(await response.json()).toEqual({ error: {
-      message: "The request body could not be processed",
-      type: "invalid_request_error",
-      param: "input",
-      code: "unprocessable_entity",
-    }});
-  });
-
   it("maps relay infrastructure kinds to stable HTTP statuses", () => {
     const cases = [
-      ["exhausted", 429],
+      ["exhausted", 503],
       ["no-bridge", 503],
       ["timeout", 504],
       ["sync", 503],
@@ -126,52 +152,20 @@ describe("OpenAI-compatible HTTP errors", () => {
     });
   });
 
-  it("maps daemon retry exhaustion to a rate-limit error", async () => {
-    const daemon = {
-      code: "rate_limited_429",
-      message: JSON.stringify({
-        error: {
-          message: "Rate limit reached",
-          type: "rate_limit_error",
-          code: "rate_limit_exceeded",
-        },
-      }),
-    };
-    const response = apiErrorResponse(Object.assign(
-      new Error(`upstream failed: ${JSON.stringify(daemon)}`),
-      { kind: "upstream" },
-    ));
-
-    expect(response.status).toBe(429);
-    expect(await response.json()).toEqual({ error: {
-      message: "Rate limit reached",
-      type: "rate_limit_error",
-      param: null,
-      code: "rate_limit_exceeded",
-    }});
-  });
-
-  it("returns the full V1 organization TPM response and parsed headers", async () => {
+  it("returns the full organization TPM response and parsed headers", async () => {
     const message = "Rate limit reached for gpt-5.6-sol in organization " +
       "org-ExampleOrganization123 on tokens per min (TPM): Limit 40000000, " +
       "Used 40000000, Requested 609930. Please try again in 914ms. Visit " +
       "https://platform.openai.com/account/rate-limits";
-    const response = apiErrorResponse(Object.assign(
-      new Error("Upstream request failed"),
-      {
-        kind: "upstream",
-        details: {
-          code: "rate_limited_429",
-          message: JSON.stringify({
-            error: {
-              message,
-              type: "rate_limit_error",
-              code: "rate_limit_exceeded",
-            },
-          }),
-        },
+    const response = apiErrorResponse(Object.assign(new Error(message), {
+      status: 429,
+      code: "rate_limit_exceeded",
+      rateLimit: {
+        retryAfterMs: 914,
+        limitTokens: 40_000_000,
+        remainingTokens: 0,
       },
-    ));
+    }));
 
     expect(response.status).toBe(429);
     expect(response.headers.get("retry-after")).toBe("1");
@@ -208,9 +202,8 @@ describe("OpenAI-compatible HTTP errors", () => {
     }});
   });
 
-  it("keeps structured upstream details on both relay error implementations", () => {
+  it("keeps structured upstream details on relay errors", () => {
     const details = { code: "http_400", message: "{}" };
     expect(new RelayError("failed", "upstream", details).details).toBe(details);
-    expect(new SlotRunnerError("failed", "upstream", details).details).toBe(details);
   });
 });

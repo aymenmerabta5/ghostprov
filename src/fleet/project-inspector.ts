@@ -8,8 +8,10 @@ import type {
   ManagedProjectInspector,
 } from "./types";
 
+export type ProjectInspectorProviderEvent = "sync" | "connection-close";
+
 export interface ProjectInspectorProviderLike {
-  on(event: string, listener: (...args: any[]) => void): void;
+  on(event: ProjectInspectorProviderEvent, listener: (...args: any[]) => void): void;
   destroy(): void;
 }
 
@@ -179,8 +181,11 @@ function isGhostProvPath(path: string): boolean {
   if (path === "" || path === "main.tex" || path === ".latexmkrc") return true;
   if (path === ".ghostprov-v2") return true;
   if (/^\.ghostprov-v2\/(?:src|sandbox)(?:\/.*)?$/.test(path)) return true;
+  if (/^\.ghostprov-v2\/revisions(?:\/.*)?$/.test(path)) return true;
   return [
+    ".ghostprov-v2/bootstrap-output.tex",
     ".ghostprov-v2/deno.json",
+    ".ghostprov-v2/revision.json",
     ".ghostprov-v2/static.json",
     ".ghostprov-v2/worker.json",
     ".ghostprov-v2/bootstrap.enc.json",
@@ -226,6 +231,7 @@ async function waitForSync(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw abortError();
+  let connectionClosed = false;
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error) => {
@@ -245,11 +251,18 @@ async function waitForSync(
     provider.on("sync", value => {
       if (value === true) finish();
     });
-    provider.on("connectionClose", () => finish(new ProjectInspectionError(
-      "Project Y-Sweet connection closed before sync",
-      "sync",
-    )));
+    provider.on("connection-close", () => {
+      connectionClosed = true;
+      finish(new ProjectInspectionError(
+        "Project Y-Sweet connection closed before sync",
+        "sync",
+      ));
+    });
   });
+  if (signal?.aborted) throw abortError();
+  if (connectionClosed) {
+    throw new ProjectInspectionError("Project Y-Sweet connection closed before sync", "sync");
+  }
 }
 
 export class YDocProjectInspector implements ManagedProjectInspector {

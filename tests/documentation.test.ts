@@ -36,7 +36,6 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_V2_SANDBOX_CAPACITY` | `128`");
     expect(readme).toContain("| `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8`");
     expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `16`");
-    expect(readme).toContain("| `GP_TARGET_CONCURRENCY` | `512`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
     expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
@@ -168,7 +167,6 @@ describe("project documentation", () => {
       typecheck: "tsc --noEmit",
       "test:unit": expect.any(String),
       "test:integration": expect.any(String),
-      "test:daemon": "python -B -m unittest sandbox/test_gp_daemon.py",
       "verify:live": expect.any(String),
       "verify:browserless": expect.any(String),
       "verify:multi-sandbox": expect.any(String),
@@ -180,6 +178,7 @@ describe("project documentation", () => {
       "monitor:v2": "bun scripts/monitor_v2.ts",
       "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
     });
+    expect(pkg.scripts).not.toHaveProperty("test:daemon");
     expect(pkg.dependencies).not.toHaveProperty("playwright");
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
     expect(unitScript.includes("tests/images-service.test.ts")).toBe(true);

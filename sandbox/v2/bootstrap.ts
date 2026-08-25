@@ -20,6 +20,7 @@ export interface PhaseZeroBootstrapResult {
 
 export interface PhaseZeroBootstrapOptions {
   binding: BootstrapBinding;
+  instanceId?: string;
   encryptedPath: string;
   helloPath?: string;
   timeoutMs?: number;
@@ -50,7 +51,10 @@ export async function phaseZeroBootstrap(
 ): Promise<PhaseZeroBootstrapResult> {
   const helloPath = options.helloPath ?? "/tmp/ghostprov-v2/bootstrap-hello";
   const timeoutMs = options.timeoutMs ?? 30_000;
-  const instanceId = crypto.randomUUID();
+  const instanceId = options.instanceId ?? crypto.randomUUID();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(instanceId)) {
+    throw new TypeError("Bootstrap instanceId is invalid");
+  }
   const keys = await createBootstrapKeyPair(options.binding);
   const hello = {
     version: 1,

@@ -26,11 +26,12 @@ import {
   type SidecarFrame,
   utf8Bytes,
 } from "../src/v2/protocol/shared";
-import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
+import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
-const BUILD_HASH = "a".repeat(64);
-const SCHEMA_HASH = "b".repeat(64);
+const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
+const BUILD_HASH = ASSETS.buildHash;
+const SCHEMA_HASH = ASSETS.schemaHash;
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
 
 type Fault =
@@ -181,28 +182,6 @@ class FakeGateway implements V2BootstrapGateway {
   }
 }
 
-const ASSETS: V2SidecarAssets = {
-  buildHash: BUILD_HASH,
-  schemaHash: SCHEMA_HASH,
-  obsoletePaths: Object.freeze([
-    ".ghostprov-v2/deno.json",
-    ".ghostprov-v2/sandbox",
-    ".ghostprov-v2/src",
-  ]),
-  files: Object.freeze([
-    {
-      path: ".ghostprov-v2/deno.json",
-      content: "{}\n",
-      sha256: "c".repeat(64),
-    },
-    {
-      path: ".ghostprov-v2/sandbox/v2/main.ts",
-      content: "await Promise.resolve();\n",
-      sha256: "d".repeat(64),
-    },
-  ]),
-};
-
 function readyEnvelope(
   binding: BootstrapBinding,
   instanceId: string,
@@ -319,6 +298,16 @@ describe("V2BootstrapController", () => {
       initialActivePerSandbox: 4,
       maxActivePerSandbox: 12,
     });
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!)).toEqual({
+      protocol: "gp-awareness-v2",
+      version: 1,
+      revision: "r1",
+      buildHash: BUILD_HASH,
+      schemaHash: SCHEMA_HASH,
+      manifestPath: ASSETS.manifest.path,
+      entrypointPath: ASSETS.entrypointPath,
+    });
+    expect(harness.ydoc.files.get(ASSETS.manifest.path)).toBe(ASSETS.manifest.content);
   });
 
   it("retries with a fresh nonce and succeeds after a stale hello", async () => {
@@ -376,7 +365,7 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.launchers[0]).toContain("/usr/local/bin/deno");
     expect(harness.gateway.launchers[0]).toContain("$gp_deno");
     expect(harness.gateway.launchers[0]).not.toContain("exec 'setsid', '/code/crixet/deno'");
-    expect(harness.gateway.launchers[0]).toContain("/workspace/.ghostprov-v2/sidecar.bundle.js");
+    expect(harness.gateway.launchers[0]).toContain(`/workspace/${ASSETS.entrypointPath}`);
     expect(harness.gateway.launchers[0]).not.toContain("--config=/workspace/.ghostprov-v2/deno.json");
     expect(harness.gateway.launchers[0]).toContain("NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM");
     expect(harness.ydoc.writes.find(write => write.path === "main.tex")?.content)
@@ -404,6 +393,20 @@ describe("V2BootstrapController", () => {
     });
     expect(error.message).toContain("Authorization: Bearer [REDACTED]");
     expect(error.message).not.toContain("sk-bootstrap-secret");
+  });
+
+  it("fails closed before launch when an immutable addressed asset was altered", async () => {
+    const harness = bootstrapHarness();
+    harness.ydoc.files.set(ASSETS.entrypointPath, "altered immutable bundle\n");
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "deploy",
+      message: expect.stringContaining("Immutable V2 sidecar asset collision"),
+    });
+
+    expect(harness.gateway.renders).toBe(0);
+    expect(harness.ydoc.files.has(".ghostprov-v2/revision.json")).toBe(false);
   });
 
   it("requests a proven drain before clearing sidecar presence", async () => {

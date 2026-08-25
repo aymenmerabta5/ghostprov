@@ -1,9 +1,3 @@
-import {
-  Unzip,
-  UnzipInflate,
-  type UnzipFile,
-} from "fflate";
-import { ZipPollCoordinator } from "../prism/zip-coordinator";
 import type { AccountRequestClient } from "../prism/provisioning-client";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
@@ -14,7 +8,6 @@ export interface SandboxGatewayOptions {
   account: AccountRequestClient;
   sandbox: ProvisionedSandbox;
   clock?: Clock;
-  zipBatchMs?: number;
   syncBatchMs?: number;
 }
 
@@ -42,88 +35,14 @@ export class SandboxGatewayError extends Error {
   }
 }
 
-function concat(chunks: Uint8Array[], total: number): Uint8Array {
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
-}
-
-async function unzipStream(response: Response, wanted: readonly string[]): Promise<Map<string, Uint8Array>> {
-  if (!response.body) throw new SandboxGatewayError("ZIP response has no body", response.status, "zip");
-  const names = new Set(wanted);
-  const output = new Map<string, Uint8Array>();
-  let pending = 0;
-  let inputDone = false;
-  let settled = false;
-
-  return new Promise<Map<string, Uint8Array>>((resolve, reject) => {
-    const finish = () => {
-      if (!settled && inputDone && pending === 0) {
-        settled = true;
-        resolve(output);
-      }
-    };
-    const fail = (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    const unzip = new Unzip((file: UnzipFile) => {
-      if (!names.has(file.name)) return;
-      pending++;
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      file.ondata = (error, data, final) => {
-        if (error) return fail(error);
-        if (data.length) {
-          chunks.push(data);
-          total += data.length;
-        }
-        if (final) {
-          output.set(file.name, concat(chunks, total));
-          pending--;
-          finish();
-        }
-      };
-      try { file.start(); } catch (error) { fail(error); }
-    });
-    unzip.register(UnzipInflate);
-
-    void (async () => {
-      const reader = response.body!.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          unzip.push(value ?? new Uint8Array(), done);
-          if (done) {
-            inputDone = true;
-            finish();
-            return;
-          }
-        }
-      } catch (error) {
-        fail(error);
-      } finally {
-        reader.releaseLock();
-      }
-    })();
-  });
-}
-
 export class SandboxGateway {
   readonly projectId: ProjectId;
   readonly #account: AccountRequestClient;
   readonly #clock: Clock;
-  readonly #zipCoordinator: ZipPollCoordinator;
   readonly #syncBatchMs: number;
   #sandbox: ProvisionedSandbox;
   #effectiveSessionId: string | null;
   #cacheBust = 0;
-  #zipChain: Promise<void> = Promise.resolve();
   #syncRequestedEpoch = 0;
   #syncCompletedEpoch = 0;
   #syncLoop: Promise<void> | null = null;
@@ -138,10 +57,6 @@ export class SandboxGateway {
     if (!Number.isFinite(this.#syncBatchMs) || this.#syncBatchMs < 0 || this.#syncBatchMs > 1_000) {
       throw new RangeError("syncBatchMs must be between 0 and 1000");
     }
-    this.#zipCoordinator = new ZipPollCoordinator(
-      names => this.#serializeZip(names),
-      options.zipBatchMs ?? 10,
-    );
   }
 
   async heartbeat(signal?: AbortSignal): Promise<HeartbeatResult> {
@@ -154,9 +69,9 @@ export class SandboxGateway {
       this.#effectiveSessionId !== null &&
       sessionId !== this.#effectiveSessionId
     ) {
-      // A live gateway silently switching sessions invalidates every V2
-      // binding and V1 daemon assumption. Fail closed and let the supervisor
-      // create a freshly fenced generation instead of adopting it in place.
+      // A live gateway silently switching sessions invalidates the V2 binding.
+      // Fail closed and let the supervisor create a freshly fenced generation
+      // instead of adopting it in place.
       return {
         ok: false,
         status: 409,
@@ -242,21 +157,10 @@ export class SandboxGateway {
     });
   }
 
-  readFiles(names: string[]): Promise<Map<string, Uint8Array>> {
-    return this.#zipCoordinator.read(names);
-  }
-
   async triggerRender(request: RenderRequest, signal?: AbortSignal): Promise<void> {
     const response = await this.postJson("render?renderMode=async&renderStatusMode=json", request, signal);
     if (response.status !== 202) {
       throw new SandboxGatewayError(`Render returned ${response.status}`, response.status, "render");
-    }
-  }
-
-  async deleteFile(filename: string, signal?: AbortSignal): Promise<void> {
-    const response = await this.postJson("delete-file", { filename }, signal);
-    if (!response.ok && response.status !== 404) {
-      throw new SandboxGatewayError(`Delete returned ${response.status}`, response.status, "delete-file");
     }
   }
 
@@ -343,25 +247,4 @@ export class SandboxGateway {
     }
   }
 
-  #serializeZip(names: string[]): Promise<Map<string, Uint8Array>> {
-    let resolveResult!: (value: Map<string, Uint8Array>) => void;
-    let rejectResult!: (reason: unknown) => void;
-    const result = new Promise<Map<string, Uint8Array>>((resolve, reject) => {
-      resolveResult = resolve;
-      rejectResult = reject;
-    });
-    this.#zipChain = this.#zipChain
-      .catch(() => undefined)
-      .then(async () => {
-        try { resolveResult(await this.#fetchZip(names)); }
-        catch (error) { rejectResult(error); }
-      });
-    return result;
-  }
-
-  async #fetchZip(names: string[]): Promise<Map<string, Uint8Array>> {
-    const response = await this.#request("zip", { method: "GET" });
-    if (!response.ok) throw new SandboxGatewayError(`ZIP returned ${response.status}`, response.status, "zip");
-    return unzipStream(response, names);
-  }
 }

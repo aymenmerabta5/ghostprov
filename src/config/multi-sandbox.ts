@@ -2,9 +2,7 @@ import * as path from "node:path";
 import type { MachineSample } from "../core/ports";
 import { projectId, type ProjectId } from "../sandbox/types";
 
-export type TransportMode = "v1" | "v2" | "auto";
 export type PrismSessionMode = "authenticated" | "auto" | "anonymous";
-export type ProjectReuseMode = "managed" | "eligible-owned" | "explicit";
 
 export interface MultiSandboxConfig {
   projectIds: readonly ProjectId[];
@@ -17,20 +15,10 @@ export interface MultiSandboxConfig {
   routerQueueTimeoutMs: number;
   shutdownDrainMs: number;
   maxProjects: number;
-  slotsPerProject: number;
   machine: MachineSample;
-  transport: TransportMode;
-  /** Semicolon-separated dashboard-declared shared TPM groups. */
-  rateLimitSharedModelGroups: readonly (readonly string[])[];
-  /** Bounded per-model concurrency while successful proxy responses omit TPM headers. */
-  rateLimitColdMaxActive: number;
   sessionMode: PrismSessionMode;
   allowAnonymous: boolean;
   guestMaxProjects: number;
-  autoCreateProjects: boolean;
-  projectReuse: ProjectReuseMode;
-  targetConcurrency: number;
-  targetSandboxes: number | null;
   v2SandboxCapacity: number;
   v2InitialActivePerSandbox: number;
   v2MaxActivePerSandbox: number;
@@ -51,11 +39,6 @@ function positiveInteger(value: string | undefined, fallback: number, name: stri
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) throw new TypeError(`${name} must be a positive integer`);
   return parsed;
-}
-
-function optionalPositiveInteger(value: string | undefined, name: string): number | null {
-  if (value === undefined || value.trim() === "") return null;
-  return positiveInteger(value, 1, name);
 }
 
 function boundedPositiveInteger(value: string | undefined, fallback: number, name: string, minimum: number, maximum: number): number {
@@ -84,97 +67,37 @@ function binaryFlag(value: string | undefined, name: string): boolean {
   throw new TypeError(`${name} must be 0 or 1`);
 }
 
-function parseRateLimitSharedModelGroups(value: string | undefined): readonly (readonly string[])[] {
-  if (value === undefined || value.trim() === "") return Object.freeze([]);
-  const seen = new Set<string>();
-  const groups = value.split(";").map((rawGroup, groupIndex) => {
-    const models = rawGroup.split(",").map(model => model.trim().toLowerCase()).filter(Boolean);
-    if (models.length < 2) {
-      throw new TypeError(
-        `GP_RATE_LIMIT_SHARED_MODEL_GROUPS group ${groupIndex + 1} must contain at least two models`,
-      );
-    }
-    const unique = [...new Set(models)];
-    if (unique.length !== models.length) {
-      throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS group ${groupIndex + 1} contains a duplicate model`);
-    }
-    for (const model of unique) {
-      if (!/^[a-z0-9][a-z0-9._:-]{0,127}$/.test(model)) {
-        throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS model ${JSON.stringify(model)} is invalid`);
-      }
-      if (seen.has(model)) {
-        throw new TypeError(`GP_RATE_LIMIT_SHARED_MODEL_GROUPS model ${JSON.stringify(model)} appears in multiple groups`);
-      }
-      seen.add(model);
-    }
-    return Object.freeze(unique);
-  });
-  return Object.freeze(groups);
-}
-
-export function resolveDesiredSandboxCount(input: {
-  targetConcurrency: number;
-  targetSandboxes: number | null;
-  v2SandboxCapacity: number;
-  maxProjects: number;
-  sessionMode: PrismSessionMode;
-  guestMaxProjects: number;
-}): number {
-  const requested = input.targetSandboxes ?? Math.ceil(
-    input.targetConcurrency / input.v2SandboxCapacity,
-  );
-  const identityCeiling = input.sessionMode === "anonymous"
-    ? Math.min(input.maxProjects, input.guestMaxProjects)
-    : input.maxProjects;
-  return Math.max(1, Math.min(requested, identityCeiling));
-}
-
 export function resolveMultiSandboxConfig(
   env: Record<string, string | undefined>,
   machine: MachineSample,
 ): MultiSandboxConfig {
-  const transport = enumValue<TransportMode>(
-    env.GP_TRANSPORT,
-    "auto",
-    ["v1", "v2", "auto"],
-    "GP_TRANSPORT",
-  );
-  const rateLimitSharedModelGroups = parseRateLimitSharedModelGroups(
-    env.GP_RATE_LIMIT_SHARED_MODEL_GROUPS,
-  );
-  const rateLimitColdMaxActive = boundedPositiveInteger(
-    env.GP_RATE_LIMIT_COLD_MAX_ACTIVE,
-    16,
-    "GP_RATE_LIMIT_COLD_MAX_ACTIVE",
-    1,
-    128,
-  );
   const sessionMode = enumValue<PrismSessionMode>(
     env.GP_PRISM_SESSION,
     "authenticated",
     ["authenticated", "auto", "anonymous"],
     "GP_PRISM_SESSION",
   );
-  if (sessionMode === "anonymous" && transport !== "v2") {
-    throw new TypeError("anonymous Prism sessions require GP_TRANSPORT=v2");
-  }
-
   const allowAnonymous = binaryFlag(env.GP_ALLOW_ANONYMOUS, "GP_ALLOW_ANONYMOUS");
   const autoCreateProjects = binaryFlag(
     env.GP_AUTO_CREATE_PROJECTS,
     "GP_AUTO_CREATE_PROJECTS",
   );
-  const projectReuse = enumValue<ProjectReuseMode>(
-    env.GP_PROJECT_REUSE,
-    "managed",
-    ["managed", "eligible-owned", "explicit"],
-    "GP_PROJECT_REUSE",
-  );
+  if (autoCreateProjects) {
+    throw new TypeError(
+      "GP_AUTO_CREATE_PROJECTS is unsupported in V2-only mode; configure existing PRISM_PROJECT_IDS",
+    );
+  }
+  const projectReuse = env.GP_PROJECT_REUSE?.trim() || "explicit";
+  if (projectReuse !== "explicit") {
+    throw new TypeError(
+      "GP_PROJECT_REUSE must be explicit in V2-only mode",
+    );
+  }
 
   const rawProjects = (env.PRISM_PROJECT_IDS ?? env.PRISM_DOC_ID ?? "").trim();
-  if (!rawProjects && (transport === "v1" || !autoCreateProjects)) {
+  if (!rawProjects) {
     throw new TypeError(
-      "PRISM_PROJECT_IDS or PRISM_DOC_ID is required unless V2 automatic project creation is enabled",
+      "PRISM_PROJECT_IDS or PRISM_DOC_ID is required in V2-only mode",
     );
   }
   const projectIds = rawProjects
@@ -194,8 +117,11 @@ export function resolveMultiSandboxConfig(
   if (guestMaxProjects > maxProjects) {
     throw new RangeError("GP_GUEST_MAX_PROJECTS must not exceed GP_MAX_PROJECTS");
   }
-  const slotsPerProject = positiveInteger(env.GP_SLOTS, 30, "GP_SLOTS");
-  if (slotsPerProject > 30) throw new RangeError("GP_SLOTS must not exceed the daemon's 30-lane capacity");
+  if (sessionMode === "anonymous" && projectIds.length > guestMaxProjects) {
+    throw new RangeError(
+      `Configured ${projectIds.length} projects exceeds GP_GUEST_MAX_PROJECTS=${guestMaxProjects}`,
+    );
+  }
   if (projectIds.length > maxProjects) throw new RangeError(`Configured ${projectIds.length} projects exceeds GP_MAX_PROJECTS=${maxProjects}`);
 
   const cookieFile = env.PRISM_COOKIE_FILE?.trim();
@@ -226,15 +152,6 @@ export function resolveMultiSandboxConfig(
     3_600_000,
   );
 
-  const targetConcurrency = positiveInteger(
-    env.GP_TARGET_CONCURRENCY,
-    512,
-    "GP_TARGET_CONCURRENCY",
-  );
-  const targetSandboxes = optionalPositiveInteger(
-    env.GP_TARGET_SANDBOXES,
-    "GP_TARGET_SANDBOXES",
-  );
   const v2SandboxCapacity = positiveInteger(
     env.GP_V2_SANDBOX_CAPACITY,
     128,
@@ -296,17 +213,7 @@ export function resolveMultiSandboxConfig(
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
-  let desiredSandboxes = resolveDesiredSandboxCount({
-    targetConcurrency,
-    targetSandboxes,
-    v2SandboxCapacity: v2MaxActivePerSandbox,
-    maxProjects,
-    sessionMode,
-    guestMaxProjects,
-  });
-  if (targetSandboxes === null && !autoCreateProjects && projectIds.length > 0) {
-    desiredSandboxes = Math.min(desiredSandboxes, projectIds.length);
-  }
+  const desiredSandboxes = projectIds.length;
   const provisionConcurrency = Math.min(
     desiredSandboxes,
     positiveInteger(env.GP_PROVISION_CONCURRENCY, 4, "GP_PROVISION_CONCURRENCY"),
@@ -323,18 +230,10 @@ export function resolveMultiSandboxConfig(
     routerQueueTimeoutMs,
     shutdownDrainMs,
     maxProjects,
-    slotsPerProject,
     machine,
-    transport,
-    rateLimitSharedModelGroups,
-    rateLimitColdMaxActive,
     sessionMode,
     allowAnonymous,
     guestMaxProjects,
-    autoCreateProjects,
-    projectReuse,
-    targetConcurrency,
-    targetSandboxes,
     v2SandboxCapacity,
     v2InitialActivePerSandbox,
     v2MaxActivePerSandbox,

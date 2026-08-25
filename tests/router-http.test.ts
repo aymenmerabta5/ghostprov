@@ -3,8 +3,12 @@ import { WebSocket } from "ws";
 import { request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
 import { parseFrames } from "../src/relay/sse";
-import { MultiSandboxRouter } from "../src/router/router";
+import {
+  MultiSandboxRouter,
+  type IncomingResourceLease,
+} from "../src/router/router";
 import { ResourceGovernor } from "../src/router/resource-governor";
+import { classifyWorkload } from "../src/router/workload";
 import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
@@ -14,6 +18,7 @@ import { projectId } from "../src/sandbox/types";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { closeResponsesWebSockets } from "../src/ws/server";
+import { V2RunHandle } from "../src/v2/transport/run-handle";
 
 const servers: Server[] = [];
 
@@ -79,15 +84,21 @@ function healthRouter(overrides: Array<Partial<RoutableSandboxSnapshot>>): Multi
 }
 
 class FakeRouter {
-  workloads: Array<{ body: Record<string, unknown>; source?: string; clientId?: string }> = [];
+  workloads: Array<{
+    body: Record<string, unknown>;
+    source?: string;
+    clientId?: string;
+    incomingLease?: IncomingResourceLease;
+  }> = [];
   bodyReservations: number[] = [];
+  bodyLeases: IncomingResourceLease[] = [];
   bodyReservationActive = 0;
   bodyReservationReleases = 0;
   async acquireIncomingBody(bytes: number) {
     this.bodyReservations.push(bytes);
     this.bodyReservationActive++;
     let released = false;
-    return {
+    const lease = {
       release: () => {
         if (released) return;
         released = true;
@@ -95,8 +106,14 @@ class FakeRouter {
         this.bodyReservationReleases++;
       },
     };
+    this.bodyLeases.push(lease);
+    return lease;
   }
-  async startRelay(body: Record<string, unknown>, options: { source?: string; clientId?: string } = {}): Promise<RunHandle> {
+  async startRelay(body: Record<string, unknown>, options: {
+    source?: string;
+    clientId?: string;
+    incomingLease?: IncomingResourceLease;
+  } = {}): Promise<RunHandle> {
     expect(this.bodyReservationActive).toBeGreaterThanOrEqual(0);
     this.workloads.push({ body, ...options });
     if (Array.isArray(body.tools) && (body.tools as any[])[0]?.type === "image_generation") {
@@ -122,6 +139,231 @@ class FakeRouter {
 }
 
 describe("router HTTP composition", () => {
+  it("rejects keepalive intervals that cannot be scheduled safely", () => {
+    const router = new FakeRouter();
+    for (const keepAliveMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+      expect(() => createGhostProvApp({ router, keepAliveMs })).toThrow(RangeError);
+    }
+    expect(() => createGhostProvApp({ router, keepAliveMs: 1 })).not.toThrow();
+    expect(() => createGhostProvApp({ router, keepAliveMs: 2_147_483_647 })).not.toThrow();
+  });
+
+  it("drains bounded relay events for non-streaming responses", async () => {
+    const responseFinal = final("resp_nonstream_bounded");
+    const bounded = new V2RunHandle({ maxBufferedBytes: 128 });
+    const producer = (async () => {
+      for (let sequence = 0; sequence < 32; sequence++) {
+        await bounded.acceptEvent({
+          event: "response.output_text.delta",
+          data: JSON.stringify({
+            type: "response.output_text.delta",
+            sequence_number: sequence,
+            delta: "bounded-event",
+          }),
+        });
+      }
+      bounded.settle(responseFinal);
+    })();
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async () => bounded,
+    };
+
+    const pending = createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x" }),
+    });
+    const response = await Promise.race([
+      pending,
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 500)),
+    ]);
+
+    expect(response).not.toBeNull();
+    if (!response) return;
+    await producer;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(responseFinal);
+  });
+
+  it("aborts non-streaming relay work when event draining fails before final settles", async () => {
+    let relaySignal: AbortSignal | undefined;
+    let iteratorClosed = false;
+    const streamHandle: RunHandle = {
+      async *events() {
+        try {
+          throw new DOMException("event drain failed", "AbortError");
+        } finally {
+          iteratorClosed = true;
+        }
+      },
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    };
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (
+        _body: Record<string, unknown>,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        relaySignal = options.signal;
+        return streamHandle;
+      },
+    };
+
+    const pending = createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x" }),
+    });
+    const response = await Promise.race([
+      pending,
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 500)),
+    ]);
+
+    expect(response).not.toBeNull();
+    if (!response) return;
+    expect(response.status).toBe(499);
+    expect(relaySignal?.aborted).toBe(true);
+    expect(iteratorClosed).toBe(true);
+  });
+
+  it("aborts and returns a waiting non-stream iterator when final rejects", async () => {
+    let relaySignal: AbortSignal | undefined;
+    let returnCalled = false;
+    let rejectFinal!: (error: unknown) => void;
+    const finalPromise = new Promise<never>((_resolve, reject) => { rejectFinal = reject; });
+    const waitingIterator = {
+      next: () => new Promise<IteratorResult<{ event: string; data: string }, void>>(() => undefined),
+      return: async () => {
+        returnCalled = true;
+        return { done: true as const, value: undefined };
+      },
+      throw: async (error?: unknown) => { throw error; },
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<{ event: string; data: string }, void>;
+    const streamHandle: RunHandle = {
+      events: () => waitingIterator,
+      final: finalPromise,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    };
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (
+        _body: Record<string, unknown>,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        relaySignal = options.signal;
+        setTimeout(() => rejectFinal(new DOMException("final failed", "AbortError")), 0);
+        return streamHandle;
+      },
+    };
+
+    const pending = createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x" }),
+    });
+    const response = await Promise.race([
+      pending,
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 500)),
+    ]);
+
+    expect(response).not.toBeNull();
+    if (!response) return;
+    expect(response.status).toBe(499);
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalled).toBe(true);
+  });
+
+  it("bounds SSE pull-ahead and aborts the relay when the response body is cancelled", async () => {
+    let produced = 0;
+    let iteratorClosed = false;
+    let relaySignal: AbortSignal | undefined;
+    const streamHandle: RunHandle = {
+      async *events() {
+        try {
+          for (let sequence = 0; sequence < 2_000; sequence++) {
+            produced++;
+            yield {
+              event: "response.output_text.delta",
+              data: JSON.stringify({
+                type: "response.output_text.delta",
+                sequence_number: sequence,
+                delta: "x",
+              }),
+            };
+          }
+        } finally {
+          iteratorClosed = true;
+        }
+      },
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    };
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (
+        _body: Record<string, unknown>,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        relaySignal = options.signal;
+        return streamHandle;
+      },
+    };
+    const response = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(produced).toBeLessThanOrEqual(2);
+    await response.body!.cancel("test cancellation");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(relaySignal?.aborted).toBe(true);
+    expect(iteratorClosed).toBe(true);
+  });
+
+  it("aborts and returns the SSE iterator when streaming fails", async () => {
+    let relaySignal: AbortSignal | undefined;
+    let returnCalled = false;
+    const failedIterator = {
+      next: async () => { throw new DOMException("stream failed", "AbortError"); },
+      return: async () => {
+        returnCalled = true;
+        return { done: true as const, value: undefined };
+      },
+      throw: async (error?: unknown) => { throw error; },
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<{ event: string; data: string }, void>;
+    const streamHandle: RunHandle = {
+      events: () => failedIterator,
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    };
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (
+        _body: Record<string, unknown>,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        relaySignal = options.signal;
+        return streamHandle;
+      },
+    };
+    const response = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+
+    const text = await response.text();
+    expect(text).toContain("event: error");
+    expect(relaySignal?.aborted).toBe(true);
+    expect(returnCalled).toBe(true);
+  });
+
   it("routes HTTP and image fan-out through one router with source metadata", async () => {
     const router = new FakeRouter();
     const app = createGhostProvApp({
@@ -320,7 +562,223 @@ describe("router HTTP composition", () => {
     }));
     await completed;
     expect(router.workloads.at(-1)?.source).toBe("websocket");
+    expect(router.workloads.at(-1)?.clientId).toMatch(/^ws-/);
+    expect(router.workloads.at(-1)?.clientId).not.toBe("websocket");
     socket.close();
+  });
+
+  it("atomically hands the HTTP body reservation to workload admission", async () => {
+    const MiB = 1024 ** 2;
+    const governor = new ResourceGovernor({
+      probe: {
+        sample: () => ({
+          totalBytes: 16 * 1024 ** 3,
+          freeBytes: 12 * 1024 ** 3,
+          rssBytes: 256 * MiB,
+          heapBytes: 64 * MiB,
+          externalBytes: 8 * MiB,
+          logicalProcessors: 8,
+        }),
+      },
+    });
+    const reservationCapacity = governor.snapshot().reservationCapacityBytes;
+    const blocker = await governor.acquire({
+      class: "text-large",
+      requestBytes: 0,
+      reservedBytes: reservationCapacity - 8 * MiB,
+      cpuPermits: 0,
+      stream: false,
+      serializedBody: "",
+    });
+    const id = projectId("00000000-0000-4000-8000-000000000099");
+    const runtime: RoutableSandboxRuntime = {
+      projectId: id,
+      async start() {},
+      async drain() {},
+      async stop() {},
+      snapshot: () => ({
+        projectId: id,
+        state: "ready",
+        capacity: 1,
+        active: 0,
+        available: 1,
+        quarantined: 0,
+        heartbeatAgeMs: 0,
+        credentialExpiresInMs: 60_000,
+        ackEwmaMs: 1,
+        completionEwmaMs: 1,
+        recentFailureRate: 0,
+        queueDepth: 0,
+        memoryPressure: 0,
+        failure: null,
+      }),
+      async run() { return handle(final("resp_atomic_handoff")); },
+    };
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      governor,
+    });
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+
+    try {
+      const body = JSON.stringify({ model: "gpt-5.6-sol", input: "handoff" });
+      const response = await Promise.race([
+        fetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(Buffer.byteLength(body)),
+          },
+          body,
+        }),
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("HTTP reservation was nested instead of replaced")),
+          500,
+        )),
+      ]);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ id: "resp_atomic_handoff" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(governor.snapshot().reservedBytes).toBe(blocker.reservedBytes);
+    } finally {
+      await router.close();
+      blocker.release();
+      governor.close();
+    }
+  });
+
+  it("hands one image batch ingress lease to exactly one concurrent fan-out job", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const body = JSON.stringify({
+      model: "gpt-image-2",
+      prompt: "two circles",
+      n: 2,
+    });
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/images/generations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(body)),
+      },
+      body,
+    });
+
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).data).toHaveLength(2);
+    const imageCalls = router.workloads.filter(call => call.source === "image");
+    expect(imageCalls).toHaveLength(2);
+    expect(imageCalls.filter(call => call.incomingLease !== undefined)).toHaveLength(1);
+    expect(imageCalls[0].incomingLease).toBe(router.bodyLeases[0]);
+    expect(imageCalls[1].incomingLease).toBeUndefined();
+    expect(router.bodyReservationReleases).toBe(1);
+    expect(router.bodyReservationActive).toBe(0);
+  });
+
+  it("keeps retained image ingress memory inside the first execution reservation", async () => {
+    const MiB = 1024 ** 2;
+    const governor = new ResourceGovernor({
+      probe: {
+        sample: () => ({
+          totalBytes: 16 * 1024 ** 3,
+          freeBytes: 12 * 1024 ** 3,
+          rssBytes: 256 * MiB,
+          heapBytes: 64 * MiB,
+          externalBytes: 8 * MiB,
+          logicalProcessors: 8,
+        }),
+      },
+    });
+    const id = projectId("00000000-0000-4000-8000-000000000100");
+    let settleFinal!: (value: ReturnType<typeof final>) => void;
+    const pendingFinal = new Promise<ReturnType<typeof final>>(resolve => {
+      settleFinal = resolve;
+    });
+    const runtime: RoutableSandboxRuntime = {
+      projectId: id,
+      async start() {},
+      async drain() {},
+      async stop() {},
+      snapshot: () => ({
+        projectId: id,
+        state: "ready",
+        capacity: 1,
+        active: 0,
+        available: 1,
+        quarantined: 0,
+        heartbeatAgeMs: 0,
+        credentialExpiresInMs: 60_000,
+        ackEwmaMs: 1,
+        completionEwmaMs: 1,
+        recentFailureRate: 0,
+        queueDepth: 0,
+        memoryPressure: 0,
+        failure: null,
+      }),
+      async run() { return handle(pendingFinal); },
+    };
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      governor,
+    });
+    const body = {
+      model: "gpt-5.6-sol",
+      input: "make an image",
+      tools: [{ type: "image_generation" }],
+    };
+    const incoming = await router.acquireIncomingBody(1024);
+    const execution = classifyWorkload({ ...body, service_tier: "fast" });
+
+    try {
+      const relay = await router.startRelay(body, {
+        source: "image",
+        incomingLease: incoming,
+      });
+      expect(governor.snapshot().reservedBytes).toBe(
+        execution.reservedBytes + 8 * MiB,
+      );
+      settleFinal(final("resp_image_memory"));
+      await relay.final;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(governor.snapshot().reservedBytes).toBe(0);
+    } finally {
+      settleFinal(final("resp_image_memory_cleanup"));
+      incoming.release();
+      await router.close();
+      governor.close();
+    }
+  });
+
+  it("releases an unconsumed ingress lease when image parsing fails", async () => {
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router });
+    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/images/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "1" },
+      body: "{",
+    });
+
+    expect(response.status).toBe(400);
+    expect(router.workloads).toHaveLength(0);
+    expect(router.bodyReservationReleases).toBe(1);
+    expect(router.bodyReservationActive).toBe(0);
   });
 
   it("closes owned WebSockets with a restart code after graceful drain", async () => {

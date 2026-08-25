@@ -39,8 +39,9 @@ function waitForDrain(res: ServerResponse): Promise<void> {
  * Node's backpressure signal before reading more upstream bytes.
  */
 export async function writeFetchResponse(res: ServerResponse, response: Response): Promise<void> {
-  res.writeHead(response.status, responseHeaders(response));
   if (!response.body) {
+    if (res.destroyed || res.closed) return;
+    res.writeHead(response.status, responseHeaders(response));
     res.end();
     return;
   }
@@ -53,15 +54,18 @@ export async function writeFetchResponse(res: ServerResponse, response: Response
   res.once("close", onClose);
 
   try {
+    if (res.destroyed || res.closed) throw new ClientDisconnectedError();
+    res.writeHead(response.status, responseHeaders(response));
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (res.destroyed) throw new ClientDisconnectedError();
-      if (!res.write(Buffer.from(value))) await waitForDrain(res);
+      if (!res.write(value)) await waitForDrain(res);
     }
     completed = true;
     if (!res.destroyed) res.end();
   } catch (error) {
+    if (!completed) await reader.cancel(error).catch(() => undefined);
     if (!(error instanceof ClientDisconnectedError) && !res.destroyed) throw error;
   } finally {
     completed = true;

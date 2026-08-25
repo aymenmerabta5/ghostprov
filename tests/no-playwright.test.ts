@@ -32,4 +32,25 @@ describe("browserless production source", () => {
     expect(existsSync(path.join(root, "src", "bridge", "playwright.ts"))).toBe(false);
     expect(existsSync(path.join(root, "src", "bridge", "config.ts"))).toBe(false);
   });
+
+  it("contains only the V2 sandbox request transport", () => {
+    const removed = [
+      "sandbox/gp_daemon.py",
+      "sandbox/runner.py",
+      "sandbox/ask.py",
+      "src/sandbox/managed-v1-runtime.ts",
+      "src/sandbox/daemon-controller.ts",
+      "src/relay/slot-runner.ts",
+      "src/relay/segments.ts",
+      "src/v2/transport-selector.ts",
+    ];
+    for (const file of removed) expect(existsSync(path.join(root, file))).toBe(false);
+
+    const config = readFileSync(path.join(root, "src", "config", "multi-sandbox.ts"), "utf8");
+    const system = readFileSync(path.join(root, "src", "server", "system.ts"), "utf8");
+    expect(config).not.toContain("GP_TRANSPORT");
+    expect(config).not.toContain("GP_SLOTS");
+    expect(system).not.toContain("ManagedV1Runtime");
+    expect(system).not.toContain("TransportSelectingRuntime");
+  });
 });

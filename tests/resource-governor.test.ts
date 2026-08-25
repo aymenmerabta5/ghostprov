@@ -2,8 +2,14 @@ import { describe, expect, it } from "bun:test";
 import type { MachineProbe, MachineSample } from "../src/core/ports";
 import {
   ResourceGovernor,
+  ResourceGovernorClosedError,
+  ResourceGovernorQueueFullError,
+  ResourceGovernorReplacementOverloadError,
+  ResourceGovernorTimeoutError,
+  ResourceReservationTooLargeError,
   SystemMachineProbe,
   deriveResourceSizing,
+  resolveEffectiveMemory,
 } from "../src/router/resource-governor";
 import type { WorkloadDescriptor } from "../src/router/workload";
 
@@ -57,6 +63,41 @@ describe("resource sizing", () => {
     expect(sizing.processCeilingBytes / GiB).toBeCloseTo(expectedGiB, 0);
     expect(sizing.cpuTransformWorkers).toBe(6);
   });
+
+  it("keeps pause and reserve thresholds reachable on small Linux-sized hosts", () => {
+    const sizing = deriveResourceSizing(sample(2, 1.5, 128));
+    expect(sizing.systemReserveBytes).toBe(gib(1));
+    expect(sizing.pauseFreeBytes).toBe(gib(0.5));
+    expect(sizing.resumeFreeBytes).toBeCloseTo(gib(0.8), 0);
+    expect(sizing.resumeFreeBytes).toBeLessThan(sizing.totalBytes);
+    expect(sizing.reservationCapacityBytes).toBeGreaterThan(0);
+    expect(deriveResourceSizing({ ...sample(2, 1.5, 128), logicalProcessors: 1 })
+      .cpuTransformWorkers).toBe(1);
+  });
+
+  it("uses constrained and available memory instead of host-wide Linux values", () => {
+    expect(resolveEffectiveMemory({
+      hostTotalBytes: gib(32),
+      hostFreeBytes: gib(20),
+      rssBytes: gib(1),
+      constrainedBytes: gib(8),
+      availableBytes: gib(3),
+    })).toEqual({ totalBytes: gib(8), freeBytes: gib(3) });
+
+    expect(resolveEffectiveMemory({
+      hostTotalBytes: gib(32),
+      hostFreeBytes: gib(20),
+      rssBytes: gib(1),
+      constrainedBytes: 0,
+    })).toEqual({ totalBytes: gib(32), freeBytes: gib(20) });
+
+    expect(resolveEffectiveMemory({
+      hostTotalBytes: gib(32),
+      hostFreeBytes: gib(20),
+      rssBytes: gib(2),
+      constrainedBytes: gib(8),
+    })).toEqual({ totalBytes: gib(8), freeBytes: gib(6) });
+  });
 });
 
 describe("ResourceGovernor", () => {
@@ -80,7 +121,7 @@ describe("ResourceGovernor", () => {
     probe.value.freeBytes = gib(2);
     expect(governor.tryAcquire(workload(MiB))).toBeNull();
     expect(governor.snapshot().paused).toBe(true);
-    probe.value.freeBytes = gib(6);
+    probe.value.freeBytes = gib(8);
     governor.refreshPressure();
     expect(governor.snapshot().paused).toBe(false);
     expect(governor.tryAcquire(workload(MiB))).not.toBeNull();
@@ -129,5 +170,253 @@ describe("ResourceGovernor", () => {
     leases.forEach(lease => lease.release());
     expect(() => governor.capacityHint(0, 128)).toThrow(RangeError);
     expect(() => governor.capacityHint(perRequest, -1)).toThrow(RangeError);
+  });
+
+  it("rejects reservations which can never fit instead of queueing them", async () => {
+    const governor = new ResourceGovernor({ probe: new MutableProbe(sample(8, 5)) });
+    const impossible = governor.snapshot().maximumReservationCapacityBytes! + 1;
+
+    const failure = await governor.acquire(workload(impossible)).catch(error => error);
+    expect(failure).toBeInstanceOf(ResourceReservationTooLargeError);
+    expect(failure).toMatchObject({ status: 413, code: "resource_reservation_too_large" });
+    expect(governor.tryAcquire(workload(impossible))).toBeNull();
+    expect(governor.snapshot().queued).toBe(0);
+  });
+
+  it("lowers idle capacity when live RSS rises and free memory falls", () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const initialCapacity = governor.snapshot().reservationCapacityBytes;
+    probe.value.rssBytes = gib(4);
+    probe.value.freeBytes = gib(4.1);
+
+    expect(governor.tryAcquire(workload(initialCapacity))).toBeNull();
+    expect(governor.snapshot().reservationCapacityBytes).toBeLessThan(initialCapacity);
+  });
+
+  it("does not subtract a materialized reservation from both RSS and logical capacity", () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const lease = governor.tryAcquire(workload(512 * MiB))!;
+    const before = governor.snapshot().reservationCapacityBytes -
+      governor.snapshot().reservedBytes;
+
+    probe.value.rssBytes += 512 * MiB;
+    probe.value.freeBytes -= 512 * MiB;
+    governor.refreshPressure();
+    const after = governor.snapshot().reservationCapacityBytes -
+      governor.snapshot().reservedBytes;
+
+    expect(after).toBe(before);
+    lease.release();
+  });
+
+  it("queues structurally valid work when transient RSS consumes all live headroom", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const hardMaximum = governor.snapshot().maximumReservationCapacityBytes!;
+    expect(hardMaximum).toBe(Math.floor(probe.value.totalBytes * 0.60));
+    probe.value.rssBytes = gib(5);
+    probe.value.freeBytes = gib(3);
+    const abort = new AbortController();
+
+    const waiting = governor.acquire(workload(MiB), abort.signal);
+    expect(governor.snapshot()).toMatchObject({
+      reservationCapacityBytes: 0,
+      maximumReservationCapacityBytes: hardMaximum,
+      queued: 1,
+    });
+    abort.abort();
+    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("bounds queued jobs and queued reservation bytes", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const capacity = deriveResourceSizing(probe.sample()).reservationCapacityBytes;
+    const governor = new ResourceGovernor({
+      probe,
+      maxByteWaiters: 1,
+      maxQueuedReservationBytes: capacity,
+    });
+    const active = governor.tryAcquire(workload(capacity))!;
+    const queued = governor.acquire(workload(MiB)).catch(error => error);
+
+    await expect(governor.acquire(workload(MiB))).rejects.toBeInstanceOf(
+      ResourceGovernorQueueFullError,
+    );
+    expect(governor.snapshot()).toMatchObject({
+      queued: 1,
+      queuedReservationBytes: MiB,
+      queueCapacity: 1,
+    });
+
+    governor.close();
+    expect(await queued).toBeInstanceOf(ResourceGovernorClosedError);
+    active.release();
+  });
+
+  it("purges expired waiters before applying queue bounds", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const capacity = deriveResourceSizing(probe.sample()).reservationCapacityBytes;
+    let now = 0;
+    const governor = new ResourceGovernor({
+      probe,
+      maxByteWaiters: 1,
+      maxQueuedReservationBytes: capacity,
+      waiterTimeoutMs: 1_000,
+      now: () => now,
+    });
+    const active = governor.tryAcquire(workload(capacity))!;
+    const expired = governor.acquire(workload(MiB)).catch(error => error);
+    now = 1_001;
+    const replacement = governor.acquire(workload(MiB));
+
+    expect(await expired).toBeInstanceOf(ResourceGovernorTimeoutError);
+    expect(governor.snapshot().queued).toBe(1);
+    active.release();
+    const replacementLease = await replacement;
+    replacementLease.release();
+  });
+
+  it("expires queued acquisition without requiring a lease release", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe, waiterTimeoutMs: 10 });
+    const active = governor.tryAcquire(workload(governor.snapshot().reservationCapacityBytes))!;
+
+    await expect(governor.acquire(workload(MiB))).rejects.toBeInstanceOf(
+      ResourceGovernorTimeoutError,
+    );
+    expect(governor.snapshot().queued).toBe(0);
+    active.release();
+  });
+
+  it("skips a non-fitting head deterministically without letting tryAcquire bypass waiters", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const capacity = governor.snapshot().reservationCapacityBytes;
+    const active = governor.tryAcquire(workload(capacity - 64 * MiB))!;
+    const large = governor.acquire(workload(128 * MiB));
+    const small = await governor.acquire(workload(32 * MiB));
+
+    expect(governor.snapshot()).toMatchObject({ queued: 1 });
+    expect(governor.tryAcquire(workload(MiB))).toBeNull();
+
+    small.release();
+    active.release();
+    const largeLease = await large;
+    largeLease.release();
+  });
+
+  it("bounds small-job bypasses so an older large waiter can accumulate headroom", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const capacity = governor.snapshot().reservationCapacityBytes;
+    const blocker = governor.tryAcquire(workload(capacity - 2 * MiB))!;
+    const large = governor.acquire(workload(3 * MiB));
+
+    for (let index = 0; index < 8; index++) {
+      const small = await governor.acquire(workload(MiB));
+      small.release();
+    }
+    const protectedSmall = governor.acquire(workload(MiB));
+    await Bun.sleep(0);
+    expect(governor.snapshot().queued).toBe(2);
+
+    blocker.release();
+    const largeLease = await large;
+    const smallLease = await protectedSmall;
+    largeLease.release();
+    smallLease.release();
+  });
+
+  it("self-wakes after host memory pressure recovers", async () => {
+    const probe = new MutableProbe(sample(32, 19));
+    const governor = new ResourceGovernor({ probe, pressurePollMs: 5 });
+    probe.value.freeBytes = gib(2);
+    const waiting = governor.acquire(workload(MiB));
+    expect(governor.snapshot()).toMatchObject({ paused: true, queued: 1 });
+
+    probe.value.freeBytes = gib(8);
+    const lease = await waiting;
+    expect(governor.snapshot().paused).toBe(false);
+    lease.release();
+  });
+
+  it("recovers capacity when constructed during transient startup pressure", async () => {
+    const probe = new MutableProbe(sample(8, 3));
+    const governor = new ResourceGovernor({ probe, pressurePollMs: 5 });
+    expect(governor.snapshot().reservationCapacityBytes).toBe(0);
+    const waiting = governor.acquire(workload(MiB));
+
+    probe.value.freeBytes = gib(6);
+    const lease = await waiting;
+    expect(governor.snapshot().reservationCapacityBytes).toBeGreaterThan(0);
+    lease.release();
+  });
+
+  it("fails replacement in place without releasing the old reservation", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const capacity = deriveResourceSizing(probe.sample()).reservationCapacityBytes;
+    const governor = new ResourceGovernor({
+      probe,
+      maxQueuedReservationBytes: capacity,
+    });
+    const firstBytes = Math.floor(capacity / 2);
+    const replacementBytes = Math.floor(capacity * 0.75);
+    const first = governor.tryAcquire(workload(firstBytes))!;
+    const other = governor.tryAcquire(workload(capacity - firstBytes))!;
+    await expect(first.replace(workload(replacementBytes))).rejects.toBeInstanceOf(
+      ResourceGovernorReplacementOverloadError,
+    );
+    expect(first.reservedBytes).toBe(firstBytes);
+    expect(governor.snapshot()).toMatchObject({
+      reservedBytes: capacity,
+      queued: 0,
+      queuedReservationBytes: 0,
+    });
+    other.release();
+
+    const replacementLease = await first.replace(workload(replacementBytes));
+    expect(first.reservedBytes).toBe(0);
+    expect(replacementLease.reservedBytes).toBe(replacementBytes);
+    first.release();
+    replacementLease.release();
+  });
+
+  it("allows an in-place downsize while pressure-paused", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const original = governor.tryAcquire(workload(128 * MiB))!;
+    probe.value.freeBytes = gib(1);
+    governor.refreshPressure();
+    expect(governor.snapshot().paused).toBe(true);
+
+    const replacement = await original.replace(workload(64 * MiB));
+    expect(original.reservedBytes).toBe(0);
+    expect(governor.snapshot().reservedBytes).toBe(64 * MiB);
+    replacement.release();
+  });
+
+  it("closes byte and CPU queues and rejects future acquisition", async () => {
+    const probe = new MutableProbe(sample(32, 19));
+    const governor = new ResourceGovernor({ probe });
+    const byteLease = governor.tryAcquire(workload(governor.snapshot().reservationCapacityBytes))!;
+    const byteWaiter = governor.acquire(workload(MiB)).catch(error => error);
+    const cpuLeases = await Promise.all(
+      Array.from({ length: governor.snapshot().cpuTransformWorkers }, () => governor.acquireCpu()),
+    );
+    const cpuWaiter = governor.acquireCpu().catch(error => error);
+
+    governor.close();
+    expect(await byteWaiter).toBeInstanceOf(ResourceGovernorClosedError);
+    expect(await cpuWaiter).toBeInstanceOf(ResourceGovernorClosedError);
+    await expect(governor.acquire(workload(MiB))).rejects.toBeInstanceOf(
+      ResourceGovernorClosedError,
+    );
+    await expect(governor.acquireCpu()).rejects.toBeInstanceOf(ResourceGovernorClosedError);
+    expect(governor.snapshot()).toMatchObject({ closed: true, queued: 0, cpuQueued: 0 });
+
+    byteLease.release();
+    cpuLeases.forEach(lease => lease.release());
   });
 });

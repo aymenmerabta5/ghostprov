@@ -249,7 +249,7 @@ describe("DirectResponsesClient", () => {
     }
   });
 
-  it("captures TPM headers from a 429 so the host can cool down the whole fleet", async () => {
+  it("captures TPM headers from a 429 for observation-only host telemetry", async () => {
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",
       apiKey: secret("key"),

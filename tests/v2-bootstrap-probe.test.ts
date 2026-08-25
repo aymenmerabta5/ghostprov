@@ -8,7 +8,6 @@ import {
 const VALID = {
   GP_LIVE_V2_BOOTSTRAP: "1",
   GP_CANDIDATE: "1",
-  GP_TRANSPORT: "v2",
   GP_LIVE_V2_PROJECT_ID: "e631d12c-d917-4434-b360-41b4715d6679",
   PRISM_COOKIE_FILE: ".ghostprov/test-cookies.json",
   PORT: "18787",

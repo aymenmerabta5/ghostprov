@@ -9,6 +9,17 @@ const NEUTRAL_CODES = new Set([
   "draining",
   "request_too_large",
   "response_too_large",
+  "cpu_transform_overloaded",
+  "cpu_transform_timeout",
+  "rate_limit",
+  "rate_limit_exceeded",
+  "rate_limited_429",
+  "http_429",
+]);
+
+const NEUTRAL_NAMES = new Set([
+  "CpuTransformQueueFullError",
+  "CpuTransformTimeoutError",
 ]);
 
 function errorRecord(value: unknown): Record<string, unknown> {
@@ -22,6 +33,10 @@ export function classifyRuntimeError(
 ): Exclude<RuntimeHealthOutcome, "healthy"> {
   const value = errorRecord(error);
   if (value.name === "AbortError") return "neutral";
+  if (value.status === 429) return "neutral";
+  if (typeof value.name === "string" && NEUTRAL_NAMES.has(value.name)) {
+    return "neutral";
+  }
   if (typeof value.code === "string" && NEUTRAL_CODES.has(value.code)) {
     return "neutral";
   }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
 import { MultiSandboxRouter } from "../src/router/router";
 import { ResourceGovernor } from "../src/router/resource-governor";
+import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 
@@ -18,6 +19,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   executions = 0;
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
+  failError: Error = new Error("pre-publication failure");
   failDelayMs = 0;
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
@@ -62,7 +64,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
     if (this.failStarts > 0) {
       this.failStarts--;
       if (this.failDelayMs > 0) await Bun.sleep(this.failDelayMs);
-      throw new Error("pre-publication failure");
+      throw this.failError;
     }
     this.active++;
     const gate = deferred<any>();
@@ -113,6 +115,23 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("does not retry host-local CPU overload through another sandbox", async () => {
+    const system = createSystem(2, 1);
+    for (const runtime of system.runtimes) {
+      runtime.failStarts = 1;
+      runtime.failError = new CpuTransformQueueFullError();
+    }
+
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "local-overload",
+      stream: true,
+    })).rejects.toBeInstanceOf(CpuTransformQueueFullError);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("expires zero-capacity queueing with a typed service-unavailable error", async () => {
     const system = createSystem(0, 1, 10);
     const pending = system.router.startRelay(

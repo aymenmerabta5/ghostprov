@@ -4,6 +4,10 @@ import {
   DecayingRuntimeFailureScore,
   classifyRuntimeError,
 } from "../src/v2/runtime-health";
+import {
+  CpuTransformQueueFullError,
+  CpuTransformTimeoutError,
+} from "../src/router/cpu-transform-pool";
 
 class ManualClock implements Clock {
   value = 0;
@@ -33,6 +37,10 @@ describe("V2 runtime health classification", () => {
       { committed: false, code: "draining" },
       { committed: false, code: "request_too_large" },
       { committed: true, code: "response_too_large", ambiguous: true },
+      new CpuTransformQueueFullError(),
+      new CpuTransformTimeoutError(1_000),
+      { status: 429, code: "rate_limit_exceeded", committed: false },
+      { code: "http_429", committed: false },
     ];
 
     for (const error of neutral) {

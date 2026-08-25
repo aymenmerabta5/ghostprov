@@ -8,7 +8,6 @@ import {
   projectId,
   sandboxId,
   sandboxSessionId,
-  slotId,
 } from "../src/sandbox/types";
 
 const PROJECT = "e631d12c-d917-4434-b360-41b4715d6679";
@@ -18,11 +17,8 @@ describe("Prism protocol types", () => {
   it("validates opaque identifiers at the boundary", () => {
     expect(projectId(PROJECT)).toBe(projectId(PROJECT));
     expect(sandboxId(SANDBOX)).toBe(sandboxId(SANDBOX));
-    expect(slotId(30)).toBe(slotId(30));
     expect(() => projectId("not-a-uuid")).toThrow("ProjectId");
     expect(() => sandboxId("")).toThrow("SandboxId");
-    expect(() => slotId(0)).toThrow("SlotId");
-    expect(() => slotId(4097)).toThrow("SlotId");
   });
 
   it("parses and normalizes a provisioned sandbox without exposing its token", () => {

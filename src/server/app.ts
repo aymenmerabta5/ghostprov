@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { RunHandle } from "../relay/run-handle";
-import { sseFrame, SSE_HEADERS } from "../relay/sse";
+import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
 import type { ImageCompatOptions } from "../images/compat";
@@ -9,6 +9,8 @@ import {
   anthropicModelsFromEnv,
   type AnthropicModelOptions,
 } from "../anthropic/model";
+import type { IncomingResourceLease } from "../router/router";
+import { takeIncomingBodyLease } from "../http/request-lease";
 
 export interface RouterLike {
   startRelay(
@@ -17,9 +19,10 @@ export interface RouterLike {
       clientId?: string;
       source?: "http" | "websocket" | "image" | "anthropic" | "internal";
       signal?: AbortSignal;
+      incomingLease?: IncomingResourceLease;
     },
   ): Promise<RunHandle>;
-  acquireIncomingBody?(bytes: number, signal?: AbortSignal): Promise<{ release(): void }>;
+  acquireIncomingBody?(bytes: number, signal?: AbortSignal): Promise<IncomingResourceLease>;
   snapshot(): {
     capacity: number;
     active: number;
@@ -27,8 +30,6 @@ export interface RouterLike {
     queued: number;
     runtimes: unknown[];
     resources: unknown;
-    rateLimit?: unknown;
-    rateLimitQueued?: unknown;
   };
 }
 
@@ -59,6 +60,7 @@ const RESPONSE_TERMINAL_EVENTS = new Set([
   "response.incomplete",
   "response.failed",
 ]);
+const MAX_TIMER_MS = 2_147_483_647;
 
 function terminalEventForFinal(final: unknown): string {
   if (!final || typeof final !== "object" || Array.isArray(final)) {
@@ -86,6 +88,164 @@ function nextResponseSequence(data: string, current: number | null): number | nu
   }
   const next = Number(sequence) + 1;
   return current === null ? next : Math.max(current, next);
+}
+
+async function nonStreamingFinal(
+  handle: RunHandle,
+  cancelRelay: (reason?: unknown) => void,
+): Promise<any> {
+  const iterator = handle.events();
+  const drain = (async () => {
+    while (!(await iterator.next()).done) {
+      // Non-streaming callers still have to consume the bounded transport
+      // queue. The authoritative response is provided by handle.final.
+    }
+  })();
+  try {
+    const [final] = await Promise.all([handle.final, drain]);
+    return final;
+  } catch (error) {
+    cancelRelay(error);
+    void iterator.return(undefined).catch(() => undefined);
+    throw error;
+  }
+}
+
+function responseEventStream(
+  handle: RunHandle,
+  keepAliveMs: number,
+  options: {
+    cancelRelay(reason?: unknown): void;
+    close(): void;
+  },
+): ReadableStream<Uint8Array> {
+  type NextOutcome = { kind: "next"; result: IteratorResult<SseFrame, void> };
+  type CancelledOutcome = { kind: "cancelled" };
+  const encoder = new TextEncoder();
+  const iterator = handle.events();
+  let pendingNext: Promise<NextOutcome> | null = null;
+  let sawTerminal = false;
+  let nextSequence: number | null = null;
+  let finished = false;
+  let cancelled = false;
+  let wakeCancellation: (() => void) | null = null;
+
+  const cancellationWaiter = (): {
+    promise: Promise<CancelledOutcome>;
+    dispose(): void;
+  } => {
+    if (cancelled) {
+      return { promise: Promise.resolve({ kind: "cancelled" }), dispose() {} };
+    }
+    let wake!: () => void;
+    const promise = new Promise<CancelledOutcome>(resolve => {
+      wake = () => resolve({ kind: "cancelled" });
+      wakeCancellation = wake;
+    });
+    return {
+      promise,
+      dispose() {
+        if (wakeCancellation === wake) wakeCancellation = null;
+      },
+    };
+  };
+
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (finished) return;
+    finished = true;
+    options.close();
+    if (!cancelled) controller.close();
+  };
+
+  const fail = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    error: unknown,
+  ): void => {
+    if (finished || cancelled) return;
+    options.cancelRelay(error);
+    void iterator.return(undefined).catch(() => undefined);
+    try {
+      controller.enqueue(encoder.encode(sseFrame("error", apiErrorEvent(error))));
+    } finally {
+      finish(controller);
+    }
+  };
+
+  const nextOrKeepAlive = async (): Promise<
+    | NextOutcome
+    | { kind: "keepalive" }
+    | CancelledOutcome
+  > => {
+    const next = pendingNext ??= iterator.next().then(result => ({ kind: "next", result }));
+    const cancellation = cancellationWaiter();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const keepAlive = new Promise<{ kind: "keepalive" }>(resolve => {
+      timer = setTimeout(() => resolve({ kind: "keepalive" }), keepAliveMs);
+      timer.unref?.();
+    });
+    try {
+      const result = await Promise.race([
+        next,
+        keepAlive,
+        cancellation.promise,
+      ]);
+      if (result.kind === "next" && pendingNext === next) pendingNext = null;
+      return result;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      cancellation.dispose();
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished || cancelled) return;
+      try {
+        const outcome = await nextOrKeepAlive();
+        if (cancelled || outcome.kind === "cancelled") return;
+        if (outcome.kind === "keepalive") {
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+          return;
+        }
+
+        if (!outcome.result.done) {
+          const frame = outcome.result.value;
+          if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) sawTerminal = true;
+          nextSequence = nextResponseSequence(frame.data, nextSequence);
+          controller.enqueue(encoder.encode(sseFrame(frame.event, frame.data)));
+          return;
+        }
+
+        if (!sawTerminal) {
+          const cancellation = cancellationWaiter();
+          const finalOutcome = await Promise.race([
+            handle.final.then(value => ({ kind: "final" as const, value })),
+            cancellation.promise,
+          ]).finally(cancellation.dispose);
+          if (cancelled || finalOutcome.kind === "cancelled") return;
+          const event = terminalEventForFinal(finalOutcome.value);
+          controller.enqueue(encoder.encode(sseFrame(event, {
+            type: event,
+            ...(nextSequence === null ? {} : { sequence_number: nextSequence }),
+            response: finalOutcome.value,
+          })));
+        }
+        finish(controller);
+      } catch (error) {
+        fail(controller, error);
+      }
+    },
+    cancel(reason) {
+      if (cancelled || finished) return;
+      cancelled = true;
+      finished = true;
+      wakeCancellation?.();
+      wakeCancellation = null;
+      options.cancelRelay(reason);
+      options.close();
+      void iterator.return(undefined).catch(() => undefined);
+    },
+  });
 }
 
 function codexModel(input: {
@@ -190,6 +350,9 @@ const CODEX_MODELS = Object.freeze([
 export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const app = new Hono();
   const keepAliveMs = options.keepAliveMs ?? 15_000;
+  if (!Number.isSafeInteger(keepAliveMs) || keepAliveMs < 1 || keepAliveMs > MAX_TIMER_MS) {
+    throw new RangeError(`keepAliveMs must be an integer from 1 through ${MAX_TIMER_MS}`);
+  }
 
   app.get("/health", c => {
     const snapshot = options.router.snapshot();
@@ -213,8 +376,6 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       queued: snapshot.queued,
       runtimes: snapshot.runtimes,
       resources: snapshot.resources,
-      rateLimit: snapshot.rateLimit ?? null,
-      rateLimitQueued: snapshot.rateLimitQueued ?? null,
     });
   });
 
@@ -239,46 +400,30 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     } catch {
       return c.json({ error: { message: "invalid JSON body" } }, 400);
     }
+    const requestSignal = c.req.raw.signal;
+    const relayAbort = new AbortController();
+    const abortRelay = () => relayAbort.abort(requestSignal.reason);
+    if (requestSignal.aborted) abortRelay();
+    else requestSignal.addEventListener("abort", abortRelay, { once: true });
+    let streamOwnsCleanup = false;
+    const cleanupSignal = () => requestSignal.removeEventListener("abort", abortRelay);
     try {
       const handle = await options.router.startRelay(body, {
         source: "http",
         clientId: c.req.header("x-ghostprov-client-id") ?? "http",
-        signal: c.req.raw.signal,
+        signal: relayAbort.signal,
+        incomingLease: takeIncomingBodyLease(c.env),
       });
-      if (body.stream !== true) return c.json(await handle.final);
+      if (body.stream !== true) {
+        const final = await nonStreamingFinal(handle, reason => relayAbort.abort(reason));
+        return c.json(final);
+      }
 
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const encoder = new TextEncoder();
-          const push = (value: string) => controller.enqueue(encoder.encode(value));
-          let closed = false;
-          let sawTerminal = false;
-          let nextSequence: number | null = null;
-          const keepAlive = setInterval(() => { if (!closed) push(": keepalive\n\n"); }, keepAliveMs);
-          try {
-            for await (const frame of handle.events()) {
-              if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) sawTerminal = true;
-              nextSequence = nextResponseSequence(frame.data, nextSequence);
-              push(sseFrame(frame.event, frame.data));
-            }
-            if (!sawTerminal) {
-              const final = await handle.final;
-              const event = terminalEventForFinal(final);
-              push(sseFrame(event, {
-                type: event,
-                ...(nextSequence === null ? {} : { sequence_number: nextSequence }),
-                response: final,
-              }));
-            }
-          } catch (error) {
-            push(sseFrame("error", apiErrorEvent(error)));
-          } finally {
-            clearInterval(keepAlive);
-            closed = true;
-            controller.close();
-          }
-        },
+      const stream = responseEventStream(handle, keepAliveMs, {
+        cancelRelay: reason => relayAbort.abort(reason),
+        close: cleanupSignal,
       });
+      streamOwnsCleanup = true;
       return new Response(stream, { headers: SSE_HEADERS });
     } catch (error) {
       const normalized = normalizeApiError(error);
@@ -286,6 +431,8 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
         console.error(`[responses] ${normalized.error.type}: ${normalized.error.message.slice(0, 240)}`);
       }
       return apiErrorResponse(error);
+    } finally {
+      if (!streamOwnsCleanup) cleanupSignal();
     }
   });
 
@@ -294,20 +441,22 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       responsesModel: "gpt-5.6-sol",
       maxEditInputBytes: 40 * 1024 ** 2,
     },
-    startRelay: (body, signal) => options.router.startRelay(body, {
+    startRelay: (body, signal, incomingLease) => options.router.startRelay(body, {
       source: "image",
       clientId: "images",
       signal,
+      incomingLease,
     }),
   });
 
   registerAnthropicRoutes(app, {
     keepAliveMs,
     models: options.anthropicModels ?? anthropicModelsFromEnv(),
-    startRelay: (body, signal, clientId) => options.router.startRelay(body, {
+    startRelay: (body, signal, clientId, incomingLease) => options.router.startRelay(body, {
       source: "anthropic",
       clientId,
       signal,
+      incomingLease,
     }),
   });
 

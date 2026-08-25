@@ -12,7 +12,7 @@ import type {
 } from "../prism/protocol";
 import type { RunHandle } from "../relay/run-handle";
 import type { RoutableSandboxRuntime, RoutableSandboxSnapshot } from "../sandbox/registry";
-import { describeSandboxFailure } from "../sandbox/runtime";
+import { describeSandboxFailure } from "../sandbox/failure";
 import type { ProjectId } from "../sandbox/types";
 import type { AwarenessChannel } from "./awareness/channel";
 import type { V2ReadyDescriptor } from "./bootstrap/controller";
@@ -24,6 +24,7 @@ import type {
 import type { V2SidecarAssets } from "./sidecar/assets";
 import type { CredentialRefreshOutcome } from "../observability/events";
 import type {
+  V2GzipOptions,
   V2TransportSession,
   V2TransportSnapshot,
 } from "./transport/session";
@@ -157,7 +158,6 @@ export interface V2RuntimeTransport {
 }
 
 export interface V2RuntimeGovernor {
-  capacityHint(perActiveRequestBytes: number, physicalMaximum: number): number;
   snapshot(): {
     reservationCapacityBytes: number;
     reservedBytes: number;
@@ -174,7 +174,7 @@ export interface V2SandboxRuntimeOptions {
   assets: V2SidecarAssets;
   transportReservationBytes: number;
   maxResponseBytes?: number;
-  gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+  gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
   clock?: Clock;
   resourceRefreshLeadMs?: number;
   ySweetRefreshMs?: number;
@@ -215,7 +215,7 @@ export interface V2SandboxRuntimeOptions {
     binding: ProtocolBinding;
     channel: AwarenessChannel<HostFrame, SidecarFrame>;
     maxResponseBytes: number;
-    gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+    gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
     expectedSidecarInstanceId: string;
   }): V2RuntimeTransport | V2TransportSession;
 }
@@ -353,8 +353,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     if (this.#state !== "ready" || !this.#transport || !this.#descriptor) {
       throw new Error(`V2 sandbox ${this.projectId} is not ready`);
     }
-    const ceiling = this.#hostCeiling(this.#descriptor.capacity);
-    this.#transport.setHostCeiling?.(ceiling);
+    this.#transport.setHostCeiling?.(this.#descriptor.capacity);
     const startedAt = this.#clock.now();
     let handle: RunHandle;
     try {
@@ -404,14 +403,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const descriptorCapacity = this.#descriptor?.capacity ?? 0;
     const active = transport?.active ?? 0;
     const quarantined = transport?.quarantined ?? 0;
-    const governorCapacity = descriptorCapacity > 0
-      ? this.#hostCeiling(descriptorCapacity)
-      : 0;
     const creditCapacity = transport
       ? Math.max(0, transport.credits + active)
       : 0;
     const capacity = this.#state === "ready" && !this.#sidecarSuspect && !this.#credentialRefreshPending
-      ? Math.max(0, Math.min(descriptorCapacity, governorCapacity, creditCapacity))
+      ? Math.max(0, Math.min(descriptorCapacity, creditCapacity))
       : 0;
     const heartbeatAt = this.#heartbeat?.snapshot().lastSuccessAtMs ?? null;
     const governor = this.#options.governor.snapshot();
@@ -430,7 +426,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       ambiguousQuarantined: transport?.ambiguousQuarantined ?? 0,
       ambiguityLimit: transport?.ambiguityLimit ?? Math.max(
         1,
-        Math.min(4, governorCapacity || descriptorCapacity || 4),
+        Math.min(4, descriptorCapacity || 4),
       ),
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
       sidecarPeerAgeMs: transport?.sidecarPeerAgeMs ?? null,
@@ -608,7 +604,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         expectedSidecarInstanceId: descriptor.instanceId,
       });
       this.#transport = transport;
-      transport.setHostCeiling?.(this.#hostCeiling(descriptor.capacity));
+      transport.setHostCeiling?.(descriptor.capacity);
       this.#setState("connecting_transport");
       await transport.connect(controller.signal);
       if (generation !== this.#generation) return;
@@ -810,13 +806,6 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         deadline = this.#clock.now();
       }
     }
-  }
-
-  #hostCeiling(physicalMaximum: number): number {
-    return this.#options.governor.capacityHint(
-      this.#options.transportReservationBytes,
-      physicalMaximum,
-    );
   }
 
   #failGeneration(generation: number, failure: V2RuntimeLifecycleFailure): void {

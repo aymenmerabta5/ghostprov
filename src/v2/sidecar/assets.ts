@@ -1,38 +1,124 @@
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  protocolSchemaHash,
+  canonicalJson,
   sha256Hex,
   utf8Bytes,
 } from "../protocol/shared";
 
+export const V2_R1 = "r1" as const;
+export const DEFAULT_V2_SIDECAR_REVISION = V2_R1;
+export const V2_SIDECAR_REVISIONS = Object.freeze([V2_R1] as const);
+
+export type V2SidecarRevision = (typeof V2_SIDECAR_REVISIONS)[number];
+
+export interface V2SidecarReleaseIdentity {
+  readonly revision: V2SidecarRevision;
+  readonly buildHash: string;
+  readonly schemaHash: string;
+  readonly bundleSha256: string;
+}
+
+/**
+ * Frozen release identity. Updating mutable sandbox/v2 sources must never
+ * change these values or the checked-in artifact they authenticate.
+ */
+export const V2_R1_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
+  revision: V2_R1,
+  buildHash: "c8517f66ab9f28496875704933f257338f910708e43645a35bf674d08ac9290a",
+  schemaHash: "c5e0f1bde5ca2820f92d0c3275788acbf199b68f81a84a9408beff98139f68e7",
+  bundleSha256: "61aab2480cb9d18b89b11bf45dd0da24ca1f7ae9f4767eee80e8c93d0554de07",
+});
+
 export interface V2SidecarAsset {
+  /** Immutable workspace-relative deployment path. */
   readonly path: string;
+  /** Revision-local identity used to calculate the build hash. */
+  readonly logicalPath: string;
   readonly content: string;
   readonly sha256: string;
 }
 
-export interface V2SidecarAssets {
+export interface V2SidecarAssetManifest {
+  readonly format: "ghostprov-v2-sidecar-assets";
+  readonly version: 1;
+  readonly revision: V2SidecarRevision;
   readonly buildHash: string;
   readonly schemaHash: string;
+  readonly entrypoint: string;
+  readonly files: readonly {
+    readonly path: string;
+    readonly sha256: string;
+  }[];
+}
+
+export interface V2SidecarAssets {
+  readonly revision: V2SidecarRevision;
+  readonly buildHash: string;
+  readonly schemaHash: string;
+  readonly entrypointPath: string;
+  readonly manifest: V2SidecarAsset;
   readonly files: readonly V2SidecarAsset[];
   readonly obsoletePaths: readonly string[];
 }
 
+export interface LoadV2SidecarAssetsOptions {
+  /** Explicit selection; omitted callers intentionally select the frozen R1 default. */
+  readonly revision?: V2SidecarRevision | string;
+}
+
 const ASSET_PREFIX = ".ghostprov-v2";
-const BUNDLE_PATH = `${ASSET_PREFIX}/sidecar.bundle.js`;
+const REVISION_PREFIX = `${ASSET_PREFIX}/revisions`;
+const MANIFEST_NAME = "manifest.json";
+const BUNDLE_NAME = "sidecar.bundle.js";
 const OBSOLETE_PATHS = Object.freeze([
   `${ASSET_PREFIX}/bootstrap.tex`,
   `${ASSET_PREFIX}/deno.json`,
   `${ASSET_PREFIX}/sandbox`,
+  `${ASSET_PREFIX}/sidecar.bundle.js`,
   `${ASSET_PREFIX}/src`,
 ]);
-const ENTRYPOINT = path.resolve(import.meta.dir, "../../../sandbox/v2/main.ts");
+const RELEASES: Readonly<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
+  readonly bundlePath: string;
+}>> = Object.freeze({
+  r1: Object.freeze({
+    ...V2_R1_RELEASE,
+    bundlePath: path.resolve(import.meta.dir, "releases/r1/sidecar.bundle.js"),
+  }),
+});
+const SHA256 = /^[a-f0-9]{64}$/;
+const LOGICAL_PATH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/;
 const CREDENTIAL_PATTERNS = Object.freeze([
   /sk-[A-Za-z0-9_-]{24,}/,
   /gAAAA[A-Za-z0-9_-]{24,}/,
   /eyJ[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{24,}(?:\.[A-Za-z0-9_-]{16,})?/,
 ]);
 const RUNTIME_IMPORT_PATTERN = /\b(?:from|import)\s*\(?["'](?:npm:|https:)/;
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sorted = [...expected].sort();
+  return actual.length === sorted.length && actual.every((key, index) => key === sorted[index]);
+}
+
+function assertLogicalPath(value: string, label: string): void {
+  if (
+    !LOGICAL_PATH.test(value) ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.split("/").some(segment => segment === "." || segment === "..")
+  ) {
+    throw new Error(`${label} is not a safe revision-local path: ${value}`);
+  }
+}
+
+function revisionRoot(
+  revision: V2SidecarRevision,
+  schemaHash: string,
+  buildHash: string,
+): string {
+  return `${REVISION_PREFIX}/${revision}/${schemaHash}/${buildHash}`;
+}
 
 function assertOfflineBundle(content: string): void {
   if (RUNTIME_IMPORT_PATTERN.test(content) || content.includes("registry.npmjs.org")) {
@@ -43,58 +129,233 @@ function assertOfflineBundle(content: string): void {
   }
 }
 
-async function buildOfflineBundle(): Promise<string> {
-  const result = await Bun.build({
-    entrypoints: [ENTRYPOINT],
-    target: "browser",
-    format: "esm",
-    splitting: false,
-    sourcemap: "none",
-    minify: {
-      syntax: true,
-      whitespace: true,
-      identifiers: false,
-    },
-    define: {
-      "process.env.NODE_ENV": '"production"',
-    },
-  });
-  if (!result.success || result.outputs.length !== 1) {
-    const detail = result.logs.map(log => log.message).join("; ").slice(0, 2_048);
-    throw new Error(`Unable to build the offline V2 sidecar bundle: ${detail || "unknown build failure"}`);
+export function resolveV2SidecarRevision(value?: string): V2SidecarRevision {
+  const selected = value ?? DEFAULT_V2_SIDECAR_REVISION;
+  if (!V2_SIDECAR_REVISIONS.some(revision => revision === selected)) {
+    throw new Error(`Unsupported V2 sidecar revision: ${selected}`);
   }
-  const content = `${(await result.outputs[0]!.text()).trimEnd()}\n`;
+  return selected as V2SidecarRevision;
+}
+
+async function loadFrozenBundle(revision: V2SidecarRevision): Promise<string> {
+  const release = RELEASES[revision];
+  let content: string;
+  try {
+    content = await readFile(release.bundlePath, "utf8");
+  } catch (cause) {
+    throw new Error(`Unable to read frozen V2-${revision.toUpperCase()} sidecar bundle`, { cause });
+  }
   assertOfflineBundle(content);
+  if (await sha256Hex(utf8Bytes(content)) !== release.bundleSha256) {
+    throw new Error(`Frozen V2-${revision.toUpperCase()} sidecar bundle hash mismatch`);
+  }
   return content;
 }
 
 export async function hashV2SidecarFiles(
-  files: readonly Pick<V2SidecarAsset, "path" | "content">[],
+  files: readonly Pick<V2SidecarAsset, "path" | "logicalPath" | "content">[],
 ): Promise<string> {
-  const sorted = [...files].sort((left, right) => left.path.localeCompare(right.path));
+  const sorted = [...files].sort((left, right) => (
+    left.logicalPath.localeCompare(right.logicalPath)
+  ));
   const seen = new Set<string>();
   let aggregate = "";
   for (const file of sorted) {
-    if (seen.has(file.path)) throw new Error(`Duplicate V2 sidecar asset: ${file.path}`);
-    seen.add(file.path);
-    aggregate += `${file.path}\0${file.content}`;
+    assertLogicalPath(file.logicalPath, "V2 sidecar logical asset path");
+    if (seen.has(file.logicalPath)) {
+      throw new Error(`Duplicate V2 sidecar logical asset: ${file.logicalPath}`);
+    }
+    seen.add(file.logicalPath);
+    aggregate += `${file.logicalPath}\0${file.content}`;
   }
   return sha256Hex(utf8Bytes(aggregate));
 }
 
-export async function loadV2SidecarAssets(): Promise<V2SidecarAssets> {
-  const content = await buildOfflineBundle();
-  const files = Object.freeze([{
-    path: BUNDLE_PATH,
+function manifestContent(manifest: V2SidecarAssetManifest): string {
+  return `${canonicalJson(manifest)}\n`;
+}
+
+function parseManifest(content: string): V2SidecarAssetManifest {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch (cause) {
+    throw new Error("V2 sidecar asset manifest is not valid JSON", { cause });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("V2 sidecar asset manifest must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  if (!exactKeys(raw, [
+    "format", "version", "revision", "buildHash", "schemaHash", "entrypoint", "files",
+  ])) {
+    throw new Error("V2 sidecar asset manifest fields are invalid");
+  }
+  if (
+    raw.format !== "ghostprov-v2-sidecar-assets" ||
+    raw.version !== 1 ||
+    typeof raw.revision !== "string" ||
+    typeof raw.buildHash !== "string" ||
+    typeof raw.schemaHash !== "string" ||
+    typeof raw.entrypoint !== "string" ||
+    !Array.isArray(raw.files)
+  ) {
+    throw new Error("V2 sidecar asset manifest values are invalid");
+  }
+  const revision = resolveV2SidecarRevision(raw.revision);
+  if (!SHA256.test(raw.buildHash) || !SHA256.test(raw.schemaHash)) {
+    throw new Error("V2 sidecar asset manifest hash is invalid");
+  }
+  assertLogicalPath(raw.entrypoint, "V2 sidecar manifest entrypoint");
+  const files = raw.files.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`V2 sidecar manifest file ${index} is invalid`);
+    }
+    const file = entry as Record<string, unknown>;
+    if (
+      !exactKeys(file, ["path", "sha256"]) ||
+      typeof file.path !== "string" ||
+      typeof file.sha256 !== "string" ||
+      !SHA256.test(file.sha256)
+    ) {
+      throw new Error(`V2 sidecar manifest file ${index} fields are invalid`);
+    }
+    assertLogicalPath(file.path, `V2 sidecar manifest file ${index} path`);
+    return Object.freeze({ path: file.path, sha256: file.sha256 });
+  });
+  return Object.freeze({
+    format: "ghostprov-v2-sidecar-assets",
+    version: 1,
+    revision,
+    buildHash: raw.buildHash,
+    schemaHash: raw.schemaHash,
+    entrypoint: raw.entrypoint,
+    files: Object.freeze(files),
+  });
+}
+
+/**
+ * Validates all local hashes and the immutable path/manifest relationship.
+ * Bootstrap calls this before it mutates the project YDoc.
+ */
+export async function assertV2SidecarAssets(
+  assets: V2SidecarAssets,
+  expectedRevision: V2SidecarRevision = DEFAULT_V2_SIDECAR_REVISION,
+): Promise<void> {
+  const selected = resolveV2SidecarRevision(expectedRevision);
+  if (assets.revision !== selected) {
+    throw new Error(
+      `V2 sidecar revision mismatch: selected ${selected}, assets are ${String(assets.revision)}`,
+    );
+  }
+  if (!SHA256.test(assets.buildHash) || !SHA256.test(assets.schemaHash)) {
+    throw new Error("V2 sidecar build/schema hash is invalid");
+  }
+  const root = revisionRoot(selected, assets.schemaHash, assets.buildHash);
+  const seenPaths = new Set<string>();
+  for (const asset of assets.files) {
+    assertLogicalPath(asset.logicalPath, "V2 sidecar logical asset path");
+    const expectedPath = `${root}/${asset.logicalPath}`;
+    if (asset.path !== expectedPath) {
+      throw new Error(`V2 sidecar asset is not build-addressed: ${asset.path}`);
+    }
+    if (seenPaths.has(asset.path)) throw new Error(`Duplicate V2 sidecar asset: ${asset.path}`);
+    seenPaths.add(asset.path);
+    if (!SHA256.test(asset.sha256) || await sha256Hex(utf8Bytes(asset.content)) !== asset.sha256) {
+      throw new Error(`V2 sidecar asset content hash mismatch: ${asset.path}`);
+    }
+  }
+  if (assets.files.length === 0) throw new Error("V2 sidecar asset set is empty");
+  if (await hashV2SidecarFiles(assets.files) !== assets.buildHash) {
+    throw new Error("V2 sidecar aggregate build hash mismatch");
+  }
+  const entrypoint = assets.files.find(asset => asset.path === assets.entrypointPath);
+  if (!entrypoint) throw new Error("V2 sidecar entrypoint is not present in its asset set");
+
+  const expectedManifestPath = `${root}/${MANIFEST_NAME}`;
+  if (
+    assets.manifest.path !== expectedManifestPath ||
+    assets.manifest.logicalPath !== MANIFEST_NAME ||
+    seenPaths.has(assets.manifest.path)
+  ) {
+    throw new Error("V2 sidecar manifest is not build-addressed");
+  }
+  if (
+    !SHA256.test(assets.manifest.sha256) ||
+    await sha256Hex(utf8Bytes(assets.manifest.content)) !== assets.manifest.sha256
+  ) {
+    throw new Error("V2 sidecar manifest content hash mismatch");
+  }
+  const manifest = parseManifest(assets.manifest.content);
+  const expectedManifest: V2SidecarAssetManifest = {
+    format: "ghostprov-v2-sidecar-assets",
+    version: 1,
+    revision: selected,
+    buildHash: assets.buildHash,
+    schemaHash: assets.schemaHash,
+    entrypoint: entrypoint.logicalPath,
+    files: [...assets.files]
+      .sort((left, right) => left.logicalPath.localeCompare(right.logicalPath))
+      .map(asset => ({ path: asset.logicalPath, sha256: asset.sha256 })),
+  };
+  if (manifestContent(manifest) !== manifestContent(expectedManifest)) {
+    throw new Error("V2 sidecar manifest does not match its selected asset set");
+  }
+  if (assets.entrypointPath !== `${root}/${manifest.entrypoint}`) {
+    throw new Error("V2 sidecar entrypoint does not match its manifest");
+  }
+}
+
+export async function loadV2SidecarAssets(
+  options: LoadV2SidecarAssetsOptions = {},
+): Promise<V2SidecarAssets> {
+  const revision = resolveV2SidecarRevision(options.revision);
+  const release = RELEASES[revision];
+  const schemaHash = release.schemaHash;
+  const content = await loadFrozenBundle(revision);
+  const logicalFiles = [{
+    path: BUNDLE_NAME,
+    logicalPath: BUNDLE_NAME,
     content,
-    sha256: await sha256Hex(utf8Bytes(content)),
-  }]);
-  return {
-    buildHash: await hashV2SidecarFiles(files),
-    schemaHash: await protocolSchemaHash(),
+  }];
+  const buildHash = await hashV2SidecarFiles(logicalFiles);
+  if (buildHash !== release.buildHash) {
+    throw new Error(`Frozen V2-${revision.toUpperCase()} aggregate build hash mismatch`);
+  }
+  const root = revisionRoot(revision, schemaHash, buildHash);
+  const files = Object.freeze(await Promise.all(logicalFiles.map(async file => Object.freeze({
+    path: `${root}/${file.logicalPath}`,
+    logicalPath: file.logicalPath,
+    content: file.content,
+    sha256: await sha256Hex(utf8Bytes(file.content)),
+  }))));
+  const manifestValue: V2SidecarAssetManifest = {
+    format: "ghostprov-v2-sidecar-assets",
+    version: 1,
+    revision,
+    buildHash,
+    schemaHash,
+    entrypoint: BUNDLE_NAME,
+    files: files.map(file => ({ path: file.logicalPath, sha256: file.sha256 })),
+  };
+  const manifestBody = manifestContent(manifestValue);
+  const manifest = Object.freeze({
+    path: `${root}/${MANIFEST_NAME}`,
+    logicalPath: MANIFEST_NAME,
+    content: manifestBody,
+    sha256: await sha256Hex(utf8Bytes(manifestBody)),
+  });
+  const assets: V2SidecarAssets = Object.freeze({
+    revision,
+    buildHash,
+    schemaHash,
+    entrypointPath: `${root}/${BUNDLE_NAME}`,
+    manifest,
     files,
     obsoletePaths: OBSOLETE_PATHS,
-  };
+  });
+  await assertV2SidecarAssets(assets, revision);
+  return assets;
 }
 
 export function sidecarSourcePath(asset: V2SidecarAsset): string {

@@ -83,10 +83,6 @@ export async function main(
   const system = await createBrowserlessSystem({
     ...env,
     GP_CANDIDATE: "1",
-    GP_TRANSPORT: "v2",
-    GP_AUTO_CREATE_PROJECTS: "0",
-    GP_TARGET_SANDBOXES: "4",
-    GP_TARGET_CONCURRENCY: "512",
     PORT: String(options.port),
   });
   const summaries: Record<string, unknown>[] = [];

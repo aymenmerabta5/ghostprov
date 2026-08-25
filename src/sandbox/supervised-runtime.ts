@@ -14,7 +14,7 @@ import type {
   RoutableSandboxRuntime,
   RoutableSandboxSnapshot,
 } from "./registry";
-import { describeSandboxFailure } from "./runtime";
+import { describeSandboxFailure } from "./failure";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 
 const DEFAULT_CHECK_INTERVAL_MS = 1_000;
@@ -66,13 +66,16 @@ export interface SandboxSupervisorEvent {
   type: "started" | "retry_scheduled" | "completed" | "aborted";
   projectId: ProjectId;
   workerIndex?: number;
-  transport?: "v1" | "v2";
+  transport?: "v2";
   reason: string;
   attempt: number;
   incarnation: number;
   consecutiveFailures: number;
   retryDelayMs?: number;
-  durationMs: number;
+  /** Wall time spent in the attempt represented by this event, excluding backoff. */
+  attemptDurationMs: number;
+  /** Wall time since this recovery lifecycle began, including retries and backoff. */
+  totalDurationMs: number;
   failure: SandboxFailureSnapshot | null;
 }
 
@@ -100,7 +103,7 @@ export interface SupervisedSandboxRuntimeOptions {
   acquirePermit?(signal: AbortSignal): Promise<() => void>;
   recoveryCoordinator?: FleetRecoveryCoordinator;
   workerIndex?: number;
-  transport?: "v1" | "v2";
+  transport?: "v2";
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
 }
 
@@ -208,7 +211,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   readonly #acquirePermit?: SupervisedSandboxRuntimeOptions["acquirePermit"];
   readonly #recoveryCoordinator?: FleetRecoveryCoordinator;
   readonly #workerIndex?: number;
-  readonly #transportMode?: "v1" | "v2";
+  readonly #transportMode?: "v2";
   readonly #onRecoveryEvent?: (event: SandboxSupervisorEvent) => void;
   readonly #clock: Clock;
   readonly #random: Pick<RandomSource, "next">;
@@ -239,6 +242,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   #shutdownPromise: Promise<void> | null = null;
   #recovery: SandboxRecoverySnapshot | null = null;
   #recoveryStartedAtMs: number | null = null;
+  #recoveryAttemptStartedAtMs: number | null = null;
+  #lastRecoveryAttemptDurationMs = 0;
 
   constructor(options: SupervisedSandboxRuntimeOptions) {
     this.projectId = options.projectId;
@@ -305,6 +310,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       firstAttempt,
     };
     this.#recoveryStartedAtMs = this.#clock.now();
+    this.#recoveryAttemptStartedAtMs = null;
+    this.#lastRecoveryAttemptDurationMs = 0;
     this.#notifyRecovery("started", "start", 0, 0, this.#lastSnapshot.failure);
     this.#emit();
     this.#startMonitor(session);
@@ -437,6 +444,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#phase = "recovering";
     if (!this.#recovery) {
       this.#recoveryStartedAtMs = this.#clock.now();
+      this.#recoveryAttemptStartedAtMs = null;
+      this.#lastRecoveryAttemptDurationMs = 0;
       this.#recovery = {
         reason,
         attempt: 0,
@@ -512,6 +521,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       }
 
       attempt++;
+      this.#recoveryAttemptStartedAtMs = this.#clock.now();
       this.#phase = pending.reason === "start" && attempt === 1
         ? "starting"
         : "recovering";
@@ -593,6 +603,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
           failures,
           null,
         );
+        this.#recoveryAttemptStartedAtMs = null;
+        this.#lastRecoveryAttemptDurationMs = 0;
         this.#recoveryStartedAtMs = null;
         this.#recovery = null;
         circuitLease?.succeed();
@@ -602,6 +614,13 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         this.#emit();
         return;
       } catch (error) {
+        if (this.#recoveryAttemptStartedAtMs !== null) {
+          this.#lastRecoveryAttemptDurationMs = Math.max(
+            0,
+            this.#clock.now() - this.#recoveryAttemptStartedAtMs,
+          );
+          this.#recoveryAttemptStartedAtMs = null;
+        }
         if (circuitLease) {
           if (this.#isActive(signal)) circuitLease.fail(error);
           else circuitLease.cancel();
@@ -863,6 +882,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         this.#recovery?.lastFailure ?? null,
       );
       this.#recoveryStartedAtMs = null;
+      this.#recoveryAttemptStartedAtMs = null;
+      this.#lastRecoveryAttemptDurationMs = 0;
     }
     this.#recovery = null;
     this.#session?.abort();
@@ -995,6 +1016,10 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   ): void {
     if (!this.#onRecoveryEvent) return;
     const startedAt = this.#recoveryStartedAtMs ?? this.#clock.now();
+    const now = this.#clock.now();
+    const attemptDurationMs = this.#recoveryAttemptStartedAtMs === null
+      ? this.#lastRecoveryAttemptDurationMs
+      : Math.max(0, now - this.#recoveryAttemptStartedAtMs);
     try {
       this.#onRecoveryEvent({
         type,
@@ -1006,7 +1031,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         incarnation: this.#childGeneration,
         consecutiveFailures,
         ...(retryDelayMs === undefined ? {} : { retryDelayMs }),
-        durationMs: Math.max(0, this.#clock.now() - startedAt),
+        attemptDurationMs,
+        totalDurationMs: Math.max(0, now - startedAt),
         failure,
       });
     } catch {}

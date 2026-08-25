@@ -118,10 +118,6 @@ export async function main(
       const system = await createBrowserlessSystem({
         ...env,
         GP_CANDIDATE: "1",
-        GP_TRANSPORT: "v2",
-        GP_AUTO_CREATE_PROJECTS: "0",
-        GP_TARGET_SANDBOXES: "1",
-        GP_TARGET_CONCURRENCY: "128",
         PORT: String(options.port),
       });
       try {

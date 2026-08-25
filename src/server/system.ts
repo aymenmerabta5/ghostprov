@@ -2,11 +2,7 @@ import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
 import { FleetManifestStore } from "../fleet/manifest";
-import { YDocProjectInspector } from "../fleet/project-inspector";
-import type {
-  ManagedProjectInspector,
-  ManagedRuntimeFactory,
-} from "../fleet/types";
+import type { ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
 import { PrismProvisioningClient } from "../prism/provisioning-client";
@@ -17,19 +13,15 @@ import {
 } from "../prism/session-manager";
 import {
   CpuTransformPool,
+  type CpuTransformJobOptions,
   type CpuTransformPoolSnapshot,
 } from "../router/cpu-transform-pool";
 import { ResourceGovernor, SystemMachineProbe } from "../router/resource-governor";
-import { ModelRateLimitGates } from "../router/rate-limit-gate";
 import { MultiSandboxRouter } from "../router/router";
 import { SandboxGateway } from "../sandbox/gateway";
 import { SandboxHeartbeat } from "../sandbox/heartbeat";
-import {
-  ManagedV1Runtime,
-  bundledV1DaemonSource,
-  v1DaemonBuild,
-} from "../sandbox/managed-v1-runtime";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
+import type { ProjectId } from "../sandbox/types";
 import {
   RecoveryPermitPool,
   SupervisedSandboxRuntime,
@@ -41,9 +33,9 @@ import { V2BootstrapController } from "../v2/bootstrap/controller";
 import type { HostFrame, SidecarFrame } from "../v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../v2/protocol/validate";
 import { V2SandboxRuntime } from "../v2/runtime";
-import { loadV2SidecarAssets, type V2SidecarAssets } from "../v2/sidecar/assets";
-import { V2TransportSession } from "../v2/transport/session";
-import { TransportSelectingRuntime } from "../v2/transport-selector";
+import type { V2SidecarAssets } from "../v2/sidecar/assets";
+import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
+import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session";
 import { createGhostProvApp } from "./app";
 import { createGhostProvServer } from "./runtime";
 import { resolveObservabilityConfig } from "../observability/config";
@@ -78,7 +70,7 @@ export interface BrowserlessSessionManager {
 }
 
 export interface BrowserlessCpuPool {
-  gzip?(bytes: Uint8Array): Promise<Uint8Array>;
+  gzip?(bytes: Uint8Array, options?: CpuTransformJobOptions): Promise<Uint8Array>;
   snapshot?(): CpuTransformPoolSnapshot;
   close(): Promise<void>;
 }
@@ -88,19 +80,27 @@ export interface BrowserlessFleetSampler {
   close(): Promise<void>;
 }
 
+export interface BrowserlessV2RevisionSelector {
+  preload(): Promise<void>;
+  loadedForProject(projectId: ProjectId): {
+    revision: string;
+    assets: V2SidecarAssets;
+  };
+}
+
 export interface BrowserlessSystemDependencies {
   machineProbe?: MachineProbe;
   governor?: ResourceGovernor;
   sessionManager?: BrowserlessSessionManager;
   projects?: FleetProjectsClient;
   manifest?: FleetManifestStore;
-  inspector?: ManagedProjectInspector;
   runtimeFactory?: ManagedRuntimeFactory;
   registry?: SandboxRegistry;
   router?: MultiSandboxRouter;
   server?: BrowserlessSystemServer;
   cpuPool?: BrowserlessCpuPool;
   assets?: V2SidecarAssets;
+  revisionSelector?: BrowserlessV2RevisionSelector;
   logger?: LoggerLike;
   sampler?: BrowserlessFleetSampler;
 }
@@ -120,15 +120,49 @@ export interface BrowserlessSystem {
   close(): Promise<void>;
 }
 
-function rateLimitScopeResolver(
-  groups: readonly (readonly string[])[],
-): (model: string) => string {
-  const scopes = new Map<string, string>();
-  for (const [index, group] of groups.entries()) {
-    const scope = `shared:${index + 1}`;
-    for (const model of group) scopes.set(model, scope);
+export function createV2CpuGzip(
+  cpuPool: BrowserlessCpuPool,
+): (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array> {
+  if (!cpuPool.gzip) throw new Error("CPU transform pool does not provide gzip");
+  return (bytes, gzipOptions) => cpuPool.gzip!(bytes, {
+    signal: gzipOptions?.signal,
+    // Only a disposable full-buffer view may be detached. The V2 transport
+    // explicitly marks its scratch copy as owned; arbitrary subviews still use
+    // the pool's copying path.
+    transferInput: gzipOptions?.inputOwnership === "owned" &&
+      bytes.buffer instanceof ArrayBuffer &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === bytes.buffer.byteLength,
+  });
+}
+
+function fixedV2RevisionSelector(
+  projectIds: readonly ProjectId[],
+  assets: V2SidecarAssets,
+): BrowserlessV2RevisionSelector {
+  const projects = new Set(projectIds);
+  return {
+    async preload() {},
+    loadedForProject(projectId) {
+      if (!projects.has(projectId)) {
+        throw new Error(`Cannot select V2 assets for unknown project: ${projectId}`);
+      }
+      return { revision: assets.revision, assets };
+    },
+  };
+}
+
+export function selectV2ProjectRelease(
+  selector: BrowserlessV2RevisionSelector,
+  projectId: ProjectId,
+): { revision: string; assets: V2SidecarAssets } {
+  const selected = selector.loadedForProject(projectId);
+  if (selected.assets.revision !== selected.revision) {
+    throw new Error(
+      `Selected V2 revision ${selected.revision} does not match loaded assets ${selected.assets.revision}`,
+    );
   }
-  return model => scopes.get(model) ?? model;
+  return selected;
 }
 
 function defaultRuntimeFactory(options: {
@@ -137,7 +171,7 @@ function defaultRuntimeFactory(options: {
   provisioning: PrismProvisioningClient;
   governor: ResourceGovernor;
   cpuPool: BrowserlessCpuPool;
-  assets: V2SidecarAssets | null;
+  revisionSelector: BrowserlessV2RevisionSelector;
   nextLeaderGeneration(projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"]): Promise<number>;
   recoveryCoordinator: FleetRecoveryCoordinator;
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
@@ -149,17 +183,13 @@ function defaultRuntimeFactory(options: {
     provisioning,
     governor,
     cpuPool,
-    assets,
+    revisionSelector,
     nextLeaderGeneration,
     recoveryCoordinator,
     revalidateAccount,
     logger,
   } = options;
-  const needsV1 = config.transport === "v1" || (
-    config.transport === "auto" && identity.kind === "authenticated"
-  );
-  const source = needsV1 ? bundledV1DaemonSource() : null;
-  if (!cpuPool.gzip) throw new Error("CPU transform pool does not provide gzip");
+  const gzip = createV2CpuGzip(cpuPool);
 
   const createV2 = (input: {
     projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"];
@@ -167,15 +197,15 @@ function defaultRuntimeFactory(options: {
     leaderGeneration: number;
     initialSandbox?: import("../prism/protocol").ProvisionedSandbox;
   }): RoutableSandboxRuntime => {
-    if (!assets) throw new Error("V2 sidecar assets are unavailable");
     const { projectId, workerIndex, leaderGeneration } = input;
+    const release = selectV2ProjectRelease(revisionSelector, projectId);
     return new V2SandboxRuntime({
       projectId,
       workerIndex,
       leaderGeneration,
       provisioning,
       governor,
-      assets,
+      assets: release.assets,
       transportReservationBytes: config.v2TransportReservationBytes,
       maxResponseBytes: config.v2ResponseMaxBytes,
       ySweetRefreshMs: config.v2YSweetRefreshMs,
@@ -196,7 +226,7 @@ function defaultRuntimeFactory(options: {
           credential_refresh_outcome: outcome,
         }), "progress");
       },
-      gzip: bytes => cpuPool.gzip!(bytes),
+      gzip,
       createGateway: sandbox => new SandboxGateway({
         projectId,
         account: identity.account,
@@ -256,6 +286,7 @@ function defaultRuntimeFactory(options: {
         gateway: bootstrap.gateway as SandboxGateway,
         awareness: bootstrap.awareness,
         assets: bootstrap.assets,
+        revision: release.revision,
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
         initialActivePerSandbox: config.v2InitialActivePerSandbox,
@@ -270,10 +301,6 @@ function defaultRuntimeFactory(options: {
         maxResponseBytes: transport.maxResponseBytes,
         gzip: transport.gzip,
         expectedSidecarInstanceId: transport.expectedSidecarInstanceId,
-        hostCeiling: governor.capacityHint(
-          config.v2TransportReservationBytes,
-          config.v2SandboxCapacity,
-        ),
       }),
     });
   };
@@ -296,47 +323,7 @@ function defaultRuntimeFactory(options: {
   const createRuntime = (
     input: Parameters<ManagedRuntimeFactory["create"]>[0],
     initialSandbox?: import("../prism/protocol").ProvisionedSandbox,
-  ): RoutableSandboxRuntime => {
-    const v1 = needsV1
-      ? new ManagedV1Runtime({
-        projectId: input.projectId,
-        account: identity.account,
-        provisioning,
-        cpuPool: cpuPool as CpuTransformPool,
-        daemonSource: source!,
-        expectedBuild: v1DaemonBuild(source!),
-        requestedCapacity: config.slotsPerProject,
-        leaderGeneration: input.leaderGeneration,
-        initialSandbox,
-        acquireSandboxForAuth: (status, signal) => acquireSandboxForAuth(
-          input.projectId,
-          status,
-          signal,
-        ),
-        onCredentialRefresh: (outcome, status) => {
-          logger.emit(recoveryObservabilityEvent("sandbox.credential_refresh", {
-            project_id: input.projectId,
-            worker_index: input.workerIndex,
-            transport: "v1",
-            cause: "credentials",
-            operation: "credential_refresh",
-            status,
-            credential_refresh_outcome: outcome,
-          }), "progress");
-        },
-      })
-      : undefined;
-    if (config.transport === "v1") return v1!;
-    const v2 = createV2({ ...input, initialSandbox });
-    return config.transport === "auto"
-      ? new TransportSelectingRuntime({
-        mode: "auto",
-        identityKind: identity.kind,
-        v2,
-        v1,
-      })
-      : v2;
-  };
+  ): RoutableSandboxRuntime => createV2({ ...input, initialSandbox });
 
   return {
     create(input) {
@@ -354,7 +341,7 @@ function defaultRuntimeFactory(options: {
         acquirePermit: signal => recoveryPermits.acquire(signal),
         recoveryCoordinator,
         workerIndex: input.workerIndex,
-        transport: config.transport === "v1" ? "v1" : "v2",
+        transport: "v2",
         onRecoveryEvent: event => {
           const failure = event.failure;
           const name = event.type === "started"
@@ -375,7 +362,8 @@ function defaultRuntimeFactory(options: {
             ...(event.retryDelayMs === undefined
               ? {}
               : { retry_delay_ms: event.retryDelayMs }),
-            duration_ms: event.durationMs,
+            attempt_duration_ms: event.attemptDurationMs,
+            duration_ms: event.totalDurationMs,
             status: failure?.status ?? null,
             error_name: failure
               ? normalizeSandboxRecoveryErrorName(failure.name)
@@ -450,26 +438,18 @@ export async function createBrowserlessSystem(
     file: config.fleetManifestFile,
     identityFingerprint: identity.fingerprint,
   });
-  const inspector = dependencies.inspector ?? new YDocProjectInspector({
-    mintYSweet: (projectId, signal) => provisioning.mintYSweet(projectId, {
-      source: "fleet-inspection",
-      bootstrapAttempt: 1,
-      previouslyConnected: false,
-      sandboxUrl: null,
-      sandboxId: null,
-      sandboxSessionId: null,
-    }, signal),
-  });
-  const assets = config.transport === "v1"
-    ? null
-    : dependencies.assets ?? await loadV2SidecarAssets();
+  const revisionSelector: BrowserlessV2RevisionSelector = dependencies.revisionSelector ??
+    (dependencies.assets
+      ? fixedV2RevisionSelector(config.projectIds, dependencies.assets)
+      : createBundledV2SidecarRevisionSelector({ projectIds: config.projectIds }));
+  await revisionSelector.preload();
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
     identity,
     provisioning,
     governor,
     cpuPool,
-    assets,
+    revisionSelector,
     nextLeaderGeneration: project => manifest.nextLeaderGeneration(
       project,
       SYSTEM_CLOCK.now(),
@@ -485,17 +465,10 @@ export async function createBrowserlessSystem(
     config,
     identity: { kind: identity.kind, fingerprint: identity.fingerprint },
     projects,
-    inspector,
     manifest,
     registry,
     runtimeFactory,
   });
-  const rateLimitGates = !dependencies.router
-    ? new ModelRateLimitGates({
-      scopeForModel: rateLimitScopeResolver(config.rateLimitSharedModelGroups),
-      coldMaxActive: config.rateLimitColdMaxActive,
-    })
-    : undefined;
   const router = dependencies.router ?? new MultiSandboxRouter({
     registry,
     governor,
@@ -503,9 +476,8 @@ export async function createBrowserlessSystem(
     queueTimeoutMs: config.routerQueueTimeoutMs,
     observability: {
       slowRequestMs: observabilityConfig.slowRequestMs,
-      transport: config.transport,
+      transport: "v2",
     },
-    rateLimitGates,
   });
   const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const sampler = dependencies.sampler ?? new FleetSampler({
@@ -573,7 +545,7 @@ export async function createBrowserlessSystem(
         const snapshot = router.snapshot();
         logger.emit(observabilityEvent("server.started", {
           port: config.port,
-          transport: config.transport,
+          transport: "v2",
           runtimes: snapshot.runtimes.length,
           capacity: snapshot.capacity,
           pid: process.pid,
@@ -610,6 +582,10 @@ export async function createBrowserlessSystem(
           firstError ??= error;
         }
         await router.close().catch(error => { firstError ??= error; });
+        // Reject any governor waiters which are not owned by the router (for
+        // example a body reservation or CPU transform waiting during teardown).
+        // Active leases remain idempotently releasable after close.
+        governor.close();
         await serverClosing.catch(error => { firstError ??= error; });
         await sessionManager.close().catch(error => { firstError ??= error; });
         await cpuPool.close().catch(error => { firstError ??= error; });

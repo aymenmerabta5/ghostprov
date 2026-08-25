@@ -48,9 +48,27 @@ describe("V2 transcript proof", () => {
     }, transcript.snapshot())).rejects.toThrow("event count");
   });
 
+  it("preserves arbitrary provider extension fields in the proven final", async () => {
+    const extended = {
+      ...FINAL,
+      transport: { provider: "future-transport", region: "test" },
+      provider_extension: { nested: [1, "two", true] },
+      gp_sse: "provider-owned-extension",
+    };
+    const transcript = new TranscriptProof(REQUEST_ID, REQUEST_DIGEST);
+    transcript.append(event("response.completed", {
+      type: "response.completed",
+      response: extended,
+    }));
+    const terminal = await transcript.createTerminal(extended);
+
+    await expect(validateTerminalProof(terminal, transcript.snapshot())).resolves.toEqual(extended);
+  });
+
   it("uses UTF-8 byte counts rather than JavaScript string length", async () => {
     const transcript = new TranscriptProof(REQUEST_ID, REQUEST_DIGEST);
-    for (const frame of completedFrames()) transcript.append(frame);
+    let returnedBytes = 0;
+    for (const frame of completedFrames()) returnedBytes += transcript.append(frame);
     const terminal = await transcript.createTerminal();
     const canonical = completedFrames()
       .map(frame => `event: ${frame.event}\ndata: ${frame.data}\n\n`)
@@ -58,6 +76,9 @@ describe("V2 transcript proof", () => {
 
     expect(terminal.byteCount).toBe(new TextEncoder().encode(canonical).byteLength);
     expect(terminal.byteCount).toBeGreaterThan(canonical.length);
+    expect(returnedBytes).toBe(terminal.byteCount);
+    expect(transcript.eventCount).toBe(terminal.eventCount);
+    expect(transcript.byteCount).toBe(terminal.byteCount);
   });
 
   it("rejects duplicate or missing terminal events", async () => {

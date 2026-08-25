@@ -9,12 +9,18 @@ import { DenoAwarenessPeer } from "../sandbox/v2/awareness-peer";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import { SidecarDiagnosticsObserver } from "../src/v2/diagnostics/sidecar-observer";
 import { SidecarResourceSampler } from "../src/v2/diagnostics/sidecar-sampler";
+import { OutputBackpressure } from "../src/v2/sidecar/output-sink";
 import type {
   AwarenessEnvelope,
   HostFrame,
   ProtocolBinding,
   SidecarFrame,
 } from "../src/v2/protocol/shared";
+import {
+  SidecarHarness,
+  TEST_BINDING,
+  completedUpstream,
+} from "./support/fake-v2-sidecar";
 
 const PROJECT = "e631d12c-d917-4434-b360-41b4715d6679";
 const BINDING: ProtocolBinding = {
@@ -30,6 +36,7 @@ class FakeProvider {
   readonly listeners = new Map<string, Set<(...args: any[]) => void>>();
   destroyed = false;
   failConnect = false;
+  holdConnect = false;
 
   constructor(doc: Y.Doc) {
     this.awareness = new Awareness(doc);
@@ -47,6 +54,7 @@ class FakeProvider {
 
   connect(): void {
     queueMicrotask(() => {
+      if (this.holdConnect) return;
       if (this.failConnect) this.emit("connection-error", new Error("failed"));
       else this.emit("sync", true);
     });
@@ -100,6 +108,302 @@ function hostEnvelope(ackSequence: number, revision = 0): AwarenessEnvelope<Host
 }
 
 describe("DenoAwarenessPeer", () => {
+  it("advertises no credits until the real engine becomes ready", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let ready = false;
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+
+    await peer.connect();
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+      .toBe(0);
+    ready = true;
+    peer.publishEngineState();
+    expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+      .toBe(8);
+    await peer.close();
+  });
+
+  it("does not ACK synchronized host work before staged engine recovery", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const accepted: string[] = [];
+    let ready = false;
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async (frame: { kind: string }) => { accepted.push(frame.kind); },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{ kind: "ping", sentAtMs: 7, epoch: 1, sequence: 0 }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(5);
+
+      expect(accepted).toEqual([]);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: -1 });
+
+      ready = true;
+      peer.publishEngineState();
+      await Bun.sleep(5);
+      expect(accepted).toEqual(["ping"]);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 0 });
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("never lets host-bootstrap pin or trigger the steady recovery transport", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let replayCalls = 0;
+    const engine = {
+      snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+      setHostCeiling: () => undefined,
+      accept: async () => undefined,
+      replayRecovered: async () => { replayCalls++; },
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: engine as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+    const bootstrapDoc = new Y.Doc();
+    const bootstrapRemote = new Awareness(bootstrapDoc);
+    const hostDoc = new Y.Doc();
+    const hostRemote = new Awareness(hostDoc);
+
+    try {
+      await peer.connect();
+      bootstrapRemote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(-1, 1),
+        peerId: "host-bootstrap",
+        instanceId: "bootstrap-instance",
+        lane: "control",
+        liveness: { kind: "ping", sentAtMs: 1 },
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(bootstrapRemote, [bootstrapDoc.clientID]),
+        "bootstrap-host",
+      );
+      await Bun.sleep(0);
+      expect(replayCalls).toBe(0);
+
+      hostRemote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(-1, 1),
+        instanceId: "steady-host-instance",
+        lane: "control",
+        liveness: { kind: "ping", sentAtMs: 2 },
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(hostRemote, [hostDoc.clientID]),
+        "steady-host",
+      );
+      await Bun.sleep(5);
+      expect(replayCalls).toBe(1);
+    } finally {
+      bootstrapRemote.destroy();
+      bootstrapDoc.destroy();
+      hostRemote.destroy();
+      hostDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("finishes bootstrap before replaying a backpressured large recovered spool", async () => {
+    const largeDelta = "x".repeat(2 * 1024 * 1024);
+    const first = new SidecarHarness({
+      behavior: input => completedUpstream(input, largeDelta),
+    });
+    await first.sendRequest({ model: "gpt-5.6-sol", input: "large recovery" });
+    await first.settle();
+
+    const backpressure = new OutputBackpressure({
+      highFrames: 256,
+      highBytes: 256 * 1024,
+      lowFrames: 64,
+      lowBytes: 64 * 1024,
+      hardFrames: 1_024,
+      hardBytes: 1_024 * 1024,
+    });
+    let peer: DenoAwarenessPeer | null = null;
+    const restarted = new SidecarHarness({
+      records: first.storage.records,
+      terminals: first.storage.terminals,
+      outputBackpressure: backpressure,
+      emit: frame => peer?.enqueue(frame, frame.kind === "response_event" ? "data" : "terminal", "req-engine-1"),
+    });
+    const providers = new Map<"data" | "control", FakeProvider>();
+    peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: TEST_BINDING,
+      instanceId: "sidecar-recovered",
+      engine: restarted.engine,
+      outputBackpressure: backpressure,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const controlDoc = new Y.Doc();
+    const controlRemote = new Awareness(controlDoc);
+    let revision = 1;
+    const host = (ack: number): AwarenessEnvelope<HostFrame> => ({
+      protocol: "gp-awareness-v2",
+      schemaVersion: 1,
+      schemaHash: TEST_BINDING.schemaHash,
+      buildHash: TEST_BINDING.buildHash,
+      projectId: TEST_BINDING.projectId,
+      sessionId: TEST_BINDING.sessionId,
+      peerId: "host",
+      instanceId: "host-transport-after-readiness",
+      leaderGeneration: TEST_BINDING.leaderGeneration,
+      epoch: 1,
+      revision: revision++,
+      ack: { epoch: 1, sequence: ack },
+      credits: 128,
+      active: 0,
+      queued: 0,
+      draining: false,
+      frames: [],
+      lane: "control",
+    });
+
+    try {
+      const startedAt = performance.now();
+      await restarted.engine.start();
+      await peer.connect();
+      expect(performance.now() - startedAt).toBeLessThan(250);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.credits)
+        .toBe(8);
+      expect(providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data)
+        .toBeUndefined();
+      expect(restarted.frames).toEqual([]);
+
+      controlRemote.setLocalStateField("ghostprovV2Control", host(-1));
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(controlRemote, [controlDoc.clientID]),
+        "bound-host-transport",
+      );
+
+      const received = new Map<number, SidecarFrame>();
+      let sawTerminal = false;
+      let recoveryDrained = false;
+      for (let attempt = 0; attempt < 250; attempt++) {
+        await Bun.sleep(5);
+        const envelope = providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data;
+        if (envelope?.frames?.length) {
+          for (const frame of envelope.frames) received.set(frame.sequence, frame);
+          const high = envelope.frames.at(-1)!.sequence;
+          controlRemote.setLocalStateField("ghostprovV2Control", host(high));
+          applyAwarenessUpdate(
+            providers.get("control")!.awareness,
+            encodeAwarenessUpdate(controlRemote, [controlDoc.clientID]),
+            "bound-host-ack",
+          );
+        }
+        sawTerminal ||= [...received.values()].some(frame => frame.kind === "response_terminal");
+        if (sawTerminal && !envelope) {
+          recoveryDrained = true;
+          break;
+        }
+      }
+
+      expect(recoveryDrained).toBe(true);
+      await Bun.sleep(0);
+      expect([...received.values()].some(frame => frame.kind === "response_event")).toBe(true);
+      expect([...received.values()].some(frame => frame.kind === "response_terminal")).toBe(true);
+      expect(restarted.engine.snapshot().ambiguous).toBe(0);
+    } finally {
+      controlRemote.destroy();
+      controlDoc.destroy();
+      await peer.closeGracefully();
+      backpressure.close();
+    }
+  }, 10_000);
+
   it("closes both split providers when either lane cannot connect", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     const peer = new DenoAwarenessPeer({
@@ -128,6 +432,643 @@ describe("DenoAwarenessPeer", () => {
     });
 
     await expect(peer.connect()).rejects.toThrow("control connection failed");
+    expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
+  });
+
+  it("aborts an in-progress connection and removes temporary listeners", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: false, credits: 0, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        provider.holdConnect = true;
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 60_000,
+    });
+
+    const connecting = peer.connect();
+    await Bun.sleep(0);
+    await peer.close();
+    await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
+    for (const provider of providers.values()) {
+      expect(provider.destroyed).toBe(true);
+      expect(provider.listeners.get("sync")?.size ?? 0).toBe(0);
+      expect(provider.listeners.get("connection-error")?.size ?? 0).toBe(0);
+      expect(provider.listeners.get("connection-close")?.size ?? 0).toBe(0);
+    }
+  });
+
+  it("rejects request-local accept failures without killing healthy streams", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const failures: Array<{ error: Error; kind: string }> = [];
+    const accepted: string[] = [];
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async (frame: { kind: string }) => {
+          accepted.push(frame.kind);
+          if (accepted.length === 1) throw new Error("unsafe internal detail");
+        },
+      } as any,
+      onAcceptError: (error, frame) => failures.push({ error, kind: frame.kind }),
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{
+          kind: "request_open",
+          requestId: "req-failure",
+          requestDigest: "a".repeat(64),
+          decodedBytes: 1,
+          encodedBytes: 1,
+          encoding: "identity",
+          partCount: 1,
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(10);
+
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 2),
+        lane: "data",
+        frames: [{
+          kind: "request_data",
+          requestId: "req-failure",
+          partIndex: 0,
+          offset: 0,
+          dataBase64Url: "eA",
+          epoch: 1,
+          sequence: 1,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(10);
+
+      expect(accepted).toEqual(["request_open", "request_data"]);
+      expect(failures).toHaveLength(0);
+      expect(providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data.frames)
+        .toContainEqual(expect.objectContaining({
+          kind: "request_reject",
+          requestId: "req-failure",
+          code: "sidecar_accept_failed",
+        }));
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("escalates durable control acceptance failures to lifecycle shutdown", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const fatalKinds: string[] = [];
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => { throw new Error("journal unavailable"); },
+      } as any,
+      onAcceptError: (_error, frame) => fatalKinds.push(frame.kind),
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{
+          kind: "response_ack",
+          requestId: "req-terminal",
+          terminalDigest: "a".repeat(64),
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(5);
+      expect(fatalKinds).toEqual(["response_ack"]);
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("bounds close even when an accept handler ignores cancellation", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let acceptStarted!: () => void;
+    const accepting = new Promise<void>(resolve => { acceptStarted = resolve; });
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => {
+          acceptStarted();
+          await new Promise<void>(() => undefined);
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+      closeTimeoutMs: 10,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    await peer.connect();
+    remote.setLocalStateField("ghostprovV2Data", {
+      ...hostEnvelope(-1, 1),
+      lane: "data",
+      frames: [{ kind: "ping", sentAtMs: 1, epoch: 1, sequence: 0 }],
+    });
+    applyAwarenessUpdate(
+      providers.get("data")!.awareness,
+      encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+      "test-host",
+    );
+    await accepting;
+    const startedAt = performance.now();
+    await expect(peer.close()).rejects.toMatchObject({
+      name: "SidecarCloseError",
+      code: "timeout",
+    });
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
+    remote.destroy();
+    remoteDoc.destroy();
+  });
+
+  it("publishes only the successfully processed host ACK cursor", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let acceptStarted!: () => void;
+    const accepting = new Promise<void>(resolve => { acceptStarted = resolve; });
+    let releaseAccept!: () => void;
+    const blocked = new Promise<void>(resolve => { releaseAccept = resolve; });
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => { acceptStarted(); await blocked; },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{ kind: "ping", sentAtMs: 1, epoch: 1, sequence: 0 }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await accepting;
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: -1 });
+
+      releaseAccept();
+      await Bun.sleep(5);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 0 });
+    } finally {
+      releaseAccept();
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("lets drain control bypass a stalled request while ACK stays contiguous", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let requestStarted!: () => void;
+    const started = new Promise<void>(resolve => { requestStarted = resolve; });
+    let releaseRequest!: () => void;
+    const blocked = new Promise<void>(resolve => { releaseRequest = resolve; });
+    let drainSeen!: () => void;
+    const drained = new Promise<void>(resolve => { drainSeen = resolve; });
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async (frame: { kind: string }) => {
+          if (frame.kind === "request_open") {
+            requestStarted();
+            await blocked;
+          } else if (frame.kind === "drain") {
+            drainSeen();
+          }
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{
+          kind: "request_open",
+          requestId: "req-stalled",
+          requestDigest: "a".repeat(64),
+          decodedBytes: 1,
+          encodedBytes: 1,
+          encoding: "identity",
+          partCount: 1,
+          epoch: 1,
+          sequence: 0,
+        }, {
+          kind: "drain",
+          reason: "shutdown",
+          epoch: 1,
+          sequence: 1,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await started;
+      await drained;
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: -1 });
+
+      releaseRequest();
+      await Bun.sleep(5);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 1 });
+    } finally {
+      releaseRequest();
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("keeps request cancellation behind earlier work for the same request", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    let openStarted!: () => void;
+    const started = new Promise<void>(resolve => { openStarted = resolve; });
+    let releaseOpen!: () => void;
+    const blocked = new Promise<void>(resolve => { releaseOpen = resolve; });
+    const accepted: string[] = [];
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async (frame: { kind: string }) => {
+          accepted.push(frame.kind);
+          if (frame.kind === "request_open") {
+            openStarted();
+            await blocked;
+          }
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{
+          kind: "request_open",
+          requestId: "req-ordered-cancel",
+          requestDigest: "a".repeat(64),
+          decodedBytes: 1,
+          encodedBytes: 1,
+          encoding: "identity",
+          partCount: 1,
+          epoch: 1,
+          sequence: 0,
+        }, {
+          kind: "request_cancel",
+          requestId: "req-ordered-cancel",
+          reason: "client stopped",
+          epoch: 1,
+          sequence: 1,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await started;
+      await Bun.sleep(0);
+      expect(accepted).toEqual(["request_open"]);
+
+      releaseOpen();
+      await Bun.sleep(5);
+      expect(accepted).toEqual(["request_open", "request_cancel"]);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 1 });
+    } finally {
+      releaseOpen();
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("graceful close waits within its bound for final output ACK", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: true }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+      closeTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    await peer.connect();
+    peer.enqueue({ kind: "drained", active: 0, queued: 0 }, "control", "control");
+    await Bun.sleep(5);
+    const flight = providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data.frames;
+    expect(flight).toHaveLength(1);
+
+    const closing = peer.closeGracefully();
+    await Bun.sleep(5);
+    expect(providers.get("data")!.destroyed).toBe(false);
+    remote.setLocalStateField("ghostprovV2Control", {
+      ...hostEnvelope(flight[0].sequence, 1),
+      lane: "control",
+    });
+    applyAwarenessUpdate(
+      providers.get("control")!.awareness,
+      encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+      "final-host-ack",
+    );
+    await closing;
+
+    expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
+    remote.destroy();
+    remoteDoc.destroy();
+  });
+
+  it("acknowledges durable outcomes only after cumulative transport ACK", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const acknowledged: string[][] = [];
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 8, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+        acknowledgeDeliveredOutcomes: async (ids: readonly string[]) => {
+          acknowledged.push([...ids]);
+        },
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      peer.enqueue({
+        kind: "response_error",
+        requestId: "req-provider-error",
+        code: "rate_limit_exceeded",
+        message: "limited",
+        ambiguous: false,
+      }, "terminal", "req-provider-error");
+      await Bun.sleep(5);
+      expect(acknowledged).toEqual([]);
+      const flight = providers.get("data")!.awareness.getLocalState()?.ghostprovV2Data.frames;
+      remote.setLocalStateField("ghostprovV2Control", {
+        ...hostEnvelope(flight.at(-1).sequence, 1),
+        lane: "control",
+      });
+      applyAwarenessUpdate(
+        providers.get("control")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "outcome-ack",
+      );
+      await Bun.sleep(5);
+      expect(acknowledged).toEqual([["req-provider-error"]]);
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("reports a typed non-clean close when reliable output remains unacknowledged", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 0, active: 0, queued: 0, draining: true }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 1,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+      closeTimeoutMs: 10,
+    });
+
+    await peer.connect();
+    peer.enqueue({ kind: "drained", active: 0, queued: 0 }, "control", "control");
+    await Bun.sleep(5);
+    await expect(peer.closeGracefully()).rejects.toMatchObject({
+      name: "SidecarCloseError",
+      code: "output",
+    });
     expect([...providers.values()].every(provider => provider.destroyed)).toBe(true);
   });
 

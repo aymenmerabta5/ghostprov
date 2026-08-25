@@ -27,53 +27,46 @@ describe("V2 live canary guards", () => {
     })).toThrow("origin");
   });
 
-  it("refuses live execution without every transport/load opt-in", () => {
+  it("refuses live execution without every load opt-in", () => {
     expect(() => resolveLiveV2Options({})).toThrow("GP_LIVE_V2=1");
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
-      GP_TRANSPORT: "auto",
-    })).toThrow("GP_TRANSPORT=v2");
-    expect(() => resolveLiveV2Options({
-      GP_LIVE_V2: "1",
-      GP_TRANSPORT: "v2",
       GP_LIVE_PROJECT_COUNT: "5",
     })).toThrow("1 through 4");
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
-      GP_TRANSPORT: "v2",
       PORT: "8787",
     })).toThrow("protected port 8787");
   });
 
-  it("never enables automatic project deletion or creation", () => {
+  it("rejects automatic project creation and never enables project deletion", () => {
+    expect(() => resolveLiveV2Options({
+      GP_LIVE_V2: "1",
+      GP_AUTO_CREATE_PROJECTS: "1",
+    })).toThrow("unsupported");
     const options = resolveLiveV2Options({
       GP_LIVE_V2: "1",
-      GP_TRANSPORT: "v2",
       GP_LIVE_PROJECT_COUNT: "4",
       PORT: "18787",
       GP_ALLOW_PROJECT_DELETE: "1",
-      GP_AUTO_CREATE_PROJECTS: "1",
     });
 
     expect(options).toMatchObject({
       projectCount: 4,
       port: 18787,
       deleteProjects: false,
-      autoCreateProjects: false,
     });
   });
 
   it("requires a separate scale opt-in for more than one project", () => {
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
-      GP_TRANSPORT: "v2",
       GP_LIVE_PROJECT_COUNT: "4",
     }, { requireScale: true })).toThrow("GP_LIVE_SCALE=1");
 
     expect(resolveLiveV2Options({
       GP_LIVE_V2: "1",
       GP_LIVE_SCALE: "1",
-      GP_TRANSPORT: "v2",
       GP_LIVE_PROJECT_COUNT: "4",
     }, { requireScale: true }).scale).toBe(true);
   });

@@ -2,25 +2,22 @@ import { SYSTEM_CLOCK, SYSTEM_RANDOM, type Clock, type RandomSource } from "../c
 import type { RunHandle } from "../relay/run-handle";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
 import type { ProjectId } from "../sandbox/types";
-import { chooseRuntime, isRuntimeHealthy, type RouteCandidate } from "./policy";
-import { ResourceGovernor } from "./resource-governor";
+import {
+  chooseRuntime,
+  isRuntimeEligible,
+  isRuntimeHealthy,
+  type RouteCandidate,
+} from "./policy";
+import { ResourceGovernor, type ResourceLease } from "./resource-governor";
 import type { ReleasableLease } from "./types";
 import { RouterTrafficTelemetry, type RouterTrafficSnapshot } from "./telemetry";
 import { classifyWorkload, type WorkloadDescriptor } from "./workload";
-import {
-  estimateRateLimitTokens,
-  FleetRateLimitGate,
-  ModelRateLimitGates,
-  type RateLimitLease,
-  type RateLimitGateSnapshot,
-} from "./rate-limit-gate";
 import type { LoggerLike } from "../observability/logger";
 import { observabilityEvent, type JsonValue } from "../observability/events";
 import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import {
   rateLimitHintFromError,
-  rateLimitCooldownMs,
   rateLimitProblemFromError,
   type RateLimitHint,
   type RateLimitProblem,
@@ -28,10 +25,21 @@ import {
 
 export type RelaySource = "http" | "websocket" | "image" | "anthropic" | "internal";
 
+/**
+ * A reservation made while the Node HTTP adapter is still buffering a body.
+ * Production leases support `replace()` so ownership can move to the parsed
+ * workload without briefly reserving both phases. `replace` stays optional on
+ * the public router seam so lightweight adapters which only pre-reserve input
+ * bytes remain compatible and continue through normal admission.
+ */
+export type IncomingResourceLease = ReleasableLease &
+  Partial<Pick<ResourceLease, "replace" | "reservedBytes">>;
+
 export interface StartRelayOptions {
   clientId?: string;
   source?: RelaySource;
   signal?: AbortSignal;
+  incomingLease?: IncomingResourceLease;
 }
 
 interface QueuedJob {
@@ -69,8 +77,6 @@ export interface MultiSandboxRouterSnapshot {
   queued: number;
   runtimes: ReturnType<SandboxRegistry["snapshots"]>;
   resources: ReturnType<ResourceGovernor["snapshot"]>;
-  rateLimit?: RateLimitGateSnapshot | Readonly<Record<string, RateLimitGateSnapshot>> | null;
-  rateLimitQueued?: Readonly<Record<string, number>> | null;
 }
 
 export class RouterShutdownError extends Error {
@@ -95,37 +101,17 @@ export class RouterCapacityTimeoutError extends Error {
   }
 }
 
-/** A local 429 used while the shared upstream TPM controller is cooling down. */
-export class RouterRateLimitedError extends Error {
-  readonly name = "RouterRateLimitedError";
-  readonly status = 429;
-  readonly code = "rate_limit_exceeded";
-  readonly retryAfterMs: number;
-  readonly resetTokensMs?: number;
-  readonly resetProjectTokensMs?: number;
-  readonly rateLimit?: RateLimitHint;
-  readonly problem?: RateLimitProblem;
-
-  constructor(hint?: RateLimitHint, problem?: RateLimitProblem) {
-    const retryAfterMs = rateLimitCooldownMs(hint);
-    super(problem?.message ?? `GhostProv is temporarily throttling upstream token usage; retry in ${retryAfterMs}ms`);
-    this.retryAfterMs = retryAfterMs;
-    this.resetTokensMs = hint?.resetTokensMs;
-    this.resetProjectTokensMs = hint?.resetProjectTokensMs;
-    this.rateLimit = hint;
-    this.problem = problem;
-  }
-}
-
-const NOOP_RATE_LIMIT_LEASE: RateLimitLease = Object.freeze({
-  estimatedTokens: 0,
-  complete() {},
-  rateLimited() {},
-  release() {},
-});
-
 function abortError(): DOMException {
   return new DOMException("Relay request aborted while queued", "AbortError");
+}
+
+function isLocalCpuTransformFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { name?: unknown; code?: unknown };
+  return value.name === "CpuTransformQueueFullError" ||
+    value.name === "CpuTransformTimeoutError" ||
+    value.code === "cpu_transform_overloaded" ||
+    value.code === "cpu_transform_timeout";
 }
 
 function runtimeIncarnationKey(value: {
@@ -145,16 +131,14 @@ export class MultiSandboxRouter {
   readonly #transport: string;
   readonly #queueTimeoutMs: number;
   readonly #registryUnsubscribe: () => void;
-  readonly #rateLimitGate: FleetRateLimitGate | null;
-  readonly #modelRateLimitGates: ModelRateLimitGates | null;
-  readonly #rateLimitUnsubscribe: (() => void) | null;
   readonly #traffic = new RouterTrafficTelemetry();
   readonly #reserved = new Map<ProjectId, number>();
-  readonly #upstreamOrganizations = new Map<ProjectId, {
-    id: string;
-    model: string | null;
+  readonly #rateLimitObservations = new Map<ProjectId, Map<string, {
+    hint: RateLimitHint;
+    problem: RateLimitProblem | null;
+    requestedModel: string | null;
     observedAtMs: number;
-  }>();
+  }>>();
   readonly #queues = new Map<string, QueuedJob[]>();
   readonly #clientOrder: string[] = [];
   #clientCursor = 0;
@@ -170,8 +154,6 @@ export class MultiSandboxRouter {
     logger?: LoggerLike;
     queueTimeoutMs?: number;
     observability?: { slowRequestMs?: number; transport?: string };
-    rateLimitGate?: FleetRateLimitGate;
-    rateLimitGates?: ModelRateLimitGates;
   }) {
     this.#registry = options.registry;
     this.#governor = options.governor;
@@ -184,15 +166,7 @@ export class MultiSandboxRouter {
     if (!Number.isSafeInteger(this.#queueTimeoutMs) || this.#queueTimeoutMs < 1) {
       throw new RangeError("queueTimeoutMs must be a positive safe integer");
     }
-    if (options.rateLimitGate && options.rateLimitGates) {
-      throw new TypeError("Configure either rateLimitGate or rateLimitGates, not both");
-    }
-    this.#rateLimitGate = options.rateLimitGate ?? null;
-    this.#modelRateLimitGates = options.rateLimitGates ?? null;
     this.#registryUnsubscribe = this.#registry.subscribe(() => this.#scheduleDrain());
-    this.#rateLimitUnsubscribe = this.#modelRateLimitGates?.subscribe(() => this.#scheduleDrain()) ??
-      this.#rateLimitGate?.subscribe(() => this.#scheduleDrain()) ??
-      null;
   }
 
   async startRelay(
@@ -201,23 +175,31 @@ export class MultiSandboxRouter {
   ): Promise<RunHandle> {
     if (this.#closed || this.#shuttingDown) throw new RouterShutdownError();
     this.#traffic.accepted();
-    const rateLimitGate = this.#rateLimitGateFor(body);
-    const rateLimitRetryAfterMs = rateLimitGate?.retryAfterMs(
-      estimateRateLimitTokens(body),
-    ) ?? null;
-    if (rateLimitRetryAfterMs !== null) {
-      this.#traffic.rejected({ totalMs: 0, rateLimited: true });
-      throw new RouterRateLimitedError(
-        { retryAfterMs: rateLimitRetryAfterMs },
-        rateLimitGate?.latestProblem() ?? undefined,
-      );
-    }
     const acceptedAtMs = this.#clock.now();
     const traceId = this.#random.uuid();
     const relayBody = body.service_tier === undefined
       ? { ...body, service_tier: "fast" }
       : body;
     const workload = classifyWorkload(relayBody);
+    // Multipart image input and its base64 relay representation remain live
+    // together until the compatibility request finishes. The first fan-out
+    // job receives the one-shot ingress lease and conservatively reserves both
+    // phases in one replacement lease; later jobs use ordinary admission.
+    const retainedIngressBytes = options.source === "image" &&
+        typeof options.incomingLease?.reservedBytes === "number" &&
+        Number.isSafeInteger(options.incomingLease.reservedBytes) &&
+        options.incomingLease.reservedBytes > 0
+      ? options.incomingLease.reservedBytes
+      : 0;
+    const admissionWorkload = retainedIngressBytes > 0
+      ? {
+          ...workload,
+          reservedBytes: Math.min(
+            Number.MAX_SAFE_INTEGER,
+            workload.reservedBytes + retainedIngressBytes,
+          ),
+        }
+      : workload;
     const initial = this.snapshot();
     this.#emit("request.accepted", {
       trace_id: traceId,
@@ -227,7 +209,7 @@ export class MultiSandboxRouter {
       stream: workload.stream,
       workload_class: workload.class,
       request_bytes: workload.requestBytes,
-      reserved_bytes: workload.reservedBytes,
+      reserved_bytes: admissionWorkload.reservedBytes,
       capacity: initial.capacity,
       active: initial.active,
       available: initial.available,
@@ -235,7 +217,9 @@ export class MultiSandboxRouter {
     });
     let memoryLease: ReleasableLease;
     try {
-      memoryLease = await this.#governor.acquire(workload, options.signal);
+      memoryLease = typeof options.incomingLease?.replace === "function"
+        ? await options.incomingLease.replace(admissionWorkload, options.signal)
+        : await this.#governor.acquire(admissionWorkload, options.signal);
     } catch (error) {
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
       this.#failure(traceId, acceptedAtMs, "admission", error, 0);
@@ -246,7 +230,7 @@ export class MultiSandboxRouter {
     this.#emit("admission.acquired", {
       trace_id: traceId,
       admission_wait_ms: Math.max(0, admittedAtMs - acceptedAtMs),
-      reserved_bytes: workload.reservedBytes,
+      reserved_bytes: admissionWorkload.reservedBytes,
       reserved_total_bytes: resources.reservedBytes,
       reservation_capacity_bytes: resources.reservationCapacityBytes,
       memory_paused: resources.paused,
@@ -299,7 +283,7 @@ export class MultiSandboxRouter {
     });
   }
 
-  acquireIncomingBody(bytes: number, signal?: AbortSignal): Promise<ReleasableLease> {
+  acquireIncomingBody(bytes: number, signal?: AbortSignal): Promise<ResourceLease> {
     if (this.#closed || this.#shuttingDown) {
       return Promise.reject(new RouterShutdownError());
     }
@@ -324,15 +308,32 @@ export class MultiSandboxRouter {
 
   snapshot(): MultiSandboxRouterSnapshot {
     const runtimes = this.#registry.snapshots().map(runtime => {
-      const organization = this.#upstreamOrganizations.get(runtime.projectId);
+      const byModel = this.#rateLimitObservations.get(runtime.projectId);
+      const observations = byModel ? [...byModel.entries()] : [];
+      const observation = observations.at(-1)?.[1];
+      const organization = observation?.problem?.organization ?? null;
       return {
         ...runtime,
         upstreamOrganization: organization ? {
-          id: organization.id,
-          model: organization.model,
+          id: organization,
+          model: observation?.problem?.model ?? observation?.requestedModel ?? null,
           source: "rate_limit" as const,
-          observedAgoMs: Math.max(0, this.#clock.now() - organization.observedAtMs),
+          observedAgoMs: Math.max(0, this.#clock.now() - observation!.observedAtMs),
         } : null,
+        upstreamRateLimit: observation ? {
+          hint: observation.hint,
+          problem: observation.problem,
+          requestedModel: observation.requestedModel,
+          observedAgoMs: Math.max(0, this.#clock.now() - observation.observedAtMs),
+        } : null,
+        upstreamRateLimits: Object.freeze(Object.fromEntries(
+          observations.map(([model, value]) => [model, {
+            hint: value.hint,
+            problem: value.problem,
+            requestedModel: value.requestedModel,
+            observedAgoMs: Math.max(0, this.#clock.now() - value.observedAtMs),
+          }]),
+        )),
       };
     });
     const capacity = runtimes
@@ -340,15 +341,6 @@ export class MultiSandboxRouter {
       .reduce((sum, runtime) => sum + Math.max(0, runtime.capacity - runtime.quarantined), 0);
     const active = runtimes.reduce((sum, runtime) => sum + runtime.active, 0) +
       [...this.#reserved.values()].reduce((sum, value) => sum + value, 0);
-    const queuedByRateLimit = new Map<string, number>();
-    if (this.#modelRateLimitGates || this.#rateLimitGate) {
-      for (const job of [...this.#queues.values()].flat()) {
-        const scope = this.#modelRateLimitGates
-          ? this.#modelRateLimitGates.scopeForModel(job.body.model)
-          : "global";
-        queuedByRateLimit.set(scope, (queuedByRateLimit.get(scope) ?? 0) + 1);
-      }
-    }
     return {
       capacity,
       active,
@@ -356,10 +348,6 @@ export class MultiSandboxRouter {
       queued: [...this.#queues.values()].reduce((sum, queue) => sum + queue.length, 0),
       runtimes,
       resources: this.#governor.snapshot(),
-      rateLimit: this.#modelRateLimitGates?.snapshot() ?? this.#rateLimitGate?.snapshot() ?? null,
-      rateLimitQueued: this.#modelRateLimitGates || this.#rateLimitGate
-        ? Object.freeze(Object.fromEntries(queuedByRateLimit))
-        : null,
     };
   }
 
@@ -403,9 +391,6 @@ export class MultiSandboxRouter {
     this.beginShutdown();
     this.#closed = true;
     this.#registryUnsubscribe();
-    this.#rateLimitUnsubscribe?.();
-    this.#modelRateLimitGates?.close();
-    this.#rateLimitGate?.close();
   }
 
   #enqueue(job: QueuedJob, front = false): void {
@@ -484,7 +469,6 @@ export class MultiSandboxRouter {
   }
 
   #drain(): void {
-    let deferredByColdGate = 0;
     for (;;) {
       const job = this.#nextJob();
       if (!job) return;
@@ -497,37 +481,9 @@ export class MultiSandboxRouter {
         job.reject(abortError());
         continue;
       }
-      const rateLimitGate = this.#rateLimitGateFor(job.body);
-      const rateLimitScope = this.#rateLimitScopeFor(job.body);
-      const estimatedRateTokens = estimateRateLimitTokens(job.body);
-      const rateLimitLease = rateLimitGate
-        ? rateLimitGate.tryAcquire(estimatedRateTokens)
-        : NOOP_RATE_LIMIT_LEASE;
-      if (!rateLimitLease) {
-        const retryAfterMs = rateLimitGate?.retryAfterMs(
-          estimatedRateTokens,
-        ) ?? null;
-        if (retryAfterMs !== null) {
-          this.#rejectRateLimitedJob(job, { retryAfterMs }, rateLimitGate);
-          continue;
-        }
-        // Unknown-budget cold admission is a bounded concurrency gate, not an
-        // upstream 429. Preserve the absolute queue deadline and wake when an
-        // active lease settles instead of making Codex retry locally.
-        this.#enqueue(job);
-        deferredByColdGate++;
-        const remainingQueued = [...this.#queues.values()].reduce(
-          (sum, queue) => sum + queue.length,
-          0,
-        );
-        if (deferredByColdGate >= remainingQueued) return;
-        continue;
-      }
-      deferredByColdGate = 0;
       const routeStarted = this.#clock.now();
       const selection = this.#choose(job);
       if (!selection) {
-        rateLimitLease.release();
         this.#enqueue(job, true);
         return;
       }
@@ -559,8 +515,6 @@ export class MultiSandboxRouter {
         job,
         runtime,
         selection.incarnationKey,
-        rateLimitLease,
-        rateLimitScope,
       );
     }
   }
@@ -593,7 +547,7 @@ export class MultiSandboxRouter {
           runtime,
           candidate,
           incarnationKey: runtimeIncarnationKey(candidate),
-          eligibleCandidates: candidates.length,
+          eligibleCandidates: candidates.filter(isRuntimeEligible).length,
         }
       : null;
   }
@@ -602,8 +556,6 @@ export class MultiSandboxRouter {
     job: QueuedJob,
     runtime: RoutableSandboxRuntime,
     selectedIncarnation: string,
-    rateLimitLease: RateLimitLease,
-    rateLimitScope: string,
   ): Promise<void> {
     const started = this.#clock.now();
     try {
@@ -655,15 +607,12 @@ export class MultiSandboxRouter {
             succeeded: final?.status === "completed",
             rateLimited: !!hint,
           });
-          if (hint) this.#recordRateLimit(
-            rateLimitLease,
+          if (hint) this.#observeRateLimit(
             hint,
-            rateLimitScope,
             rateLimitProblemFromError(final),
             runtime.projectId,
             job.body.model,
           );
-          else rateLimitLease.complete(handle.rateLimit);
         },
         error => {
           const hint = rateLimitHintFromError(error);
@@ -674,15 +623,12 @@ export class MultiSandboxRouter {
             succeeded: false,
             rateLimited: !!hint,
           });
-          if (hint) this.#recordRateLimit(
-            rateLimitLease,
+          if (hint) this.#observeRateLimit(
             hint,
-            rateLimitScope,
             rateLimitProblemFromError(error),
             runtime.projectId,
             job.body.model,
           );
-          else rateLimitLease.release();
         },
       );
       job.resolve(traced);
@@ -700,10 +646,8 @@ export class MultiSandboxRouter {
       const rateLimit = rateLimitHintFromError(error);
       if (rateLimit) {
         const problem = rateLimitProblemFromError(error);
-        this.#recordRateLimit(
-          rateLimitLease,
+        this.#observeRateLimit(
           rateLimit,
-          rateLimitScope,
           problem,
           runtime.projectId,
           job.body.model,
@@ -714,13 +658,20 @@ export class MultiSandboxRouter {
           totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs),
           rateLimited: true,
         });
-        const output = new RouterRateLimitedError(rateLimit, problem);
-        this.#failure(job.traceId, job.acceptedAtMs, "rate-limit", output, job.attempts);
-        job.reject(output);
+        this.#failure(job.traceId, job.acceptedAtMs, "rate-limit", error, job.attempts);
+        job.reject(error);
         this.#scheduleDrain();
         return;
       }
-      rateLimitLease.release();
+      if (isLocalCpuTransformFailure(error)) {
+        job.signal?.removeEventListener("abort", job.onAbort!);
+        job.memoryLease.release();
+        this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
+        this.#failure(job.traceId, job.acceptedAtMs, "host-transform", error, job.attempts);
+        job.reject(error);
+        this.#scheduleDrain();
+        return;
+      }
       const committed = !!error && typeof error === "object" &&
         (error as { committed?: unknown }).committed === true;
       if (
@@ -785,66 +736,32 @@ export class MultiSandboxRouter {
     else this.#reserved.delete(projectId);
   }
 
-  #recordRateLimit(
-    lease: RateLimitLease,
+  #observeRateLimit(
     hint: RateLimitHint,
-    rateLimitScope: string,
     problem?: RateLimitProblem,
     projectId?: ProjectId,
     requestedModel?: unknown,
   ): void {
-    if (problem?.organization && projectId) {
-      this.#upstreamOrganizations.set(projectId, {
-        id: problem.organization,
-        model: problem.model ?? (
-          typeof requestedModel === "string" && requestedModel.trim()
-            ? requestedModel.trim().toLowerCase()
-            : null
-        ),
-        observedAtMs: this.#clock.now(),
-      });
-    }
-    lease.rateLimited(hint, problem);
-    this.#rejectQueuedRateLimited(hint, rateLimitScope);
-    this.#scheduleDrain();
-  }
-
-  #rejectRateLimitedJob(
-    job: QueuedJob,
-    hint?: RateLimitHint,
-    gate: FleetRateLimitGate | null = this.#rateLimitGateFor(job.body),
-  ): void {
-    job.signal?.removeEventListener("abort", job.onAbort!);
-    job.memoryLease.release();
-    const retryAfterMs = hint === undefined
-      ? gate?.retryAfterMs(estimateRateLimitTokens(job.body)) ?? null
+    if (!projectId) return;
+    const normalizedRequestedModel = typeof requestedModel === "string" && requestedModel.trim()
+      ? requestedModel.trim().toLowerCase()
       : null;
-    const error = new RouterRateLimitedError(hint ?? (
-      retryAfterMs === null ? undefined : { retryAfterMs }
-    ), gate?.latestProblem() ?? undefined);
-    this.#traffic.rejected({
-      totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs),
-      rateLimited: true,
-    });
-    this.#failure(job.traceId, job.acceptedAtMs, "rate-limit", error, job.attempts);
-    job.reject(error);
-  }
-
-  #rejectQueuedRateLimited(hint: RateLimitHint | undefined, rateLimitScope: string): void {
-    const jobs = [...this.#queues.values()].flat().filter(
-      job => this.#rateLimitScopeFor(job.body) === rateLimitScope,
-    );
-    for (const job of jobs) {
-      if (!this.#removeJob(job)) continue;
-      this.#rejectRateLimitedJob(job, hint);
+    const rawModel = problem?.model ?? normalizedRequestedModel;
+    const model = rawModel && /^[a-z0-9][a-z0-9._:-]{0,127}$/.test(rawModel)
+      ? rawModel
+      : "unknown";
+    let byModel = this.#rateLimitObservations.get(projectId);
+    if (!byModel) {
+      byModel = new Map();
+      this.#rateLimitObservations.set(projectId, byModel);
     }
-  }
-
-  #rateLimitGateFor(body: Record<string, unknown>): FleetRateLimitGate | null {
-    return this.#modelRateLimitGates?.forModel(body.model) ?? this.#rateLimitGate;
-  }
-
-  #rateLimitScopeFor(body: Record<string, unknown>): string {
-    return this.#modelRateLimitGates?.scopeForModel(body.model) ?? "global";
+    byModel.delete(model);
+    byModel.set(model, {
+      hint: Object.freeze({ ...hint }),
+      problem: problem ?? null,
+      requestedModel: normalizedRequestedModel,
+      observedAtMs: this.#clock.now(),
+    });
+    while (byModel.size > 16) byModel.delete(byModel.keys().next().value!);
   }
 }

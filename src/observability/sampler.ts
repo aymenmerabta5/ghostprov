@@ -4,7 +4,6 @@ import { SYSTEM_CLOCK } from "../core/ports";
 import type { CpuTransformPoolSnapshot } from "../router/cpu-transform-pool";
 import type { MultiSandboxRouterSnapshot } from "../router/router";
 import type { RouterTrafficSnapshot } from "../router/telemetry";
-import type { RateLimitGateSnapshot } from "../router/rate-limit-gate";
 import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
@@ -59,7 +58,33 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     ),
   };
 }
-function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue { if(!value)return null;const r=value.resource;return { version:value.version,malformed_count:value.malformedCount,resource:r?{process_rss_bytes:r.processRssBytes,heap_used_bytes:r.heapUsedBytes,heap_total_bytes:r.heapTotalBytes,external_bytes:r.externalBytes,system_total_bytes:r.systemTotalBytes,system_free_bytes:r.systemFreeBytes,process_cpu_percent:r.processCpuPercent,normalized_load_1:r.normalizedLoad1,event_loop_p50_ms:r.eventLoopP50Ms,event_loop_p95_ms:r.eventLoopP95Ms,event_loop_max_ms:r.eventLoopMaxMs}:null,transport:transportJson(value.transport) }; }
+function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue {
+  if (!value) return null;
+  const resource = value.resource;
+  return {
+    version: value.version,
+    malformed_count: value.malformedCount,
+    resource: resource ? {
+      process_rss_bytes: resource.processRssBytes,
+      heap_used_bytes: resource.heapUsedBytes,
+      heap_total_bytes: resource.heapTotalBytes,
+      external_bytes: resource.externalBytes,
+      array_buffer_bytes: resource.arrayBufferBytes,
+      system_total_bytes: resource.systemTotalBytes,
+      system_free_bytes: resource.systemFreeBytes,
+      process_cpu_percent: resource.processCpuPercent,
+      normalized_load_1: resource.normalizedLoad1,
+      event_loop_samples: resource.eventLoopSamples,
+      event_loop_p50_ms: resource.eventLoopP50Ms,
+      event_loop_p95_ms: resource.eventLoopP95Ms,
+      event_loop_max_ms: resource.eventLoopMaxMs,
+      gc_samples: resource.gcSamples,
+      gc_duration_p95_ms: resource.gcDurationP95Ms,
+      gc_duration_max_ms: resource.gcDurationMaxMs,
+    } : null,
+    transport: transportJson(value.transport),
+  };
+}
 
 function distributionJson(value: RouterTrafficSnapshot["totalMs"]): JsonValue {
   return { count: value.count, p50_ms: value.p50, p95_ms: value.p95, max_ms: value.max };
@@ -84,39 +109,6 @@ function trafficJson(value: RouterTrafficSnapshot, intervalMs: number): JsonValu
   };
 }
 
-function oneRateLimitJson(value: RateLimitGateSnapshot, queued: number): JsonValue {
-  return {
-    state: value.state,
-    retry_after_ms: value.retryAfterMs,
-    budget_limit: value.tokenLimit,
-    budget_remaining: value.remainingTokens,
-    active: value.active,
-    queued,
-    cold_max_active: value.coldMaxActive,
-    last_limit: value.lastRateLimit?.tokenLimit ?? null,
-    last_used: value.lastRateLimit?.usedTokens ?? null,
-    last_requested: value.lastRateLimit?.requestedTokens ?? null,
-  };
-}
-
-function isRateLimitGateSnapshot(value: unknown): value is RateLimitGateSnapshot {
-  return !!value && typeof value === "object" &&
-    typeof (value as { state?: unknown }).state === "string" &&
-    typeof (value as { active?: unknown }).active === "number";
-}
-
-function rateLimitJson(router: MultiSandboxRouterSnapshot): JsonValue {
-  const value = router.rateLimit;
-  if (!value) return null;
-  if (isRateLimitGateSnapshot(value)) {
-    return { global: oneRateLimitJson(value, router.rateLimitQueued?.global ?? 0) };
-  }
-  return Object.fromEntries(Object.entries(value).map(([scope, snapshot]) => [
-    scope,
-    oneRateLimitJson(snapshot, router.rateLimitQueued?.[scope] ?? 0),
-  ]));
-}
-
 interface EventLoopDelayLike {
   min: number | bigint;
   max: number | bigint;
@@ -135,6 +127,27 @@ function milliseconds(value: number | bigint): number {
 
 function rounded(value: number): number {
   return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0;
+}
+
+function rateLimitObservationJson(
+  model: string,
+  value: NonNullable<MultiSandboxRouterSnapshot["runtimes"][number]["upstreamRateLimit"]>,
+): JsonValue {
+  return {
+    model: value.problem?.model ?? value.requestedModel ?? model,
+    organization: value.problem?.organization ?? null,
+    kind: value.problem?.limitKind?.includes("token")
+      ? "tpm"
+      : value.problem?.limitKind?.includes("request")
+        ? "rpm"
+        : value.problem?.limitKind ?? null,
+    limit: value.problem?.tokenLimit ?? value.hint.limitTokens ?? null,
+    used: value.problem?.usedTokens ?? null,
+    requested: value.problem?.requestedTokens ?? null,
+    remaining: value.hint.remainingTokens ?? null,
+    retry_after_ms: value.problem?.retryAfterMs ?? value.hint.retryAfterMs ?? null,
+    observed_ago_ms: value.observedAgoMs,
+  };
 }
 
 export interface FleetSamplerOptions {
@@ -249,6 +262,9 @@ export class FleetSampler {
           consecutive_failures: runtime.recovery.consecutiveFailures,
           retry_in_ms: runtime.recovery.retryInMs,
         } : null,
+        rate_limit_observations: Object.entries(runtime.upstreamRateLimits ?? {})
+          .slice(0, 16)
+          .map(([model, value]) => rateLimitObservationJson(model, value)),
         diagnostics: runtime.diagnostics ? {
           host: transportJson(runtime.diagnostics.host),
           sidecar: sidecarJson(runtime.diagnostics.sidecar),
@@ -263,7 +279,8 @@ export class FleetSampler {
         queued: router.queued,
         rss_bytes: memory.rss,
         heap_bytes: memory.heapUsed,
-        external_bytes: memory.external + memory.arrayBuffers,
+        external_bytes: memory.external,
+        array_buffer_bytes: memory.arrayBuffers,
         system_total_bytes: machine.totalBytes,
         system_free_bytes: machine.freeBytes,
         event_loop_p50_ms: milliseconds(this.#eventLoop.percentile(50)),
@@ -284,7 +301,6 @@ export class FleetSampler {
           last_failure_kind: circuit.lastFailureKind,
         } : null,
         traffic: traffic ? trafficJson(traffic, this.#intervalMs) : null,
-        rate_limit: rateLimitJson(router),
         websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
       }), "sample");
       this.#eventLoop.reset();

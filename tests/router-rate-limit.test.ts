@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
-import { FleetRateLimitGate, ModelRateLimitGates } from "../src/router/rate-limit-gate";
-import { MultiSandboxRouter, RouterRateLimitedError } from "../src/router/router";
+import { MultiSandboxRouter } from "../src/router/router";
 import { ResourceGovernor } from "../src/router/resource-governor";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
@@ -25,13 +24,17 @@ function deferred<T>() {
 class Runtime implements RoutableSandboxRuntime {
   readonly projectId: ProjectId;
   calls = 0;
+  active = 0;
   readonly finals: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
   readonly rateLimits: Array<RunHandle["rateLimit"]> = [];
+  readonly startErrors: unknown[] = [];
 
-  constructor(id = "00000000-0000-4000-8000-000000000001") {
+  constructor(
+    id = "00000000-0000-4000-8000-000000000001",
+    readonly capacity = 64,
+  ) {
     this.projectId = projectId(id);
   }
-
   async start(): Promise<void> {}
   async drain(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -39,9 +42,9 @@ class Runtime implements RoutableSandboxRuntime {
     return {
       projectId: this.projectId,
       state: "ready",
-      capacity: 8,
-      active: 0,
-      available: 8,
+      capacity: this.capacity,
+      active: this.active,
+      available: Math.max(0, this.capacity - this.active),
       quarantined: 0,
       heartbeatAgeMs: 1,
       credentialExpiresInMs: 60_000,
@@ -55,182 +58,69 @@ class Runtime implements RoutableSandboxRuntime {
   }
   async run(): Promise<RunHandle> {
     this.calls++;
+    if (this.startErrors.length) throw this.startErrors.shift();
     const final = deferred<Record<string, unknown>>();
     this.finals.push(final);
+    this.active++;
     return {
       async *events() {},
-      final: final.promise,
+      final: final.promise.finally(() => { this.active--; }),
       rateLimit: this.rateLimits.shift(),
       stats: { bytes: 0, firstByteMs: null, frames: 0 },
     };
   }
 }
 
-function router(runtime: Runtime | readonly Runtime[], rateLimit: {
-  rateLimitGate?: FleetRateLimitGate;
-  rateLimitGates?: ModelRateLimitGates;
-} = {}): MultiSandboxRouter {
+function router(runtime: Runtime | readonly Runtime[]): MultiSandboxRouter {
   return new MultiSandboxRouter({
     registry: new SandboxRegistry(Array.isArray(runtime) ? runtime : [runtime]),
     governor: new ResourceGovernor({
       probe: { sample: () => ({
-        totalBytes: 8 * 1024 ** 3,
-        freeBytes: 6 * 1024 ** 3,
+        totalBytes: 64 * 1024 ** 3,
+        freeBytes: 52 * 1024 ** 3,
         rssBytes: 64 * 1024 ** 2,
         heapBytes: 32 * 1024 ** 2,
         externalBytes: 8 * 1024 ** 2,
-        logicalProcessors: 4,
+        logicalProcessors: 16,
       }) },
     }),
-    rateLimitGate: rateLimit.rateLimitGate,
-    rateLimitGates: rateLimit.rateLimitGates,
-    random: { next: () => 0, uuid: () => "trace-rate-limit" },
+    random: { next: () => 0, uuid: () => crypto.randomUUID() },
   });
 }
 
-describe("V2 fleet TPM admission", () => {
-  it("queues above bounded cold parallelism instead of returning a local 429", async () => {
+describe("V2 upstream rate-limit observation", () => {
+  it("dispatches more than sixteen same-model requests without a provider gate", async () => {
     const runtime = new Runtime();
-    const value = router(runtime, {
-      rateLimitGate: new FleetRateLimitGate({ coldMaxActive: 2 }),
-    });
-    const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
-    const second = await value.startRelay({ model: "gpt-5.6-sol", input: "second" });
-    let thirdSettled = false;
-    const thirdPending = value
-      .startRelay({ model: "gpt-5.6-sol", input: "third" })
-      .then(handle => {
-        thirdSettled = true;
-        return handle;
-      });
-    await Bun.sleep(0);
-    expect(runtime.calls).toBe(2);
-    expect(thirdSettled).toBe(false);
-    expect(value.snapshot().rateLimit).toMatchObject({
-      state: "cold",
-      active: 2,
-      coldMaxActive: 2,
-      retryAfterMs: null,
-    });
-
-    runtime.finals[0]!.resolve({ id: "resp_first", status: "completed" });
-    await first.final;
-    const third = await thirdPending;
-    expect(runtime.calls).toBe(3);
-
-    runtime.finals[1]!.resolve({ id: "resp_second", status: "completed" });
-    runtime.finals[2]!.resolve({ id: "resp_third", status: "completed" });
-    await Promise.all([second.final, third.final]);
-    await Bun.sleep(0);
+    const value = router(runtime);
+    const handles = await Promise.all(Array.from({ length: 40 }, (_, index) => (
+      value.startRelay({ model: "gpt-5.6-sol", input: `ungated-${index}` })
+    )));
+    expect(runtime.calls).toBe(40);
+    expect(value.snapshot().queued).toBe(0);
+    expect(value.snapshot()).not.toHaveProperty("rateLimit");
+    for (const [index, final] of runtime.finals.entries()) {
+      final.resolve({ id: `resp_${index}`, status: "completed" });
+    }
+    await Promise.all(handles.map(handle => handle.final));
     expect(value.trafficSnapshotAndReset()).toMatchObject({
-      accepted: 3,
-      committed: 3,
-      succeeded: 3,
-      failed: 0,
+      accepted: 40,
+      committed: 40,
+      succeeded: 40,
       rateLimited: 0,
-      totalMs: { count: 3 },
     });
     await value.close();
   });
 
-  it("does not head-of-line block a different model behind a saturated cold scope", async () => {
-    const runtime = new Runtime();
-    const value = router(runtime, {
-      rateLimitGates: new ModelRateLimitGates({ coldMaxActive: 1 }),
-    });
-    const firstSol = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
-    let secondSolSettled = false;
-    const secondSolPending = value
-      .startRelay({ model: "gpt-5.6-sol", input: "second" })
-      .then(handle => {
-        secondSolSettled = true;
-        return handle;
-      });
-    await Bun.sleep(0);
-    expect(runtime.calls).toBe(1);
-
-    const terra = await value.startRelay({ model: "gpt-5.6-terra", input: "independent" });
-    expect(runtime.calls).toBe(2);
-    expect(secondSolSettled).toBe(false);
-
-    runtime.finals[0]!.resolve({ id: "resp_sol_1", status: "completed" });
-    await firstSol.final;
-    const secondSol = await secondSolPending;
-    runtime.finals[1]!.resolve({ id: "resp_terra", status: "completed" });
-    runtime.finals[2]!.resolve({ id: "resp_sol_2", status: "completed" });
-    await Promise.all([terra.final, secondSol.final]);
-    await value.close();
-  });
-
-  it("turns a streamed rate-limit terminal into a fleet-wide local 429 before another sandbox call", async () => {
+  it("records a full streamed TPM problem but never blocks the next request", async () => {
     const runtime = new Runtime();
     runtime.rateLimits.push({
       limitTokens: 40_000_000,
       remainingTokens: 0,
-      resetTokensMs: 60_000,
-    });
-    const value = router(runtime, { rateLimitGate: new FleetRateLimitGate() });
-    const handle = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
-    runtime.finals[0]!.resolve({
-      id: "resp_limited",
-      status: "failed",
-      error: {
-        code: "rate_limit_exceeded",
-        type: "rate_limit_error",
-        message: "Rate limit reached. Please try again in 109ms.",
-      },
-    });
-    await handle.final;
-    await Promise.resolve();
-
-    await expect(value.startRelay({ model: "gpt-5.6-sol", input: "second" }))
-      .rejects.toMatchObject({ status: 429, code: "rate_limit_exceeded" });
-    expect(runtime.calls).toBe(1);
-    await value.close();
-  });
-
-  it("blocks only the rate-limited model across every sandbox", async () => {
-    const runtime = new Runtime();
-    runtime.rateLimits.push(
-      { limitTokens: 40_000_000, remainingTokens: 0, resetTokensMs: 60_000 },
-      { limitTokens: 40_000_000, remainingTokens: 39_000_000 },
-    );
-    const value = router(runtime, { rateLimitGates: new ModelRateLimitGates() });
-    const sol = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
-    runtime.finals[0]!.resolve({
-      id: "resp_limited",
-      status: "failed",
-      error: {
-        code: "rate_limit_exceeded",
-        type: "rate_limit_error",
-        message: "Rate limit reached. Please try again in 109ms.",
-      },
-    });
-    await sol.final;
-    await Promise.resolve();
-
-    await expect(value.startRelay({ model: "gpt-5.6-sol", input: "second" }))
-      .rejects.toMatchObject({ status: 429 });
-    const terra = await value.startRelay({ model: "gpt-5.6-terra", input: "third" });
-    expect(runtime.calls).toBe(2);
-    runtime.finals[1]!.resolve({ id: "resp_terra", status: "completed" });
-    await terra.final;
-    await value.close();
-  });
-
-  it("shares one model limit across distinct sandboxes and returns the original problem", async () => {
-    const first = new Runtime("00000000-0000-4000-8000-000000000001");
-    const second = new Runtime("00000000-0000-4000-8000-000000000002");
-    first.rateLimits.push({
-      limitTokens: 40_000_000,
-      remainingTokens: 0,
       retryAfterMs: 914,
     });
-    const gates = new ModelRateLimitGates();
-    const value = router([first, second], { rateLimitGates: gates });
-
-    const handle = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
-    first.finals[0]!.resolve({
+    const value = router(runtime);
+    const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
+    runtime.finals[0]!.resolve({
       id: "resp_limited",
       status: "failed",
       error: {
@@ -239,47 +129,81 @@ describe("V2 fleet TPM admission", () => {
         code: "rate_limit_exceeded",
       },
     });
-    await handle.final;
+    await first.final;
     await Promise.resolve();
-
-    expect(value.snapshot().rateLimit).toMatchObject({
-      "gpt-5.6-sol": {
-        state: "cooldown",
-        tokenLimit: 40_000_000,
-        remainingTokens: 0,
-        lastRateLimit: {
+    expect(value.snapshot().runtimes[0]).toMatchObject({
+      upstreamOrganization: {
+        id: "org-ExampleOrganization123",
+        model: "gpt-5.6-sol",
+        source: "rate_limit",
+      },
+      upstreamRateLimit: {
+        hint: { limitTokens: 40_000_000, remainingTokens: 0, retryAfterMs: 914 },
+        problem: {
           message: FULL_TPM_MESSAGE,
           organization: "org-ExampleOrganization123",
           requestedTokens: 609_930,
         },
+        requestedModel: "gpt-5.6-sol",
+      },
+      upstreamRateLimits: {
+        "gpt-5.6-sol": {
+          problem: { organization: "org-ExampleOrganization123" },
+        },
       },
     });
-    expect(value.snapshot().runtimes).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        projectId: first.projectId,
-        upstreamOrganization: {
-          id: "org-ExampleOrganization123",
-          model: "gpt-5.6-sol",
-          source: "rate_limit",
-          observedAgoMs: expect.any(Number),
-        },
-      }),
-      expect.objectContaining({
-        projectId: second.projectId,
-        upstreamOrganization: null,
-      }),
-    ]));
+    const second = await value.startRelay({ model: "gpt-5.6-sol", input: "second" });
+    expect(runtime.calls).toBe(2);
+    runtime.finals[1]!.resolve({ id: "resp_second", status: "completed" });
+    await second.final;
+    await value.close();
+  });
 
-    let blocked: unknown;
+  it("does not flush or reject locally queued capacity work after a 429", async () => {
+    const runtime = new Runtime("00000000-0000-4000-8000-000000000001", 1);
+    runtime.rateLimits.push({ remainingTokens: 0, retryAfterMs: 914 });
+    const value = router(runtime);
+    const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
+    const secondPending = value.startRelay({ model: "gpt-5.6-sol", input: "second" });
+    await Promise.resolve();
+    expect(runtime.calls).toBe(1);
+    expect(value.snapshot().queued).toBe(1);
+
+    runtime.finals[0]!.resolve({
+      status: "failed",
+      error: { message: FULL_TPM_MESSAGE, code: "rate_limit_exceeded" },
+    });
+    await first.final;
+    const second = await secondPending;
+    expect(runtime.calls).toBe(2);
+    runtime.finals[1]!.resolve({ id: "resp_second", status: "completed" });
+    await second.final;
+    await value.close();
+  });
+
+  it("returns the original pre-commit 429 and does not reroute it", async () => {
+    const first = new Runtime("00000000-0000-4000-8000-000000000001");
+    const second = new Runtime("00000000-0000-4000-8000-000000000002");
+    const upstream = Object.assign(new Error(FULL_TPM_MESSAGE), {
+      status: 429,
+      code: "rate_limit_exceeded",
+      type: "rate_limit_error",
+      rateLimit: { retryAfterMs: 914, limitTokens: 40_000_000, remainingTokens: 0 },
+    });
+    first.startErrors.push(upstream);
+    second.startErrors.push(upstream);
+    const value = router([first, second]);
+    let observed: unknown;
     try {
-      await value.startRelay({ model: "gpt-5.6-sol", input: "second" });
+      await value.startRelay({ model: "gpt-5.6-sol", input: "limited" });
     } catch (error) {
-      blocked = error;
+      observed = error;
     }
-    expect(blocked).toBeInstanceOf(RouterRateLimitedError);
-    expect((blocked as Error).message).toBe(FULL_TPM_MESSAGE);
-    const response = apiErrorResponse(blocked);
+    expect(observed).toBe(upstream);
+    expect(first.calls + second.calls).toBe(1);
+    const response = apiErrorResponse(observed);
     expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("1");
     expect(await response.json()).toEqual({
       error: {
         message: FULL_TPM_MESSAGE,
@@ -288,22 +212,60 @@ describe("V2 fleet TPM admission", () => {
         code: "rate_limit_exceeded",
       },
     });
-    expect(first.calls).toBe(1);
-    expect(second.calls).toBe(0);
     await value.close();
   });
 
-  it("returns retry metadata on the local 429 response", async () => {
-    const response = apiErrorResponse(new RouterRateLimitedError({
-      retryAfterMs: 109,
-      resetTokensMs: 360_000,
-    }));
-    expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("360");
-    expect(response.headers.get("x-ratelimit-reset-tokens")).toBe("360000ms");
+  it("keeps observations scoped to the sandbox that produced the evidence", async () => {
+    const first = new Runtime("00000000-0000-4000-8000-000000000001");
+    const second = new Runtime("00000000-0000-4000-8000-000000000002");
+    first.rateLimits.push({ remainingTokens: 0, retryAfterMs: 914 });
+    second.rateLimits.push({ remainingTokens: 0, retryAfterMs: 914 });
+    const value = router([first, second]);
+    const handle = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
+    const selected = first.calls ? first : second;
+    const other = first.calls ? second : first;
+    selected.finals[0]!.resolve({
+      status: "failed",
+      error: { message: FULL_TPM_MESSAGE, code: "rate_limit_exceeded" },
+    });
+    await handle.final;
+    await Promise.resolve();
+    const snapshots = value.snapshot().runtimes;
+    expect(snapshots.find(runtime => runtime.projectId === selected.projectId)?.upstreamRateLimit)
+      .not.toBeNull();
+    expect(snapshots.find(runtime => runtime.projectId === other.projectId)?.upstreamRateLimit)
+      .toBeNull();
+    await value.close();
   });
 
-  it("maps a V2 committed upstream 429 to the same public error contract", async () => {
+  it("retains bounded observation evidence independently for each model", async () => {
+    const runtime = new Runtime();
+    runtime.rateLimits.push(
+      { remainingTokens: 0, retryAfterMs: 100 },
+      { remainingTokens: 0, retryAfterMs: 200 },
+    );
+    const value = router(runtime);
+    const sol = await value.startRelay({ model: "gpt-5.6-sol", input: "sol" });
+    runtime.finals[0]!.resolve({
+      status: "failed",
+      error: { message: "Rate limit reached. Please try again in 100ms.", code: "rate_limit_exceeded" },
+    });
+    await sol.final;
+    const terra = await value.startRelay({ model: "gpt-5.6-terra", input: "terra" });
+    runtime.finals[1]!.resolve({
+      status: "failed",
+      error: { message: "Rate limit reached. Please try again in 200ms.", code: "rate_limit_exceeded" },
+    });
+    await terra.final;
+    await Promise.resolve();
+
+    expect(Object.keys(value.snapshot().runtimes[0]!.upstreamRateLimits ?? {}).sort())
+      .toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
+    expect(runtime.calls).toBe(2);
+    await value.close();
+  });
+
+  it("maps a committed upstream 429 without any local cooldown wrapper", async () => {
     const upstream = Object.assign(
       new Error("Rate limit reached. Please try again in 109ms."),
       {

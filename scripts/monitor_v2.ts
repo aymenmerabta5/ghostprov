@@ -140,6 +140,37 @@ function runtimeMetrics(value: unknown): JsonValue | null {
   const state = typeof value.state === "string" && RUNTIME_STATES.has(value.state)
     ? value.state
     : "unknown";
+  const observations = isRecord(value.upstreamRateLimits)
+    ? Object.entries(value.upstreamRateLimits).slice(0, 16)
+    : [];
+  const rateLimitObservations = observations.flatMap(([fallbackModel, raw]) => {
+    if (!isRecord(raw)) return [];
+    const problem = isRecord(raw.problem) ? raw.problem : null;
+    const hint = isRecord(raw.hint) ? raw.hint : null;
+    return [{
+      model: typeof problem?.model === "string"
+        ? problem.model.slice(0, 128)
+        : typeof raw.requestedModel === "string"
+          ? raw.requestedModel.slice(0, 128)
+          : fallbackModel.slice(0, 128),
+      organization: typeof problem?.organization === "string"
+        ? problem.organization.slice(0, 160)
+        : null,
+      kind: typeof problem?.limitKind === "string"
+        ? problem.limitKind.includes("token")
+          ? "tpm"
+          : problem.limitKind.includes("request")
+            ? "rpm"
+            : problem.limitKind.slice(0, 64)
+        : null,
+      limit: nullableMetric(problem?.tokenLimit ?? hint?.limitTokens),
+      used: nullableMetric(problem?.usedTokens),
+      requested: nullableMetric(problem?.requestedTokens),
+      remaining: nullableMetric(hint?.remainingTokens),
+      retry_after_ms: nullableMetric(problem?.retryAfterMs ?? hint?.retryAfterMs),
+      observed_ago_ms: nullableMetric(raw.observedAgoMs),
+    } satisfies JsonValue];
+  });
   return {
     project_id: id,
     state,
@@ -162,26 +193,8 @@ function runtimeMetrics(value: unknown): JsonValue | null {
       consecutive_failures: metric(value.recovery.consecutiveFailures),
       retry_in_ms: metric(value.recovery.retryInMs),
     } : null,
+    rate_limit_observations: rateLimitObservations,
   };
-}
-
-function rateLimitMetrics(value: unknown, queuedValue: unknown): JsonValue {
-  if (!isRecord(value)) return null;
-  const queued = isRecord(queuedValue) ? queuedValue : {};
-  const output: Record<string, JsonValue> = {};
-  for (const [scope, candidate] of Object.entries(value).slice(0, 64)) {
-    if (!/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(scope) || !isRecord(candidate)) continue;
-    output[scope] = {
-      state: typeof candidate.state === "string" ? candidate.state.slice(0, 16) : "unknown",
-      retry_after_ms: nullableMetric(candidate.retryAfterMs),
-      budget_limit: nullableMetric(candidate.tokenLimit),
-      budget_remaining: nullableMetric(candidate.remainingTokens),
-      active: metric(candidate.active),
-      queued: metric(queued[scope]),
-      cold_max_active: metric(candidate.coldMaxActive),
-    };
-  }
-  return output;
 }
 
 function resourceMetrics(value: unknown): JsonValue {
@@ -300,10 +313,6 @@ export async function pollMonitorSample(
       queued: metric(sandboxes.value.queued),
       resources: resourceMetrics(sandboxes.value.resources),
       runtimes,
-      rate_limit: rateLimitMetrics(
-        sandboxes.value.rateLimit,
-        sandboxes.value.rateLimitQueued,
-      ),
     });
   } catch (error) {
     if (error instanceof MonitorPollError) {

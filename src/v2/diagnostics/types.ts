@@ -7,13 +7,20 @@ export interface V2SidecarResourceSnapshot {
   heapUsedBytes: number;
   heapTotalBytes: number;
   externalBytes: number;
+  /** V8 ArrayBuffer backing stores when the runtime exposes them separately. */
+  arrayBufferBytes: number | null;
   systemTotalBytes: number | null;
   systemFreeBytes: number | null;
   processCpuPercent: number | null;
   normalizedLoad1: number | null;
+  eventLoopSamples: number;
   eventLoopP50Ms: number;
   eventLoopP95Ms: number;
   eventLoopMaxMs: number;
+  /** Rolling bounded GC observations; zero when this runtime cannot expose GC entries. */
+  gcSamples: number;
+  gcDurationP95Ms: number;
+  gcDurationMaxMs: number;
 }
 
 export interface V2TransportDiagnostics {
@@ -99,6 +106,16 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
     keys.every(key => key in value);
 }
 
+function exactWithOptional(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return Object.keys(value).every(key => allowed.has(key) && !FORBIDDEN_KEY.test(key)) &&
+    required.every(key => key in value);
+}
+
 function number(value: unknown, integer = false): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
       (!integer || Number.isSafeInteger(value))
@@ -114,25 +131,59 @@ function nullableNumber(value: unknown): number | null | undefined {
 
 function parseResource(value: unknown): V2SidecarResourceSnapshot | null {
   const raw = object(value);
-  const keys = [
+  const requiredKeys = [
     "processRssBytes", "heapUsedBytes", "heapTotalBytes", "externalBytes",
     "systemTotalBytes", "systemFreeBytes", "processCpuPercent", "normalizedLoad1",
     "eventLoopP50Ms", "eventLoopP95Ms", "eventLoopMaxMs",
   ] as const;
-  if (!raw || !exact(raw, keys)) return null;
+  // Resource diagnostics are intentionally extensible within envelope v1.
+  // Accept old sidecars without the optional metrics while rejecting unknown
+  // fields, then normalize absent values to explicit null/zero evidence.
+  const optionalKeys = [
+    "arrayBufferBytes", "eventLoopSamples", "gcSamples",
+    "gcDurationP95Ms", "gcDurationMaxMs",
+  ] as const;
+  if (!raw || !exactWithOptional(raw, requiredKeys, optionalKeys)) return null;
   const systemTotalBytes = nullableNumber(raw.systemTotalBytes);
   const systemFreeBytes = nullableNumber(raw.systemFreeBytes);
   const processCpuPercent = nullableNumber(raw.processCpuPercent);
   const normalizedLoad1 = nullableNumber(raw.normalizedLoad1);
-  if ([systemTotalBytes, systemFreeBytes, processCpuPercent, normalizedLoad1].includes(undefined)) return null;
-  const required = keys.slice(0, 4).concat(keys.slice(8)).map(key => number(raw[key]));
+  const arrayBufferBytes = raw.arrayBufferBytes === undefined
+    ? null
+    : nullableNumber(raw.arrayBufferBytes);
+  if (
+    [systemTotalBytes, systemFreeBytes, processCpuPercent, normalizedLoad1, arrayBufferBytes]
+      .includes(undefined)
+  ) return null;
+  const numericKeys = [
+    "processRssBytes", "heapUsedBytes", "heapTotalBytes", "externalBytes",
+    "eventLoopP50Ms", "eventLoopP95Ms", "eventLoopMaxMs",
+  ] as const;
+  const required = numericKeys.map(key => number(raw[key]));
   if (required.some(value => value === null)) return null;
+  const eventLoopSamples = raw.eventLoopSamples === undefined
+    ? 0
+    : number(raw.eventLoopSamples, true);
+  const gcSamples = raw.gcSamples === undefined ? 0 : number(raw.gcSamples, true);
+  const gcDurationP95Ms = raw.gcDurationP95Ms === undefined
+    ? 0
+    : number(raw.gcDurationP95Ms);
+  const gcDurationMaxMs = raw.gcDurationMaxMs === undefined
+    ? 0
+    : number(raw.gcDurationMaxMs);
+  if (
+    eventLoopSamples === null || gcSamples === null ||
+    gcDurationP95Ms === null || gcDurationMaxMs === null
+  ) return null;
   return {
     processRssBytes: required[0]!, heapUsedBytes: required[1]!,
     heapTotalBytes: required[2]!, externalBytes: required[3]!,
+    arrayBufferBytes: arrayBufferBytes!,
     systemTotalBytes: systemTotalBytes!, systemFreeBytes: systemFreeBytes!,
     processCpuPercent: processCpuPercent!, normalizedLoad1: normalizedLoad1!,
+    eventLoopSamples,
     eventLoopP50Ms: required[4]!, eventLoopP95Ms: required[5]!, eventLoopMaxMs: required[6]!,
+    gcSamples, gcDurationP95Ms, gcDurationMaxMs,
   };
 }
 

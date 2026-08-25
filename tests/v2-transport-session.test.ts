@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { gzipSync } from "fflate";
 import type { RunHandle } from "../src/relay/run-handle";
 import { projectId } from "../src/sandbox/types";
@@ -21,6 +21,7 @@ import {
 import {
   computeV2RetransmitDelayMs,
   V2TransportSession,
+  type V2GzipOptions,
 } from "../src/v2/transport/session";
 import { FakeAwarenessNetwork } from "./support/fake-awareness";
 
@@ -95,7 +96,7 @@ class TransportHarness {
     retransmitMs?: number;
     maxResponseBytes?: number;
     maxBufferedResponseBytes?: number;
-    gzip?: (bytes: Uint8Array) => Promise<Uint8Array>;
+    gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
     rotationTimeoutMs?: number;
     publicationIntervalMs?: number;
     unadmittedTimeoutMs?: number;
@@ -884,16 +885,23 @@ describe("V2TransportSession", () => {
     const handle = await harness.commit(harness.session.run(BODY));
     const frames = await harness.completedFrames();
     const terminal = frames.pop()!;
+    const snapshot = spyOn(TranscriptProof.prototype, "snapshot");
 
-    harness.publish([terminal]);
-    await harness.settle();
-    expect(await promiseState(handle.final)).toBe("pending");
+    try {
+      harness.publish([terminal]);
+      await harness.settle();
+      expect(await promiseState(handle.final)).toBe("pending");
+      expect(snapshot).not.toHaveBeenCalled();
 
-    harness.publish(frames);
-    await harness.settle();
-    await expect(handle.final).resolves.toMatchObject({ id: "resp_1" });
-    expect(await Array.fromAsync(handle.events())).toHaveLength(3);
-    await harness.close();
+      harness.publish(frames);
+      await harness.settle();
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_1" });
+      expect(await Array.fromAsync(handle.events())).toHaveLength(3);
+      expect(snapshot).toHaveBeenCalledTimes(1);
+    } finally {
+      snapshot.mockRestore();
+      await harness.close();
+    }
   });
 
   it("quarantines a tampered terminal proof without acknowledging it", async () => {
@@ -1065,15 +1073,20 @@ describe("V2TransportSession", () => {
   });
 
   it("uses gzip only when it reduces the request part count", async () => {
+    const controller = new AbortController();
+    let observedOptions: V2GzipOptions | undefined;
     const harness = new TransportHarness({
-      gzip: async bytes => gzipSync(bytes),
+      gzip: async (bytes, options) => {
+        observedOptions = options;
+        return gzipSync(bytes);
+      },
     });
     await harness.start();
     const pending = harness.session.run({
       model: "gpt-5.6-sol",
       input: "compressible-context-".repeat(10_000),
       stream: true,
-    });
+    }, controller.signal);
     await harness.settle();
     const open = [...harness.hostFrames.values()].find(
       (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
@@ -1083,6 +1096,10 @@ describe("V2TransportSession", () => {
     expect(open.encoding).toBe("gzip+base64");
     expect(open.encodedBytes).toBeLessThan(open.decodedBytes);
     expect(open.partCount).toBe(1);
+    expect(observedOptions).toEqual({
+      signal: controller.signal,
+      inputOwnership: "owned",
+    });
     await harness.commit(pending);
     await harness.close();
   });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   chooseRuntime,
+  isRuntimeEligible,
   isRuntimeHealthy,
   type RouteCandidate,
 } from "../src/router/policy";
@@ -44,6 +45,9 @@ function candidate(
 describe("chooseRuntime", () => {
   it("separates runtime health from immediate spare capacity", () => {
     expect(isRuntimeHealthy(candidate("1", { active: 30 }))).toBe(true);
+    expect(isRuntimeEligible(candidate("1", { active: 30 }))).toBe(false);
+    expect(isRuntimeEligible(candidate("1", { active: 28, reserved: 1 }))).toBe(true);
+    expect(isRuntimeEligible(candidate("1", { capacity: 30, quarantined: 2, active: 28 }))).toBe(false);
     expect(isRuntimeHealthy(candidate("2", { heartbeatAgeMs: null }))).toBe(false);
     expect(isRuntimeHealthy(candidate("3", { heartbeatAgeMs: 20_001 }))).toBe(false);
     expect(isRuntimeHealthy(candidate("4", { credentialExpiresInMs: 29_999 }))).toBe(false);

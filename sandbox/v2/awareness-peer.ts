@@ -53,6 +53,12 @@ export interface DenoAwarenessPeerOptions {
   publicationIntervalMs?: number;
   initialActivePerSandbox?: number;
   maxActivePerSandbox?: number;
+  closeTimeoutMs?: number;
+  onAcceptError?: (
+    error: Error,
+    frame: ReliableFrame<HostFrame>,
+  ) => void;
+  onEngineError?: (error: Error) => void;
 }
 
 export interface DenoAwarenessProviderLike {
@@ -69,6 +75,17 @@ export interface DenoAwarenessProviderLike {
   connect(): void;
   disconnect(): void;
   destroy(): void;
+}
+
+export class SidecarCloseError extends Error {
+  readonly name = "SidecarCloseError";
+  constructor(
+    message: string,
+    readonly code: "timeout" | "operation" | "output" | "teardown",
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
 }
 
 function defaultProviderFactory(
@@ -111,6 +128,30 @@ function strongestUrgency(
   return left ?? right;
 }
 
+function hostFrameIsControl(frame: ReliableFrame<HostFrame>): boolean {
+  return frame.kind === "request_cancel" ||
+    frame.kind === "response_ack" ||
+    frame.kind === "drain" ||
+    frame.kind === "ping" ||
+    frame.kind === "credential_rotate";
+}
+
+function sleepWithSignal(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export class DenoAwarenessPeer {
   readonly #binding: ProtocolBinding;
   readonly #instanceId: string;
@@ -122,10 +163,16 @@ export class DenoAwarenessPeer {
   readonly #controlProvider: DenoAwarenessProviderLike;
   readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
   readonly #inbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
+  readonly #bootstrapInbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
+  #processedAck = { epoch: 1, sequence: -1 };
+  #bootstrapProcessedAck = { epoch: 1, sequence: -1 };
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
   readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #retransmitMs: number;
   readonly #connectTimeoutMs: number;
+  readonly #closeTimeoutMs: number;
+  readonly #onAcceptError?: DenoAwarenessPeerOptions["onAcceptError"];
+  readonly #onEngineError?: DenoAwarenessPeerOptions["onEngineError"];
   readonly #diagnostics?: SidecarDiagnosticsObserver;
   readonly #outputBackpressure?: OutputBackpressure;
   readonly #delivery: ReliableDeliveryTiming;
@@ -135,11 +182,16 @@ export class DenoAwarenessPeer {
   #controlRevision = 0;
   #dataDirty = false;
   #hostPeerId: string | null = null;
+  #hostInstanceId: string | null = null;
   readonly #hostClientId: Record<AwarenessLane, number | null> = {
     data: null,
     control: null,
   };
   readonly #hostRevision: Record<AwarenessLane, number> = {
+    data: -1,
+    control: -1,
+  };
+  readonly #bootstrapRevision: Record<AwarenessLane, number> = {
     data: -1,
     control: -1,
   };
@@ -160,8 +212,22 @@ export class DenoAwarenessPeer {
   #responseBatchFrames = 0;
   #batchedEvents = 0;
   readonly #congestion = new TransportCongestion();
+  readonly #lifecycleAbort = new AbortController();
   #closed = false;
-  #acceptChain: Promise<void> = Promise.resolve();
+  #closing = false;
+  #connected = false;
+  #connectPromise: Promise<void> | null = null;
+  #closePromise: Promise<void> | null = null;
+  #recoveryReplayStarted = false;
+  #recoveryReplayCompleted = false;
+  #recoveryReplayFailed = false;
+  #recoveryReplayInProgress = false;
+  #recoveryReplayPromise: Promise<void> | null = null;
+  #inboundFrozen = false;
+  readonly #requestAcceptChains = new Map<string, Promise<void>>();
+  #controlAcceptChain: Promise<void> = Promise.resolve();
+  readonly #processedReady = new Map<number, ReliableFrame<HostFrame>>();
+  readonly #bootstrapProcessedReady = new Map<number, ReliableFrame<HostFrame>>();
 
   constructor(options: DenoAwarenessPeerOptions) {
     this.#binding = options.binding;
@@ -177,10 +243,16 @@ export class DenoAwarenessPeer {
       throw new RangeError("retransmitMs must be positive");
     }
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.#closeTimeoutMs = options.closeTimeoutMs ?? 5_000;
+    this.#onAcceptError = options.onAcceptError;
+    this.#onEngineError = options.onEngineError;
     this.#diagnostics = options.diagnostics;
     this.#outputBackpressure = options.outputBackpressure;
     if (!Number.isFinite(this.#connectTimeoutMs) || this.#connectTimeoutMs < 1) {
       throw new RangeError("connectTimeoutMs must be positive");
+    }
+    if (!Number.isFinite(this.#closeTimeoutMs) || this.#closeTimeoutMs < 1) {
+      throw new RangeError("closeTimeoutMs must be positive");
     }
     this.#dataDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:data` });
     this.#controlDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:control` });
@@ -204,16 +276,35 @@ export class DenoAwarenessPeer {
     this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
   }
 
-  async connect(): Promise<void> {
-    if (this.#closed) throw new Error("Awareness peer is closed");
+  connect(signal?: AbortSignal): Promise<void> {
+    if (this.#closed || this.#closing) return Promise.reject(new Error("Awareness peer is closed"));
+    if (!this.#connectPromise) this.#connectPromise = this.#connect(signal);
+    return this.#connectPromise;
+  }
+
+  async #connect(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw signal.reason;
+    const onAbort = () => this.#lifecycleAbort.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
       await Promise.all([
-        this.#connectProvider(this.#dataProvider, "data"),
-        this.#connectProvider(this.#controlProvider, "control"),
+        this.#connectProvider(this.#dataProvider, "data", this.#lifecycleAbort.signal),
+        this.#connectProvider(this.#controlProvider, "control", this.#lifecycleAbort.signal),
       ]);
+      if (this.#closed) throw new Error("Awareness peer closed while connecting");
+      this.#connected = true;
     } catch (error) {
-      await this.close();
+      try {
+        await this.close();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Awareness connection and teardown both failed",
+        );
+      }
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
     this.#pacer.flushNow("initial");
   }
@@ -221,6 +312,7 @@ export class DenoAwarenessPeer {
   async #connectProvider(
     provider: DenoAwarenessProviderLike,
     lane: AwarenessLane,
+    signal: AbortSignal,
   ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -230,16 +322,30 @@ export class DenoAwarenessPeer {
         clearTimeout(timer);
         provider.off("sync", onSync);
         provider.off("connection-error", onError);
+        provider.off("connection-close", onClose);
+        signal.removeEventListener("abort", onAbort);
         error ? reject(error) : resolve();
       };
       const onSync = (synced: boolean) => { if (synced) finish(); };
       const onError = () => finish(new Error(`Y-Sweet sidecar ${lane} connection failed`));
+      const onClose = () => finish(new Error(`Y-Sweet sidecar ${lane} connection closed before synchronization`));
+      const onAbort = () => finish(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException(`Y-Sweet sidecar ${lane} connection was aborted`, "AbortError"),
+      );
       const timer = setTimeout(
         () => finish(new Error(`Y-Sweet sidecar ${lane} synchronization timed out`)),
         this.#connectTimeoutMs,
       );
       provider.on("sync", onSync);
       provider.on("connection-error", onError);
+      provider.on("connection-close", onClose);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
       provider.connect();
     });
   }
@@ -265,22 +371,166 @@ export class DenoAwarenessPeer {
     this.#updateBackpressure();
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  /** Publishes changed engine readiness/credits without changing the wire shape. */
+  publishEngineState(): void {
+    if (this.#closed || !this.#connected) return;
+    // A provider can synchronize the host's existing Awareness state before
+    // journal recovery is finished. Revisit that exact state only after the
+    // engine is ready so the transport does not ACK work merely parked behind
+    // startup.
+    this.#reprocessSteadyHostData();
+    this.#pacer.flushNow("urgent");
+  }
+
+  freezeInbound(): void {
+    this.#inboundFrozen = true;
+    this.#pacer.requestUrgent();
+  }
+
+  #reprocessSteadyHostData(): void {
+    const hostClientId = this.#hostClientId.data;
+    if (hostClientId === null || this.#engine.snapshot().ready === false) return;
+    this.#hostRevision.data = -1;
+    this.#onAwarenessChange(
+      "data",
+      this.#dataProvider,
+      "ghostprovV2Data",
+      { added: [], updated: [hostClientId], removed: [] },
+    );
+  }
+
+  close(): Promise<void> {
+    if (!this.#closePromise) this.#closePromise = this.#close(false);
+    return this.#closePromise;
+  }
+
+  closeGracefully(): Promise<void> {
+    if (!this.#closePromise) this.#closePromise = this.#close(true);
+    return this.#closePromise;
+  }
+
+  async #close(graceful: boolean): Promise<void> {
+    this.#closing = true;
+    this.#inboundFrozen = true;
+    this.#connected = false;
+    if (!graceful) {
+      this.#lifecycleAbort.abort(new DOMException("Awareness peer closed", "AbortError"));
+    }
+    const deadline = performance.now() + this.#closeTimeoutMs;
+    const lifecycleErrors: unknown[] = [];
+    try {
+      if (this.#recoveryReplayPromise) {
+        await this.#awaitBounded(this.#recoveryReplayPromise, deadline, "recovery replay");
+      }
+      await this.#awaitAcceptChain(deadline);
+      if (graceful) {
+        this.#pacer.flushNow("urgent");
+        await this.#awaitOutputDrain(deadline);
+        // A terminal ACK can arrive while the output window is draining. Let
+        // its durable journal cleanup settle before ownership is released.
+        this.#inboundFrozen = true;
+        await this.#awaitAcceptChain(deadline);
+      }
+    } catch (error) {
+      lifecycleErrors.push(error);
+    }
+    this.#lifecycleAbort.abort(new DOMException("Awareness peer closed", "AbortError"));
     this.#closed = true;
-    this.#pacer.close();
+    try { this.#pacer.close(); } catch (error) { lifecycleErrors.push(error); }
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
-    await this.#acceptChain.catch(() => undefined);
-    this.#dataProvider.awareness.off("change", this.#onDataAwarenessChange);
-    this.#controlProvider.awareness.off("change", this.#onControlAwarenessChange);
+    const cleanup = (operation: () => void) => {
+      try { operation(); } catch (error) { lifecycleErrors.push(error); }
+    };
+    cleanup(() => this.#dataProvider.awareness.off("change", this.#onDataAwarenessChange));
+    cleanup(() => this.#controlProvider.awareness.off("change", this.#onControlAwarenessChange));
     for (const provider of [this.#dataProvider, this.#controlProvider]) {
-      provider.awareness.setLocalState(null);
-      provider.disconnect();
-      provider.destroy();
+      cleanup(() => provider.awareness.setLocalState(null));
+      cleanup(() => provider.disconnect());
+      cleanup(() => provider.destroy());
     }
-    this.#dataDoc.destroy();
-    this.#controlDoc.destroy();
+    cleanup(() => this.#dataDoc.destroy());
+    cleanup(() => this.#controlDoc.destroy());
+    if (lifecycleErrors.length) {
+      if (lifecycleErrors.length === 1 && lifecycleErrors[0] instanceof SidecarCloseError) {
+        throw lifecycleErrors[0];
+      }
+      throw new SidecarCloseError(
+        "Awareness peer did not close cleanly",
+        "teardown",
+        { cause: new AggregateError(lifecycleErrors, "Awareness peer teardown failures") },
+      );
+    }
+  }
+
+  async #awaitAcceptChain(deadline: number): Promise<void> {
+    await this.#awaitBounded(
+      Promise.all([
+        ...this.#requestAcceptChains.values(),
+        this.#controlAcceptChain,
+      ]),
+      deadline,
+      "host frame processing",
+    );
+  }
+
+  async #awaitBounded(
+    promise: Promise<unknown>,
+    deadline: number,
+    operation: string,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        promise.then(
+          () => ({ kind: "complete" as const }),
+          error => ({ kind: "failed" as const, error }),
+        ),
+        new Promise<{ kind: "timeout" }>(resolve => {
+          timer = setTimeout(
+            () => resolve({ kind: "timeout" }),
+            Math.max(0, deadline - performance.now()),
+          );
+          (timer as any).unref?.();
+        }),
+      ]);
+      if (result.kind === "timeout") {
+        throw new SidecarCloseError(`${operation} exceeded the close deadline`, "timeout");
+      }
+      if (result.kind === "failed") {
+        throw new SidecarCloseError(`${operation} failed during close`, "operation", {
+          cause: result.error,
+        });
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async #awaitOutputDrain(deadline: number): Promise<void> {
+    while (performance.now() < deadline) {
+      const outbound = this.#outbound.snapshot();
+      const scheduled = this.#scheduler.snapshot();
+      if (outbound.frames.length === 0 && scheduled.queuedFrames === 0) return;
+      await new Promise<void>(resolve => setTimeout(
+        resolve,
+        Math.min(10, Math.max(0, deadline - performance.now())),
+      ));
+    }
+    throw new SidecarCloseError(
+      "Reliable output remained pending at the close deadline",
+      "output",
+    );
+  }
+
+  async #waitForReliableOutputDrain(signal: AbortSignal): Promise<void> {
+    for (;;) {
+      if (signal.aborted) throw signal.reason;
+      const outbound = this.#outbound.snapshot();
+      const scheduled = this.#scheduler.snapshot();
+      if (outbound.frames.length === 0 && scheduled.queuedFrames === 0) return;
+      await sleepWithSignal(10, signal);
+    }
   }
 
   readonly #onDataAwarenessChange = (
@@ -313,6 +563,7 @@ export class DenoAwarenessPeer {
         this.#hostRevision[lane] = -1;
         if (this.#hostClientId.data === null && this.#hostClientId.control === null) {
           this.#hostPeerId = null;
+          this.#hostInstanceId = null;
         }
       }
     }
@@ -323,6 +574,10 @@ export class DenoAwarenessPeer {
         if (clientId === this.#hostClientId[lane]) {
           this.#hostClientId[lane] = null;
           this.#hostRevision[lane] = -1;
+          if (this.#hostClientId.data === null && this.#hostClientId.control === null) {
+            this.#hostPeerId = null;
+            this.#hostInstanceId = null;
+          }
         }
         continue;
       }
@@ -335,20 +590,33 @@ export class DenoAwarenessPeer {
         continue;
       }
       if (envelope.lane !== undefined && envelope.lane !== lane) continue;
-      if (this.#hostPeerId && envelope.peerId !== this.#hostPeerId) continue;
-      if (envelope.revision <= this.#hostRevision[lane]) continue;
-      this.#hostPeerId = envelope.peerId;
-      this.#hostClientId[lane] = clientId;
-      this.#hostRevision[lane] = envelope.revision;
+      const steadyHost = envelope.peerId === "host";
+      const bootstrapHost = envelope.peerId === "host-bootstrap";
+      if (!steadyHost && !bootstrapHost) continue;
+      if (bootstrapHost) {
+        // Bootstrap can ping/drain before a transport exists, but it must never
+        // pin the steady host identity or trigger recovered response delivery.
+        if (this.#hostInstanceId !== null) continue;
+        if (envelope.revision <= this.#bootstrapRevision[lane]) continue;
+        this.#bootstrapRevision[lane] = envelope.revision;
+      } else {
+        if (this.#hostPeerId && envelope.peerId !== this.#hostPeerId) continue;
+        if (this.#hostInstanceId && envelope.instanceId !== this.#hostInstanceId) continue;
+        if (envelope.revision <= this.#hostRevision[lane]) continue;
+        this.#hostPeerId = envelope.peerId;
+        this.#hostInstanceId = envelope.instanceId;
+        this.#hostClientId[lane] = clientId;
+        this.#hostRevision[lane] = envelope.revision;
+        this.#observeBoundHostTransport(envelope);
+      }
       if (envelope.liveness?.kind === "ping") {
         // Liveness is deliberately best-effort and out of band. Answer it
         // before (and instead of) the reliable ACK/window, admission, engine,
         // scheduler, and output-backpressure paths below.
         try {
           this.#publishLivenessPong(envelope.liveness.sentAtMs);
-        } catch {
-          // A later probe can retry if the Awareness provider rejects this
-          // publication while its connection is being re-established.
+        } catch (error) {
+          this.#reportEngineError(error, "Sidecar liveness publication failed");
         }
         continue;
       }
@@ -361,7 +629,17 @@ export class DenoAwarenessPeer {
           this.#hostCredits = envelope.credits;
           this.#engine.setHostCeiling(envelope.credits);
         }
+        const acknowledgedOutcomeIds = this.#outbound.snapshot().frames.flatMap(frame => (
+          frame.epoch === envelope.ack.epoch &&
+          frame.sequence <= envelope.ack.sequence &&
+          (frame.kind === "response_error" || frame.kind === "request_cancelled")
+            ? [frame.requestId]
+            : []
+        ));
         this.#outbound.acknowledge(envelope.ack);
+        if (acknowledgedOutcomeIds.length) {
+          this.#queueOutcomeAcknowledgements(acknowledgedOutcomeIds);
+        }
         const flightCompleted = this.#flight.acknowledged(envelope.ack);
         if (flightCompleted) this.#flightCompletions++;
         const now = performance.now();
@@ -383,15 +661,39 @@ export class DenoAwarenessPeer {
         }
         let frames: readonly ReliableFrame<HostFrame>[] = [];
         if (lane === "data") {
-          const currentEpoch = this.#inbound.ack().epoch;
-          if (envelope.epoch > currentEpoch) this.#inbound.reset(envelope.epoch);
-          frames = this.#inbound.accept(envelope.frames);
+          // Connecting before recovery is required so large recovered spools
+          // can drain. Do not advance the inbound cursor until recovery has
+          // actually completed, otherwise a synced host frame could be ACKed
+          // before the engine ever processed it.
+          if (this.#engine.snapshot().ready !== false) {
+            const inbound = bootstrapHost ? this.#bootstrapInbound : this.#inbound;
+            const processed = bootstrapHost
+              ? this.#bootstrapProcessedAck
+              : this.#processedAck;
+            const currentEpoch = inbound.ack().epoch;
+            if (envelope.epoch > currentEpoch) {
+              if (processed.sequence !== inbound.ack().sequence) {
+                throw new Error("Host epoch changed while accepted frames were still processing");
+              }
+              inbound.reset(envelope.epoch);
+              if (bootstrapHost) {
+                this.#bootstrapProcessedAck = { epoch: envelope.epoch, sequence: -1 };
+                this.#bootstrapProcessedReady.clear();
+              } else {
+                this.#processedAck = { epoch: envelope.epoch, sequence: -1 };
+                this.#processedReady.clear();
+              }
+            }
+            const pendingFrames = envelope.frames.filter(frame => (
+              frame.epoch === inbound.ack().epoch &&
+              frame.sequence > inbound.ack().sequence
+            ));
+            if (!this.#inboundFrozen || pendingFrames.every(hostFrameIsControl)) {
+              frames = inbound.accept(envelope.frames);
+            }
+          }
         }
-        for (const frame of frames) {
-          this.#acceptChain = this.#acceptChain
-            .then(() => this.#acceptHostFrame(frame))
-            .catch(() => undefined);
-        }
+        for (const frame of frames) this.#queueHostFrame(frame, bootstrapHost);
         const urgency = this.#pump();
         if (flightCompleted && urgency === null) {
           this.#dataProvider.awareness.setLocalStateField("ghostprovV2Data", null);
@@ -403,9 +705,8 @@ export class DenoAwarenessPeer {
             ? "urgent"
             : urgency,
         );
-      } catch {
-        // Invalid ACK/window transitions are ignored; a valid current host
-        // envelope must re-establish contiguous state.
+      } catch (error) {
+        this.#reportEngineError(error, "Bound host protocol transition failed");
       }
     }
   }
@@ -460,6 +761,7 @@ export class DenoAwarenessPeer {
   #publishLivenessPong(sentAtMs: number): void {
     const current = this.#controlProvider.awareness.getLocalState()
       ?.ghostprovV2Control as AwarenessEnvelope<SidecarFrame> | undefined;
+    const transport = this.#engine.snapshot();
     const envelope: AwarenessEnvelope<SidecarFrame> = {
       protocol: "gp-awareness-v2",
       schemaVersion: 1,
@@ -472,11 +774,13 @@ export class DenoAwarenessPeer {
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: current?.epoch ?? 1,
       revision: this.#controlRevision++,
-      ack: current?.ack ?? { epoch: 1, sequence: -1 },
-      credits: current?.credits ?? 0,
-      active: current?.active ?? 0,
-      queued: current?.queued ?? 0,
-      draining: current?.draining ?? false,
+      ack: this.#publishedHostAck(),
+      credits: this.#inboundFrozen || this.#recoveryReplayInProgress
+        ? 0
+        : (current?.credits ?? 0),
+      active: transport.active,
+      queued: transport.queued,
+      draining: transport.draining,
       frames: [],
       lane: "control",
       liveness: { kind: "pong", sentAtMs },
@@ -516,8 +820,13 @@ export class DenoAwarenessPeer {
       leaderGeneration: this.#binding.leaderGeneration,
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
-      ack: this.#inbound.ack(),
-      credits: this.#congestion.congested
+      ack: this.#publishedHostAck(),
+      credits:
+        transport.ready === false ||
+        transport.draining ||
+        this.#inboundFrozen ||
+        this.#recoveryReplayInProgress ||
+        this.#congestion.congested
         ? 0
         : this.#adaptiveCapacity.available(transport.active, transport.credits),
       active: transport.active,
@@ -561,9 +870,200 @@ export class DenoAwarenessPeer {
     }, delay) as unknown as number;
   }
 
-  async #acceptHostFrame(frame: ReliableFrame<HostFrame>): Promise<void> {
+  #observeBoundHostTransport(envelope: AwarenessEnvelope<HostFrame>): void {
+    // Bootstrap publishes as "host-bootstrap" and is not a steady-state
+    // transport capable of draining a large response window. The production
+    // V2TransportSession publishes as "host" only after bootstrap readiness.
+    if (
+      this.#recoveryReplayStarted ||
+      this.#recoveryReplayCompleted ||
+      this.#recoveryReplayFailed ||
+      envelope.peerId !== "host" ||
+      this.#engine.snapshot().ready === false
+    ) return;
+    const replayRecovered = (this.#engine as SidecarEngine & {
+      replayRecovered?: (signal?: AbortSignal) => Promise<void>;
+    }).replayRecovered;
+    if (typeof replayRecovered !== "function") return;
+    this.#recoveryReplayStarted = true;
+    this.#recoveryReplayInProgress = true;
+    this.#inboundFrozen = true;
+    this.#pacer.requestUrgent();
+    const replay = (async () => {
+      await replayRecovered.call(this.#engine, this.#lifecycleAbort.signal);
+      await this.#waitForReliableOutputDrain(this.#lifecycleAbort.signal);
+    })();
+    this.#recoveryReplayPromise = replay;
+    void replay.then(
+      () => {
+        this.#recoveryReplayCompleted = true;
+        this.#inboundFrozen = false;
+        this.#reprocessSteadyHostData();
+      },
+      value => {
+        if (this.#lifecycleAbort.signal.aborted) return;
+        this.#recoveryReplayFailed = true;
+        this.#reportEngineError(value, "Recovered terminal replay failed");
+      },
+    ).finally(() => {
+      if (this.#recoveryReplayPromise === replay) this.#recoveryReplayPromise = null;
+      this.#recoveryReplayStarted = false;
+      this.#recoveryReplayInProgress = false;
+      this.#pacer.requestUrgent();
+    });
+  }
+
+  #reportEngineError(value: unknown, fallback: string): void {
+    const error = value instanceof Error ? value : new Error(fallback);
+    this.#onEngineError?.(error);
+  }
+
+  #publishedHostAck(): { epoch: number; sequence: number } {
+    return this.#hostInstanceId === null
+      ? this.#bootstrapProcessedAck
+      : this.#processedAck;
+  }
+
+  #queueOutcomeAcknowledgements(requestIds: readonly string[]): void {
+    const acknowledge = (this.#engine as SidecarEngine & {
+      acknowledgeDeliveredOutcomes?: (requestIds: readonly string[]) => Promise<void>;
+    }).acknowledgeDeliveredOutcomes;
+    if (typeof acknowledge !== "function") return;
+    const next = this.#controlAcceptChain.then(() => (
+      acknowledge.call(this.#engine, requestIds)
+    ));
+    this.#controlAcceptChain = next;
+    void next.catch(error => {
+      this.#reportEngineError(error, "Durable outcome acknowledgement failed");
+    });
+  }
+
+  #queueHostFrame(
+    frame: ReliableFrame<HostFrame>,
+    bootstrapHost: boolean,
+  ): void {
+    if (frame.kind === "drain") this.#inboundFrozen = true;
+    const requestId = "requestId" in frame ? frame.requestId : null;
+    const previous = requestId
+      ? this.#requestAcceptChains.get(requestId) ?? Promise.resolve()
+      : this.#controlAcceptChain;
+    const next = previous
+      .then(() => this.#acceptHostFrame(frame, this.#lifecycleAbort.signal))
+      .then(() => this.#markHostFrameProcessed(frame, bootstrapHost))
+      .catch(error => {
+        if (!this.#reportAcceptError(frame, error)) {
+          this.#markHostFrameProcessed(frame, bootstrapHost);
+        }
+      });
+    if (requestId) {
+      this.#requestAcceptChains.set(requestId, next);
+      void next.then(
+        () => {
+          if (this.#requestAcceptChains.get(requestId) === next) {
+            this.#requestAcceptChains.delete(requestId);
+          }
+        },
+        () => {
+          if (this.#requestAcceptChains.get(requestId) === next) {
+            this.#requestAcceptChains.delete(requestId);
+          }
+        },
+      );
+    } else {
+      this.#controlAcceptChain = next;
+    }
+  }
+
+  #markHostFrameProcessed(
+    frame: ReliableFrame<HostFrame>,
+    bootstrapHost: boolean,
+  ): void {
+    const processed = bootstrapHost
+      ? this.#bootstrapProcessedAck
+      : this.#processedAck;
+    if (frame.epoch !== processed.epoch || frame.sequence <= processed.sequence) return;
+    const ready = bootstrapHost
+      ? this.#bootstrapProcessedReady
+      : this.#processedReady;
+    ready.set(frame.sequence, frame);
+    let sequence = processed.sequence;
+    while (ready.has(sequence + 1)) {
+      ready.delete(sequence + 1);
+      sequence++;
+    }
+    if (sequence !== processed.sequence) {
+      if (bootstrapHost) {
+        this.#bootstrapProcessedAck = { epoch: frame.epoch, sequence };
+      } else {
+        this.#processedAck = { epoch: frame.epoch, sequence };
+      }
+      this.#pacer.requestUrgent();
+    }
+  }
+
+  /** Returns true when the failure is engine-wide and must remain un-ACKed. */
+  #reportAcceptError(frame: ReliableFrame<HostFrame>, value: unknown): boolean {
+    if (this.#lifecycleAbort.signal.aborted) return true;
+    const error = value instanceof Error
+      ? value
+      : new Error("Sidecar frame processing failed");
+    if (
+      frame.kind === "request_open" ||
+      frame.kind === "request_data" ||
+      frame.kind === "request_commit"
+    ) {
+      this.enqueue({
+        kind: "request_reject",
+        requestId: frame.requestId,
+        code: "sidecar_accept_failed",
+        message: "Sidecar could not safely accept the request frame",
+      }, "control", frame.requestId);
+    } else if (frame.kind === "request_cancel") {
+      this.enqueue({
+        kind: "response_error",
+        requestId: frame.requestId,
+        code: "sidecar_cancel_failed",
+        message: "Sidecar could not safely process cancellation",
+        ambiguous: true,
+      }, "terminal", frame.requestId);
+    } else if (frame.kind === "credential_rotate") {
+      this.enqueue({
+        kind: "response_error",
+        requestId: "credential",
+        code: "credential_rotation_failed",
+        message: "Sidecar credential rotation failed",
+        ambiguous: false,
+      }, "terminal", "credential");
+    }
+    // Malformed or incomplete request-local state is rejected in-band and
+    // must not tear down unrelated healthy streams. Only failures in durable
+    // terminal ACK, lifecycle control, engine progress, or credentials imply
+    // that the sidecar as a whole is no longer trustworthy.
+    const errorCode = "code" in error
+      ? (error as Error & { code?: unknown }).code
+      : undefined;
+    const systemic =
+      error.name === "SidecarOwnershipError" ||
+      (error.name === "ClaimJournalError" &&
+        (errorCode === "storage" || errorCode === "corrupt"));
+    const fatal = systemic || (
+      frame.kind === "response_ack" ||
+      frame.kind === "drain" ||
+      frame.kind === "ping" ||
+      frame.kind === "credential_rotate"
+    );
+    if (fatal) {
+      this.#onAcceptError?.(error, frame);
+    }
+    return fatal;
+  }
+
+  async #acceptHostFrame(
+    frame: ReliableFrame<HostFrame>,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (frame.kind !== "credential_rotate") {
-      await this.#engine.accept(frame);
+      await this.#engine.accept(frame, signal);
       return;
     }
     await this.#rotator.accept(frame.rotationId, frame.sealedJson);

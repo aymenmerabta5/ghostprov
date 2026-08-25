@@ -6,7 +6,7 @@
  * - output audio / transcription handling
  * - helpers to encode audio bytes to base64 and to upload via Files API
  *
- * Like image helpers, all structures are forwarded verbatim via relayCreate's Yjs+render+zip loop.
+ * Like image helpers, all structures are forwarded verbatim through the Responses transport.
  * No fields are stripped; unknown keys survive.
  */
 

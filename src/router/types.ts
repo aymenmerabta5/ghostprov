@@ -21,3 +21,12 @@ export interface ResourceGovernorSnapshot extends ResourceSizing {
   cpuActive: number;
   cpuQueued: number;
 }
+
+export interface ResourceGovernorDetailedSnapshot extends ResourceGovernorSnapshot {
+  maximumReservationCapacityBytes?: number;
+  closed?: boolean;
+  queuedReservationBytes?: number;
+  queueCapacity?: number;
+  queueReservationCapacityBytes?: number;
+  cpuQueueCapacity?: number;
+}

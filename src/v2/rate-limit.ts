@@ -1,7 +1,7 @@
 /**
  * Rate-limit metadata is deliberately small and serializable because it crosses
- * the V2 Awareness boundary.  The upstream values are advisory; the host uses
- * them only to stop a fleet-wide retry stampede.
+ * the V2 Awareness boundary. The host treats every value as observation-only;
+ * callers receive the provider failure without a derived admission decision.
  */
 export interface RateLimitHint {
   /** HTTP Retry-After, normalized to milliseconds. */
@@ -36,8 +36,8 @@ export interface RateLimitProblem {
   retryAfterMs: number | null;
 }
 
-// The documented reset example is 6m0s. Keep a generous upper bound so the
-// controller honors a real token reset rather than immediately stampeding.
+// The documented reset example is 6m0s. Keep a generous upper bound so parsing
+// cannot retain an unbounded or nonsensical provider duration.
 export const MAX_RATE_LIMIT_DELAY_MS = 60 * 60_000;
 const DEFAULT_RATE_LIMIT_DELAY_MS = 1_000;
 
@@ -443,14 +443,4 @@ export function rateLimitHintFromError(
     retryAfterMs === undefined ? undefined : { retryAfterMs },
   )
     ?? { retryAfterMs: DEFAULT_RATE_LIMIT_DELAY_MS };
-}
-
-export function rateLimitCooldownMs(hint: RateLimitHint | undefined): number {
-  const value = Math.max(
-    DEFAULT_RATE_LIMIT_DELAY_MS,
-    hint?.retryAfterMs ?? 0,
-    hint?.resetTokensMs ?? 0,
-    hint?.resetProjectTokensMs ?? 0,
-  );
-  return boundedMs(value) ?? DEFAULT_RATE_LIMIT_DELAY_MS;
 }

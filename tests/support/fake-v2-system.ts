@@ -67,6 +67,7 @@ export class FakeScaleUpstream {
   constructor(
     readonly runtimeIndex: number,
     readonly gate: Gate,
+    readonly finalExtensions: Readonly<Record<string, unknown>> = {},
   ) {}
 
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
@@ -111,6 +112,7 @@ export class FakeScaleUpstream {
             content: [{ type: "output_text", text: String(body.input ?? "") }],
           }];
       const final = {
+        ...this.finalExtensions,
         id: responseId,
         object: "response",
         status: "completed",
@@ -294,6 +296,7 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
     physical: number;
     gate: Gate;
     faults?: FaultOptions;
+    finalExtensions?: Readonly<Record<string, unknown>>;
   }) {
     this.projectId = projectId(
       `00000000-0000-4000-8000-${String(options.index).padStart(12, "0")}`,
@@ -317,7 +320,11 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       retransmitMs: 25,
       publicationIntervalMs: 1,
     });
-    this.upstream = new FakeScaleUpstream(options.index, options.gate);
+    this.upstream = new FakeScaleUpstream(
+      options.index,
+      options.gate,
+      options.finalExtensions,
+    );
     const timeline: string[] = [];
     const storage = new FakeSidecarStorage(timeline);
     const admission = new AdmissionController({
@@ -429,6 +436,7 @@ export async function createFakeV2System(options: {
   physicalPerRuntime: number;
   holdUpstream?: boolean;
   faults?: FaultOptions;
+  finalExtensions?: Readonly<Record<string, unknown>>;
 }): Promise<FakeV2System> {
   const gates = Array.from({ length: options.runtimes }, () => new Gate());
   if (!options.holdUpstream) gates.forEach(gate => gate.release());
@@ -437,6 +445,7 @@ export async function createFakeV2System(options: {
     physical: options.physicalPerRuntime,
     gate,
     faults: options.faults,
+    finalExtensions: options.finalExtensions,
   }));
   await Promise.all(runtimes.map(runtime => runtime.start()));
   const registry = new SandboxRegistry(runtimes);

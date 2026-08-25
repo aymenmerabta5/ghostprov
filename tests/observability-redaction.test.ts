@@ -113,16 +113,18 @@ describe("observability privacy", () => {
         requests_per_second: 2,
         total: { count: 10, p50_ms: 100, p95_ms: 500, max_ms: 900 },
       },
-      rate_limit: {
-        "gpt-5.6-sol": {
-          state: "cold",
-          active: 8,
-          queued: 2,
-          cold_max_active: 16,
-          budget_limit: null,
-          budget_remaining: null,
-        },
-      },
+      runtimes: [{
+        project_id: "e631d12c-d917-4434-b360-41b4715d6679",
+        rate_limit_observations: [{
+          model: "gpt-5.6-sol",
+          organization: "org-Example123",
+          limit: 40_000_000,
+          used: 40_000_000,
+          requested: 609_930,
+          remaining: 0,
+          retry_after_ms: 914,
+        }],
+      }],
     }))).not.toThrow();
   });
 });

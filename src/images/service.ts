@@ -162,6 +162,57 @@ function aggregate(extracted: ExtractedImage[]): ImagesResponse {
   return response;
 }
 
+async function finalWithDrainedEvents(
+  handle: RunHandle,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const iterator = handle.events();
+  const returnIterator = (): void => {
+    try {
+      void Promise.resolve(iterator.return(undefined)).catch(() => undefined);
+    } catch {
+      // Cleanup is best-effort and must never replace the authoritative error.
+    }
+  };
+  const drain = (async () => {
+    for await (const _event of iterator) {
+      // Image compatibility returns only the authoritative final object, but
+      // V2's bounded event buffer must still be consumed concurrently.
+    }
+  })();
+  const work = Promise.all([Promise.resolve(handle.final), drain])
+    .then(([final]) => final);
+  if (!signal) {
+    try {
+      return await work;
+    } catch (error) {
+      returnIterator();
+      throw error;
+    }
+  }
+
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    const abort = () => reject(new DOMException("Image relay was aborted", "AbortError"));
+    if (signal.aborted) abort();
+    else {
+      onAbort = abort;
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([work, cancelled]);
+  } catch (error) {
+    returnIterator();
+    // A non-cooperative handle must not create an unhandled rejection after
+    // downstream cancellation wins the race.
+    void work.catch(() => undefined);
+    throw error;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function executeImageBatch(
   bodies: Record<string, unknown>[],
   startRelay: ImageRelayStarter,
@@ -171,7 +222,7 @@ export async function executeImageBatch(
 
   const settled = await Promise.allSettled(bodies.map(async body => {
     const handle = await startRelay(body, signal);
-    return handle.final;
+    return finalWithDrainedEvents(handle, signal);
   }));
   const rejected = settled.find(
     (result): result is PromiseRejectedResult => result.status === "rejected",

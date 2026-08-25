@@ -77,4 +77,49 @@ describe("writeFetchResponse", () => {
     while (!cancelled && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     expect(cancelled).toBe(true);
   });
+
+  it("cancels the Fetch body before reading when the response is already closed", async () => {
+    let reads = 0;
+    let cancellations = 0;
+    let releases = 0;
+    let resolveAdapter!: () => void;
+    let rejectAdapter!: (error: unknown) => void;
+    const adapterFinished = new Promise<void>((resolve, reject) => {
+      resolveAdapter = resolve;
+      rejectAdapter = reject;
+    });
+    const server = createServer((_req, res) => {
+      res.destroy();
+      const response = {
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: {
+          getReader: () => ({
+            read: async () => {
+              reads++;
+              return { done: false as const, value: new Uint8Array([1]) };
+            },
+            cancel: async () => { cancellations++; },
+            releaseLock: () => { releases++; },
+          }),
+        },
+      } as unknown as Response;
+      void writeFetchResponse(res, response).then(resolveAdapter, rejectAdapter);
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const clientFinished = new Promise<void>(resolve => {
+      const request = get(`http://127.0.0.1:${address.port}`);
+      request.once("error", () => resolve());
+      request.once("close", () => resolve());
+    });
+
+    await adapterFinished;
+    await clientFinished;
+    expect(reads).toBe(0);
+    expect(cancellations).toBe(1);
+    expect(releases).toBe(1);
+  });
 });

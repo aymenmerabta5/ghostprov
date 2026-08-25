@@ -37,8 +37,16 @@ import {
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS: V2SidecarAssets = {
+  revision: "r1",
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
+  entrypointPath: `.ghostprov-v2/revisions/r1/${"b".repeat(64)}/${"a".repeat(64)}/sidecar.bundle.js`,
+  manifest: {
+    path: `.ghostprov-v2/revisions/r1/${"b".repeat(64)}/${"a".repeat(64)}/manifest.json`,
+    logicalPath: "manifest.json",
+    content: "{}\n",
+    sha256: "c".repeat(64),
+  },
   obsoletePaths: Object.freeze([]),
   files: [],
 };
@@ -182,8 +190,9 @@ class FakeTransport implements V2RuntimeTransport {
 }
 
 class FakeGovernor implements V2RuntimeGovernor {
+  capacityHintCalls = 0;
   constructor(public ceiling: number) {}
-  capacityHint(): number { return this.ceiling; }
+  capacityHint(): number { this.capacityHintCalls++; return this.ceiling; }
   snapshot() {
     return {
       reservationCapacityBytes: 1024,
@@ -223,6 +232,7 @@ function runtimeHarness(options: {
   sidecarCapacity?: number;
   credits?: number;
   governorCeiling?: number;
+  governor?: V2RuntimeGovernor;
   resourceExpiresInMs?: number;
   resourceRefreshError?: Error;
   livenessOutcomes?: Array<Error | null>;
@@ -315,7 +325,7 @@ function runtimeHarness(options: {
       return { rttMs: 1, sentAtMs: clock.now() };
     };
   }
-  const governor = new FakeGovernor(options.governorCeiling ?? 128);
+  const governor = options.governor ?? new FakeGovernor(options.governorCeiling ?? 128);
   const runtime = new V2SandboxRuntime({
     projectId: PROJECT,
     workerIndex: 1,
@@ -591,7 +601,7 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("advertises the lower sidecar, credit, and host-governor ceiling", async () => {
+  it("advertises the lower sidecar and credit ceiling without duplicating global memory", async () => {
     const harness = runtimeHarness({
       sidecarCapacity: 128,
       credits: 90,
@@ -600,12 +610,35 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
 
     expect(harness.runtime.snapshot()).toMatchObject({
-      capacity: 64,
-      available: 64,
+      capacity: 90,
+      available: 90,
       ackEwmaMs: 7,
     });
-    expect(harness.transport.hostCeilings.at(-1)).toBe(64);
+    expect(harness.transport.hostCeilings.at(-1)).toBe(128);
+    expect((harness.governor as FakeGovernor).capacityHintCalls).toBe(0);
     await harness.runtime.stop();
+  });
+
+  it("does not repeat one global memory hint as each runtime's capacity", async () => {
+    const sharedGovernor = new FakeGovernor(0);
+    const first = runtimeHarness({
+      sidecarCapacity: 30,
+      credits: 30,
+      governor: sharedGovernor,
+    });
+    const second = runtimeHarness({
+      sidecarCapacity: 30,
+      credits: 30,
+      governor: sharedGovernor,
+    });
+
+    await Promise.all([first.runtime.start(), second.runtime.start()]);
+    expect([first.runtime.snapshot().capacity, second.runtime.snapshot().capacity])
+      .toEqual([30, 30]);
+    expect(first.transport.hostCeilings.at(-1)).toBe(30);
+    expect(second.transport.hostCeilings.at(-1)).toBe(30);
+    expect(sharedGovernor.capacityHintCalls).toBe(0);
+    await Promise.all([first.runtime.stop(), second.runtime.stop()]);
   });
 
   it("refreshes expiring resources without dropping committed work", async () => {

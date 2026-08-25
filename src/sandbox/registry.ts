@@ -2,6 +2,14 @@ import type { RunHandle } from "../relay/run-handle";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import type { V2TransportSnapshot } from "../v2/transport/session";
+import type { RateLimitHint, RateLimitProblem } from "../v2/rate-limit";
+
+export interface UpstreamRateLimitObservation {
+  hint: RateLimitHint;
+  problem: RateLimitProblem | null;
+  requestedModel: string | null;
+  observedAgoMs: number;
+}
 
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
@@ -31,6 +39,9 @@ export interface RoutableSandboxSnapshot {
     source: "rate_limit";
     observedAgoMs: number;
   } | null;
+  /** Latest upstream evidence only; it never changes routing or admission. */
+  upstreamRateLimit?: UpstreamRateLimitObservation | null;
+  upstreamRateLimits?: Readonly<Record<string, UpstreamRateLimitObservation>>;
   recovery?: {
     attempt: number;
     consecutiveFailures: number;
