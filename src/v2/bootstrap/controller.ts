@@ -1424,21 +1424,17 @@ export class V2BootstrapController {
       diagnostics: this.#diagnostics,
       batching: this.#batching,
     });
+    const launcher = temporaryLauncher(
+      this.#assets.entrypointPath,
+      binding.nonce,
+      this.#selectedRevision,
+      staticConfig,
+    );
+    const mainSource = bootstrapMainSource(artifacts.outputPath);
     try {
       await this.#ydoc.writePath(STATIC_PATH, staticConfig);
-      await this.#ydoc.writePath(
-        LAUNCHER_PATH,
-        temporaryLauncher(
-          this.#assets.entrypointPath,
-          binding.nonce,
-          this.#selectedRevision,
-          staticConfig,
-        ),
-      );
-      await this.#ydoc.writePath(
-        MAIN_PATH,
-        bootstrapMainSource(artifacts.outputPath),
-      );
+      await this.#ydoc.writePath(LAUNCHER_PATH, launcher);
+      await this.#ydoc.writePath(MAIN_PATH, mainSource);
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
       throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
@@ -1454,7 +1450,14 @@ export class V2BootstrapController {
       throw new V2BootstrapError("Unable to trigger V2 sidecar render", "render", attempt, { cause });
     }
 
-    const hello = await this.#waitForHello(binding, attempt, signal);
+    const hello = await this.#waitForHello(
+      binding,
+      attempt,
+      staticConfig,
+      launcher,
+      mainSource,
+      signal,
+    );
     const rotationKey = this.#reusableRotationKey ?? createCredentialRotationKey();
     this.#reusableRotationKey = rotationKey;
     let sealed: SealedBootstrapCredential;
@@ -1502,9 +1505,13 @@ export class V2BootstrapController {
   async #waitForHello(
     binding: BootstrapBinding,
     attempt: number,
+    expectedStatic: string,
+    expectedLauncher: string,
+    expectedMain: string,
     signal?: AbortSignal,
   ): Promise<BootstrapHello> {
     const deadline = this.#clock.now() + this.#timeoutMs;
+    let nextAuthorityCheckMs = this.#clock.now();
     let lastError: V2BootstrapError | null = null;
     for (;;) {
       if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");
@@ -1562,6 +1569,26 @@ export class V2BootstrapController {
             decoded.fatal ? { sidecarDiagnostic: decoded.fatal } : undefined,
           );
         }
+      }
+      const now = this.#clock.now();
+      if (now >= nextAuthorityCheckMs) {
+        const [currentStatic, currentLauncher, currentMain] = await Promise.all([
+          this.#ydoc.readPath(STATIC_PATH),
+          this.#ydoc.readPath(LAUNCHER_PATH),
+          this.#ydoc.readPath(MAIN_PATH),
+        ]);
+        if (
+          currentStatic !== expectedStatic ||
+          currentLauncher !== expectedLauncher ||
+          currentMain !== expectedMain
+        ) {
+          throw new V2BootstrapError(
+            "V2 bootstrap workspace authority was replaced by another generation",
+            "deploy",
+            attempt,
+          );
+        }
+        nextAuthorityCheckMs = now + Math.min(1_000, this.#timeoutMs);
       }
       if (this.#clock.now() >= deadline) {
         throw lastError ?? new V2BootstrapError(

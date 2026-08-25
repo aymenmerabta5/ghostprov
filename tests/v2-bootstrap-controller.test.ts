@@ -46,6 +46,7 @@ type Fault =
   | "post-hello-fatal"
   | "same-owner-retry"
   | "same-owner-no-cache"
+  | "replaced-binding"
   | "sidecar-log-secret"
   | "timeout"
   | "first-wrong-nonce";
@@ -154,6 +155,11 @@ class FakeGateway implements V2BootstrapGateway {
     this.renders++;
     this.mainDocuments.push(request?.mainDocument ?? "");
     this.launchers.push(this.ydoc.files.get(".latexmkrc") ?? "");
+    if (this.fault === "replaced-binding") {
+      this.ydoc.files.set(".ghostprov-v2/static.json", "foreign-generation");
+      this.logs = "render accepted without a bootstrap marker";
+      return;
+    }
     if (this.awaitingReadiness) {
       const message = this.fault === "post-hello-fatal"
         ? JSON.stringify({
@@ -1062,6 +1068,18 @@ describe("V2BootstrapController", () => {
         rotationId: "rotation-1",
       },
     })).resolves.toMatchObject({ token: "rotated-y-token" });
+  });
+
+  it("fails fast when another generation replaces root bootstrap authority", async () => {
+    const harness = bootstrapHarness("replaced-binding");
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "deploy",
+      message: "V2 bootstrap workspace authority was replaced by another generation",
+    });
+    expect(harness.gateway.renders).toBe(3);
+    expect(harness.clock.value).toBe(1_787_400_000_000);
   });
 
   it.each([
