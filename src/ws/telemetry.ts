@@ -29,6 +29,11 @@ export interface WebSocketTelemetrySnapshot {
   deliveryErrors: number;
   bufferedBytesPeak: number;
   delayedByBackpressure: number;
+  ingressMessageBytesPeak: number;
+  ingressPromotions: number;
+  ingressWaits: number;
+  ingressRejections: number;
+  ingressTimeouts: number;
   enqueueToSend: DistributionSnapshot;
   sendCallback: DistributionSnapshot;
 }
@@ -60,6 +65,11 @@ export class WebSocketTelemetry {
   #deliveryErrors = 0;
   #bufferPeak = 0;
   #delayed = 0;
+  #ingressMessageBytesPeak = 0;
+  #ingressPromotions = 0;
+  #ingressWaits = 0;
+  #ingressRejections = 0;
+  #ingressTimeouts = 0;
 
   constructor(options: { capacity?: number } = {}) {
     this.#queue = new BoundedDistribution(options.capacity ?? 256);
@@ -145,6 +155,18 @@ export class WebSocketTelemetry {
 
   sendRejected(): void { this.#rejectedSends++; }
   deliveryFailed(): void { this.#deliveryErrors++; }
+  recordIngressMessageBytes(bytes: number): void {
+    this.#ingressMessageBytesPeak = Math.max(
+      this.#ingressMessageBytesPeak,
+      nonNegativeInteger(bytes),
+    );
+  }
+  ingressPromoted(): void { this.#ingressPromotions++; }
+  ingressWaited(): void { this.#ingressWaits++; }
+  ingressRejected(timedOut = false): void {
+    this.#ingressRejections++;
+    if (timedOut) this.#ingressTimeouts++;
+  }
 
   recordSend(value: {
     queueMs: number;
@@ -188,6 +210,11 @@ export class WebSocketTelemetry {
       deliveryErrors: this.#deliveryErrors,
       bufferedBytesPeak: this.#bufferPeak,
       delayedByBackpressure: this.#delayed,
+      ingressMessageBytesPeak: this.#ingressMessageBytesPeak,
+      ingressPromotions: this.#ingressPromotions,
+      ingressWaits: this.#ingressWaits,
+      ingressRejections: this.#ingressRejections,
+      ingressTimeouts: this.#ingressTimeouts,
       enqueueToSend: this.#queue.snapshotAndReset(),
       sendCallback: this.#callback.snapshotAndReset(),
     };
@@ -207,6 +234,11 @@ export class WebSocketTelemetry {
     this.#deliveryErrors = 0;
     this.#bufferPeak = 0;
     this.#delayed = 0;
+    this.#ingressMessageBytesPeak = 0;
+    this.#ingressPromotions = 0;
+    this.#ingressWaits = 0;
+    this.#ingressRejections = 0;
+    this.#ingressTimeouts = 0;
     return value;
   }
 

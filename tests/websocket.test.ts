@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import {
   attachResponsesWebSocket,
+  DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES,
   DEFAULT_WS_MAX_PAYLOAD_BYTES,
   DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
   decodeWebSocketRawData,
@@ -152,13 +153,10 @@ describe("Responses WebSocket server", () => {
     const defaults = Array.from({ length: 30 }, () => budget.openSession(normalBytes));
     expect(defaults.every(Boolean)).toBe(true);
     expect(budget.openSession(normalBytes)).toBeNull();
-    for (const lease of defaults) {
-      expect(lease!.tryReserve(DEFAULT_WS_MAX_PAYLOAD_BYTES)).toBe(true);
-    }
     expect(budget.snapshot()).toMatchObject({
       sessions: 30,
       ingressReservedBytes: 510 * 1024 * 1024,
-      queuedBytes: 120 * 1024 * 1024,
+      queuedBytes: 0,
       maxIngressBytes: 512 * 1024 * 1024,
     });
     for (const lease of defaults) lease!.close();
@@ -181,8 +179,61 @@ describe("Responses WebSocket server", () => {
     });
   });
 
-  it("requires explicit jumbo ingress before assembling more than four MiB", async () => {
-    const input = "x".repeat(5 * 1024 * 1024);
+  it("validates adaptive parser and fast-path limits before installing an upgrade", () => {
+    const startRelay = async () => relayHandle(Promise.resolve(completed("unused")));
+    for (const maxPayloadBytes of [0, Number.NaN, MAX_WS_PAYLOAD_BYTES + 1]) {
+      const server = createServer();
+      expect(() => attachResponsesWebSocket(server, {
+        maxPayloadBytes,
+        startRelay,
+      })).toThrow(RangeError);
+    }
+    for (const fastPathPayloadBytes of [0, DEFAULT_WS_MAX_PAYLOAD_BYTES + 1]) {
+      const server = createServer();
+      expect(() => attachResponsesWebSocket(server, {
+        maxPayloadBytes: DEFAULT_WS_MAX_PAYLOAD_BYTES,
+        fastPathPayloadBytes,
+        startRelay,
+      })).toThrow(RangeError);
+    }
+  });
+
+  it("automatically promotes a large message without changing the connection", async () => {
+    const input = "x".repeat(10 * 1024 * 1024);
+    const telemetry = new WebSocketTelemetry();
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed(`resp_auto_${calls}`)));
+    }, { telemetry });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "large",
+      model: "gpt-5.6-sol",
+      store: false,
+      input,
+    }));
+    await waitFor(() => messages.some(message => message.type === "response.completed"), 5_000);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "small",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "small follow-up",
+    }));
+    await waitFor(() => messages.filter(message => message.type === "response.completed").length === 2);
+    expect(calls).toBe(2);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 1,
+      ingressRejections: 0,
+      ingressMessageBytesPeak: expect.any(Number),
+    });
+  }, 15_000);
+
+  it("enforces Bun's native ceiling and retains the jumbo header below it", async () => {
+    const input = "x".repeat(DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES + 1024);
     let normalCalls = 0;
     const normal = await startServer(async () => {
       normalCalls++;
@@ -190,7 +241,10 @@ describe("Responses WebSocket server", () => {
     });
     const normalClosed = new Promise<number>(resolve => normal.once("close", resolve));
     normal.send(JSON.stringify({ type: "response.create", input }));
-    expect(await normalClosed).toBe(1009);
+    // Bun's `ws` compatibility layer may surface a parser-sized close as
+    // abnormal (1006) for a multi-MiB frame even though smaller overflows
+    // preserve the protocol's 1009 close code.
+    expect([1006, 1009]).toContain(await normalClosed);
     expect(normalCalls).toBe(0);
 
     let jumboCalls = 0;
@@ -203,11 +257,188 @@ describe("Responses WebSocket server", () => {
       type: "response.create",
       model: "gpt-5.6-sol",
       store: false,
-      input,
+      input: "x".repeat(10 * 1024 * 1024),
     }));
     await waitFor(() => messages.some(message => message.type === "response.completed"), 5_000);
     expect(jumboCalls).toBe(1);
+  }, 20_000);
+
+  it("holds a large decoded message until shared ingress memory becomes available", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 2,
+      maxQueuedBytes: 64 * MiB,
+      maxIngressBytes: 70 * MiB,
+    });
+    const blocker = budget.openSession(17 * MiB)!;
+    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
+    const telemetry = new WebSocketTelemetry();
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed("resp_waited_jumbo")));
+    }, { processBudget: budget, telemetry });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "waited",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "x".repeat(5 * MiB),
+    }));
+    await waitFor(() => budget.snapshot().ingressWaiters === 1);
+    expect(calls).toBe(0);
+    blocker.releaseIngress();
+    await waitFor(() => messages.some(message => message.type === "response.completed"), 5_000);
+    expect(calls).toBe(1);
+    expect(budget.snapshot().ingressWaiters).toBe(0);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 1,
+      ingressWaits: 1,
+      ingressRejections: 0,
+    });
+    blocker.close();
   }, 15_000);
+
+  it("closes only a large message connection after bounded ingress wait timeout", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 2,
+      maxQueuedBytes: 64 * MiB,
+      maxIngressBytes: 70 * MiB,
+    });
+    const blocker = budget.openSession(17 * MiB)!;
+    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
+    const telemetry = new WebSocketTelemetry();
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed("unexpected")));
+    }, {
+      processBudget: budget,
+      telemetry,
+      ingressWaitTimeoutMs: 20,
+    });
+    const closed = new Promise<number>(resolve => socket.once("close", resolve));
+    socket.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "x".repeat(5 * MiB),
+    }));
+    expect(await closed).toBe(1013);
+    expect(calls).toBe(0);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 1,
+      ingressWaits: 1,
+      ingressRejections: 1,
+      ingressTimeouts: 1,
+    });
+    await waitFor(() => budget.snapshot().sessions === 1);
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 1,
+      ingressReservedBytes: 53 * MiB,
+      ingressWaiters: 0,
+    });
+    blocker.close();
+  }, 15_000);
+
+  it("cancels a waiting ingress lease immediately when its connection terminates", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 2,
+      maxQueuedBytes: 64 * MiB,
+      maxIngressBytes: 70 * MiB,
+    });
+    const blocker = budget.openSession(17 * MiB)!;
+    expect(blocker.tryEnsureIngress(36 * MiB)).toBe(true);
+    let calls = 0;
+    const socket = await startServer(async () => {
+      calls++;
+      return relayHandle(Promise.resolve(completed("unexpected")));
+    }, {
+      processBudget: budget,
+      ingressWaitTimeoutMs: 10_000,
+    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "x".repeat(5 * MiB),
+    }));
+    await waitFor(() => budget.snapshot().ingressWaiters === 1);
+    socket.terminate();
+    await waitFor(() => budget.snapshot().sessions === 1);
+    expect(calls).toBe(0);
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 1,
+      ingressReservedBytes: 53 * MiB,
+      ingressWaiters: 0,
+    });
+    blocker.close();
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 0,
+      ingressReservedBytes: 0,
+      ingressWaiters: 0,
+    });
+  }, 15_000);
+
+  it("keeps nineteen normal agents healthy while one agent sends a large image-sized turn", async () => {
+    const MiB = 1024 * 1024;
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 32,
+      maxQueuedBytes: 512 * MiB,
+      maxIngressBytes: DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
+    });
+    const telemetry = new WebSocketTelemetry();
+    let calls = 0;
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    attachResponsesWebSocket(server, {
+      processBudget: budget,
+      telemetry,
+      startRelay: async () => {
+        calls++;
+        return relayHandle(Promise.resolve(completed(`resp_mixed_${calls}`)));
+      },
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const clients = Array.from(
+      { length: 20 },
+      () => new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`),
+    );
+    sockets.push(...clients);
+    await Promise.all(clients.map(socket => new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    })));
+    const outputs = clients.map(collect);
+    clients.forEach((socket, index) => socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: `mixed-${index}`,
+      model: "gpt-5.6-sol",
+      store: false,
+      input: index === 0 ? "x".repeat(5 * MiB) : `small-${index}`,
+    })));
+    await waitFor(
+      () => outputs.every(messages => messages.some(message => message.type === "response.completed")),
+      10_000,
+    );
+    expect(calls).toBe(20);
+    expect(clients.every(socket => socket.readyState === WebSocket.OPEN)).toBe(true);
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 20,
+      ingressWaiters: 0,
+      queuedBytes: 0,
+    });
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 1,
+      ingressWaits: 0,
+      ingressRejections: 0,
+    });
+  }, 20_000);
 
   it("rejects an upgrade before parser construction when ingress is exhausted", async () => {
     const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
@@ -507,6 +738,52 @@ describe("Responses WebSocket server", () => {
     expect(JSON.stringify(bodies[1].input)).toContain("function_call");
     expect(JSON.stringify(bodies[1].input)).toContain("function_call_output");
   });
+
+  it("preserves one exact large image across a small store:false continuation", async () => {
+    const MiB = 1024 * 1024;
+    const imageUrl = `data:image/png;base64,${"A".repeat(10 * MiB)}`;
+    const bodies: Record<string, unknown>[] = [];
+    const telemetry = new WebSocketTelemetry();
+    const socket = await startServer(async body => {
+      bodies.push(body);
+      return relayHandle(Promise.resolve(completed(
+        bodies.length === 1 ? "resp_image_parent" : "resp_image_child",
+      )));
+    }, { telemetry });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "image-lineage",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: "inspect this exact image" },
+          { type: "input_image", image_url: imageUrl, detail: "original" },
+        ],
+      }],
+    }));
+    await waitFor(() => messages.some(message => message.response?.id === "resp_image_parent"), 5_000);
+    const continuation = JSON.stringify({
+      type: "response.create",
+      stream_id: "image-lineage",
+      model: "gpt-5.6-sol",
+      store: false,
+      previous_response_id: "resp_image_parent",
+      input: "now inspect the same image again",
+    });
+    expect(Buffer.byteLength(continuation)).toBeLessThan(DEFAULT_WS_MAX_PAYLOAD_BYTES);
+    socket.send(continuation);
+    await waitFor(() => messages.some(message => message.response?.id === "resp_image_child"), 5_000);
+    const materialized = JSON.stringify(bodies[1]?.input);
+    expect(materialized.split(imageUrl).length - 1).toBe(1);
+    expect(materialized).toContain("now inspect the same image again");
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressPromotions: 1,
+      ingressRejections: 0,
+    });
+  }, 15_000);
 
   it("holds lineage capacity only until router handoff completes", async () => {
     const shared = new SharedByteBudget(16 * 1024 * 1024);

@@ -3,6 +3,7 @@ import { WebSocketServer, type RawData } from "ws";
 import {
   ResponsesWebSocketSession,
   WebSocketProcessBudget,
+  WebSocketIngressTimeoutError,
   WebSocketSessionCapacityError,
   type ResponsesWebSocketSessionOptions,
   type WebSocketProcessLease,
@@ -14,6 +15,8 @@ import { apiKeyAuthorized } from "../http/api-key";
 export type { WebSocketRelayStarter } from "./session";
 
 export const DEFAULT_WS_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+export const DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
+/** Compatibility ceiling for Node/ws hosts; Bun 1.4 itself caps messages at 16 MiB. */
 export const MAX_WS_PAYLOAD_BYTES = 64 * 1024 * 1024;
 export const WS_INGRESS_WORKING_SET_FACTOR = 4;
 export const WS_INGRESS_FIXED_OVERHEAD_BYTES = 1024 * 1024;
@@ -23,6 +26,7 @@ export const DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_WS_HEARTBEAT_INTERVAL_MS = 30_000;
 export const DEFAULT_WS_PONG_TIMEOUT_MS = 15_000;
 export const DEFAULT_WS_IDLE_TIMEOUT_MS = 5 * 60_000;
+export const DEFAULT_WS_INGRESS_WAIT_TIMEOUT_MS = 30_000;
 
 const DEFAULT_PROCESS_BUDGET = new WebSocketProcessBudget({
   maxSessions: DEFAULT_WS_PROCESS_MAX_SESSIONS,
@@ -74,6 +78,8 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   apiKey?: string;
   /** Hard parser-level limit enforced before a complete message reaches JS. */
   maxPayloadBytes?: number;
+  /** Normal-path threshold before automatic per-message memory promotion. */
+  fastPathPayloadBytes?: number;
   /** Test/integration hook; production defaults to a fresh ID per connection. */
   clientIdFactory?: () => string;
   /** Test/composition hook; production creates one isolated graph per socket. */
@@ -81,6 +87,7 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   heartbeatIntervalMs?: number;
   pongTimeoutMs?: number;
   idleTimeoutMs?: number;
+  ingressWaitTimeoutMs?: number;
 }
 
 const attachedServers = new WeakMap<Server, readonly WebSocketServer[]>();
@@ -89,8 +96,20 @@ export function attachResponsesWebSocket(
   server: Server,
   options: AttachResponsesWebSocketOptions,
 ): WebSocketServer {
-  const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_WS_MAX_PAYLOAD_BYTES;
-  const ingressReservationBytes = webSocketIngressReservationBytes(maxPayloadBytes);
+  const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES;
+  if (
+    !Number.isSafeInteger(maxPayloadBytes) ||
+    maxPayloadBytes < 1 ||
+    maxPayloadBytes > MAX_WS_PAYLOAD_BYTES
+  ) throw new RangeError(`maxPayloadBytes must be between 1 and ${MAX_WS_PAYLOAD_BYTES}`);
+  const fastPathPayloadBytes = options.fastPathPayloadBytes ??
+    Math.min(DEFAULT_WS_MAX_PAYLOAD_BYTES, maxPayloadBytes);
+  if (
+    !Number.isSafeInteger(fastPathPayloadBytes) ||
+    fastPathPayloadBytes < 1 ||
+    fastPathPayloadBytes > maxPayloadBytes
+  ) throw new RangeError("fastPathPayloadBytes must be within the normal parser limit");
+  const ingressReservationBytes = webSocketIngressReservationBytes(fastPathPayloadBytes);
   const jumboIngressReservationBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
   const processBudget = options.processBudget ?? DEFAULT_PROCESS_BUDGET;
   const heartbeatIntervalMs = positiveTimer(
@@ -105,10 +124,19 @@ export function attachResponsesWebSocket(
     options.idleTimeoutMs ?? DEFAULT_WS_IDLE_TIMEOUT_MS,
     "idleTimeoutMs",
   );
+  const ingressWaitTimeoutMs = positiveTimer(
+    options.ingressWaitTimeoutMs ?? DEFAULT_WS_INGRESS_WAIT_TIMEOUT_MS,
+    "ingressWaitTimeoutMs",
+  );
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
   const pendingLeases = new WeakMap<object, WebSocketProcessLease>();
-  const acceptConnection = (socket: import("ws").WebSocket, parserLimitBytes: number) => {
+  const acceptConnection = (
+    socket: import("ws").WebSocket,
+    parserLimitBytes: number,
+    baseReservationBytes: number,
+    automaticPromotion: boolean,
+  ) => {
     const processLease = pendingLeases.get(socket);
     pendingLeases.delete(socket);
     if (!processLease) {
@@ -138,9 +166,13 @@ export function attachResponsesWebSocket(
     }
     let cleaned = false;
     let pingSentAt: number | null = null;
+    let ingressWaiting = false;
+    const ingressAbort = new AbortController();
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
+      ingressAbort.abort(new DOMException("WebSocket ingress closed", "AbortError"));
+      processLease.releaseIngress();
       clearInterval(heartbeat);
       session.close();
     };
@@ -168,6 +200,20 @@ export function attachResponsesWebSocket(
     }, heartbeatIntervalMs);
     heartbeat.unref?.();
     socket.on("pong", () => { pingSentAt = null; });
+    const pauseIngress = () => {
+      try { (socket as import("ws").WebSocket & { pause?(): void }).pause?.(); } catch {}
+    };
+    const resumeIngress = () => {
+      try { (socket as import("ws").WebSocket & { resume?(): void }).resume?.(); } catch {}
+    };
+    const consumeMessage = (data: RawData, releaseIngress: boolean) => {
+      try {
+        const decoded = decodeWebSocketRawData(data);
+        session.receive(decoded.text, decoded.bytes);
+      } finally {
+        if (releaseIngress) processLease.releaseIngress();
+      }
+    };
     socket.on("message", data => {
       lastApplicationActivityAt = Date.now();
       pingSentAt = null;
@@ -182,14 +228,76 @@ export function attachResponsesWebSocket(
         socket.close(1009, "WebSocket message exceeds configured limit");
         return;
       }
-      const decoded = decodeWebSocketRawData(data);
-      session.receive(decoded.text, decoded.bytes);
+      options.telemetry?.recordIngressMessageBytes(bytes);
+      if (!automaticPromotion || bytes <= fastPathPayloadBytes) {
+        consumeMessage(data, false);
+        return;
+      }
+      const totalWorkingSet = bytes > 0
+        ? webSocketIngressReservationBytes(bytes)
+        : baseReservationBytes;
+      const dynamicIngressBytes = Math.max(0, totalWorkingSet - baseReservationBytes);
+      options.telemetry?.ingressPromoted();
+      if (
+        dynamicIngressBytes === 0 ||
+        processLease.tryEnsureIngress(dynamicIngressBytes)
+      ) {
+        consumeMessage(data, true);
+        return;
+      }
+      if (ingressWaiting) {
+        options.telemetry?.ingressRejected(false);
+        ingressWaiting = false;
+        resumeIngress();
+        cleanup();
+        socket.close(1013, "GhostProv WebSocket ingress already has a waiting message");
+        return;
+      }
+      ingressWaiting = true;
+      options.telemetry?.ingressWaited();
+      pauseIngress();
+      void processLease.ensureIngress(
+        dynamicIngressBytes,
+        ingressAbort.signal,
+        ingressWaitTimeoutMs,
+      ).then(() => {
+        if (cleaned) return;
+        ingressWaiting = false;
+        try {
+          consumeMessage(data, true);
+        } finally {
+          resumeIngress();
+        }
+      }, error => {
+        if (cleaned) return;
+        ingressWaiting = false;
+        const timedOut = error instanceof WebSocketIngressTimeoutError;
+        options.telemetry?.ingressRejected(timedOut);
+        resumeIngress();
+        cleanup();
+        socket.close(
+          1013,
+          timedOut
+            ? "GhostProv WebSocket large-message ingress timed out"
+            : "GhostProv WebSocket large-message ingress is unavailable",
+        );
+      });
     });
     socket.once("close", cleanup);
     socket.once("error", cleanup);
   };
-  wss.on("connection", socket => acceptConnection(socket, maxPayloadBytes));
-  jumboWss.on("connection", socket => acceptConnection(socket, MAX_WS_PAYLOAD_BYTES));
+  wss.on("connection", socket => acceptConnection(
+    socket,
+    maxPayloadBytes,
+    ingressReservationBytes,
+    true,
+  ));
+  jumboWss.on("connection", socket => acceptConnection(
+    socket,
+    MAX_WS_PAYLOAD_BYTES,
+    jumboIngressReservationBytes,
+    false,
+  ));
   server.on("upgrade", (request, socket, head) => {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);

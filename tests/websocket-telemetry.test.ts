@@ -10,6 +10,8 @@ describe("WebSocketTelemetry", () => {
     telemetry.sendQueued(1_024); telemetry.sendStarted(1_024);
     telemetry.sendQueued(512);
     telemetry.recordSend({ queueMs: 12, callbackMs: 3, bufferedBytes: 2_048, delayed: true });
+    telemetry.recordIngressMessageBytes(6 * 1024 * 1024);
+    telemetry.ingressPromoted(); telemetry.ingressWaited(); telemetry.ingressRejected(true);
     const value = telemetry.snapshotAndReset();
     expect(value).toMatchObject({
       activeSessions: 1,
@@ -34,6 +36,11 @@ describe("WebSocketTelemetry", () => {
       waitingSendBytesPeak: 1_024,
       bufferedBytesPeak: 2_048,
       delayedByBackpressure: 1,
+      ingressMessageBytesPeak: 6 * 1024 * 1024,
+      ingressPromotions: 1,
+      ingressWaits: 1,
+      ingressRejections: 1,
+      ingressTimeouts: 1,
       enqueueToSend: { p95: 12 },
       sendCallback: { p95: 3 },
     });

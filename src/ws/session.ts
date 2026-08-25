@@ -33,6 +33,7 @@ export interface WebSocketProcessBudgetSnapshot {
   sessions: number;
   queuedBytes: number;
   ingressReservedBytes: number;
+  ingressWaiters: number;
   maxSessions: number;
   maxQueuedBytes: number;
   maxIngressBytes: number;
@@ -42,7 +43,25 @@ export interface WebSocketProcessLease {
   canReserve(bytes: number): boolean;
   tryReserve(bytes: number): boolean;
   release(bytes: number): void;
+  tryEnsureIngress(bytes: number): boolean;
+  ensureIngress(bytes: number, signal: AbortSignal, timeoutMs: number): Promise<void>;
+  releaseIngress(): void;
   close(): void;
+}
+
+interface IngressWaiter {
+  readonly bytes: number;
+  active: boolean;
+  grant(): boolean;
+  reject(error: Error): void;
+}
+
+export class WebSocketIngressCapacityError extends Error {
+  readonly name = "WebSocketIngressCapacityError";
+}
+
+export class WebSocketIngressTimeoutError extends Error {
+  readonly name = "WebSocketIngressTimeoutError";
 }
 
 /** Shared process-level fence across every WebSocket server/session. */
@@ -53,6 +72,7 @@ export class WebSocketProcessBudget {
   #sessions = 0;
   #queuedBytes = 0;
   #ingressReservedBytes = 0;
+  readonly #ingressWaiters: IngressWaiter[] = [];
 
   constructor(options: WebSocketProcessBudgetOptions) {
     this.#maxSessions = positiveInteger(options.maxSessions, "maxSessions");
@@ -78,32 +98,136 @@ export class WebSocketProcessBudget {
     this.#sessions++;
     this.#ingressReservedBytes += ingressReservationBytes;
     let closed = false;
-    let dynamicReserved = 0;
+    let queuedReserved = 0;
+    let dynamicIngressReserved = 0;
+    let pendingIngress: IngressWaiter | null = null;
+    const validateIngressTarget = (bytes: number): number => {
+      if (!Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new RangeError("WebSocket ingress target must be a non-negative safe integer");
+      }
+      return bytes;
+    };
+    const tryEnsureIngress = (bytes: number): boolean => {
+      const target = validateIngressTarget(bytes);
+      if (closed) return false;
+      if (target <= dynamicIngressReserved) return true;
+      const growth = target - dynamicIngressReserved;
+      if (this.#ingressReservedBytes + growth > this.#maxIngressBytes) return false;
+      this.#ingressReservedBytes += growth;
+      dynamicIngressReserved = target;
+      return true;
+    };
+    const cancelPendingIngress = (error: Error): void => {
+      if (pendingIngress?.active) pendingIngress.reject(error);
+    };
     return {
       canReserve: bytes => !closed && this.#canReserve(bytes),
       tryReserve: bytes => {
         if (closed || !this.#canReserve(bytes)) return false;
         const value = Math.max(0, Math.floor(bytes));
-        dynamicReserved += value;
+        queuedReserved += value;
         this.#queuedBytes += value;
         return true;
       },
       release: bytes => {
         if (closed) return;
-        const value = Math.min(dynamicReserved, Math.max(0, Math.floor(bytes)));
-        dynamicReserved -= value;
+        const value = Math.min(queuedReserved, Math.max(0, Math.floor(bytes)));
+        queuedReserved -= value;
         this.#queuedBytes = Math.max(0, this.#queuedBytes - value);
+      },
+      tryEnsureIngress,
+      ensureIngress: (bytes, signal, timeoutMs) => {
+        const target = validateIngressTarget(bytes);
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+          return Promise.reject(new RangeError("WebSocket ingress timeout must be positive"));
+        }
+        if (tryEnsureIngress(target)) return Promise.resolve();
+        if (closed) {
+          return Promise.reject(new WebSocketIngressCapacityError(
+            "WebSocket ingress lease is closed",
+          ));
+        }
+        if (pendingIngress?.active || this.#ingressWaiters.length >= this.#maxSessions) {
+          return Promise.reject(new WebSocketIngressCapacityError(
+            "WebSocket ingress waiter capacity is exhausted",
+          ));
+        }
+        if (signal.aborted) {
+          return Promise.reject(signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("WebSocket ingress wait aborted", "AbortError"));
+        }
+        const growth = target - dynamicIngressReserved;
+        return new Promise<void>((resolve, reject) => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const cleanup = () => {
+            if (timer !== undefined) clearTimeout(timer);
+            signal.removeEventListener("abort", onAbort);
+            if (pendingIngress === waiter) pendingIngress = null;
+            const index = this.#ingressWaiters.indexOf(waiter);
+            if (index >= 0) this.#ingressWaiters.splice(index, 1);
+          };
+          const settleReject = (error: Error) => {
+            if (!waiter.active) return;
+            waiter.active = false;
+            cleanup();
+            reject(error);
+          };
+          const waiter: IngressWaiter = {
+            bytes: growth,
+            active: true,
+            grant: () => {
+              if (!waiter.active || closed) return false;
+              if (this.#ingressReservedBytes + growth > this.#maxIngressBytes) return false;
+              this.#ingressReservedBytes += growth;
+              dynamicIngressReserved += growth;
+              waiter.active = false;
+              cleanup();
+              resolve();
+              return true;
+            },
+            reject: settleReject,
+          };
+          const onAbort = () => settleReject(signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("WebSocket ingress wait aborted", "AbortError"));
+          pendingIngress = waiter;
+          this.#ingressWaiters.push(waiter);
+          signal.addEventListener("abort", onAbort, { once: true });
+          timer = setTimeout(() => settleReject(new WebSocketIngressTimeoutError(
+            "WebSocket ingress memory remained unavailable",
+          )), timeoutMs);
+          timer.unref?.();
+          this.#drainIngressWaiters();
+        });
+      },
+      releaseIngress: () => {
+        if (closed) return;
+        cancelPendingIngress(new WebSocketIngressCapacityError(
+          "WebSocket ingress message was released while waiting",
+        ));
+        this.#ingressReservedBytes = Math.max(
+          0,
+          this.#ingressReservedBytes - dynamicIngressReserved,
+        );
+        dynamicIngressReserved = 0;
+        this.#drainIngressWaiters();
       },
       close: () => {
         if (closed) return;
         closed = true;
-        this.#queuedBytes = Math.max(0, this.#queuedBytes - dynamicReserved);
+        cancelPendingIngress(new WebSocketIngressCapacityError(
+          "WebSocket ingress lease closed while waiting",
+        ));
+        this.#queuedBytes = Math.max(0, this.#queuedBytes - queuedReserved);
         this.#ingressReservedBytes = Math.max(
           0,
-          this.#ingressReservedBytes - ingressReservationBytes,
+          this.#ingressReservedBytes - ingressReservationBytes - dynamicIngressReserved,
         );
-        dynamicReserved = 0;
+        queuedReserved = 0;
+        dynamicIngressReserved = 0;
         this.#sessions = Math.max(0, this.#sessions - 1);
+        this.#drainIngressWaiters();
       },
     };
   }
@@ -113,6 +237,7 @@ export class WebSocketProcessBudget {
       sessions: this.#sessions,
       queuedBytes: this.#queuedBytes,
       ingressReservedBytes: this.#ingressReservedBytes,
+      ingressWaiters: this.#ingressWaiters.filter(waiter => waiter.active).length,
       maxSessions: this.#maxSessions,
       maxQueuedBytes: this.#maxQueuedBytes,
       maxIngressBytes: this.#maxIngressBytes,
@@ -122,6 +247,19 @@ export class WebSocketProcessBudget {
   #canReserve(bytes: number): boolean {
     return Number.isSafeInteger(bytes) && bytes >= 0 &&
       this.#queuedBytes + bytes <= this.#maxQueuedBytes;
+  }
+
+  #drainIngressWaiters(): void {
+    for (;;) {
+      const index = this.#ingressWaiters.findIndex(waiter =>
+        !waiter.active ||
+        this.#ingressReservedBytes + waiter.bytes <= this.#maxIngressBytes
+      );
+      if (index < 0) return;
+      const [waiter] = this.#ingressWaiters.splice(index, 1);
+      if (!waiter?.active) continue;
+      if (!waiter.grant()) return;
+    }
   }
 }
 
