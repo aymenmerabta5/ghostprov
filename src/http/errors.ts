@@ -111,6 +111,20 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
   }
 
   const structured = record(error);
+  if (
+    structured?.name === "V2PreCommitError" &&
+    structured.code === "request_too_large"
+  ) {
+    return {
+      status: 413,
+      error: {
+        message: "Request body exceeds the V2 transport limit",
+        type: "invalid_request_error",
+        param: "body",
+        code: "request_too_large",
+      },
+    };
+  }
   if (structured?.name === "ResourceReservationTooLargeError") {
     return {
       status: 413,

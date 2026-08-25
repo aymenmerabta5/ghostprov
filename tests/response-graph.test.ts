@@ -3,7 +3,7 @@ import {
   PreviousResponseNotFoundError,
   ResponseGraph,
   SharedByteBudget,
-  releaseResponseGraphMaterialization,
+  releaseResponseGraphResolution,
   releaseResponseGraphPayload,
   type ResponseCreateEvent,
 } from "../src/ws/response-graph";
@@ -46,7 +46,7 @@ describe("ResponseGraph", () => {
     expect(next.relayBody).not.toHaveProperty("instructions");
     expect(next.relayBody.input).toEqual([user("first"), assistant("one"), ...nextInput]);
     expect(next.relayBody.include).toContain("reasoning.encrypted_content");
-    releaseResponseGraphMaterialization(next.relayBody);
+    releaseResponseGraphResolution(next);
   });
 
   it("supports two cross-lane forks from the same cached parent", () => {
@@ -60,8 +60,8 @@ describe("ResponseGraph", () => {
     expect(left.relayBody.input).toEqual([user("root"), assistant("root answer"), user("left")]);
     expect(right.relayBody.input).toEqual([user("root"), assistant("root answer"), user("right")]);
     expect(graph.stats().nodes).toBe(1);
-    releaseResponseGraphMaterialization(left.relayBody);
-    releaseResponseGraphMaterialization(right.relayBody);
+    releaseResponseGraphResolution(left);
+    releaseResponseGraphResolution(right);
   });
 
   it("shares frozen JSON values without allowing caller or transport mutation", () => {
@@ -82,7 +82,31 @@ describe("ResponseGraph", () => {
     expect(JSON.stringify(continuation.relayBody.input)).toContain("original-output");
     expect(JSON.stringify(continuation.relayBody.input)).not.toContain("caller-mutated");
     expect(JSON.stringify(continuation.relayBody.input)).not.toContain("final-mutated");
-    releaseResponseGraphMaterialization(continuation.relayBody);
+    releaseResponseGraphResolution(continuation);
+  });
+
+  it("takes ownership of an isolated parsed input without cloning its objects", () => {
+    const graph = new ResponseGraph();
+    const input = [user("owned")];
+    const resolved = graph.resolve(request(input), { inputOwnership: "owned" });
+    expect(resolved.inputDelta).toBe(input);
+    expect((resolved.relayBody.input as any[])[0]).toBe(input[0]);
+    expect(Object.isFrozen(input)).toBe(true);
+    expect(Object.isFrozen(input[0])).toBe(true);
+    graph.record(resolved, { id: "owned", output: [] });
+  });
+
+  it("precharges a store:false root input and transfers it into the cached node", () => {
+    const shared = new SharedByteBudget(2 * 1024 * 1024);
+    const graph = new ResponseGraph({ maxBytes: 2 * 1024 * 1024, sharedBudget: shared });
+    const resolved = graph.resolve(request([user("x".repeat(256 * 1024))]), {
+      inputOwnership: "owned",
+    });
+    expect(shared.used).toBeGreaterThan(256 * 1024);
+    graph.record(resolved, { id: "precharged-root", output: [] });
+    expect(shared.used).toBe(graph.stats().bytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
   });
 
   it("rejects an unknown store:false previous_response_id", () => {
@@ -114,7 +138,7 @@ describe("ResponseGraph", () => {
 
     const continuation = graph.resolve(request([user("continue")], { previous_response_id: "resp_reasoning" }));
     expect(JSON.stringify(continuation.relayBody.input)).toContain("secret");
-    releaseResponseGraphMaterialization(continuation.relayBody);
+    releaseResponseGraphResolution(continuation);
 
     const visible = graph.resolve(request([], { include: ["reasoning.encrypted_content"] }));
     expect(graph.sanitizeOutbound(final, visible)).toBe(final);
@@ -163,7 +187,7 @@ describe("ResponseGraph", () => {
     expect(outbound.response).not.toBe(terminal.response);
     expect(outbound.response.previous_response_id).toBe("resp_parent");
     expect(terminal.response.previous_response_id).toBeNull();
-    releaseResponseGraphMaterialization(continuation.relayBody);
+    releaseResponseGraphResolution(continuation);
   });
 
   it("evicts least-recently-used independent leaves within count and shared byte budgets", () => {
@@ -179,7 +203,7 @@ describe("ResponseGraph", () => {
     );
     const latest = graph.resolve(request([], { previous_response_id: "resp_3" }));
     expect(latest.parentId).toBe("resp_3");
-    releaseResponseGraphMaterialization(latest.relayBody);
+    releaseResponseGraphResolution(latest);
     graph.clear();
     expect(shared.used).toBe(0);
   });
@@ -197,7 +221,7 @@ describe("ResponseGraph", () => {
     expect(() => graph.resolve(request([], { previous_response_id: "left" }))).toThrow();
     const retained = graph.resolve(request([], { previous_response_id: "right" }));
     expect(retained.parentId).toBe("right");
-    releaseResponseGraphMaterialization(retained.relayBody);
+    releaseResponseGraphResolution(retained);
   });
 
   it("never evicts the parent required by a continuation being recorded", () => {
@@ -212,7 +236,7 @@ describe("ResponseGraph", () => {
 
     const retained = graph.resolve(request([], { previous_response_id: "root" }));
     expect(retained.parentId).toBe("root");
-    releaseResponseGraphMaterialization(retained.relayBody);
+    releaseResponseGraphResolution(retained);
     expect(() => graph.resolve(request([], { previous_response_id: "child" }))).toThrow(
       PreviousResponseNotFoundError,
     );
@@ -246,7 +270,7 @@ describe("ResponseGraph", () => {
       assistant("child"),
       user("grandchild"),
     ]);
-    releaseResponseGraphMaterialization(grandchild.relayBody);
+    releaseResponseGraphResolution(grandchild);
   });
 
   it("reports cache admission failure instead of silently publishing an unusable id", () => {
@@ -286,7 +310,7 @@ describe("ResponseGraph", () => {
     competing.clear();
     const retained = graph.resolve(request([], { previous_response_id: "root" }));
     expect(retained.parentId).toBe("root");
-    releaseResponseGraphMaterialization(retained.relayBody);
+    releaseResponseGraphResolution(retained);
     graph.clear();
     expect(shared.used).toBe(0);
   });
@@ -323,7 +347,7 @@ describe("ResponseGraph", () => {
     expect(shared.used).toBe(0);
   });
 
-  it("pre-reserves sixteen large continuation lineages before cloning", () => {
+  it("charges only frozen-reference materialization arrays for large lineages", () => {
     const MiB = 1024 * 1024;
     const shared = new SharedByteBudget(70 * MiB);
     const graph = new ResponseGraph({
@@ -338,21 +362,33 @@ describe("ResponseGraph", () => {
       output: [assistant("x".repeat(2 * MiB))],
     });
     const storedBytes = shared.used;
-    expect(storedBytes * 17).toBeLessThanOrEqual(shared.limit);
-    expect(storedBytes * 18).toBeGreaterThan(shared.limit);
-
-    const active = Array.from({ length: 16 }, (_, index) => graph.resolve(request(
+    const active = Array.from({ length: 128 }, (_, index) => graph.resolve(request(
       [user(`child-${index}`)],
       { previous_response_id: "resp_large_root", stream_id: `lane-${index}` },
     )));
     expect(shared.used).toBeLessThanOrEqual(shared.limit);
-    expect(() => graph.resolve(request([user("overflow")], {
-      previous_response_id: "resp_large_root",
-    }))).toThrow("materialization capacity");
+    expect(shared.used - storedBytes).toBeLessThan(256 * 1024);
 
     for (const resolved of active) {
-      releaseResponseGraphMaterialization(resolved.relayBody);
+      releaseResponseGraphResolution(resolved);
     }
+    expect(shared.used).toBe(storedBytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
+  it("charges current continuation delta slots as well as stored lineage slots", () => {
+    const shared = new SharedByteBudget(4 * 1024 * 1024);
+    const graph = new ResponseGraph({ maxBytes: 4 * 1024 * 1024, sharedBudget: shared });
+    const root = graph.resolve(request([user("root")]));
+    graph.record(root, { id: "delta-root", output: [] });
+    const storedBytes = shared.used;
+    const delta = Array.from({ length: 10_000 }, () => null);
+    const continuation = graph.resolve(request(delta, {
+      previous_response_id: "delta-root",
+    }), { inputOwnership: "owned" });
+    expect(shared.used - storedBytes).toBeGreaterThanOrEqual(10_000 * 16);
+    releaseResponseGraphResolution(continuation);
     expect(shared.used).toBe(storedBytes);
     graph.clear();
     expect(shared.used).toBe(0);

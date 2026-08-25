@@ -685,7 +685,10 @@ export class ResourceGovernor {
     this.#reservedBytes = projectedReservedBytes;
     invalidate();
     const replacement = this.#createLease(next.reservedBytes);
-    if (next.reservedBytes < currentReservedBytes) this.#drainBytes();
+    // Pressure was sampled before the atomic swap. Never sample again after
+    // invalidating the old lease: a throwing probe must not strand accounting
+    // between the old and replacement handles.
+    if (next.reservedBytes < currentReservedBytes) this.#drainBytes(false);
     return Promise.resolve(replacement);
   }
 

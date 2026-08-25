@@ -196,6 +196,41 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("fails a deterministic oversized request once without exhausting the fleet", async () => {
+    const system = createSystem(8, 1, 1_000);
+    const error = new V2PreCommitError("request too large", "request_too_large");
+    for (const runtime of system.runtimes) {
+      runtime.failStarts = 100;
+      runtime.failError = error;
+    }
+
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "oversized",
+      stream: true,
+    })).rejects.toBe(error);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("preserves deterministic overflow even when it arrives after the admission deadline", async () => {
+    const system = createSystem(1, 1, 10);
+    const error = new V2PreCommitError("request too large", "request_too_large");
+    system.runtimes[0]!.failStarts = 1;
+    system.runtimes[0]!.failError = error;
+    system.runtimes[0]!.failDelayMs = 20;
+
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "late-oversized",
+      stream: true,
+    })).rejects.toBe(error);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("expires zero-capacity queueing with a typed service-unavailable error", async () => {
     const system = createSystem(0, 1, 10);
     const pending = system.router.startRelay(
@@ -632,6 +667,79 @@ describe("MultiSandboxRouter", () => {
     });
     while (runtime.finals.length) runtime.completeOne();
     await Promise.all(handles.map(handle => handle.final));
+    await system.router.close();
+  });
+
+  it("downgrades request memory after transport commitment and releases it at terminal", async () => {
+    const system = createSystem(1, 1);
+    const handle = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "committed-memory",
+      stream: true,
+    });
+    expect(system.governor.snapshot().reservedBytes).toBe(4 * 1024 * 1024);
+    system.runtimes[0]!.completeOne({ id: "resp-memory", status: "completed" });
+    await handle.final;
+    await flush();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("keeps a committed run alive when the optional lease downgrade fails", async () => {
+    const system = createSystem(1, 1);
+    system.runtimes[0]!.postAdmissionDelayMs = 20;
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "committed-memory-fallback",
+      stream: true,
+    });
+    while (system.runtimes[0]!.uncommitted === 0) await Bun.sleep(1);
+    system.governor.close();
+
+    const handle = await pending;
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(4 * 1024 * 1024);
+    system.runtimes[0]!.completeOne({ id: "resp-memory-fallback", status: "completed" });
+    await handle.final;
+    await flush();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("ends admission timing before an optional slow committed-lease downgrade", async () => {
+    const system = createSystem(1, 1, 10);
+    let replacementReleased = false;
+    const replacement = {
+      reservedBytes: 4 * 1024 * 1024,
+      replace: async () => { throw new Error("replacement is already minimal"); },
+      release: () => { replacementReleased = true; },
+    };
+    const committedLease = {
+      reservedBytes: 16 * 1024 * 1024,
+      replace: async () => {
+        await Bun.sleep(40);
+        return replacement;
+      },
+      release: () => undefined,
+    };
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "slow-accounting",
+      stream: true,
+    }, {
+      incomingLease: {
+        acceptedAtMs: Date.now(),
+        deadlineMs: Date.now() + 10,
+        replace: async () => committedLease,
+        release: () => undefined,
+      },
+    });
+
+    const handle = await pending;
+    expect(system.runtimes[0]!.lastRunSignal?.aborted).toBe(false);
+    system.runtimes[0]!.completeOne({ id: "resp-slow-accounting", status: "completed" });
+    await handle.final;
+    await flush();
+    expect(replacementReleased).toBe(true);
     await system.router.close();
   });
 

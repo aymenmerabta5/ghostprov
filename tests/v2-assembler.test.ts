@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { gzipSync } from "fflate";
 import {
   GP_V2_REQUEST_MAX_BYTES,
+  base64UrlDecode,
   base64UrlEncode,
   sha256Hex,
   type HostFrame,
@@ -93,6 +94,27 @@ describe("RequestAssembler", () => {
     for (const frame of requestFrames) assembler.accept(frame);
 
     await expect(assembler.commit(REQUEST)).resolves.toEqual(decoded);
+  });
+
+  it("maps a corrupt native gzip stream to a bounded encoding failure", async () => {
+    const decoded = new TextEncoder().encode(JSON.stringify({ input: "gzip integrity".repeat(100) }));
+    const requestFrames = await frames(decoded, { encoding: "gzip+base64", partBytes: 13 });
+    const finalIndex = requestFrames.length - 1;
+    const finalPart = requestFrames[finalIndex] as Extract<
+      ReliableFrame<HostFrame>,
+      { kind: "request_data" }
+    >;
+    const corrupt = base64UrlDecode(finalPart.dataBase64Url);
+    corrupt[corrupt.length - 1] ^= 0xff;
+    requestFrames[finalIndex] = {
+      ...finalPart,
+      dataBase64Url: base64UrlEncode(corrupt),
+    };
+    const assembler = new RequestAssembler();
+    for (const frame of requestFrames) assembler.accept(frame);
+
+    await expect(assembler.commit(REQUEST)).rejects.toMatchObject({ code: "encoding" });
+    expect(assembler.snapshot()).toEqual({ requests: 0, reservedBytes: 0 });
   });
 
   it("accepts identical duplicates but rejects conflicting duplicate parts", async () => {

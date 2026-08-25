@@ -19,12 +19,14 @@ import {
   GP_V2_R2_SCHEMA_VERSION,
   type AwarenessEnvelope,
   type HostFrame,
+  type ProtocolRevision,
   type ReliableFrame,
   type SidecarFrame,
   type R2AwarenessEnvelope,
 } from "../protocol/shared";
 import {
   assertV2SidecarAssets,
+  protocolRevisionForV2SidecarRevision,
   resolveV2SidecarRevision,
   type V2SidecarAssets,
   type V2SidecarRevision,
@@ -132,7 +134,7 @@ function processInterlockHelpers(): string[] {
     "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
     "  return undef unless defined $gp_cmd;",
     "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r2/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[23]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
     "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
     "}",
     "sub gp_exact_sidecar_entrypoint {",
@@ -140,7 +142,7 @@ function processInterlockHelpers(): string[] {
     "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
     "  return undef unless defined $gp_cmd;",
     "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[12]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
+    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[123]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
     "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
     "}",
     "sub gp_group_alive {",
@@ -317,7 +319,8 @@ export type V2BootstrapAwareness = AwarenessChannel<HostFrame, SidecarFrame>;
 
 export interface V2ReadyDescriptor {
   instanceId: string;
-  protocolRevision: V2SidecarRevision;
+  releaseRevision: V2SidecarRevision;
+  protocolRevision: ProtocolRevision;
   launchNonce: string;
   buildHash: string;
   schemaHash: string;
@@ -406,7 +409,7 @@ function exactKeys(
 function temporaryLauncher(
   entrypointPath: string,
   launchNonce: string,
-  revision: V2SidecarRevision,
+  protocolRevision: ProtocolRevision,
   staticConfig: string,
 ): string {
   const workspaceEntrypoint = `/workspace/${entrypointPath}`;
@@ -416,10 +419,10 @@ function temporaryLauncher(
   const artifacts = bootstrapArtifactPaths(launchNonce);
   const logPath = perlSingleQuoted(`/tmp/ghostprov-v2/sidecar.${launchNonce}.log`);
   const outputPath = perlSingleQuoted(`/workspace/${artifacts.outputPath}`);
-  const helloExpression = revision === "r2"
+  const helloExpression = protocolRevision === "r2"
     ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$gp_pid"'
     : '"$gp_dir/bootstrap-hello"';
-  const childHelloExpression = revision === "r2"
+  const childHelloExpression = protocolRevision === "r2"
     ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$$"'
     : '"$gp_dir/bootstrap-hello"';
   return [
@@ -433,7 +436,7 @@ function temporaryLauncher(
     `my $gp_launch_nonce = '${nonce}';`,
     `my $gp_expected_static = '${expectedStatic}';`,
     "my $gp_static_path = '/workspace/.ghostprov-v2/static.json';",
-    `my $gp_require_owner = ${revision === "r2" ? 1 : 0};`,
+    `my $gp_require_owner = ${protocolRevision === "r2" ? 1 : 0};`,
     "my $gp_hello = '';",
     "my $gp_candidate_pid_file = '';",
     "my $gp_candidate_record = '';",
@@ -462,7 +465,7 @@ function temporaryLauncher(
     "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
     "if (!$gp_deno && !$gp_launch_error) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
     // A host restart does not imply a sandbox restart. Retire a prior immutable
-    // R1 or R2 owner before forking the selected release; otherwise tryLock
+    // R1, R2, or R3 owner before forking the selected release; otherwise tryLock
     // correctly makes every new child lose forever. The locked owner record,
     // canonical PID record, Linux start tick, process group/session, immutable
     // entrypoint, and argv nonce are all revalidated immediately before signal.
@@ -1027,6 +1030,7 @@ export class V2BootstrapController {
   readonly #awareness: V2BootstrapAwareness;
   readonly #assets: V2SidecarAssets;
   readonly #selectedRevision: V2SidecarRevision;
+  readonly #protocolRevision: ProtocolRevision;
   readonly #launchNonce: string | null;
   readonly #attempts: number;
   readonly #timeoutMs: number;
@@ -1141,10 +1145,16 @@ export class V2BootstrapController {
         `Selected V2 revision ${this.#selectedRevision} does not match supplied assets ${this.#assets.revision}`,
       );
     }
+    this.#protocolRevision = protocolRevisionForV2SidecarRevision(this.#selectedRevision);
+    if (this.#assets.protocolRevision !== this.#protocolRevision) {
+      throw new TypeError(
+        `Selected V2 release ${this.#selectedRevision} requires wire protocol ${this.#protocolRevision}, supplied assets use ${String(this.#assets.protocolRevision)}`,
+      );
+    }
     if (options.launchNonce !== undefined && !SAFE_ID.test(options.launchNonce)) {
       throw new TypeError("launchNonce is invalid");
     }
-    if ((this.#selectedRevision as string) === "r2" && options.launchNonce === undefined) {
+    if (this.#protocolRevision === "r2" && options.launchNonce === undefined) {
       throw new TypeError("R2 bootstrap requires an explicit launchNonce");
     }
     this.#launchNonce = options.launchNonce ?? null;
@@ -1309,7 +1319,7 @@ export class V2BootstrapController {
         schemaHash: this.#assets.schemaHash,
         nonce: this.#launchNonce ?? this.#random.uuid(),
       };
-      const binding: BootstrapBinding = (this.#selectedRevision as string) === "r2"
+      const binding: BootstrapBinding = this.#protocolRevision === "r2"
         ? {
             ...baseBinding,
             protocolRevision: "r2",
@@ -1366,6 +1376,7 @@ export class V2BootstrapController {
       protocol: "gp-awareness-v2",
       version: 1,
       revision: this.#selectedRevision,
+      protocolRevision: this.#protocolRevision,
       buildHash: this.#assets.buildHash,
       schemaHash: this.#assets.schemaHash,
       manifestPath: this.#assets.manifest.path,
@@ -1427,7 +1438,7 @@ export class V2BootstrapController {
     const launcher = temporaryLauncher(
       this.#assets.entrypointPath,
       binding.nonce,
-      this.#selectedRevision,
+      this.#protocolRevision,
       staticConfig,
     );
     const mainSource = bootstrapMainSource(artifacts.outputPath);
@@ -1620,7 +1631,8 @@ export class V2BootstrapController {
       if (envelope) {
         return {
           instanceId,
-          protocolRevision: this.#selectedRevision,
+          releaseRevision: this.#selectedRevision,
+          protocolRevision: this.#protocolRevision,
           launchNonce: binding.nonce,
           buildHash: binding.buildHash,
           schemaHash: binding.schemaHash,
@@ -1641,7 +1653,8 @@ export class V2BootstrapController {
         if (lateEnvelope) {
           return {
             instanceId,
-            protocolRevision: this.#selectedRevision,
+            releaseRevision: this.#selectedRevision,
+            protocolRevision: this.#protocolRevision,
             launchNonce: binding.nonce,
             buildHash: binding.buildHash,
             schemaHash: binding.schemaHash,

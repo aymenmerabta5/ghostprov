@@ -144,6 +144,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
   snapshot(): RoutableSandboxSnapshot {
     return {
       projectId: this.projectId,
+      releaseRevision: "r3",
+      protocolRevision: "r2",
+      buildHash: "a".repeat(64),
+      schemaHash: "b".repeat(64),
       state: this.state,
       capacity: this.state === "ready" ? 128 : 0,
       active: 0,
@@ -240,6 +244,12 @@ describe("SupervisedSandboxRuntime", () => {
     await runtime.start();
     initial.setState("failed");
     await waitFor(() => runtime.supervisorSnapshot().phase === "recovering");
+    expect(runtime.snapshot()).toMatchObject({
+      releaseRevision: null,
+      protocolRevision: null,
+      buildHash: null,
+      schemaHash: null,
+    });
 
     await expect(runtime.run({ input: "recovering" })).rejects.toEqual(
       expect.objectContaining({
@@ -251,6 +261,7 @@ describe("SupervisedSandboxRuntime", () => {
     expect(initial.runCalls).toBe(0);
     release(replacement);
     await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+    expect(runtime.snapshot()).toMatchObject({ releaseRevision: "r3", protocolRevision: "r2" });
     await runtime.stop();
   });
 

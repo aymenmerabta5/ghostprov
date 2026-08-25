@@ -1,4 +1,5 @@
 import { Gunzip } from "fflate";
+import { createHash } from "node:crypto";
 import {
   GP_V2_REQUEST_MAX_BYTES,
   base64UrlDecode,
@@ -12,20 +13,19 @@ import {
   AtomicBytePermitPool,
 } from "../memory/atomic-byte-permits";
 import { attachAtomicBytePermit } from "../memory/permit-carrier";
-import { IncrementalSha256 } from "../protocol/transcript";
 
 const VERIFIED_REQUEST_DIGESTS = new WeakMap<Uint8Array, string>();
 const REQUEST_DIGEST_SLICE_BYTES = 4 * 1024 * 1024;
 
 async function requestDigestWithoutCopy(bytes: Uint8Array): Promise<string> {
-  const hasher = new IncrementalSha256();
+  const hasher = createHash("sha256");
   for (let offset = 0; offset < bytes.byteLength; offset += REQUEST_DIGEST_SLICE_BYTES) {
     hasher.update(bytes.subarray(offset, offset + REQUEST_DIGEST_SLICE_BYTES));
     if (offset + REQUEST_DIGEST_SLICE_BYTES < bytes.byteLength) {
       await new Promise<void>(resolve => setTimeout(resolve, 0));
     }
   }
-  return hasher.digestHex();
+  return hasher.digest("hex");
 }
 
 /** Digest already proven by RequestAssembler without another full-body copy. */
@@ -178,7 +178,7 @@ export class RequestAssembler {
       }
       const decoded = state.encoding === "identity"
         ? this.#identity(state)
-        : this.#gunzip(state);
+        : await this.#gunzip(state);
       if (await requestDigestWithoutCopy(decoded) !== state.requestDigest) {
         decoded.fill(0);
         throw new RequestAssemblyError("Request digest does not match", "digest");
@@ -383,7 +383,57 @@ export class RequestAssembler {
     return output;
   }
 
-  #gunzip(state: RequestState): Uint8Array {
+  async #gunzip(state: RequestState): Promise<Uint8Array> {
+    if (typeof globalThis.DecompressionStream === "function") {
+      return this.#nativeGunzip(state);
+    }
+    return this.#fallbackGunzip(state);
+  }
+
+  async #nativeGunzip(state: RequestState): Promise<Uint8Array> {
+    const output = new Uint8Array(state.decodedBytes);
+    let partIndex = 0;
+    const source = new ReadableStream<Uint8Array>({
+      pull: controller => {
+        const part = state.parts[partIndex++];
+        if (part) controller.enqueue(part.bytes);
+        else controller.close();
+      },
+    });
+    const reader = source.pipeThrough(
+      new DecompressionStream("gzip") as unknown as ReadableWritablePair<
+        Uint8Array,
+        Uint8Array
+      >,
+    ).getReader();
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const next = total + value.byteLength;
+        if (next > state.decodedBytes || next > GP_V2_REQUEST_MAX_BYTES) {
+          throw new RequestAssemblyError("Decompressed request exceeds declared bounds", "bounds");
+        }
+        output.set(value, total);
+        total = next;
+      }
+    } catch (error) {
+      output.fill(0);
+      try { await reader.cancel(error); } catch {}
+      if (error instanceof RequestAssemblyError) throw error;
+      throw new RequestAssemblyError("Request gzip stream is invalid", "encoding");
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+    if (total !== state.decodedBytes) {
+      output.fill(0);
+      throw new RequestAssemblyError("Decompressed request size does not match", "bounds");
+    }
+    return output;
+  }
+
+  #fallbackGunzip(state: RequestState): Uint8Array {
     const output = new Uint8Array(state.decodedBytes);
     let total = 0;
     const gunzip = new Gunzip((chunk, _final) => {

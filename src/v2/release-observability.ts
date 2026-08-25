@@ -1,8 +1,10 @@
 const SHA256 = /^[a-f0-9]{64}$/;
-const REVISIONS = new Set(["r1", "r2"]);
+const RELEASE_REVISIONS = new Set(["r1", "r2", "r3"]);
+const PROTOCOL_REVISIONS = new Set(["r1", "r2"]);
 const MAX_RELEASE_SELECTIONS = 256;
 
 export interface SafeV2ReleaseIdentity {
+  releaseRevision: "r1" | "r2" | "r3";
   protocolRevision: "r1" | "r2";
   buildHash: string;
   schemaHash: string;
@@ -28,14 +30,20 @@ export function safeV2ReleaseIdentity(value: unknown): SafeV2ReleaseIdentity | n
   const raw = record(value);
   if (
     !raw ||
+    typeof raw.releaseRevision !== "string" ||
+    !RELEASE_REVISIONS.has(raw.releaseRevision) ||
     typeof raw.protocolRevision !== "string" ||
-    !REVISIONS.has(raw.protocolRevision) ||
+    !PROTOCOL_REVISIONS.has(raw.protocolRevision) ||
+    (raw.releaseRevision === "r1"
+      ? raw.protocolRevision !== "r1"
+      : raw.protocolRevision !== "r2") ||
     typeof raw.buildHash !== "string" ||
     !SHA256.test(raw.buildHash) ||
     typeof raw.schemaHash !== "string" ||
     !SHA256.test(raw.schemaHash)
   ) return null;
   return Object.freeze({
+    releaseRevision: raw.releaseRevision as "r1" | "r2" | "r3",
     protocolRevision: raw.protocolRevision as "r1" | "r2",
     buildHash: raw.buildHash,
     schemaHash: raw.schemaHash,
@@ -52,7 +60,7 @@ export function summarizeV2Releases(runtimes: readonly unknown[]): SafeV2Release
       unknownRuntimes++;
       continue;
     }
-    const key = `${identity.protocolRevision}:${identity.buildHash}:${identity.schemaHash}`;
+    const key = `${identity.releaseRevision}:${identity.protocolRevision}:${identity.buildHash}:${identity.schemaHash}`;
     const current = selected.get(key);
     if (current) current.runtimes++;
     else if (selected.size < MAX_RELEASE_SELECTIONS) {
@@ -62,6 +70,7 @@ export function summarizeV2Releases(runtimes: readonly unknown[]): SafeV2Release
     }
   }
   const selections = [...selected.values()].sort((left, right) => (
+    left.releaseRevision.localeCompare(right.releaseRevision) ||
     left.protocolRevision.localeCompare(right.protocolRevision) ||
     left.buildHash.localeCompare(right.buildHash) ||
     left.schemaHash.localeCompare(right.schemaHash)

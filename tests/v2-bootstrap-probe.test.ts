@@ -62,10 +62,14 @@ describe("V2 live bootstrap probe guards", () => {
       revision: "r1",
       rollbackFromR2SandboxSessionId: "sandbox-session-r2",
     });
-    expect(() => resolveV2BootstrapProbeOptions({
+    expect(resolveV2BootstrapProbeOptions({
       ...VALID,
       GP_LIVE_V2_REVISION: "r3",
-    })).toThrow(/unsupported.*r3/i);
+    })).toMatchObject({ revision: "r3" });
+    expect(() => resolveV2BootstrapProbeOptions({
+      ...VALID,
+      GP_LIVE_V2_REVISION: "r4",
+    })).toThrow(/unsupported.*r4/i);
     expect(() => resolveV2BootstrapProbeOptions({
       ...VALID,
       GP_LIVE_V2_REVISION: "r2",

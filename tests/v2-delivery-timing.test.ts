@@ -1,7 +1,61 @@
 import { describe, expect, it } from "bun:test";
 import { ReliableDeliveryTiming } from "../src/v2/protocol/delivery-timing";
+import { deterministicV2JitterSeed } from "../src/v2/protocol/retransmit";
 
 describe("ReliableDeliveryTiming", () => {
+  it("salts deterministic retransmission jitter per session", () => {
+    const first = deterministicV2JitterSeed("session-a", 7);
+    expect(first).toBe(deterministicV2JitterSeed("session-a", 7));
+    expect(first).not.toBe(deterministicV2JitterSeed("session-b", 7));
+    expect(first).not.toBe(deterministicV2JitterSeed("session-a", 8));
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(first).toBeLessThanOrEqual(1);
+  });
+
+  it("does not sample ambiguous RTT after a retransmission", () => {
+    const timing = new ReliableDeliveryTiming({ epoch: 1, minimumMs: 10 });
+    timing.published([{ epoch: 1, sequence: 0 }], 0);
+    timing.retransmitted(100);
+    expect(timing.acknowledged({ epoch: 1, sequence: 0 }, false, 500)).toBe(true);
+    expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.attempt).toBe(1);
+  });
+
+  it("keeps later high ACKs ambiguous after partial retransmission progress", () => {
+    const timing = new ReliableDeliveryTiming({ epoch: 1, minimumMs: 10 });
+    timing.published([
+      { epoch: 1, sequence: 0 },
+      { epoch: 1, sequence: 1 },
+    ], 0);
+    timing.retransmitted(100);
+    expect(timing.acknowledged({ epoch: 1, sequence: 0 }, true, 200)).toBe(true);
+    expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.attempt).toBe(1);
+    expect(timing.acknowledged({ epoch: 1, sequence: 1 }, false, 300)).toBe(true);
+    expect(timing.roundTripEwmaMs).toBeNull();
+    expect(timing.attempt).toBe(1);
+    timing.published([{ epoch: 1, sequence: 2 }], 300);
+    expect(timing.nextDelayMs(300, 0)).toBe(3_000);
+    expect(timing.acknowledged({ epoch: 1, sequence: 2 }, false, 600)).toBe(true);
+    expect(timing.roundTripEwmaMs).toBe(300);
+    expect(timing.attempt).toBe(0);
+  });
+
+  it("learns clean RTT at sustained 300 and 1000 ms without bootstrap retransmission", () => {
+    for (const rttMs of [300, 1_000]) {
+      const timing = new ReliableDeliveryTiming({ epoch: 1, minimumMs: 250 });
+      let now = 0;
+      for (let sequence = 0; sequence < 10; sequence++) {
+        timing.published([{ epoch: 1, sequence }], now);
+        expect(timing.nextDelayMs(now, 0)).toBeGreaterThan(rttMs);
+        now += rttMs;
+        expect(timing.acknowledged({ epoch: 1, sequence }, false, now)).toBe(true);
+      }
+      expect(timing.roundTripEwmaMs).toBe(rttMs);
+      expect(timing.attempt).toBe(0);
+    }
+  });
+
   it("measures first-send sequence RTT and updates a cumulative ACK EWMA", () => {
     const timing = new ReliableDeliveryTiming({
       epoch: 1,
@@ -30,7 +84,11 @@ describe("ReliableDeliveryTiming", () => {
   });
 
   it("anchors its deadline to progress rather than duplicate publications", () => {
-    const timing = new ReliableDeliveryTiming({ epoch: 1, minimumMs: 250 });
+    const timing = new ReliableDeliveryTiming({
+      epoch: 1,
+      minimumMs: 250,
+      initialRtoMs: 250,
+    });
     timing.published([{ epoch: 1, sequence: 0 }], 100);
     expect(timing.nextDelayMs(100, 0)).toBe(250);
 
@@ -48,8 +106,8 @@ describe("ReliableDeliveryTiming", () => {
     expect(timing.nextDelayMs(400, 0)).toBe(450);
 
     expect(timing.acknowledged({ epoch: 1, sequence: 0 }, true, 500)).toBe(true);
-    expect(timing.attempt).toBe(0);
-    expect(timing.nextDelayMs(500, 0)).toBe(800);
+    expect(timing.attempt).toBe(1);
+    expect(timing.nextDelayMs(500, 0)).toBe(500);
   });
 
   it("measures ACK age only while a reliable flight is outstanding", () => {
@@ -103,6 +161,11 @@ describe("ReliableDeliveryTiming", () => {
   it("rejects invalid construction and impossible delivery transitions", () => {
     expect(() => new ReliableDeliveryTiming({ epoch: -1 })).toThrow("epoch");
     expect(() => new ReliableDeliveryTiming({ epoch: 1, minimumMs: 0 })).toThrow("minimumMs");
+    expect(() => new ReliableDeliveryTiming({
+      epoch: 1,
+      minimumMs: 250,
+      initialRtoMs: 100,
+    })).toThrow("initialRtoMs");
     expect(() => new ReliableDeliveryTiming({ epoch: 1, maxTracked: 0 })).toThrow("maxTracked");
 
     const timing = new ReliableDeliveryTiming({ epoch: 1 });

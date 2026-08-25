@@ -634,7 +634,7 @@ export class ResponsesWebSocketSession {
       const streamId = event.stream_id;
       const localContinuation = event.store === false &&
         typeof event.previous_response_id === "string";
-      resolved = this.#graph.resolve(event);
+      resolved = this.#graph.resolve(event, { inputOwnership: "owned" });
       const relayBody = resolved.relayBody;
       // resolve() owns independent graph and relay representations now; avoid
       // retaining the original payload for the complete streamed response.
@@ -654,6 +654,7 @@ export class ResponsesWebSocketSession {
         // Router/transport preparation has taken ownership of its encoded
         // request by this boundary; the large reconstructed lineage can drop.
         releaseResponseGraphPayload(resolved);
+        if (!resolved.cacheLocally) resolved.inputDelta = [];
         // Retain only the tiny field needed by graph.record; the reconstructed
         // lineage is now owned by router/transport preparation, not the session.
         resolved.relayBody = typeof relayBody.model === "string"

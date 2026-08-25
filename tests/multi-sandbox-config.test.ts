@@ -127,19 +127,19 @@ describe("multi-sandbox configuration", () => {
     }
   });
 
-  it("supports only explicit R1 rollback and exact known-project revision overrides", () => {
+  it("supports immutable R1/R2/R3 releases and exact known-project overrides", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: `${A},${B}`,
       GP_V2_SIDECAR_REVISION: "r1",
-      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r2`,
+      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r3`,
     }, MACHINE);
     expect(config.v2SidecarRevision).toBe("r1");
-    expect(config.v2SidecarProjectRevisions).toEqual({ [B]: "r2" });
+    expect(config.v2SidecarProjectRevisions).toEqual({ [B]: "r3" });
     expect(Object.isFrozen(config.v2SidecarProjectRevisions)).toBe(true);
 
     for (const revisions of [
-      `${B}=r3`,
+      `${B}=r4`,
       `${B}=r1,${B}=r2`,
       "*=r1",
       "not-an-assignment",

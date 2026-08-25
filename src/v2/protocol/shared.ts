@@ -41,7 +41,7 @@ export const GP_V2_R1_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freez
 
 /**
  * R2 keeps the proven frame/window bounds but fills one larger immutable
- * ACK-clocked flight. Thirty-two 8 KiB request-data frames remain below the
+ * ACK-clocked flight. Thirty-two 11 KiB request-data frames remain below the
  * existing 512 KiB encoded window even after base64url/JSON expansion.
  */
 export const GP_V2_R2_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freeze({
@@ -560,6 +560,22 @@ export function utf8Text(value: Uint8Array): string {
   return TEXT_DECODER.decode(value);
 }
 
+/** Exact JSON byte length using cached per-frame JSON byte accounting. */
+export function awarenessEnvelopeEncodedBytes(
+  envelope: { readonly frames: readonly unknown[] },
+  encodedFrameBytes: number,
+): number {
+  if (!Number.isSafeInteger(encodedFrameBytes) || encodedFrameBytes < 0) {
+    throw new RangeError("encodedFrameBytes must be a non-negative safe integer");
+  }
+  const fixedBytes = utf8Bytes(JSON.stringify({ ...envelope, frames: [] })).byteLength;
+  const total = fixedBytes + encodedFrameBytes + Math.max(0, envelope.frames.length - 1);
+  if (!Number.isSafeInteger(total)) {
+    throw new RangeError("Awareness envelope byte length exceeds safe integer bounds");
+  }
+  return total;
+}
+
 export function bytesToHex(value: Uint8Array): string {
   let output = "";
   for (const byte of value) output += byte.toString(16).padStart(2, "0");
@@ -568,14 +584,22 @@ export function bytesToHex(value: Uint8Array): string {
 
 export async function sha256Hex(value: string | Uint8Array): Promise<string> {
   const bytes = typeof value === "string" ? utf8Bytes(value) : value;
-  const input = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  ) as ArrayBuffer;
-  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", input)));
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    bytes as unknown as BufferSource,
+  )));
 }
 
 export function base64UrlEncode(value: Uint8Array): string {
+  const native = (value as Uint8Array & {
+    toBase64?: (options?: {
+      alphabet?: "base64" | "base64url";
+      omitPadding?: boolean;
+    }) => string;
+  }).toBase64;
+  if (typeof native === "function") {
+    return native.call(value, { alphabet: "base64url", omitPadding: true });
+  }
   let binary = "";
   for (let offset = 0; offset < value.length; offset += 32_768) {
     binary += String.fromCharCode(...value.subarray(offset, offset + 32_768));
@@ -587,8 +611,20 @@ export function base64UrlEncode(value: Uint8Array): string {
 }
 
 export function base64UrlDecode(value: string): Uint8Array {
-  if (!/^[A-Za-z0-9_-]*$/.test(value)) {
+  if (!/^[A-Za-z0-9_-]*$/.test(value) || value.length % 4 === 1) {
     throw new TypeError("Value must be unpadded base64url");
+  }
+  const native = (Uint8Array as unknown as {
+    fromBase64?: (value: string, options?: {
+      alphabet?: "base64" | "base64url";
+    }) => Uint8Array;
+  }).fromBase64;
+  if (typeof native === "function") {
+    try {
+      return native(value, { alphabet: "base64url" });
+    } catch {
+      throw new TypeError("Value must be valid base64url");
+    }
   }
   const padded = value
     .replace(/-/g, "+")

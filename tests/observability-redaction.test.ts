@@ -171,9 +171,10 @@ describe("observability privacy", () => {
       release: {
         knownRuntimes: 1,
         unknownRuntimes: 0,
-        selections: [{ protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
+        selections: [{ releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
       },
       runtimes: [{
+        release_revision: "r3",
         protocol_revision: "r2",
         build_hash: buildHash,
         schema_hash: schemaHash,
@@ -183,7 +184,14 @@ describe("observability privacy", () => {
       release: {
         knownRuntimes: 1,
         unknownRuntimes: 0,
-        selections: [{ protocolRevision: "r2", buildHash: "short", schemaHash, runtimes: 1 }],
+        selections: [{ releaseRevision: "r3", protocolRevision: "r2", buildHash: "short", schemaHash, runtimes: 1 }],
+      },
+    }))).toThrow("release");
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
+      release: {
+        knownRuntimes: 1,
+        unknownRuntimes: 0,
+        selections: [{ releaseRevision: "r3", protocolRevision: "r1", buildHash, schemaHash, runtimes: 1 }],
       },
     }))).toThrow("release");
     expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {

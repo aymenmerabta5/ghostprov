@@ -1575,7 +1575,7 @@ export class SidecarEngine {
 
   async #emitEvent(requestId: string, eventIndex: number, event: SseFrame, diagnostics?: import("../diagnostics/types").V2FirstEventDiagnostics, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) throw abortError(signal);
-    if (!diagnostics && this.#batcher) {
+    if (eventIndex !== 0 && this.#batcher) {
       await this.#outputBackpressure?.wait(signal);
       if (this.#batcher.push(requestId, eventIndex, event)) return;
     }

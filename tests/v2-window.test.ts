@@ -15,6 +15,18 @@ function reliable(sequence: number, sentAtMs = sequence): ReliableFrame<HostFram
 }
 
 describe("V2 reliable frame windows", () => {
+  it("reuses immutable outbound snapshots until the window mutates", () => {
+    const window = new OutboundFrameWindow<{ kind: "value"; value: number }>({ epoch: 1 });
+    const empty = window.snapshot();
+    expect(window.snapshot()).toBe(empty);
+    window.push({ kind: "value", value: 1 });
+    const populated = window.snapshot();
+    expect(populated).not.toBe(empty);
+    expect(window.snapshot()).toBe(populated);
+    window.acknowledge({ epoch: 1, sequence: 0 });
+    expect(window.snapshot()).not.toBe(populated);
+  });
+
   it("retains unacknowledged frames and advances cumulatively", () => {
     const outbound = new OutboundFrameWindow<HostFrame>({ epoch: 7 });
     outbound.push(ping(1));

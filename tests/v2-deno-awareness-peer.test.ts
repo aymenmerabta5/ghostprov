@@ -1045,6 +1045,89 @@ describe("DenoAwarenessPeer", () => {
     }
   });
 
+  it("escalates when scheduler saturation prevents an in-band request rejection", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const failures: Array<{ error: Error; kind: string }> = [];
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => { throw new Error("request-local failure"); },
+      } as any,
+      onAcceptError: (error, frame) => failures.push({ error, kind: frame.kind }),
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 60_000,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+
+    try {
+      await peer.connect();
+      let saturated = false;
+      for (let index = 0; index < 5_000; index++) {
+        try {
+          peer.enqueue({
+            kind: "response_error",
+            requestId: "saturation",
+            code: "synthetic",
+            message: "bounded",
+            ambiguous: false,
+          }, "terminal", "saturation");
+        } catch {
+          saturated = true;
+          break;
+        }
+      }
+      expect(saturated).toBe(true);
+
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames: [{
+          kind: "request_open",
+          requestId: "req-saturated-reject",
+          requestDigest: "a".repeat(64),
+          decodedBytes: 1,
+          encodedBytes: 1,
+          encoding: "identity",
+          partCount: 1,
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(20);
+
+      expect(failures).toHaveLength(1);
+      expect(failures[0]!.kind).toBe("request_open");
+      expect(failures[0]!.error.name).toBe("V2SchedulerOverflowError");
+    } finally {
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
   it("escalates durable control acceptance failures to lifecycle shutdown", async () => {
     const providers = new Map<"data" | "control", FakeProvider>();
     const fatalKinds: string[] = [];
@@ -1214,6 +1297,88 @@ describe("DenoAwarenessPeer", () => {
         .toEqual({ epoch: 1, sequence: 0 });
     } finally {
       releaseAccept();
+      remote.destroy();
+      remoteDoc.destroy();
+      await peer.close();
+    }
+  });
+
+  it("coalesces a processed host flight to its high ACK and replays a lost ACK", async () => {
+    const providers = new Map<"data" | "control", FakeProvider>();
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: `wss://prism.test/y/d/${PROJECT}/ws`,
+        baseUrl: `https://prism.test/y/d/${PROJECT}`,
+        docId: PROJECT,
+        token: "y-secret",
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding: BINDING,
+      instanceId: "sidecar-instance-1",
+      engine: {
+        snapshot: () => ({ ready: true, credits: 128, active: 0, queued: 0, draining: false }),
+        setHostCeiling: () => undefined,
+        accept: async () => undefined,
+      } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const provider = new FakeProvider(doc);
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 25,
+      retransmitMs: 60_000,
+      connectTimeoutMs: 100,
+    });
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    const frames = Array.from({ length: 32 }, (_, sequence) => ({
+      kind: "request_open" as const,
+      requestId: `req-ack-${sequence}`,
+      requestDigest: "a".repeat(64),
+      decodedBytes: 1,
+      encodedBytes: 1,
+      encoding: "identity" as const,
+      partCount: 1,
+      epoch: 1,
+      sequence,
+    }));
+
+    try {
+      await peer.connect();
+      let controlPublications = 0;
+      providers.get("control")!.awareness.on("update", () => { controlPublications++; });
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 1),
+        lane: "data",
+        frames,
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(30);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 31 });
+      expect(controlPublications).toBeLessThanOrEqual(2);
+
+      controlPublications = 0;
+      remote.setLocalStateField("ghostprovV2Data", {
+        ...hostEnvelope(-1, 2),
+        lane: "data",
+        frames,
+      });
+      applyAwarenessUpdate(
+        providers.get("data")!.awareness,
+        encodeAwarenessUpdate(remote, [remoteDoc.clientID]),
+        "test-host",
+      );
+      await Bun.sleep(10);
+      expect(controlPublications).toBe(1);
+      expect(providers.get("control")!.awareness.getLocalState()?.ghostprovV2Control.ack)
+        .toEqual({ epoch: 1, sequence: 31 });
+    } finally {
       remote.destroy();
       remoteDoc.destroy();
       await peer.close();

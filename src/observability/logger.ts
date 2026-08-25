@@ -133,6 +133,7 @@ export function formatConsoleObservabilityLine(line: string): string {
         ingress_reserved_bytes: websocket.ingressReservedBytes,
         ingress_reserved_peak_bytes: websocket.ingressReservedBytesPeak,
         ingress_capacity_bytes: websocket.ingressCapacityBytes,
+        ingress_guaranteed_sessions: websocket.ingressGuaranteedSessions,
         ingress_promotions: websocket.ingressPromotions,
         ingress_rejections: websocket.ingressRejections,
         ingress_parser_rejections: websocket.ingressParserRejections,

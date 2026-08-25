@@ -8,8 +8,12 @@ import {
   GP_V2_SCHEMA_VERSION,
   GP_V2_WINDOW_MAX_BYTES,
   GP_V2_WINDOW_MAX_FRAMES,
+  awarenessEnvelopeEncodedBytes,
+  base64UrlDecode,
+  base64UrlEncode,
   canonicalJson,
   protocolSchemaHash,
+  sha256Hex,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
@@ -64,6 +68,70 @@ function validEnvelope(): AwarenessEnvelope<HostFrame> {
 }
 
 describe("V2 shared protocol", () => {
+  it("matches exact JSON envelope bytes from cached frame accounting", () => {
+    for (const frames of [
+      [],
+      [{ kind: "ping", sentAtMs: 1, epoch: 1, sequence: 0 }],
+      [
+        { kind: "request_cancel", requestId: "req-α", reason: "stop 🌍", epoch: 1, sequence: 0 },
+        { kind: "ping", sentAtMs: 2, epoch: 1, sequence: 1 },
+      ],
+    ]) {
+      const envelope = { lane: "data", revision: 7, note: "é", frames };
+      const frameBytes = frames.reduce(
+        (sum, frame) => sum + new TextEncoder().encode(JSON.stringify(frame)).byteLength,
+        0,
+      );
+      expect(awarenessEnvelopeEncodedBytes(envelope, frameBytes)).toBe(
+        new TextEncoder().encode(JSON.stringify(envelope)).byteLength,
+      );
+    }
+    expect(() => awarenessEnvelopeEncodedBytes({ frames: [] }, -1)).toThrow("non-negative");
+  });
+
+  it("uses exact native-compatible base64url and hashing for arbitrary subviews", async () => {
+    for (let length = 0; length <= 257; length++) {
+      const backing = new Uint8Array(length + 6);
+      for (let index = 0; index < backing.length; index++) {
+        backing[index] = (index * 131 + length * 17) & 0xff;
+      }
+      const view = backing.subarray(3, 3 + length);
+      const encoded = base64UrlEncode(view);
+      expect(encoded).toBe(Buffer.from(
+        view.buffer,
+        view.byteOffset,
+        view.byteLength,
+      ).toString("base64url"));
+      expect(base64UrlDecode(encoded)).toEqual(view);
+    }
+    const digestView = new TextEncoder().encode("xabcx").subarray(1, 4);
+    expect(await sha256Hex(digestView)).toBe(
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+  });
+
+  it("keeps the base64url fallback exact and rejects malformed input", () => {
+    const prototype = Uint8Array.prototype as Uint8Array & { toBase64?: unknown };
+    const constructor = Uint8Array as unknown as { fromBase64?: unknown };
+    const encodeDescriptor = Object.getOwnPropertyDescriptor(prototype, "toBase64");
+    const decodeDescriptor = Object.getOwnPropertyDescriptor(constructor, "fromBase64");
+    try {
+      Object.defineProperty(prototype, "toBase64", { configurable: true, value: undefined });
+      Object.defineProperty(constructor, "fromBase64", { configurable: true, value: undefined });
+      const backing = Uint8Array.from([255, 1, 2, 3, 254]);
+      const view = backing.subarray(1, 4);
+      expect(base64UrlEncode(view)).toBe("AQID");
+      expect(base64UrlDecode("AQID")).toEqual(view);
+      expect(() => base64UrlDecode("A")).toThrow("unpadded base64url");
+      expect(() => base64UrlDecode("AA=")).toThrow("unpadded base64url");
+    } finally {
+      if (encodeDescriptor) Object.defineProperty(prototype, "toBase64", encodeDescriptor);
+      else delete (prototype as any).toBase64;
+      if (decodeDescriptor) Object.defineProperty(constructor, "fromBase64", decodeDescriptor);
+      else delete constructor.fromBase64;
+    }
+  });
+
   it("publishes the exact hard transport limits and deterministic schema hash", async () => {
     expect(GP_V2_FRAME_MAX_BYTES).toBe(16 * 1024);
     expect(GP_V2_WINDOW_MAX_FRAMES).toBe(128);

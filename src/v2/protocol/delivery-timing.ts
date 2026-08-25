@@ -1,4 +1,7 @@
-import { computeV2RetransmitDelayMs } from "./retransmit";
+import {
+  DEFAULT_V2_INITIAL_RETRANSMIT_MS,
+  computeV2RetransmitDelayMs,
+} from "./retransmit";
 import {
   GP_V2_WINDOW_MAX_FRAMES,
   type AckCursor,
@@ -31,8 +34,10 @@ function assertTime(value: number): void {
 export class ReliableDeliveryTiming {
   #epoch: number;
   readonly #minimumMs: number;
+  readonly #initialRtoMs: number;
   readonly #maxTracked: number;
   readonly #firstSentAt = new Map<number, number>();
+  readonly #retransmittedSequences = new Set<number>();
   #lastAcknowledged = -1;
   #roundTripEwmaMs: number | null = null;
   #attempt = 0;
@@ -42,6 +47,7 @@ export class ReliableDeliveryTiming {
   constructor(options: {
     epoch: number;
     minimumMs?: number;
+    initialRtoMs?: number;
     maxTracked?: number;
   }) {
     assertEpoch(options.epoch);
@@ -55,6 +61,14 @@ export class ReliableDeliveryTiming {
     }
     this.#epoch = options.epoch;
     this.#minimumMs = minimumMs;
+    const initialRtoMs = options.initialRtoMs ?? Math.max(
+      minimumMs,
+      DEFAULT_V2_INITIAL_RETRANSMIT_MS,
+    );
+    if (!Number.isFinite(initialRtoMs) || initialRtoMs < minimumMs) {
+      throw new RangeError("initialRtoMs must be finite and no less than minimumMs");
+    }
+    this.#initialRtoMs = initialRtoMs;
     this.#maxTracked = maxTracked;
   }
 
@@ -122,22 +136,27 @@ export class ReliableDeliveryTiming {
 
     let sampledSequence = -1;
     let sampledAt: number | null = null;
+    let sampledAfterRetransmission = false;
     for (const [sequence, firstSentAt] of this.#firstSentAt) {
       if (sequence > cursor.sequence) continue;
       this.#firstSentAt.delete(sequence);
+      const retransmitted = this.#retransmittedSequences.delete(sequence);
       if (sequence > sampledSequence) {
         sampledSequence = sequence;
         sampledAt = firstSentAt;
+        sampledAfterRetransmission = retransmitted;
       }
     }
     this.#lastAcknowledged = cursor.sequence;
-    if (sampledAt !== null) {
+    // Karn's algorithm: an ACK after retransmission cannot be attributed to a
+    // specific send, so it advances progress without contaminating RTT/RTO.
+    if (sampledAt !== null && !sampledAfterRetransmission) {
       const sampleMs = Math.max(0, nowMs - sampledAt);
       this.#roundTripEwmaMs = this.#roundTripEwmaMs === null
         ? sampleMs
         : this.#roundTripEwmaMs * 0.8 + sampleMs * 0.2;
+      this.#attempt = 0;
     }
-    this.#attempt = 0;
     this.#deadlineBaseMs = hasOutstanding ? nowMs : null;
     this.#lastProgressAtMs = hasOutstanding ? nowMs : null;
     return true;
@@ -147,6 +166,9 @@ export class ReliableDeliveryTiming {
     assertTime(nowMs);
     if (this.#deadlineBaseMs === null) {
       throw new Error("cannot retransmit an empty delivery window");
+    }
+    for (const sequence of this.#firstSentAt.keys()) {
+      this.#retransmittedSequences.add(sequence);
     }
     this.#attempt++;
     this.#deadlineBaseMs = nowMs;
@@ -160,6 +182,7 @@ export class ReliableDeliveryTiming {
       jitterSeed,
       this.#minimumMs,
       this.#attempt,
+      this.#initialRtoMs,
     );
     return Math.max(0, this.#deadlineBaseMs + delayMs - nowMs);
   }
@@ -171,6 +194,7 @@ export class ReliableDeliveryTiming {
     }
     this.#epoch = epoch;
     this.#firstSentAt.clear();
+    this.#retransmittedSequences.clear();
     this.#lastAcknowledged = -1;
     this.#roundTripEwmaMs = null;
     this.#attempt = 0;

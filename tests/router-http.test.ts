@@ -696,7 +696,7 @@ describe("router HTTP composition", () => {
     const buildHash = "a".repeat(64);
     const schemaHash = "b".repeat(64);
     const router = healthRouter([
-      { protocolRevision: "r2", buildHash, schemaHash },
+      { releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash },
       {
         token: "credential-canary",
         sandboxSessionId: "session-canary",
@@ -710,12 +710,12 @@ describe("router HTTP composition", () => {
       expect(health.release).toEqual({
         knownRuntimes: 1,
         unknownRuntimes: 1,
-        selections: [{ protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
+        selections: [{ releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
       });
       expect(sandboxes.release).toEqual(health.release);
       expect(sandboxes.runtimes).toEqual(expect.arrayContaining([
-        expect.objectContaining({ protocolRevision: "r2", buildHash, schemaHash }),
-        expect.objectContaining({ protocolRevision: null, buildHash: null, schemaHash: null }),
+        expect.objectContaining({ releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash }),
+        expect.objectContaining({ releaseRevision: null, protocolRevision: null, buildHash: null, schemaHash: null }),
       ]));
       expect(JSON.stringify({ health, sandboxes })).not.toMatch(
         /sandboxSessionId|instanceId|authorization|ySweetToken/i,

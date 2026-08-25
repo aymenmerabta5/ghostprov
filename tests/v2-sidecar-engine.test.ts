@@ -201,6 +201,10 @@ describe("SidecarEngine", () => {
     const harness = new SidecarHarness({ batching: true });
     await harness.sendRequest({ model: "gpt-5.6-sol", input: "batch" });
     await harness.settle();
+    const firstOutput = harness.frames.find(frame =>
+      frame.kind === "response_event" || frame.kind === "response_batch"
+    );
+    expect(firstOutput).toMatchObject({ kind: "response_event", eventIndex: 0 });
     const batchIndex = harness.frames.findIndex(frame => frame.kind === "response_batch");
     const terminalIndex = harness.frames.findIndex(frame => frame.kind === "response_terminal");
     expect(batchIndex).toBeGreaterThanOrEqual(0);

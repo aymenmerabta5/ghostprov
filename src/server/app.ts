@@ -119,6 +119,7 @@ function sanitizeRuntimeValue(
 function publicRuntimeSnapshot(value: unknown): Record<string, unknown> {
   const raw = sanitizeRuntimeValue(value) as Record<string, unknown> ?? {};
   const release = safeV2ReleaseIdentity(raw);
+  raw.releaseRevision = release?.releaseRevision ?? null;
   raw.protocolRevision = release?.protocolRevision ?? null;
   raw.buildHash = release?.buildHash ?? null;
   raw.schemaHash = release?.schemaHash ?? null;

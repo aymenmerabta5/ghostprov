@@ -51,6 +51,12 @@ export class OutboundFrameWindow<T extends object> {
   #acknowledgedSequence = -1;
   #encodedBytes = 0;
   #frames: OutboundStoredFrame<T>[] = [];
+  #snapshot: {
+    epoch: number;
+    nextSequence: number;
+    encodedBytes: number;
+    frames: readonly ReliableFrame<T>[];
+  } | null = null;
 
   constructor(options: { epoch: number }) {
     validEpoch(options.epoch);
@@ -82,6 +88,7 @@ export class OutboundFrameWindow<T extends object> {
     });
     this.#nextSequence++;
     this.#encodedBytes += encodedBytes;
+    this.#snapshot = null;
     return reliable;
   }
 
@@ -109,6 +116,7 @@ export class OutboundFrameWindow<T extends object> {
     }
     this.#frames = retained;
     this.#encodedBytes = retainedBytes;
+    this.#snapshot = null;
   }
 
   snapshot(): {
@@ -117,12 +125,14 @@ export class OutboundFrameWindow<T extends object> {
     encodedBytes: number;
     frames: readonly ReliableFrame<T>[];
   } {
-    return {
+    if (this.#snapshot) return this.#snapshot;
+    this.#snapshot = Object.freeze({
       epoch: this.#epoch,
       nextSequence: this.#nextSequence,
       encodedBytes: this.#encodedBytes,
       frames: Object.freeze(this.#frames.map(stored => stored.frame)),
-    };
+    });
+    return this.#snapshot;
   }
 
   reset(epoch: number): void {
@@ -135,6 +145,7 @@ export class OutboundFrameWindow<T extends object> {
     this.#acknowledgedSequence = -1;
     this.#encodedBytes = 0;
     this.#frames = [];
+    this.#snapshot = null;
   }
 }
 

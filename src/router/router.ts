@@ -33,6 +33,7 @@ type RouterQueueClass = "latency" | "bulk";
 
 const KiB = 1024;
 const MiB = KiB ** 2;
+const POST_COMMIT_RESERVATION_BYTES = 4 * MiB;
 const MIN_FAIR_COST_BYTES = 4 * KiB;
 const MAX_FAIR_COST_BYTES = 1 * MiB;
 const CLIENT_QUANTUM_BYTES = 256 * KiB;
@@ -115,7 +116,8 @@ interface QueuedJob {
   clientId: string;
   source: RelaySource;
   signal?: AbortSignal;
-  memoryLease: ReleasableLease;
+  memoryLease: ResourceLease;
+  retainFullLeaseAfterCommit: boolean;
   attempts: number;
   excluded: Map<string, {
     retryEpoch: number;
@@ -246,6 +248,16 @@ function isSafePreCommitFailure(error: unknown): boolean {
   // V2 owns this contract: only an explicit pre-commit proof is safe to move
   // to another sandbox. A generic rejected Promise is not such a proof.
   return value.committed === false && value.name === "V2PreCommitError";
+}
+
+function isDeterministicRequestTooLarge(error: unknown): boolean {
+  if (!isSafePreCommitFailure(error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "request_too_large";
+}
+
+function isRetryablePreCommitFailure(error: unknown): boolean {
+  return isSafePreCommitFailure(error) && !isDeterministicRequestTooLarge(error);
 }
 
 function queueClassFor(workload: WorkloadDescriptor): RouterQueueClass {
@@ -501,7 +513,7 @@ export class MultiSandboxRouter {
     if (options.signal?.aborted) abortAdmissionWait();
     else options.signal?.addEventListener("abort", abortAdmissionWait, { once: true });
     this.#pendingAdmissions.add(admissionTracker);
-    let memoryLease: ReleasableLease;
+    let memoryLease: ResourceLease;
     try {
       memoryLease = typeof options.incomingLease?.replace === "function"
         ? await options.incomingLease.replace(
@@ -550,6 +562,7 @@ export class MultiSandboxRouter {
         source,
         signal: options.signal,
         memoryLease,
+        retainFullLeaseAfterCommit: retainedIngressBytes > 0,
         attempts: 0,
         excluded: new Map(),
         resolve,
@@ -1516,12 +1529,36 @@ export class MultiSandboxRouter {
           this.#scheduleDrain();
         },
       });
-      // The admission deadline ends at commit, but caller cancellation must
-      // continue flowing through the same signal for the request's lifetime.
+      // Commitment ends the admission deadline immediately. Optional memory
+      // accounting work must never turn an accepted upstream request into a
+      // local capacity timeout or inflate the measured commit ACK latency.
       clearAdmissionDeadline();
-      this.#refreshRuntimeSafely(runtime);
       const committedAtMs = this.#clock.now();
       const commitAckMs = Math.max(0, committedAtMs - started);
+      // The transport now owns canonical request bytes. Drop the router's
+      // payload before reducing its accounting, not one microtask afterward.
+      job.body = {};
+      if (
+        !job.retainFullLeaseAfterCommit &&
+        job.memoryLease.reservedBytes > POST_COMMIT_RESERVATION_BYTES
+      ) {
+        const committedLease = job.memoryLease;
+        try {
+          job.memoryLease = await committedLease.replace({
+            ...job.workload,
+            reservedBytes: POST_COMMIT_RESERVATION_BYTES,
+            cpuPermits: 0,
+          });
+        } catch {
+          // Downgrading is an accounting optimization, never part of request
+          // correctness. A failed replacement leaves the original lease fully
+          // active by contract, so retain it and continue the committed run.
+          job.memoryLease = committedLease;
+        }
+      }
+      // The admission deadline ends at commit, but caller cancellation must
+      // continue flowing through the same signal for the request's lifetime.
+      this.#refreshRuntimeSafely(runtime);
       this.#releaseRuntimeReservation(job, runtime.projectId);
       job.signal?.removeEventListener("abort", job.onAbort!);
       this.#emit("transport.committed", {
@@ -1593,10 +1630,7 @@ export class MultiSandboxRouter {
           );
         },
       );
-      // All post-commit callbacks now capture only scalar metadata. The
-      // transport owns canonical request bytes, so the router can drop its
-      // payload reference before publishing the handle to the caller.
-      job.body = {};
+      // All post-commit callbacks capture only scalar metadata.
       job.resolve(traced);
       void traced.final.then(
         () => undefined,
@@ -1617,6 +1651,7 @@ export class MultiSandboxRouter {
         : {};
       if (
         admissionDeadlineExpired &&
+        !isDeterministicRequestTooLarge(error) &&
         commitment.committed !== true &&
         commitment.ambiguous !== true
       ) {
@@ -1659,9 +1694,9 @@ export class MultiSandboxRouter {
         : {};
       const committed = value.committed === true;
       const ambiguous = value.ambiguous === true;
-      const safePreCommit = isSafePreCommitFailure(error);
+      const retryablePreCommit = isRetryablePreCommitFailure(error);
       if (
-        safePreCommit &&
+        retryablePreCommit &&
         !job.signal?.aborted &&
         !this.#shuttingDown &&
         this.#clock.now() >= job.queueDeadlineMs
@@ -1671,7 +1706,7 @@ export class MultiSandboxRouter {
         return;
       }
       if (
-        safePreCommit &&
+        retryablePreCommit &&
         !job.signal?.aborted &&
         !this.#shuttingDown &&
         this.#clock.now() < job.queueDeadlineMs

@@ -189,7 +189,7 @@ supports_websockets = true
 
 ## Performance observability
 
-- `GET /health` returns aggregate capacity, active, available, queued, desired/ready/unavailable fleet counts, bounded exact unavailable project UUIDs, runtime count, and an exact release summary (`protocolRevision`, `buildHash`, and `schemaHash`); zero routable capacity returns HTTP 503 with `ok:false`.
+- `GET /health` returns aggregate capacity, active, available, queued, desired/ready/unavailable fleet counts, bounded exact unavailable project UUIDs, runtime count, and an exact release summary (`releaseRevision`, `protocolRevision`, `buildHash`, and `schemaHash`); zero routable capacity returns HTTP 503 with `ok:false`.
 - `GET /__sandboxes` returns sanitized per-project lifecycle, exact verified release, slot, heartbeat, latency, failure, quarantine, and resource snapshots. A runtime which has not proven a V2 release reports all three release fields as `null`; sandbox instance/session IDs and credentials are never exposed. The originating runtime retains its latest observation-only `upstreamRateLimit` problem and parsed organization/model/limit/used/requested/remaining/retry evidence; no unsupported `/v1/me` call is made through the scoped sandbox proxy.
 
 Start the read-only external monitor against an already-running router without restarting it:
@@ -295,7 +295,7 @@ journalctl --user -u ghostprov.service -f
 
 Use `restart` only for a rolling code restart with the current startup configuration. After editing `GP_V2_SIDECAR_REVISION`, `GP_V2_SIDECAR_PROJECT_REVISIONS`, project IDs, credentials, or any other `.env` setting, use `config-restart`. It requests a graceful drain of the whole supervisor/fleet, applies the configured bounded fallback if a drain cannot finish, launches a fresh supervisor that reloads `.env`, and on both Windows and Linux waits boundedly for a new descriptor nonce plus matching ready status, supervisor PID, worker PID, start time, and readiness time. A timeout exits nonzero rather than reporting a Type=simple/systemd launch as ready. Windows also reports whether the old process proved a clean drain instead of silently calling a forced stop graceful. Every new sandbox session is acquired inside the same explicitly configured Prism project; this path never creates, adopts, deletes, or silently falls back to another project or protocol revision. Environment variables explicitly supplied by the service manager still take precedence over `.env` and must be updated there as well.
 
-`GP_V2_SIDECAR_REVISION=r2` selects the frozen production release for every configured project. `GP_V2_SIDECAR_PROJECT_REVISIONS` accepts only exact configured `project-id=r1|r2` overrides. To roll back, set the global value or exact overrides to `r1` and run `config-restart`—never the rolling `restart`. The old fleet drains first; the replacement uses a **fresh sandbox session in the same existing Prism project**, proves the pinned R1 build/schema, and only then becomes routable. There is no in-place sidecar downgrade, protocol fallback, or project creation.
+`GP_V2_SIDECAR_REVISION=r3` selects the frozen production release for every configured project. R3 is an implementation release that deliberately keeps the stable R2 wire protocol. `GP_V2_SIDECAR_PROJECT_REVISIONS` accepts only exact configured `project-id=r1|r2|r3` overrides. To roll back, select the pinned `r2` or `r1` release and run `config-restart`—never the rolling `restart`. The old fleet drains first; the replacement uses a **fresh sandbox session in the same existing Prism project**, proves the selected build/schema, and only then becomes routable. There is no in-place sidecar downgrade, protocol fallback, or project creation.
 
 Before shipping or starting a pinned R2 release, run both independent release gates:
 
@@ -304,7 +304,7 @@ bun run check:v2-sidecar-release
 bun run check:v2-sidecar-deno
 ```
 
-The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and live R2 schema hash with the checked-in artifact. The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
+The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and stable R2 wire-schema hash with the checked-in R3 artifact. The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
@@ -339,8 +339,8 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
 | `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
-| `GP_V2_SIDECAR_REVISION` | `r2` | Frozen global sidecar revision; use `r1` only for explicit rollback |
-| `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact configured `project-id=r1|r2` overrides; no wildcard or fallback |
+| `GP_V2_SIDECAR_REVISION` | `r3` | Frozen global sidecar release; R3 uses wire protocol R2, while R2/R1 remain explicit rollback choices |
+| `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact configured `project-id=r1|r2|r3` overrides; no wildcard or fallback |
 | `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
 | `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000` | Maximum global wait for any sandbox capacity |

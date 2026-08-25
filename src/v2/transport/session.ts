@@ -8,6 +8,7 @@ import type {
 import {
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
+  awarenessEnvelopeEncodedBytes,
   base64UrlDecode,
   base64UrlEncode,
   canonicalJson,
@@ -62,8 +63,31 @@ import {
 import { v2RetainedEventPermitBytes } from "../memory/event-memory-sizing";
 
 export { computeV2RetransmitDelayMs } from "../protocol/retransmit";
+import {
+  DEFAULT_V2_INITIAL_RETRANSMIT_MS,
+  deterministicV2JitterSeed,
+} from "../protocol/retransmit";
 
-const REQUEST_PART_BYTES = 8 * 1024;
+const R1_REQUEST_PART_BYTES = 8 * 1024;
+const R2_REQUEST_PART_BYTES = 11 * 1024;
+const MIN_GZIP_SAVINGS_RATIO = 0.05;
+const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
+const GZIP_SAMPLE_BYTES = 64 * 1024;
+
+function containsLargeInlineBase64(value: unknown, seen = new Set<object>()): boolean {
+  if (typeof value === "string") {
+    return value.length >= LARGE_INLINE_BASE64_BYTES &&
+      /^data:[^;,]{1,127};base64,/i.test(value);
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) return value.some(item => containsLargeInlineBase64(item, seen));
+    return Object.values(value).some(item => containsLargeInlineBase64(item, seen));
+  } finally {
+    seen.delete(value);
+  }
+}
 
 export interface V2TransportSnapshot {
   connected: boolean;
@@ -180,6 +204,7 @@ interface PreparedRequestPlan {
   encodedBytes: number;
   encoding: RequestEncoding;
   partCount: number;
+  partBytes: number;
   encodedPayload: Uint8Array | null;
   nextPartIndex: number;
   stage: "open" | "data" | "commit" | "done";
@@ -562,6 +587,9 @@ export class V2TransportSession {
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
       minimumMs: retransmitMs,
+      initialRtoMs: options.retransmitMs === undefined
+        ? Math.max(retransmitMs, DEFAULT_V2_INITIAL_RETRANSMIT_MS)
+        : retransmitMs,
     });
     this.#pacer = new PublicationPacer({
       intervalMs: options.publicationIntervalMs,
@@ -2633,34 +2661,66 @@ export class V2TransportSession {
       throw new V2PreCommitError("V2 request exceeds the 64 MiB limit", "request_too_large");
     }
     const requestDigest = await sha256Hex(decoded);
+    const partBytes = this.#binding.protocolRevision === "r2"
+      ? R2_REQUEST_PART_BYTES
+      : R1_REQUEST_PART_BYTES;
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
-    if (this.#gzip) {
-      // Compression owns this scratch copy, so a worker pool may transfer its
-      // complete ArrayBuffer without detaching the canonical request bytes.
-      const compressed = await this.#gzip(decoded.slice(), {
+    if (
+      this.#gzip &&
+      decoded.byteLength > partBytes &&
+      !containsLargeInlineBase64(body)
+    ) {
+      const sampleLength = Math.min(decoded.byteLength, GZIP_SAMPLE_BYTES);
+      const sample = new Uint8Array(sampleLength);
+      const firstLength = Math.ceil(sampleLength / 2);
+      sample.set(decoded.subarray(0, firstLength), 0);
+      sample.set(
+        decoded.subarray(decoded.byteLength - (sampleLength - firstLength)),
+        firstLength,
+      );
+      const sampleCompressed = await this.#gzip(sample, {
         signal,
         inputOwnership: "owned",
       });
-      const identityParts = Math.ceil(decoded.byteLength / REQUEST_PART_BYTES);
-      const compressedParts = compressed.byteLength > 0
-        ? Math.ceil(compressed.byteLength / REQUEST_PART_BYTES)
+      const sampleSavings = sampleLength - sampleCompressed.byteLength;
+      const sampleWorthwhile = sampleCompressed.byteLength > 0 &&
+        sampleSavings >= Math.ceil(sampleLength * MIN_GZIP_SAVINGS_RATIO);
+      // Compression owns this scratch copy, so a worker pool may transfer its
+      // complete ArrayBuffer without detaching the canonical request bytes.
+      const compressed = !sampleWorthwhile
+        ? null
+        : sampleLength === decoded.byteLength
+          ? sampleCompressed
+          : await this.#gzip(decoded.slice(), {
+              signal,
+              inputOwnership: "owned",
+            });
+      const identityParts = Math.ceil(decoded.byteLength / partBytes);
+      const compressedParts = compressed && compressed.byteLength > 0
+        ? Math.ceil(compressed.byteLength / partBytes)
         : Number.POSITIVE_INFINITY;
-      if (compressedParts < identityParts) {
-        encoded = compressed;
+      const savedBytes = compressed ? decoded.byteLength - compressed.byteLength : 0;
+      if (
+        compressedParts < identityParts &&
+        savedBytes >= partBytes &&
+        savedBytes >= Math.ceil(decoded.byteLength * MIN_GZIP_SAVINGS_RATIO)
+      ) {
+        encoded = compressed!;
         encoding = "gzip+base64";
       }
     }
     if (encoded.byteLength < 1 || encoded.byteLength > this.#limits.requestMaxBytes) {
       throw new V2PreCommitError("Encoded V2 request exceeds the 64 MiB limit", "request_too_large");
     }
-    const partCount = Math.ceil(encoded.byteLength / REQUEST_PART_BYTES);
+    const partCount = Math.ceil(encoded.byteLength / partBytes);
     return {
       requestDigest,
       decodedBytes: decoded.byteLength,
       encodedBytes: encoded.byteLength,
       encoding,
       partCount,
+      partBytes,
       encodedPayload: encoded,
       nextPartIndex: 0,
       stage: "open",
@@ -2690,14 +2750,14 @@ export class V2TransportSession {
         throw new Error("Prepared V2 request data state is invalid");
       }
       const partIndex = plan.nextPartIndex++;
-      const offset = partIndex * REQUEST_PART_BYTES;
+      const offset = partIndex * plan.partBytes;
       const frame: HostFrame = {
         kind: "request_data",
         requestId,
         partIndex,
         offset,
         dataBase64Url: base64UrlEncode(
-          encoded.subarray(offset, Math.min(encoded.byteLength, offset + REQUEST_PART_BYTES)),
+          encoded.subarray(offset, Math.min(encoded.byteLength, offset + plan.partBytes)),
         ),
       };
       if (plan.nextPartIndex === plan.partCount) {
@@ -2904,7 +2964,10 @@ export class V2TransportSession {
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
-    const encodedBytes = utf8Bytes(JSON.stringify(envelope)).byteLength;
+    const encodedBytes = awarenessEnvelopeEncodedBytes(
+      envelope,
+      frames.length > 0 ? outbound.encodedBytes : 0,
+    );
     this.#publishedBytes += encodedBytes;
     if (lane === "data") {
       this.#dataPublications++;
@@ -2970,7 +3033,7 @@ export class V2TransportSession {
       this.#outbound.snapshot().frames.length === 0
     ) return;
     const revision = this.#dataRevision + this.#controlRevision;
-    const jitterSeed = ((revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
+    const jitterSeed = deterministicV2JitterSeed(this.#hostInstanceId, revision);
     const delay = this.#delivery.nextDelayMs(this.#clock.now(), jitterSeed);
     if (delay === null) return;
     this.#timer = setTimeout(() => {

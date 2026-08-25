@@ -274,6 +274,7 @@ export class FleetSampler {
         const release = safeV2ReleaseIdentity(runtime);
         return {
         project_id: runtime.projectId,
+        release_revision: release?.releaseRevision ?? null,
         protocol_revision: release?.protocolRevision ?? null,
         build_hash: release?.buildHash ?? null,
         schema_hash: release?.schemaHash ?? null,

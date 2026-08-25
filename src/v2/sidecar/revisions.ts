@@ -4,6 +4,7 @@ import {
   loadV2SidecarAssets,
   V2_R1,
   V2_R2,
+  V2_R3,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "./assets";
@@ -190,13 +191,14 @@ export interface BundledV2SidecarRevisionSelectorOptions {
   readonly projectOverrides?: V2ProjectRevisionOverrides<V2SidecarRevision>;
 }
 
-/** Production registry with explicit immutable R2 and strict R1 rollback. */
+/** Production registry with immutable R3, R2 fallback, and strict R1 rollback. */
 export function createBundledV2SidecarRevisionSelector(
   options: BundledV2SidecarRevisionSelectorOptions,
 ): V2SidecarRevisionSelector<V2SidecarRevision, V2SidecarAssets> {
   const loaders = new Map<V2SidecarRevision, () => Promise<V2SidecarAssets>>([
     [V2_R1, () => loadV2SidecarAssets({ revision: V2_R1 })],
     [V2_R2, () => loadV2SidecarAssets({ revision: V2_R2 })],
+    [V2_R3, () => loadV2SidecarAssets({ revision: V2_R3 })],
   ]);
   return new V2SidecarRevisionSelector({
     projectIds: options.projectIds,

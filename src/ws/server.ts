@@ -129,12 +129,22 @@ export function attachResponsesWebSocket(
   );
   const jumboIngressReservationBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
   const processBudget = options.processBudget ?? DEFAULT_PROCESS_BUDGET;
+  const processBudgetSnapshot = processBudget.snapshot();
   const recordIngressBudget = () => {
-    options.telemetry?.recordIngressBudget(processBudget.snapshot());
+    options.telemetry?.recordIngressBudget({
+      ...processBudget.snapshot(),
+      ingressGuaranteedSessions: Math.min(
+        processBudgetSnapshot.maxSessions,
+        Math.max(0, Math.floor(
+          (processBudgetSnapshot.maxIngressBytes - admittedPromotionHeadroomBytes) /
+            ingressReservationBytes,
+        )),
+      ),
+    });
   };
   const admittedPromotionHeadroomBytes = Math.min(
     promotionHeadroomBytes,
-    Math.max(0, processBudget.snapshot().maxIngressBytes - ingressReservationBytes),
+    Math.max(0, processBudgetSnapshot.maxIngressBytes - ingressReservationBytes),
   );
   const heartbeatIntervalMs = positiveTimer(
     options.heartbeatIntervalMs ?? DEFAULT_WS_HEARTBEAT_INTERVAL_MS,

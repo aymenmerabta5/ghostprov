@@ -411,6 +411,30 @@ describe("ResourceGovernor", () => {
     replacement.release();
   });
 
+  it("keeps replacement failure-atomic when a later machine probe would throw", async () => {
+    let calls = 0;
+    let throwAfter = Number.POSITIVE_INFINITY;
+    const probe: MachineProbe = {
+      sample() {
+        calls++;
+        if (calls >= throwAfter) throw new Error("probe failed after replacement swap");
+        return sample(8, 5);
+      },
+    };
+    const governor = new ResourceGovernor({ probe });
+    const original = governor.tryAcquire(workload(128 * MiB))!;
+    throwAfter = calls + 2;
+
+    const replacement = await original.replace(workload(64 * MiB));
+    expect(calls).toBe(throwAfter - 1);
+    expect(original.reservedBytes).toBe(0);
+    expect(replacement.reservedBytes).toBe(64 * MiB);
+    expect(governor.snapshot().reservedBytes).toBe(64 * MiB);
+    throwAfter = Number.POSITIVE_INFINITY;
+    replacement.release();
+    expect(governor.snapshot().reservedBytes).toBe(0);
+  });
+
   it("closes byte and CPU queues and rejects future acquisition", async () => {
     const probe = new MutableProbe(sample(32, 19));
     const governor = new ResourceGovernor({ probe });

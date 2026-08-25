@@ -61,6 +61,7 @@ describe("ObservabilityLogger", () => {
         ingressReservedBytes: 136 * 1024 * 1024,
         ingressReservedBytesPeak: 160 * 1024 * 1024,
         ingressCapacityBytes: 512 * 1024 * 1024,
+        ingressGuaranteedSessions: 27,
         ingressPromotions: 1,
         ingressRejections: 0,
         ingressParserRejections: 1,
@@ -84,6 +85,7 @@ describe("ObservabilityLogger", () => {
       websocket: {
         active_sessions: 8,
         ingress_promotions: 1,
+        ingress_guaranteed_sessions: 27,
         ingress_parser_rejections: 1,
       },
     });

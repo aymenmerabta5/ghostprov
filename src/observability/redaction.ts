@@ -298,13 +298,15 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
         pending.push(child);
       }
     }
-    const hasReleaseFields = ["protocol_revision", "build_hash", "schema_hash"]
+    const hasReleaseFields = ["release_revision", "protocol_revision", "build_hash", "schema_hash"]
       .some(key => key in runtime);
     if (!hasReleaseFields) continue;
-    const hasRelease = runtime.protocol_revision !== null ||
+    const hasRelease = runtime.release_revision !== null ||
+      runtime.protocol_revision !== null ||
       runtime.build_hash !== null || runtime.schema_hash !== null;
     if (!hasRelease) continue;
     if (safeV2ReleaseIdentity({
+      releaseRevision: runtime.release_revision,
       protocolRevision: runtime.protocol_revision,
       buildHash: runtime.build_hash,
       schemaHash: runtime.schema_hash,

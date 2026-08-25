@@ -18,8 +18,24 @@ import {
   CpuTransformTimeoutError,
 } from "../src/router/cpu-transform-pool";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
+import { V2PreCommitError } from "../src/v2/transport/run-handle";
 
 describe("OpenAI-compatible HTTP errors", () => {
+  it("maps deterministic V2 request overflow to an immediate 413", () => {
+    expect(normalizeApiError(new V2PreCommitError(
+      "V2 request exceeds the 64 MiB limit",
+      "request_too_large",
+    ))).toEqual({
+      status: 413,
+      error: {
+        message: "Request body exceeds the V2 transport limit",
+        type: "invalid_request_error",
+        param: "body",
+        code: "request_too_large",
+      },
+    });
+  });
+
   it("maps router shutdown admission to a typed service-unavailable response", () => {
     expect(normalizeApiError(new RouterShutdownError())).toEqual({
       status: 503,

@@ -106,6 +106,7 @@ describe("FleetSampler", () => {
         },
         runtimes: [{
           projectId: projectId("00000000-0000-4000-8000-000000000001"),
+          releaseRevision: "r3" as const,
           protocolRevision: "r2" as const,
           buildHash: "a".repeat(64),
           schemaHash: "b".repeat(64),
@@ -265,6 +266,7 @@ describe("FleetSampler", () => {
     webSocketTelemetry.recordIngressBudget({
       ingressReservedBytes: 17 * 1024 ** 2,
       maxIngressBytes: 512 * 1024 ** 2,
+      ingressGuaranteedSessions: 27,
     });
     webSocketTelemetry.ingressPromoted(24 * 1024 ** 2);
     webSocketTelemetry.ingressParserRejected();
@@ -302,6 +304,7 @@ describe("FleetSampler", () => {
       ingressReservedBytes: 17 * 1024 ** 2,
       ingressReservedBytesPeak: 17 * 1024 ** 2,
       ingressCapacityBytes: 512 * 1024 ** 2,
+      ingressGuaranteedSessions: 27,
       ingressPromotions: 1,
       ingressPromotionsTotal: 1,
       ingressParserRejections: 1,
@@ -309,6 +312,7 @@ describe("FleetSampler", () => {
     });
     expect((event.runtimes as any[])[0]).toMatchObject({
       project_id: "00000000-0000-4000-8000-000000000001",
+      release_revision: "r3",
       protocol_revision: "r2",
       build_hash: "a".repeat(64),
       schema_hash: "b".repeat(64),
@@ -362,6 +366,7 @@ describe("FleetSampler", () => {
       knownRuntimes: 1,
       unknownRuntimes: 0,
       selections: [{
+        releaseRevision: "r3",
         protocolRevision: "r2",
         buildHash: "a".repeat(64),
         schemaHash: "b".repeat(64),

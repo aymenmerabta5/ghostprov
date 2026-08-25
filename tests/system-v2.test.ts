@@ -278,12 +278,12 @@ describe("V2 browserless system composition", () => {
       close: async () => {},
     };
     value.dependencies.revisionSelector = {
-      preload: async () => { throw new Error("selected R2 artifact is corrupt"); },
+      preload: async () => { throw new Error("selected sidecar artifact is corrupt"); },
       loadedForProject: () => { throw new Error("not preloaded"); },
     };
 
     await expect(createBrowserlessSystem(value.env, value.dependencies))
-      .rejects.toThrow("selected R2 artifact is corrupt");
+      .rejects.toThrow("selected sidecar artifact is corrupt");
     expect(accountResolves).toBe(0);
     expect(value.server.listening).toBe(false);
     expect(value.sampler.starts).toBe(0);
@@ -292,6 +292,7 @@ describe("V2 browserless system composition", () => {
   it("selects the exact immutable release pair for each configured project", () => {
     const asset = (revision: string, fill: string) => Object.freeze({
       revision,
+      protocolRevision: revision === "r1" ? "r1" : "r2",
       buildHash: fill.repeat(64),
       schemaHash: (fill === "a" ? "b" : "c").repeat(64),
       entrypointPath: `.ghostprov-v2/revisions/${revision}/sidecar.bundle.js`,

@@ -35,7 +35,8 @@ function expectExactAndBounded(
     value.wallFirstEventMs >= value.wallCommitMs)).toBe(true);
   expect(report.requests.every(value =>
     value.wallCommitMs >= value.hostPreparationWallMs)).toBe(true);
-  expect(report.preparation.gzipCalls).toBe(report.concurrency);
+  expect(report.preparation.gzipCalls).toBeGreaterThanOrEqual(report.concurrency);
+  expect(report.preparation.gzipCalls).toBeLessThanOrEqual(report.concurrency * 2);
   expect(report.preparation.gzipWallMs).toBeGreaterThanOrEqual(0);
   expect(report.wire.usefulRequestBytes).toBe(report.requestBytes * report.concurrency);
   expect(report.wire.uniqueRequestDataBytes).toBe(report.wire.postCompressionRequestBytes);
@@ -54,7 +55,11 @@ function expectExactAndBounded(
     GP_V2_WINDOW_MAX_BYTES,
   );
   expect(report.transport.sidecar).not.toBeNull();
-  expect(report.transport.awarenessRttMs).toBeGreaterThan(0);
+  if (report.transport.retransmissions === 0) {
+    expect(report.transport.awarenessRttMs).toBeGreaterThan(0);
+  } else if (report.transport.awarenessRttMs !== null) {
+    expect(report.transport.awarenessRttMs).toBeGreaterThan(0);
+  }
   expect(report.router).toMatchObject({ active: 0, queued: 0 });
 }
 

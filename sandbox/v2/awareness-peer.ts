@@ -6,6 +6,7 @@ import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
+  awarenessEnvelopeEncodedBytes,
   protocolTransportLimits,
   type AwarenessLane,
   type AwarenessEnvelope,
@@ -39,6 +40,10 @@ import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
 import { TransportCongestion } from "../../src/v2/transport/congestion.ts";
 import { AdaptiveTransportCapacity } from "../../src/v2/transport/adaptive-capacity.ts";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../../src/v2/sidecar/capacity.ts";
+import {
+  DEFAULT_V2_INITIAL_RETRANSMIT_MS,
+  deterministicV2JitterSeed,
+} from "../../src/v2/protocol/retransmit.ts";
 
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
@@ -171,6 +176,8 @@ export class DenoAwarenessPeer {
   readonly #bootstrapInbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
   #processedAck = { epoch: 1, sequence: -1 };
   #bootstrapProcessedAck = { epoch: 1, sequence: -1 };
+  #processedFlightHigh = -1;
+  #bootstrapProcessedFlightHigh = -1;
   readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
   readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #retransmitMs: number;
@@ -276,6 +283,9 @@ export class DenoAwarenessPeer {
     this.#delivery = new ReliableDeliveryTiming({
       epoch: 1,
       minimumMs: this.#retransmitMs,
+      initialRtoMs: options.retransmitMs === undefined
+        ? Math.max(this.#retransmitMs, DEFAULT_V2_INITIAL_RETRANSMIT_MS)
+        : this.#retransmitMs,
     });
     this.#pacer = new PublicationPacer({
       intervalMs: options.publicationIntervalMs,
@@ -855,6 +865,7 @@ export class DenoAwarenessPeer {
           this.#armRetransmission();
         }
         let frames: readonly ReliableFrame<HostFrame>[] = [];
+        let replayProcessedAck = false;
         if (lane === "data") {
           // Connecting before recovery is required so large recovered spools
           // can drain. Do not advance the inbound cursor until recovery has
@@ -873,18 +884,41 @@ export class DenoAwarenessPeer {
               inbound.reset(envelope.epoch);
               if (bootstrapHost) {
                 this.#bootstrapProcessedAck = { epoch: envelope.epoch, sequence: -1 };
+                this.#bootstrapProcessedFlightHigh = -1;
                 this.#bootstrapProcessedReady.clear();
               } else {
                 this.#processedAck = { epoch: envelope.epoch, sequence: -1 };
+                this.#processedFlightHigh = -1;
                 this.#processedReady.clear();
               }
             }
+            const envelopeHigh = envelope.frames.reduce(
+              (high, frame) => frame.epoch === inbound.ack().epoch
+                ? Math.max(high, frame.sequence)
+                : high,
+              -1,
+            );
             const pendingFrames = envelope.frames.filter(frame => (
               frame.epoch === inbound.ack().epoch &&
               frame.sequence > inbound.ack().sequence
             ));
             if (!this.#inboundFrozen || pendingFrames.every(hostFrameIsControl)) {
               frames = inbound.accept(envelope.frames);
+            }
+            if (frames.length > 0) {
+              const acceptedHigh = frames.at(-1)!.sequence;
+              if (bootstrapHost) {
+                this.#bootstrapProcessedFlightHigh = Math.max(
+                  this.#bootstrapProcessedFlightHigh,
+                  acceptedHigh,
+                );
+              } else {
+                this.#processedFlightHigh = Math.max(this.#processedFlightHigh, acceptedHigh);
+              }
+            } else if (envelopeHigh >= 0 && envelopeHigh <= processed.sequence) {
+              // A repeated immutable flight proves the sender missed the final
+              // ACK-only update. Republish the current processed cursor.
+              replayProcessedAck = true;
             }
           }
         }
@@ -896,7 +930,7 @@ export class DenoAwarenessPeer {
         this.#updateBackpressure();
         const congestionChanged=this.#updateCongestion();
         this.#requestPublication(
-          frames.length > 0 || ceilingChanged || congestionChanged || capacityChanged
+          replayProcessedAck || ceilingChanged || congestionChanged || capacityChanged
             ? "urgent"
             : urgency,
         );
@@ -990,7 +1024,10 @@ export class DenoAwarenessPeer {
             targetInstanceId: this.#hostInstanceId ?? this.#binding.launchNonce,
           }
         : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
-    const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    const encodedBytes = awarenessEnvelopeEncodedBytes(
+      envelope,
+      0,
+    );
     this.#publications++;
     this.#urgentPublications++;
     this.#publishedBytes += encodedBytes;
@@ -1051,7 +1088,10 @@ export class DenoAwarenessPeer {
             targetInstanceId: this.#hostInstanceId ?? this.#binding.launchNonce,
           }
         : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
-    const encodedBytes = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    const encodedBytes = awarenessEnvelopeEncodedBytes(
+      envelope,
+      frames.length > 0 ? outbound.encodedBytes : 0,
+    );
     this.#publishedBytes += encodedBytes;
     if (lane === "data") {
       this.#dataPublications++;
@@ -1070,7 +1110,7 @@ export class DenoAwarenessPeer {
     this.#timer = null;
     if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
     const revision = this.#dataRevision + this.#controlRevision;
-    const jitterSeed = ((revision * 2_654_435_761) >>> 0) / 0xffff_ffff;
+    const jitterSeed = deterministicV2JitterSeed(this.#instanceId, revision);
     const delay = this.#delivery.nextDelayMs(performance.now(), jitterSeed);
     if (delay === null) return;
     this.#timer = setTimeout(() => {
@@ -1279,7 +1319,16 @@ export class DenoAwarenessPeer {
       } else {
         this.#processedAck = { epoch: frame.epoch, sequence };
       }
-      this.#pacer.requestUrgent();
+      const flightHigh = bootstrapHost
+        ? this.#bootstrapProcessedFlightHigh
+        : this.#processedFlightHigh;
+      if (flightHigh >= 0 && sequence >= flightHigh) {
+        if (bootstrapHost) this.#bootstrapProcessedFlightHigh = -1;
+        else this.#processedFlightHigh = -1;
+        this.#pacer.requestUrgent();
+      } else {
+        this.#pacer.requestPaced();
+      }
     }
   }
 
@@ -1296,34 +1345,45 @@ export class DenoAwarenessPeer {
       this.#onAcceptError?.(error, frame);
       return true;
     }
-    if (
-      frame.kind === "request_open" ||
-      frame.kind === "request_data" ||
-      frame.kind === "request_commit" ||
-      frame.kind === "request_start"
-    ) {
-      this.enqueue({
-        kind: "request_reject",
-        requestId: frame.requestId,
-        code: "sidecar_accept_failed",
-        message: "Sidecar could not safely accept the request frame",
-      }, "control", frame.requestId);
-    } else if (frame.kind === "request_cancel") {
-      this.enqueue({
-        kind: "response_error",
-        requestId: frame.requestId,
-        code: "sidecar_cancel_failed",
-        message: "Sidecar could not safely process cancellation",
-        ambiguous: true,
-      }, "terminal", frame.requestId);
-    } else if (frame.kind === "credential_rotate") {
-      this.enqueue({
-        kind: "response_error",
-        requestId: "credential",
-        code: "credential_rotation_failed",
-        message: "Sidecar credential rotation failed",
-        ambiguous: false,
-      }, "terminal", "credential");
+    try {
+      if (
+        frame.kind === "request_open" ||
+        frame.kind === "request_data" ||
+        frame.kind === "request_commit" ||
+        frame.kind === "request_start"
+      ) {
+        this.enqueue({
+          kind: "request_reject",
+          requestId: frame.requestId,
+          code: "sidecar_accept_failed",
+          message: "Sidecar could not safely accept the request frame",
+        }, "control", frame.requestId);
+      } else if (frame.kind === "request_cancel") {
+        this.enqueue({
+          kind: "response_error",
+          requestId: frame.requestId,
+          code: "sidecar_cancel_failed",
+          message: "Sidecar could not safely process cancellation",
+          ambiguous: true,
+        }, "terminal", frame.requestId);
+      } else if (frame.kind === "credential_rotate") {
+        this.enqueue({
+          kind: "response_error",
+          requestId: "credential",
+          code: "credential_rotation_failed",
+          message: "Sidecar credential rotation failed",
+          ambiguous: false,
+        }, "terminal", "credential");
+      }
+    } catch (cause) {
+      // The inbound sequence was already accepted. If its in-band rejection
+      // cannot enter the bounded scheduler, explicitly fail the lifecycle so
+      // recovery can replay it; never leave a permanent silent ACK gap.
+      const enqueueError = cause instanceof Error
+        ? cause
+        : new Error("Sidecar rejection could not enter the output scheduler");
+      try { this.#onAcceptError?.(enqueueError, frame); } catch {}
+      return true;
     }
     // Malformed or incomplete request-local state is rejected in-band and
     // must not tear down unrelated healthy streams. Only failures in durable

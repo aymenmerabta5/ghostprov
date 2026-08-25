@@ -49,6 +49,7 @@ import type { WorkloadDescriptor } from "../src/router/workload";
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS: V2SidecarAssets = {
   revision: "r1",
+  protocolRevision: "r1",
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
   entrypointPath: `.ghostprov-v2/revisions/r1/${"b".repeat(64)}/${"a".repeat(64)}/sidecar.bundle.js`,
@@ -405,10 +406,11 @@ function runtimeHarness(options: {
   const awarenesses = [awareness];
   let awarenessCalls = 0;
   const assets = options.enableR2Recovery
-    ? { ...ASSETS, revision: "r2" as const }
+    ? { ...ASSETS, revision: "r2" as const, protocolRevision: "r2" as const }
     : ASSETS;
   const descriptor: V2ReadyDescriptor = {
     instanceId: "sidecar-instance-1",
+    releaseRevision: options.enableR2Recovery ? "r2" : "r1",
     protocolRevision: options.enableR2Recovery ? "r2" : "r1",
     launchNonce: "runtime-launch-placeholder",
     buildHash: ASSETS.buildHash,
@@ -1607,6 +1609,7 @@ describe("V2SandboxRuntime", () => {
     await stopping;
     resolveReady({
       instanceId: "late-sidecar",
+      releaseRevision: "r1",
       protocolRevision: "r1",
       launchNonce: "late-launch",
       buildHash: ASSETS.buildHash,

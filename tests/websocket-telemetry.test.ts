@@ -11,7 +11,7 @@ describe("WebSocketTelemetry", () => {
     telemetry.sendQueued(512);
     telemetry.recordSend({ queueMs: 12, callbackMs: 3, bufferedBytes: 2_048, delayed: true });
     telemetry.recordIngressMessageBytes(6 * 1024 * 1024);
-    telemetry.recordIngressBudget({ ingressReservedBytes: 17 * 1024 * 1024, maxIngressBytes: 512 * 1024 * 1024 });
+    telemetry.recordIngressBudget({ ingressReservedBytes: 17 * 1024 * 1024, maxIngressBytes: 512 * 1024 * 1024, ingressGuaranteedSessions: 27 });
     telemetry.ingressPromoted(8 * 1024 * 1024);
     telemetry.ingressRejected(); telemetry.ingressParserRejected(); telemetry.ingressUpgradeRejected();
     telemetry.responseGraphRejected();
@@ -44,6 +44,7 @@ describe("WebSocketTelemetry", () => {
       ingressReservedBytes: 17 * 1024 * 1024,
       ingressReservedBytesPeak: 17 * 1024 * 1024,
       ingressCapacityBytes: 512 * 1024 * 1024,
+      ingressGuaranteedSessions: 27,
       ingressPromotions: 1,
       ingressRejections: 1,
       ingressParserRejections: 1,

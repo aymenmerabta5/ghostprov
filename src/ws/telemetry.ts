@@ -34,6 +34,7 @@ export interface WebSocketTelemetrySnapshot {
   ingressReservedBytes: number;
   ingressReservedBytesPeak: number;
   ingressCapacityBytes: number;
+  ingressGuaranteedSessions: number;
   ingressPromotions: number;
   ingressRejections: number;
   ingressParserRejections: number;
@@ -80,6 +81,7 @@ export class WebSocketTelemetry {
   #ingressReservedBytes = 0;
   #ingressReservedBytesPeak = 0;
   #ingressCapacityBytes = 0;
+  #ingressGuaranteedSessions = 0;
   #ingressPromotions = 0;
   #ingressRejections = 0;
   #ingressParserRejections = 0;
@@ -184,9 +186,13 @@ export class WebSocketTelemetry {
   recordIngressBudget(value: {
     ingressReservedBytes: number;
     maxIngressBytes: number;
+    ingressGuaranteedSessions?: number;
   }): void {
     this.#ingressReservedBytes = nonNegativeInteger(value.ingressReservedBytes);
     this.#ingressCapacityBytes = nonNegativeInteger(value.maxIngressBytes);
+    if (value.ingressGuaranteedSessions !== undefined) {
+      this.#ingressGuaranteedSessions = nonNegativeInteger(value.ingressGuaranteedSessions);
+    }
     this.#ingressReservedBytesPeak = Math.max(
       this.#ingressReservedBytesPeak,
       this.#ingressReservedBytes,
@@ -264,6 +270,7 @@ export class WebSocketTelemetry {
       ingressReservedBytes: this.#ingressReservedBytes,
       ingressReservedBytesPeak: this.#ingressReservedBytesPeak,
       ingressCapacityBytes: this.#ingressCapacityBytes,
+      ingressGuaranteedSessions: this.#ingressGuaranteedSessions,
       ingressPromotions: this.#ingressPromotions,
       ingressRejections: this.#ingressRejections,
       ingressParserRejections: this.#ingressParserRejections,

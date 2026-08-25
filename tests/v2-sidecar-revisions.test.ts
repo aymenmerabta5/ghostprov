@@ -9,6 +9,7 @@ import {
   loadV2SidecarAssets,
   V2_R1_RELEASE,
   V2_R2_RELEASE,
+  V2_R3_RELEASE,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
@@ -148,30 +149,38 @@ describe("V2SidecarRevisionSelector", () => {
     await expect(mutable.preload()).rejects.toThrow(/not frozen/i);
   });
 
-  it("provides a production R2 default backed by the pinned bundled release", async () => {
+  it("provides a production R3 default backed by the pinned bundled release", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2],
     });
 
     await selector.preload();
-    expect(selector.defaultRevision).toBe("r2");
-    expect(selector.loadedForProject(PROJECT_1).assets.buildHash).toBe(V2_R2_RELEASE.buildHash);
+    expect(selector.defaultRevision).toBe("r3");
+    expect(selector.loadedForProject(PROJECT_1).assets).toMatchObject({
+      revision: "r3",
+      protocolRevision: "r2",
+      buildHash: V2_R3_RELEASE.buildHash,
+    });
     expect(selector.loadedForProject(PROJECT_2).assets).toBe(
       selector.loadedForProject(PROJECT_1).assets,
     );
   });
 
-  it("retains an explicit pinned R1 rollback and supports a mixed exact-project fleet", async () => {
+  it("retains explicit pinned R1/R2 rollback and supports a mixed exact-project fleet", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
-      projectIds: [PROJECT_1, PROJECT_2],
-      projectOverrides: { [PROJECT_2]: "r1" },
+      projectIds: [PROJECT_1, PROJECT_2, PROJECT_3],
+      projectOverrides: { [PROJECT_2]: "r2", [PROJECT_3]: "r1" },
     });
     await selector.preload();
     expect(selector.loadedForProject(PROJECT_1)).toMatchObject({
+      revision: "r3",
+      assets: { protocolRevision: "r2", buildHash: V2_R3_RELEASE.buildHash },
+    });
+    expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
       revision: "r2",
       assets: { buildHash: V2_R2_RELEASE.buildHash },
     });
-    expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
+    expect(selector.loadedForProject(PROJECT_3)).toMatchObject({
       revision: "r1",
       assets: { buildHash: V2_R1_RELEASE.buildHash },
     });

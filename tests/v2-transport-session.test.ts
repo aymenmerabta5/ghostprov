@@ -1043,12 +1043,14 @@ describe("V2TransportSession", () => {
     await harness.close();await Promise.allSettled(pending);
   });
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
-    expect(computeV2RetransmitDelayMs(null, 0)).toBe(250);
+    expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);
     expect(computeV2RetransmitDelayMs(200, 1)).toBeGreaterThan(400);
     expect(computeV2RetransmitDelayMs(200, 1)).toBeLessThanOrEqual(440);
-    expect(computeV2RetransmitDelayMs(null, 0, 250, 1)).toBe(500);
+    expect(computeV2RetransmitDelayMs(null, 0, 250, 1)).toBe(3_000);
     expect(computeV2RetransmitDelayMs(null, 0, 250, 20)).toBe(30_000);
+    expect(() => computeV2RetransmitDelayMs(null, 0, 250, 0, 100))
+      .toThrow("initialRtoMs");
   });
 
   it("does not return a RunHandle before a matching committed ACK", async () => {
@@ -1637,6 +1639,74 @@ describe("V2TransportSession", () => {
       signal: controller.signal,
       inputOwnership: "owned",
     });
+    await harness.commit(pending);
+    await harness.close();
+  });
+
+  it("skips provably useless gzip for one-part and large inline-base64 requests", async () => {
+    for (const body of [{
+      model: "gpt-5.6-sol",
+      input: "tiny",
+      stream: true,
+    }, {
+      model: "gpt-5.6-sol",
+      input: [{
+        role: "user",
+        content: [{
+          type: "input_image",
+          image_url: `data:image/png;base64,${"A".repeat(128 * 1024)}`,
+        }],
+      }],
+      stream: true,
+    }]) {
+      let gzipCalls = 0;
+      const harness = new TransportHarness({
+        gzip: async bytes => {
+          gzipCalls++;
+          return gzipSync(bytes);
+        },
+      });
+      await harness.start();
+      const pending = harness.session.run(body);
+      await harness.settleUntil(() => (
+        [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+      ));
+      const open = [...harness.hostFrames.values()].find(
+        (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+          frame.kind === "request_open"
+        ),
+      )!;
+      expect(open.encoding).toBe("identity");
+      expect(gzipCalls).toBe(0);
+      await harness.commit(pending);
+      await harness.close();
+    }
+  });
+
+  it("uses one bounded sample and skips full gzip when savings are negligible", async () => {
+    let gzipCalls = 0;
+    const harness = new TransportHarness({
+      gzip: async bytes => {
+        gzipCalls++;
+        return bytes;
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run({
+      model: "gpt-5.6-sol",
+      input: "incompressible".repeat(20_000),
+      stream: true,
+    });
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
+    const open = [...harness.hostFrames.values()].find(
+      (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+        frame.kind === "request_open"
+      ),
+    )!;
+    expect(open.encoding).toBe("identity");
+    expect(gzipCalls).toBe(1);
     await harness.commit(pending);
     await harness.close();
   });

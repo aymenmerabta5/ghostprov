@@ -30,6 +30,12 @@ interface MaterializationReservation {
 
 const MATERIALIZATION_RESERVATIONS = new WeakMap<object, MaterializationReservation>();
 const RESOLUTION_RESERVATIONS = new WeakMap<ResolvedRelayRequest, MaterializationReservation>();
+interface PendingInputReservation {
+  readonly bytes: number;
+  transfer(retainedBytes: number): void;
+  release(): void;
+}
+const PENDING_INPUT_RESERVATIONS = new WeakMap<ResolvedRelayRequest, PendingInputReservation>();
 
 export function releaseResponseGraphMaterialization(value: unknown): void {
   if (!value || typeof value !== "object") return;
@@ -47,9 +53,15 @@ export function releaseResponseGraphPayload(resolved: ResolvedRelayRequest): voi
 /** Releases every remaining materialization charge and lineage pin. */
 export function releaseResponseGraphResolution(resolved: ResolvedRelayRequest): void {
   const reservation = RESOLUTION_RESERVATIONS.get(resolved);
-  if (!reservation) return;
-  RESOLUTION_RESERVATIONS.delete(resolved);
-  reservation.release();
+  if (reservation) {
+    RESOLUTION_RESERVATIONS.delete(resolved);
+    reservation.release();
+  }
+  const pending = PENDING_INPUT_RESERVATIONS.get(resolved);
+  if (pending) {
+    PENDING_INPUT_RESERVATIONS.delete(resolved);
+    pending.release();
+  }
 }
 
 interface ResponseNode {
@@ -111,6 +123,11 @@ export interface ResponseGraphOptions {
   sharedBudget?: SharedByteBudget;
 }
 
+export interface ResponseGraphResolveOptions {
+  /** Caller transfers an isolated JSON.parse-owned input graph. */
+  inputOwnership?: "borrowed" | "owned";
+}
+
 const DEFAULT_MAX_NODES = positiveInt(process.env.GP_WS_CACHE_NODES, 256);
 const DEFAULT_MAX_BYTES = positiveInt(process.env.GP_WS_CACHE_BYTES, 64 * 1024 * 1024);
 export const processResponseGraphBudget = new SharedByteBudget(
@@ -127,7 +144,16 @@ function freezeJson<T>(value: T, seen = new Set<object>()): T {
   const object = value as object;
   if (seen.has(object)) return value;
   seen.add(object);
-  for (const child of Object.values(object)) freezeJson(child, seen);
+  if (Array.isArray(object)) {
+    for (let index = 0; index < object.length; index++) {
+      const child = object[index];
+      if (child && typeof child === "object") freezeJson(child, seen);
+    }
+  } else {
+    for (const child of Object.values(object)) {
+      if (child && typeof child === "object") freezeJson(child, seen);
+    }
+  }
   return Object.freeze(value);
 }
 
@@ -135,9 +161,9 @@ function cloneFrozen<T>(value: T): T {
   return freezeJson(structuredClone(value));
 }
 
-function normalizeInput(input: unknown): unknown[] {
+function normalizeInput(input: unknown, owned: boolean): unknown[] {
   if (input == null) return freezeJson([] as unknown[]);
-  if (Array.isArray(input)) return cloneFrozen(input);
+  if (Array.isArray(input)) return owned ? freezeJson(input) : cloneFrozen(input);
   if (typeof input === "string") {
     return freezeJson([{
       type: "message",
@@ -145,11 +171,29 @@ function normalizeInput(input: unknown): unknown[] {
       content: [{ type: "input_text", text: input }],
     }]);
   }
-  return freezeJson([cloneFrozen(input)]);
+  return freezeJson([owned ? freezeJson(input) : cloneFrozen(input)]);
 }
 
 function byteSize(value: unknown): number {
   return jsonEncodedByteLength(value);
+}
+
+function normalizedInputItemCount(input: unknown): number {
+  if (input == null) return 0;
+  return Array.isArray(input) ? input.length : 1;
+}
+
+function normalizedInputByteSize(input: unknown): number {
+  if (input == null) return byteSize([]);
+  if (Array.isArray(input)) return byteSize(input);
+  if (typeof input === "string") {
+    return byteSize([{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: input }],
+    }]);
+  }
+  return byteSize([input]);
 }
 
 function stripEncryptedContent(value: unknown): unknown {
@@ -198,7 +242,10 @@ export class ResponseGraph {
     this.sharedBudget = options.sharedBudget ?? processResponseGraphBudget;
   }
 
-  resolve(event: ResponseCreateEvent): ResolvedRelayRequest {
+  resolve(
+    event: ResponseCreateEvent,
+    options: ResponseGraphResolveOptions = {},
+  ): ResolvedRelayRequest {
     const relayBody: Record<string, unknown> = { ...event };
     delete relayBody.type;
     delete relayBody.stream_id;
@@ -207,22 +254,48 @@ export class ResponseGraph {
     delete relayBody.stream;
 
     const localContinuation = event.store === false && typeof event.previous_response_id === "string";
+    const cacheLocally = event.store === false;
     let parentId: string | undefined;
     let materialization: { lineage: ResponseNode[]; reservation: MaterializationReservation } | null = null;
+    let pendingInput: PendingInputReservation | null = null;
     try {
       if (localContinuation) {
         parentId = event.previous_response_id as string;
         const parent = this.nodes.get(parentId);
         if (!parent) throw new PreviousResponseNotFoundError(parentId);
         parent.lastAccess = ++this.clock;
-        materialization = this.reserveLineage(parent);
+        materialization = this.reserveLineage(parent, normalizedInputItemCount(event.input));
+      }
+      if (cacheLocally) {
+        const pendingBytes = normalizedInputByteSize(event.input);
+        if (pendingBytes > this.maxBytes || pendingBytes > this.sharedBudget.limit) {
+          throw new ResponseGraphCapacityError("WebSocket response input exceeds cache capacity");
+        }
+        if (!this.sharedBudget.reserve(pendingBytes)) {
+          throw new ResponseGraphCapacityError("WebSocket response input capacity is exhausted");
+        }
+        let active = true;
+        pendingInput = {
+          bytes: pendingBytes,
+          transfer: retainedBytes => {
+            if (!active) throw new Error("Pending response input reservation is no longer active");
+            active = false;
+            if (retainedBytes < pendingBytes) {
+              this.sharedBudget.release(pendingBytes - retainedBytes);
+            }
+          },
+          release: () => {
+            if (!active) return;
+            active = false;
+            this.sharedBudget.release(pendingBytes);
+          },
+        };
       }
 
       // No payload-scale lineage clone occurs before reserveLineage succeeds.
-      const inputDelta = normalizeInput(event.input);
+      const inputDelta = normalizeInput(event.input, options.inputOwnership === "owned");
       if (localContinuation) {
-        const history = this.materialize(materialization!.lineage);
-        history.push(...inputDelta);
+        const history = this.materialize(materialization!.lineage, inputDelta);
         relayBody.input = Object.freeze(history);
         delete relayBody.previous_response_id;
         const parent = materialization!.lineage[0]!;
@@ -253,20 +326,26 @@ export class ResponseGraph {
           ? event.previous_response_id
           : undefined,
         inputDelta,
-        cacheLocally: event.store === false,
+        cacheLocally,
         exposeEncryptedReasoning,
       };
       if (materialization) {
         RESOLUTION_RESERVATIONS.set(resolved, materialization.reservation);
       }
+      if (pendingInput) {
+        PENDING_INPUT_RESERVATIONS.set(resolved, pendingInput);
+        pendingInput = null;
+      }
       return resolved;
     } catch (error) {
+      pendingInput?.release();
       materialization?.reservation.release();
       throw error;
     }
   }
 
   record(resolved: ResolvedRelayRequest, final: any): void {
+    let additionalReservedBytes = 0;
     try {
       if (!resolved.cacheLocally || typeof final?.id !== "string") return;
       if (resolved.parentId && !this.nodes.has(resolved.parentId)) {
@@ -274,45 +353,54 @@ export class ResponseGraph {
           "WebSocket continuation parent became unavailable before cache commit",
         );
       }
-      const output = Array.isArray(final.output) ? cloneFrozen(final.output) : Object.freeze([]);
+      if (this.nodes.has(final.id)) {
+        throw new ResponseGraphCapacityError("WebSocket response id is already cached");
+      }
+      const outputSource = Array.isArray(final.output) ? final.output : [];
+      const model = typeof final.model === "string"
+        ? final.model
+        : typeof resolved.relayBody.model === "string"
+          ? resolved.relayBody.model
+          : undefined;
+      const nodeBytes = byteSize({ input: resolved.inputDelta, output: outputSource, model });
+      if (nodeBytes > this.maxBytes || nodeBytes > this.sharedBudget.limit) {
+        throw new ResponseGraphCapacityError("WebSocket response exceeds cache capacity");
+      }
+      const pending = PENDING_INPUT_RESERVATIONS.get(resolved);
+      const pendingBytes = pending?.bytes ?? 0;
+      const additionalBytes = Math.max(0, nodeBytes - pendingBytes);
+      const protectedIds = this.ancestorsOf(resolved.parentId);
+      if (!this.makeRoom(nodeBytes, additionalBytes, protectedIds)) {
+        throw new ResponseGraphCapacityError("WebSocket response cache capacity is exhausted");
+      }
+      if (
+        this.nodes.size >= this.maxNodes ||
+        this.bytes + nodeBytes > this.maxBytes ||
+        !this.sharedBudget.reserve(additionalBytes)
+      ) {
+        throw new ResponseGraphCapacityError("WebSocket response cache admission failed");
+      }
+      additionalReservedBytes = additionalBytes;
+      const output = outputSource.length > 0 ? cloneFrozen(outputSource) : Object.freeze([]);
       const node: ResponseNode = {
         id: final.id,
         parentId: resolved.parentId,
         children: new Set(),
         input: resolved.inputDelta,
         output,
-        model: typeof final.model === "string"
-          ? final.model
-          : typeof resolved.relayBody.model === "string"
-            ? resolved.relayBody.model
-            : undefined,
-        bytes: 0,
+        model,
+        bytes: nodeBytes,
         lastAccess: ++this.clock,
       };
-      node.bytes = byteSize({ input: node.input, output: node.output, model: node.model });
-      if (node.bytes > this.maxBytes || node.bytes > this.sharedBudget.limit) {
-        throw new ResponseGraphCapacityError("WebSocket response exceeds cache capacity");
-      }
-
-      if (this.nodes.has(node.id)) {
-        throw new ResponseGraphCapacityError("WebSocket response id is already cached");
-      }
-      const protectedIds = this.ancestorsOf(node.parentId);
-      if (!this.makeRoom(node.bytes, protectedIds)) {
-        throw new ResponseGraphCapacityError("WebSocket response cache capacity is exhausted");
-      }
-      if (
-        this.nodes.size >= this.maxNodes ||
-        this.bytes + node.bytes > this.maxBytes ||
-        !this.sharedBudget.reserve(node.bytes)
-      ) {
-        throw new ResponseGraphCapacityError("WebSocket response cache admission failed");
-      }
 
       this.nodes.set(node.id, node);
       this.bytes += node.bytes;
       if (node.parentId) this.nodes.get(node.parentId)!.children.add(node.id);
+      pending?.transfer(node.bytes);
+      if (pending) PENDING_INPUT_RESERVATIONS.delete(resolved);
+      additionalReservedBytes = 0;
     } finally {
+      if (additionalReservedBytes > 0) this.sharedBudget.release(additionalReservedBytes);
       releaseResponseGraphResolution(resolved);
     }
   }
@@ -359,13 +447,14 @@ export class ResponseGraph {
     return { nodes: this.nodes.size, bytes: this.bytes };
   }
 
-  private reserveLineage(node: ResponseNode): {
+  private reserveLineage(node: ResponseNode, additionalItems: number): {
     lineage: ResponseNode[];
     reservation: MaterializationReservation;
   } {
     const lineage: ResponseNode[] = [];
     const seen = new Set<string>();
     let lineageBytes = 0;
+    let lineageItems = 0;
     let current: ResponseNode | undefined = node;
     while (current) {
       if (seen.has(current.id)) {
@@ -373,6 +462,7 @@ export class ResponseGraph {
       }
       seen.add(current.id);
       lineage.push(current);
+      lineageItems += current.input.length + current.output.length;
       if (lineage.length > this.maxNodes) {
         throw new ResponseGraphCapacityError("Response graph lineage exceeds its node limit");
       }
@@ -386,7 +476,15 @@ export class ResponseGraph {
       current = parent;
     }
 
-    if (!this.sharedBudget.reserve(lineageBytes)) throw new ResponseGraphCapacityError();
+    // Materialization shares deeply frozen node items and allocates only the
+    // new history array. Stored payload bytes are already charged once.
+    const materializationBytes = 1_024 +
+      (lineageItems + additionalItems) * 16 +
+      lineage.length * 128;
+    if (!Number.isSafeInteger(materializationBytes) ||
+        !this.sharedBudget.reserve(materializationBytes)) {
+      throw new ResponseGraphCapacityError();
+    }
     for (const entry of lineage) {
       this.activeMaterializations.set(
         entry.id,
@@ -399,7 +497,7 @@ export class ResponseGraph {
       releasePayload: () => {
         if (payloadReleased) return;
         payloadReleased = true;
-        this.sharedBudget.release(lineageBytes);
+        this.sharedBudget.release(materializationBytes);
       },
       releasePin: () => {
         if (pinReleased) return;
@@ -418,23 +516,35 @@ export class ResponseGraph {
     return { lineage, reservation };
   }
 
-  private materialize(lineage: readonly ResponseNode[]): unknown[] {
-    const history: unknown[] = [];
+  private materialize(
+    lineage: readonly ResponseNode[],
+    inputDelta: readonly unknown[],
+  ): unknown[] {
+    let itemCount = inputDelta.length;
+    for (const entry of lineage) itemCount += entry.input.length + entry.output.length;
+    const history = new Array<unknown>(itemCount);
+    let cursor = 0;
     for (let index = lineage.length - 1; index >= 0; index--) {
       const entry = lineage[index]!;
-      history.push(...entry.input, ...entry.output);
+      for (const item of entry.input) history[cursor++] = item;
+      for (const item of entry.output) history[cursor++] = item;
     }
+    for (const item of inputDelta) history[cursor++] = item;
     return history;
   }
 
-  private makeRoom(incomingBytes: number, protectedIds: Set<string>): boolean {
+  private makeRoom(
+    incomingBytes: number,
+    additionalSharedBytes: number,
+    protectedIds: Set<string>,
+  ): boolean {
     const remaining = new Set(this.nodes.keys());
     const removals: string[] = [];
     let removedBytes = 0;
     while (
       remaining.size >= this.maxNodes ||
       this.bytes - removedBytes + incomingBytes > this.maxBytes ||
-      this.sharedBudget.used - removedBytes + incomingBytes > this.sharedBudget.limit
+      this.sharedBudget.used - removedBytes + additionalSharedBytes > this.sharedBudget.limit
     ) {
       const candidate = [...this.nodes.values()]
         .filter(node =>

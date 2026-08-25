@@ -186,6 +186,7 @@ export function sandboxRecoveryBackoffMs(
 function emptySnapshot(projectId: ProjectId): RoutableSandboxSnapshot {
   return {
     projectId,
+    releaseRevision: null,
     protocolRevision: null,
     buildHash: null,
     schemaHash: null,
@@ -380,10 +381,17 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         : this.#phase === "recovering"
           ? "recovering"
           : this.#lastSnapshot.state;
+    const hasCurrentRelease = this.#phase !== "recovering" && this.#phase !== "stopped";
     return {
       ...this.#lastSnapshot,
       projectId: this.projectId,
       incarnation: this.#childGeneration,
+      ...(!hasCurrentRelease ? {
+        releaseRevision: null,
+        protocolRevision: null,
+        buildHash: null,
+        schemaHash: null,
+      } : {}),
       state,
       capacity: 0,
       available: 0,

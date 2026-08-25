@@ -210,7 +210,7 @@ export async function main(
       buildHash: assets.buildHash,
       schemaHash: assets.schemaHash,
     };
-    const binding: ProtocolBinding = assets.revision === "r2"
+    const binding: ProtocolBinding = assets.protocolRevision === "r2"
       ? { ...commonBinding, protocolRevision: "r2", launchNonce }
       : { ...commonBinding, protocolRevision: "r1", launchNonce };
     const lane = (
@@ -252,7 +252,8 @@ export async function main(
     await controller.drainAndStop("live-bootstrap-probe", abort);
     result = {
       projectId: options.projectId,
-      protocolRevision: assets.revision,
+      releaseRevision: assets.revision,
+      protocolRevision: assets.protocolRevision,
       sandboxSessionId: sessionId,
       rollbackFromR2SandboxSessionId: options.rollbackFromR2SandboxSessionId ?? null,
       instanceId: descriptor.instanceId,

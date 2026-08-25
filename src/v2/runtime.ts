@@ -534,6 +534,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       : governor.paused ? 1 : 0;
     return {
       projectId: this.projectId,
+      releaseRevision: verifiedRelease?.releaseRevision ?? null,
       protocolRevision: verifiedRelease?.protocolRevision ?? null,
       buildHash: verifiedRelease?.buildHash ?? null,
       schemaHash: verifiedRelease?.schemaHash ?? null,
@@ -706,7 +707,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         buildHash: this.#options.assets.buildHash,
         schemaHash: this.#options.assets.schemaHash,
         launchNonce: crypto.randomUUID(),
-        protocolRevision: this.#options.assets.revision,
+        protocolRevision: this.#options.assets.protocolRevision,
       };
       this.#binding = binding;
       const awareness = this.#options.createAwareness(binding, credentials);
@@ -727,6 +728,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#setState("bootstrapping");
       const descriptor = await bootstrap.ensureReady(controller.signal);
       if (
+        descriptor.releaseRevision !== this.#options.assets.revision ||
         descriptor.buildHash !== binding.buildHash ||
         descriptor.schemaHash !== binding.schemaHash ||
         descriptor.leaderGeneration !== binding.leaderGeneration ||
@@ -1006,6 +1008,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       const descriptor = await this.#abortable(context.bootstrap.ensureReady(signal), signal);
       this.#assertSidecarRelaunchCurrent(context, signal);
       if (
+        descriptor.releaseRevision !== this.#options.assets.revision ||
         descriptor.buildHash !== nextBinding.buildHash ||
         descriptor.schemaHash !== nextBinding.schemaHash ||
         descriptor.leaderGeneration !== nextBinding.leaderGeneration ||
