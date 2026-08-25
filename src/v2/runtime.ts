@@ -50,6 +50,20 @@ function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
   return isRateLimited(value) || rateLimitHintFromError(value) !== undefined;
 }
 
+function shouldQuarantineSandboxSession(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { name?: unknown; kind?: unknown };
+  if (value.name === "V2BootstrapError") {
+    return value.kind === "render" || value.kind === "hello" ||
+      value.kind === "readiness" || value.kind === "timeout";
+  }
+  if (value.name === "V2TransportLivenessError") return true;
+  if (value.name !== "V2RuntimeLifecycleFailure") return false;
+  return value.kind === "heartbeat_unreachable" ||
+    value.kind === "sidecar_unreachable" ||
+    value.kind === "ambiguity_exhausted";
+}
+
 export interface V2RuntimeProvisioning {
   provision(
     projectId: ProjectId,
@@ -75,6 +89,8 @@ export interface V2RuntimeProvisioning {
     context: YSweetRequestContext,
     signal?: AbortSignal,
   ): Promise<YSweetEnvelope>;
+  reportSandboxFailure?(projectId: ProjectId, sandbox: ProvisionedSandbox): void;
+  reportSandboxReady?(projectId: ProjectId, sandbox: ProvisionedSandbox): void;
 }
 
 export interface V2RuntimeGateway {
@@ -739,6 +755,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (generation !== this.#generation) return;
       this.#sidecarSuspect = false;
       this.#setState("ready");
+      this.#reportSandboxReady(this.#credentials.sandbox);
       this.#refreshLoop = this.#refreshResources(generation, controller.signal);
       void this.#refreshLoop.catch(error => {
         if (controller.signal.aborted || generation !== this.#generation) return;
@@ -772,6 +789,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     } catch (error) {
       if (generation !== this.#generation) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
+      const failedSandbox = effectiveSandbox ?? this.#credentials?.sandbox ?? null;
+      if (failedSandbox && shouldQuarantineSandboxSession(error)) {
+        this.#reportSandboxFailure(failedSandbox);
+      }
       this.#failure = error;
       this.#setState("failed");
       const transport = this.#transport;
@@ -1304,11 +1325,32 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #failGeneration(generation: number, failure: V2RuntimeLifecycleFailure): void {
     if (generation !== this.#generation) return;
     if (this.#state === "failed" || this.#state === "stopped") return;
+    if (this.#credentials && shouldQuarantineSandboxSession(failure)) {
+      this.#reportSandboxFailure(this.#credentials.sandbox);
+    }
     this.#failure = failure;
     this.#runtimeHealth.record("unhealthy");
     ++this.#generation;
     this.#setState("failed");
     this.#controller?.abort();
+  }
+
+  #reportSandboxFailure(sandbox: ProvisionedSandbox): void {
+    try {
+      this.#options.provisioning.reportSandboxFailure?.(this.projectId, sandbox);
+    } catch {
+      // Recovery policy telemetry/admission must never replace the runtime's
+      // authoritative lifecycle failure.
+    }
+  }
+
+  #reportSandboxReady(sandbox: ProvisionedSandbox): void {
+    try {
+      this.#options.provisioning.reportSandboxReady?.(this.projectId, sandbox);
+    } catch {
+      // Readiness is already proven; auxiliary failure-history cleanup cannot
+      // make a healthy runtime fail startup.
+    }
   }
 
   #maybeFailAmbiguousTransport(error: unknown): void {

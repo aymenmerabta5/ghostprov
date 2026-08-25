@@ -182,6 +182,56 @@ describe("PrismProvisioningClient", () => {
     expect(account.calls[0].path).toBe(`/api/projects/${PROJECT}/sandbox/resources-token`);
   });
 
+  it("quarantines a repeatedly failed sandbox session and periodically reprobes it", async () => {
+    const sandbox = parseProvisionedSandbox({
+      url: "/s/sandboxes/proxy",
+      token: "sandbox-token",
+      sandbox_id: SANDBOX,
+      sandbox_session_id: SESSION,
+    });
+    const clock = new FakeClock();
+    const account = new ScriptedAccountSession([
+      ...successResponses().slice(1),
+      ...successResponses().slice(1),
+      ...successResponses().slice(1),
+    ]);
+    const provisioning = client(account, clock);
+
+    // One transient generation failure may retry the same session.
+    provisioning.reportSandboxFailure(projectId(PROJECT), sandbox);
+    await expect(provisioning.provisionAcquired(projectId(PROJECT), sandbox))
+      .resolves.toMatchObject({ sandbox });
+    provisioning.reportSandboxReady(projectId(PROJECT), sandbox);
+
+    // Two consecutive failures fence only this exact session before any
+    // credential or workspace mutation is attempted.
+    provisioning.reportSandboxFailure(projectId(PROJECT), sandbox);
+    provisioning.reportSandboxFailure(projectId(PROJECT), sandbox);
+    const callsBeforeFence = account.calls.length;
+    await expect(provisioning.provisionAcquired(projectId(PROJECT), sandbox))
+      .rejects.toMatchObject({
+        name: "ProvisioningError",
+        kind: "reprovision",
+        status: 409,
+      });
+    expect(account.calls).toHaveLength(callsBeforeFence);
+
+    const freshSandbox = parseProvisionedSandbox({
+      url: "/s/sandboxes/proxy-fresh",
+      token: "sandbox-token-fresh",
+      sandbox_id: "750ba53d-dc42-40f0-933b-a64bdf3656cb",
+      sandbox_session_id: "sandbox-session-2",
+    });
+    await expect(provisioning.provisionAcquired(projectId(PROJECT), freshSandbox))
+      .resolves.toMatchObject({ sandbox: freshSandbox });
+
+    // The bounded quarantine permits a later same-project probe when Prism
+    // cannot supply a different physical session.
+    clock.value += 5 * 60_000 + 1;
+    await expect(provisioning.provisionAcquired(projectId(PROJECT), sandbox))
+      .resolves.toMatchObject({ sandbox });
+  });
+
   it("rejects a mismatched Y-Sweet document before syncing it into the sandbox", async () => {
     const sandbox = parseProvisionedSandbox({
       url: "/s/sandboxes/proxy",

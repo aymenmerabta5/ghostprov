@@ -329,6 +329,8 @@ function runtimeHarness(options: {
   let gatewayRotations = 0;
   let refreshedSandboxToken: string | null = null;
   const credentialOutcomes: string[] = [];
+  const sandboxFailures: ProvisionedSandbox[] = [];
+  const sandboxReady: ProvisionedSandbox[] = [];
   const awarenessCredentials: Array<{ sandboxToken: string; ySweetToken: string }> = [];
   const bootstrapCredentials: Array<{ sandboxToken: string; ySweetToken: string }> = [];
   const heartbeatOutcomes = [...(options.gatewayHeartbeatOutcomes ?? [])];
@@ -388,6 +390,12 @@ function runtimeHarness(options: {
         token: `y-token-${ySweetMints}`,
         authorization: "full",
       });
+    },
+    reportSandboxFailure(_projectId: typeof PROJECT, sandbox: ProvisionedSandbox) {
+      sandboxFailures.push(sandbox);
+    },
+    reportSandboxReady(_projectId: typeof PROJECT, sandbox: ProvisionedSandbox) {
+      sandboxReady.push(sandbox);
     },
   };
   const heartbeat = new FakeHeartbeat(order, clock);
@@ -533,6 +541,8 @@ function runtimeHarness(options: {
     gatewayRotations: () => gatewayRotations,
     refreshedSandboxToken: () => refreshedSandboxToken,
     credentialOutcomes,
+    sandboxFailures,
+    sandboxReady,
     awarenessCredentials,
     bootstrapCredentials,
     releaseInitialRotation: () => releaseInitialRotation?.(),
@@ -554,6 +564,40 @@ function runtimeHarness(options: {
 }
 
 describe("V2SandboxRuntime", () => {
+  it("reports ready and repeatedly unhealthy sandbox identities to provisioning", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    expect(harness.sandboxReady.map(sandbox => String(sandbox.sessionId))).toEqual([
+      "sandbox-session-1",
+    ]);
+
+    harness.heartbeatUnreachable();
+    expect(harness.sandboxFailures.map(sandbox => String(sandbox.sessionId))).toEqual([
+      "sandbox-session-1",
+    ]);
+    await harness.runtime.stop();
+  });
+
+  it("reports a bootstrap timeout against the acquired sandbox session", async () => {
+    const harness = runtimeHarness();
+    harness.bootstrap.ensureReadyWait = async () => {
+      const error = new Error("synthetic bootstrap timeout") as Error & { kind: string };
+      error.name = "V2BootstrapError";
+      error.kind = "timeout";
+      throw error;
+    };
+
+    await expect(harness.runtime.start()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "timeout",
+    });
+    expect(harness.sandboxReady).toHaveLength(0);
+    expect(harness.sandboxFailures.map(sandbox => String(sandbox.sessionId))).toEqual([
+      "sandbox-session-1",
+    ]);
+    await harness.runtime.stop();
+  });
+
   it("forwards the exact admission ownership callback to transport", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();

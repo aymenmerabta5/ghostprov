@@ -69,6 +69,9 @@ export interface AcquireSandboxOptions {
 
 const DEFAULT_ACQUIRE_MAX_ATTEMPTS = 3;
 const MAX_ACQUIRE_MAX_ATTEMPTS = 10;
+const FAILED_SANDBOX_THRESHOLD = 2;
+const FAILED_SANDBOX_QUARANTINE_MS = 5 * 60_000;
+const MAX_FAILED_SANDBOX_IDENTITIES = 256;
 
 export type ProvisioningErrorKind =
   | "auth"
@@ -503,6 +506,16 @@ function sandboxPath(sandbox: ProvisionedSandbox, suffix: string): string {
   return `${sandbox.url}${suffix.replace(/^\/+/, "")}`;
 }
 
+function sandboxIdentityKey(sandbox: ProvisionedSandbox): string | null {
+  if (sandbox.sessionId) return `session:${sandbox.sessionId}`;
+  if (sandbox.sandboxId) {
+    return sandbox.sessionFirstSeenAtMs === undefined
+      ? `sandbox:${sandbox.sandboxId}`
+      : `sandbox:${sandbox.sandboxId}:${sandbox.sessionFirstSeenAtMs}`;
+  }
+  return null;
+}
+
 function sandboxBodyAdmissionKey(
   sandbox: ProvisionedSandbox,
   method: string,
@@ -550,6 +563,11 @@ export class PrismProvisioningClient {
   readonly #readinessPollMs: number;
   readonly #requestTimeoutMs: number;
   readonly #responseBodyLimitBytes: number;
+  readonly #failedSandboxes = new Map<string, {
+    failures: number;
+    quarantinedUntilMs: number;
+    updatedAtMs: number;
+  }>();
 
   constructor(options: PrismProvisioningClientOptions) {
     this.#account = options.account;
@@ -574,6 +592,7 @@ export class PrismProvisioningClient {
     hooks: ProvisioningHooks = {},
   ): Promise<ProvisionedRuntimeCredentials> {
     const sandbox = await this.acquireSandbox(signal);
+    this.#assertSandboxSessionAllowed(projectId, sandbox);
     return this.provisionAcquired(projectId, sandbox, signal, hooks);
   }
 
@@ -598,6 +617,7 @@ export class PrismProvisioningClient {
     hooks: ProvisioningHooks = {},
   ): Promise<ProvisionedRuntimeCredentials> {
     checkAbort(signal);
+    this.#assertSandboxSessionAllowed(projectId, sandbox);
     const provisionedAtMs = this.#clock.now();
     await hooks.onSandboxAcquired?.(sandbox);
 
@@ -620,6 +640,66 @@ export class PrismProvisioningClient {
     );
     await this.waitForWorkspaceSync(sandbox, signal);
     return { projectId, sandbox, resource, ySweet, provisionedAtMs };
+  }
+
+  /**
+   * Records one generation-level failure against a stable sandbox identity.
+   * The first failure is allowed to retry in place; repeated failures fence
+   * that exact session for a bounded period while `/new` may return a fresh
+   * sandbox for the same Prism project.
+   */
+  reportSandboxFailure(projectId: ProjectId, sandbox: ProvisionedSandbox): void {
+    const identity = sandboxIdentityKey(sandbox);
+    if (!identity) return;
+    const now = this.#clock.now();
+    this.#pruneFailedSandboxes(now);
+    const key = `${projectId}:${identity}`;
+    const previous = this.#failedSandboxes.get(key);
+    const failures = (previous?.failures ?? 0) + 1;
+    this.#failedSandboxes.delete(key);
+    this.#failedSandboxes.set(key, {
+      failures,
+      quarantinedUntilMs: failures >= FAILED_SANDBOX_THRESHOLD
+        ? now + FAILED_SANDBOX_QUARANTINE_MS
+        : 0,
+      updatedAtMs: now,
+    });
+    while (this.#failedSandboxes.size > MAX_FAILED_SANDBOX_IDENTITIES) {
+      const oldest = this.#failedSandboxes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#failedSandboxes.delete(oldest);
+    }
+  }
+
+  reportSandboxReady(projectId: ProjectId, sandbox: ProvisionedSandbox): void {
+    const identity = sandboxIdentityKey(sandbox);
+    if (!identity) return;
+    this.#failedSandboxes.delete(`${projectId}:${identity}`);
+  }
+
+  #assertSandboxSessionAllowed(projectId: ProjectId, sandbox: ProvisionedSandbox): void {
+    const identity = sandboxIdentityKey(sandbox);
+    if (!identity) return;
+    const now = this.#clock.now();
+    this.#pruneFailedSandboxes(now);
+    const record = this.#failedSandboxes.get(`${projectId}:${identity}`);
+    if (!record || record.quarantinedUntilMs <= now) return;
+    throw new ProvisioningError(
+      "Prism returned a repeatedly failed sandbox session",
+      "reprovision",
+      409,
+    );
+  }
+
+  #pruneFailedSandboxes(now: number): void {
+    for (const [key, record] of this.#failedSandboxes) {
+      const expiresAt = record.quarantinedUntilMs > 0
+        ? record.quarantinedUntilMs
+        : record.updatedAtMs + FAILED_SANDBOX_QUARANTINE_MS;
+      if (expiresAt <= now) {
+        this.#failedSandboxes.delete(key);
+      }
+    }
   }
 
   async refreshResources(
