@@ -1494,6 +1494,9 @@ describe("V2TransportSession", () => {
       stream: true,
     });
 
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
     for (let window = 0; window < 8; window++) {
       await harness.settle();
       if ([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit")) break;
