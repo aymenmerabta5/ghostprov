@@ -274,12 +274,10 @@ const MAIN_SOURCE = [
 ].join("\n");
 
 function bootstrapArtifactPaths(launchNonce: string): {
-  mainPath: string;
   outputPath: string;
 } {
   if (!SAFE_ID.test(launchNonce)) throw new TypeError("launchNonce is invalid");
   return {
-    mainPath: `.ghostprov-v2/bootstrap-main.${launchNonce}.tex`,
     outputPath: `.ghostprov-v2/bootstrap-output.${launchNonce}.tex`,
   };
 }
@@ -1414,7 +1412,6 @@ export class V2BootstrapController {
     signal?: AbortSignal,
   ): Promise<V2ReadyDescriptor> {
     const artifacts = bootstrapArtifactPaths(binding.nonce);
-    this.#transientArtifactPaths.add(artifacts.mainPath);
     this.#transientArtifactPaths.add(artifacts.outputPath);
     const staticConfig = canonicalJson({
       version: 1,
@@ -1439,7 +1436,7 @@ export class V2BootstrapController {
         ),
       );
       await this.#ydoc.writePath(
-        artifacts.mainPath,
+        MAIN_PATH,
         bootstrapMainSource(artifacts.outputPath),
       );
       await this.#gateway.syncWorkspace(signal);
@@ -1450,7 +1447,7 @@ export class V2BootstrapController {
     try {
       this.#launchAttempted = true;
       await this.#gateway.triggerRender({
-        mainDocument: artifacts.mainPath,
+        mainDocument: MAIN_PATH,
         ...await this.#ydoc.renderSyncState(),
       }, signal);
     } catch (cause) {
@@ -1488,7 +1485,7 @@ export class V2BootstrapController {
         hello.instanceId,
         readiness,
         attempt,
-        artifacts.mainPath,
+        MAIN_PATH,
         signal,
       );
       this.#rotationKey = rotationKey;

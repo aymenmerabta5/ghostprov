@@ -466,18 +466,18 @@ describe("V2BootstrapController", () => {
     });
   });
 
-  it("keeps the root main inert and renders a nonce-specific bootstrap bridge", async () => {
+  it("renders the nonce-specific bootstrap bridge through root main.tex", async () => {
     const harness = bootstrapHarness();
     harness.ydoc.files.set("main.tex", "legacy V1 document\n");
 
     await harness.controller.ensureReady();
 
     const nonce = "00000000-0000-4000-8000-000000000001";
-    const bootstrapMain = `.ghostprov-v2/bootstrap-main.${nonce}.tex`;
-    expect(harness.gateway.mainDocuments).toEqual([bootstrapMain]);
+    expect(harness.gateway.mainDocuments).toEqual(["main.tex"]);
+    expect(harness.ydoc.writes.some(write => write.path === ".latexmkrc")).toBe(true);
+    expect(harness.ydoc.writes.some(write => write.path.endsWith("/.latexmkrc"))).toBe(false);
     expect(harness.ydoc.files.get("main.tex")).not.toBe("legacy V1 document\n");
-    expect(harness.ydoc.files.get("main.tex")).toContain("launcher inactive");
-    expect(harness.ydoc.writes.find(write => write.path === bootstrapMain)?.content)
+    expect(harness.ydoc.files.get("main.tex"))
       .toContain(`\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`);
   });
 
@@ -502,11 +502,12 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.launchers[0]).toContain(`/workspace/${ASSETS.entrypointPath}`);
     expect(harness.gateway.launchers[0]).not.toContain("--config=/workspace/.ghostprov-v2/deno.json");
     expect(harness.gateway.launchers[0]).toContain("NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM");
-    expect(harness.ydoc.writes.find(write => (
-      write.path === `.ghostprov-v2/bootstrap-main.${nonce}.tex`
-    ))?.content).toContain(
-      `\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`,
-    );
+    expect(harness.ydoc.writes.some(write => (
+      write.path === "main.tex" &&
+      write.content.includes(
+        `\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`,
+      )
+    ))).toBe(true);
   });
 
   it("stages a candidate and never opens the incumbent PID for in-place overwrite", async () => {
@@ -781,21 +782,23 @@ describe("V2BootstrapController", () => {
     ))).toBe(false);
   });
 
-  it("keeps delayed renders confined to nonce-specific log, output, and main artifacts", async () => {
+  it("keeps delayed renders on root main with nonce-specific log and output artifacts", async () => {
     const harness = bootstrapHarness("post-hello-fatal", "r2", 8, R2_ASSETS);
     await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
 
     const nonce = "r2-launch-nonce";
-    const mainPath = `.ghostprov-v2/bootstrap-main.${nonce}.tex`;
     const outputPath = `.ghostprov-v2/bootstrap-output.${nonce}.tex`;
-    expect(new Set(harness.gateway.mainDocuments)).toEqual(new Set([mainPath]));
+    expect(new Set(harness.gateway.mainDocuments)).toEqual(new Set(["main.tex"]));
     expect(harness.gateway.launchers.every(launcher => (
       launcher.includes(`/tmp/ghostprov-v2/sidecar.${nonce}.log`) &&
       launcher.includes(`/workspace/${outputPath}`)
     ))).toBe(true);
-    expect(harness.ydoc.deleted).toEqual(expect.arrayContaining([mainPath, outputPath]));
-    expect(harness.ydoc.writes.find(write => write.path === mainPath)?.content)
-      .toContain(`\\InputIfFileExists{${outputPath}}{}{}`);
+    expect(harness.ydoc.deleted).toEqual(expect.arrayContaining([outputPath]));
+    expect(harness.ydoc.deleted).not.toContain("main.tex");
+    expect(harness.ydoc.writes.some(write => (
+      write.path === "main.tex" &&
+      write.content.includes(`\\InputIfFileExists{${outputPath}}{}{}`)
+    ))).toBe(true);
   });
 
   it.each(["state", "render", "fetch"] as const)(
