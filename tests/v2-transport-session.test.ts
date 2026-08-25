@@ -285,6 +285,16 @@ class TransportHarness {
     }
   }
 
+  async settleUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+    const deadline = performance.now() + timeoutMs;
+    do {
+      await this.settle();
+      if (predicate()) return;
+      await Bun.sleep(1);
+    } while (performance.now() < deadline);
+    throw new Error("transport harness condition did not settle before its deadline");
+  }
+
   requestIdentity(): { requestId: string; requestDigest: string } {
     const open = [...this.hostFrames.values()].find(
       (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
@@ -370,7 +380,9 @@ describe("V2TransportSession", () => {
       input: "liveness-flight-".repeat(30_000),
     });
     try {
-      await harness.settle();
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.some(envelope => envelope.lane === "data")
+      ));
       const dataBefore = harness.hostEnvelopes.filter(envelope => envelope.lane === "data");
       const framesBefore = [...harness.hostFrames.values()];
       expect(dataBefore).toHaveLength(1);
@@ -830,7 +842,9 @@ describe("V2TransportSession", () => {
       input: "control-split-".repeat(20_000),
     });
     try {
-      await harness.settle();
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.some(value => value.lane === "data")
+      ));
       const requestFlight = harness.hostEnvelopes.find(value => value.lane === "data");
       expect(requestFlight?.frames.length).toBeGreaterThan(0);
 
@@ -838,7 +852,9 @@ describe("V2TransportSession", () => {
         kind: "pong",
         sentAtMs: 1,
       }], { lane: "data", ackSequence: -1 });
-      await harness.settle();
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.some(value => value.lane === "control")
+      ));
 
       const control = harness.hostEnvelopes.find(value => value.lane === "control");
       expect(control?.frames).toEqual([]);
@@ -855,7 +871,9 @@ describe("V2TransportSession", () => {
     harness.hostEnvelopes.length = 0;
     const pending = harness.session.run({ ...BODY, input: "large-flight-".repeat(40_000) });
     try {
-      await harness.settle();
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.some(value => value.lane === "data")
+      ));
 
       const first = harness.hostEnvelopes.filter(value => value.lane === "data");
       expect(first).toHaveLength(1);
@@ -871,7 +889,9 @@ describe("V2TransportSession", () => {
 
       const high = first[0]!.frames.at(-1)!.sequence;
       harness.publish([], { lane: "control", ackSequence: high });
-      await harness.settle();
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.filter(value => value.lane === "data").length > 1
+      ));
       expect(harness.hostEnvelopes.filter(value => value.lane === "data").length)
         .toBeGreaterThan(1);
     } finally {
@@ -884,7 +904,9 @@ describe("V2TransportSession", () => {
     const harness = new TransportHarness({ publicationIntervalMs: 1 });
     await harness.start();
     const pending = harness.session.run(BODY);
-    await harness.settle();
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
     const identity = harness.requestIdentity();
     harness.credits = 127;
     try {
@@ -913,7 +935,9 @@ describe("V2TransportSession", () => {
       ...BODY,
       input: `paced-${index}`,
     }));
-    await harness.settle();
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
 
     expect(harness.hostEnvelopes).toHaveLength(1);
     expect(harness.hostEnvelopes[0]!.frames.filter(
@@ -1505,7 +1529,9 @@ describe("V2TransportSession", () => {
       input: "compressible-context-".repeat(10_000),
       stream: true,
     }, controller.signal);
-    await harness.settle();
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
     const open = [...harness.hostFrames.values()].find(
       (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
         frame.kind === "request_open"

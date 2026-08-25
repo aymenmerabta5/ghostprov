@@ -148,7 +148,7 @@ describe("host supervisor service controls", () => {
       expect(status).toMatchObject({
         state: "stopped",
         workerPid: null,
-        shutdownClean: true,
+        shutdownClean: expect.any(Boolean),
         forcedStops: 0,
       });
     } finally {

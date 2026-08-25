@@ -19,9 +19,11 @@ describe("observability configuration", () => {
   });
 
   it("resolves explicit values and supports disabling logging", () => {
+    const cwd = path.resolve("ghostprov-test-root");
+    const logDirectory = path.resolve("ghostprov-test-logs");
     expect(resolveObservabilityConfig({
       GP_LOG_LEVEL: "off",
-      GP_LOG_DIR: "D:/logs",
+      GP_LOG_DIR: logDirectory,
       GP_LOG_ROTATE_BYTES: "1048576",
       GP_LOG_RETAIN_FILES: "2",
       GP_LOG_QUEUE_MAX_EVENTS: "100",
@@ -30,9 +32,9 @@ describe("observability configuration", () => {
       GP_METRICS_INTERVAL_MS: "1000",
       GP_SLOW_REQUEST_MS: "3000",
       GP_SLOW_FIRST_EVENT_MS: "1500",
-    }, "D:/ghostprov")).toMatchObject({
+    }, cwd)).toMatchObject({
       level: "off",
-      directory: path.resolve("D:/logs"),
+      directory: logDirectory,
       rotateBytes: 1_048_576,
       retainFiles: 2,
       queueMaxEvents: 100,
