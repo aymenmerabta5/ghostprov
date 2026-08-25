@@ -186,10 +186,10 @@ Deno.test("real Deno journal storage atomically spools, replaces, bounds reads, 
     });
     assert(typeof storage.pruneTerminals === "function", "owned storage has no prune operation");
     await storage.pruneTerminals!([]);
-    await assertRejects(() => Deno.stat(terminalPath), /not found|cannot find/i);
+    await assertRejects(() => Deno.stat(terminalPath), /not found|cannot find|no such file/i);
     await assertRejects(
       () => Deno.stat(`${journalRoot}/terminals/orphan.crash.tmp`),
-      /not found|cannot find/i,
+      /not found|cannot find|no such file/i,
     );
   }, {
     maxTerminalSpoolBytes: 256,
@@ -389,7 +389,10 @@ Deno.test("cleans bounded crash rewrite temps and fails closed on temp quota or 
     });
     await cleanup.readRecords();
     for (const name of names) {
-      await assertRejects(() => Deno.stat(`${journalRoot}/${name}`), /not found|cannot find/i);
+      await assertRejects(
+        () => Deno.stat(`${journalRoot}/${name}`),
+        /not found|cannot find|no such file/i,
+      );
     }
 
     const oversized = "claims.jsonl.999.00000000-0000-4000-8000-999999999999.tmp";
@@ -433,7 +436,7 @@ Deno.test({
       const path = `${journalRoot}/terminals/${requestId}.json`;
       assert((await Deno.stat(path)).size === limit, "64 MiB promoted file size is wrong");
       await storage.deleteTerminal(requestId);
-      await assertRejects(() => Deno.stat(path), /not found|cannot find/i);
+      await assertRejects(() => Deno.stat(path), /not found|cannot find|no such file/i);
     }, {
       maxTerminalSpoolBytes: limit,
       maxTerminalBytes: limit,
