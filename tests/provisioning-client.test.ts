@@ -290,11 +290,227 @@ describe("PrismProvisioningClient", () => {
 
   it("honors an already-aborted provisioning signal", async () => {
     const abort = new AbortController();
-    abort.abort();
+    const reason = new DOMException("caller stopped before provisioning", "AbortError");
+    abort.abort(reason);
     await expect(client(new ScriptedAccountSession(successResponses())).provision(
       projectId(PROJECT),
       abort.signal,
-    )).rejects.toMatchObject({ name: "AbortError" });
+    )).rejects.toBe(reason);
+  });
+
+  it("bounds each workspace poll by the remaining outer synchronization deadline", async () => {
+    const prefix = new ScriptedAccountSession(successResponses().slice(0, 5));
+    let calls = 0;
+    const account: AccountRequestClient = {
+      request: async (path, init) => {
+        calls++;
+        if (calls <= 5) return prefix.request(path, init);
+        return new Promise<Response>(() => undefined);
+      },
+    };
+    const startedAt = performance.now();
+
+    await expect(client(account, new FakeClock(), {
+      workspaceSyncTimeoutMs: 20,
+      requestTimeoutMs: 1_000,
+    }).provision(projectId(PROJECT))).rejects.toMatchObject({ kind: "timeout" });
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(calls).toBe(6);
+  });
+
+  it("bounds a Prism request even when the outer startup signal remains live", async () => {
+    let calls = 0;
+    const hanging: AccountRequestClient = {
+      request: async () => {
+        calls++;
+        // AccountSession can be stuck in reload/jar persistence where the
+        // request AbortSignal cannot settle this operation.
+        return new Promise<Response>(() => undefined);
+      },
+    };
+    const provisioning = client(hanging, new FakeClock(), { requestTimeoutMs: 10 });
+
+    await expect(provisioning.acquireSandbox())
+      .rejects.toMatchObject({
+        name: "ProvisioningError",
+        kind: "timeout",
+      });
+    await Promise.all(Array.from({ length: 8 }, () => (
+      expect(provisioning.acquireSandbox()).rejects.toMatchObject({ kind: "timeout" })
+    )));
+    // A timeout is an ambiguous outcome and must not replay a mutating POST.
+    expect(calls).toBe(1);
+  });
+
+  it("keeps one total Prism deadline through a non-cooperative response body", async () => {
+    let calls = 0;
+    let bodyCancelled = false;
+    const account: AccountRequestClient = {
+      request: async () => {
+        calls++;
+        if (calls === 1) {
+          return new Response(new ReadableStream({
+            start() {},
+            cancel() { bodyCancelled = true; },
+          }), { status: 200 });
+        }
+        return json(200, {
+          url: "/s/sandboxes/proxy",
+          token: "sandbox-token",
+          sandbox_id: SANDBOX,
+          sandbox_session_id: SESSION,
+        });
+      },
+    };
+    const provisioning = client(account, new FakeClock(), { requestTimeoutMs: 10 });
+
+    await expect(provisioning.acquireSandbox()).rejects.toMatchObject({
+      name: "ProvisioningError",
+      kind: "timeout",
+      message: "Prism request timed out",
+    });
+    expect(bodyCancelled).toBe(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    await expect(provisioning.acquireSandbox()).resolves.toMatchObject({ sandboxId: SANDBOX });
+    expect(calls).toBe(2);
+  });
+
+  it("rejects a body that completes only after the total deadline", async () => {
+    let calls = 0;
+    const account: AccountRequestClient = {
+      request: async () => {
+        calls++;
+        if (calls === 1) {
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              const releaseAt = performance.now() + 20;
+              while (performance.now() < releaseAt) { /* delayed body production */ }
+              controller.enqueue(new TextEncoder().encode(JSON.stringify({ late: true })));
+              controller.close();
+            },
+          }), { status: 200 });
+        }
+        return json(200, {
+          url: "/s/sandboxes/proxy",
+          token: "sandbox-token",
+          sandbox_id: SANDBOX,
+          sandbox_session_id: SESSION,
+        });
+      },
+    };
+    const provisioning = client(account, new FakeClock(), { requestTimeoutMs: 5 });
+
+    await expect(provisioning.acquireSandbox()).rejects.toMatchObject({ kind: "timeout" });
+    await expect(provisioning.acquireSandbox()).resolves.toMatchObject({ sandboxId: SANDBOX });
+    expect(calls).toBe(2);
+  });
+
+  it("rejects an oversized Prism body before JSON parsing", async () => {
+    const account: AccountRequestClient = {
+      request: async () => new Response("123456789", { status: 200 }),
+    };
+
+    await expect(client(account, new FakeClock(), {
+      requestTimeoutMs: 1_000,
+      responseBodyLimitBytes: 8,
+    }).acquireSandbox()).rejects.toMatchObject({
+      name: "ProvisioningError",
+      kind: "protocol",
+      status: 200,
+      message: "Prism response body exceeded the bounded limit",
+    });
+  });
+
+  it("stops waiting immediately when a caller aborts a non-cooperative Prism request", async () => {
+    let entered!: () => void;
+    const requestEntered = new Promise<void>(resolve => { entered = resolve; });
+    const account: AccountRequestClient = {
+      request: async () => {
+        entered();
+        return new Promise<Response>(() => undefined);
+      },
+    };
+    const controller = new AbortController();
+    const reason = new DOMException("startup stopped", "AbortError");
+    const pending = client(account, new FakeClock(), { requestTimeoutMs: 1_000 })
+      .acquireSandbox(controller.signal);
+    await requestEntered;
+
+    controller.abort(reason);
+
+    await expect(Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("caller abort did not settle the request")), 100);
+      }),
+    ])).rejects.toBe(reason);
+  });
+
+  it("preserves caller cancellation while a Prism response body is stalled", async () => {
+    let bodyStarted!: () => void;
+    const started = new Promise<void>(resolve => { bodyStarted = resolve; });
+    const account: AccountRequestClient = {
+      request: async () => new Response(new ReadableStream({
+        start() { bodyStarted(); },
+      }), { status: 200 }),
+    };
+    const controller = new AbortController();
+    const reason = new DOMException("startup stopped during body", "AbortError");
+    const pending = client(account, new FakeClock(), { requestTimeoutMs: 1_000 })
+      .acquireSandbox(controller.signal);
+    await started;
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("discards a late Prism response after the total request deadline", async () => {
+    let resolveRequest!: (response: Response) => void;
+    let bodyCancelled = false;
+    const account: AccountRequestClient = {
+      request: async () => new Promise<Response>(resolve => { resolveRequest = resolve; }),
+    };
+    const pending = client(account, new FakeClock(), { requestTimeoutMs: 10 }).acquireSandbox();
+
+    await expect(pending).rejects.toMatchObject({ kind: "timeout" });
+    resolveRequest(new Response(new ReadableStream({
+      cancel() { bodyCancelled = true; },
+    })));
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(bodyCancelled).toBe(true);
+  });
+
+  it("consumes a late Prism rejection after the total request deadline", async () => {
+    let rejectRequest!: (error: unknown) => void;
+    const account: AccountRequestClient = {
+      request: async () => new Promise<Response>((_resolve, reject) => { rejectRequest = reject; }),
+    };
+    const pending = client(account, new FakeClock(), { requestTimeoutMs: 10 }).acquireSandbox();
+
+    await expect(pending).rejects.toMatchObject({ kind: "timeout" });
+    rejectRequest(new Error("late account failure"));
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+  });
+
+  it("rejects a response completed after the deadline while the event loop was blocked", async () => {
+    const account: AccountRequestClient = {
+      request: async () => {
+        const releaseAt = performance.now() + 20;
+        while (performance.now() < releaseAt) { /* simulate synchronous jar work */ }
+        return json(200, {
+          url: "/s/sandboxes/proxy",
+          token: "sandbox-token",
+          sandbox_id: SANDBOX,
+          sandbox_session_id: SESSION,
+        });
+      },
+    };
+
+    await expect(client(account, new FakeClock(), { requestTimeoutMs: 5 }).acquireSandbox())
+      .rejects.toMatchObject({ kind: "timeout" });
   });
 
   it("classifies account authentication and invalid JSON without leaking responses", async () => {

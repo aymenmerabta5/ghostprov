@@ -96,6 +96,7 @@ class SidecarLifecycleError extends Error {
 }
 
 const CLEANUP_TIMEOUT_MS = 15_000;
+let fatalPhase = "config";
 
 async function settleCleanup(
   operation: () => void | Promise<void>,
@@ -132,6 +133,7 @@ async function run(): Promise<void> {
     await Deno.readTextFile("/workspace/.ghostprov-v2/static.json"),
   ));
   const binding = protocolBindingFromBootstrap(config.binding, "r2");
+  fatalPhase = "environment";
   const baseUrl = Deno.env.get("OPENAI_BASE_URL");
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!baseUrl || !apiKey) throw new Error("Required upstream environment is missing");
@@ -143,6 +145,7 @@ async function run(): Promise<void> {
     args: Deno.args,
     root: SIDECAR_OWNERSHIP_ROOT,
   });
+  fatalPhase = "ownership";
 
   const lifecycle = new AbortController();
   let resolveShutdown!: (reason: string) => void;
@@ -184,6 +187,7 @@ async function run(): Promise<void> {
       instanceId,
       root: SIDECAR_OWNERSHIP_ROOT,
     });
+    fatalPhase = "bootstrap";
     const bootstrap = await phaseZeroBootstrap({
       binding: config.binding,
       instanceId,
@@ -199,11 +203,13 @@ async function run(): Promise<void> {
       throw new SidecarLifecycleError("Bootstrap changed the owned instance", "instance_mismatch");
     }
 
+    fatalPhase = "storage";
     const storage = new DenoJournalStorage({
       // R1 and R2 journal schemas differ. Keeping the R2 journal disjoint
       // preserves an exact R2 -> frozen-R1 rollback while the global lock
       // above still prevents either revision from executing concurrently.
       root: sidecarJournalRoot(binding.protocolRevision),
+      rootBoundary: SIDECAR_OWNERSHIP_ROOT,
       assertExclusiveOwnership: () => ownership!.assertOwned(),
       withExclusiveOwnership: operation => ownership!.withOwnership(operation),
       maxTerminalSpoolBytes: V2_TERMINAL_SPOOL_RESERVATION_BYTES,
@@ -321,9 +327,12 @@ async function run(): Promise<void> {
     (maintenanceTimer as any).unref?.();
 
     // Scan-only recovery makes readiness independent of replay delivery.
+    fatalPhase = "engine_start";
     await engine.start(lifecycle.signal);
+    fatalPhase = "awareness_connect";
     await peer.connect(lifecycle.signal);
     peer.publishEngineState();
+    fatalPhase = "runtime";
     const reason = await Promise.race([shutdown, drainRequested]);
     peer.freezeInbound();
     await engine.drain(reason);
@@ -381,15 +390,27 @@ async function run(): Promise<void> {
 try {
   await run();
 } catch (error) {
-  const value = error instanceof Error ? error : new Error("Unknown sidecar failure");
+  const wrapper = error instanceof Error ? error : new Error("Unknown sidecar failure");
+  let value = wrapper;
+  const seen = new Set<Error>();
+  while (value instanceof AggregateError && !seen.has(value)) {
+    seen.add(value);
+    const primary = value.errors.find((candidate): candidate is Error => candidate instanceof Error);
+    if (!primary) break;
+    value = primary;
+  }
   const code = "code" in value && typeof (value as { code?: unknown }).code === "string"
     ? String((value as { code: string }).code).slice(0, 64)
     : "fatal";
+  const permission = /Requires (read|write|env|net|sys|run|ffi) access/i
+    .exec(value.message)?.[1]?.toLowerCase() ?? null;
   console.error(JSON.stringify({
     event: "ghostprov_v2_sidecar_fatal",
     error_name: value.name.slice(0, 64),
     error_code: code,
     cause_name: value.cause instanceof Error ? value.cause.name.slice(0, 64) : null,
+    phase: fatalPhase,
+    permission,
   }));
   Deno.exit(1);
 }

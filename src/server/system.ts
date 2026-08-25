@@ -55,6 +55,8 @@ import {
   normalizeV2SidecarFatalCauseName,
   normalizeV2SidecarFatalErrorCode,
   normalizeV2SidecarFatalErrorName,
+  normalizeV2SidecarFatalPermission,
+  normalizeV2SidecarFatalPhase,
   observabilityEvent,
   recoveryObservabilityEvent,
   type JsonValue,
@@ -443,6 +445,10 @@ function defaultRuntimeFactory(options: {
         assets: bootstrap.assets,
         revision: release.revision,
         launchNonce: bootstrap.binding.launchNonce,
+        // The outer same-project supervisor already retries forever with
+        // observable backoff. One bounded bootstrap attempt prevents three
+        // opaque 45-second tries from exceeding its 120-second child budget.
+        attempts: 1,
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
         initialActivePerSandbox: config.v2InitialActivePerSandbox,
@@ -536,6 +542,12 @@ function defaultRuntimeFactory(options: {
               : null,
             sidecar_cause_name: failure && "sidecarCauseName" in failure
               ? normalizeV2SidecarFatalCauseName(failure.sidecarCauseName)
+              : null,
+            sidecar_phase: failure?.sidecarPhase
+              ? normalizeV2SidecarFatalPhase(failure.sidecarPhase)
+              : null,
+            sidecar_permission: failure && "sidecarPermission" in failure
+              ? normalizeV2SidecarFatalPermission(failure.sidecarPermission)
               : null,
             operation: failure
               ? normalizeSandboxRecoveryOperation(failure.operation)
@@ -825,6 +837,10 @@ export async function createBrowserlessSystem(
       }
       starting = (async () => {
         try {
+          // Startup can legitimately spend time provisioning or bootstrapping.
+          // Sample before readiness so both JSONL and the compact console show
+          // the exact runtime phases instead of appearing completely frozen.
+          sampler.start();
           reconciliation ??= fleet.reconcile(startupController.signal);
           await Promise.race([
             fleet.waitForReady(1, startupController.signal),
@@ -843,7 +859,6 @@ export async function createBrowserlessSystem(
           if (startupController.signal.aborted || closing) {
             throw new DOMException("GhostProv startup aborted", "AbortError");
           }
-          sampler.start();
           await listen();
           if (startupController.signal.aborted || closing) {
             throw new DOMException("GhostProv startup aborted", "AbortError");

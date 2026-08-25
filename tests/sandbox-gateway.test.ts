@@ -102,6 +102,26 @@ describe("SandboxGateway", () => {
     )).toBe(false);
   });
 
+  it("returns heartbeat authentication status without waiting for a stalled body", async () => {
+    const account = new FakeAccount(() => new Response(new ReadableStream({
+      start() {},
+      cancel: () => new Promise<void>(() => undefined),
+    }), { status: 401 }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 1_000,
+    });
+
+    await expect(Promise.race([
+      gateway.heartbeat(),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("heartbeat waited for an unused body")), 100);
+      }),
+    ])).resolves.toMatchObject({ ok: false, status: 401 });
+  });
+
   it("keeps an in-flight credential snapshot and uses a rotation on later requests", async () => {
     let enterFirst!: () => void;
     let releaseFirst!: () => void;
@@ -239,5 +259,248 @@ describe("SandboxGateway", () => {
     const gateway = new SandboxGateway({ projectId: PROJECT, account, sandbox: SANDBOX });
     await gateway.triggerRender({ mainDocument: "main.tex", clientStateVector: "state", clientDeleteSetUpdate: "delete" });
     expect(account.calls.at(-1)?.json).toEqual({ mainDocument: "main.tex", clientStateVector: "state", clientDeleteSetUpdate: "delete" });
+  });
+
+  it("accepts render headers promptly and fences a non-cooperative body cleanup", async () => {
+    const account = new FakeAccount(() => new Response(new ReadableStream({
+      start() {},
+      cancel: () => new Promise<void>(() => undefined),
+    }), { status: 202 }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 1_000,
+    });
+    const request = {
+      mainDocument: "main.tex",
+      clientStateVector: "state",
+      clientDeleteSetUpdate: "delete",
+    };
+
+    await expect(Promise.race([
+      gateway.triggerRender(request),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("render waited for an unused body")), 100);
+      }),
+    ])).resolves.toBeUndefined();
+    await expect(gateway.triggerRender(request)).rejects.toMatchObject({
+      name: "SandboxGatewayError",
+      status: 408,
+      operation: "render",
+    });
+    expect(account.calls).toHaveLength(1);
+  });
+
+  it("bounds a sandbox request even when only the outer lifecycle remains live", async () => {
+    const account = new FakeAccount(() => new Promise<Response>(() => undefined));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+
+    await expect(gateway.fetchText("logs")).rejects.toMatchObject({
+      name: "SandboxGatewayError",
+      status: 408,
+      operation: "logs",
+    });
+    await Promise.all(Array.from({ length: 8 }, () => (
+      expect(gateway.fetchText("logs")).rejects.toMatchObject({ status: 408 })
+    )));
+    expect(account.calls).toHaveLength(1);
+  });
+
+  it("keeps one total sandbox deadline through a non-cooperative response body", async () => {
+    let calls = 0;
+    let bodyCancelled = false;
+    const account = new FakeAccount(() => {
+      calls++;
+      if (calls === 1) {
+        return new Response(new ReadableStream({
+          start() {},
+          cancel() { bodyCancelled = true; },
+        }), { status: 200 });
+      }
+      return new Response("ok");
+    });
+    const first = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+    const second = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+
+    await expect(first.fetchText("logs")).rejects.toMatchObject({
+      name: "SandboxGatewayError",
+      status: 408,
+      operation: "logs",
+      message: "Sandbox logs request timed out",
+    });
+    expect(bodyCancelled).toBe(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    await expect(second.fetchText("logs")).resolves.toMatchObject({ text: "ok" });
+    expect(account.calls).toHaveLength(2);
+  });
+
+  it("scopes a truly stuck body fence to its sandbox and operation", async () => {
+    const account = new FakeAccount((_path, init) => {
+      const token = new Headers(init.headers).get("x-crixet-sandbox-token");
+      if (token === "sandbox-A") {
+        return new Response(new ReadableStream({
+          start() {},
+          cancel: () => new Promise<void>(() => undefined),
+        }), { status: 200 });
+      }
+      return new Response("ok", { headers: { "x-session-id": "session-b" } });
+    });
+    const sandboxA = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+    const sandboxB = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: sandboxCredential("sandbox-B", "session-b", "sandbox-b"),
+      requestTimeoutMs: 100,
+    });
+
+    await expect(sandboxA.fetchText("logs")).rejects.toMatchObject({ status: 408 });
+    await expect(sandboxB.heartbeat()).resolves.toMatchObject({ ok: true, status: 200 });
+    await expect(sandboxA.fetchText("logs")).rejects.toMatchObject({ status: 408 });
+    expect(account.calls).toHaveLength(2);
+  });
+
+  it("rejects an oversized sandbox response body", async () => {
+    const account = new FakeAccount(() => new Response("123456789", { status: 200 }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 1_000,
+      responseBodyLimitBytes: 8,
+    });
+
+    await expect(gateway.fetchText("logs")).rejects.toMatchObject({
+      name: "SandboxGatewayError",
+      status: 502,
+      operation: "logs",
+      message: "Sandbox logs response body exceeded the bounded limit",
+    });
+  });
+
+  it("does not start a sandbox mutation when its caller is already aborted", async () => {
+    const account = new FakeAccount(() => new Response("unexpected"));
+    const gateway = new SandboxGateway({ projectId: PROJECT, account, sandbox: SANDBOX });
+    const controller = new AbortController();
+    const reason = new DOMException("owner stopped", "AbortError");
+    controller.abort(reason);
+
+    try {
+      await gateway.postJson("token", { token: "new" }, controller.signal);
+      throw new Error("expected request cancellation");
+    } catch (error) {
+      expect(error).toBe(reason);
+    }
+    expect(account.calls).toHaveLength(0);
+  });
+
+  it("stops waiting immediately when a caller aborts a non-cooperative sandbox request", async () => {
+    let entered!: () => void;
+    const requestEntered = new Promise<void>(resolve => { entered = resolve; });
+    const account = new FakeAccount(() => {
+      entered();
+      return new Promise<Response>(() => undefined);
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 1_000,
+    });
+    const controller = new AbortController();
+    const reason = new DOMException("owner stopped", "AbortError");
+    const pending = gateway.fetchText("logs", { signal: controller.signal });
+    await requestEntered;
+
+    controller.abort(reason);
+
+    await expect(Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("caller abort did not settle the request")), 100);
+      }),
+    ])).rejects.toBe(reason);
+  });
+
+  it("preserves caller cancellation while a sandbox response body is stalled", async () => {
+    let bodyStarted!: () => void;
+    const started = new Promise<void>(resolve => { bodyStarted = resolve; });
+    const account = new FakeAccount(() => new Response(new ReadableStream({
+      start() { bodyStarted(); },
+    }), { status: 200 }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 1_000,
+    });
+    const controller = new AbortController();
+    const reason = new DOMException("owner stopped during body", "AbortError");
+    const pending = gateway.fetchText("logs", { signal: controller.signal });
+    await started;
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("discards a late sandbox response after the total request deadline", async () => {
+    let resolveRequest!: (response: Response) => void;
+    let bodyCancelled = false;
+    const account = new FakeAccount(() => new Promise<Response>(resolve => { resolveRequest = resolve; }));
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+    const pending = gateway.fetchText("logs");
+
+    await expect(pending).rejects.toMatchObject({ status: 408, operation: "logs" });
+    resolveRequest(new Response(new ReadableStream({
+      cancel() { bodyCancelled = true; },
+    })));
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(bodyCancelled).toBe(true);
+  });
+
+  it("keeps the timed signal alive after a response is returned", async () => {
+    let requestSignal!: AbortSignal;
+    const account = new FakeAccount((_path, init) => {
+      requestSignal = init.signal!;
+      return new Response("ok");
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      requestTimeoutMs: 10,
+    });
+
+    await gateway.fetchText("logs");
+    expect(requestSignal.aborted).toBe(false);
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+    expect(requestSignal.aborted).toBe(true);
   });
 });

@@ -36,6 +36,149 @@ const JOURNAL_TEMP = /^claims\.jsonl\.[1-9][0-9]{0,19}\.[0-9a-f]{8}-[0-9a-f]{4}-
 const MAX_JOURNAL_TEMP_FILES = 16;
 const MAX_JOURNAL_ROOT_ENTRIES = 4_096;
 
+type AbsoluteStoragePathKind = "posix" | "drive" | "unc";
+
+interface AbsoluteStoragePath {
+  readonly kind: AbsoluteStoragePathKind;
+  /** Filesystem root: `/`, `C:/`, or `//server/share`. */
+  readonly anchor: string;
+  readonly components: readonly string[];
+  /** Normalized path using `/`; Deno accepts this form on Windows too. */
+  readonly value: string;
+}
+
+function invalidAbsoluteStoragePath(label: string): never {
+  throw new TypeError(`${label} must be an unambiguous absolute filesystem path`);
+}
+
+function assertWindowsPathComponent(component: string, label: string): void {
+  // Dot components and Win32 aliases (trailing dots/spaces or alternate data
+  // streams) make lexical containment differ from the path the kernel opens.
+  if (
+    component === "." ||
+    component === ".." ||
+    component.includes(":") ||
+    /[. ]$/.test(component)
+  ) invalidAbsoluteStoragePath(label);
+}
+
+function normalizeAbsoluteStoragePath(value: string, label: string): AbsoluteStoragePath {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    invalidAbsoluteStoragePath(label);
+  }
+
+  const drive = /^([A-Za-z]):[\\/]/.exec(value);
+  if (drive) {
+    const components = value.slice(3).split(/[\\/]+/).filter(Boolean);
+    for (const component of components) assertWindowsPathComponent(component, label);
+    const anchor = `${drive[1].toUpperCase()}:/`;
+    return {
+      kind: "drive",
+      anchor,
+      components,
+      value: components.length ? `${anchor}${components.join("/")}` : anchor,
+    };
+  }
+
+  // Reject Win32 device/extended-length namespaces. Their normalization rules
+  // can bypass ordinary drive/share containment and are unnecessary here.
+  if (/^[\\/]{2}[?.][\\/]/.test(value)) invalidAbsoluteStoragePath(label);
+  const unc = /^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)(?:[\\/]+|$)/.exec(value);
+  if (unc) {
+    const server = unc[1];
+    const share = unc[2];
+    assertWindowsPathComponent(server, label);
+    assertWindowsPathComponent(share, label);
+    const components = value.slice(unc[0].length).split(/[\\/]+/).filter(Boolean);
+    for (const component of components) assertWindowsPathComponent(component, label);
+    const anchor = `//${server}/${share}`;
+    return {
+      kind: "unc",
+      anchor,
+      components,
+      value: components.length ? `${anchor}/${components.join("/")}` : anchor,
+    };
+  }
+
+  // A double-separator prefix is either a complete UNC share or ambiguous;
+  // never reinterpret an incomplete network path as a POSIX path.
+  if (/^[\\/]{2}/.test(value)) invalidAbsoluteStoragePath(label);
+
+  if (!value.startsWith("/") || value.includes("\\")) {
+    invalidAbsoluteStoragePath(label);
+  }
+  const components = value.split(/\/+/).filter(Boolean);
+  if (components.some(component => component === "." || component === "..")) {
+    invalidAbsoluteStoragePath(label);
+  }
+  return {
+    kind: "posix",
+    anchor: "/",
+    components,
+    value: components.length ? `/${components.join("/")}` : "/",
+  };
+}
+
+function assertNativeStoragePath(path: AbsoluteStoragePath, label: string): void {
+  // Bun unit tests construct the adapter without performing Deno I/O. Enforce
+  // native path semantics in the actual sidecar runtime while preserving that
+  // constructor-only portability seam.
+  const deno = (globalThis as unknown as {
+    Deno?: { build?: { os?: string } };
+  }).Deno;
+  if (!deno?.build?.os) return;
+  const native = deno.build.os === "windows"
+    ? path.kind === "drive" || path.kind === "unc"
+    : path.kind === "posix";
+  if (!native) {
+    throw new TypeError(`${label} is not an absolute path on this host`);
+  }
+}
+
+function storagePathComponentKey(path: AbsoluteStoragePath, component: string): string {
+  return path.kind === "posix" ? component : component.toLowerCase();
+}
+
+function storagePathDescendsFrom(
+  path: AbsoluteStoragePath,
+  boundary: AbsoluteStoragePath,
+): boolean {
+  if (path.kind !== boundary.kind) return false;
+  const pathAnchor = path.kind === "posix" ? path.anchor : path.anchor.toLowerCase();
+  const boundaryAnchor = boundary.kind === "posix"
+    ? boundary.anchor
+    : boundary.anchor.toLowerCase();
+  if (pathAnchor !== boundaryAnchor || path.components.length < boundary.components.length) {
+    return false;
+  }
+  return boundary.components.every((component, index) => (
+    storagePathComponentKey(boundary, component) ===
+      storagePathComponentKey(path, path.components[index])
+  ));
+}
+
+function rebaseStorageDescendant(
+  path: AbsoluteStoragePath,
+  boundary: AbsoluteStoragePath,
+): AbsoluteStoragePath {
+  const components = [
+    ...boundary.components,
+    ...path.components.slice(boundary.components.length),
+  ];
+  return {
+    kind: boundary.kind,
+    anchor: boundary.anchor,
+    components,
+    value: components.length
+      ? appendStoragePath(boundary.anchor, components.join("/"))
+      : boundary.anchor,
+  };
+}
+
+function appendStoragePath(path: string, component: string): string {
+  return path.endsWith("/") ? `${path}${component}` : `${path}/${component}`;
+}
+
 async function writeAll(file: Deno.FsFile, bytes: Uint8Array): Promise<void> {
   let offset = 0;
   while (offset < bytes.byteLength) {
@@ -52,6 +195,12 @@ function terminalName(requestId: string): string {
 
 export interface DenoJournalStorageOptions {
   root?: string;
+  /**
+   * Lifecycle-provisioned real directory from which every storage component
+   * descends. When explicit, storage never creates it or syncs its parent;
+   * confinement and journal durability begin at this capability boundary.
+   */
+  rootBoundary?: string;
   /** Retained for non-destructive diagnostics/backward-compatible construction. */
   assertExclusiveOwnership?: () => Promise<void>;
   /** Holds the ownership lease throughout one destructive filesystem operation. */
@@ -163,6 +312,10 @@ class DenoTerminalReader implements JournalTerminalReader {
 
 export class DenoJournalStorage implements JournalStorage {
   readonly #root: string;
+  readonly #rootBoundary: string;
+  readonly #rootPath: AbsoluteStoragePath;
+  readonly #rootBoundaryPath: AbsoluteStoragePath;
+  readonly #explicitRootBoundary: boolean;
   readonly #journal: string;
   readonly #terminals: string;
   readonly #withExclusiveOwnership?: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -189,9 +342,30 @@ export class DenoJournalStorage implements JournalStorage {
     const root = typeof options === "string"
       ? options
       : options.root ?? "/tmp/ghostprov-v2";
-    this.#root = root.replace(/\/+$/, "");
-    this.#journal = `${this.#root}/claims.jsonl`;
-    this.#terminals = `${this.#root}/terminals`;
+    const rootPath = normalizeAbsoluteStoragePath(root, "journal root");
+    const explicitRootBoundary = typeof options !== "string" && options.rootBoundary !== undefined;
+    const rootBoundaryPath = normalizeAbsoluteStoragePath(
+      explicitRootBoundary ? options.rootBoundary! : rootPath.value,
+      "journal rootBoundary",
+    );
+    assertNativeStoragePath(rootPath, "journal root");
+    assertNativeStoragePath(rootBoundaryPath, "journal rootBoundary");
+    if (!storagePathDescendsFrom(rootPath, rootBoundaryPath)) {
+      throw new TypeError("journal root must descend from its absolute rootBoundary");
+    }
+    // The explicit boundary spelling is authoritative. On Windows this avoids
+    // validating a case-insensitive prefix and later opening a differently
+    // cased path on a case-sensitive directory/volume.
+    const confinedRootPath = explicitRootBoundary
+      ? rebaseStorageDescendant(rootPath, rootBoundaryPath)
+      : rootPath;
+    this.#rootPath = confinedRootPath;
+    this.#rootBoundaryPath = rootBoundaryPath;
+    this.#explicitRootBoundary = explicitRootBoundary;
+    this.#root = confinedRootPath.value;
+    this.#rootBoundary = rootBoundaryPath.value;
+    this.#journal = appendStoragePath(this.#root, "claims.jsonl");
+    this.#terminals = appendStoragePath(this.#root, "terminals");
     const assertExclusiveOwnership = typeof options === "string"
       ? undefined
       : options.assertExclusiveOwnership;
@@ -808,37 +982,81 @@ export class DenoJournalStorage implements JournalStorage {
     }
   }
 
-  async #ensurePosixDirectoryHierarchy(path: string): Promise<void> {
-    if (!path.startsWith("/")) throw new Error("journal storage path must be absolute");
-    let current = "/";
-    for (const component of path.split("/").filter(Boolean)) {
+  async #requireRealDirectory(path: string, message: string): Promise<void> {
+    const info = await Deno.lstat(path);
+    if (!info.isDirectory || info.isSymlink) throw new Error(message);
+  }
+
+  async #ensureDirectoryHierarchy(path: AbsoluteStoragePath): Promise<void> {
+    if (!storagePathDescendsFrom(path, this.#rootBoundaryPath)) {
+      throw new Error("journal storage path escaped its root boundary");
+    }
+
+    let current: string;
+    let relative: readonly string[];
+    if (this.#explicitRootBoundary) {
+      // The ownership phase provisions this capability boundary. Journal
+      // storage must neither create it recursively nor touch/sync its parent:
+      // confinement and journal durability begin at this directory.
+      await this.#requireRealDirectory(
+        this.#rootBoundary,
+        "journal root boundary must be a pre-existing real directory",
+      );
+      current = this.#rootBoundary;
+      relative = path.components.slice(this.#rootBoundaryPath.components.length);
+    } else {
+      // Backward-compatible root-only construction may create a missing root,
+      // but still validates every existing component from the filesystem
+      // anchor so a symlink cannot redirect the recursive creation.
+      await this.#requireRealDirectory(
+        path.anchor,
+        "journal filesystem anchor must be a real directory",
+      );
+      current = path.anchor;
+      relative = path.components;
+    }
+
+    for (const component of relative) {
       const parent = current;
-      current = current === "/" ? `/${component}` : `${current}/${component}`;
+      current = appendStoragePath(current, component);
+      let created = false;
       try {
-        await Deno.mkdir(current, { mode: 0o700 });
+        await this.#requireRealDirectory(
+          current,
+          "journal storage hierarchy must contain only real directories",
+        );
       } catch (error) {
-        if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+        try {
+          await Deno.mkdir(current, { mode: 0o700 });
+          created = true;
+        } catch (mkdirError) {
+          // Concurrent first-use in this process may publish the same child
+          // after our lstat. Validate that winner below instead of failing.
+          if (!(mkdirError instanceof Deno.errors.AlreadyExists)) throw mkdirError;
+        }
+        await this.#requireRealDirectory(
+          current,
+          "journal storage hierarchy must contain only real directories",
+        );
       }
-      const info = await Deno.lstat(current);
-      if (!info.isDirectory || info.isSymlink) {
-        throw new Error("journal storage hierarchy must contain only directories");
+      // An explicit capability fences every descendant parent once during
+      // initialization: another phase could have created a pre-existing child
+      // earlier in this boot without syncing it. Legacy traversal only fences
+      // entries that it creates, avoiding fsyncs of unrelated host ancestors.
+      if (this.#explicitRootBoundary || created) {
+        await this.#syncDirectory(parent, true);
       }
-      // This is deliberately repeated for pre-existing entries during the
-      // first initialization: another phase may have created them without a
-      // parent fsync earlier in the same boot.
-      if (parent !== "/") await this.#syncDirectory(parent, true);
     }
   }
 
   async #ensureDirectories(): Promise<void> {
     if (!this.#directoriesDurable) {
-      if (Deno.build.os === "windows") {
-        await Deno.mkdir(this.#root, { recursive: true, mode: 0o700 });
-        await Deno.mkdir(this.#terminals, { recursive: true, mode: 0o700 });
-      } else {
-        await this.#ensurePosixDirectoryHierarchy(this.#root);
-        await this.#ensurePosixDirectoryHierarchy(this.#terminals);
-      }
+      await this.#ensureDirectoryHierarchy(this.#rootPath);
+      await this.#ensureDirectoryHierarchy(normalizeAbsoluteStoragePath(
+        this.#terminals,
+        "journal terminal root",
+      ));
     }
     const [rootInfo, terminalInfo] = await Promise.all([
       Deno.lstat(this.#root),

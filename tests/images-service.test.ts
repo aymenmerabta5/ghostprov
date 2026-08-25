@@ -33,6 +33,7 @@ function imageFinal(
     outputTokens?: number;
     imageOutputTokens?: number;
     textOutputTokens?: number;
+    callStatus?: string;
   } = {},
 ) {
   const inputTokens = options.inputTokens ?? 10;
@@ -44,7 +45,7 @@ function imageFinal(
     output: [{
       id: `ig_${result}`,
       type: "image_generation_call",
-      status: "completed",
+      status: options.callStatus ?? "completed",
       result,
       revised_prompt: options.revisedPrompt,
       background: "opaque",
@@ -128,6 +129,14 @@ describe("image batch execution", () => {
         total_tokens: 64,
       },
     });
+  });
+
+  it("accepts gpt-image-2 terminal results whose call status remains generating", async () => {
+    const response = await executeImageBatch([{}], async () => handle(Promise.resolve(
+      imageFinal("IMAGE_BYTES", { callStatus: "generating" }),
+    )));
+
+    expect(response.data).toEqual([{ b64_json: "IMAGE_BYTES" }]);
   });
 
   it("waits for all submitted children before rejecting with the first input-order failure", async () => {
@@ -225,6 +234,8 @@ describe("image batch execution", () => {
     [{ status: "completed", output: [] }, "missing image result"],
     [{ status: "completed", output: [{ type: "image_generation_call", status: "completed", result: "A" }, { type: "image_generation_call", status: "completed", result: "B" }] }, "multiple image results"],
     [{ status: "completed", output: [{ type: "image_generation_call", status: "failed", result: "A" }] }, "failed image call"],
+    [{ status: "failed", output: [{ type: "image_generation_call", status: "completed", result: "A" }] }, "failed outer response"],
+    [{ status: "incomplete", output: [{ type: "image_generation_call", status: "completed", result: "A" }] }, "incomplete outer response"],
   ])("rejects malformed upstream finals: %s", async (final) => {
     try {
       await executeImageBatch([{}], async () => handle(Promise.resolve(final)));

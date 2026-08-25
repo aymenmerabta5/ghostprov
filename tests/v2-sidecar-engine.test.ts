@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { HostFrame, ReliableFrame, SidecarFrame } from "../src/v2/protocol/shared";
 import {
   JournalStorageCapacityError,
@@ -893,10 +893,30 @@ describe("SidecarEngine", () => {
     await harness.sendRequest(BODY);
     await started;
 
-    const draining = harness.engine.drain("terminal promotion race");
-    await Bun.sleep(45);
-    releasePromotion();
-    await draining;
+    const forcedMark = spyOn(harness.journal, "markForcedAmbiguous");
+    try {
+      const draining = harness.engine.drain("terminal promotion race");
+      const deadline = performance.now() + 500;
+      while (forcedMark.mock.calls.length === 0) {
+        if (performance.now() >= deadline) {
+          throw new Error("forced drain did not install its journal intent");
+        }
+        await Bun.sleep(0);
+      }
+      // markForcedAmbiguous installs its intent synchronously before its first
+      // await. Release the competing promotion only after that linearization
+      // point instead of racing two chains of wall-clock timers.
+      releasePromotion();
+      const forcedResult = forcedMark.mock.results[0]?.value;
+      if (!(forcedResult instanceof Promise)) {
+        throw new Error("forced journal transition did not return a promise");
+      }
+      await forcedResult;
+      await draining;
+    } finally {
+      releasePromotion();
+      forcedMark.mockRestore();
+    }
     await harness.settle();
 
     expect(harness.journal.status(harness.requestId)).toBe("forced_ambiguous");

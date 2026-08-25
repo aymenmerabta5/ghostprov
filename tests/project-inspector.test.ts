@@ -183,6 +183,7 @@ describe("YDocProjectInspector", () => {
   it("keeps an interrupted revision-addressed V2 deployment eligible for same-project reuse", async () => {
     const schema = "b".repeat(64);
     const build = "a".repeat(64);
+    const nonce = "12345678-1234-4234-8234-123456789abc";
     const root = `.ghostprov-v2/revisions/r1/${schema}/${build}`;
     const { inspector, factory } = createInspector([
       { path: "main.tex", content: "GhostProv V2 sidecar bootstrap." },
@@ -190,6 +191,8 @@ describe("YDocProjectInspector", () => {
       { path: ".ghostprov-v2/static.json", content: "{}" },
       { path: ".ghostprov-v2/bootstrap.enc.json", content: "{}" },
       { path: ".ghostprov-v2/bootstrap-output.tex", content: "" },
+      { path: `.ghostprov-v2/bootstrap-main.${nonce}.tex`, content: "bootstrap" },
+      { path: `.ghostprov-v2/bootstrap-output.${nonce}.tex`, content: "" },
       { path: ".ghostprov-v2/revision.json", content: JSON.stringify({ revision: "r1" }) },
       { path: `${root}/manifest.json`, content: "{}" },
       { path: `${root}/sidecar.bundle.js`, content: "// frozen bundle" },
@@ -203,6 +206,16 @@ describe("YDocProjectInspector", () => {
       marker: null,
     });
     expect(factory.writes).toBe(0);
+  });
+
+  it.each([
+    ".ghostprov-v2/bootstrap-main.bad!.tex",
+    ".ghostprov-v2/bootstrap-output..tex",
+    ".ghostprov-v2/bootstrap-main.safe/escape.tex",
+  ])("treats a lookalike bootstrap artifact as user content: %s", async path => {
+    const { inspector } = createInspector([{ path }]);
+
+    await expect(inspector.inspect(PROJECT)).resolves.toMatchObject({ empty: false });
   });
 
   it("requires exact full authorization and reports unrelated live files as non-empty", async () => {

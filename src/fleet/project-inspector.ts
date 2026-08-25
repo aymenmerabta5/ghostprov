@@ -182,6 +182,9 @@ function isGhostProvPath(path: string): boolean {
   if (path === ".ghostprov-v2") return true;
   if (/^\.ghostprov-v2\/(?:src|sandbox)(?:\/.*)?$/.test(path)) return true;
   if (/^\.ghostprov-v2\/revisions(?:\/.*)?$/.test(path)) return true;
+  if (
+    /^\.ghostprov-v2\/bootstrap-(?:main|output)\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.tex$/.test(path)
+  ) return true;
   return [
     ".ghostprov-v2/bootstrap-output.tex",
     ".ghostprov-v2/deno.json",

@@ -118,14 +118,25 @@ export type SandboxRecoveryErrorKind = typeof SANDBOX_RECOVERY_ERROR_KINDS[numbe
 
 /** Exact secret-free atoms the R2 sidecar may emit in its fatal JSON record. */
 export const V2_SIDECAR_FATAL_ERROR_NAMES = [
+  "AdmissionError",
   "AggregateError",
+  "AwarenessChannelError",
+  "ClaimJournalError",
   "DOMException",
   "Error",
+  "JournalStorageCapacityError",
+  "JournalStorageDurabilityError",
+  "NotCapable",
   "RangeError",
+  "RequestAssemblyError",
+  "SidecarCloseError",
+  "SidecarCredentialRotationError",
   "SidecarLifecycleError",
   "SidecarOwnershipError",
   "SyntaxError",
   "TypeError",
+  "UpstreamExecutionError",
+  "V2ExecutionFenceError",
   "unknown",
 ] as const;
 export type V2SidecarFatalErrorName = typeof V2_SIDECAR_FATAL_ERROR_NAMES[number];
@@ -160,6 +171,24 @@ export const V2_SIDECAR_FATAL_CAUSE_NAMES = [
   "unknown",
 ] as const;
 export type V2SidecarFatalCauseName = typeof V2_SIDECAR_FATAL_CAUSE_NAMES[number] | null;
+
+export const V2_SIDECAR_FATAL_PHASES = [
+  "awareness_connect",
+  "bootstrap",
+  "config",
+  "engine_start",
+  "environment",
+  "ownership",
+  "runtime",
+  "storage",
+  "unknown",
+] as const;
+export type V2SidecarFatalPhase = typeof V2_SIDECAR_FATAL_PHASES[number];
+
+export const V2_SIDECAR_FATAL_PERMISSIONS = [
+  "env", "ffi", "net", "read", "run", "sys", "write", "unknown",
+] as const;
+export type V2SidecarFatalPermission = typeof V2_SIDECAR_FATAL_PERMISSIONS[number] | null;
 
 export const CREDENTIAL_REFRESH_OUTCOMES = [
   "cookie_retry_succeeded",
@@ -229,6 +258,8 @@ export interface RecoveryObservabilityFields {
   sidecar_error_name?: V2SidecarFatalErrorName | null;
   sidecar_error_code?: V2SidecarFatalErrorCode | null;
   sidecar_cause_name?: V2SidecarFatalCauseName;
+  sidecar_phase?: V2SidecarFatalPhase | null;
+  sidecar_permission?: V2SidecarFatalPermission;
   operation?: SandboxRecoveryOperation | null;
   retry_delay_ms?: number;
   attempt_duration_ms?: number;
@@ -246,6 +277,8 @@ const RECOVERY_ERROR_KIND_SET = new Set<string>(SANDBOX_RECOVERY_ERROR_KINDS);
 const V2_SIDECAR_FATAL_ERROR_NAME_SET = new Set<string>(V2_SIDECAR_FATAL_ERROR_NAMES);
 const V2_SIDECAR_FATAL_ERROR_CODE_SET = new Set<string>(V2_SIDECAR_FATAL_ERROR_CODES);
 const V2_SIDECAR_FATAL_CAUSE_NAME_SET = new Set<string>(V2_SIDECAR_FATAL_CAUSE_NAMES);
+const V2_SIDECAR_FATAL_PHASE_SET = new Set<string>(V2_SIDECAR_FATAL_PHASES);
+const V2_SIDECAR_FATAL_PERMISSION_SET = new Set<string>(V2_SIDECAR_FATAL_PERMISSIONS);
 
 /** Collapse a possibly dynamic supervisor reason to a fixed safe category. */
 export function normalizeSandboxRecoveryCause(value: unknown): SandboxRecoveryCause {
@@ -320,6 +353,19 @@ export function normalizeV2SidecarFatalCauseName(value: unknown): V2SidecarFatal
   if (value === null || value === undefined) return null;
   return typeof value === "string" && V2_SIDECAR_FATAL_CAUSE_NAME_SET.has(value)
     ? value as Exclude<V2SidecarFatalCauseName, null>
+    : "unknown";
+}
+
+export function normalizeV2SidecarFatalPhase(value: unknown): V2SidecarFatalPhase {
+  return typeof value === "string" && V2_SIDECAR_FATAL_PHASE_SET.has(value)
+    ? value as V2SidecarFatalPhase
+    : "unknown";
+}
+
+export function normalizeV2SidecarFatalPermission(value: unknown): V2SidecarFatalPermission {
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" && V2_SIDECAR_FATAL_PERMISSION_SET.has(value)
+    ? value as Exclude<V2SidecarFatalPermission, null>
     : "unknown";
 }
 

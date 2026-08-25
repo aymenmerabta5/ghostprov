@@ -69,4 +69,6 @@ export interface SandboxFailureSnapshot {
   sidecarErrorName?: string;
   sidecarErrorCode?: string;
   sidecarCauseName?: string | null;
+  sidecarPhase?: string;
+  sidecarPermission?: string | null;
 }

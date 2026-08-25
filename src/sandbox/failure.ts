@@ -25,6 +25,10 @@ export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
   const sidecarCauseName = sidecar?.causeName === null
     ? null
     : safeDetail(sidecar?.causeName);
+  const sidecarPhase = safeDetail(sidecar?.phase);
+  const sidecarPermission = sidecar?.permission === null
+    ? null
+    : safeDetail(sidecar?.permission);
   const rawMessage = error instanceof Error ? error.message : String(error ?? "Sandbox runtime failed");
   const rawName = error instanceof Error ? error.name : "Error";
   const status = typeof record.status === "number" && Number.isInteger(record.status) &&
@@ -42,6 +46,8 @@ export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
           sidecarErrorName,
           sidecarErrorCode,
           sidecarCauseName,
+          ...(sidecarPhase ? { sidecarPhase } : {}),
+          ...(sidecarPermission !== undefined ? { sidecarPermission } : {}),
         }
       : {}),
   };

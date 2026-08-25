@@ -29,6 +29,17 @@ async function assertRejects(
   throw new Error("expected operation to reject");
 }
 
+function assertThrows(operation: () => unknown, pattern: RegExp): void {
+  try {
+    operation();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    assert(pattern.test(message), `unexpected thrown error: ${message}`);
+    return;
+  }
+  throw new Error("expected operation to throw");
+}
+
 async function withStorage(
   operation: (input: {
     root: string;
@@ -61,6 +72,7 @@ async function withStorage(
   const journalRoot = `${root}/journals/r2`;
   const storage = new DenoJournalStorage({
     root: journalRoot,
+    rootBoundary: root,
     maxTerminalSpoolBytes: options.maxTerminalSpoolBytes,
     maxTerminalBytes: options.maxTerminalBytes,
     maxActiveSpools: options.maxActiveSpools,
@@ -77,6 +89,183 @@ async function withStorage(
     await Deno.remove(root, { recursive: true }).catch(() => undefined);
   }
 }
+
+Deno.test("journal roots validate POSIX, Windows drive, and UNC containment lexically", () => {
+  // A path must be absolute for the current kernel: `/x` is drive-relative on
+  // Windows, while drive and UNC spellings are not absolute POSIX paths.
+  if (Deno.build.os === "windows") {
+    new DenoJournalStorage({
+      root: String.raw`C:\Owned\journals/r2`,
+      rootBoundary: "c:/owned",
+    });
+    new DenoJournalStorage({
+      root: "//SERVER/SHARE/Owned/journals/r2",
+      rootBoundary: String.raw`\\server\share\owned`,
+    });
+    assertThrows(
+      () => new DenoJournalStorage({ root: "/owned/journals/r2" }),
+      /not an absolute path on this host/i,
+    );
+  } else {
+    new DenoJournalStorage({
+      root: "/owned/journals/r2/",
+      rootBoundary: "/owned/",
+    });
+    assertThrows(
+      () => new DenoJournalStorage({ root: String.raw`C:\owned\journals\r2` }),
+      /not an absolute path on this host/i,
+    );
+    assertThrows(
+      () => new DenoJournalStorage({ root: String.raw`\\server\share\owned` }),
+      /not an absolute path on this host/i,
+    );
+  }
+
+  const escaped: Array<{ root: string; rootBoundary: string }> = [
+    { root: "/owned/../escape", rootBoundary: "/owned" },
+    { root: "/owned-other/r2", rootBoundary: "/owned" },
+    { root: String.raw`C:\owned\..\escape`, rootBoundary: String.raw`C:\owned` },
+    { root: String.raw`D:\owned\r2`, rootBoundary: String.raw`C:\owned` },
+    {
+      root: String.raw`\\server\share\owned\..\escape`,
+      rootBoundary: String.raw`\\server\share\owned`,
+    },
+    {
+      root: String.raw`\\server\other\owned\r2`,
+      rootBoundary: String.raw`\\server\share\owned`,
+    },
+  ];
+  for (const options of escaped) {
+    assertThrows(
+      () => new DenoJournalStorage(options),
+      /absolute filesystem path|absolute path on this host|descend from/i,
+    );
+  }
+  assertThrows(
+    () => new DenoJournalStorage({ root: "relative/journal" }),
+    /absolute filesystem path/i,
+  );
+  assertThrows(
+    () => new DenoJournalStorage({ root: String.raw`\\?\C:\owned` }),
+    /absolute filesystem path/i,
+  );
+  assertThrows(
+    () => new DenoJournalStorage({ root: String.raw`\\server-without-share` }),
+    /absolute filesystem path/i,
+  );
+});
+
+Deno.test("explicit journal boundary is pre-existing and no ancestor is created or synced", async () => {
+  const parent = await Deno.makeTempDir({ prefix: "ghostprov-deno-boundary-parent-" });
+  const missingBoundary = `${parent}/missing/boundary`;
+  const synced: string[] = [];
+  try {
+    const storage = new DenoJournalStorage({
+      root: `${missingBoundary}/journals/r2`,
+      rootBoundary: missingBoundary,
+      syncDirectory: path => {
+        synced.push(path);
+        return Promise.resolve();
+      },
+    });
+    await assertRejects(
+      () => storage.writeTerminal("req-missing-boundary", new Uint8Array([1])),
+      /not found|cannot find|no such file|pre-existing/i,
+    );
+    await assertRejects(
+      () => Deno.lstat(`${parent}/missing`),
+      /not found|cannot find|no such file/i,
+    );
+    assert(synced.length === 0, "missing explicit boundary caused an ancestor sync");
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("explicit journal boundary creates and fences descendants only", async () => {
+  const boundary = await Deno.makeTempDir({ prefix: "ghostprov-deno-boundary-owned-" });
+  const synced: string[] = [];
+  const portableBoundary = boundary.replaceAll("\\", "/").replace(/\/+$/, "");
+  const boundaryKey = Deno.build.os === "windows"
+    ? portableBoundary.toLowerCase()
+    : portableBoundary;
+  try {
+    const storage = new DenoJournalStorage({
+      root: `${boundary}/journals/r2`,
+      rootBoundary: boundary,
+      syncDirectory: path => {
+        synced.push(path);
+        return Promise.resolve();
+      },
+    });
+    await storage.writeTerminal("req-owned-boundary", new Uint8Array([1, 2, 3]));
+    assert(synced.length > 0, "descendant creation was not durability-fenced");
+    for (const path of synced) {
+      const portablePath = path.replaceAll("\\", "/");
+      const pathKey = Deno.build.os === "windows" ? portablePath.toLowerCase() : portablePath;
+      assert(
+        pathKey === boundaryKey || pathKey.startsWith(`${boundaryKey}/`),
+        `journal storage synced outside its boundary: ${path}`,
+      );
+    }
+    assert(
+      (await Deno.stat(`${boundary}/journals/r2/terminals/req-owned-boundary.json`)).size === 3,
+      "explicit-boundary terminal was not written",
+    );
+  } finally {
+    await Deno.remove(boundary, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("legacy root-only construction creates a missing root component-by-component", async () => {
+  const parent = await Deno.makeTempDir({ prefix: "ghostprov-deno-legacy-root-" });
+  const root = `${parent}/missing/journal`;
+  try {
+    const storage = new DenoJournalStorage(root);
+    await storage.writeTerminal("req-legacy-root", new Uint8Array([4, 5, 6]));
+    assert(
+      (await Deno.stat(`${root}/terminals/req-legacy-root.json`)).size === 3,
+      "legacy root-only storage did not create its missing root",
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test({
+  name: "explicit and legacy hierarchy walks reject symlink escapes",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const boundary = await Deno.makeTempDir({ prefix: "ghostprov-deno-symlink-boundary-" });
+    const outside = await Deno.makeTempDir({ prefix: "ghostprov-deno-symlink-outside-" });
+    try {
+      await Deno.symlink(outside, `${boundary}/redirect`);
+      for (const storage of [
+        new DenoJournalStorage({
+          root: `${boundary}/redirect/explicit-root`,
+          rootBoundary: boundary,
+        }),
+        new DenoJournalStorage(`${boundary}/redirect/legacy-root`),
+      ]) {
+        await assertRejects(
+          () => storage.writeTerminal("req-symlink-escape", new Uint8Array([1])),
+          /real director|symbolic|hierarchy/i,
+        );
+      }
+      await assertRejects(
+        () => Deno.stat(`${outside}/explicit-root`),
+        /not found|cannot find|no such file/i,
+      );
+      await assertRejects(
+        () => Deno.stat(`${outside}/legacy-root`),
+        /not found|cannot find|no such file/i,
+      );
+    } finally {
+      await Deno.remove(boundary, { recursive: true }).catch(() => undefined);
+      await Deno.remove(outside, { recursive: true }).catch(() => undefined);
+    }
+  },
+});
 
 Deno.test({
   name: "owned sidecar atomically promotes only its exact candidate process identity",
@@ -273,7 +462,10 @@ Deno.test("first journal append does not resolve when the parent-directory fence
     recordedAtMs: 1,
   };
   let journalRootSyncs = 0;
-  const failureSync = Deno.build.os === "windows" ? 1 : 2;
+  // Both native implementations now create the hierarchy component-by-
+  // component: the first root fence publishes `terminals`, and the second is
+  // the first claims.jsonl entry that this fault model targets.
+  const failureSync = 2;
   await withStorage(async ({ journalRoot, storage }) => {
     await assertRejects(() => storage.appendAndSync([first]), /synthetic directory fsync failure/i);
     const restarted = new DenoJournalStorage({

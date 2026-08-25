@@ -43,6 +43,9 @@ type Fault =
   | "stale-instance"
   | "sidecar-log"
   | "sidecar-fatal"
+  | "post-hello-fatal"
+  | "same-owner-retry"
+  | "same-owner-no-cache"
   | "sidecar-log-secret"
   | "timeout"
   | "first-wrong-nonce";
@@ -132,6 +135,8 @@ class FakeGateway implements V2BootstrapGateway {
   readonly mainDocuments: string[] = [];
   logs = "";
   renders = 0;
+  bootstrapRenders = 0;
+  awaitingReadiness = false;
   current: {
     binding: BootstrapBinding;
     instanceId: string;
@@ -149,10 +154,33 @@ class FakeGateway implements V2BootstrapGateway {
     this.renders++;
     this.mainDocuments.push(request?.mainDocument ?? "");
     this.launchers.push(this.ydoc.files.get(".latexmkrc") ?? "");
+    if (this.awaitingReadiness) {
+      const message = this.fault === "post-hello-fatal"
+        ? JSON.stringify({
+            event: "ghostprov_v2_sidecar_fatal",
+            error_name: "SidecarOwnershipError",
+            error_code: "lost",
+            cause_name: "Error",
+            phase: "engine_start",
+            permission: "write",
+          })
+        : "sidecar log is missing";
+      const wrapped = Buffer.from(message).toString("hex").match(/.{1,48}/g)!.join("\n");
+      this.logs = `render starting\nGPV2_SIDECAR_HEX ${wrapped}\n) render continues\n`;
+      return;
+    }
     const config = JSON.parse(this.ydoc.files.get(".ghostprov-v2/static.json")!) as {
       binding: BootstrapBinding;
     };
     this.nonces.push(config.binding.nonce);
+    this.bootstrapRenders++;
+    if (
+      this.fault === "same-owner-no-cache" ||
+      (this.fault === "same-owner-retry" && this.bootstrapRenders > 1)
+    ) {
+      this.logs = `render starting\nGPV2_OWNER_REUSED ${config.binding.nonce}\n) render continues\n`;
+      return;
+    }
     const helloBinding = (
       this.fault === "wrong-nonce" ||
       (this.fault === "first-wrong-nonce" && this.renders === 1)
@@ -236,6 +264,7 @@ function bootstrapHarness(
   revision?: "r1" | "r2",
   maxActivePerSandbox = 8,
   assets = ASSETS,
+  controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number } = {},
 ) {
   const clock = new FakeClock();
   const random = new FakeRandom();
@@ -244,6 +273,7 @@ function bootstrapHarness(
   const gateway = new FakeGateway(ydoc, fault);
   const decrypted: string[] = [];
   const decryptedCredentials: BootstrapCredentialPayload[] = [];
+  let ciphertextWrites = 0;
   const ySweet = parseYSweetEnvelope({
     url: `wss://prism.test/y/d/${PROJECT}/ws`,
     baseUrl: `https://prism.test/y/d/${PROJECT}`,
@@ -252,6 +282,10 @@ function bootstrapHarness(
     authorization: "full",
   });
   ydoc.onWrite = async (path, content) => {
+    if (path === ".latexmkrc" && content.includes("temporary bootstrap launcher")) {
+      gateway.awaitingReadiness = false;
+      return;
+    }
     if (path !== ".ghostprov-v2/bootstrap.enc.json") return;
     const current = gateway.current!;
     const credential = await openBootstrapCredential({
@@ -261,8 +295,12 @@ function bootstrapHarness(
     });
     decrypted.push(credential.token);
     decryptedCredentials.push(credential);
-    if (fault !== "timeout") {
+    ciphertextWrites++;
+    gateway.awaitingReadiness = true;
+    if (fault === "same-owner-retry" && ciphertextWrites === 1) return;
+    if (fault !== "timeout" && fault !== "post-hello-fatal") {
       awareness.sidecar(readyEnvelope(current.binding, current.instanceId, fault));
+      gateway.awaitingReadiness = false;
     }
   };
   const controller = new V2BootstrapController({
@@ -279,9 +317,9 @@ function bootstrapHarness(
     ...(revision === "r2" && assets.revision === "r2"
       ? { launchNonce: "r2-launch-nonce" }
       : {}),
-    attempts: 3,
-    timeoutMs: 20,
-    pollMs: 5,
+    attempts: controllerTiming.attempts ?? 3,
+    timeoutMs: controllerTiming.timeoutMs ?? 20,
+    pollMs: controllerTiming.pollMs ?? 5,
     clock,
     random,
     diagnostics: { enabled: true, intervalMs: 1_000 },
@@ -361,6 +399,36 @@ describe("V2BootstrapController", () => {
     expect(harness.ydoc.deleted.filter(path => path.endsWith("bootstrap.enc.json"))).toHaveLength(2);
   });
 
+  it("adopts a proven same-nonce owner with its cached one-shot hello", async () => {
+    const harness = bootstrapHarness("same-owner-retry", "r2", 8, R2_ASSETS);
+
+    await expect(harness.controller.ensureReady()).resolves.toMatchObject({
+      instanceId: "sidecar-instance-1",
+      launchNonce: "r2-launch-nonce",
+    });
+
+    expect(harness.gateway.nonces).toEqual(["r2-launch-nonce", "r2-launch-nonce"]);
+    expect(harness.gateway.bootstrapRenders).toBe(2);
+    expect(harness.gateway.launchers[2]).toContain("temporary bootstrap launcher");
+    expect(harness.decrypted).toEqual([TOKEN, TOKEN]);
+    expect(harness.decryptedCredentials[1]!.rotationKey)
+      .toBe(harness.decryptedCredentials[0]!.rotationKey);
+  });
+
+  it("fails a retained same-nonce owner in bounded attempts without a cached hello", async () => {
+    const harness = bootstrapHarness("same-owner-no-cache", "r2", 8, R2_ASSETS);
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "hello",
+      message: expect.stringContaining("without its cached bootstrap hello"),
+    });
+
+    expect(harness.gateway.renders).toBe(3);
+    expect(harness.gateway.bootstrapRenders).toBe(3);
+    expect(harness.decrypted).toEqual([]);
+  });
+
   it("runs exact prior-owner retirement again before a retry fork", async () => {
     const harness = bootstrapHarness("first-wrong-nonce", "r2", 8, R2_ASSETS);
 
@@ -374,7 +442,7 @@ describe("V2BootstrapController", () => {
       expect(takeover).toBeGreaterThan(-1);
       expect(takeover).toBeLessThan(launcher.indexOf("my $gp_pid = fork()"));
       expect(launcher).toContain(
-        "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
+        "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint, $gp_static_path, $gp_expected_static)",
       );
     }
   });
@@ -398,16 +466,19 @@ describe("V2BootstrapController", () => {
     });
   });
 
-  it("replaces a legacy root main file with the V2 bootstrap log bridge", async () => {
+  it("keeps the root main inert and renders a nonce-specific bootstrap bridge", async () => {
     const harness = bootstrapHarness();
     harness.ydoc.files.set("main.tex", "legacy V1 document\n");
 
     await harness.controller.ensureReady();
 
-    expect(harness.gateway.mainDocuments).toEqual(["main.tex"]);
+    const nonce = "00000000-0000-4000-8000-000000000001";
+    const bootstrapMain = `.ghostprov-v2/bootstrap-main.${nonce}.tex`;
+    expect(harness.gateway.mainDocuments).toEqual([bootstrapMain]);
     expect(harness.ydoc.files.get("main.tex")).not.toBe("legacy V1 document\n");
-    expect(harness.ydoc.files.get("main.tex"))
-      .toContain("\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}");
+    expect(harness.ydoc.files.get("main.tex")).toContain("launcher inactive");
+    expect(harness.ydoc.writes.find(write => write.path === bootstrapMain)?.content)
+      .toContain(`\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`);
   });
 
   it("publishes the bootstrap hello and bounded child diagnostics through the TeX log", async () => {
@@ -415,10 +486,15 @@ describe("V2BootstrapController", () => {
 
     await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
 
-    expect(harness.gateway.launchers[0]).toContain("bootstrap-output.tex");
+    const nonce = "00000000-0000-4000-8000-000000000001";
+    expect(harness.gateway.launchers[0])
+      .toContain(`bootstrap-output.${nonce}.tex`);
+    expect(harness.gateway.launchers[0]).toContain(`sidecar.${nonce}.log`);
+    expect(harness.gateway.launchers[0]).not.toContain("'/tmp/ghostprov-v2/sidecar.log'");
+    expect(harness.gateway.launchers[0])
+      .not.toContain("'/workspace/.ghostprov-v2/bootstrap-output.tex'");
     expect(harness.gateway.launchers[0]).toContain("typeout{$gp_marker}");
     expect(harness.gateway.launchers[0]).toContain("GPV2_SIDECAR_HEX ");
-    expect(harness.gateway.launchers[0]).toContain("/tmp/ghostprov-v2/sidecar.log");
     expect(harness.gateway.launchers[0]).toContain("command -v deno");
     expect(harness.gateway.launchers[0]).toContain("/usr/local/bin/deno");
     expect(harness.gateway.launchers[0]).toContain("$gp_deno");
@@ -426,8 +502,11 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.launchers[0]).toContain(`/workspace/${ASSETS.entrypointPath}`);
     expect(harness.gateway.launchers[0]).not.toContain("--config=/workspace/.ghostprov-v2/deno.json");
     expect(harness.gateway.launchers[0]).toContain("NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM");
-    expect(harness.ydoc.writes.find(write => write.path === "main.tex")?.content)
-      .toContain("\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}");
+    expect(harness.ydoc.writes.find(write => (
+      write.path === `.ghostprov-v2/bootstrap-main.${nonce}.tex`
+    ))?.content).toContain(
+      `\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`,
+    );
   });
 
   it("stages a candidate and never opens the incumbent PID for in-place overwrite", async () => {
@@ -438,7 +517,7 @@ describe("V2BootstrapController", () => {
     const candidateWrite = launcher.indexOf(
       "open my $gp_pid_fh, '>', $gp_candidate_pid_file",
     );
-    const helloProof = launcher.indexOf("if ($gp_hello_seen) {");
+    const helloProof = launcher.indexOf("if ($gp_hello_seen) {\n  my $gp_promoted", candidateWrite);
     const atomicPromotion = launcher.indexOf(
       "rename $gp_candidate_pid_file, $gp_pid_file",
     );
@@ -485,7 +564,7 @@ describe("V2BootstrapController", () => {
     );
   });
 
-  it("retires a strictly proven prior R2 owner before forking a fresh build", async () => {
+  it("retires a strictly proven prior immutable owner before forking a fresh build", async () => {
     const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
     await harness.controller.ensureReady();
     const launcher = harness.gateway.launchers[0]!;
@@ -493,12 +572,19 @@ describe("V2BootstrapController", () => {
     const authority = launcher.indexOf("bootstrap launcher binding is no longer current");
     const takeover = launcher.indexOf("my $gp_prior_owner = $gp_deno && !$gp_launch_error ? gp_owner_record_if_locked");
     const fork = launcher.indexOf("my $gp_pid = fork()");
+    const authoritativeOutput = launcher.lastIndexOf(
+      "if ($gp_authoritative && length($gp_marker) && gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    );
+    const outputWrite = launcher.lastIndexOf("open my $gp_tex_fh, '>', $gp_tex");
 
     expect(takeover).toBeGreaterThan(-1);
     expect(denoDiscovery).toBeLessThan(takeover);
     expect(authority).toBeGreaterThan(-1);
     expect(authority).toBeLessThan(takeover);
     expect(takeover).toBeLessThan(fork);
+    expect(authoritativeOutput).toBeGreaterThan(fork);
+    expect(outputWrite).toBeGreaterThan(authoritativeOutput);
+    expect(launcher).toContain("$gp_authoritative = 0; $gp_launch_error = 'bootstrap launcher binding is no longer current'");
     expect(launcher).toContain("$gp_current_static ne $gp_expected_static");
     expect(launcher).toContain("if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner)");
     expect(launcher).toContain("sub gp_exact_r2_entrypoint");
@@ -509,19 +595,32 @@ describe("V2BootstrapController", () => {
       "gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
     );
     expect(launcher).toContain(
-      "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
+      "gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint, $gp_static_path, $gp_expected_static)",
     );
     expect(launcher).toContain(
       "gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_prior_pid_record)",
     );
     expect(launcher).toContain("existing sidecar ownership lock did not release");
-    expect(launcher).toContain("if ($gp_deno && !$gp_launch_error)");
+    expect(launcher).toContain("$gp_prior_nonce eq $gp_launch_nonce && $gp_prior_entrypoint eq $gp_expected");
+    expect(launcher).toContain("$gp_reused_owner = 1;");
+    expect(launcher).toContain("$gp_marker = \"GPV2_OWNER_REUSED $gp_launch_nonce\"");
+    expect(launcher).toContain(
+      "if ($gp_deno && !$gp_launch_error && !$gp_reused_owner && !$gp_repeated_attempt)",
+    );
+    expect(launcher).toContain("$gp_attempt_claimed && !$gp_hello_seen");
+    expect(launcher).not.toContain("current owned sidecar hello is unavailable");
+    expect(launcher).toContain(
+      "my $gp_prior_entrypoint = defined($gp_prior_pid) ? gp_exact_sidecar_entrypoint($gp_prior_pid) : undef",
+    );
+    expect(launcher).not.toContain(
+      "my $gp_prior_entrypoint = defined($gp_prior_pid) ? gp_exact_r2_entrypoint($gp_prior_pid) : undef",
+    );
     expect(launcher).toContain("sub gp_exact_sidecar_entrypoint");
     expect(launcher).toContain(
       "/workspace/\\.ghostprov-v2/revisions/r[12]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
     );
     expect(launcher).toContain(
-      "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint)",
+      "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint, $gp_static_path, $gp_expected_static)",
     );
     expect(launcher).toContain("sidecar ownership changed during startup preflight");
     expect(launcher).toContain("sub gp_process_state_start");
@@ -532,15 +631,88 @@ describe("V2BootstrapController", () => {
     );
   });
 
+  it("keeps a crashed promoted same-nonce launch diagnostic-only", async () => {
+    const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+    const sameNonceProof = launcher.indexOf(
+      "defined($gp_prior_start) && $gp_prior_nonce eq $gp_launch_nonce",
+    );
+    const preflight = launcher.indexOf(
+      "open my $gp_preflight_owner_fh, '+>>', $gp_owner_file",
+    );
+    const attemptClaim = launcher.indexOf("mkdir $gp_attempt_path, 0700");
+    const fork = launcher.indexOf("my $gp_pid = fork()");
+    const logUnlink = launcher.indexOf("unlink $gp_log if -e $gp_log", attemptClaim);
+
+    expect(launcher).toContain("bootstrap-attempt.$gp_launch_nonce");
+    expect(launcher).toContain("my $gp_attempt_claim_limit = 256");
+    expect(launcher).toContain(
+      "^bootstrap-attempt\\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    );
+    expect(launcher).toContain("bootstrap attempt claim capacity is exhausted");
+    expect(launcher).toContain("last if $gp_attempt_claim_count >= $gp_attempt_claim_limit");
+    expect(launcher).toContain("$gp_repeated_attempt = 1");
+    expect(launcher).toContain("same-nonce sidecar no longer has a live owner");
+    expect(launcher).toContain("$gp_marker = gp_hex_diag($gp_repeated_diag)");
+    expect(sameNonceProof).toBeGreaterThan(-1);
+    expect(sameNonceProof).toBeLessThan(preflight);
+    expect(attemptClaim).toBeLessThan(fork);
+    expect(launcher).toContain(
+      "if ($gp_deno && !$gp_launch_error && $gp_attempt_claimed)",
+    );
+    expect(logUnlink).toBeGreaterThan(attemptClaim);
+    expect(logUnlink).toBeLessThan(fork);
+  });
+
+  it("rechecks stale-launch authority at every signal, claim, and fork boundary", async () => {
+    const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+    const signalHelper = launcher.indexOf("sub gp_signal_if_authoritative");
+    const signalAuthority = launcher.indexOf(
+      "return 0 unless gp_static_authority_is_current($gp_static_path, $gp_expected_static)",
+      signalHelper,
+    );
+    const destructiveSignal = launcher.indexOf("return kill $gp_signal, $gp_target", signalHelper);
+    const claim = launcher.indexOf(
+      "gp_static_authority_is_current($gp_static_path, $gp_expected_static) && mkdir $gp_attempt_path",
+    );
+    const fork = launcher.indexOf("my $gp_pid = fork()");
+    const forkAuthority = launcher.lastIndexOf(
+      "!gp_static_authority_is_current($gp_static_path, $gp_expected_static)",
+      fork,
+    );
+
+    expect(signalHelper).toBeGreaterThan(-1);
+    expect(signalAuthority).toBeGreaterThan(signalHelper);
+    expect(destructiveSignal).toBeGreaterThan(signalAuthority);
+    expect(launcher).not.toContain("kill 'TERM'");
+    expect(launcher).not.toContain("kill 'KILL'");
+    expect(launcher).toContain(
+      "gp_signal_if_authoritative('TERM', -$gp_pid, $gp_static_path, $gp_expected_static)",
+    );
+    expect(launcher).toContain(
+      "gp_signal_if_authoritative('KILL', -$gp_pid, $gp_static_path, $gp_expected_static)",
+    );
+    expect(claim).toBeGreaterThan(-1);
+    expect(claim).toBeLessThan(fork);
+    expect(forkAuthority).toBeGreaterThan(claim);
+    expect(forkAuthority).toBeLessThan(fork);
+    expect(launcher).toContain(
+      "length($gp_marker) && gp_static_authority_is_current($gp_static_path, $gp_expected_static)",
+    );
+  });
+
   it("reaps an exit-fast contender and removes only its exact candidate identity", async () => {
     const harness = bootstrapHarness("none", "r2", 8, R2_ASSETS);
     await harness.controller.ensureReady();
     const launcher = harness.gateway.launchers[0]!;
     const helloPoll = launcher.indexOf(
-      "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_try < 900",
+      "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_attempt_claimed && !$gp_hello_seen && $gp_try < 500",
     );
     const exited = launcher.indexOf(
-      "waitpid($gp_child_pid, 1) == $gp_child_pid",
+      "my $gp_waited = waitpid($gp_child_pid, 1)",
       helloPoll,
     );
     const pollSleep = launcher.indexOf("0.05;", helloPoll);
@@ -549,6 +721,10 @@ describe("V2BootstrapController", () => {
     expect(exited).toBeGreaterThan(helloPoll);
     expect(exited).toBeLessThan(pollSleep);
     expect(launcher).toContain("sidecar exited before bootstrap hello");
+    expect(launcher).toContain("sub gp_process_is_same_live");
+    expect(launcher).toContain("!gp_process_is_same_live($gp_child_pid, $gp_child_start)");
+    expect(launcher).toContain("$gp_try < 20 && gp_group_alive($gp_pid)");
+    expect(launcher).toContain("$gp_try < 300 && !$gp_promoted");
     expect(launcher).toContain(
       "$gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag)",
     );
@@ -580,6 +756,93 @@ describe("V2BootstrapController", () => {
       },
     });
   });
+
+  it("captures an exact sidecar fatal record when readiness fails after hello", async () => {
+    const harness = bootstrapHarness("post-hello-fatal");
+
+    await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+      name: "V2BootstrapError",
+      kind: "readiness",
+      sidecarDiagnostic: {
+        errorName: "SidecarOwnershipError",
+        errorCode: "lost",
+        causeName: "Error",
+        phase: "engine_start",
+        permission: "write",
+      },
+    });
+    const launcher = harness.gateway.launchers[0]!;
+    expect(launcher).toContain("sub gp_read_tail");
+    expect(launcher).toContain("read $gp_fh, $gp_value, $gp_limit");
+    expect(launcher).toContain("gp_read_tail($gp_log, 4096)");
+    expect(launcher).toContain("$gp_secondary_marker");
+    expect(harness.ydoc.writes.some(write => (
+      write.content.includes("bounded sidecar diagnostic launcher")
+    ))).toBe(false);
+  });
+
+  it("keeps delayed renders confined to nonce-specific log, output, and main artifacts", async () => {
+    const harness = bootstrapHarness("post-hello-fatal", "r2", 8, R2_ASSETS);
+    await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
+
+    const nonce = "r2-launch-nonce";
+    const mainPath = `.ghostprov-v2/bootstrap-main.${nonce}.tex`;
+    const outputPath = `.ghostprov-v2/bootstrap-output.${nonce}.tex`;
+    expect(new Set(harness.gateway.mainDocuments)).toEqual(new Set([mainPath]));
+    expect(harness.gateway.launchers.every(launcher => (
+      launcher.includes(`/tmp/ghostprov-v2/sidecar.${nonce}.log`) &&
+      launcher.includes(`/workspace/${outputPath}`)
+    ))).toBe(true);
+    expect(harness.ydoc.deleted).toEqual(expect.arrayContaining([mainPath, outputPath]));
+    expect(harness.ydoc.writes.find(write => write.path === mainPath)?.content)
+      .toContain(`\\InputIfFileExists{${outputPath}}{}{}`);
+  });
+
+  it.each(["state", "render", "fetch"] as const)(
+    "keeps the post-hello diagnostic deadline when %s ignores cancellation",
+    async stage => {
+      const harness = bootstrapHarness(
+        "post-hello-fatal",
+        undefined,
+        8,
+        ASSETS,
+        { attempts: 1, timeoutMs: 20, pollMs: 5 },
+      );
+      const never = () => new Promise<void>(() => undefined);
+      const originalState = harness.ydoc.renderSyncState.bind(harness.ydoc);
+      const originalRender = harness.gateway.triggerRender.bind(harness.gateway);
+      const originalFetch = harness.gateway.fetchText.bind(harness.gateway);
+      if (stage === "state") {
+        harness.ydoc.renderSyncState = async () => {
+          if (harness.gateway.awaitingReadiness) {
+            await never();
+          }
+          return originalState();
+        };
+      } else if (stage === "render") {
+        harness.gateway.triggerRender = async request => {
+          if (harness.gateway.awaitingReadiness) {
+            await never();
+          }
+          await originalRender(request);
+        };
+      } else {
+        harness.gateway.fetchText = async suffix => {
+          if (harness.gateway.awaitingReadiness) {
+            await never();
+          }
+          return originalFetch(suffix);
+        };
+      }
+
+      const startedAt = performance.now();
+      await expect(harness.controller.ensureReady()).rejects.toMatchObject({
+        name: "V2BootstrapError",
+        kind: "readiness",
+      });
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+    },
+  );
 
   it("redacts credential-shaped values from sidecar launch diagnostics", async () => {
     const harness = bootstrapHarness("sidecar-log-secret");
@@ -808,7 +1071,7 @@ describe("V2BootstrapController", () => {
     const harness = bootstrapHarness(fault);
 
     await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
-    expect(harness.gateway.renders).toBe(3);
+    expect(harness.gateway.renders).toBe(fault === "wrong-nonce" ? 3 : 6);
     expect(new Set(harness.gateway.nonces).size).toBe(3);
     expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
     expect(harness.ydoc.writes.every(write => !write.content.includes(TOKEN))).toBe(true);

@@ -39,8 +39,10 @@ const REVISION_PATH = ".ghostprov-v2/revision.json";
 const LAUNCHER_PATH = ".latexmkrc";
 const MAIN_PATH = "main.tex";
 const HELLO_PREFIX = "GPV2_BOOTSTRAP ";
+const OWNER_REUSED_PREFIX = "GPV2_OWNER_REUSED ";
 const SIDECAR_HEX_PREFIX = "GPV2_SIDECAR_HEX ";
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const BOOTSTRAP_ATTEMPT_CLAIM_LIMIT = 256;
 
 function perlSingleQuoted(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -61,6 +63,18 @@ function processInterlockHelpers(): string[] {
     "  local $/; my $gp_value = <$gp_fh>; close $gp_fh;",
     "  return undef unless defined $gp_value && length($gp_value) <= $gp_limit;",
     "  return $gp_value;",
+    "}",
+    "sub gp_read_tail {",
+    "  my ($gp_path, $gp_limit) = @_;",
+    "  return undef unless defined($gp_limit) && $gp_limit =~ /^\\d+$/ && $gp_limit > 0 && $gp_limit <= 4096;",
+    "  return undef unless open my $gp_fh, '<', $gp_path;",
+    "  my $gp_size = -s $gp_fh;",
+    "  my $gp_offset = defined($gp_size) && $gp_size > $gp_limit ? $gp_size - $gp_limit : 0;",
+    "  seek $gp_fh, $gp_offset, 0;",
+    "  my $gp_value = '';",
+    "  my $gp_read = read $gp_fh, $gp_value, $gp_limit;",
+    "  close $gp_fh;",
+    "  return defined($gp_read) && $gp_read > 0 ? $gp_value : undef;",
     "}",
     "sub gp_record_is {",
     "  my ($gp_path, $gp_expected_record) = @_;",
@@ -90,6 +104,11 @@ function processInterlockHelpers(): string[] {
     "  my @gp_fields = split /\\s+/, $gp_tail;",
     "  return () unless @gp_fields > 18 && $gp_fields[18] =~ /^\\d+$/;",
     "  return ($gp_state, $gp_fields[18]);",
+    "}",
+    "sub gp_process_is_same_live {",
+    "  my ($gp_pid, $gp_start) = @_;",
+    "  my ($gp_state, $gp_live_start) = gp_process_state_start($gp_pid);",
+    "  return defined($gp_state) && $gp_state ne 'Z' && $gp_state ne 'X' && $gp_state ne 'x' && $gp_live_start eq $gp_start;",
     "}",
     "sub gp_process_matches {",
     "  my ($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
@@ -142,17 +161,30 @@ function processInterlockHelpers(): string[] {
     "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock) = @_;",
     "  return $gp_require_lock ? gp_owner_record_is_locked($gp_identity_path, $gp_identity_record) : gp_record_is($gp_identity_path, $gp_identity_record);",
     "}",
+    "sub gp_static_authority_is_current {",
+    "  my ($gp_static_path, $gp_expected_static) = @_;",
+    "  return 1 unless defined($gp_static_path) || defined($gp_expected_static);",
+    "  return 0 unless defined($gp_static_path) && defined($gp_expected_static);",
+    "  my $gp_current_static = gp_read_file($gp_static_path, 16384);",
+    "  return defined($gp_current_static) && $gp_current_static eq $gp_expected_static;",
+    "}",
+    "sub gp_signal_if_authoritative {",
+    "  my ($gp_signal, $gp_target, $gp_static_path, $gp_expected_static) = @_;",
+    "  return 0 unless gp_static_authority_is_current($gp_static_path, $gp_expected_static);",
+    "  return kill $gp_signal, $gp_target;",
+    "}",
     "sub gp_stop_if_current {",
-    "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock, $gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
+    "  my ($gp_identity_path, $gp_identity_record, $gp_require_lock, $gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint, $gp_static_path, $gp_expected_static) = @_;",
+    "  return 0 unless gp_static_authority_is_current($gp_static_path, $gp_expected_static);",
     "  return 0 unless gp_identity_is_current($gp_identity_path, $gp_identity_record, $gp_require_lock);",
     "  return 0 unless gp_process_matches($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint);",
-    "  kill 'TERM', -$gp_pid;",
-    "  for (my $gp_try = 0; $gp_try < 50 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
+    "  return 0 unless gp_signal_if_authoritative('TERM', -$gp_pid, $gp_static_path, $gp_expected_static);",
+    "  for (my $gp_try = 0; $gp_try < 20 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
     "  if (gp_group_alive($gp_pid)) {",
     "    return 0 unless gp_identity_is_current($gp_identity_path, $gp_identity_record, $gp_require_lock);",
     "    return 0 unless gp_process_matches($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint);",
-    "    kill 'KILL', -$gp_pid;",
-    "    for (my $gp_try = 0; $gp_try < 50 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
+    "    return 0 unless gp_signal_if_authoritative('KILL', -$gp_pid, $gp_static_path, $gp_expected_static);",
+    "    for (my $gp_try = 0; $gp_try < 20 && gp_group_alive($gp_pid); $gp_try++) { waitpid($gp_pid, 1); select undef, undef, undef, 0.1 if gp_group_alive($gp_pid); }",
     "  }",
     "  return gp_group_alive($gp_pid) ? 0 : 1;",
     "}",
@@ -236,11 +268,32 @@ function terminationLauncher(entrypointPath: string, launchNonce: string): strin
 const MAIN_SOURCE = [
   "\\documentclass{article}",
   "\\begin{document}",
-  "\\InputIfFileExists{.ghostprov-v2/bootstrap-output.tex}{}{}",
-  "GhostProv V2 sidecar bootstrap.",
+  "GhostProv V2 launcher inactive.",
   "\\end{document}",
   "",
 ].join("\n");
+
+function bootstrapArtifactPaths(launchNonce: string): {
+  mainPath: string;
+  outputPath: string;
+} {
+  if (!SAFE_ID.test(launchNonce)) throw new TypeError("launchNonce is invalid");
+  return {
+    mainPath: `.ghostprov-v2/bootstrap-main.${launchNonce}.tex`,
+    outputPath: `.ghostprov-v2/bootstrap-output.${launchNonce}.tex`,
+  };
+}
+
+function bootstrapMainSource(outputPath: string): string {
+  return [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    `\\InputIfFileExists{${outputPath}}{}{}`,
+    "GhostProv V2 sidecar bootstrap.",
+    "\\end{document}",
+    "",
+  ].join("\n");
+}
 
 export interface V2BootstrapYDoc {
   readPath(path: string): Promise<string | null>;
@@ -286,6 +339,8 @@ export interface V2SidecarFatalDiagnostic {
   readonly errorName: string;
   readonly errorCode: string;
   readonly causeName: string | null;
+  readonly phase?: string;
+  readonly permission?: string | null;
 }
 
 export class V2BootstrapError extends Error {
@@ -360,6 +415,9 @@ function temporaryLauncher(
   const expected = perlSingleQuoted(workspaceEntrypoint);
   const nonce = perlSingleQuoted(launchNonce);
   const expectedStatic = perlSingleQuoted(staticConfig);
+  const artifacts = bootstrapArtifactPaths(launchNonce);
+  const logPath = perlSingleQuoted(`/tmp/ghostprov-v2/sidecar.${launchNonce}.log`);
+  const outputPath = perlSingleQuoted(`/workspace/${artifacts.outputPath}`);
   const helloExpression = revision === "r2"
     ? '"$gp_dir/bootstrap-hello.$gp_launch_nonce.$gp_pid"'
     : '"$gp_dir/bootstrap-hello"';
@@ -376,53 +434,81 @@ function temporaryLauncher(
     `my $gp_expected = '${expected}';`,
     `my $gp_launch_nonce = '${nonce}';`,
     `my $gp_expected_static = '${expectedStatic}';`,
+    "my $gp_static_path = '/workspace/.ghostprov-v2/static.json';",
     `my $gp_require_owner = ${revision === "r2" ? 1 : 0};`,
     "my $gp_hello = '';",
     "my $gp_candidate_pid_file = '';",
     "my $gp_candidate_record = '';",
     "my $gp_child_pid = 0;",
     "my $gp_child_start = '';",
+    "my $gp_reused_owner = 0;",
+    "my $gp_repeated_attempt = 0;",
+    "my $gp_attempt_claimed = 0;",
+    `my $gp_attempt_claim_limit = ${BOOTSTRAP_ATTEMPT_CLAIM_LIMIT};`,
     "my $gp_launch_error = '';",
-    "my $gp_log = '/tmp/ghostprov-v2/sidecar.log';",
-    "my $gp_tex = '/workspace/.ghostprov-v2/bootstrap-output.tex';",
+    "my $gp_authoritative = 1;",
+    `my $gp_log = '${logPath}';`,
+    `my $gp_tex = '${outputPath}';`,
     "my $gp_hello_seen = 0;",
     "my $gp_marker = '';",
+    "my $gp_secondary_marker = '';",
+    "my $gp_attempt_path = \"$gp_dir/bootstrap-attempt.$gp_launch_nonce\";",
     "mkdir $gp_dir, 0700 unless -d $gp_dir;",
-    "unlink $gp_log if -e $gp_log;",
-    "unlink $gp_tex if -e $gp_tex;",
     // A delayed render must not retire the owner chosen by a newer binding.
     // The canonical static config contains the project/session/generation,
     // release hashes, protocol revision, launch nonce, and runtime limits.
-    "my $gp_current_static = gp_read_file('/workspace/.ghostprov-v2/static.json', 16384);",
-    "if (!defined($gp_current_static) || $gp_current_static ne $gp_expected_static) { $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
+    "my $gp_current_static = gp_read_file($gp_static_path, 16384);",
+    "if (!defined($gp_current_static) || $gp_current_static ne $gp_expected_static) { $gp_authoritative = 0; $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
     "my $gp_deno = '';",
     "for my $gp_candidate (grep { defined $_ && length $_ } ($ENV{DENO_BIN}, '/usr/local/bin/deno', '/usr/bin/deno', '/root/.deno/bin/deno', '/code/crixet/deno')) { if (-x $gp_candidate) { $gp_deno = $gp_candidate; last; } }",
     "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
     "if (!$gp_deno && !$gp_launch_error) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
-    // A host restart does not imply a sandbox restart. Retire a prior R2
-    // owner before forking the fresh nonce; otherwise tryLock correctly makes
-    // every new child lose forever. The locked owner record, canonical PID
-    // record, Linux start tick, process group/session, immutable entrypoint,
-    // and argv nonce are all revalidated immediately before either signal.
+    // A host restart does not imply a sandbox restart. Retire a prior immutable
+    // R1 or R2 owner before forking the selected release; otherwise tryLock
+    // correctly makes every new child lose forever. The locked owner record,
+    // canonical PID record, Linux start tick, process group/session, immutable
+    // entrypoint, and argv nonce are all revalidated immediately before signal.
     "my $gp_prior_owner = $gp_deno && !$gp_launch_error ? gp_owner_record_if_locked($gp_owner_file) : undef;",
+    "my $gp_prior_pid_record = $gp_deno && !$gp_launch_error ? gp_read_file($gp_pid_file, 4096) : undef;",
+    "my ($gp_prior_pid, $gp_prior_nonce, $gp_prior_start) = defined($gp_prior_pid_record) ? $gp_prior_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n$/ : ();",
     "if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner) {",
     "    my ($gp_owner_instance, $gp_owner_nonce, $gp_owner_pid, $gp_owner_time) = $gp_prior_owner =~ /^\\{\"version\":1,\"instanceId\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"nonce\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"pid\":([0-9]+),\"acquiredAtMs\":([0-9]+)\\}$/;",
-    "    my $gp_prior_pid_record = gp_read_file($gp_pid_file, 4096);",
-    "    my ($gp_prior_pid, $gp_prior_nonce, $gp_prior_start) = defined($gp_prior_pid_record) ? $gp_prior_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n$/ : ();",
-    "    my $gp_prior_entrypoint = defined($gp_prior_pid) ? gp_exact_r2_entrypoint($gp_prior_pid) : undef;",
-    "    if (!defined($gp_owner_pid) || !defined($gp_prior_start) || !defined($gp_prior_entrypoint) || $gp_owner_pid ne $gp_prior_pid || $gp_owner_pid < 2) {",
+    "    my $gp_prior_entrypoint = defined($gp_prior_pid) ? gp_exact_sidecar_entrypoint($gp_prior_pid) : undef;",
+    "    if (!defined($gp_owner_pid) || !defined($gp_owner_nonce) || !defined($gp_prior_start) || !defined($gp_prior_entrypoint) || $gp_owner_pid ne $gp_prior_pid || $gp_owner_pid < 2) {",
     "      $gp_launch_error = 'existing owned sidecar identity is incomplete';",
     "    } elsif (!gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)) {",
     "      $gp_launch_error = 'existing owned sidecar process identity is invalid';",
+    "    } elsif ($gp_prior_nonce eq $gp_launch_nonce && $gp_prior_entrypoint eq $gp_expected) {",
+    // bootstrap.ts intentionally removes its hello after credential handoff.
+    // A delayed duplicate render or a same-binding retry must therefore adopt
+    // the strictly proven owner without requiring that one-shot file or ever
+    // signalling the healthy process. The host only accepts this marker when
+    // it still holds the decoded hello for the exact same binding.
+    "      $gp_reused_owner = 1;",
+    "      $gp_marker = \"GPV2_OWNER_REUSED $gp_launch_nonce\";",
+    "      my $gp_reused_diag = gp_read_tail($gp_log, 4096);",
+    "      $gp_secondary_marker = gp_hex_diag($gp_reused_diag) if defined($gp_reused_diag) && length($gp_reused_diag);",
     "    } else {",
-    "      my $gp_prior_stopped = gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint);",
-    "      if (!$gp_prior_stopped) {",
+    "      my $gp_prior_stopped = gp_stop_if_current($gp_owner_file, $gp_prior_owner, 1, $gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint, $gp_static_path, $gp_expected_static);",
+    "      if (!$gp_prior_stopped && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    "        $gp_authoritative = 0;",
+    "        $gp_launch_error = 'bootstrap launcher binding is no longer current';",
+    "      } elsif (!$gp_prior_stopped) {",
     "        $gp_launch_error = 'existing owned sidecar could not be retired safely';",
     "      } else {",
     "        gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_prior_pid_record);",
     "        $gp_launch_error = 'existing sidecar ownership lock did not release' if defined gp_owner_record_if_locked($gp_owner_file);",
     "      }",
     "    }",
+    // The canonical PID is only promoted after hello ownership proof. Its
+    // exact nonce (or the atomic attempt directory used by newer launchers)
+    // proves this nonce has already forked. If its owner has since exited,
+    // preserve the log and report it; never fork the same nonce a second time.
+    "} elsif ($gp_deno && !$gp_launch_error && (-d $gp_attempt_path || (defined($gp_prior_start) && $gp_prior_nonce eq $gp_launch_nonce))) {",
+    "  $gp_repeated_attempt = 1;",
+    "  my $gp_repeated_diag = gp_read_tail($gp_log, 4096);",
+    "  $gp_repeated_diag = 'same-nonce sidecar no longer has a live owner' unless defined($gp_repeated_diag) && length($gp_repeated_diag);",
+    "  $gp_marker = gp_hex_diag($gp_repeated_diag);",
     "} elsif ($gp_deno && !$gp_launch_error) {",
     "  if (!open my $gp_preflight_owner_fh, '+>>', $gp_owner_file) {",
     "    $gp_launch_error = 'unable to open sidecar ownership interlock';",
@@ -448,8 +534,9 @@ function temporaryLauncher(
     "          if (!defined($gp_unowned_entrypoint) || !gp_process_matches($gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint)) {",
     "            $gp_launch_error = 'unowned live sidecar identity is not an immutable GhostProv release';",
     "          } else {",
-    "            my $gp_unowned_stopped = gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint);",
-    "            if (!$gp_unowned_stopped) { $gp_launch_error = 'unowned sidecar could not be retired safely'; }",
+    "            my $gp_unowned_stopped = gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint, $gp_static_path, $gp_expected_static);",
+    "            if (!$gp_unowned_stopped && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) { $gp_authoritative = 0; $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
+    "            elsif (!$gp_unowned_stopped) { $gp_launch_error = 'unowned sidecar could not be retired safely'; }",
     "            elsif (gp_record_is($gp_pid_file, $gp_unowned_pid_record)) { unlink $gp_pid_file; }",
     "          }",
     "        }",
@@ -459,7 +546,52 @@ function temporaryLauncher(
     "    close $gp_preflight_owner_fh;",
     "  }",
     "}",
-    "if ($gp_deno && !$gp_launch_error) {",
+    // mkdir is the atomic once-per-nonce fork claim. A delayed duplicate which
+    // raced through preflight loses this claim and becomes diagnostic-only.
+    // Claims are intentionally permanent for the sandbox lifetime, so cap the
+    // exact protected names and fail closed into sandbox recovery rather than
+    // leak inodes forever or delete a fence a delayed launcher may still need.
+    "if ($gp_deno && !$gp_launch_error && !$gp_reused_owner && !$gp_repeated_attempt) {",
+    "  my $gp_attempt_claim_count = 0;",
+    "  if (!opendir my $gp_attempt_dir, $gp_dir) {",
+    "    $gp_launch_error = 'unable to inspect bootstrap attempt claims';",
+    "  } else {",
+    "    while (my $gp_attempt_name = readdir $gp_attempt_dir) {",
+    "      next unless $gp_attempt_name =~ /^bootstrap-attempt\\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;",
+    "      my $gp_attempt_candidate = \"$gp_dir/$gp_attempt_name\";",
+    "      next if -l $gp_attempt_candidate;",
+    "      $gp_attempt_claim_count++ if -d $gp_attempt_candidate;",
+    "      last if $gp_attempt_claim_count >= $gp_attempt_claim_limit;",
+    "    }",
+    "    closedir $gp_attempt_dir;",
+    "  }",
+    "  if (!$gp_launch_error && $gp_attempt_claim_count >= $gp_attempt_claim_limit) {",
+    "    $gp_launch_error = 'bootstrap attempt claim capacity is exhausted';",
+    "  } elsif (!$gp_launch_error && gp_static_authority_is_current($gp_static_path, $gp_expected_static) && mkdir $gp_attempt_path, 0700) {",
+    "    $gp_attempt_claimed = 1;",
+    "  } elsif (!$gp_launch_error && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    "    $gp_authoritative = 0;",
+    "    $gp_launch_error = 'bootstrap launcher binding is no longer current';",
+    "  } elsif (!$gp_launch_error) {",
+    "    $gp_repeated_attempt = 1;",
+    "    my $gp_repeated_diag = gp_read_tail($gp_log, 4096);",
+    "    $gp_repeated_diag = 'same-nonce bootstrap attempt is already claimed' unless defined($gp_repeated_diag) && length($gp_repeated_diag);",
+    "    $gp_marker = gp_hex_diag($gp_repeated_diag);",
+    "  }",
+    "}",
+    "if ($gp_deno && !$gp_launch_error && $gp_attempt_claimed && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    "  $gp_authoritative = 0;",
+    "  $gp_launch_error = 'bootstrap launcher binding is no longer current';",
+    "}",
+    "if ($gp_deno && !$gp_launch_error && $gp_attempt_claimed) {",
+    "  unlink $gp_log if -e $gp_log;",
+    "  unlink $gp_tex if -e $gp_tex;",
+    "}",
+    "if ($gp_deno && !$gp_launch_error && $gp_attempt_claimed && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    "  $gp_authoritative = 0;",
+    "  $gp_launch_error = 'bootstrap launcher binding is no longer current';",
+    "}",
+    "if ($gp_deno && !$gp_launch_error && $gp_attempt_claimed) {",
     "  my $gp_pid = fork();",
     "  die 'GhostProv V2 fork failed' unless defined $gp_pid;",
     "  if ($gp_pid > 0) {",
@@ -467,11 +599,19 @@ function temporaryLauncher(
     `    $gp_hello = ${helloExpression};`,
     "    $gp_candidate_pid_file = \"$gp_dir/sidecar.pid.$gp_launch_nonce.$gp_pid.candidate\";",
     "    for (my $gp_try = 0; $gp_try < 50 && !$gp_child_start; $gp_try++) { $gp_child_start = gp_process_start($gp_pid); select undef, undef, undef, 0.001 unless $gp_child_start; }",
-    "    if (!$gp_child_start) { $gp_launch_error = 'unable to record exact candidate process identity'; kill 'TERM', $gp_pid; }",
+    "    if (!$gp_child_start) {",
+    "      $gp_launch_error = 'unable to record exact candidate process identity';",
+    "      my $gp_signalled = gp_signal_if_authoritative('TERM', $gp_pid, $gp_static_path, $gp_expected_static);",
+    "      if (!$gp_signalled && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) { $gp_authoritative = 0; $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
+    "    }",
     "    else {",
     "      $gp_candidate_record = \"$gp_pid $gp_launch_nonce $gp_child_start\\n\";",
     "      if (open my $gp_pid_fh, '>', $gp_candidate_pid_file) { print $gp_pid_fh $gp_candidate_record; close $gp_pid_fh; chmod 0600, $gp_candidate_pid_file; }",
-    "      else { $gp_launch_error = 'unable to write candidate process identity'; kill 'TERM', $gp_pid; }",
+    "      else {",
+    "        $gp_launch_error = 'unable to write candidate process identity';",
+    "        my $gp_signalled = gp_signal_if_authoritative('TERM', $gp_pid, $gp_static_path, $gp_expected_static);",
+    "        if (!$gp_signalled && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) { $gp_authoritative = 0; $gp_launch_error = 'bootstrap launcher binding is no longer current'; }",
+    "      }",
     "    }",
     "  }",
     "  if ($gp_pid == 0) {",
@@ -494,23 +634,29 @@ function temporaryLauncher(
     "    exit 127;",
     "  }",
     "}",
-    "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_try < 900; $gp_try++) {",
+    // Keep the complete launcher (prior-owner stop + child hello + promotion)
+    // strictly below the host's 45-second attempt deadline.
+    "for (my $gp_try = 0; $gp_deno && !$gp_launch_error && $gp_attempt_claimed && !$gp_hello_seen && $gp_try < 500; $gp_try++) {",
     "  if (open my $gp_fh, '<', $gp_hello) {",
     "    while (my $gp_line = <$gp_fh>) { if ($gp_line =~ /^(GPV2_BOOTSTRAP [A-Za-z0-9_-]+)/) { $gp_marker = $1; $gp_hello_seen = 1; } }",
     "    close $gp_fh;",
     "    last;",
     "  }",
-    "  if ($gp_child_pid && waitpid($gp_child_pid, 1) == $gp_child_pid) { $gp_launch_error = 'sidecar exited before bootstrap hello'; last; }",
+    "  if ($gp_child_pid) {",
+    "    my $gp_waited = waitpid($gp_child_pid, 1);",
+    "    if ($gp_waited == $gp_child_pid || ($gp_child_start && !gp_process_is_same_live($gp_child_pid, $gp_child_start))) { $gp_launch_error = 'sidecar exited before bootstrap hello'; last; }",
+    "  }",
     "  select undef, undef, undef, 0.05;",
     "}",
     "if ($gp_hello_seen) {",
     "  my $gp_promoted = 0;",
     "  if ($gp_require_owner) {",
-    "    for (my $gp_try = 0; $gp_try < 500 && !$gp_promoted; $gp_try++) {",
+    "    for (my $gp_try = 0; $gp_try < 300 && !$gp_promoted; $gp_try++) {",
     "      my $gp_owner_record = gp_owner_record_if_locked($gp_owner_file);",
     "      my $gp_owner_matches = defined($gp_owner_record) && $gp_owner_record =~ /\"pid\"\\s*:\\s*\\Q$gp_child_pid\\E(?:\\D|$)/;",
     "      $gp_promoted = gp_record_is($gp_pid_file, $gp_candidate_record) && gp_process_matches($gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected) && $gp_owner_matches && gp_owner_record_is_locked($gp_owner_file, $gp_owner_record);",
-    "      if (!$gp_promoted && waitpid($gp_child_pid, 1) == $gp_child_pid) { $gp_launch_error = 'sidecar exited before owned PID promotion proof'; last; }",
+    "      my $gp_waited = waitpid($gp_child_pid, 1);",
+    "      if (!$gp_promoted && ($gp_waited == $gp_child_pid || !gp_process_is_same_live($gp_child_pid, $gp_child_start))) { $gp_launch_error = 'sidecar exited before owned PID promotion proof'; last; }",
     "      select undef, undef, undef, 0.01 unless $gp_promoted;",
     "    }",
     "    $gp_launch_error ||= 'owned sidecar did not atomically promote its process identity' unless $gp_promoted;",
@@ -524,23 +670,26 @@ function temporaryLauncher(
     "    } else { chmod 0600, $gp_pid_file; $gp_promoted = 1; }",
     "  }",
     "}",
-    "if (!$gp_hello_seen || $gp_launch_error) {",
+    "if (!$gp_reused_owner && !$gp_repeated_attempt && (!$gp_hello_seen || $gp_launch_error)) {",
     "  my $gp_stopped = 0;",
     "  my $gp_reaped = $gp_child_pid && waitpid($gp_child_pid, 1) == $gp_child_pid;",
     "  if ($gp_child_pid && $gp_child_start && $gp_candidate_record) {",
     "    my $gp_identity_path = -e $gp_candidate_pid_file ? $gp_candidate_pid_file : $gp_pid_file;",
-    "    $gp_stopped = gp_stop_if_current($gp_identity_path, $gp_candidate_record, 0, $gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected);",
+    "    $gp_stopped = gp_stop_if_current($gp_identity_path, $gp_candidate_record, 0, $gp_child_pid, $gp_launch_nonce, $gp_child_start, $gp_expected, $gp_static_path, $gp_expected_static);",
     "    unlink $gp_candidate_pid_file if ($gp_reaped || $gp_stopped || !gp_group_alive($gp_child_pid)) && gp_record_is($gp_candidate_pid_file, $gp_candidate_record);",
     "  }",
     "  unlink $gp_hello if $gp_hello && -e $gp_hello;",
     "  my $gp_diag = $gp_launch_error || 'sidecar log is missing';",
-    "  if (open my $gp_log_fh, '<', $gp_log) { local $/; my $gp_sidecar_diag = <$gp_log_fh>; close $gp_log_fh; $gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag); }",
+    "  if ($gp_child_pid) { my $gp_sidecar_diag = gp_read_tail($gp_log, 4096); $gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag); }",
     "  $gp_diag = substr($gp_diag // '', 0, 4096);",
     "  $gp_marker = gp_hex_diag($gp_diag);",
     "}",
-    "open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 bootstrap output';",
-    "print $gp_tex_fh \"\\\\typeout{$gp_marker}\\n\";",
-    "close $gp_tex_fh;",
+    "if ($gp_authoritative && length($gp_marker) && gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
+    "  open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 bootstrap output';",
+    "  print $gp_tex_fh \"\\\\typeout{$gp_marker}\\n\";",
+    "  print $gp_tex_fh \"\\\\typeout{$gp_secondary_marker}\\n\" if length($gp_secondary_marker);",
+    "  close $gp_tex_fh;",
+    "}",
     "$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';",
     "",
   ].join("\n");
@@ -569,8 +718,12 @@ function parseSidecarFatalDiagnostic(value: string): V2SidecarFatalDiagnostic | 
     if (!line.startsWith("{") || !line.endsWith("}") || line.length > 1_024) continue;
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
+      const legacy = exactKeys(parsed, ["event", "error_name", "error_code", "cause_name"]);
+      const detailed = exactKeys(parsed, [
+        "event", "error_name", "error_code", "cause_name", "phase", "permission",
+      ]);
       if (
-        !exactKeys(parsed, ["event", "error_name", "error_code", "cause_name"]) ||
+        (!legacy && !detailed) ||
         parsed.event !== "ghostprov_v2_sidecar_fatal" ||
         typeof parsed.error_name !== "string" ||
         !SAFE_ID.test(parsed.error_name) ||
@@ -579,12 +732,21 @@ function parseSidecarFatalDiagnostic(value: string): V2SidecarFatalDiagnostic | 
         !(
           parsed.cause_name === null ||
           (typeof parsed.cause_name === "string" && SAFE_ID.test(parsed.cause_name))
-        )
+        ) ||
+        (detailed && (typeof parsed.phase !== "string" || !SAFE_ID.test(parsed.phase))) ||
+        (detailed && !(
+          parsed.permission === null ||
+          (typeof parsed.permission === "string" && /^(?:read|write|env|net|sys|run|ffi)$/.test(parsed.permission))
+        ))
       ) continue;
       return Object.freeze({
         errorName: parsed.error_name,
         errorCode: parsed.error_code,
         causeName: parsed.cause_name as string | null,
+        ...(detailed ? {
+          phase: parsed.phase as string,
+          permission: parsed.permission as string | null,
+        } : {}),
       });
     } catch {
       // Only the sidecar's exact bounded JSON fatal record is structured.
@@ -809,6 +971,53 @@ function abortable<T>(source: Promise<T>, signal: AbortSignal | undefined): Prom
   });
 }
 
+type DiagnosticStepResult<T> =
+  | { readonly completed: true; readonly value: T }
+  | { readonly completed: false };
+
+/**
+ * Bounds even operations which ignore AbortSignal. Every diagnostic stage is
+ * raced against the same monotonic wall-clock deadline, while the operation
+ * signal is still aborted to release cooperative gateway work. Late promise
+ * settlement is observed by `completed`, so it cannot become unhandled.
+ */
+async function runDiagnosticStep<T>(
+  deadlineMonoMs: number,
+  signal: AbortSignal | undefined,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<DiagnosticStepResult<T>> {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("V2 bootstrap aborted", "AbortError");
+  }
+  const remainingMs = deadlineMonoMs - performance.now();
+  if (remainingMs <= 0) return { completed: false };
+
+  const operationController = new AbortController();
+  const completed = Promise.resolve()
+    .then(() => operation(operationController.signal))
+    .then(
+      value => ({ kind: "completed" as const, value }),
+      () => ({ kind: "failed" as const }),
+    );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ readonly kind: "timeout" }>(resolve => {
+    timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+  });
+  try {
+    const outcome = await abortable(Promise.race([completed, timeout]), signal);
+    if (outcome.kind !== "completed") return { completed: false };
+    return { completed: true, value: outcome.value };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    operationController.abort(new DOMException(
+      "V2 post-hello diagnostic deadline expired",
+      "TimeoutError",
+    ));
+  }
+}
+
 export class V2BootstrapController {
   readonly #projectId: ProjectId;
   readonly #workerIndex: number;
@@ -843,6 +1052,9 @@ export class V2BootstrapController {
   #closed = false;
   #launchAttempted = false;
   #lastLaunchNonce: string | null = null;
+  #reusableHello: BootstrapHello | null = null;
+  #reusableRotationKey: string | null = null;
+  readonly #transientArtifactPaths = new Set<string>();
   #awarenessRevision = 0;
   #hostSequence = 0;
   #sidecarAck = { epoch: 1, sequence: -1 };
@@ -1201,6 +1413,9 @@ export class V2BootstrapController {
     attempt: number,
     signal?: AbortSignal,
   ): Promise<V2ReadyDescriptor> {
+    const artifacts = bootstrapArtifactPaths(binding.nonce);
+    this.#transientArtifactPaths.add(artifacts.mainPath);
+    this.#transientArtifactPaths.add(artifacts.outputPath);
     const staticConfig = canonicalJson({
       version: 1,
       binding,
@@ -1223,6 +1438,10 @@ export class V2BootstrapController {
           staticConfig,
         ),
       );
+      await this.#ydoc.writePath(
+        artifacts.mainPath,
+        bootstrapMainSource(artifacts.outputPath),
+      );
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
       throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
@@ -1231,7 +1450,7 @@ export class V2BootstrapController {
     try {
       this.#launchAttempted = true;
       await this.#gateway.triggerRender({
-        mainDocument: MAIN_PATH,
+        mainDocument: artifacts.mainPath,
         ...await this.#ydoc.renderSyncState(),
       }, signal);
     } catch (cause) {
@@ -1239,7 +1458,8 @@ export class V2BootstrapController {
     }
 
     const hello = await this.#waitForHello(binding, attempt, signal);
-    const rotationKey = createCredentialRotationKey();
+    const rotationKey = this.#reusableRotationKey ?? createCredentialRotationKey();
+    this.#reusableRotationKey = rotationKey;
     let sealed: SealedBootstrapCredential;
     try {
       sealed = await sealBootstrapCredential({
@@ -1268,6 +1488,7 @@ export class V2BootstrapController {
         hello.instanceId,
         readiness,
         attempt,
+        artifacts.mainPath,
         signal,
       );
       this.#rotationKey = rotationKey;
@@ -1302,10 +1523,37 @@ export class V2BootstrapController {
         const hello = extractWrappedMarker(log, HELLO_PREFIX, /^[A-Za-z0-9_-]+/, 8_192);
         if (hello) {
           try {
-            return parseHelloCandidate(hello, binding, attempt);
+            const parsed = parseHelloCandidate(hello, binding, attempt);
+            if (
+              this.#reusableHello &&
+              canonicalJson(this.#reusableHello) !== canonicalJson(parsed)
+            ) this.#reusableRotationKey = null;
+            this.#reusableHello = parsed;
+            return parsed;
           } catch (cause) {
             lastError = cause as V2BootstrapError;
           }
+        }
+        const reusedOwner = extractWrappedMarker(
+          log,
+          OWNER_REUSED_PREFIX,
+          /^[A-Za-z0-9._:-]+/,
+          128,
+        );
+        if (reusedOwner) {
+          const cached = this.#reusableHello;
+          if (
+            reusedOwner === binding.nonce &&
+            cached &&
+            canonicalJson(cached.binding) === canonicalJson(binding)
+          ) return cached;
+          throw new V2BootstrapError(
+            reusedOwner === binding.nonce
+              ? "Already-running V2 sidecar cannot be adopted without its cached bootstrap hello"
+              : "Already-running V2 sidecar reuse marker is stale",
+            "hello",
+            attempt,
+          );
         }
         const diagnostic = extractWrappedMarker(log, SIDECAR_HEX_PREFIX, /^[0-9a-fA-F]+/, 8_192);
         if (diagnostic) {
@@ -1334,9 +1582,15 @@ export class V2BootstrapController {
     instanceId: string,
     readiness: readonly AwarenessEnvelope<SidecarFrame>[],
     attempt: number,
+    mainPath: string,
     signal?: AbortSignal,
   ): Promise<V2ReadyDescriptor> {
     const deadline = this.#clock.now() + this.#timeoutMs;
+    // Reserve a bounded tail of the existing readiness budget for one
+    // best-effort render of sidecar.log. Diagnostics never extend the attempt.
+    const diagnosticWindowMs = Math.min(5_000, Math.max(1, this.#timeoutMs / 4));
+    const observationDeadline = deadline - diagnosticWindowMs;
+    const diagnosticBudgetMs = Math.max(1, diagnosticWindowMs * 0.8);
     for (;;) {
       const envelope = readiness.find(candidate => matchesReadiness(candidate, binding, instanceId));
       if (envelope) {
@@ -1351,14 +1605,92 @@ export class V2BootstrapController {
         };
       }
       if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");
-      if (this.#clock.now() >= deadline) {
+      if (this.#clock.now() >= observationDeadline) {
+        const diagnostic = await this.#capturePostHelloDiagnostic(
+          diagnosticBudgetMs,
+          mainPath,
+          signal,
+        );
+        const lateEnvelope = readiness.find(candidate => (
+          matchesReadiness(candidate, binding, instanceId)
+        ));
+        if (lateEnvelope) {
+          return {
+            instanceId,
+            protocolRevision: this.#selectedRevision,
+            launchNonce: binding.nonce,
+            buildHash: binding.buildHash,
+            schemaHash: binding.schemaHash,
+            leaderGeneration: binding.leaderGeneration,
+            capacity: this.#maxActivePerSandbox,
+          };
+        }
         throw new V2BootstrapError(
-          "Sidecar readiness did not match the bootstrap binding and instance",
+          diagnostic
+            ? `Sidecar readiness failed after hello: ${diagnostic.message}`
+            : "Sidecar readiness did not match the bootstrap binding and instance",
           "readiness",
           attempt,
+          diagnostic?.fatal ? { sidecarDiagnostic: diagnostic.fatal } : undefined,
         );
       }
-      await this.#clock.sleep(Math.min(this.#pollMs, deadline - this.#clock.now()), signal);
+      await this.#clock.sleep(
+        Math.min(this.#pollMs, observationDeadline - this.#clock.now()),
+        signal,
+      );
+    }
+  }
+
+  async #capturePostHelloDiagnostic(
+    budgetMs: number,
+    mainPath: string,
+    signal?: AbortSignal,
+  ): Promise<DecodedSidecarDiagnostic | null> {
+    const deadlineMonoMs = performance.now() + budgetMs;
+    try {
+      // Re-render the already staged, binding-fenced temporary launcher. Its
+      // same-owner/same-attempt branches emit a bounded log tail without a
+      // second fork or signalling/replacing the owner. Avoiding a diagnostic
+      // write/sync is critical:
+      // a signal-unaware late YDoc write could otherwise overwrite the inert
+      // launcher or a newer generation after this deadline has returned.
+      const syncState = await runDiagnosticStep(deadlineMonoMs, signal, () => (
+        this.#ydoc.renderSyncState()
+      ));
+      if (!syncState.completed) return null;
+      const render = await runDiagnosticStep(deadlineMonoMs, signal, stepSignal => (
+        this.#gateway.triggerRender({
+          mainDocument: mainPath,
+          ...syncState.value,
+        }, stepSignal)
+      ));
+      if (!render.completed) return null;
+      for (;;) {
+        if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");
+        const fetched = await runDiagnosticStep(deadlineMonoMs, signal, stepSignal => (
+          this.#gateway.fetchText("logs", { method: "GET", signal: stepSignal })
+        ));
+        if (!fetched.completed) return null;
+        const response = fetched.value;
+        if (response.status >= 200 && response.status < 300) {
+          const diagnostic = extractWrappedMarker(
+            renderLogText(response.text),
+            SIDECAR_HEX_PREFIX,
+            /^[0-9a-fA-F]+/,
+            8_192,
+          );
+          if (diagnostic) return decodeSidecarDiagnostic(diagnostic);
+        }
+        const remainingMs = deadlineMonoMs - performance.now();
+        if (remainingMs <= 0) return null;
+        const slept = await runDiagnosticStep(deadlineMonoMs, signal, stepSignal => (
+          this.#clock.sleep(Math.min(this.#pollMs, remainingMs), stepSignal)
+        ));
+        if (!slept.completed) return null;
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      return null;
     }
   }
 
@@ -1372,6 +1704,8 @@ export class V2BootstrapController {
     this.#ready = null;
     this.#readyBinding = null;
     this.#rotationKey = null;
+    this.#reusableHello = null;
+    this.#reusableRotationKey = null;
     const ensuring = this.#ensuring;
     const retiring = this.#retire(
       force,
@@ -1482,6 +1816,9 @@ export class V2BootstrapController {
   async #cleanupTransient(required: boolean, signal?: AbortSignal): Promise<void> {
     try {
       await this.#ydoc.tombstonePath(CIPHERTEXT_PATH);
+      for (const path of this.#transientArtifactPaths) {
+        await this.#ydoc.tombstonePath(path);
+      }
       await this.#ydoc.writePath(LAUNCHER_PATH, INERT_LAUNCHER);
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {

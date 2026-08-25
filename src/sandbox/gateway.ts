@@ -1,4 +1,7 @@
-import type { AccountRequestClient } from "../prism/provisioning-client";
+import {
+  boundedAccountRequest,
+  type AccountRequestClient,
+} from "../prism/provisioning-client";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { ProjectId } from "./types";
@@ -9,6 +12,8 @@ export interface SandboxGatewayOptions {
   sandbox: ProvisionedSandbox;
   clock?: Clock;
   syncBatchMs?: number;
+  requestTimeoutMs?: number;
+  responseBodyLimitBytes?: number;
 }
 
 export interface HeartbeatResult {
@@ -35,11 +40,17 @@ export class SandboxGatewayError extends Error {
   }
 }
 
+function signalAbortError(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("Sandbox request aborted", "AbortError");
+}
+
 export class SandboxGateway {
   readonly projectId: ProjectId;
   readonly #account: AccountRequestClient;
   readonly #clock: Clock;
   readonly #syncBatchMs: number;
+  readonly #requestTimeoutMs: number;
+  readonly #responseBodyLimitBytes: number;
   #sandbox: ProvisionedSandbox;
   #effectiveSessionId: string | null;
   #cacheBust = 0;
@@ -54,14 +65,22 @@ export class SandboxGateway {
     this.#effectiveSessionId = options.sandbox.sessionId ?? null;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#syncBatchMs = options.syncBatchMs ?? 5;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    this.#responseBodyLimitBytes = options.responseBodyLimitBytes ?? 8 * 1024 * 1024;
     if (!Number.isFinite(this.#syncBatchMs) || this.#syncBatchMs < 0 || this.#syncBatchMs > 1_000) {
       throw new RangeError("syncBatchMs must be between 0 and 1000");
+    }
+    if (!Number.isSafeInteger(this.#requestTimeoutMs) || this.#requestTimeoutMs < 1) {
+      throw new RangeError("requestTimeoutMs must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.#responseBodyLimitBytes) || this.#responseBodyLimitBytes < 1) {
+      throw new RangeError("responseBodyLimitBytes must be a positive safe integer");
     }
   }
 
   async heartbeat(signal?: AbortSignal): Promise<HeartbeatResult> {
     const started = this.#clock.now();
-    const response = await this.#request("heartbeat", { method: "GET", signal });
+    const response = await this.#request("heartbeat", { method: "GET", signal }, false);
     const sessionId = this.#headerSessionId(response);
     if (
       response.ok &&
@@ -158,13 +177,22 @@ export class SandboxGateway {
   }
 
   async triggerRender(request: RenderRequest, signal?: AbortSignal): Promise<void> {
-    const response = await this.postJson("render?renderMode=async&renderStatusMode=json", request, signal);
+    const response = await this.#request("render?renderMode=async&renderStatusMode=json", {
+      method: "POST",
+      signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    }, false);
     if (response.status !== 202) {
       throw new SandboxGatewayError(`Render returned ${response.status}`, response.status, "render");
     }
   }
 
-  async #request(suffix: string, init: RequestInit): Promise<Response> {
+  async #request(
+    suffix: string,
+    init: RequestInit,
+    bufferResponseBody = true,
+  ): Promise<Response> {
     // A request owns one immutable credential snapshot. Rotation may happen
     // while the request is in flight, but can only affect later requests.
     const sandbox = this.#sandbox;
@@ -172,7 +200,38 @@ export class SandboxGateway {
     const path = `${sandbox.url}${suffix}${delimiter}prism_cache_bust=gp${Date.now().toString(36)}${this.#cacheBust++}`;
     const headers = new Headers(init.headers);
     headers.set("x-crixet-sandbox-token", sandbox.token.reveal());
-    return this.#account.request(path, { ...init, headers });
+    const operation = suffix.split("?", 1)[0] ?? "request";
+    const timeoutError = () => new SandboxGatewayError(
+      `Sandbox ${operation} request timed out`,
+      408,
+      operation,
+    );
+    return boundedAccountRequest({
+      account: this.#account,
+      path,
+      init: { ...init, headers },
+      timeoutMs: this.#requestTimeoutMs,
+      responseBodyLimitBytes: this.#responseBodyLimitBytes,
+      bodyAdmissionKey: [
+        "sandbox",
+        sandbox.sessionId ?? sandbox.sandboxId ?? this.projectId,
+        (init.method ?? "GET").toUpperCase(),
+        suffix,
+      ].join(":"),
+      shouldBufferResponseBody: () => bufferResponseBody,
+      timeoutError,
+      responseBodyLimitError: () => new SandboxGatewayError(
+        `Sandbox ${operation} response body exceeded the bounded limit`,
+        502,
+        operation,
+      ),
+      responseBodyReadError: () => new SandboxGatewayError(
+        `Sandbox ${operation} response body could not be read`,
+        502,
+        operation,
+      ),
+      abortError: signalAbortError,
+    });
   }
 
   #headerSessionId(response: Response): string | null {

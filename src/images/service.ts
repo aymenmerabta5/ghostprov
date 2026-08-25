@@ -96,6 +96,9 @@ function invalidUpstream(message: string): ApiError {
 function extractImage(finalValue: unknown): ExtractedImage {
   const final = record(finalValue);
   if (!final) throw invalidUpstream("Image relay returned a non-object final response.");
+  if (final.status !== "completed") {
+    throw invalidUpstream(`Image relay ended with status '${String(final.status)}'.`);
+  }
   const output = Array.isArray(final.output) ? final.output : [];
   const calls = output
     .map(record)
@@ -104,14 +107,21 @@ function extractImage(finalValue: unknown): ExtractedImage {
     throw invalidUpstream(`Image relay returned ${calls.length} image generation results; expected exactly one.`);
   }
   const call = calls[0];
-  if (call.status !== undefined && call.status !== "completed") {
+  const hasResult = typeof call.result === "string" && call.result.length > 0;
+  const completedWithProviderGeneratingStatus = final.status === "completed" &&
+    call.status === "generating" && hasResult;
+  if (
+    call.status !== undefined &&
+    call.status !== "completed" &&
+    !completedWithProviderGeneratingStatus
+  ) {
     throw invalidUpstream(`Image generation call ended with status '${String(call.status)}'.`);
   }
-  if (typeof call.result !== "string" || call.result.length === 0) {
+  if (!hasResult) {
     throw invalidUpstream("Image generation call completed without base64 result data.");
   }
 
-  const image: ImagesResponseImage = { b64_json: call.result };
+  const image: ImagesResponseImage = { b64_json: call.result as string };
   if (typeof call.revised_prompt === "string" && call.revised_prompt.length > 0) {
     image.revised_prompt = call.revised_prompt;
   }

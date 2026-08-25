@@ -7,6 +7,8 @@ import {
   normalizeV2SidecarFatalCauseName,
   normalizeV2SidecarFatalErrorCode,
   normalizeV2SidecarFatalErrorName,
+  normalizeV2SidecarFatalPermission,
+  normalizeV2SidecarFatalPhase,
   normalizeSandboxRecoveryCause,
   normalizeSandboxRecoveryErrorKind,
   normalizeSandboxRecoveryErrorName,
@@ -62,6 +64,8 @@ describe("recovery observability schema", () => {
         sidecar_error_name: "SidecarOwnershipError",
         sidecar_error_code: "contended",
         sidecar_cause_name: null,
+        sidecar_phase: "engine_start",
+        sidecar_permission: "write",
         operation: "sidecar_ping",
         retry_delay_ms: 1_000,
         attempt_duration_ms: 250.5,
@@ -106,9 +110,13 @@ describe("recovery observability schema", () => {
       .toBe("SidecarOwnershipError");
     expect(normalizeV2SidecarFatalErrorCode("contended")).toBe("contended");
     expect(normalizeV2SidecarFatalCauseName("TypeError")).toBe("TypeError");
+    expect(normalizeV2SidecarFatalPhase("engine_start")).toBe("engine_start");
+    expect(normalizeV2SidecarFatalPermission("write")).toBe("write");
     expect(normalizeV2SidecarFatalErrorName("SUPER_SECRET_CANARY")).toBe("unknown");
     expect(normalizeV2SidecarFatalErrorCode("SUPER_SECRET_CANARY")).toBe("unknown");
     expect(normalizeV2SidecarFatalCauseName("SUPER_SECRET_CANARY")).toBe("unknown");
+    expect(normalizeV2SidecarFatalPhase("SUPER_SECRET_CANARY")).toBe("unknown");
+    expect(normalizeV2SidecarFatalPermission("SUPER_SECRET_CANARY")).toBe("unknown");
   });
 
   it("rejects free-form canaries, invalid identifiers, and invalid numbers", () => {
@@ -120,6 +128,8 @@ describe("recovery observability schema", () => {
       { sidecar_error_name: "SUPER_SECRET_CANARY" },
       { sidecar_error_code: "SUPER_SECRET_CANARY" },
       { sidecar_cause_name: "SUPER_SECRET_CANARY" },
+      { sidecar_phase: "SUPER_SECRET_CANARY" },
+      { sidecar_permission: "SUPER_SECRET_CANARY" },
       { project_id: "project-SUPER_SECRET_CANARY" },
       { worker_index: -1 },
       { attempt: 1.5 },
