@@ -1138,6 +1138,17 @@ describe("V2TransportSession", () => {
     await harness.settle();expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,queued:1});
     await harness.close();await Promise.allSettled(pending);
   });
+  it("admits only one multi-megabyte transfer at a time per sandbox", async () => {
+    const harness=new TransportHarness();await harness.start();
+    const body={...BODY,input:"x".repeat(2*1024*1024)};
+    const pending=[harness.session.run(body),harness.session.run(body)];
+    await harness.settle();
+    expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,active:1,queued:1});
+    await harness.commit(pending[0]!);
+    await harness.settle();
+    expect(harness.session.snapshot()).toMatchObject({active:2,queued:0});
+    await harness.close();await Promise.allSettled(pending);
+  });
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);

@@ -254,6 +254,27 @@ describe("V2 deterministic performance harness", () => {
       .toBeGreaterThan(fast.timings.modeledLink.commitMs.p50);
   }, 30_000);
 
+  it("bounds the observed four-way 2 MiB transfer workload without losing integrity", async () => {
+    const report = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      corpus: "incompressible",
+      rttMs: 800,
+      requestBytes: 2 * 1024 * 1024,
+      concurrency: 4,
+      linkBandwidthBytesPerSecond: 350 * 1024,
+      serializationBytesPerSecond: 100 * 1024 * 1024,
+      maxAggregateRequestBytes: 16 * 1024 * 1024,
+      timeoutMs: 120_000,
+    });
+
+    expect(report.requests.every(request => request.exactRequest && request.exactTerminal)).toBe(true);
+    expect(report.timings.modeledLink.commitMs.p50).toBeLessThan(30_000);
+    expect(report.timings.modeledLink.commitMs.p95).toBeLessThan(60_000);
+    expect(report.virtualElapsedMs).toBeLessThan(60_000);
+    expect(report.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(512 * 1024);
+    expect(report.wire.droppedUpdates).toBe(0);
+  }, 30_000);
+
   it("preserves a 3.35 MiB R2 request across disconnect, loss, duplicate, and reorder faults", async () => {
     const report = await runV2PerformanceHarness({
       protocolRevision: "r2",

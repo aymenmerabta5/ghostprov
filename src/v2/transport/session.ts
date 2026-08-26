@@ -58,6 +58,10 @@ import {
 } from "./run-handle";
 import { createNativeTranscriptHasher } from "./native-transcript-hasher";
 import {
+  V2_HOST_TRANSFER_BUDGET,
+  v2RequestTransferCost,
+} from "./admission-cost";
+import {
   AtomicBytePermit,
   AtomicBytePermitPool,
   estimateAtomicEventPermitBytes,
@@ -247,6 +251,7 @@ interface RequestState {
   onAbort?: () => void;
   onAdmissionReflected?: () => void;
   admitted: boolean;
+  transferCost: number;
   published: boolean;
   commitStaged: boolean;
   commitPublished: boolean;
@@ -514,6 +519,7 @@ export class V2TransportSession {
   #livenessProbe: LivenessProbe | null = null;
   #remoteCredits = 0;
   #creditReservations = 0;
+  #transferReservations = 0;
   #quarantined = 0;
   #ambiguousQuarantined = 0;
   #retransmissions = 0;
@@ -836,6 +842,7 @@ export class V2TransportSession {
       signal,
       onAdmissionReflected: options?.onAdmissionReflected,
       admitted: false,
+      transferCost: v2RequestTransferCost(prepared.encodedBytes),
       published: false,
       commitStaged: false,
       commitPublished: false,
@@ -1013,6 +1020,7 @@ export class V2TransportSession {
       payload.states.push(state);
     }
     this.#creditReservations = 0;
+    this.#transferReservations = 0;
     for (const [requestId, receipt] of this.#terminalReceipts) {
       this.#scheduler.removeStream(requestId);
       receipt.queued = false;
@@ -1409,6 +1417,7 @@ export class V2TransportSession {
       this.#scheduler.removeStream("control");
       this.#terminalReceipts.clear();
       this.#creditReservations = 0;
+      this.#transferReservations = 0;
       const nextEpoch = this.#outbound.snapshot().epoch + 1;
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
@@ -1822,6 +1831,10 @@ export class V2TransportSession {
         state.committed = true;
         state.diagnostics.committed(frame.diagnostics);
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+        this.#transferReservations = Math.max(
+          0,
+          this.#transferReservations - state.transferCost,
+        );
         state.resolveRun(state.handle);
         return;
       }
@@ -2894,12 +2907,16 @@ export class V2TransportSession {
 
   #admitPending(): void {
     while (this.#availableCredits() > 0) {
-      const state = this.#pending.find(candidate => !candidate.admitted);
+      const transferAvailable = V2_HOST_TRANSFER_BUDGET - this.#transferReservations;
+      const state = this.#pending.find(candidate => (
+        !candidate.admitted && candidate.transferCost <= transferAvailable
+      ));
       if (!state) return;
       state.admitted = true;
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
       state.admissionTimer = undefined;
       this.#creditReservations++;
+      this.#transferReservations += state.transferCost;
       const onAdmissionReflected = state.onAdmissionReflected;
       state.onAdmissionReflected = undefined;
       // The credit is owned by the transport before the router is notified.
@@ -2919,6 +2936,7 @@ export class V2TransportSession {
       this.#remoteCredits - this.#creditReservations,
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
       4 - this.#creditReservations - this.#ambiguousQuarantined,
+      V2_HOST_TRANSFER_BUDGET - this.#transferReservations,
     ));
   }
 
@@ -3402,6 +3420,10 @@ export class V2TransportSession {
       }
       if (state.admitted && !state.committed) {
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+        this.#transferReservations = Math.max(
+          0,
+          this.#transferReservations - state.transferCost,
+        );
       }
     }
     // commitPublished is deliberately promoted to committed-risk here so
@@ -3425,6 +3447,10 @@ export class V2TransportSession {
     this.#scheduler.removeStream(state.requestId);
     if (state.admitted && !state.committed) {
       this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+      this.#transferReservations = Math.max(
+        0,
+        this.#transferReservations - state.transferCost,
+      );
     }
     state.signal?.removeEventListener("abort", state.onAbort!);
     if (state.admissionTimer) clearTimeout(state.admissionTimer);

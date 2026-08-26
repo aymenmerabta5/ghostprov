@@ -22,6 +22,10 @@ import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
 import {
+  V2_HOST_TRANSFER_BUDGET,
+  v2RequestTransferCost,
+} from "../v2/transport/admission-cost";
+import {
   rateLimitHintFromError,
   rateLimitProblemFromError,
   type RateLimitHint,
@@ -49,6 +53,7 @@ const DEFAULT_QUEUE_BYTES = 1024 * MiB;
 const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
 const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
+const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 
 interface ClientLane {
   readonly key: string;
@@ -136,6 +141,7 @@ interface QueuedJob {
   queueDeadlineMs: number;
   queueClass: RouterQueueClass;
   fairCostBytes: number;
+  admissionCost: number;
   fairnessCharged: boolean;
   queueLane: ClientLane | null;
   queuePrevious: QueuedJob | null;
@@ -505,6 +511,7 @@ export class MultiSandboxRouter {
           ),
         }
       : workload;
+    const transferAdmissionCost = v2RequestTransferCost(workload.requestBytes);
     const initial = this.snapshot();
     this.#emit("request.accepted", {
       trace_id: traceId,
@@ -514,6 +521,7 @@ export class MultiSandboxRouter {
       stream: workload.stream,
       workload_class: workload.class,
       request_bytes: workload.requestBytes,
+      transfer_admission_cost: transferAdmissionCost,
       reserved_bytes: admissionWorkload.reservedBytes,
       capacity: initial.capacity,
       active: initial.active,
@@ -605,6 +613,7 @@ export class MultiSandboxRouter {
         queueDeadlineMs: admissionDeadlineMs,
         queueClass: queueClassFor(workload),
         fairCostBytes: fairCostBytes(workload),
+        admissionCost: transferAdmissionCost,
         fairnessCharged: false,
         queueLane: null,
         queuePrevious: null,
@@ -771,8 +780,16 @@ export class MultiSandboxRouter {
     return this.#traffic.snapshotAndReset();
   }
 
-  #unreflectedReservations(projectId: ProjectId): number {
+  #unreflectedReservationCount(projectId: ProjectId): number {
     return this.#reserved.get(projectId)?.size ?? 0;
+  }
+
+  #unreflectedReservationCost(projectId: ProjectId): number {
+    const jobs = this.#reserved.get(projectId);
+    if (!jobs) return 0;
+    let cost = 0;
+    for (const job of jobs) cost += job.admissionCost;
+    return cost;
   }
 
   #reserveRuntime(job: QueuedJob, projectId: ProjectId): void {
@@ -831,10 +848,10 @@ export class MultiSandboxRouter {
       .filter(isRuntimeHealthy)
       .reduce((sum, runtime) => sum + Math.max(
         0,
-        runtime.available - this.#unreflectedReservations(runtime.projectId),
+        runtime.available - this.#unreflectedReservationCount(runtime.projectId),
       ), 0);
     const active = runtimes.reduce(
-      (sum, runtime) => sum + runtime.active + this.#unreflectedReservations(runtime.projectId),
+      (sum, runtime) => sum + runtime.active + this.#unreflectedReservationCount(runtime.projectId),
       0,
     );
     return {
@@ -1314,6 +1331,7 @@ export class MultiSandboxRouter {
         eligible_candidates: selection.eligibleCandidates,
         queue_class: job.queueClass,
         fair_cost_bytes: job.fairCostBytes,
+        transfer_admission_cost: job.admissionCost,
         route_attempt: job.attempts + 1,
       });
       this.#reserveRuntime(job, runtime.projectId);
@@ -1321,6 +1339,8 @@ export class MultiSandboxRouter {
       // admission credit immediately so queued jobs cannot trigger repeated
       // all-runtime snapshots/scans on every Awareness publication.
       candidate.reserved++;
+      candidate.reservedTransferCost = (candidate.reservedTransferCost ?? 0) +
+        job.admissionCost;
       if (!isRuntimeEligible(candidate)) {
         const index = candidates.indexOf(candidate);
         if (index >= 0) candidates.splice(index, 1);
@@ -1361,6 +1381,7 @@ export class MultiSandboxRouter {
       available: snapshot.available,
       // Reservations are applied from the live router map when selected.
       reserved: 0,
+      reservedTransferCost: 0,
       commitBacklog: host?.admittedUncommitted ?? snapshot.queueDepth,
       schedulerBytes: host?.schedulerBytes ?? 0,
       schedulerOldestMs: host?.oldestQueuedFrameMs ?? 0,
@@ -1421,7 +1442,8 @@ export class MultiSandboxRouter {
   #candidateWithReservations(candidate: RouteCandidate): RouteCandidate {
     return {
       ...candidate,
-      reserved: this.#unreflectedReservations(candidate.projectId),
+      reserved: this.#unreflectedReservationCount(candidate.projectId),
+      reservedTransferCost: this.#unreflectedReservationCost(candidate.projectId),
     };
   }
 
@@ -1439,6 +1461,10 @@ export class MultiSandboxRouter {
     const now = this.#clock.now();
     const candidates = available.filter(
       candidate => {
+        if (
+          V2_HOST_TRANSFER_BUDGET - (candidate.reservedTransferCost ?? 0) <
+            job.admissionCost
+        ) return false;
         const block = job.excluded.get(runtimeIncarnationKey(candidate));
         if (!block) return true;
         const retryEpoch = this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0;
@@ -1474,10 +1500,18 @@ export class MultiSandboxRouter {
     let admissionDeadlineExpired = false;
     let routeAttemptExpired = false;
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+    let cancellationProofTimer: ReturnType<typeof setTimeout> | undefined;
+    let rejectAdmissionWait!: (error: unknown) => void;
+    const admissionWait = new Promise<never>((_resolve, reject) => {
+      rejectAdmissionWait = reject;
+    });
+    void admissionWait.catch(() => undefined);
     const onCallerAbort = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
       admissionTimer = undefined;
-      admissionController.abort(job.signal?.reason ?? abortError());
+      const error = job.signal?.reason ?? abortError();
+      admissionController.abort(error);
+      rejectAdmissionWait(error);
     };
     if (job.signal?.aborted) onCallerAbort();
     else job.signal?.addEventListener("abort", onCallerAbort, { once: true });
@@ -1486,7 +1520,9 @@ export class MultiSandboxRouter {
       // Caller cancellation already owns the outcome.
     } else if (remainingAdmissionMs <= 0) {
       admissionDeadlineExpired = true;
-      admissionController.abort(new RouterCapacityTimeoutError());
+      const error = new RouterCapacityTimeoutError();
+      admissionController.abort(error);
+      rejectAdmissionWait(error);
     } else {
       const attemptTimeoutMs = Math.min(
         remainingAdmissionMs,
@@ -1496,10 +1532,22 @@ export class MultiSandboxRouter {
         admissionTimer = undefined;
         if (this.#clock.now() >= job.queueDeadlineMs) {
           admissionDeadlineExpired = true;
-          admissionController.abort(new RouterCapacityTimeoutError());
+          const error = new RouterCapacityTimeoutError();
+          admissionController.abort(error);
+          cancellationProofTimer = setTimeout(
+            () => rejectAdmissionWait(error),
+            ROUTE_CANCELLATION_PROOF_GRACE_MS,
+          );
+          cancellationProofTimer.unref?.();
         } else {
           routeAttemptExpired = true;
-          admissionController.abort(new RouterRouteAttemptTimeoutError());
+          const error = new RouterRouteAttemptTimeoutError();
+          admissionController.abort(error);
+          cancellationProofTimer = setTimeout(
+            () => rejectAdmissionWait(error),
+            ROUTE_CANCELLATION_PROOF_GRACE_MS,
+          );
+          cancellationProofTimer.unref?.();
         }
       }, attemptTimeoutMs);
       admissionTimer.unref?.();
@@ -1507,6 +1555,8 @@ export class MultiSandboxRouter {
     const clearAdmissionDeadline = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
       admissionTimer = undefined;
+      if (cancellationProofTimer) clearTimeout(cancellationProofTimer);
+      cancellationProofTimer = undefined;
     };
     const detachAdmission = () => {
       clearAdmissionDeadline();
@@ -1516,14 +1566,20 @@ export class MultiSandboxRouter {
       // Older test seams may ignore the third argument and therefore retain
       // the conservative router reservation through commit. Production V2
       // explicitly calls it only after its request owns an admission credit.
-      const handle = await runtime.run(job.body, admissionController.signal, {
+      const runtimeRun = Promise.resolve(runtime.run(job.body, admissionController.signal, {
         onAdmissionReflected: () => {
+          if (admissionController.signal.aborted) return;
           clearAdmissionDeadline();
           this.#refreshRuntimeSafely(runtime);
           this.#releaseRuntimeReservation(job, runtime.projectId);
           this.#scheduleDrain();
         },
-      });
+      }));
+      // Promise.race installs terminal handlers on runtimeRun. If a broken test
+      // seam ignores cancellation, its late rejection remains consumed while
+      // the router safely moves work only because admission ownership was
+      // never reflected.
+      const handle = await Promise.race([runtimeRun, admissionWait]);
       // Commitment ends the admission deadline immediately. Optional memory
       // accounting work must never turn an accepted upstream request into a
       // local capacity timeout or inflate the measured commit ACK latency.

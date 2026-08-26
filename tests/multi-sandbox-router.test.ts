@@ -28,6 +28,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
   failDelayMs = 0;
   waitForAdmissionAbort = false;
   admissionAbortError: Error | null = null;
+  admissionAbortDelayMs = 0;
+  ignoreAdmissionAbortMs = 0;
   postAdmissionDelayMs = 0;
   admissionWindow: number | null = null;
   ackEwmaMs = 1_000;
@@ -109,10 +111,16 @@ class FakeRuntime implements RoutableSandboxRuntime {
           reject(signal.reason);
           return;
         }
-        signal?.addEventListener("abort", () => reject(this.admissionAbortError ?? signal.reason), {
-          once: true,
-        });
+        signal?.addEventListener("abort", () => {
+          const fail = () => reject(this.admissionAbortError ?? signal.reason);
+          if (this.admissionAbortDelayMs > 0) setTimeout(fail, this.admissionAbortDelayMs);
+          else fail();
+        }, { once: true });
       });
+    }
+    if (this.ignoreAdmissionAbortMs > 0) {
+      await Bun.sleep(this.ignoreAdmissionAbortMs);
+      throw new V2PreCommitError("late pre-commit cleanup", "late_precommit");
     }
     this.active++;
     this.uncommitted++;
@@ -218,6 +226,28 @@ describe("MultiSandboxRouter", () => {
       status: 400,
       code: "invalid_function_call_arguments",
       param: "input[0].arguments",
+    });
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(0);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("rejects provider-incompatible Unicode before sandbox admission", async () => {
+    const system = createSystem(2, 1);
+
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "broken-\ud800" }],
+      }],
+      stream: true,
+    })).rejects.toMatchObject({
+      name: "ResponsesInputUnicodeError",
+      status: 400,
+      code: "invalid_unicode",
+      param: "input[0]",
     });
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(0);
     expect(system.governor.snapshot().reservedBytes).toBe(0);
@@ -444,6 +474,39 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("does not await non-cooperative cleanup after the admission handoff deadline", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    system.runtimes[1]!.ignoreAdmissionAbortMs = 120;
+    const started = performance.now();
+
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "detach-safe-cleanup", stream: true },
+      { clientId: "detach-safe-cleanup", source: "websocket" },
+    );
+
+    expect(performance.now() - started).toBeLessThan(80);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await Bun.sleep(130);
+    await system.router.close();
+  });
+
+  it("enforces the absolute deadline when every runtime ignores cancellation", async () => {
+    const system = createSystem(1, 1, 60, undefined, undefined, undefined, 20);
+    system.runtimes[0]!.ignoreAdmissionAbortMs = 200;
+    const started = performance.now();
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "hard-deadline", stream: true },
+      { clientId: "hard-deadline", source: "websocket" },
+    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+
+    expect(performance.now() - started).toBeLessThan(110);
+    await Bun.sleep(220);
+    await system.router.close();
+  });
+
   it("never fails over an attempt timeout once the runtime reports execution risk", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
     system.runtimes[1]!.waitForAdmissionAbort = true;
@@ -458,6 +521,28 @@ describe("MultiSandboxRouter", () => {
       { clientId: "never-duplicate", source: "websocket" },
     )).rejects.toMatchObject({ committed: true, ambiguous: true, code: "start_risk" });
 
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    await system.router.close();
+  });
+
+  it("preserves delayed execution-risk proof inside the cancellation fence", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    system.runtimes[1]!.waitForAdmissionAbort = true;
+    system.runtimes[1]!.admissionAbortDelayMs = 10;
+    system.runtimes[1]!.admissionAbortError = new V2CommittedError(
+      "late durable start proof",
+      "late_start_risk",
+      true,
+    );
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "delayed-risk", stream: true },
+      { clientId: "delayed-risk", source: "websocket" },
+    )).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "late_start_risk",
+    });
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
     await system.router.close();
   });
@@ -593,6 +678,29 @@ describe("MultiSandboxRouter", () => {
     await firstHandle.final;
     await flush();
     expect(await jobs[120]).toBeDefined();
+  });
+
+  it("spreads multi-megabyte transfer ownership across the fleet", async () => {
+    const system = createSystem(4, 4, 1_000);
+    const body = {
+      model: "gpt-5.6-sol",
+      input: "x".repeat(2 * 1024 * 1024),
+      stream: true,
+    };
+
+    const handles = await Promise.all(Array.from(
+      { length: 4 },
+      (_, index) => system.router.startRelay(body, {
+        clientId: `large-${index}`,
+        source: "websocket",
+      }),
+    ));
+
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1, 1, 1]);
+    expect(system.runtimes.map(runtime => runtime.uncommittedPeak)).toEqual([1, 1, 1, 1]);
+    system.runtimes.forEach(runtime => runtime.completeOne());
+    await Promise.all(handles.map(handle => handle.final));
+    await system.router.close();
   });
 
   it("reroutes one pre-publication startup failure", async () => {

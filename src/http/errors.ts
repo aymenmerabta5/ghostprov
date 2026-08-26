@@ -129,6 +129,23 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
   if (
+    structured?.name === "ResponsesInputUnicodeError" &&
+    structured.status === 400 &&
+    structured.code === "invalid_unicode"
+  ) {
+    return {
+      status: 400,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "Responses input must contain valid Unicode scalar values",
+        type: "invalid_request_error",
+        param: typeof structured.param === "string" ? structured.param : "input",
+        code: "invalid_unicode",
+      },
+    };
+  }
+  if (
     structured?.name === "V2PreCommitError" &&
     structured.code === "request_too_large"
   ) {

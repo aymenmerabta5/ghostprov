@@ -65,6 +65,7 @@ describe("observability privacy", () => {
       stream: true,
       workload_class: "text-small",
       request_bytes: 100,
+      transfer_admission_cost: 1,
       reserved_bytes: 1024,
       capacity: 512,
       active: 16,
@@ -160,6 +161,7 @@ describe("observability privacy", () => {
       sandbox_throughput_bytes_per_sec: 1_000_000.5,
       queue_class: "latency",
       fair_cost_bytes: 4_096,
+      transfer_admission_cost: 3,
       route_attempt: 1,
     }))).not.toThrow();
     expect(() => assertSafeObservabilityEvent(observabilityEvent("route.selected", {
@@ -173,6 +175,9 @@ describe("observability privacy", () => {
     }))).toThrow();
     expect(() => assertSafeObservabilityEvent(observabilityEvent("route.selected", {
       route_attempt: 0,
+    }))).toThrow();
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("route.selected", {
+      transfer_admission_cost: 1.5,
     }))).toThrow();
   });
 

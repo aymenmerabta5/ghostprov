@@ -51,4 +51,39 @@ describe("Responses nested JSON validation", () => {
       input: [{ type: "function_call", call_id: "call_1", name: "read", arguments: {} }],
     })).toThrow("must be a JSON string");
   });
+
+  it("rejects lone Unicode surrogates before canonical request serialization", () => {
+    let thrown: unknown;
+    try {
+      validateResponsesInputJson({
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "broken-\ud800-unicode" }],
+        }],
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(normalizeApiError(thrown)).toEqual({
+      status: 400,
+      error: {
+        message: "Responses value at input[0] must contain valid Unicode scalar values",
+        type: "invalid_request_error",
+        param: "input[0]",
+        code: "invalid_unicode",
+      },
+    });
+  });
+
+  it("rejects lone Unicode surrogates decoded from function arguments", () => {
+    expect(() => validateResponsesInputJson({
+      input: [{
+        type: "function_call",
+        call_id: "call_unicode",
+        name: "read",
+        arguments: "{\"path\":\"\\ud800\"}",
+      }],
+    })).toThrow("valid Unicode");
+  });
 });

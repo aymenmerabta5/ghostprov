@@ -18,6 +18,8 @@ export interface RouteCandidate {
   available?: number;
   /** Host reservations not yet reflected in runtime admission credits. */
   reserved: number;
+  /** Weighted large-body transfer reservations not yet reflected by V2. */
+  reservedTransferCost?: number;
   quarantined: number;
   queueDepth: number;
   ackEwmaMs: number;
