@@ -143,7 +143,11 @@ export function reserveWebSocketIngressMemory(
   governor: ResourceGovernor,
   budget: WebSocketProcessBudget,
 ): BrowserlessWebSocketIngressMemory {
-  const reservedBytes = budget.snapshot().maxIngressBytes;
+  const snapshot = budget.snapshot();
+  const reservedBytes = snapshot.maxIngressBytes + snapshot.maxQueuedBytes;
+  if (!Number.isSafeInteger(reservedBytes)) {
+    throw new RangeError("WebSocket process memory reservation exceeds the safe integer range");
+  }
   let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
   let closed = false;
   return {
@@ -152,10 +156,14 @@ export function reserveWebSocketIngressMemory(
     close() {
       if (closed) return;
       const snapshot = budget.snapshot();
-      if (snapshot.sessions !== 0 || snapshot.ingressReservedBytes !== 0) {
+      if (
+        snapshot.sessions !== 0 ||
+        snapshot.ingressReservedBytes !== 0 ||
+        snapshot.queuedBytes !== 0
+      ) {
         throw new Error(
           `WebSocket ingress memory closed with ${snapshot.sessions} sessions and ` +
-          `${snapshot.ingressReservedBytes} reserved bytes`,
+          `${snapshot.ingressReservedBytes} ingress bytes and ${snapshot.queuedBytes} queued bytes`,
         );
       }
       closed = true;

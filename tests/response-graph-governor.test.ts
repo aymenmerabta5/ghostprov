@@ -38,7 +38,7 @@ function resolved(graph: ResponseGraph, input: string) {
 }
 
 describe("ResponseGraph fixed governor memory", () => {
-  it("keeps WebSocket ingress fixed memory charged until sessions close", () => {
+  it("charges independent WebSocket ingress and queued-memory ceilings", () => {
     const value = governor();
     const budget = new WebSocketProcessBudget({
       maxSessions: 2,
@@ -47,9 +47,10 @@ describe("ResponseGraph fixed governor memory", () => {
     });
     const memory = reserveWebSocketIngressMemory(value, budget);
     const session = budget.openSession(3072)!;
-    expect(value.snapshot().reservedBytes).toBe(4096);
+    expect(memory.reservedBytes).toBe(5120);
+    expect(value.snapshot().reservedBytes).toBe(5120);
     expect(() => memory.close()).toThrow("1 sessions");
-    expect(value.snapshot().reservedBytes).toBe(4096);
+    expect(value.snapshot().reservedBytes).toBe(5120);
 
     session.close();
     memory.close();

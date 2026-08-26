@@ -140,7 +140,7 @@ describe("Responses WebSocket server", () => {
     expect(budget.snapshot().sessions).toBe(1);
   });
 
-  it("guarantees full promotion headroom while retaining legacy Node jumbo math", () => {
+  it("guarantees forty-two default sessions plus full promotion headroom", () => {
     const normalBytes = webSocketIngressReservationBytes(DEFAULT_WS_MAX_PAYLOAD_BYTES);
     const jumboBytes = webSocketIngressReservationBytes(MAX_WS_PAYLOAD_BYTES);
     expect(normalBytes).toBe(17 * 1024 * 1024);
@@ -153,30 +153,30 @@ describe("Responses WebSocket server", () => {
     });
     expect(DEFAULT_WS_PROMOTION_HEADROOM_BYTES).toBe(48 * 1024 * 1024);
     const defaults = Array.from(
-      { length: 27 },
+      { length: 42 },
       () => budget.openSession(normalBytes, DEFAULT_WS_PROMOTION_HEADROOM_BYTES),
     );
     expect(defaults.every(Boolean)).toBe(true);
     expect(budget.openSession(normalBytes, DEFAULT_WS_PROMOTION_HEADROOM_BYTES)).toBeNull();
     expect(budget.snapshot()).toMatchObject({
-      sessions: 27,
-      ingressReservedBytes: 459 * 1024 * 1024,
+      sessions: 42,
+      ingressReservedBytes: 714 * 1024 * 1024,
       queuedBytes: 0,
-      maxIngressBytes: 512 * 1024 * 1024,
+      maxIngressBytes: 768 * 1024 * 1024,
     });
     expect(defaults[0]!.tryEnsureIngress(DEFAULT_WS_PROMOTION_HEADROOM_BYTES)).toBe(true);
-    expect(budget.snapshot().ingressReservedBytes).toBe(507 * 1024 * 1024);
+    expect(budget.snapshot().ingressReservedBytes).toBe(762 * 1024 * 1024);
     defaults[0]!.releaseIngress();
     for (const lease of defaults) lease!.close();
 
     const jumbo = budget.openSession(jumboBytes);
     expect(jumbo).not.toBeNull();
-    const alongsideJumbo = Array.from({ length: 15 }, () => budget.openSession(normalBytes));
+    const alongsideJumbo = Array.from({ length: 30 }, () => budget.openSession(normalBytes));
     expect(alongsideJumbo.every(Boolean)).toBe(true);
     expect(budget.openSession(normalBytes)).toBeNull();
     expect(budget.snapshot()).toMatchObject({
-      sessions: 16,
-      ingressReservedBytes: 512 * 1024 * 1024,
+      sessions: 31,
+      ingressReservedBytes: 767 * 1024 * 1024,
     });
     jumbo!.close();
     for (const lease of alongsideJumbo) lease!.close();
@@ -376,10 +376,10 @@ describe("Responses WebSocket server", () => {
     blocker.close();
   }, 15_000);
 
-  it("keeps twenty-six normal agents healthy while one sends a 10 MiB turn", async () => {
+  it("keeps thirty-six normal agents healthy while one sends a 10 MiB turn", async () => {
     const MiB = 1024 * 1024;
     const budget = new WebSocketProcessBudget({
-      maxSessions: 32,
+      maxSessions: 48,
       maxQueuedBytes: 512 * MiB,
       maxIngressBytes: DEFAULT_WS_PROCESS_MAX_INGRESS_BYTES,
     });
@@ -399,7 +399,7 @@ describe("Responses WebSocket server", () => {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("missing test address");
     const clients = Array.from(
-      { length: 27 },
+      { length: 37 },
       () => new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`),
     );
     sockets.push(...clients);
@@ -419,15 +419,17 @@ describe("Responses WebSocket server", () => {
       () => outputs.every(messages => messages.some(message => message.type === "response.completed")),
       10_000,
     );
-    expect(calls).toBe(27);
+    expect(calls).toBe(37);
     expect(clients.every(socket => socket.readyState === WebSocket.OPEN)).toBe(true);
     expect(budget.snapshot()).toMatchObject({
-      sessions: 27,
+      sessions: 37,
       queuedBytes: 0,
     });
     expect(telemetry.snapshotAndReset()).toMatchObject({
+      ingressGuaranteedSessions: 42,
       ingressPromotions: 1,
       ingressRejections: 0,
+      ingressUpgradeRejectionsTotal: 0,
     });
   }, 20_000);
 

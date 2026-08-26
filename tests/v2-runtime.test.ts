@@ -27,6 +27,7 @@ import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import type {
   V2TransportSnapshot,
 } from "../src/v2/transport/session";
+import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
 import {
   V2CommittedError,
   V2PreCommitError,
@@ -256,6 +257,43 @@ class FakeTransport implements V2RuntimeTransport {
     if (this.recoveryAdoptPromise) await this.recoveryAdoptPromise;
   }
   failSidecarRecovery(): void { this.recoveryFailures++; }
+}
+
+function stalledHostDiagnostics(): V2TransportDiagnostics {
+  return {
+    windowFrames: 1,
+    windowBytes: 764,
+    schedulerFrames: 2,
+    schedulerBytes: 324,
+    schedulerStreams: 2,
+    oldestQueuedFrameMs: 60_000,
+    ackProgressAgeMs: 60_000,
+    retransmissionAttempt: 16,
+    peakRetransmissionAttempt: 16,
+    retransmissionsTotal: 16,
+    publicationsTotal: 32,
+    publishedBytesTotal: 64 * 1024,
+    admittedUncommitted: 0,
+    roundTripEwmaMs: 250,
+    pacedPublicationsTotal: 0,
+    urgentPublicationsTotal: 32,
+    logicalEventsTotal: 0,
+    responseBatchFramesTotal: 0,
+    batchedEventsTotal: 0,
+    dataPublicationsTotal: 16,
+    controlPublicationsTotal: 16,
+    dataPublishedBytesTotal: 48 * 1024,
+    controlPublishedBytesTotal: 16 * 1024,
+    flightCompletionsTotal: 1,
+    adaptiveCapacity: 0,
+    capacityIncreasesTotal: 0,
+    capacityReductionsTotal: 1,
+    unadmittedTimeoutsTotal: 0,
+    acknowledgedGoodputBytesPerSecond: null,
+    uniqueAcknowledgedBytesTotal: 1024,
+    retransmittedBytesTotal: 16 * 1024,
+    stallEventsTotal: 1,
+  };
 }
 
 class FakeGovernor implements V2RuntimeGovernor {
@@ -1065,6 +1103,32 @@ describe("V2SandboxRuntime", () => {
       protocolRevision: "r2",
     });
     expect(harness.transports[1]!.binding!.launchNonce).not.toBe(originalNonce);
+    await harness.runtime.stop();
+  });
+
+  it("relaunches an R2 sidecar when reliable host frames stall after request state settles", async () => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+    });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = {
+      host: stalledHostDiagnostics(),
+      sidecar: null,
+    };
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await harness.clock.advanceBy(10_000);
+    }
+    for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.transport.livenessProbes).toBe(1);
+    expect(harness.transport.recoverySuspends).toBe(1);
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("ready");
     await harness.runtime.stop();
   });
 

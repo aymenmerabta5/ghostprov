@@ -842,12 +842,19 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (signal.aborted || generation !== this.#generation) return;
       try {
         const diagnostics = monitoredTransport.snapshot().diagnostics?.host;
-        if (
-          diagnostics &&
-          diagnostics.admittedUncommitted > 0 &&
-          diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs
-        ) {
-          throw new Error("V2 sidecar commit processing stopped making progress");
+        if (diagnostics) {
+          const windowStalled = diagnostics.windowFrames > 0 &&
+            diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs;
+          const schedulerStalled = diagnostics.schedulerFrames > 0 &&
+            diagnostics.oldestQueuedFrameMs >= this.#sidecarCommitStallMs;
+          if (windowStalled || schedulerStalled) {
+            // A definitive prepared-expired outcome removes request-local
+            // admission state, but it cannot retract a reliable frame already
+            // in the cumulative window. Treat the transport itself as sick so
+            // successful out-of-band pongs cannot leave an unroutable runtime
+            // marked ready forever.
+            throw new Error("V2 reliable host transport stopped making progress");
+          }
         }
         await monitoredTransport.probeLiveness!(signal);
         if (generation !== this.#generation) return;
