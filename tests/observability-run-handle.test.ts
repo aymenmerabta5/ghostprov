@@ -4,7 +4,8 @@ import type { RunHandle } from "../src/relay/run-handle";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { traceRunHandle } from "../src/observability/traced-run-handle";
-import { V2RunHandle } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -168,5 +169,58 @@ describe("traceRunHandle", () => {
       quarantined: true,
       error_kind: "sidecar_unreachable",
     });
+  });
+
+  it("attributes a committed provider failure without logging its payload", async () => {
+    const logger = new MemoryLogger();
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 400,
+      value: {
+        type: "error",
+        error: {
+          message: "Invalid body",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_json",
+        },
+      },
+      headers: new Headers({ "x-request-id": "req_invalid_json_1" }),
+      model: "gpt-5.6-sol",
+    });
+    const final = Promise.reject(new V2CommittedError(
+      "Invalid body",
+      "invalid_json",
+      false,
+      undefined,
+      providerError,
+    ));
+    void final.catch(() => undefined);
+    const traced = traceRunHandle({
+      async *events() {},
+      final,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }, {
+      logger,
+      clock: new FakeClock(),
+      traceId: "trace-provider-error",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+
+    await expect(traced.final).rejects.toThrow("Invalid body");
+    expect(logger.events[0]).toMatchObject({
+      event: "request.failed",
+      error_kind: "invalid_json",
+      status: 400,
+      provider_origin: "sse",
+      upstream_request_id: "req_invalid_json_1",
+    });
+    expect(JSON.stringify(logger.events[0])).not.toContain("invalid_request_error");
   });
 });

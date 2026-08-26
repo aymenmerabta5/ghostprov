@@ -3,6 +3,7 @@ import type { RunHandle } from "../relay/run-handle";
 import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import { sanitizeDiagnosticMessage } from "./redaction";
+import { providerErrorEnvelopeFrom } from "../v2/provider-error";
 
 export interface RunTraceContext {
   logger: LoggerLike;
@@ -21,6 +22,7 @@ function errorFields(error: unknown): Record<string, JsonValue> {
   const value = error && typeof error === "object"
     ? error as Record<string, unknown>
     : {};
+  const providerError = providerErrorEnvelopeFrom(error);
   return {
     error_name: error instanceof Error ? error.name : "Error",
     error_kind: typeof value.kind === "string"
@@ -28,10 +30,18 @@ function errorFields(error: unknown): Record<string, JsonValue> {
       : typeof value.code === "string"
         ? value.code
         : null,
-    status: typeof value.status === "number" ? value.status : null,
+    status: typeof value.status === "number"
+      ? value.status
+      : providerError?.status ?? null,
     error_message: sanitizeDiagnosticMessage(
       error instanceof Error ? error.message : error,
     ),
+    ...(providerError ? {
+      provider_origin: providerError.origin,
+      ...(providerError.upstreamRequestId
+        ? { upstream_request_id: providerError.upstreamRequestId }
+        : {}),
+    } : {}),
   };
 }
 

@@ -44,8 +44,9 @@ The global router evaluates every healthy runtime and selects the lowest predict
 
 Failure rules:
 
-- Before committed ACK, one safe router retry is allowed.
+- Safe router failover is allowed only before committed ACK and inside the original admission deadline. A selected runtime has 15 seconds to take transport ownership before another healthy incarnation is tried; any committed or ambiguous execution-risk signal disables failover.
 - After committed ACK, the request remains pinned to its original sandbox and is never retried.
+- Top-level Responses `function_call.arguments` strings are parsed before memory admission, so malformed nested JSON receives an exact local 400 path instead of consuming a sandbox request.
 - `FETCH_STARTING` is durable before fetch; a crash afterward is ambiguous and quarantined.
 - A request is released only after exact request/response/transcript terminal proof.
 - Proven terminal spools replay after restart without another upstream call.
@@ -53,8 +54,9 @@ Failure rules:
 - One failed project never stops healthy projects.
 - Global zero-capacity queueing fails with a typed 503 after 30 seconds instead of waiting for a client WebSocket idle timeout.
 - Client cancellations and definitive upstream errors are routing-neutral; only transport-attributable failures feed a sixty-second decaying sandbox health score.
-- ACK-stall age starts with the active reliable flight; idle time never suppresses credits, and a fully drained transport restores credits immediately.
+- ACK-stall age starts with the active reliable flight; idle time never suppresses credits, and a fully drained transport restores credits immediately. Two consecutive ten-second reliable-stall samples remove capacity and start same-session R2 recovery, while fresh ACK progress prevents queued-but-moving frames from being misclassified.
 - Every project runtime is supervised. A dead child is replaced with a fresh sandbox session for the **same Prism project and worker index**; recovery never creates or deletes a project.
+- One isolated sidecar failure recovers immediately. A second distinct project failing within five seconds activates the existing fleet single-probe circuit, preventing an account outage from reprovisioning every sandbox at once.
 
 ## Concurrency and latency
 
@@ -443,6 +445,7 @@ The isolated suite includes:
 - `tests/recovery-observability.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/response-graph-governor.test.ts`
+- `tests/responses-validation.test.ts`
 - `tests/router-http.test.ts`
 - `tests/router-observability.test.ts`
 - `tests/router-policy.test.ts`

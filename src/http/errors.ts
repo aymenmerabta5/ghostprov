@@ -112,6 +112,23 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
 
   const structured = record(error);
   if (
+    structured?.name === "ResponsesInputJsonError" &&
+    structured.status === 400 &&
+    structured.code === "invalid_function_call_arguments"
+  ) {
+    return {
+      status: 400,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "Function call arguments must contain valid JSON",
+        type: "invalid_request_error",
+        param: typeof structured.param === "string" ? structured.param : "input",
+        code: "invalid_function_call_arguments",
+      },
+    };
+  }
+  if (
     structured?.name === "V2PreCommitError" &&
     structured.code === "request_too_large"
   ) {

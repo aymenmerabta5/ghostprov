@@ -163,6 +163,82 @@ describe("FleetRecoveryCoordinator classification", () => {
 });
 
 describe("FleetRecoveryCoordinator", () => {
+  it("gates a correlated burst while leaving one isolated sidecar recovery immediate", async () => {
+    const clock = new ManualClock();
+    const coordinator = new FleetRecoveryCoordinator({ clock });
+    const trigger = (suffix: string) => ({
+      projectId: `00000000-0000-4000-8000-${suffix.padStart(12, "0")}`,
+      reason: "state:failed",
+      failure: { name: "V2RuntimeLifecycleFailure", kind: "sidecar_unreachable" },
+    });
+
+    const isolated = await coordinator.enter(trigger("1"));
+    expect(isolated.probe).toBe(false);
+    const correlated = await coordinator.enter(trigger("2"));
+    expect(correlated.probe).toBe(true);
+    const queued = observe(coordinator.enter(trigger("3")));
+    await flush();
+
+    expect(queued.settled).toBe(false);
+    expect(coordinator.snapshot()).toMatchObject({
+      state: "half_open",
+      scope: "outage",
+      queued: 1,
+      probeInFlight: true,
+    });
+
+    correlated.succeed();
+    await flush();
+    expect(queued.settled).toBe(true);
+    expect(queued.value?.probe).toBe(false);
+    isolated.cancel();
+    queued.value?.cancel();
+    coordinator.close();
+  });
+
+  it("does not correlate sidecar failures outside the bounded window", async () => {
+    const clock = new ManualClock();
+    const coordinator = new FleetRecoveryCoordinator({
+      clock,
+      correlatedSidecarWindowMs: 100,
+    });
+    const first = await coordinator.enter({
+      projectId: "00000000-0000-4000-8000-000000000001",
+      failure: { kind: "sidecar_unreachable" },
+    });
+    clock.advanceBy(101);
+    const second = await coordinator.enter({
+      projectId: "00000000-0000-4000-8000-000000000002",
+      failure: { kind: "sidecar_unreachable" },
+    });
+
+    expect(first.probe).toBe(false);
+    expect(second.probe).toBe(false);
+    expect(coordinator.snapshot().state).toBe("closed");
+    first.cancel();
+    second.cancel();
+    coordinator.close();
+  });
+
+  it("forgets an isolated sidecar observation after that recovery succeeds", async () => {
+    const clock = new ManualClock();
+    const coordinator = new FleetRecoveryCoordinator({ clock });
+    const first = await coordinator.enter({
+      projectId: "00000000-0000-4000-8000-000000000001",
+      failure: { kind: "sidecar_unreachable" },
+    });
+    first.succeed();
+    const second = await coordinator.enter({
+      projectId: "00000000-0000-4000-8000-000000000002",
+      failure: { kind: "sidecar_unreachable" },
+    });
+
+    expect(second.probe).toBe(false);
+    expect(coordinator.snapshot().state).toBe("closed");
+    second.cancel();
+    coordinator.close();
+  });
+
   it("admits one outage probe at a time, backs off forever, and wakes all waiters on health", async () => {
     const clock = new ManualClock();
     const coordinator = new FleetRecoveryCoordinator({

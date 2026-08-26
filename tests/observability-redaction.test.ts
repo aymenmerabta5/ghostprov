@@ -74,6 +74,18 @@ describe("observability privacy", () => {
     expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
   });
 
+  it("accepts bounded provider attribution on terminal failures", () => {
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("request.failed", {
+      trace_id: "trace-provider-error",
+      project_id: "e631d12c-d917-4434-b360-41b4715d6679",
+      status: 400,
+      error_kind: "invalid_json",
+      provider_origin: "sse",
+      upstream_request_id: "req_invalid_json_1",
+      committed: true,
+    }))).not.toThrow();
+  });
+
   it("rejects forbidden fields and credential values", () => {
     expect(() => assertSafeObservabilityEvent({
       schema: 1,

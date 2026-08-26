@@ -348,6 +348,8 @@ function runtimeHarness(options: {
   initialSandbox?: ProvisionedSandbox;
   stopTimeoutMs?: number;
   sidecarRecoveryTimeoutMs?: number;
+  sidecarCommitStallMs?: number;
+  sidecarStallSampleThreshold?: number;
   enableR2Recovery?: boolean;
   recoveryAdoptError?: Error;
   heartbeatSessionId?: string;
@@ -484,6 +486,8 @@ function runtimeHarness(options: {
     ySweetRefreshMs: 300_000,
     stopTimeoutMs: options.stopTimeoutMs,
     sidecarRecoveryTimeoutMs: options.sidecarRecoveryTimeoutMs,
+    sidecarCommitStallMs: options.sidecarCommitStallMs,
+    sidecarStallSampleThreshold: options.sidecarStallSampleThreshold,
     initialSandbox: options.initialSandbox,
     onCredentialRefresh: outcome => credentialOutcomes.push(outcome),
     createGateway: (_sandbox: ProvisionedSandbox) => ({
@@ -1117,9 +1121,10 @@ describe("V2SandboxRuntime", () => {
       sidecar: null,
     };
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await harness.clock.advanceBy(10_000);
-    }
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+    expect(harness.transports).toHaveLength(1);
+    await harness.clock.advanceBy(10_000);
     for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
       await Promise.resolve();
     }
@@ -1129,6 +1134,47 @@ describe("V2SandboxRuntime", () => {
     expect(harness.transports).toHaveLength(2);
     expect(harness.transports[1]!.recoveryAdopts).toBe(1);
     expect(harness.runtime.snapshot().state).toBe("ready");
+    await harness.runtime.stop();
+  });
+
+  it("restores routing when one reliable-stall sample makes progress", async () => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+    });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = {
+      host: stalledHostDiagnostics(),
+      sidecar: null,
+    };
+
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+    harness.transport.snapshotValue.diagnostics = undefined;
+    await harness.clock.advanceBy(10_000);
+
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot().capacity).toBe(128);
+    await harness.runtime.stop();
+  });
+
+  it("does not mistake queued frames behind fresh ACK progress for a stall", async () => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+    });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = {
+      host: { ...stalledHostDiagnostics(), ackProgressAgeMs: 1 },
+      sidecar: null,
+    };
+
+    await harness.clock.advanceBy(20_000);
+
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot().capacity).toBe(128);
     await harness.runtime.stop();
   });
 

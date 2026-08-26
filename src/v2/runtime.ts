@@ -239,6 +239,7 @@ export interface V2SandboxRuntimeOptions {
   sidecarProbePeriodMs?: number;
   sidecarFailureThreshold?: number;
   sidecarCommitStallMs?: number;
+  sidecarStallSampleThreshold?: number;
   sidecarRecoveryTimeoutMs?: number;
   stopTimeoutMs?: number;
   initialSandbox?: ProvisionedSandbox;
@@ -306,6 +307,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   readonly #sidecarProbePeriodMs: number;
   readonly #sidecarFailureThreshold: number;
   readonly #sidecarCommitStallMs: number;
+  readonly #sidecarStallSampleThreshold: number;
   readonly #sidecarRecoveryTimeoutMs: number;
   readonly #stopTimeoutMs: number;
   #state: RuntimeState = "configured";
@@ -382,7 +384,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#ySweetRefreshMs = ySweetRefreshMs;
     this.#sidecarProbePeriodMs = options.sidecarProbePeriodMs ?? 10_000;
     this.#sidecarFailureThreshold = options.sidecarFailureThreshold ?? 3;
-    this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? 60_000;
+    // A reliable-window stall is stronger evidence than one missed out-of-band
+    // pong. Observe it twice, one probe period apart, so the effective default
+    // recovery boundary is 20 seconds without reacting to a single slow ACK.
+    this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? this.#sidecarProbePeriodMs;
+    this.#sidecarStallSampleThreshold = options.sidecarStallSampleThreshold ?? 2;
     // Recovery includes authenticated session proof, old-PID retirement, one
     // or more bootstrap attempts, journal replay, and a final liveness proof.
     // It must not inherit the much shorter shutdown cleanup budget.
@@ -396,6 +402,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }
     if (!Number.isSafeInteger(this.#sidecarCommitStallMs) || this.#sidecarCommitStallMs < 1) {
       throw new RangeError("sidecarCommitStallMs must be positive");
+    }
+    if (
+      !Number.isSafeInteger(this.#sidecarStallSampleThreshold) ||
+      this.#sidecarStallSampleThreshold < 2
+    ) {
+      throw new RangeError("sidecarStallSampleThreshold must be at least two");
     }
     if (
       !Number.isSafeInteger(this.#sidecarRecoveryTimeoutMs) ||
@@ -832,7 +844,31 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     if (!transport.probeLiveness) return;
     let monitoredTransport = transport;
     let consecutiveFailures = 0;
+    let consecutiveReliableStalls = 0;
     let deadline = this.#clock.now() + this.#sidecarProbePeriodMs;
+    const recover = async (): Promise<boolean> => {
+      try {
+        monitoredTransport = await this.#relaunchSidecar(
+          generation,
+          monitoredTransport,
+          signal,
+        );
+        consecutiveFailures = 0;
+        consecutiveReliableStalls = 0;
+        this.#sidecarSuspect = false;
+        this.#emit();
+        return true;
+      } catch (relaunchError) {
+        if (signal.aborted || generation !== this.#generation) return false;
+        this.#failGeneration(
+          generation,
+          new V2RuntimeLifecycleFailure("sidecar_unreachable", null, {
+            cause: relaunchError,
+          }),
+        );
+        return false;
+      }
+    };
     while (!signal.aborted && generation === this.#generation) {
       try {
         await this.#clock.waitUntil(deadline, signal);
@@ -840,59 +876,56 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         if (signal.aborted) return;
       }
       if (signal.aborted || generation !== this.#generation) return;
+      let reliableStallReady = false;
       try {
         const diagnostics = monitoredTransport.snapshot().diagnostics?.host;
-        if (diagnostics) {
-          const windowStalled = diagnostics.windowFrames > 0 &&
-            diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs;
-          const schedulerStalled = diagnostics.schedulerFrames > 0 &&
-            diagnostics.oldestQueuedFrameMs >= this.#sidecarCommitStallMs;
-          if (windowStalled || schedulerStalled) {
+        const windowStalled = !!diagnostics && diagnostics.windowFrames > 0 &&
+          diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs;
+        const schedulerStalled = !!diagnostics && diagnostics.schedulerFrames > 0 &&
+          diagnostics.oldestQueuedFrameMs >= this.#sidecarCommitStallMs &&
+          (
+            diagnostics.windowFrames === 0 ||
+            diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs
+          );
+        if (windowStalled || schedulerStalled) {
+          consecutiveReliableStalls++;
+          if (!this.#sidecarSuspect) {
+            this.#sidecarSuspect = true;
+            this.#emit();
+          }
+          if (consecutiveReliableStalls >= this.#sidecarStallSampleThreshold) {
             // A definitive prepared-expired outcome removes request-local
             // admission state, but it cannot retract a reliable frame already
-            // in the cumulative window. Treat the transport itself as sick so
-            // successful out-of-band pongs cannot leave an unroutable runtime
-            // marked ready forever.
+            // in the cumulative window. Two independent samples prove that a
+            // successful out-of-band pong must not keep it routable.
+            reliableStallReady = true;
             throw new Error("V2 reliable host transport stopped making progress");
           }
-        }
-        await monitoredTransport.probeLiveness!(signal);
-        if (generation !== this.#generation) return;
-        consecutiveFailures = 0;
-        if (this.#sidecarSuspect) {
-          this.#sidecarSuspect = false;
-          this.#emit();
+        } else {
+          consecutiveReliableStalls = 0;
+          await monitoredTransport.probeLiveness!(signal);
+          if (generation !== this.#generation) return;
+          consecutiveFailures = 0;
+          if (this.#sidecarSuspect) {
+            this.#sidecarSuspect = false;
+            this.#emit();
+          }
         }
       } catch (error) {
         if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           return;
         }
         if (generation !== this.#generation) return;
-        consecutiveFailures++;
+        if (!reliableStallReady) consecutiveFailures++;
         if (!this.#sidecarSuspect) {
           this.#sidecarSuspect = true;
           this.#emit();
         }
-        if (consecutiveFailures >= this.#sidecarFailureThreshold) {
-          try {
-            monitoredTransport = await this.#relaunchSidecar(
-              generation,
-              monitoredTransport,
-              signal,
-            );
-            consecutiveFailures = 0;
-            this.#sidecarSuspect = false;
-            this.#emit();
-          } catch (relaunchError) {
-            if (signal.aborted || generation !== this.#generation) return;
-            this.#failGeneration(
-              generation,
-              new V2RuntimeLifecycleFailure("sidecar_unreachable", null, {
-                cause: relaunchError,
-              }),
-            );
-            return;
-          }
+        if (
+          reliableStallReady ||
+          consecutiveFailures >= this.#sidecarFailureThreshold
+        ) {
+          if (!await recover()) return;
         }
       }
       deadline += this.#sidecarProbePeriodMs;

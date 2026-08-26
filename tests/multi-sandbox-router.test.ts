@@ -5,7 +5,7 @@ import { ResourceGovernor } from "../src/router/resource-governor";
 import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
-import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 import type { Clock } from "../src/core/ports";
 
 function deferred<T>() {
@@ -27,6 +27,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   failError: Error = new V2PreCommitError("pre-publication failure", "test_precommit");
   failDelayMs = 0;
   waitForAdmissionAbort = false;
+  admissionAbortError: Error | null = null;
   postAdmissionDelayMs = 0;
   admissionWindow: number | null = null;
   ackEwmaMs = 1_000;
@@ -108,7 +109,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
           reject(signal.reason);
           return;
         }
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        signal?.addEventListener("abort", () => reject(this.admissionAbortError ?? signal.reason), {
+          once: true,
+        });
       });
     }
     this.active++;
@@ -144,6 +147,7 @@ function createSystem(
   queueCapacity?: number,
   queueByteCapacity?: number,
   clock?: Clock,
+  routeAttemptTimeoutMs?: number,
 ) {
   const runtimes = Array.from({ length: projects }, (_, index) => new FakeRuntime(
     projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
@@ -170,6 +174,7 @@ function createSystem(
     queueCapacity,
     queueByteCapacity,
     clock,
+    routeAttemptTimeoutMs,
   });
   return { runtimes, registry, governor, router };
 }
@@ -192,6 +197,29 @@ describe("MultiSandboxRouter", () => {
       stream: true,
     })).rejects.toBeInstanceOf(CpuTransformQueueFullError);
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("rejects malformed nested function arguments before sandbox admission", async () => {
+    const system = createSystem(2, 1);
+
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "function_call",
+        call_id: "call_bad_json",
+        name: "read",
+        arguments: "{\"path\":",
+      }],
+      stream: true,
+    })).rejects.toMatchObject({
+      name: "ResponsesInputJsonError",
+      status: 400,
+      code: "invalid_function_call_arguments",
+      param: "input[0].arguments",
+    });
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(0);
     expect(system.governor.snapshot().reservedBytes).toBe(0);
     await system.router.close();
   });
@@ -396,6 +424,41 @@ describe("MultiSandboxRouter", () => {
     expect(performance.now() - started).toBeLessThan(60);
     expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0 });
     expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("fails over a safely unadmitted route before the global deadline", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    system.runtimes[1]!.waitForAdmissionAbort = true;
+    const started = performance.now();
+
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "early-safe-failover", stream: true },
+      { clientId: "early-safe-failover", source: "websocket" },
+    );
+
+    expect(performance.now() - started).toBeLessThan(150);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("never fails over an attempt timeout once the runtime reports execution risk", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    system.runtimes[1]!.waitForAdmissionAbort = true;
+    system.runtimes[1]!.admissionAbortError = new V2CommittedError(
+      "request start may have crossed the durable boundary",
+      "start_risk",
+      true,
+    );
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "never-duplicate", stream: true },
+      { clientId: "never-duplicate", source: "websocket" },
+    )).rejects.toMatchObject({ committed: true, ambiguous: true, code: "start_risk" });
+
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
     await system.router.close();
   });
 

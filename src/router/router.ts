@@ -20,6 +20,7 @@ import type { LoggerLike } from "../observability/logger";
 import { observabilityEvent, type JsonValue } from "../observability/events";
 import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
+import { validateResponsesInputJson } from "../relay/responses-validation";
 import {
   rateLimitHintFromError,
   rateLimitProblemFromError,
@@ -47,6 +48,7 @@ const DEFAULT_QUEUE_CAPACITY = 4_096;
 const DEFAULT_QUEUE_BYTES = 1024 * MiB;
 const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
+const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 
 interface ClientLane {
   readonly key: string;
@@ -206,6 +208,16 @@ export class RouterCapacityTimeoutError extends Error {
   }
 }
 
+class RouterRouteAttemptTimeoutError extends Error {
+  readonly name = "RouterRouteAttemptTimeoutError";
+  readonly code = "router_route_attempt_timeout";
+  readonly committed = false;
+
+  constructor() {
+    super("Selected sandbox did not acquire transport admission in time");
+  }
+}
+
 export class RouterQueueFullError extends Error {
   readonly name = "RouterQueueFullError";
   readonly status = 503;
@@ -302,6 +314,7 @@ export class MultiSandboxRouter {
   readonly #slowRequestMs: number;
   readonly #transport: string;
   readonly #queueTimeoutMs: number;
+  readonly #routeAttemptTimeoutMs: number;
   readonly #queueCapacity: number;
   readonly #queueByteCapacity: number;
   readonly #registryUnsubscribe: () => void;
@@ -360,6 +373,7 @@ export class MultiSandboxRouter {
     clock?: Clock;
     logger?: LoggerLike;
     queueTimeoutMs?: number;
+    routeAttemptTimeoutMs?: number;
     queueCapacity?: number;
     queueByteCapacity?: number;
     observability?: { slowRequestMs?: number; transport?: string };
@@ -374,6 +388,19 @@ export class MultiSandboxRouter {
     this.#queueTimeoutMs = options.queueTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(this.#queueTimeoutMs) || this.#queueTimeoutMs < 1) {
       throw new RangeError("queueTimeoutMs must be a positive safe integer");
+    }
+    this.#routeAttemptTimeoutMs = options.routeAttemptTimeoutMs ?? Math.min(
+      DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS,
+      this.#queueTimeoutMs,
+    );
+    if (
+      !Number.isSafeInteger(this.#routeAttemptTimeoutMs) ||
+      this.#routeAttemptTimeoutMs < 1 ||
+      this.#routeAttemptTimeoutMs > this.#queueTimeoutMs
+    ) {
+      throw new RangeError(
+        "routeAttemptTimeoutMs must be a positive safe integer no greater than queueTimeoutMs",
+      );
     }
     this.#queueCapacity = options.queueCapacity ?? DEFAULT_QUEUE_CAPACITY;
     this.#queueByteCapacity = options.queueByteCapacity ?? DEFAULT_QUEUE_BYTES;
@@ -493,6 +520,14 @@ export class MultiSandboxRouter {
       available: initial.available,
       queued: initial.queued,
     });
+    try {
+      validateResponsesInputJson(relayBody);
+    } catch (error) {
+      options.incomingLease?.release();
+      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
+      this.#failure(traceId, acceptedAtMs, "validation", error, 0);
+      throw error;
+    }
     const admissionWaitController = new AbortController();
     const admissionTracker: IncomingRequestTracker = { controller: admissionWaitController };
     const abortAdmissionWait = () => admissionWaitController.abort(
@@ -1437,6 +1472,7 @@ export class MultiSandboxRouter {
       : job.workload.model;
     const admissionController = new AbortController();
     let admissionDeadlineExpired = false;
+    let routeAttemptExpired = false;
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
     const onCallerAbort = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
@@ -1452,11 +1488,20 @@ export class MultiSandboxRouter {
       admissionDeadlineExpired = true;
       admissionController.abort(new RouterCapacityTimeoutError());
     } else {
+      const attemptTimeoutMs = Math.min(
+        remainingAdmissionMs,
+        this.#routeAttemptTimeoutMs,
+      );
       admissionTimer = setTimeout(() => {
         admissionTimer = undefined;
-        admissionDeadlineExpired = true;
-        admissionController.abort(new RouterCapacityTimeoutError());
-      }, remainingAdmissionMs);
+        if (this.#clock.now() >= job.queueDeadlineMs) {
+          admissionDeadlineExpired = true;
+          admissionController.abort(new RouterCapacityTimeoutError());
+        } else {
+          routeAttemptExpired = true;
+          admissionController.abort(new RouterRouteAttemptTimeoutError());
+        }
+      }, attemptTimeoutMs);
       admissionTimer.unref?.();
     }
     const clearAdmissionDeadline = () => {
@@ -1658,7 +1703,11 @@ export class MultiSandboxRouter {
         : {};
       const committed = value.committed === true;
       const ambiguous = value.ambiguous === true;
-      const retryablePreCommit = isRetryablePreCommitFailure(error);
+      const timedOutBeforeCommit = routeAttemptExpired &&
+        !isDeterministicRequestTooLarge(error) &&
+        !committed &&
+        !ambiguous;
+      const retryablePreCommit = timedOutBeforeCommit || isRetryablePreCommitFailure(error);
       if (
         retryablePreCommit &&
         !job.signal?.aborted &&
@@ -1738,7 +1787,11 @@ export class MultiSandboxRouter {
       total_ms: Math.max(0, this.#clock.now() - acceptedAtMs),
       stage,
       error_name: error instanceof Error ? error.name : "Error",
-      error_kind: typeof value.kind === "string" ? value.kind : null,
+      error_kind: typeof value.kind === "string"
+        ? value.kind
+        : typeof value.code === "string"
+          ? value.code
+          : null,
       status: typeof value.status === "number" ? value.status : null,
       error_message: sanitizeDiagnosticMessage(error instanceof Error ? error.message : error),
       committed: value.committed === true,

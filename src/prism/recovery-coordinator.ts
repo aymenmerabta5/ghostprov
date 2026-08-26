@@ -9,6 +9,9 @@ import type { ProjectId } from "../sandbox/types";
 const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 const DEFAULT_MAX_BACKOFF_MS = 60_000;
 const MAX_RETRY_AFTER_MS = 300_000;
+const DEFAULT_CORRELATED_SIDECAR_WINDOW_MS = 5_000;
+const DEFAULT_CORRELATED_SIDECAR_THRESHOLD = 2;
+const SAFE_PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export type FleetRecoveryCircuitState =
   | "closed"
@@ -82,6 +85,10 @@ export interface FleetRecoveryCoordinatorOptions {
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   revalidationTimeoutMs?: number;
+  /** Distinct sidecar failures inside this window are treated as common-mode. */
+  correlatedSidecarWindowMs?: number;
+  /** One isolated failure remains local; this many distinct projects open the circuit. */
+  correlatedSidecarThreshold?: number;
 }
 
 interface Waiter {
@@ -216,6 +223,22 @@ function statusFromReason(value: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+function correlatedSidecarProject(value: unknown): string | null {
+  const root = record(value);
+  const projectId = root ? read(root, "projectId") : null;
+  if (typeof projectId !== "string" || !SAFE_PROJECT_ID.test(projectId)) return null;
+  for (const candidate of valuesToInspect(value)) {
+    const object = record(candidate);
+    const bare = normalizedWord(candidate);
+    const kind = object ? normalizedWord(read(object, "kind")) : bare;
+    const reason = object ? normalizedWord(read(object, "reason")) : bare;
+    if (kind === "sidecar_unreachable" || reason === "sidecar_unreachable") {
+      return projectId.toLowerCase();
+    }
+  }
+  return null;
+}
+
 /**
  * Reduces arbitrary errors to a small allow-list. No message, URL, header,
  * cookie, token, or original error is retained by the coordinator.
@@ -317,6 +340,9 @@ export class FleetRecoveryCoordinator {
   readonly #initialBackoffMs: number;
   readonly #maxBackoffMs: number;
   readonly #revalidationTimeoutMs: number;
+  readonly #correlatedSidecarWindowMs: number;
+  readonly #correlatedSidecarThreshold: number;
+  readonly #recentSidecarFailures = new Map<string, number>();
   readonly #waiters: Waiter[] = [];
   readonly #leases = new Set<LeaseRecord>();
   readonly #leaseRecords = new WeakMap<FleetRecoveryLease, LeaseRecord>();
@@ -353,6 +379,17 @@ export class FleetRecoveryCoordinator {
       options.revalidationTimeoutMs ?? 10_000,
       "revalidationTimeoutMs",
     );
+    this.#correlatedSidecarWindowMs = positiveInteger(
+      options.correlatedSidecarWindowMs ?? DEFAULT_CORRELATED_SIDECAR_WINDOW_MS,
+      "correlatedSidecarWindowMs",
+    );
+    this.#correlatedSidecarThreshold = positiveInteger(
+      options.correlatedSidecarThreshold ?? DEFAULT_CORRELATED_SIDECAR_THRESHOLD,
+      "correlatedSidecarThreshold",
+    );
+    if (this.#correlatedSidecarThreshold < 2) {
+      throw new RangeError("correlatedSidecarThreshold must be at least two");
+    }
     if (this.#maxBackoffMs < this.#initialBackoffMs) {
       throw new RangeError("maxBackoffMs must be at least initialBackoffMs");
     }
@@ -362,9 +399,13 @@ export class FleetRecoveryCoordinator {
     if (this.#closed) return Promise.reject(abortError("Fleet recovery coordinator is closed"));
     if (signal?.aborted) return Promise.reject(abortError());
 
-    const result = classifyFleetRecoveryFailure(trigger);
+    let result = classifyFleetRecoveryFailure(trigger);
     if (result.disposition === "local") {
-      return Promise.resolve(this.#makeLease(false, signal));
+      const projectId = correlatedSidecarProject(trigger);
+      if (!projectId || !this.#correlatedSidecarRequiresGate(projectId)) {
+        return Promise.resolve(this.#makeLease(false, signal));
+      }
+      result = classification("other", "outage", result.retryAfterMs);
     }
 
     return new Promise<FleetRecoveryLease>((resolve, reject) => {
@@ -435,6 +476,7 @@ export class FleetRecoveryCoordinator {
     this.#scope = null;
     this.#nextProbeAtMs = null;
     this.#authValidationRequired = false;
+    this.#recentSidecarFailures.clear();
     this.#emit();
   }
 
@@ -683,6 +725,7 @@ export class FleetRecoveryCoordinator {
 
   #closeAfterSuccess(): void {
     if (this.#closed) return;
+    this.#recentSidecarFailures.clear();
     if (
       this.#state === "closed" &&
       this.#scope === null &&
@@ -703,7 +746,6 @@ export class FleetRecoveryCoordinator {
     this.#nextProbeAtMs = null;
     this.#lastFailureKind = null;
     this.#authValidationRequired = false;
-
     for (const waiter of this.#waiters.splice(0)) {
       this.#detachWaiter(waiter);
       if (waiter.signal?.aborted) {
@@ -713,6 +755,17 @@ export class FleetRecoveryCoordinator {
       waiter.resolve(this.#makeLease(false, waiter.signal));
     }
     this.#emit();
+  }
+
+  #correlatedSidecarRequiresGate(projectId: string): boolean {
+    const now = this.#clock.now();
+    const cutoff = now - this.#correlatedSidecarWindowMs;
+    for (const [candidate, observedAtMs] of this.#recentSidecarFailures) {
+      if (observedAtMs < cutoff) this.#recentSidecarFailures.delete(candidate);
+    }
+    this.#recentSidecarFailures.set(projectId, now);
+    if (this.#state !== "closed" && this.#scope === "outage") return true;
+    return this.#recentSidecarFailures.size >= this.#correlatedSidecarThreshold;
   }
 
   #armTimer(deadlineMs: number): void {
