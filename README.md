@@ -196,6 +196,8 @@ supports_websockets = true
 - `GET /health` returns aggregate capacity, active, available, queued, desired/ready/unavailable fleet counts, bounded exact unavailable project UUIDs, runtime count, and an exact release summary (`releaseRevision`, `protocolRevision`, `buildHash`, and `schemaHash`); zero routable capacity returns HTTP 503 with `ok:false`.
 - `GET /__sandboxes` returns sanitized per-project lifecycle, exact verified release, slot, heartbeat, latency, failure, quarantine, and resource snapshots. A runtime which has not proven a V2 release reports all three release fields as `null`; sandbox instance/session IDs and credentials are never exposed. The originating runtime retains its latest observation-only `upstreamRateLimit` problem and parsed organization/model/limit/used/requested/remaining/retry evidence; no unsupported `/v1/me` call is made through the scoped sandbox proxy.
 
+Routing treats either a fresh direct sandbox heartbeat or a fresh envelope from the exact bootstrap-bound V2 sidecar as liveness proof; lifecycle state and credential expiry still fail closed. Admission-credit ownership does not end R2 failover by itself: the per-route deadline remains active until `request_start` enters the cumulative reliable window. Work stalled before that execution fence can move to another runtime, while work at or beyond the fence is never duplicated.
+
 Start the read-only external monitor against an already-running router without restarting it:
 
 ```powershell

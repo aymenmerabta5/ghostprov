@@ -129,6 +129,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.runCalls++;
     if (this.runFailure) throw this.runFailure;
     options?.onAdmissionReflected?.();
+    options?.onExecutionRiskReflected?.();
     return {
       async *events() {},
       final: Promise.resolve({ id: "resp_supervised", status: "completed" }),
@@ -205,18 +206,23 @@ function supervisor(input: {
 }
 
 describe("SupervisedSandboxRuntime", () => {
-  it("forwards admission ownership to the selected child exactly once", async () => {
+  it("forwards admission and execution-risk ownership to the selected child exactly once", async () => {
     const clock = new ManualClock();
     const initial = new FakeRuntime();
     const runtime = supervisor({ clock, initial, create: () => new FakeRuntime() });
     await runtime.start();
     let reflected = 0;
+    let executionRisks = 0;
     const handle = await runtime.run(
       { input: "handoff" },
       undefined,
-      { onAdmissionReflected: () => { reflected++; } },
+      {
+        onAdmissionReflected: () => { reflected++; },
+        onExecutionRiskReflected: () => { executionRisks++; },
+      },
     );
     expect(reflected).toBe(1);
+    expect(executionRisks).toBe(1);
     await handle.final;
     await runtime.stop();
   });

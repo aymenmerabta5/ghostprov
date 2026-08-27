@@ -154,6 +154,8 @@ export interface V2GzipOptions {
 export interface V2TransportRunOptions {
   /** Ownership handoff after this session charges its admission credit. */
   onAdmissionReflected?(): void;
+  /** Irreversible execution handoff after the protocol-specific start fence. */
+  onExecutionRiskReflected?(): void;
 }
 
 export interface V2TransportSessionOptions {
@@ -250,6 +252,7 @@ interface RequestState {
   signal?: AbortSignal;
   onAbort?: () => void;
   onAdmissionReflected?: () => void;
+  onExecutionRiskReflected?: () => void;
   admitted: boolean;
   transferCost: number;
   published: boolean;
@@ -841,6 +844,7 @@ export class V2TransportSession {
       rejectRun,
       signal,
       onAdmissionReflected: options?.onAdmissionReflected,
+      onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes),
       published: false,
@@ -1004,6 +1008,7 @@ export class V2TransportSession {
       state.startQueued = false;
       state.startStaged = false;
       state.onAdmissionReflected = undefined;
+      state.onExecutionRiskReflected = undefined;
       const prefix = state.transcript.snapshot();
       state.responseBytes = prefix.byteCount;
       state.recoveryPrefix = {
@@ -1524,6 +1529,10 @@ export class V2TransportSession {
     result: V2TransportLivenessResult,
   ): void {
     if (!this.#finishLivenessProbe(probe, true)) return;
+    // Idle links may have no credit/ACK delta to refresh the router cache.
+    // Publish the successful exact-instance proof so its peer age can expire
+    // accurately instead of appearing fresh forever or aging out while alive.
+    this.#notifyStateChange();
     probe.resolve(result);
   }
 
@@ -1803,7 +1812,10 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) return;
         if (frame.requestDigest !== state.requestDigest) {
-          if (this.#binding.protocolRevision === "r2") state.startRisk = true;
+          if (this.#binding.protocolRevision === "r2") {
+            state.startRisk = true;
+            this.#reflectExecutionRisk(state);
+          }
           if (this.#hasExecutionRisk(state)) {
             this.#failCommitted(state, new V2CommittedError(
               "Committed ACK digest does not match the request",
@@ -1820,6 +1832,7 @@ export class V2TransportSession {
         }
         if (this.#binding.protocolRevision === "r2" && !state.startRisk) {
           state.startRisk = true;
+          this.#reflectExecutionRisk(state);
           this.#failCommitted(state, new V2CommittedError(
             "Sidecar claimed fetch-started commitment before request_start",
             "ack_before_start",
@@ -2040,6 +2053,15 @@ export class V2TransportSession {
     return this.#binding.protocolRevision === "r2"
       ? state.startRisk
       : state.commitPublished;
+  }
+
+  #reflectExecutionRisk(state: RequestState): void {
+    if (!this.#hasExecutionRisk(state)) return;
+    const onExecutionRiskReflected = state.onExecutionRiskReflected;
+    state.onExecutionRiskReflected = undefined;
+    // Risk is already recorded in authoritative transport state. An observer
+    // failure must never make an irreversible request look retryable.
+    try { onExecutionRiskReflected?.(); } catch {}
   }
 
   #consumeRecoveryPrefixWhole(
@@ -2973,6 +2995,7 @@ export class V2TransportSession {
         if (state && reliable.kind === "request_start") {
           state.startStaged = true;
           state.startRisk = true;
+          this.#reflectExecutionRisk(state);
         }
         if (state) state.diagnostics.published();
         if (state && reliable.kind !== "request_commit") {
@@ -3101,7 +3124,10 @@ export class V2TransportSession {
       for (const frame of frames) {
         if (frame.kind !== "request_commit") continue;
         const state = this.#requests.get(frame.requestId);
-        if (state) state.commitPublished = true;
+        if (state) {
+          state.commitPublished = true;
+          this.#reflectExecutionRisk(state);
+        }
       }
     }
     this.#channel.publish(envelope, lane);
@@ -3356,6 +3382,7 @@ export class V2TransportSession {
       // already-scheduled publication may still send it after this callback.
       if (this.#binding.protocolRevision === "r1" && state.commitStaged) {
         state.commitPublished = true;
+        this.#reflectExecutionRisk(state);
       }
       state.cancelled = true;
       if (!state.quarantineKind) {
@@ -3453,6 +3480,8 @@ export class V2TransportSession {
       );
     }
     state.signal?.removeEventListener("abort", state.onAbort!);
+    state.onAdmissionReflected = undefined;
+    state.onExecutionRiskReflected = undefined;
     if (state.admissionTimer) clearTimeout(state.admissionTimer);
     state.admissionTimer = undefined;
     if (this.#requests.size === 0) {

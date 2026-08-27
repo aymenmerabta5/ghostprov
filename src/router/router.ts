@@ -1326,6 +1326,7 @@ export class MultiSandboxRouter {
         completion_ewma_ms: candidate.completionEwmaMs,
         recent_failure_rate: candidate.recentFailureRate,
         heartbeat_age_ms: candidate.heartbeatAgeMs,
+        sidecar_peer_age_ms: candidate.sidecarPeerAgeMs ?? null,
         credential_expires_in_ms: candidate.credentialExpiresInMs,
         memory_pressure: candidate.memoryPressure,
         eligible_candidates: selection.eligibleCandidates,
@@ -1424,6 +1425,9 @@ export class MultiSandboxRouter {
       heartbeatAgeMs: cached.snapshot.heartbeatAgeMs === null
         ? null
         : cached.snapshot.heartbeatAgeMs + elapsed,
+      sidecarPeerAgeMs: cached.snapshot.sidecarPeerAgeMs == null
+        ? null
+        : cached.snapshot.sidecarPeerAgeMs + elapsed,
       credentialExpiresInMs: cached.snapshot.credentialExpiresInMs === null
         ? null
         : Math.max(0, cached.snapshot.credentialExpiresInMs - elapsed),
@@ -1435,6 +1439,7 @@ export class MultiSandboxRouter {
     return {
       ...cached.candidate,
       heartbeatAgeMs: snapshot.heartbeatAgeMs,
+      sidecarPeerAgeMs: snapshot.sidecarPeerAgeMs,
       credentialExpiresInMs: snapshot.credentialExpiresInMs,
     };
   }
@@ -1563,26 +1568,30 @@ export class MultiSandboxRouter {
       job.signal?.removeEventListener("abort", onCallerAbort);
     };
     try {
-      // Older test seams may ignore the third argument and therefore retain
-      // the conservative router reservation through commit. Production V2
-      // explicitly calls it only after its request owns an admission credit.
+      // Admission ownership releases only the router's duplicate reservation.
+      // The selected-runtime attempt deadline remains active until V2 reports
+      // its irreversible execution fence; an admitted R2 request is still safe
+      // to move while request_start has not entered the cumulative window.
       const runtimeRun = Promise.resolve(runtime.run(job.body, admissionController.signal, {
         onAdmissionReflected: () => {
           if (admissionController.signal.aborted) return;
-          clearAdmissionDeadline();
           this.#refreshRuntimeSafely(runtime);
           this.#releaseRuntimeReservation(job, runtime.projectId);
           this.#scheduleDrain();
         },
+        onExecutionRiskReflected: () => {
+          if (admissionController.signal.aborted) return;
+          clearAdmissionDeadline();
+        },
       }));
       // Promise.race installs terminal handlers on runtimeRun. If a broken test
-      // seam ignores cancellation, its late rejection remains consumed while
-      // the router safely moves work only because admission ownership was
-      // never reflected.
+      // seam ignores cancellation, its late rejection remains consumed. V2's
+      // abort path synchronously proves pre-execution safety or committed risk
+      // before the short cancellation-proof fence permits a retry.
       const handle = await Promise.race([runtimeRun, admissionWait]);
-      // Commitment ends the admission deadline immediately. Optional memory
-      // accounting work must never turn an accepted upstream request into a
-      // local capacity timeout or inflate the measured commit ACK latency.
+      // Commitment also ends any remaining attempt deadline immediately.
+      // Optional memory accounting work must never turn an accepted upstream
+      // request into a local timeout or inflate measured commit ACK latency.
       clearAdmissionDeadline();
       const committedAtMs = this.#clock.now();
       const commitAckMs = Math.max(0, committedAtMs - started);

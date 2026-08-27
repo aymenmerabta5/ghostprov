@@ -26,6 +26,8 @@ export interface RouteCandidate {
   completionEwmaMs: number;
   recentFailureRate: number;
   heartbeatAgeMs: number | null;
+  /** Freshness of the exact bootstrap-bound V2 sidecar transport peer. */
+  sidecarPeerAgeMs?: number | null;
   credentialExpiresInMs: number | null;
   memoryPressure: number;
   /** Requests accepted by the transport but not yet commit-acknowledged. */
@@ -59,8 +61,15 @@ export interface RouteDecision {
 
 export type RuntimeHealthCandidate = Pick<
   RouteCandidate,
-  "state" | "heartbeatAgeMs" | "credentialExpiresInMs"
+  "state" | "heartbeatAgeMs" | "sidecarPeerAgeMs" | "credentialExpiresInMs"
 >;
+
+const RUNTIME_LIVENESS_MAX_AGE_MS = 20_000;
+
+function isFreshLivenessAge(value: number | null | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
+    value <= RUNTIME_LIVENESS_MAX_AGE_MS;
+}
 
 /**
  * Reports whether a runtime is alive and safe to count toward fleet capacity.
@@ -69,7 +78,14 @@ export type RuntimeHealthCandidate = Pick<
  */
 export function isRuntimeHealthy(candidate: RuntimeHealthCandidate): boolean {
   if (candidate.state !== "ready") return false;
-  if (candidate.heartbeatAgeMs === null || candidate.heartbeatAgeMs > 20_000) return false;
+  // A phased direct-heartbeat outage must not zero an otherwise live V2 fleet.
+  // The sidecar signal is accepted only when it belongs to the exact instance
+  // fenced during bootstrap; a stale/missing sidecar retains the old fail-closed
+  // direct-heartbeat behavior.
+  if (
+    !isFreshLivenessAge(candidate.heartbeatAgeMs) &&
+    !isFreshLivenessAge(candidate.sidecarPeerAgeMs)
+  ) return false;
   if (candidate.credentialExpiresInMs !== null && candidate.credentialExpiresInMs < 30_000) return false;
   return true;
 }

@@ -392,6 +392,7 @@ describe("V2TransportSession", () => {
       expect(dataBefore).toHaveLength(1);
       expect(dataBefore[0]!.frames.length).toBeGreaterThan(0);
 
+      const stateChangesBeforeProbe = harness.stateChanges;
       const probing = harness.session.probeLiveness();
       await expect(harness.session.probeLiveness()).rejects.toMatchObject({
         code: "probe_in_flight",
@@ -402,6 +403,8 @@ describe("V2TransportSession", () => {
         rttMs: expect.any(Number),
         sentAtMs: expect.any(Number),
       });
+      await Promise.resolve();
+      expect(harness.stateChanges).toBeGreaterThan(stateChangesBeforeProbe);
       const pingEnvelope = harness.hostEnvelopes.find(envelope => (
         envelope.liveness?.kind === "ping"
       ));
@@ -790,22 +793,26 @@ describe("V2TransportSession", () => {
     }
   });
 
-  it("hands reservation ownership off exactly once at transport admission", async () => {
+  it("hands admission and R1 execution-risk ownership off exactly once", async () => {
     const harness = new TransportHarness();
     await harness.start();
     let reflected = 0;
+    let executionRisks = 0;
     const pending = harness.session.run(BODY, undefined, {
       onAdmissionReflected: () => { reflected++; },
+      onExecutionRiskReflected: () => { executionRisks++; },
     });
     await harness.settle();
 
     expect(reflected).toBe(1);
+    expect(executionRisks).toBe(1);
     expect(harness.session.snapshot()).toMatchObject({
       active: 1,
       admissionCredits: 3,
     });
     await harness.settle();
     expect(reflected).toBe(1);
+    expect(executionRisks).toBe(1);
     await harness.close();
     await Promise.allSettled([pending]);
   });

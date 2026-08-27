@@ -194,6 +194,40 @@ class R2Harness {
 }
 
 describe("R2 prepared/start host boundary", () => {
+  it("reports admission before execution risk and reports start risk exactly once", async () => {
+    const harness = new R2Harness();
+    await harness.start();
+    let admissions = 0;
+    let executionRisks = 0;
+    const pending = harness.session.run(BODY, undefined, {
+      onAdmissionReflected: () => { admissions++; },
+      onExecutionRiskReflected: () => { executionRisks++; },
+    });
+    await harness.settle();
+
+    expect(admissions).toBe(1);
+    expect(executionRisks).toBe(0);
+    const prepared = harness.prepared();
+    harness.publish([prepared]);
+    await harness.settle();
+    expect(harness.starts()).toHaveLength(1);
+    expect(executionRisks).toBe(1);
+
+    harness.publish([prepared]);
+    await harness.settle();
+    expect(harness.starts()).toHaveLength(1);
+    expect(executionRisks).toBe(1);
+    harness.publish([{
+      kind: "request_ack",
+      requestId: prepared.requestId,
+      requestDigest: prepared.requestDigest,
+      committed: true,
+    }]);
+    await harness.settle();
+    await expect(pending).resolves.toBeDefined();
+    await harness.close();
+  });
+
   it("keeps a published network commit safely precommit until prepared", async () => {
     const harness = new R2Harness();
     await harness.start();

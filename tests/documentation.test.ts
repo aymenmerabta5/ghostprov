@@ -234,6 +234,13 @@ describe("project documentation", () => {
     expect(readme).toContain("neutral ten-second baseline every idle minute");
   });
 
+  it("documents failover at the exact R2 execution fence", () => {
+    expect(readme).toContain("exact bootstrap-bound V2 sidecar");
+    expect(readme).toContain("Admission-credit ownership does not end R2 failover");
+    expect(readme).toContain("request_start");
+    expect(readme).toContain("never duplicated");
+  });
+
   it("keeps live multi-sandbox state out of version control", () => {
     expect(gitignore.split(/\r?\n/)).toContain(".ghostprov/");
   });

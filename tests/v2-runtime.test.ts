@@ -220,6 +220,7 @@ class FakeTransport implements V2RuntimeTransport {
     this.snapshotValue.active++;
     this.snapshotValue.committed++;
     options?.onAdmissionReflected?.();
+    options?.onExecutionRiskReflected?.();
     const final = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pending.push({ resolve, reject });
     }).finally(() => {
@@ -643,16 +644,21 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("forwards the exact admission ownership callback to transport", async () => {
+  it("forwards exact admission and execution-risk callbacks to transport", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();
     let reflected = 0;
+    let executionRisks = 0;
     const handle = await harness.runtime.run(
       { model: "gpt-5.6-sol", input: "handoff" },
       undefined,
-      { onAdmissionReflected: () => { reflected++; } },
+      {
+        onAdmissionReflected: () => { reflected++; },
+        onExecutionRiskReflected: () => { executionRisks++; },
+      },
     );
     expect(reflected).toBe(1);
+    expect(executionRisks).toBe(1);
     harness.transport.pending.shift()?.resolve({ id: "resp_handoff", status: "completed" });
     await handle.final;
     await harness.runtime.stop();

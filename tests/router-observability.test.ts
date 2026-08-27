@@ -42,6 +42,7 @@ class Runtime implements RoutableSandboxRuntime {
       available: 128 - this.active,
       quarantined: 0,
       heartbeatAgeMs: 10,
+      sidecarPeerAgeMs: 20,
       credentialExpiresInMs: 3_600_000,
       ackEwmaMs: 12,
       completionEwmaMs: 2_000,
@@ -115,7 +116,10 @@ describe("router observability", () => {
       queued_bytes: expect.any(Number),
       queue_class: "latency",
     });
-    expect(logger.events.find(event => event.event === "route.selected")).toMatchObject({
+    const routeSelected = logger.events.find(event => event.event === "route.selected");
+    const sidecarPeerAge = (routeSelected as unknown as Record<string, unknown>)
+      .sidecar_peer_age_ms;
+    expect(routeSelected).toMatchObject({
       project_id: runtime.projectId,
       eligible_candidates: 1,
       sandbox_admission_credits: 128,
@@ -123,9 +127,15 @@ describe("router observability", () => {
       sandbox_scheduler_bytes: 0,
       sandbox_scheduler_oldest_ms: 0,
       sandbox_throughput_bytes_per_sec: null,
+      sidecar_peer_age_ms: expect.any(Number),
       queue_class: "latency",
       fair_cost_bytes: 4 * 1024,
       route_attempt: 1,
     });
+    expect(typeof sidecarPeerAge).toBe("number");
+    if (typeof sidecarPeerAge === "number") {
+      expect(sidecarPeerAge).toBeGreaterThanOrEqual(20);
+      expect(sidecarPeerAge).toBeLessThan(1_000);
+    }
   });
 });

@@ -52,6 +52,27 @@ describe("chooseRuntime", () => {
     expect(isRuntimeHealthy(candidate("4", { credentialExpiresInMs: 29_999 }))).toBe(false);
   });
 
+  it("keeps a ready V2 runtime routable through a direct-heartbeat lapse when its bound sidecar is fresh", () => {
+    expect(isRuntimeHealthy(candidate("5", {
+      heartbeatAgeMs: 30_000,
+      sidecarPeerAgeMs: 1_000,
+    }))).toBe(true);
+    expect(isRuntimeHealthy(candidate("6", {
+      heartbeatAgeMs: 30_000,
+      sidecarPeerAgeMs: 20_001,
+    }))).toBe(false);
+    expect(isRuntimeHealthy(candidate("7", {
+      state: "draining",
+      heartbeatAgeMs: 30_000,
+      sidecarPeerAgeMs: 1_000,
+    }))).toBe(false);
+    expect(isRuntimeHealthy(candidate("8", {
+      heartbeatAgeMs: 30_000,
+      sidecarPeerAgeMs: 1_000,
+      credentialExpiresInMs: 29_999,
+    }))).toBe(false);
+  });
+
   it("chooses the lowest predicted completion time instead of round robin", () => {
     const decision = chooseRuntime(TEXT, [
       candidate("1", { active: 28, ackEwmaMs: 900 }),

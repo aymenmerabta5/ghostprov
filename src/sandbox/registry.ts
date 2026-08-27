@@ -60,6 +60,12 @@ export interface SandboxRunOptions {
    * credit for this request. It is never called for pre-admission failure.
    */
   onAdmissionReflected?(): void;
+  /**
+   * Called exactly once when execution can no longer be safely retried on a
+   * different runtime. R2 reports this only after request_start enters the
+   * cumulative reliable window; admission alone is still pre-execution.
+   */
+  onExecutionRiskReflected?(): void;
 }
 
 export interface RoutableSandboxRuntime {

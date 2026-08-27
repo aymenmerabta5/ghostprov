@@ -31,8 +31,12 @@ class FakeRuntime implements RoutableSandboxRuntime {
   admissionAbortDelayMs = 0;
   ignoreAdmissionAbortMs = 0;
   postAdmissionDelayMs = 0;
+  waitForPostAdmissionAbort = false;
+  reflectExecutionRisk = true;
   admissionWindow: number | null = null;
   ackEwmaMs = 1_000;
+  heartbeatAgeMs: number | null = 1_000;
+  sidecarPeerAgeMs: number | null = null;
   diagnostics: any = undefined;
   lastRunSignal?: AbortSignal;
   pulseAdmissionOnFailure = false;
@@ -73,7 +77,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
         this.capacity - this.active,
       )),
       quarantined: 0,
-      heartbeatAgeMs: 1_000,
+      heartbeatAgeMs: this.heartbeatAgeMs,
+      sidecarPeerAgeMs: this.sidecarPeerAgeMs,
       credentialExpiresInMs: 3_600_000,
       ackEwmaMs: this.ackEwmaMs,
       completionEwmaMs: 10_000,
@@ -87,7 +92,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
   async run(
     body: Record<string, unknown>,
     signal?: AbortSignal,
-    options?: { onAdmissionReflected(): void },
+    options?: {
+      onAdmissionReflected(): void;
+      onExecutionRiskReflected?(): void;
+    },
   ): Promise<RunHandle> {
     this.lastRunSignal = signal;
     this.executions++;
@@ -126,6 +134,22 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.uncommitted++;
     this.uncommittedPeak = Math.max(this.uncommittedPeak, this.uncommitted);
     options?.onAdmissionReflected();
+    if (this.reflectExecutionRisk) options?.onExecutionRiskReflected?.();
+    if (this.waitForPostAdmissionAbort) {
+      try {
+        await new Promise<never>((_resolve, reject) => {
+          if (signal?.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      } finally {
+        this.active--;
+        this.uncommitted--;
+        this.notify();
+      }
+    }
     const gate = deferred<any>();
     this.finals.push(gate);
     if (this.postAdmissionDelayMs > 0) await Bun.sleep(this.postAdmissionDelayMs);
@@ -173,6 +197,7 @@ function createSystem(
         logicalProcessors: 12,
       }),
     },
+    now: clock ? () => clock.now() : undefined,
   });
   const router = new MultiSandboxRouter({
     registry,
@@ -474,6 +499,63 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("fails over after transport admission while R2 execution is still provably safe", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    const selected = system.runtimes[1]!;
+    selected.reflectExecutionRisk = false;
+    selected.waitForPostAdmissionAbort = true;
+    const started = performance.now();
+
+    const outcome = await Promise.race([
+      system.router.startRelay(
+        { model: "gpt-5.6-sol", input: "admitted-but-not-started", stream: true },
+        { clientId: "admitted-but-not-started", source: "websocket" },
+      ).then(handle => ({ kind: "handle" as const, handle })),
+      Bun.sleep(120).then(() => ({ kind: "timeout" as const })),
+    ]);
+
+    if (outcome.kind === "timeout") {
+      await system.router.close();
+      throw new Error("safe admitted work was stranded on its first runtime");
+    }
+    expect(performance.now() - started).toBeLessThan(100);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    system.runtimes[0]!.completeOne();
+    await outcome.handle.final;
+    await system.router.close();
+  });
+
+  it("reroutes a concurrent admitted-but-unstarted burst without reducing fleet concurrency", async () => {
+    const system = createSystem(8, 8, 500, undefined, undefined, undefined, 25);
+    for (const runtime of system.runtimes) {
+      runtime.admissionWindow = 4;
+      runtime.notify();
+    }
+    const stalled = system.runtimes[4]!;
+    stalled.reflectExecutionRisk = false;
+    stalled.waitForPostAdmissionAbort = true;
+    const started = performance.now();
+
+    const handles = await Promise.all(Array.from({ length: 24 }, (_, index) => (
+      system.router.startRelay(
+        { model: "gpt-5.6-sol", input: `burst-${index}`, stream: true },
+        { clientId: `burst-${index}`, source: "websocket" },
+      )
+    )));
+
+    expect(performance.now() - started).toBeLessThan(200);
+    expect(stalled.executions).toBeGreaterThan(0);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0))
+      .toBe(24 + stalled.executions);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.finals.length, 0)).toBe(24);
+    for (const runtime of system.runtimes) {
+      while (runtime.finals.length > 0) runtime.completeOne();
+    }
+    await Promise.all(handles.map(handle => handle.final));
+    expect(system.router.snapshot()).toMatchObject({ queued: 0 });
+    await system.router.close();
+  });
+
   it("does not await non-cooperative cleanup after the admission handoff deadline", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
     system.runtimes[1]!.ignoreAdmissionAbortMs = 120;
@@ -547,7 +629,7 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("ends the admission deadline once the runtime owns the credit", async () => {
+  it("ends the route-attempt deadline once the runtime reports execution risk", async () => {
     const system = createSystem(1, 1, 10);
     system.runtimes[0].postAdmissionDelayMs = 25;
     const handle = await system.router.startRelay(
@@ -700,6 +782,22 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes.map(runtime => runtime.uncommittedPeak)).toEqual([1, 1, 1, 1]);
     system.runtimes.forEach(runtime => runtime.completeOne());
     await Promise.all(handles.map(handle => handle.final));
+    await system.router.close();
+  });
+
+  it("does not collapse an eight-runtime fleet during a shared direct-heartbeat lapse", async () => {
+    const system = createSystem(8, 8);
+    const sidecarAges = [5_874, 1_551, 5_319, 6_494, 7_481, 5_760, 1_627, 4_232];
+    system.runtimes.forEach((runtime, index) => {
+      runtime.heartbeatAgeMs = 24_000 + index * 1_000;
+      runtime.sidecarPeerAgeMs = sidecarAges[index]!;
+      runtime.notify();
+    });
+
+    expect(system.router.snapshot()).toMatchObject({
+      capacity: 64,
+      available: 64,
+    });
     await system.router.close();
   });
 
@@ -1235,6 +1333,38 @@ describe("MultiSandboxRouter", () => {
     now += 18_901; // cached heartbeatAgeMs crosses the 20-second health fence
     expect(system.router.snapshot()).toMatchObject({ capacity: 0, available: 0 });
     await system.router.close();
+  });
+
+  it("ages cached sidecar liveness instead of keeping a dead peer healthy forever", async () => {
+    let now = 1_000;
+    const clock: Clock = {
+      now: () => now,
+      sleep: () => Promise.resolve(),
+      waitUntil: () => Promise.resolve(),
+    };
+    const system = createSystem(1, 1, undefined, undefined, undefined, clock);
+    const runtime = system.runtimes[0]!;
+    runtime.heartbeatAgeMs = 30_000;
+    runtime.sidecarPeerAgeMs = 19_000;
+    runtime.notify();
+    expect(system.router.snapshot()).toMatchObject({ capacity: 1, available: 1 });
+
+    now += 1_001;
+    expect(system.router.snapshot()).toMatchObject({ capacity: 0, available: 0 });
+    expect(system.router.snapshot().runtimes[0]).toMatchObject({
+      heartbeatAgeMs: 31_001,
+      sidecarPeerAgeMs: 20_001,
+    });
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "both-liveness-signals-aged-out",
+      stream: true,
+    });
+    await flush();
+    expect(runtime.executions).toBe(0);
+    expect(system.router.snapshot().queued).toBe(1);
+    await system.router.close();
+    await expect(pending).rejects.toMatchObject({ code: "router_shutting_down" });
   });
 
   it("retains byte debt when unequal bulk clients each keep only one job queued", async () => {
