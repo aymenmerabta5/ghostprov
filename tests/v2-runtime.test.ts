@@ -1065,7 +1065,12 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
 
     await harness.clock.advanceBy(10_000);
-    expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      available: 0,
+      availabilityReason: "sidecar_suspect",
+    });
 
     await harness.clock.advanceBy(10_000);
     expect(harness.runtime.snapshot().capacity).toBe(128);

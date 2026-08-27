@@ -3,6 +3,7 @@ import {
   PRISM_CIRCUIT_SCOPES,
   PRISM_CIRCUIT_STATES,
   RECOVERY_OBSERVABILITY_EVENT_NAMES,
+  SANDBOX_AVAILABILITY_REASONS,
   ROUTER_QUEUE_CLASSES,
   SANDBOX_RECOVERY_CAUSES,
   SANDBOX_RECOVERY_ERROR_KINDS,
@@ -59,12 +60,13 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "request.accepted": new Set(["trace_id", "source", "model", "service_tier", "stream", "workload_class", "request_bytes", "transfer_admission_cost", "reserved_bytes", "capacity", "active", "available", "queued"]),
   "admission.acquired": new Set(["trace_id", "admission_wait_ms", "reserved_bytes", "reserved_total_bytes", "reservation_capacity_bytes", "memory_paused"]),
   "request.queued": new Set(["trace_id", "queued", "queued_bytes", "client_queue_depth", "queue_class", "active", "available"]),
-  "route.selected": new Set(["trace_id", "project_id", "route_ms", "queue_wait_ms", "sandbox_capacity", "sandbox_active", "sandbox_admission_credits", "sandbox_reserved", "sandbox_queued", "sandbox_quarantined", "sandbox_commit_backlog", "sandbox_scheduler_bytes", "sandbox_scheduler_oldest_ms", "sandbox_throughput_bytes_per_sec", "awareness_rtt_ms", "completion_ewma_ms", "recent_failure_rate", "heartbeat_age_ms", "sidecar_peer_age_ms", "credential_expires_in_ms", "memory_pressure", "eligible_candidates", "queue_class", "fair_cost_bytes", "transfer_admission_cost", "route_attempt"]),
+  "route.selected": new Set(["trace_id", "project_id", "route_ms", "queue_wait_ms", "sandbox_capacity", "sandbox_active", "sandbox_admission_credits", "sandbox_reserved", "sandbox_queued", "sandbox_quarantined", "sandbox_commit_backlog", "sandbox_scheduler_bytes", "sandbox_scheduler_oldest_ms", "sandbox_throughput_bytes_per_sec", "awareness_rtt_ms", "completion_ewma_ms", "recent_failure_rate", "heartbeat_age_ms", "sidecar_peer_age_ms", "credential_expires_in_ms", "memory_pressure", "eligible_candidates", "queue_class", "fair_cost_bytes", "transfer_admission_cost", "route_attempt", "capacity_reason"]),
+  "route.attempt_expired": new Set(["trace_id", "project_id", "route_attempt", "attempt_ms", "progress_observed", "progress_age_ms", "capacity_reason", "transfer_admission_cost"]),
   "transport.committed": new Set(["trace_id", "project_id", "transport", "queue_wait_ms", "commit_ack_ms", "retry_count", "request_decoded_bytes", "request_encoded_bytes", "request_part_count", "request_encoding", "request_compression_ratio", "host_prepare_ms", "host_scheduler_wait_ms", "host_publish_to_ack_ms", "sidecar_first_frame_to_commit_ms", "sidecar_commit_to_assembly_ms", "sidecar_claim_sync_ms", "sidecar_admission_wait_ms", "sidecar_prepared_to_fetch_start_ms", "sidecar_fetch_start_sync_ms", "sidecar_commit_processing_ms", "transport_commit_residual_ms"]),
   "response.first_event": new Set(["trace_id", "project_id", "first_event_ms", "post_commit_first_event_ms", "upstream_first_event_ms", "sidecar_scheduler_ms", "host_ack_to_first_frame_ms", "host_assembly_to_delivery_ms"]),
   "request.completed": new Set(["trace_id", "project_id", "total_ms", "queue_wait_ms", "commit_ack_ms", "first_event_ms", "response_bytes", "frames", "terminal_status", "retry_count", "slow"]),
   "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id", "committed", "quarantined", "retry_count"]),
-  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
+  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
   "monitor.sample": new Set(["poll_ms", "health_status", "sandboxes_status", "capacity", "active", "available", "queued", "resources", "runtimes"]),
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
@@ -119,6 +121,7 @@ const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
   "circuit_scope",
 ]);
 const ROUTER_QUEUE_CLASS_SET = new Set<string>(ROUTER_QUEUE_CLASSES);
+const SANDBOX_AVAILABILITY_REASON_SET = new Set<string>(SANDBOX_AVAILABILITY_REASONS);
 const ROUTER_INTEGER_FIELDS = new Set([
   "queued_bytes",
   "sandbox_admission_credits",
@@ -134,9 +137,12 @@ const ROUTER_NULLABLE_FIELDS = new Set([
   "sandbox_scheduler_bytes",
   "sandbox_scheduler_oldest_ms",
   "sandbox_throughput_bytes_per_sec",
+  "progress_age_ms",
 ]);
 const ROUTER_NUMERIC_FIELDS = new Set([
   ...ROUTER_INTEGER_FIELDS,
+  "attempt_ms",
+  "progress_age_ms",
   "sandbox_scheduler_oldest_ms",
   "sandbox_throughput_bytes_per_sec",
 ]);
@@ -216,10 +222,18 @@ function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
   if (
     event.event !== "request.queued" &&
     event.event !== "route.selected" &&
+    event.event !== "route.attempt_expired" &&
     event.event !== "fleet.sample"
   ) return;
   if ("queue_class" in event && !ROUTER_QUEUE_CLASS_SET.has(String(event.queue_class))) {
     throw new TypeError("Router observability queue_class is invalid");
+  }
+  if (
+    "capacity_reason" in event &&
+    !SANDBOX_AVAILABILITY_REASON_SET.has(String(event.capacity_reason))
+  ) throw new TypeError("Router observability capacity_reason is invalid");
+  if ("progress_observed" in event && typeof event.progress_observed !== "boolean") {
+    throw new TypeError("Router observability progress_observed is invalid");
   }
   for (const [key, value] of Object.entries(event)) {
     if (!ROUTER_NUMERIC_FIELDS.has(key)) continue;
@@ -255,7 +269,7 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
     throw new TypeError("Fleet release observability is invalid");
   }
   if (event.event !== "fleet.sample") return;
-  for (const key of ["desired", "ready", "unavailable"] as const) {
+  for (const key of ["desired", "ready", "routable", "unavailable"] as const) {
     if (!(key in event)) continue;
     const value = event[key];
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
@@ -290,6 +304,10 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
   for (const value of event.runtimes) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const runtime = value as Record<string, JsonValue>;
+    if (
+      "availability_reason" in runtime &&
+      !SANDBOX_AVAILABILITY_REASON_SET.has(String(runtime.availability_reason))
+    ) throw new TypeError("Fleet runtime availability reason is invalid");
     const pending: unknown[] = [runtime];
     const seen = new WeakSet<object>();
     while (pending.length) {

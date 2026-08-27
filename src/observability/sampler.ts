@@ -289,6 +289,8 @@ export class FleetSampler {
         capacity: runtime.capacity,
         active: runtime.active,
         available: runtime.available,
+        availability_reason: runtime.availabilityReason ??
+          (runtime.available > 0 ? "available" : "transport_unavailable"),
         quarantined: runtime.quarantined,
         ambiguous_quarantined: runtime.ambiguousQuarantined ?? 0,
         ambiguity_limit: runtime.ambiguityLimit ?? null,
@@ -328,6 +330,7 @@ export class FleetSampler {
         queued_bytes: router.queuedBytes ?? 0,
         desired: fleet?.desired ?? router.runtimes.length,
         ready: fleet?.ready ?? router.runtimes.filter(runtime => runtime.state === "ready").length,
+        routable: router.runtimes.filter(runtime => runtime.available > 0).length,
         unavailable: fleet?.unavailable ?? 0,
         unavailable_projects: unavailableProjects,
         unavailable_projects_truncated:

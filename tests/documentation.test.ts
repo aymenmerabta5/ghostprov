@@ -211,6 +211,7 @@ describe("project documentation", () => {
       "bun run monitor:v2",
       "GP_LOG_DIR",
       "request.accepted",
+      "route.attempt_expired",
       "transport.committed",
       "response.first_event",
       "fleet.sample",
@@ -220,6 +221,7 @@ describe("project documentation", () => {
       "post_commit_first_event_ms",
     ]) expect(readme).toContain(value);
     expect(readme).toContain("manual restart");
+    expect(readme).toContain("actually-routable runtime counts");
     expect(readme).toContain("never logs prompts");
     expect(readme).toContain("64 MiB");
     expect(envExample).toContain("GP_LOG_ROTATE_BYTES=67108864");

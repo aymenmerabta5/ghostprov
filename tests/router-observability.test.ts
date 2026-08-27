@@ -24,6 +24,7 @@ class MemoryLogger implements LoggerLike {
 class Runtime implements RoutableSandboxRuntime {
   readonly projectId;
   readonly terminal = deferred<any>();
+  waitForAdmissionAbort = false;
   constructor(
     id = "00000000-0000-4000-8000-000000000001",
     readonly active = 0,
@@ -40,6 +41,7 @@ class Runtime implements RoutableSandboxRuntime {
       capacity: 128,
       active: this.active,
       available: 128 - this.active,
+      availabilityReason: this.active < 128 ? "available" as const : "execution_window" as const,
       quarantined: 0,
       heartbeatAgeMs: 10,
       sidecarPeerAgeMs: 20,
@@ -52,7 +54,13 @@ class Runtime implements RoutableSandboxRuntime {
       failure: null,
     };
   }
-  async run(): Promise<RunHandle> {
+  async run(_body?: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
+    if (this.waitForAdmissionAbort) {
+      await new Promise<never>((_resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason);
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
     return {
       async *events() { yield { event: "response.completed", data: "{}" }; },
       final: this.terminal.promise,
@@ -131,11 +139,60 @@ describe("router observability", () => {
       queue_class: "latency",
       fair_cost_bytes: 4 * 1024,
       route_attempt: 1,
+      capacity_reason: "available",
     });
     expect(typeof sidecarPeerAge).toBe("number");
     if (typeof sidecarPeerAge === "number") {
       expect(sidecarPeerAge).toBeGreaterThanOrEqual(20);
       expect(sidecarPeerAge).toBeLessThan(1_000);
+    }
+  });
+
+  it("records a sanitized selected-runtime attempt expiry", async () => {
+    const logger = new MemoryLogger();
+    const runtime = new Runtime();
+    runtime.waitForAdmissionAbort = true;
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      governor: new ResourceGovernor({
+        probe: { sample: () => ({
+          totalBytes: 32 * 1024 ** 3,
+          freeBytes: 20 * 1024 ** 3,
+          rssBytes: 100 * 1024 ** 2,
+          heapBytes: 50 * 1024 ** 2,
+          externalBytes: 10 * 1024 ** 2,
+          logicalProcessors: 12,
+        }) },
+      }),
+      logger,
+      queueTimeoutMs: 45,
+      routeAttemptTimeoutMs: 10,
+      random: { next: () => 0.5, uuid: () => "trace-timeout" },
+    });
+    try {
+      await expect(router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "must not be logged",
+        stream: true,
+      }, {
+        source: "http",
+        encodedBodyBytes: Math.floor(2.9 * 1024 * 1024),
+      })).rejects.toMatchObject({ code: "router_capacity_timeout" });
+      const expired = logger.events.filter(event => event.event === "route.attempt_expired");
+      expect(expired.length).toBeGreaterThan(0);
+      expect(expired[0]).toMatchObject({
+        project_id: runtime.projectId,
+        route_attempt: 1,
+        progress_observed: false,
+        progress_age_ms: null,
+        capacity_reason: "available",
+      });
+      expect(JSON.stringify(expired)).not.toContain("must not be logged");
+      for (const event of expired) {
+        expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+      }
+    } finally {
+      await router.close();
     }
   });
 });

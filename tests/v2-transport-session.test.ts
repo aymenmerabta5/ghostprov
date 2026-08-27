@@ -1382,7 +1382,11 @@ describe("V2TransportSession", () => {
         harness.publish([],{lane:"control"});
         await harness.settle();
       }
-      expect(harness.session.snapshot()).toMatchObject({active:4,queued:2});
+      expect(harness.session.snapshot()).toMatchObject({
+        active:4,
+        queued:2,
+        admissionBlockReason:"execution_window",
+      });
       expect([...harness.hostFrames.values()].filter(frame=>frame.kind==="request_commit"))
         .toHaveLength(4);
     }finally{

@@ -4,6 +4,22 @@ export type ObservabilityPriority = "terminal" | "progress" | "sample";
 export const ROUTER_QUEUE_CLASSES = ["latency", "bulk"] as const;
 export type RouterQueueClass = typeof ROUTER_QUEUE_CLASSES[number];
 
+export const SANDBOX_AVAILABILITY_REASONS = [
+  "available",
+  "lifecycle_unavailable",
+  "sidecar_suspect",
+  "credential_refresh",
+  "awareness_reconnect",
+  "transport_unavailable",
+  "transport_recovery",
+  "transport_congested",
+  "zero_remote_credits",
+  "host_ceiling",
+  "execution_window",
+  "transfer_budget",
+  "quarantine",
+] as const;
+
 export const RECOVERY_OBSERVABILITY_EVENT_NAMES = [
   "sandbox.recovery.started",
   "sandbox.recovery.retry_scheduled",
@@ -220,6 +236,7 @@ export type ObservabilityEventName =
   | "admission.acquired"
   | "request.queued"
   | "route.selected"
+  | "route.attempt_expired"
   | "transport.committed"
   | "response.first_event"
   | "request.completed"

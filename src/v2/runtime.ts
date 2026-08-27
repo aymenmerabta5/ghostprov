@@ -14,6 +14,7 @@ import type { RunHandle } from "../relay/run-handle";
 import type {
   RoutableSandboxRuntime,
   RoutableSandboxSnapshot,
+  SandboxAvailabilityReason,
   SandboxRunOptions,
 } from "../sandbox/registry";
 import { describeSandboxFailure } from "../sandbox/failure";
@@ -547,6 +548,30 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         !this.#credentialRefreshPending && !this.#ySweetReconnectPending
       ? Math.max(0, Math.min(descriptorCapacity, creditCapacity))
       : 0;
+    const available = this.#state === "ready" && !this.#sidecarSuspect &&
+        !this.#credentialRefreshPending && !this.#ySweetReconnectPending && transport
+      ? Math.max(0, Math.min(
+          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+          capacity - active - prefetched - quarantined,
+        ))
+      : 0;
+    const availabilityReason: SandboxAvailabilityReason = available > 0
+      ? "available"
+      : this.#state !== "ready"
+        ? "lifecycle_unavailable"
+        : this.#sidecarSuspect
+          ? "sidecar_suspect"
+          : this.#credentialRefreshPending
+            ? "credential_refresh"
+            : this.#ySweetReconnectPending
+              ? "awareness_reconnect"
+              : !transport || !transport.connected
+                ? "transport_unavailable"
+                : quarantined >= Math.max(1, capacity - active - prefetched)
+                  ? "quarantine"
+                  : transport.admissionBlockReason === "draining"
+                    ? "lifecycle_unavailable"
+                    : transport.admissionBlockReason ?? "transport_unavailable";
     const heartbeatAt = this.#heartbeat?.snapshot().lastSuccessAtMs ?? null;
     const governor = this.#options.governor.snapshot();
     const memoryPressure = governor.reservationCapacityBytes > 0
@@ -562,13 +587,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       state: this.#state,
       capacity,
       active,
-      available: this.#state === "ready" && !this.#sidecarSuspect &&
-          !this.#credentialRefreshPending && !this.#ySweetReconnectPending && transport
-        ? Math.max(0, Math.min(
-            transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
-            capacity - active - prefetched - quarantined,
-          ))
-        : 0,
+      available,
+      availabilityReason,
       quarantined,
       ambiguousQuarantined: transport?.ambiguousQuarantined ?? 0,
       ambiguityLimit: transport?.ambiguityLimit ?? Math.max(

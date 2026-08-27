@@ -115,6 +115,7 @@ describe("FleetSampler", () => {
           capacity: 128,
           active: 4,
           available: 124,
+          availabilityReason: "available" as const,
           quarantined: 0,
           ambiguousQuarantined: 1,
           ambiguityLimit: 4,
@@ -318,6 +319,7 @@ describe("FleetSampler", () => {
       schema_hash: "b".repeat(64),
       incarnation: 3,
       awareness_rtt_ms: 15,
+      availability_reason: "available",
       sidecar_peer_age_ms: 250,
       recovery: { attempt: 2, consecutive_failures: 1, retry_in_ms: 1_000 },
       ambiguous_quarantined: 1,
@@ -355,6 +357,7 @@ describe("FleetSampler", () => {
         },
       },
     });
+    expect(event.routable).toBe(1);
     expect(event.provisioning_circuit).toMatchObject({
       state: "open",
       scope: "outage",

@@ -1435,6 +1435,7 @@ export class MultiSandboxRouter {
         fair_cost_bytes: job.fairCostBytes,
         transfer_admission_cost: job.admissionCost,
         route_attempt: job.attempts + 1,
+        capacity_reason: candidate.availabilityReason ?? "available",
       });
       this.#reserveRuntime(job, runtime.projectId);
       // This drain pass uses one immutable fleet snapshot. Charge its local
@@ -1452,6 +1453,7 @@ export class MultiSandboxRouter {
         runtime,
         selection.incarnationKey,
         selection.retryEpoch,
+        candidate.availabilityReason ?? "available",
       );
       if (candidates.length === 0) return;
     }
@@ -1604,6 +1606,7 @@ export class MultiSandboxRouter {
     runtime: RoutableSandboxRuntime,
     selectedIncarnation: string,
     selectedRetryEpoch: number,
+    selectedCapacityReason: NonNullable<RoutableSandboxSnapshot["availabilityReason"]>,
   ): Promise<void> {
     const started = this.#clock.now();
     const requestModel = typeof job.body.model === "string"
@@ -1881,6 +1884,18 @@ export class MultiSandboxRouter {
         !committed &&
         !ambiguous;
       const retryablePreCommit = timedOutBeforeCommit || isRetryablePreCommitFailure(error);
+      if (timedOutBeforeCommit) {
+        this.#emit("route.attempt_expired", {
+          trace_id: job.traceId,
+          project_id: runtime.projectId,
+          route_attempt: job.attempts + 1,
+          attempt_ms: Math.max(0, this.#clock.now() - started),
+          progress_observed: false,
+          progress_age_ms: null,
+          capacity_reason: selectedCapacityReason,
+          transfer_admission_cost: job.admissionCost,
+        });
+      }
       if (
         retryablePreCommit &&
         !job.signal?.aborted &&

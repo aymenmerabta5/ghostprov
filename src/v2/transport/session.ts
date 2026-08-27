@@ -129,12 +129,24 @@ export interface V2TransportSnapshot {
   admissionCredits?: number;
   /** Safe host run calls, including bounded body-only R5 prefetch capacity. */
   prefetchCredits?: number;
+  admissionBlockReason?: V2AdmissionBlockReason;
   retransmissions: number;
   awarenessRttMs: number | null;
   /** Age of the newest valid envelope from the bootstrap-bound sidecar instance. */
   sidecarPeerAgeMs?: number | null;
   diagnostics?: { host: V2TransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
 }
+
+export type V2AdmissionBlockReason =
+  | "available"
+  | "transport_unavailable"
+  | "transport_recovery"
+  | "draining"
+  | "transport_congested"
+  | "zero_remote_credits"
+  | "host_ceiling"
+  | "execution_window"
+  | "transfer_budget";
 
 export type V2TransportLivenessErrorCode =
   | "unavailable"
@@ -1528,6 +1540,7 @@ export class V2TransportSession {
       credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
       admissionCredits: this.#availableCredits(),
       prefetchCredits: this.#availablePrefetchCredits(),
+      admissionBlockReason: this.#admissionBlockReason(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#delivery.roundTripEwmaMs,
       sidecarPeerAgeMs: this.#lastValidPeerAtMs === null
@@ -3121,6 +3134,31 @@ export class V2TransportSession {
       limit - this.#creditReservations - this.#ambiguousQuarantined,
       this.#transferBudget - this.#transferReservations,
     ));
+  }
+
+  #admissionBlockReason(): V2AdmissionBlockReason {
+    if (this.#sidecarRecovery) return "transport_recovery";
+    if (!this.#connected || this.#closed) return "transport_unavailable";
+    if (this.#draining) return "draining";
+    if (this.#congestion.congested) return "transport_congested";
+    if (this.#remoteCredits - this.#creditReservations <= 0) {
+      return "zero_remote_credits";
+    }
+    if (
+      this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined <= 0
+    ) return "host_ceiling";
+    const prefetchLimit = this.#transportProfile === "bulk-v1" &&
+        this.#binding.protocolRevision === "r2" &&
+        this.#latencyCriticalRequests === 0
+      ? MAX_BULK_BODY_PREFETCH_RESERVATIONS
+      : MAX_PRECOMMIT_EXECUTION_RESERVATIONS;
+    if (
+      prefetchLimit - this.#creditReservations - this.#ambiguousQuarantined <= 0
+    ) return "execution_window";
+    if (this.#transferBudget - this.#transferReservations <= 0) {
+      return "transfer_budget";
+    }
+    return "available";
   }
 
   #hostFlightLimits(): Pick<

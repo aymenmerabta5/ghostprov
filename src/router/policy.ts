@@ -1,5 +1,6 @@
 import type { RandomSource } from "../core/ports";
 import type { ProjectId } from "../sandbox/types";
+import type { SandboxAvailabilityReason } from "../sandbox/registry";
 import type { WorkloadDescriptor } from "./workload";
 
 export interface RouteCandidate {
@@ -18,6 +19,7 @@ export interface RouteCandidate {
    * V2 and may fall independently while a transport is congested.
    */
   available?: number;
+  availabilityReason?: SandboxAvailabilityReason;
   /** Host reservations not yet reflected in runtime admission credits. */
   reserved: number;
   /** Weighted large-body transfer reservations not yet reflected by V2. */

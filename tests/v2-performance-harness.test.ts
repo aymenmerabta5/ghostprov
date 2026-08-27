@@ -429,6 +429,26 @@ describe("V2 deterministic performance harness", () => {
     expect(report.transport.retransmissions).toBe(0);
   }, 30_000);
 
+  it("reproduces the observed 2.9 MiB admission cliff on a 600 ms, 400 KiB/s link", async () => {
+    const requestBytes = Math.floor(2.9 * 1024 * 1024);
+    const report = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      transportProfile: "bulk-v1",
+      corpus: "incompressible",
+      rttMs: 600,
+      linkBandwidthBytesPerSecond: 400 * 1024,
+      serializationBytesPerSecond: 100 * 1024 * 1024,
+      requestBytes,
+      concurrency: 3,
+      maxAggregateRequestBytes: 16 * 1024 * 1024,
+      timeoutMs: 60_000,
+    });
+    expectExactAndBounded(report);
+    expect(report.upstream.maxActive).toBe(3);
+    expect(report.transport.retransmissions).toBe(0);
+    expect(report.timings.modeledLink.commitMs.p95).toBeGreaterThan(40_000);
+  }, 30_000);
+
   it("keeps tiny p95 exact while accelerating a 24-way 128/512 KiB production-deadline mix", async () => {
     const requestBytesByRequest = Array.from(
       { length: 24 },

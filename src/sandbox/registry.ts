@@ -4,6 +4,21 @@ import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import type { V2TransportSnapshot } from "../v2/transport/session";
 import type { RateLimitHint, RateLimitProblem } from "../v2/rate-limit";
 
+export type SandboxAvailabilityReason =
+  | "available"
+  | "lifecycle_unavailable"
+  | "sidecar_suspect"
+  | "credential_refresh"
+  | "awareness_reconnect"
+  | "transport_unavailable"
+  | "transport_recovery"
+  | "transport_congested"
+  | "zero_remote_credits"
+  | "host_ceiling"
+  | "execution_window"
+  | "transfer_budget"
+  | "quarantine";
+
 export interface UpstreamRateLimitObservation {
   hint: RateLimitHint;
   problem: RateLimitProblem | null;
@@ -25,6 +40,8 @@ export interface RoutableSandboxSnapshot {
   capacity: number;
   active: number;
   available: number;
+  /** Sanitized reason this runtime can or cannot accept another request. */
+  availabilityReason?: SandboxAvailabilityReason;
   quarantined: number;
   ambiguousQuarantined?: number;
   ambiguityLimit?: number;
