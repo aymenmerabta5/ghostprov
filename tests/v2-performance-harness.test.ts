@@ -333,6 +333,8 @@ describe("V2 deterministic performance harness", () => {
       standardSmall.timings.modeledLink.commitMs.p50,
     )).toBeLessThanOrEqual(0.001);
     expect(acceleratedLarge.timings.modeledLink.commitMs.p50).toBeLessThan(10_000);
+    expect(acceleratedLarge.requests[0]!.ackRoundsAtCommit).toBe(19);
+    expect(acceleratedLarge.timings.modeledLink.commitMs.p50).toBeLessThan(8_900);
     expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
     expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(1024 * 1024);
   }, 30_000);

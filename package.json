@@ -29,6 +29,8 @@
     "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
     "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
     "benchmark:scriptc": "bun scripts/benchmark_scriptc.ts",
+    "benchmark:v2-research": "bun scripts/v2_performance_research.ts --compare benchmarks/v2-performance-baseline.json",
+    "benchmark:v2-research:record": "bun scripts/v2_performance_research.ts --record benchmarks/v2-performance-baseline.json",
     "monitor:v2": "bun scripts/monitor_v2.ts",
     "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts"
   },

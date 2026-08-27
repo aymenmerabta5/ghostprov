@@ -1,0 +1,295 @@
+{
+  "schemaVersion": 1,
+  "suite": "ghostprov-v2-performance-research",
+  "commit": "906595e5ffa44965d1b53a52d672b457650611c0",
+  "transportProfile": "bulk-v1",
+  "results": [
+    {
+      "scenario": {
+        "id": "tiny-128k-c40-rtt50",
+        "description": "Forty short-context agents on a low-latency link",
+        "rttMs": 50,
+        "concurrency": 40,
+        "requestBytes": 131072,
+        "timeoutMs": 30000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 1118.7071838378906,
+      "commitP95Ms": 2095.391902923584,
+      "commitMaxMs": 2220.5969276428223,
+      "virtualElapsedMs": 2624.2492713928223,
+      "wallCommitP95Ms": 454.6702,
+      "wallTotalP95Ms": 536.2750000000001,
+      "hostPeakWindowBytes": 400851,
+      "attemptedWireBytes": 7522632,
+      "usefulRequestBytes": 5242880,
+      "retransmissions": 0,
+      "upstreamMaxActive": 40,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "tiny": {
+          "requests": 40,
+          "commitP95Ms": 2095.391902923584,
+          "commitMaxMs": 2220.5969276428223,
+          "ackRoundsP95": 3
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "tiny-128k-c24-rtt400",
+        "description": "Twenty-four short-context agents on the observed high-RTT class",
+        "rttMs": 400,
+        "concurrency": 24,
+        "requestBytes": 131072,
+        "timeoutMs": 30000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 5017.939914703369,
+      "commitP95Ms": 10219.063312530518,
+      "commitMaxMs": 10219.063312530518,
+      "virtualElapsedMs": 12621.42537689209,
+      "wallCommitP95Ms": 274.55700000000024,
+      "wallTotalP95Ms": 313.1373000000003,
+      "hostPeakWindowBytes": 400851,
+      "attemptedWireBytes": 4514939,
+      "usefulRequestBytes": 3145728,
+      "retransmissions": 0,
+      "upstreamMaxActive": 24,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "tiny": {
+          "requests": 24,
+          "commitP95Ms": 10219.063312530518,
+          "commitMaxMs": 10219.063312530518,
+          "ackRoundsP95": 3
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "medium-512k-c1-rtt400",
+        "description": "One isolated medium-context request",
+        "rttMs": 400,
+        "concurrency": 1,
+        "requestBytes": 524288,
+        "timeoutMs": 30000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 1029.8295440673828,
+      "commitP95Ms": 1029.8295440673828,
+      "commitMaxMs": 1029.8295440673828,
+      "virtualElapsedMs": 2230.195281982422,
+      "wallCommitP95Ms": 30.233400000000074,
+      "wallTotalP95Ms": 39.16179999999986,
+      "hostPeakWindowBytes": 707134,
+      "attemptedWireBytes": 737690,
+      "usefulRequestBytes": 524288,
+      "retransmissions": 0,
+      "upstreamMaxActive": 1,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "medium": {
+          "requests": 1,
+          "commitP95Ms": 1029.8295440673828,
+          "commitMaxMs": 1029.8295440673828,
+          "ackRoundsP95": 2
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "medium-512k-c40-rtt400",
+        "description": "Forty concurrent medium-context agents",
+        "rttMs": 400,
+        "concurrency": 40,
+        "requestBytes": 524288,
+        "timeoutMs": 120000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 13640.926517486572,
+      "commitP95Ms": 25042.944370269775,
+      "commitMaxMs": 26043.150150299072,
+      "virtualElapsedMs": 29246.80366897583,
+      "wallCommitP95Ms": 762.8099999999995,
+      "wallTotalP95Ms": 851.6677,
+      "hostPeakWindowBytes": 949765,
+      "attemptedWireBytes": 28811004,
+      "usefulRequestBytes": 20971520,
+      "retransmissions": 0,
+      "upstreamMaxActive": 40,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "medium": {
+          "requests": 40,
+          "commitP95Ms": 25042.944370269775,
+          "commitMaxMs": 26043.150150299072,
+          "ackRoundsP95": 4
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "mixed-128k-512k-c24-rtt400",
+        "description": "Production-deadline short/medium context mix",
+        "rttMs": 400,
+        "concurrency": 24,
+        "requestBytes": [
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288,
+          131072,
+          524288
+        ],
+        "timeoutMs": 30000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 5017.939998626709,
+      "commitP95Ms": 12619.284534454346,
+      "commitMaxMs": 12619.284534454346,
+      "virtualElapsedMs": 15021.648025512695,
+      "wallCommitP95Ms": 372.20130000000063,
+      "wallTotalP95Ms": 404.96250000000055,
+      "hostPeakWindowBytes": 949701,
+      "attemptedWireBytes": 10899667,
+      "usefulRequestBytes": 7864320,
+      "retransmissions": 0,
+      "upstreamMaxActive": 24,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "tiny": {
+          "requests": 12,
+          "commitP95Ms": 5017.939998626709,
+          "commitMaxMs": 5017.939998626709,
+          "ackRoundsP95": 3
+        },
+        "medium": {
+          "requests": 12,
+          "commitP95Ms": 12619.284534454346,
+          "commitMaxMs": 12619.284534454346,
+          "ackRoundsP95": 4
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "long-2m-c16-rtt400",
+        "description": "Sixteen concurrent long-context agents",
+        "rttMs": 400,
+        "concurrency": 16,
+        "requestBytes": 2097152,
+        "timeoutMs": 60000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 15351.706871032715,
+      "commitP95Ms": 30703.47169113159,
+      "commitMaxMs": 30703.47169113159,
+      "virtualElapsedMs": 32705.190399169922,
+      "wallCommitP95Ms": 981.6153999999988,
+      "wallTotalP95Ms": 1018.7709999999988,
+      "hostPeakWindowBytes": 971137,
+      "attemptedWireBytes": 45612870,
+      "usefulRequestBytes": 33554432,
+      "retransmissions": 0,
+      "upstreamMaxActive": 16,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "medium": {
+          "requests": 16,
+          "commitP95Ms": 30703.47169113159,
+          "commitMaxMs": 30703.47169113159,
+          "ackRoundsP95": 4
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "large-13m-c1-rtt400",
+        "description": "Observed thirteen-MiB request class",
+        "rttMs": 400,
+        "concurrency": 1,
+        "requestBytes": 13631488,
+        "timeoutMs": 30000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 9172.801780700684,
+      "commitP95Ms": 9172.801780700684,
+      "commitMaxMs": 9172.801780700684,
+      "virtualElapsedMs": 10773.222110748291,
+      "wallCommitP95Ms": 312.83179999999993,
+      "wallTotalP95Ms": 328.14589999999953,
+      "hostPeakWindowBytes": 971328,
+      "attemptedWireBytes": 18445036,
+      "usefulRequestBytes": 13631488,
+      "retransmissions": 0,
+      "upstreamMaxActive": 1,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "large": {
+          "requests": 1,
+          "commitP95Ms": 9172.801780700684,
+          "commitMaxMs": 9172.801780700684,
+          "ackRoundsP95": 20
+        }
+      }
+    },
+    {
+      "scenario": {
+        "id": "medium-1m-c4-rtt1000",
+        "description": "Four medium-context agents on a one-second RTT",
+        "rttMs": 1000,
+        "concurrency": 4,
+        "requestBytes": 1048576,
+        "timeoutMs": 60000
+      },
+      "repetitions": 3,
+      "commitP50Ms": 8197.793632507324,
+      "commitP95Ms": 10697.949729919434,
+      "commitMaxMs": 10697.949729919434,
+      "virtualElapsedMs": 14698.667526245117,
+      "wallCommitP95Ms": 156.67469999999958,
+      "wallTotalP95Ms": 166.3107999999993,
+      "hostPeakWindowBytes": 971008,
+      "attemptedWireBytes": 5731880,
+      "usefulRequestBytes": 4194304,
+      "retransmissions": 0,
+      "upstreamMaxActive": 4,
+      "exactRequests": true,
+      "exactTerminals": true,
+      "classes": {
+        "medium": {
+          "requests": 4,
+          "commitP95Ms": 10697.949729919434,
+          "commitMaxMs": 10697.949729919434,
+          "ackRoundsP95": 7
+        }
+      }
+    }
+  ]
+}

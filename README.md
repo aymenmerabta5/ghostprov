@@ -390,6 +390,19 @@ bun run typecheck
 bun audit --production
 ```
 
+The continuous performance branch compares every transport experiment against a checked-in best-known baseline spanning short, medium, long, large, mixed, 40-agent, and 1,000 ms RTT workloads. The comparator rejects any exactness, concurrency, retransmission, 1 MiB window, useful-byte, tiny-p95, overall-p95, virtual-duration, or wire-volume regression. A candidate is marked `keep` only when it clears every regression gate and improves p95 or total modeled duration by at least two percent; otherwise it is `stable` or `reject`.
+
+```powershell
+# Normal no-regression comparison.
+bun run benchmark:v2-research
+
+# Experimental acceptance requires a measurable improvement.
+bun scripts/v2_performance_research.ts --compare benchmarks/v2-performance-baseline.json --require-improvement
+
+# Baseline replacement is intentionally explicit and is allowed only after a keep decision.
+bun scripts/v2_performance_research.ts --record benchmarks/v2-performance-baseline.json --replace
+```
+
 The isolated suite includes:
 
 - `tests/account-session.test.ts`
@@ -497,6 +510,7 @@ The isolated suite includes:
 - `tests/v2-output-sink.test.ts`
 - `tests/v2-performance-harness.test.ts`
 - `tests/v2-performance-large.test.ts`
+- `tests/v2-performance-research.test.ts`
 - `tests/v2-permit-carrier.test.ts`
 - `tests/v2-protocol.test.ts`
 - `tests/v2-provider-error.test.ts`

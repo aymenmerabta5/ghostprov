@@ -63,6 +63,7 @@ veryLargeDescribe("V2 opt-in maximum request integrity", () => {
       exactTerminal: true,
     });
     expect(report.requests[0]!.encodedRequestBytes).toBeGreaterThan(0);
+    expect(report.requests[0]!.ackRoundsAtCommit).toBe(90);
     expect(report.requests[0]!.encodedRequestBytes).toBeLessThanOrEqual(
       V2_PERFORMANCE_PAYLOAD_BYTES.mib64,
     );

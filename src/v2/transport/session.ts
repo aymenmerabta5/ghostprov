@@ -77,7 +77,8 @@ import {
 } from "../protocol/retransmit";
 
 const R1_REQUEST_PART_BYTES = 8 * 1024;
-const R2_REQUEST_PART_BYTES = 11 * 1024;
+/** Dense host-generated R2 part with >256 bytes of worst-case frame headroom. */
+export const V2_R2_REQUEST_PART_BYTES = 11_900;
 const MIN_GZIP_SAVINGS_RATIO = 0.05;
 const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
 const BULK_GZIP_MIN_BYTES = 2 * 1024 * 1024;
@@ -2814,7 +2815,7 @@ export class V2TransportSession {
     }
     const requestDigest = await sha256Hex(decoded);
     const partBytes = this.#binding.protocolRevision === "r2"
-      ? R2_REQUEST_PART_BYTES
+      ? V2_R2_REQUEST_PART_BYTES
       : R1_REQUEST_PART_BYTES;
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";

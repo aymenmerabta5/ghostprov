@@ -27,6 +27,7 @@ import {
 } from "../src/v2/transport/run-handle";
 import {
   computeV2RetransmitDelayMs,
+  V2_R2_REQUEST_PART_BYTES,
   V2TransportSession,
   type V2GzipOptions,
 } from "../src/v2/transport/session";
@@ -401,6 +402,21 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("packs the dense R2 request part under the hard frame cap at worst metadata widths", () => {
+    const frame: ReliableFrame<HostFrame> = {
+      kind: "request_data",
+      requestId: `req-${"f".repeat(36)}`,
+      partIndex: 9_999_999,
+      offset: 64 * 1024 ** 2 - 1,
+      dataBase64Url: base64UrlEncode(new Uint8Array(V2_R2_REQUEST_PART_BYTES)),
+      epoch: Number.MAX_SAFE_INTEGER,
+      sequence: Number.MAX_SAFE_INTEGER,
+    };
+    const encodedBytes = utf8Bytes(JSON.stringify(frame)).byteLength;
+    expect(encodedBytes).toBeLessThanOrEqual(16 * 1024);
+    expect(16 * 1024 - encodedBytes).toBeGreaterThanOrEqual(256);
+  });
+
   it("probes on the control lane without disturbing an active reliable flight", async () => {
     const harness = new TransportHarness({ autoPong: true, livenessTimeoutMs: 250 });
     await harness.start();
