@@ -16,6 +16,7 @@ export interface RoutableSandboxSnapshot {
   /** Exact verified V2 release; null until this generation proves readiness. */
   releaseRevision?: "r1" | "r2" | "r3" | "r4" | "r5" | null;
   protocolRevision?: "r1" | "r2" | null;
+  transportProfile?: "standard" | "bulk-v1" | null;
   buildHash?: string | null;
   schemaHash?: string | null;
   /** Changes when a stable supervisor installs a fresh runtime generation. */

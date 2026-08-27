@@ -31,6 +31,10 @@ import {
   V2TransportSession,
   type V2GzipOptions,
 } from "../src/v2/transport/session";
+import {
+  v2HostTransferBudget,
+  v2RequestTransferCost,
+} from "../src/v2/transport/admission-cost";
 import { FakeAwarenessNetwork } from "./support/fake-awareness";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
@@ -402,6 +406,16 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("keeps standard rollback accounting conservative while R5 admits bounded medium concurrency", () => {
+    expect(v2HostTransferBudget("standard")).toBe(5);
+    expect(v2HostTransferBudget("bulk-v1")).toBe(6);
+    expect(v2RequestTransferCost(2 * 1024 ** 2, "standard")).toBe(3);
+    expect(v2RequestTransferCost(2 * 1024 ** 2, "bulk-v1")).toBe(1);
+    expect(v2RequestTransferCost(2 * 1024 ** 2 + 1, "standard")).toBe(4);
+    expect(v2RequestTransferCost(2 * 1024 ** 2 + 1, "bulk-v1")).toBe(4);
+    expect(() => v2HostTransferBudget("invalid" as never)).toThrow(RangeError);
+  });
+
   it("packs the dense R2 request part under the hard frame cap at worst metadata widths", () => {
     const frame: ReliableFrame<HostFrame> = {
       kind: "request_data",
@@ -1327,16 +1341,25 @@ describe("V2TransportSession", () => {
     await harness.settle();expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,queued:1});
     await harness.close();await Promise.allSettled(pending);
   });
-  it("admits only one multi-megabyte transfer while retaining one ordinary slot", async () => {
-    const harness=new TransportHarness();await harness.start();
-    const body={...BODY,input:"x".repeat(2*1024*1024)};
-    const pending=[harness.session.run(body),harness.session.run(body)];
+  it("admits four exact 2 MiB transfers concurrently but never two true bulk transfers", async () => {
+    const harness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await harness.start();
+    const medium=createExactSizedV2Request(2*1024*1024,10,"incompressible");
+    const controllers=Array.from({length:5},()=>new AbortController());
+    const pending=controllers.map(controller=>harness.session.run(medium,controller.signal));
     await harness.settle();
-    expect(harness.session.snapshot()).toMatchObject({ admissionCredits: 1, active: 1, queued: 1 });
-    await harness.commit(pending[0]!);
+    expect(harness.session.snapshot()).toMatchObject({ admissionCredits: 0, active: 4, queued: 1 });
+    controllers[0]!.abort();
+    await expect(pending[0]!).rejects.toBeInstanceOf(DOMException);
     await harness.settle();
-    expect(harness.session.snapshot()).toMatchObject({active:2,queued:0});
+    expect(harness.session.snapshot()).toMatchObject({active:4,queued:0});
     await harness.close();await Promise.allSettled(pending);
+
+    const bulkHarness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await bulkHarness.start();
+    const bulk=createExactSizedV2Request(3*1024*1024,11,"incompressible");
+    const bulkPending=[bulkHarness.session.run(bulk),bulkHarness.session.run(bulk)];
+    await bulkHarness.settle();
+    expect(bulkHarness.session.snapshot()).toMatchObject({active:1,queued:1});
+    await bulkHarness.close();await Promise.allSettled(bulkPending);
   });
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);

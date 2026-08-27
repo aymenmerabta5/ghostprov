@@ -45,6 +45,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   heartbeatAgeMs: number | null = 1_000;
   sidecarPeerAgeMs: number | null = null;
   diagnostics: any = undefined;
+  transportProfile: "standard" | "bulk-v1" | null = null;
   lastRunSignal?: AbortSignal;
   pulseAdmissionOnFailure = false;
   readonly executionStartedAtMs: number[] = [];
@@ -73,6 +74,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.snapshotCalls++;
     return {
       projectId: this.projectId,
+      transportProfile: this.transportProfile,
       incarnation: this.incarnation,
       state: this.state,
       capacity: this.capacity,
@@ -224,6 +226,42 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("uses profile-specific transfer reservations without oversubscribing standard rollback", async () => {
+    const launch = (system: ReturnType<typeof createSystem>) => Array.from(
+      { length: 4 },
+      (_, index) => system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: `profile-cost-${index}`,
+        service_tier: "fast",
+        stream: true,
+      }, {
+        clientId: `profile-cost-${index}`,
+        source: "websocket",
+        encodedBodyBytes: 2 * 1024 ** 2,
+      }),
+    );
+
+    const standard = createSystem(1, 4, 100, undefined, undefined, undefined, 20);
+    standard.runtimes[0]!.transportProfile = "standard";
+    standard.runtimes[0]!.waitForAdmissionAbort = true;
+    standard.runtimes[0]!.notify();
+    const standardPending = launch(standard);
+    await flush();
+    expect(standard.runtimes[0]!.executions).toBe(1);
+    await standard.router.close();
+    await Promise.allSettled(standardPending);
+
+    const bulk = createSystem(1, 4, 100, undefined, undefined, undefined, 20);
+    bulk.runtimes[0]!.transportProfile = "bulk-v1";
+    bulk.runtimes[0]!.waitForAdmissionAbort = true;
+    bulk.runtimes[0]!.notify();
+    const bulkPending = launch(bulk);
+    await flush();
+    expect(bulk.runtimes[0]!.executions).toBe(4);
+    await bulk.router.close();
+    await Promise.allSettled(bulkPending);
+  });
+
   it("keeps small deadlines exact and scales only genuinely large request admission", () => {
     expect(requestRoutingTimeouts(128 * 1024, 30_000, 15_000)).toEqual({
       queueTimeoutMs: 30_000,

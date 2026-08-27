@@ -843,6 +843,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   readonly #journal: ClaimJournal;
   readonly #sampler: SidecarResourceSampler;
   readonly #binding: ProtocolBinding;
+  readonly #transportProfile: V2TransportProfile;
   readonly #credential: BootstrapCredentialPayload;
   readonly #peerErrors: Error[];
   readonly #preparationWall: PreparationWallMetrics;
@@ -862,6 +863,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     journal: ClaimJournal;
     sampler: SidecarResourceSampler;
     binding: ProtocolBinding;
+    transportProfile: V2TransportProfile;
     credential: BootstrapCredentialPayload;
     peerErrors: Error[];
     preparationWall: PreparationWallMetrics;
@@ -875,6 +877,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     this.#journal = options.journal;
     this.#sampler = options.sampler;
     this.#binding = options.binding;
+    this.#transportProfile = options.transportProfile;
     this.#credential = options.credential;
     this.#peerErrors = options.peerErrors;
     this.#preparationWall = options.preparationWall;
@@ -1048,6 +1051,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       journal,
       sampler,
       binding,
+      transportProfile,
       credential,
       peerErrors,
       preparationWall,
@@ -1182,6 +1186,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     const capacity = this.#state === "ready" ? this.#physical : 0;
     return {
       projectId: this.projectId,
+      transportProfile: this.#transportProfile,
       state: this.#state,
       capacity,
       active: transport.active,

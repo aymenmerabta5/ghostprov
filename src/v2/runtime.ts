@@ -555,6 +555,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       projectId: this.projectId,
       releaseRevision: verifiedRelease?.releaseRevision ?? null,
       protocolRevision: verifiedRelease?.protocolRevision ?? null,
+      transportProfile: verifiedRelease ? this.#options.assets.transportProfile : null,
       buildHash: verifiedRelease?.buildHash ?? null,
       schemaHash: verifiedRelease?.schemaHash ?? null,
       state: this.#state,

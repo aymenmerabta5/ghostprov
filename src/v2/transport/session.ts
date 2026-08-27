@@ -60,7 +60,7 @@ import {
 } from "./run-handle";
 import { createNativeTranscriptHasher } from "./native-transcript-hasher";
 import {
-  V2_HOST_TRANSFER_BUDGET,
+  v2HostTransferBudget,
   v2RequestTransferCost,
 } from "./admission-cost";
 import {
@@ -473,6 +473,7 @@ export class V2TransportSession {
   readonly #binding: ProtocolBinding;
   readonly #limits: V2ProtocolTransportLimits;
   readonly #transportProfile: V2TransportProfile;
+  readonly #transferBudget: number;
   readonly #channel: AwarenessChannel<HostFrame, SidecarFrame>;
   readonly #clock: Clock;
   readonly #gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
@@ -629,6 +630,7 @@ export class V2TransportSession {
       options.binding.protocolRevision,
       this.#transportProfile,
     );
+    this.#transferBudget = v2HostTransferBudget(this.#transportProfile);
     this.#outbound = new OutboundFrameWindow<HostFrame>({
       epoch: 1,
       limits: this.#limits,
@@ -872,7 +874,7 @@ export class V2TransportSession {
       onAdmissionReflected: options?.onAdmissionReflected,
       onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
-      transferCost: v2RequestTransferCost(prepared.encodedBytes),
+      transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
       latencyCriticalPreCommitTracked: false,
       published: false,
       commitStaged: false,
@@ -2965,7 +2967,7 @@ export class V2TransportSession {
 
   #admitPending(): void {
     while (this.#availableCredits() > 0) {
-      const transferAvailable = V2_HOST_TRANSFER_BUDGET - this.#transferReservations;
+      const transferAvailable = this.#transferBudget - this.#transferReservations;
       const state = this.#pending.find(candidate => (
         !candidate.admitted && candidate.transferCost <= transferAvailable
       ));
@@ -2998,7 +3000,7 @@ export class V2TransportSession {
       this.#remoteCredits - this.#creditReservations,
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
       4 - this.#creditReservations - this.#ambiguousQuarantined,
-      V2_HOST_TRANSFER_BUDGET - this.#transferReservations,
+      this.#transferBudget - this.#transferReservations,
     ));
   }
 

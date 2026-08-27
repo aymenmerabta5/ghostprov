@@ -878,6 +878,7 @@ describe("V2SandboxRuntime", () => {
     expect(harness.runtime.snapshot()).toMatchObject({
       state: "ready",
       protocolRevision: "r1",
+      transportProfile: "standard",
       buildHash: ASSETS.buildHash,
       schemaHash: ASSETS.schemaHash,
       capacity: 128,

@@ -188,6 +188,7 @@ function emptySnapshot(projectId: ProjectId): RoutableSandboxSnapshot {
     projectId,
     releaseRevision: null,
     protocolRevision: null,
+    transportProfile: null,
     buildHash: null,
     schemaHash: null,
     state: "configured",
@@ -389,6 +390,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       ...(!hasCurrentRelease ? {
         releaseRevision: null,
         protocolRevision: null,
+        transportProfile: null,
         buildHash: null,
         schemaHash: null,
       } : {}),

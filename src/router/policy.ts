@@ -6,6 +6,8 @@ export interface RouteCandidate {
   projectId: ProjectId;
   /** Verified wire revision; ready production V2 runtimes always provide it. */
   protocolRevision?: "r1" | "r2" | null;
+  /** Release-negotiated transfer accounting profile. Unknown stays conservative. */
+  transportProfile?: "standard" | "bulk-v1" | null;
   incarnation?: number;
   state: string;
   capacity: number;
@@ -45,8 +47,8 @@ const UNKNOWN_THROUGHPUT_BYTES_PER_ACK: Readonly<Record<"r1" | "r2", number>> =
   Object.freeze({
     // R1's 128 KiB encoded flight fits roughly ten 8 KiB request parts.
     r1: 80 * KiB,
-    // R2 carries exactly thirty-two 11 KiB request parts per full flight.
-    r2: 32 * 11 * KiB,
+    // R2 carries up to thirty-two dense request parts per standard flight.
+    r2: 32 * 11_900,
   });
 // A fresh/recovered remote sandbox must not look faster than every measured
 // peer merely because it has no RTT sample yet. This matches the conservative

@@ -409,6 +409,26 @@ describe("V2 deterministic performance harness", () => {
     }
   }, 60_000);
 
+  it("keeps sixteen exact 2 MiB agents below the production admission deadline", async () => {
+    const report = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      transportProfile: "bulk-v1",
+      corpus: "incompressible",
+      rttMs: 400,
+      requestBytes: 2 * 1024 * 1024,
+      concurrency: 16,
+      maxAggregateRequestBytes: 32 * 1024 * 1024,
+      timeoutMs: 60_000,
+    });
+    expectExactAndBounded(report);
+    expect(report.upstream.maxActive).toBe(16);
+    // The 64-frame/1-MiB wire ceiling gives four equal streams sixteen frames
+    // per RTT. This bound requires >20% improvement without inventing a larger
+    // R6 window or weakening the R2 start fence.
+    expect(report.timings.modeledLink.commitMs.p95).toBeLessThan(24_000);
+    expect(report.transport.retransmissions).toBe(0);
+  }, 30_000);
+
   it("keeps tiny p95 exact while accelerating a 24-way 128/512 KiB production-deadline mix", async () => {
     const requestBytesByRequest = Array.from(
       { length: 24 },

@@ -22,7 +22,7 @@ import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
 import {
-  V2_HOST_TRANSFER_BUDGET,
+  v2HostTransferBudget,
   v2RequestTransferCost,
 } from "../v2/transport/admission-cost";
 import {
@@ -201,6 +201,8 @@ interface QueuedJob {
   queueClass: RouterQueueClass;
   fairCostBytes: number;
   admissionCost: number;
+  standardAdmissionCost: number;
+  bulkAdmissionCost: number;
   fairnessCharged: boolean;
   queueLane: ClientLane | null;
   queuePrevious: QueuedJob | null;
@@ -216,6 +218,7 @@ interface RouteSelection {
   incarnationKey: string;
   eligibleCandidates: number;
   retryEpoch: number;
+  admissionCost: number;
 }
 
 interface CachedRuntime {
@@ -581,7 +584,8 @@ export class MultiSandboxRouter {
           ),
         }
       : workload;
-    const transferAdmissionCost = v2RequestTransferCost(workload.requestBytes);
+    const standardAdmissionCost = v2RequestTransferCost(workload.requestBytes, "standard");
+    const bulkAdmissionCost = v2RequestTransferCost(workload.requestBytes, "bulk-v1");
     const initial = this.snapshot();
     this.#emit("request.accepted", {
       trace_id: traceId,
@@ -591,7 +595,8 @@ export class MultiSandboxRouter {
       stream: workload.stream,
       workload_class: workload.class,
       request_bytes: workload.requestBytes,
-      transfer_admission_cost: transferAdmissionCost,
+      // No runtime is selected yet; emit the conservative rollback profile.
+      transfer_admission_cost: standardAdmissionCost,
       reserved_bytes: admissionWorkload.reservedBytes,
       capacity: initial.capacity,
       active: initial.active,
@@ -684,7 +689,9 @@ export class MultiSandboxRouter {
         routeAttemptTimeoutMs,
         queueClass: queueClassFor(workload),
         fairCostBytes: fairCostBytes(workload),
-        admissionCost: transferAdmissionCost,
+        admissionCost: standardAdmissionCost,
+        standardAdmissionCost,
+        bulkAdmissionCost,
         fairnessCharged: false,
         queueLane: null,
         queuePrevious: null,
@@ -1400,6 +1407,7 @@ export class MultiSandboxRouter {
       const selectedAtMs = this.#clock.now();
       job.queueWaitMs = Math.max(0, selectedAtMs - job.queuedAtMs);
       const candidate = selection.candidate;
+      job.admissionCost = selection.admissionCost;
       this.#emit("route.selected", {
         trace_id: job.traceId,
         project_id: runtime.projectId,
@@ -1559,9 +1567,13 @@ export class MultiSandboxRouter {
     const now = this.#clock.now();
     const candidates = available.filter(
       candidate => {
+        const profile = candidate.transportProfile === "bulk-v1" ? "bulk-v1" : "standard";
+        const admissionCost = profile === "bulk-v1"
+          ? job.bulkAdmissionCost
+          : job.standardAdmissionCost;
         if (
-          V2_HOST_TRANSFER_BUDGET - (candidate.reservedTransferCost ?? 0) <
-            job.admissionCost
+          v2HostTransferBudget(profile) - (candidate.reservedTransferCost ?? 0) <
+            admissionCost
         ) return false;
         const block = job.excluded.get(runtimeIncarnationKey(candidate));
         if (!block) return true;
@@ -1580,6 +1592,9 @@ export class MultiSandboxRouter {
           incarnationKey: runtimeIncarnationKey(candidate),
           eligibleCandidates: candidates.filter(isRuntimeEligible).length,
           retryEpoch: this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0,
+          admissionCost: candidate.transportProfile === "bulk-v1"
+            ? job.bulkAdmissionCost
+            : job.standardAdmissionCost,
         }
       : null;
   }
