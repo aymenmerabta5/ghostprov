@@ -1487,6 +1487,48 @@ describe("V2TransportSession", () => {
       await Promise.allSettled(pending);
     }
   },20_000);
+  it("keeps snapshot bookkeeping O(1) with 128 queued requests", async () => {
+    const idle=new TransportHarness();
+    const loaded=new TransportHarness();
+    await idle.start();
+    await loaded.start();
+    loaded.credits=0;
+    loaded.publish([],{lane:"control"});
+    await loaded.settle();
+    const controllers=Array.from({length:128},()=>new AbortController());
+    const pending=controllers.map((controller,index)=>loaded.session.run(
+      {...BODY,input:`snapshot-load-${index}`},
+      controller.signal,
+    ));
+    const median=(values:number[])=>{
+      const sorted=[...values].sort((left,right)=>left-right);
+      return sorted[Math.floor(sorted.length/2)]!;
+    };
+    const measure=(harness:TransportHarness)=>{
+      let checksum=0;
+      for(let index=0;index<10_000;index++)checksum+=harness.session.snapshot().queued;
+      const samples:number[]=[];
+      for(let round=0;round<5;round++){
+        const started=performance.now();
+        for(let index=0;index<75_000;index++)checksum+=harness.session.snapshot().queued;
+        samples.push(performance.now()-started);
+      }
+      return {elapsed:median(samples),checksum};
+    };
+    try {
+      await loaded.settleUntil(()=>loaded.session.snapshot().queued===128,10_000);
+      const idleCost=measure(idle);
+      const loadedCost=measure(loaded);
+      expect(idleCost.checksum).toBe(0);
+      expect(loadedCost.checksum).toBeGreaterThan(0);
+      expect(loadedCost.elapsed).toBeLessThan(idleCost.elapsed*3);
+    }finally{
+      for(const controller of controllers)controller.abort();
+      await loaded.close();
+      await idle.close();
+      await Promise.allSettled(pending);
+    }
+  },30_000);
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);

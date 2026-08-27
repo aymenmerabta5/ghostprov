@@ -506,6 +506,9 @@ export class V2TransportSession {
   readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #pacer: PublicationPacer;
   readonly #requests = new Map<string, RequestState>();
+  #committedRequestCount = 0;
+  #admittedUncommittedRequestCount = 0;
+  #unadmittedRequestCount = 0;
   readonly #rotations = new Map<string, RotationWaiter>();
   readonly #rotationStreams = new Set<string>();
   readonly #pending: RequestState[] = [];
@@ -913,6 +916,7 @@ export class V2TransportSession {
     signal?.addEventListener("abort", state.onAbort, { once: true });
     this.#requests.set(requestId, state);
     this.#pending.push(state);
+    this.#trackRequestState(state);
     state.admissionTimer = setTimeout(() => {
       if (!this.#requests.has(state.requestId) || state.admitted) return;
       this.#unadmittedTimeouts++;
@@ -1172,6 +1176,7 @@ export class V2TransportSession {
       state.onAbort = () => this.#abortRequest(state);
       state.signal?.addEventListener("abort", state.onAbort, { once: true });
       this.#requests.set(state.requestId, state);
+      this.#trackRequestState(state);
       if (state.quarantineKind) this.#quarantined++;
       if (state.quarantineKind === "ambiguity") this.#ambiguousQuarantined++;
       if (state.signal?.aborted) this.#abortRequest(state);
@@ -1492,28 +1497,20 @@ export class V2TransportSession {
   }
 
   snapshot(): V2TransportSnapshot {
-    let committed = 0;
-    let admittedUncommitted = 0;
-    let unadmitted = 0;
-    for (const state of this.#requests.values()) {
-      if (state.committed) committed++;
-      else if (state.admitted) admittedUncommitted++;
-      else unadmitted++;
-    }
     const executionReservations = Math.min(
-      admittedUncommitted,
+      this.#admittedUncommittedRequestCount,
       Math.max(
         0,
         MAX_PRECOMMIT_EXECUTION_RESERVATIONS - this.#ambiguousQuarantined,
       ),
     );
-    const prefetched = admittedUncommitted - executionReservations;
+    const prefetched = this.#admittedUncommittedRequestCount - executionReservations;
     return {
       connected: this.#connected && !this.#closed && !this.#sidecarRecovery,
-      committed,
-      active: committed + executionReservations,
+      committed: this.#committedRequestCount,
+      active: this.#committedRequestCount + executionReservations,
       prefetched,
-      queued: unadmitted + prefetched,
+      queued: this.#unadmittedRequestCount + prefetched,
       quarantined: this.#quarantined,
       ambiguousQuarantined: this.#ambiguousQuarantined,
       ambiguityLimit: Math.max(1, Math.min(4, this.#hostCeiling)),
@@ -1901,7 +1898,7 @@ export class V2TransportSession {
         if (state.committed) return;
         this.#releaseStartReservation(state);
         this.#stopTrackingLatencyCriticalPreCommit(state);
-        state.committed = true;
+        this.#markRequestCommitted(state);
         state.diagnostics.committed(frame.diagnostics);
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
         this.#transferReservations = Math.max(
@@ -3062,7 +3059,7 @@ export class V2TransportSession {
         candidate.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
       )) ?? this.#pending.find(eligible);
       if (!state) return;
-      state.admitted = true;
+      this.#markRequestAdmitted(state);
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
       state.admissionTimer = undefined;
       this.#creditReservations++;
@@ -3235,9 +3232,12 @@ export class V2TransportSession {
     reason: PublicationReason,
   ): void {
     const outbound = this.#outbound.snapshot();
-    const committed = [...this.#requests.values()].filter(state => state.committed).length;
-    const recoveryActive = [...this.#requests.values()]
-      .filter(state => this.#hasExecutionRisk(state)).length;
+    let recoveryActive = 0;
+    if (this.#sidecarRecovery) {
+      for (const state of this.#requests.values()) {
+        if (this.#hasExecutionRisk(state)) recoveryActive++;
+      }
+    }
     const common = {
       protocol: "gp-awareness-v2",
       schemaHash: this.#binding.schemaHash,
@@ -3251,8 +3251,10 @@ export class V2TransportSession {
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#processedInboundAck,
       credits: this.#sidecarRecovery || this.#congestion.congested ? 0 : this.#hostCeiling,
-      active: this.#sidecarRecovery ? Math.max(1, recoveryActive) : committed,
-      queued: this.#pending.filter(state => !state.admitted).length,
+      active: this.#sidecarRecovery
+        ? Math.max(1, recoveryActive)
+        : this.#committedRequestCount,
+      queued: this.#unadmittedRequestCount,
       draining: this.#draining,
       frames,
       lane,
@@ -3322,8 +3324,7 @@ export class V2TransportSession {
       retransmissionsTotal: this.#retransmissions,
       publicationsTotal: this.#publications,
       publishedBytesTotal: this.#publishedBytes,
-      admittedUncommitted: [...this.#requests.values()]
-        .filter(value => value.admitted && !value.committed).length,
+      admittedUncommitted: this.#admittedUncommittedRequestCount,
       roundTripEwmaMs: this.#delivery.roundTripEwmaMs,
       roundTripVariationMs: this.#delivery.roundTripVariationMs,
       pacedPublicationsTotal: this.#pacedPublications,
@@ -3537,11 +3538,39 @@ export class V2TransportSession {
     state.completedEvents.clear();
   }
 
+  #trackRequestState(state: RequestState): void {
+    if (state.committed) this.#committedRequestCount++;
+    else if (state.admitted) this.#admittedUncommittedRequestCount++;
+    else this.#unadmittedRequestCount++;
+  }
+
+  #untrackRequestState(state: RequestState): void {
+    if (state.committed) this.#committedRequestCount--;
+    else if (state.admitted) this.#admittedUncommittedRequestCount--;
+    else this.#unadmittedRequestCount--;
+  }
+
+  #markRequestAdmitted(state: RequestState): void {
+    if (state.admitted) return;
+    state.admitted = true;
+    this.#unadmittedRequestCount--;
+    this.#admittedUncommittedRequestCount++;
+  }
+
+  #markRequestCommitted(state: RequestState): void {
+    if (state.committed) return;
+    if (state.admitted) this.#admittedUncommittedRequestCount--;
+    else this.#unadmittedRequestCount--;
+    state.committed = true;
+    this.#committedRequestCount++;
+  }
+
   #detachStateForRecovery(state: RequestState): void {
     this.#discardPreparedStart(state);
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
     this.#stopTrackingLatencyCriticalRequest(state);
+    this.#untrackRequestState(state);
     this.#requests.delete(state.requestId);
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
@@ -3662,7 +3691,7 @@ export class V2TransportSession {
     this.#stopTrackingLatencyCriticalPreCommit(state);
     // commitPublished is deliberately promoted to committed-risk here so
     // removal cannot release capacity for work that may still be executing.
-    state.committed = true;
+    this.#markRequestCommitted(state);
     this.#removeState(state);
     if (!acknowledged) state.rejectRun(error);
     state.handle.fail(error);
@@ -3673,6 +3702,7 @@ export class V2TransportSession {
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
     this.#stopTrackingLatencyCriticalRequest(state);
+    this.#untrackRequestState(state);
     this.#requests.delete(state.requestId);
     state.preparedRequest = null;
     state.recoveryPrefix = undefined;
