@@ -64,8 +64,8 @@ export const GP_V2_R2_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freez
 /**
  * Release-negotiated R2 bulk profile. Frame shape and execution fencing remain
  * R2; only the host request window grows. Response egress stays conservative,
- * and the host dynamically falls back to the standard flight whenever a
- * smaller admitted request is present.
+ * and the host dynamically falls back to the standard flight for admitted
+ * latency-critical requests or after transport trouble.
  */
 export const GP_V2_R2_BULK_V1_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freeze({
   frameMaxBytes: 16 * 1024,

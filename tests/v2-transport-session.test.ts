@@ -1134,6 +1134,59 @@ describe("V2TransportSession", () => {
     }
   }, 30_000);
 
+  it("falls medium transfers back after loss and restores acceleration only after two clean flights", async () => {
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      publicationIntervalMs: 1,
+      retransmitMs: 100,
+      unadmittedTimeoutMs: 10_000,
+    });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    const pending = harness.session.run(createExactSizedV2Request(
+      2 * 1024 ** 2,
+      3,
+      "incompressible",
+    ));
+    const dataFlights = () => harness.hostEnvelopes.filter(
+      envelope => envelope.lane === "data" && envelope.frames.length > 0,
+    );
+    const acknowledgeAndTakeNext = async (
+      flight: AwarenessEnvelope<HostFrame>,
+    ): Promise<AwarenessEnvelope<HostFrame>> => {
+      const before = dataFlights().length;
+      harness.publish([], {
+        lane: "control",
+        ackSequence: flight.frames.at(-1)!.sequence,
+      });
+      await harness.settleUntil(() => dataFlights().length > before, 2_000);
+      return dataFlights()[before]!;
+    };
+
+    try {
+      await harness.settleUntil(() => dataFlights().length >= 1, 2_000);
+      const first = dataFlights()[0]!;
+      expect(first.frames).toHaveLength(64);
+      await harness.settleUntil(() => dataFlights().length >= 2, 2_000);
+      const retransmission = dataFlights()[1]!;
+      expect(retransmission.frames.map(frame => frame.sequence))
+        .toEqual(first.frames.map(frame => frame.sequence));
+
+      const firstRecovery = await acknowledgeAndTakeNext(first);
+      expect(firstRecovery.frames.length).toBeLessThanOrEqual(32);
+      const secondRecovery = await acknowledgeAndTakeNext(firstRecovery);
+      expect(secondRecovery.frames.length).toBeLessThanOrEqual(32);
+      const acceleratedAgain = await acknowledgeAndTakeNext(secondRecovery);
+      expect(acceleratedAgain.frames.length).toBeGreaterThan(32);
+      expect(acceleratedAgain.frames.length).toBeLessThanOrEqual(64);
+      expect(harness.session.snapshot().retransmissions).toBeGreaterThanOrEqual(1);
+    } finally {
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  }, 10_000);
+
   it("measures ACK RTT from first sequence send instead of a later cumulative publish", async () => {
     const harness = new TransportHarness({ publicationIntervalMs: 1 });
     await harness.start();

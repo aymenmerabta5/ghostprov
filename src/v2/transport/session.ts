@@ -60,7 +60,6 @@ import {
 } from "./run-handle";
 import { createNativeTranscriptHasher } from "./native-transcript-hasher";
 import {
-  V2_BULK_TRANSFER_COST,
   V2_HOST_TRANSFER_BUDGET,
   v2RequestTransferCost,
 } from "./admission-cost";
@@ -83,6 +82,8 @@ const MIN_GZIP_SAVINGS_RATIO = 0.05;
 const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
 const BULK_GZIP_MIN_BYTES = 2 * 1024 * 1024;
 const GZIP_SAMPLE_BYTES = 64 * 1024;
+const LATENCY_CRITICAL_REQUEST_BYTES = 256 * 1024;
+const ACCELERATION_RECOVERY_CLEAN_FLIGHTS = 2;
 const DEFAULT_TRANSPORT_STALL_MS = 2_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
 
@@ -261,7 +262,7 @@ interface RequestState {
   onExecutionRiskReflected?: () => void;
   admitted: boolean;
   transferCost: number;
-  smallPreCommitTracked: boolean;
+  latencyCriticalPreCommitTracked: boolean;
   published: boolean;
   commitStaged: boolean;
   commitPublished: boolean;
@@ -531,7 +532,7 @@ export class V2TransportSession {
   #remoteCredits = 0;
   #creditReservations = 0;
   #transferReservations = 0;
-  #smallPreCommitTransfers = 0;
+  #latencyCriticalPreCommitTransfers = 0;
   #quarantined = 0;
   #ambiguousQuarantined = 0;
   #retransmissions = 0;
@@ -558,6 +559,9 @@ export class V2TransportSession {
   #stateChangeScheduled = false;
   #flightStartedAtMs: number | null = null;
   #flightRequestBytes = 0;
+  #currentFlightRetransmitted = false;
+  #acceleratedFlightsHealthy = true;
+  #cleanRequestFlightsSinceTrouble = 0;
   #acknowledgedGoodputBytesPerSecond: number | null = null;
   #goodputUpdatedAtMs: number | null = null;
   #uniqueAcknowledgedBytes = 0;
@@ -868,7 +872,7 @@ export class V2TransportSession {
       onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes),
-      smallPreCommitTracked: false,
+      latencyCriticalPreCommitTracked: false,
       published: false,
       commitStaged: false,
       commitPublished: false,
@@ -1048,7 +1052,7 @@ export class V2TransportSession {
     }
     this.#creditReservations = 0;
     this.#transferReservations = 0;
-    this.#smallPreCommitTransfers = 0;
+    this.#latencyCriticalPreCommitTransfers = 0;
     for (const [requestId, receipt] of this.#terminalReceipts) {
       this.#scheduler.removeStream(requestId);
       receipt.queued = false;
@@ -1690,8 +1694,11 @@ export class V2TransportSession {
     const now = this.#clock.now();
     let goodputChanged = false;
     if (flightCompleted) {
+      const requestBytes = this.#flightRequestBytes;
+      const retransmitted = this.#currentFlightRetransmitted;
       this.#flightCompletions++;
       goodputChanged = this.#recordAcknowledgedFlight(now);
+      this.#observeAccelerationFlight(requestBytes, retransmitted);
     }
     const acknowledgementAdvanced = this.#delivery.acknowledged(
       envelope.ack,
@@ -1864,7 +1871,7 @@ export class V2TransportSession {
           return;
         }
         if (state.committed) return;
-        this.#stopTrackingSmallPreCommit(state);
+        this.#stopTrackingLatencyCriticalPreCommit(state);
         state.committed = true;
         state.diagnostics.committed(frame.diagnostics);
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
@@ -2967,9 +2974,9 @@ export class V2TransportSession {
       state.admissionTimer = undefined;
       this.#creditReservations++;
       this.#transferReservations += state.transferCost;
-      if (state.transferCost < V2_BULK_TRANSFER_COST) {
-        state.smallPreCommitTracked = true;
-        this.#smallPreCommitTransfers++;
+      if (state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES) {
+        state.latencyCriticalPreCommitTracked = true;
+        this.#latencyCriticalPreCommitTransfers++;
       }
       const onAdmissionReflected = state.onAdmissionReflected;
       state.onAdmissionReflected = undefined;
@@ -2999,10 +3006,13 @@ export class V2TransportSession {
     "hostFlightMaxFrames" | "hostFlightMaxBytes"
   > {
     if (this.#transportProfile !== "bulk-v1") return this.#limits;
-    // Preserve the established small-request flight exactly. This counter is
-    // maintained at admission/commit/removal boundaries, so the publication
-    // hot path stays O(1) regardless of retained committed request count.
-    return this.#smallPreCommitTransfers > 0
+    // Requests already small enough to fit one standard flight never pay for
+    // medium/bulk sizing. A loss or stall also returns future flights to the
+    // proven standard bound until two clean request flights restore confidence.
+    // Both decisions are O(1) on the publication hot path.
+    return this.#latencyCriticalPreCommitTransfers > 0 ||
+        this.#congestion.congested ||
+        !this.#acceleratedFlightsHealthy
       ? GP_V2_R2_TRANSPORT_LIMITS
       : this.#limits;
   }
@@ -3066,6 +3076,7 @@ export class V2TransportSession {
       if (publishData) {
         const newFlight = !this.#flight.active;
         if (newFlight) {
+          this.#currentFlightRetransmitted = false;
           this.#flightStartedAtMs = this.#clock.now();
           this.#flightRequestBytes = outbound.frames
             .filter(hostFrameCarriesRequest)
@@ -3088,6 +3099,8 @@ export class V2TransportSession {
       this.#armStallWatchdog();
     } catch (cause) {
       if (this.#isReconnectableAwarenessFailure(cause)) {
+        this.#currentFlightRetransmitted = true;
+        this.#markAccelerationTrouble();
         this.#remoteCredits = 0;
         return;
       }
@@ -3248,7 +3261,29 @@ export class V2TransportSession {
   #resetFlightMeasurement(): void {
     this.#flightStartedAtMs = null;
     this.#flightRequestBytes = 0;
+    this.#currentFlightRetransmitted = false;
+    this.#acceleratedFlightsHealthy = true;
+    this.#cleanRequestFlightsSinceTrouble = 0;
     this.#lastFastRetransmitAtMs = null;
+  }
+
+  #markAccelerationTrouble(): void {
+    this.#acceleratedFlightsHealthy = false;
+    this.#cleanRequestFlightsSinceTrouble = 0;
+  }
+
+  #observeAccelerationFlight(requestBytes: number, retransmitted: boolean): void {
+    this.#currentFlightRetransmitted = false;
+    if (requestBytes <= 0) return;
+    if (retransmitted) {
+      this.#markAccelerationTrouble();
+      return;
+    }
+    if (this.#acceleratedFlightsHealthy) return;
+    this.#cleanRequestFlightsSinceTrouble++;
+    if (this.#cleanRequestFlightsSinceTrouble < ACCELERATION_RECOVERY_CLEAN_FLIGHTS) return;
+    this.#acceleratedFlightsHealthy = true;
+    this.#cleanRequestFlightsSinceTrouble = 0;
   }
 
   #updateCongestion(): boolean {
@@ -3266,7 +3301,10 @@ export class V2TransportSession {
     if (
       !before && this.#congestion.congested && outbound.frames.length > 0 &&
       ackProgressAgeMs >= this.#transportStallMs
-    ) this.#stallEvents++;
+    ) {
+      this.#stallEvents++;
+      this.#markAccelerationTrouble();
+    }
     return before !== this.#congestion.congested;
   }
 
@@ -3327,6 +3365,8 @@ export class V2TransportSession {
       )
     ) return false;
     this.#lastFastRetransmitAtMs = now;
+    this.#currentFlightRetransmitted = true;
+    this.#markAccelerationTrouble();
     this.#delivery.retransmitted(now);
     this.#retransmissions++;
     this.#peakRetransmissionAttempt = Math.max(
@@ -3353,6 +3393,8 @@ export class V2TransportSession {
       this.#timer = null;
       if (!this.#connected || this.#closed) return;
       if (this.#outbound.snapshot().frames.length === 0) return;
+      this.#currentFlightRetransmitted = true;
+      this.#markAccelerationTrouble();
       this.#delivery.retransmitted(this.#clock.now());
       this.#retransmissions++;
       this.#peakRetransmissionAttempt = Math.max(
@@ -3382,7 +3424,7 @@ export class V2TransportSession {
   }
 
   #detachStateForRecovery(state: RequestState): void {
-    this.#stopTrackingSmallPreCommit(state);
+    this.#stopTrackingLatencyCriticalPreCommit(state);
     this.#requests.delete(state.requestId);
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
@@ -3500,7 +3542,7 @@ export class V2TransportSession {
         );
       }
     }
-    this.#stopTrackingSmallPreCommit(state);
+    this.#stopTrackingLatencyCriticalPreCommit(state);
     // commitPublished is deliberately promoted to committed-risk here so
     // removal cannot release capacity for work that may still be executing.
     state.committed = true;
@@ -3510,7 +3552,7 @@ export class V2TransportSession {
   }
 
   #removeState(state: RequestState): void {
-    this.#stopTrackingSmallPreCommit(state);
+    this.#stopTrackingLatencyCriticalPreCommit(state);
     this.#requests.delete(state.requestId);
     state.preparedRequest = null;
     state.recoveryPrefix = undefined;
@@ -3540,10 +3582,13 @@ export class V2TransportSession {
     this.#admitPending();
   }
 
-  #stopTrackingSmallPreCommit(state: RequestState): void {
-    if (!state.smallPreCommitTracked) return;
-    state.smallPreCommitTracked = false;
-    this.#smallPreCommitTransfers = Math.max(0, this.#smallPreCommitTransfers - 1);
+  #stopTrackingLatencyCriticalPreCommit(state: RequestState): void {
+    if (!state.latencyCriticalPreCommitTracked) return;
+    state.latencyCriticalPreCommitTracked = false;
+    this.#latencyCriticalPreCommitTransfers = Math.max(
+      0,
+      this.#latencyCriticalPreCommitTransfers - 1,
+    );
   }
 
   #failProtocol(cause: unknown): void {

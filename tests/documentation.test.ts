@@ -47,6 +47,8 @@ describe("project documentation", () => {
     expect(readme).toContain("ghostprovV2Data");
     expect(readme).toContain("ghostprovV2Control");
     expect(readme).toContain("128 KiB");
+    expect(readme).toContain("through 256 KiB retain the exact R4 32-frame/512-KiB host flight");
+    expect(readme).toContain("two clean request flights are required before acceleration resumes");
     expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r5");

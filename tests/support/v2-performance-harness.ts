@@ -109,8 +109,11 @@ export interface V2PerformanceHarnessOptions {
   protocolRevision?: ProtocolRevision;
   transportProfile?: V2TransportProfile;
   rttMs: number;
+  /** Homogeneous size, or the report label/default when requestBytesByRequest is supplied. */
   requestBytes: number;
   concurrency: number;
+  /** Optional exact heterogeneous corpus; length must equal concurrency. */
+  requestBytesByRequest?: readonly number[];
   /** Logical SSE events emitted per response, including created/completed. */
   responseEventCount?: number;
   corpus?: V2PerformanceCorpus;
@@ -892,9 +895,10 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     // Wall timers remain production timers. Keep normal runs clear of
     // artificial retransmissions; fault cases use a short bounded RTO so CI
     // does not wait for the virtual RTT in wall-clock time.
+    const requestSizes = performanceRequestSizes(options);
     const retransmitMs = faulted
       ? 5
-      : Math.max(1_000, Math.ceil(options.requestBytes / MiB) * 500);
+      : Math.max(1_000, Math.ceil(Math.max(...requestSizes) / MiB) * 500);
     const protocolRevision = options.protocolRevision ?? "r2";
     const transportProfile = options.transportProfile ?? "standard";
     const bindingBase = {
@@ -969,7 +973,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       flushIntervalMs: 0,
       maxBatch: Math.max(64, options.concurrency * 2),
     });
-    const aggregate = options.requestBytes * options.concurrency;
+    const aggregate = requestSizes.reduce((total, bytes) => total + bytes, 0);
     // Assembly owns decoded + encoded bytes plus a dense part index. Keep
     // explicit metadata/headroom so an exact 64 MiB request is not rejected by
     // the harness budget before the production protocol boundary is tested.
@@ -1304,6 +1308,12 @@ function summary(values: readonly number[]): V2HarnessTimingSummary {
   };
 }
 
+function performanceRequestSizes(options: V2PerformanceHarnessOptions): readonly number[] {
+  return options.requestBytesByRequest === undefined
+    ? Array.from({ length: options.concurrency }, () => options.requestBytes)
+    : [...options.requestBytesByRequest];
+}
+
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -1352,6 +1362,21 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
   ) {
     throw new RangeError("concurrency must be 1 through 128");
   }
+  if (options.requestBytesByRequest !== undefined) {
+    if (
+      !Array.isArray(options.requestBytesByRequest) ||
+      options.requestBytesByRequest.length !== options.concurrency
+    ) {
+      throw new RangeError("requestBytesByRequest must match concurrency exactly");
+    }
+    for (const requestBytes of options.requestBytesByRequest) {
+      if (
+        !Number.isSafeInteger(requestBytes) ||
+        requestBytes < 1 ||
+        requestBytes > GP_V2_REQUEST_MAX_BYTES
+      ) throw new RangeError("requestBytesByRequest contains an invalid V2 request size");
+    }
+  }
   if (
     options.responseEventCount !== undefined &&
     (!Number.isSafeInteger(options.responseEventCount) ||
@@ -1389,7 +1414,9 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
   if (!Number.isSafeInteger(aggregateLimit) || aggregateLimit < 1) {
     throw new RangeError("maxAggregateRequestBytes must be a positive safe integer");
   }
-  if (options.requestBytes * options.concurrency > aggregateLimit) {
+  const aggregateBytes = performanceRequestSizes(options)
+    .reduce((total, requestBytes) => total + requestBytes, 0);
+  if (!Number.isSafeInteger(aggregateBytes) || aggregateBytes > aggregateLimit) {
     throw new RangeError("aggregate request bytes exceed the harness safety limit");
   }
   if (
@@ -1462,8 +1489,9 @@ export async function runV2PerformanceHarness(
   try {
     await runtime.start();
     const corpus = options.corpus ?? "incompressible";
-    const bodies = Array.from({ length: options.concurrency }, (_, index) =>
-      createExactSizedV2Request(options.requestBytes, index, corpus));
+    const requestSizes = performanceRequestSizes(options);
+    const bodies = requestSizes.map((requestBytes, index) =>
+      createExactSizedV2Request(requestBytes, index, corpus));
     const expectedDigests = await Promise.all(bodies.map(body =>
       sha256Hex(utf8Bytes(canonicalJson(body)))));
     const modeledStarts = bodies.map(() => clock.now());
@@ -1577,7 +1605,7 @@ export async function runV2PerformanceHarness(
       const requestDigest = expectedDigests[value.index]!;
       return {
         index: value.index,
-        requestBytes: options.requestBytes,
+        requestBytes: requestSizes[value.index]!,
         encodedRequestBytes: value.encodedRequestBytes,
         requestEncoding: value.requestEncoding,
         requestDigest,

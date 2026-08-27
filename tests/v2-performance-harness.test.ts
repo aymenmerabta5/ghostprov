@@ -41,7 +41,9 @@ function expectExactAndBounded(
   expect(report.preparation.gzipCalls).toBeGreaterThanOrEqual(report.concurrency);
   expect(report.preparation.gzipCalls).toBeLessThanOrEqual(report.concurrency * 2);
   expect(report.preparation.gzipWallMs).toBeGreaterThanOrEqual(0);
-  expect(report.wire.usefulRequestBytes).toBe(report.requestBytes * report.concurrency);
+  expect(report.wire.usefulRequestBytes).toBe(
+    report.requests.reduce((total, request) => total + request.requestBytes, 0),
+  );
   expect(report.wire.uniqueRequestDataBytes).toBe(report.wire.postCompressionRequestBytes);
   expect(report.wire.postCompressionRequestBytes).toBeGreaterThan(0);
   expect(report.wire.attemptedBytes).toBeGreaterThan(report.wire.postCompressionRequestBytes);
@@ -66,6 +68,11 @@ function expectExactAndBounded(
   expect(report.router).toMatchObject({ active: 0, queued: 0 });
 }
 
+function p95(values: readonly number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)]!;
+}
+
 describe("V2 deterministic performance harness", () => {
   it("constructs exact canonical request sizes without approximate payload accounting", () => {
     for (const bytes of [
@@ -75,6 +82,15 @@ describe("V2 deterministic performance harness", () => {
       const request = createExactSizedV2Request(bytes, 7);
       expect(utf8Bytes(canonicalJson(request)).byteLength).toBe(bytes);
     }
+  });
+
+  it("rejects a heterogeneous corpus that does not exactly match concurrency", async () => {
+    await expect(runV2PerformanceHarness({
+      rttMs: 400,
+      requestBytes: 128 * 1024,
+      requestBytesByRequest: [128 * 1024],
+      concurrency: 2,
+    })).rejects.toThrow("requestBytesByRequest must match concurrency exactly");
   });
 
   it("measures 50/300/1000 ms RTT with monotonic ACK-clocked latency", async () => {
@@ -320,6 +336,114 @@ describe("V2 deterministic performance harness", () => {
     expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
     expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(1024 * 1024);
   }, 30_000);
+
+  it("accelerates isolated 512 KiB through 2 MiB requests without changing the 256 KiB boundary", async () => {
+    const compare = async (requestBytes: number) => {
+      const common = {
+        protocolRevision: "r2" as const,
+        corpus: "incompressible" as const,
+        rttMs: 400,
+        requestBytes,
+        concurrency: 1,
+      };
+      const standard = await runV2PerformanceHarness(common);
+      const adaptive = await runV2PerformanceHarness({
+        ...common,
+        transportProfile: "bulk-v1" as const,
+      });
+      expectExactAndBounded(standard);
+      expectExactAndBounded(adaptive);
+      return { standard, adaptive };
+    };
+
+    const tiny = await compare(256 * 1024);
+    expect(tiny.adaptive.requests[0]!.ackRoundsAtCommit)
+      .toBe(tiny.standard.requests[0]!.ackRoundsAtCommit);
+    expect(Math.abs(
+      tiny.adaptive.timings.modeledLink.commitMs.p50 -
+      tiny.standard.timings.modeledLink.commitMs.p50,
+    )).toBeLessThanOrEqual(0.01);
+
+    for (const [requestBytes, standardRounds, adaptiveRounds, minimumGainMs] of [
+      [512 * 1024, 3, 2, 300],
+      [1024 * 1024, 4, 3, 300],
+      [2 * 1024 * 1024, 7, 4, 1_000],
+    ] as const) {
+      const result = await compare(requestBytes);
+      expect(result.standard.requests[0]!.ackRoundsAtCommit).toBe(standardRounds);
+      expect(result.adaptive.requests[0]!.ackRoundsAtCommit).toBe(adaptiveRounds);
+      expect(
+        result.standard.timings.modeledLink.commitMs.p50 -
+        result.adaptive.timings.modeledLink.commitMs.p50,
+      ).toBeGreaterThan(minimumGainMs);
+    }
+  }, 30_000);
+
+  it("reduces 512 KiB p95 latency at 4/16/40 concurrency without losing upstream scale", async () => {
+    for (const concurrency of [4, 16, 40]) {
+      const common = {
+        protocolRevision: "r2" as const,
+        corpus: "incompressible" as const,
+        rttMs: 400,
+        requestBytes: 512 * 1024,
+        concurrency,
+        maxAggregateRequestBytes: 32 * 1024 * 1024,
+        timeoutMs: 120_000,
+      };
+      const standard = await runV2PerformanceHarness(common);
+      const adaptive = await runV2PerformanceHarness({
+        ...common,
+        transportProfile: "bulk-v1" as const,
+      });
+      expectExactAndBounded(standard);
+      expectExactAndBounded(adaptive);
+      expect(adaptive.upstream.maxActive).toBe(concurrency);
+      expect(adaptive.transport.retransmissions).toBe(0);
+      expect(adaptive.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
+      expect(adaptive.timings.modeledLink.commitMs.p95)
+        .toBeLessThan(standard.timings.modeledLink.commitMs.p95 * 0.9);
+      expect(adaptive.virtualElapsedMs).toBeLessThan(standard.virtualElapsedMs * 0.95);
+      expect(adaptive.wire.usefulRequestBytes).toBe(standard.wire.usefulRequestBytes);
+    }
+  }, 60_000);
+
+  it("keeps tiny p95 exact while accelerating a 24-way 128/512 KiB production-deadline mix", async () => {
+    const requestBytesByRequest = Array.from(
+      { length: 24 },
+      (_, index) => index % 2 === 0 ? 128 * 1024 : 512 * 1024,
+    );
+    const common = {
+      protocolRevision: "r2" as const,
+      corpus: "incompressible" as const,
+      rttMs: 400,
+      requestBytes: 512 * 1024,
+      requestBytesByRequest,
+      concurrency: requestBytesByRequest.length,
+      maxAggregateRequestBytes: 16 * 1024 * 1024,
+      timeoutMs: 30_000,
+    };
+    const standard = await runV2PerformanceHarness(common);
+    const adaptive = await runV2PerformanceHarness({
+      ...common,
+      transportProfile: "bulk-v1" as const,
+    });
+    expectExactAndBounded(standard);
+    expectExactAndBounded(adaptive);
+    const commits = (report: V2PerformanceHarnessReport, bytes: number) => report.requests
+      .filter(request => request.requestBytes === bytes)
+      .map(request => request.modeledCommitMs);
+    const standardTiny = p95(commits(standard, 128 * 1024));
+    const adaptiveTiny = p95(commits(adaptive, 128 * 1024));
+    const standardMedium = p95(commits(standard, 512 * 1024));
+    const adaptiveMedium = p95(commits(adaptive, 512 * 1024));
+
+    expect(Math.abs(adaptiveTiny - standardTiny)).toBeLessThanOrEqual(0.01);
+    expect(adaptiveMedium).toBeLessThan(standardMedium * 0.9);
+    expect(adaptive.virtualElapsedMs).toBeLessThan(standard.virtualElapsedMs * 0.9);
+    expect(adaptive.upstream.maxActive).toBe(24);
+    expect(adaptive.transport.retransmissions).toBe(0);
+    expect(adaptive.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
+  }, 60_000);
 
   it("preserves a 3.35 MiB R5 bulk request across disconnect, loss, duplicate, and reorder faults", async () => {
     const report = await runV2PerformanceHarness({
