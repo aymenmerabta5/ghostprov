@@ -111,3 +111,38 @@ Proceed with the previously identified host CPU experiment: replace repeated
 O(n) request-state scans on Awareness publication with mutation-maintained
 counters. Accept it only if every wire byte, flight, ACK round, modeled timing,
 and safety result remains identical while measured host wall cost improves.
+
+## 2026-08-27 - Phase 4 - constant-time host transport accounting - KEEP
+
+Candidate: `755def4`
+Accepted baseline: `524e31b`
+
+Committed, admitted-uncommitted, and unadmitted request totals are now updated
+only at their authoritative state transitions. `snapshot()`, normal Awareness
+publication metadata, and host transport diagnostics read those counters in
+O(1) instead of repeatedly materializing and filtering the request map.
+Recovery keeps its rare explicit execution-risk scan so no safety boundary was
+approximated.
+
+Seven warmed samples of 250,000 snapshots each produced these median costs:
+
+| Queued requests | Previous | Candidate | Result |
+|---:|---:|---:|---:|
+| 0 | 194.3 ns | 127.1 ns | 34.6% faster |
+| 32 | 608.3 ns | 126.7 ns | 79.2% faster |
+| 128 | 1,866.9 ns | 121.4 ns | 93.5% faster |
+
+The new 128-request scaling test failed against the prior implementation and
+passes only when loaded snapshot cost stays within three times the idle cost.
+The full modeled matrix remained stable with exact request/terminal proofs,
+tiny ACK rounds, wire bytes, windows, and concurrency. The full suite passed
+1,628 tests, and both opt-in 16/64 MiB integrity gates plus release/Deno checks
+passed.
+
+## Next investigation after Phase 4
+
+The remaining normal-publication O(n) work is per-request diagnostic peak
+fan-out, which also clones one full transport diagnostic object per live
+request per publication. Investigate a shared live view that freezes one exact
+copy only when a request leaves the transport; reject it if request-local
+diagnostic lifetime semantics or observer isolation changes.
