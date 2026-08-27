@@ -41,6 +41,7 @@ import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import { createExactSizedV2Request } from "./support/v2-performance-harness";
+import { HostRequestDiagnosticsObserver } from "../src/v2/diagnostics/host-observer";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
@@ -1529,6 +1530,31 @@ describe("V2TransportSession", () => {
       await Promise.allSettled(pending);
     }
   },30_000);
+  it("does not eagerly clone transport diagnostics for every queued request", async () => {
+    const peak=spyOn(HostRequestDiagnosticsObserver.prototype,"peak");
+    const harness=new TransportHarness();
+    await harness.start();
+    harness.credits=0;
+    harness.publish([],{lane:"control"});
+    await harness.settle();
+    const controllers=Array.from({length:128},()=>new AbortController());
+    const pending=controllers.map((controller,index)=>harness.session.run(
+      {...BODY,input:`diagnostic-fanout-${index}`},
+      controller.signal,
+    ));
+    try {
+      await harness.settleUntil(()=>harness.session.snapshot().queued===128,10_000);
+      peak.mockClear();
+      harness.session.setHostCeiling(127);
+      await Bun.sleep(0);
+      expect(peak).toHaveBeenCalledTimes(0);
+    }finally{
+      peak.mockRestore();
+      for(const controller of controllers)controller.abort();
+      await harness.close();
+      await Promise.allSettled(pending);
+    }
+  },20_000);
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);

@@ -39,7 +39,10 @@ import {
   PublicationPacer,
   type PublicationReason,
 } from "../protocol/publication-pacer";
-import { HostRequestDiagnosticsObserver } from "../diagnostics/host-observer";
+import {
+  HostRequestDiagnosticsObserver,
+  type VersionedHostTransportDiagnostics,
+} from "../diagnostics/host-observer";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnostics/types";
 import {
   MAX_TRANSCRIPT_CHUNK_BYTES,
@@ -564,6 +567,10 @@ export class V2TransportSession {
   #pacedPublications = 0;
   #urgentPublications = 0;
   #publishedBytes = 0;
+  #hostDiagnosticsRevision = 0;
+  #publishedHostDiagnostics: VersionedHostTransportDiagnostics | null = null;
+  readonly #hostDiagnosticsSource = (): VersionedHostTransportDiagnostics | null =>
+    this.#publishedHostDiagnostics;
   #dataPublications = 0;
   #controlPublications = 0;
   #dataPublishedBytes = 0;
@@ -839,7 +846,10 @@ export class V2TransportSession {
       throw new V2PreCommitError("V2 transport is draining", "draining");
     }
     const requestId = `req-${crypto.randomUUID()}`;
-    const diagnostics = new HostRequestDiagnosticsObserver(() => this.#clock.now());
+    const diagnostics = new HostRequestDiagnosticsObserver(
+      () => this.#clock.now(),
+      this.#hostDiagnosticsSource,
+    );
     const prepared = await this.#prepareRequest(body, signal);
     diagnostics.prepared(prepared);
     if (signal?.aborted) throw abortError("V2 request aborted before commitment");
@@ -1175,6 +1185,7 @@ export class V2TransportSession {
       state.signal?.removeEventListener("abort", state.onAbort!);
       state.onAbort = () => this.#abortRequest(state);
       state.signal?.addEventListener("abort", state.onAbort, { once: true });
+      state.diagnostics.followPeak(this.#hostDiagnosticsSource);
       this.#requests.set(state.requestId, state);
       this.#trackRequestState(state);
       if (state.quarantineKind) this.#quarantined++;
@@ -3205,7 +3216,10 @@ export class V2TransportSession {
         this.#publishLane("control", [], reason);
       }
       const diagnostics = this.#hostTransportDiagnostics();
-      for (const state of this.#requests.values()) state.diagnostics.peak(diagnostics);
+      this.#publishedHostDiagnostics = {
+        revision: ++this.#hostDiagnosticsRevision,
+        value: diagnostics,
+      };
       this.#armRetransmission();
       this.#armStallWatchdog();
     } catch (cause) {
@@ -3566,6 +3580,7 @@ export class V2TransportSession {
   }
 
   #detachStateForRecovery(state: RequestState): void {
+    state.diagnostics.freezePeak();
     this.#discardPreparedStart(state);
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
@@ -3698,6 +3713,7 @@ export class V2TransportSession {
   }
 
   #removeState(state: RequestState): void {
+    state.diagnostics.freezePeak();
     this.#discardPreparedStart(state);
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
