@@ -180,3 +180,32 @@ states currently remain in the same array, so every later admission and final
 removal can scan or splice through unrelated live work. First try removing a
 state from that queue at its admission boundary, preserving priority and
 failover ordering exactly; keep it only with a material measured gain.
+
+## 2026-08-27 - Phase 6 - unadmitted queue restructuring - REJECT
+
+Candidate was intentionally not committed. Baseline remains `8c85a5a`.
+
+The first attempt removed admitted states early but only moved work into array
+splices. The repaired attempt used insertion-ordered sets with a separate tiny
+priority subset, preserving FIFO and transfer-cost bypass behavior. Neither
+attempt produced a material gain at the real bounded 128-agent workload:
+
+| 128-agent metric | Phase 5 | Best candidate | Result |
+|---|---:|---:|---:|
+| measured commit p95 | 1,419.5 ms | 1,421.1 ms | no gain |
+| measured total p95 | 1,664.8 ms | 1,669.2 ms | no gain |
+| modeled commit p95 | 6,653.38 ms | 6,653.38 ms | exact |
+| ACK rounds | 2-3 | 2-3 | exact |
+
+At an artificial 8,192-request cancellation depth the set version improved
+43.40 ms to 37.34 ms, but that exceeds the router's bounded real workload and
+does not justify extra production complexity. Both attempts were removed;
+Phases 1 through 5 remain intact.
+
+## Next investigation after Phase 6
+
+Stop speculative queue tuning. The remaining local costs are already below
+network RTT at supported queue depths. The next useful evidence is a fresh
+post-restart live R5 trace comparing commit, first-event, total, CPU, event-loop,
+and router-capacity timeouts against these deterministic baselines. Do not
+restart or touch the protected port as part of offline research.
