@@ -5,6 +5,8 @@ export type V2AdmissionProfile = "standard" | "bulk-v1";
 export const V2_STANDARD_HOST_TRANSFER_BUDGET = 5;
 /** Four medium transfers, or one true bulk plus two ordinary requests. */
 export const V2_BULK_HOST_TRANSFER_BUDGET = 6;
+/** Three observed-size transfers retain at most 9 MiB in aggregate. */
+export const V2_OBSERVED_TRANSFER_COST = 2;
 /** A request at this cost owns the bulk lane; two such transfers never overlap. */
 export const V2_BULK_TRANSFER_COST = 4;
 
@@ -21,9 +23,11 @@ export function v2HostTransferBudget(profile: V2AdmissionProfile): number {
  * Limits concurrent pre-commit body transfer, not upstream model concurrency.
  * Bulk-v1 charges up to 2 MiB as one unit, permitting the existing four-
  * uncommitted-request ceiling without exceeding the retained bytes of one
- * legal bulk request. Anything larger owns four units, so two true bulk
- * transfers cannot overlap inside the six-unit peer budget. Standard rollback
- * retains its original graduated 512 KiB accounting above the first MiB.
+ * legal bulk request. Requests through 3 MiB use two units, admitting three
+ * observed-size bodies while retaining at most 9 MiB total. Anything larger
+ * owns four units, so two true bulk transfers cannot overlap inside the six-
+ * unit peer budget. Standard rollback retains its original graduated 512 KiB
+ * accounting above the first MiB.
  */
 export function v2RequestTransferCost(
   bytes: number,
@@ -35,7 +39,8 @@ export function v2RequestTransferCost(
   v2HostTransferBudget(profile);
   if (bytes <= MiB) return 1;
   if (profile === "bulk-v1") {
-    return bytes <= 2 * MiB ? 1 : V2_BULK_TRANSFER_COST;
+    if (bytes <= 2 * MiB) return 1;
+    return bytes <= 3 * MiB ? V2_OBSERVED_TRANSFER_COST : V2_BULK_TRANSFER_COST;
   }
   return Math.min(
     V2_BULK_TRANSFER_COST,

@@ -243,6 +243,27 @@ export interface V2PerformanceHarnessReport {
   router: ReturnType<MultiSandboxRouter["snapshot"]>;
 }
 
+export interface V2FleetPerformanceHarnessOptions
+extends Omit<V2PerformanceHarnessOptions, "concurrency" | "requestBytesByRequest"> {
+  runtimeCount: number;
+  unavailableRuntimeCount?: number;
+  requestBytesByRequest: readonly number[];
+}
+
+export interface V2FleetPerformanceHarnessReport {
+  runtimeCount: number;
+  usableRuntimeCount: number;
+  assignments: readonly number[];
+  reports: readonly V2PerformanceHarnessReport[];
+  requests: readonly (V2HarnessRequestResult & { runtimeIndex: number })[];
+  modeledCommitMs: V2HarnessTimingSummary;
+  modeledTotalMs: V2HarnessTimingSummary;
+  exactRequests: boolean;
+  exactTerminals: boolean;
+  upstreamMaxActive: number;
+  retransmissions: number;
+}
+
 class HarnessClock implements Clock {
   #now = 0;
 
@@ -1709,4 +1730,60 @@ export async function runV2PerformanceHarness(
     await router.close();
     hub.close();
   }
+}
+
+export async function runV2FleetPerformanceHarness(
+  options: V2FleetPerformanceHarnessOptions,
+): Promise<V2FleetPerformanceHarnessReport> {
+  if (!Number.isSafeInteger(options.runtimeCount) || options.runtimeCount < 1 ||
+      options.runtimeCount > 32) {
+    throw new RangeError("runtimeCount must be an integer from 1 through 32");
+  }
+  const unavailable = options.unavailableRuntimeCount ?? 0;
+  if (!Number.isSafeInteger(unavailable) || unavailable < 0 || unavailable >= options.runtimeCount) {
+    throw new RangeError("unavailableRuntimeCount must leave at least one usable runtime");
+  }
+  if (options.requestBytesByRequest.length < 1) {
+    throw new RangeError("fleet harness requires at least one request");
+  }
+  const usableRuntimeCount = options.runtimeCount - unavailable;
+  const assignments = options.requestBytesByRequest.map(
+    (_bytes, index) => index % usableRuntimeCount,
+  );
+  const groups = Array.from({ length: usableRuntimeCount }, () => (
+    [] as Array<{ index: number; bytes: number }>
+  ));
+  options.requestBytesByRequest.forEach((bytes, index) => {
+    groups[assignments[index]!]!.push({ index, bytes });
+  });
+  const reports = await Promise.all(groups.map(group => runV2PerformanceHarness({
+    ...options,
+    requestBytes: Math.max(...group.map(value => value.bytes)),
+    requestBytesByRequest: group.map(value => value.bytes),
+    concurrency: group.length,
+    maxAggregateRequestBytes: group.reduce((total, value) => total + value.bytes, 0),
+  })));
+  const requests = reports.flatMap((report, runtimeIndex) => report.requests.map(
+    (request, localIndex) => ({
+      ...request,
+      index: groups[runtimeIndex]![localIndex]!.index,
+      runtimeIndex,
+    }),
+  )).sort((left, right) => left.index - right.index);
+  return Object.freeze({
+    runtimeCount: options.runtimeCount,
+    usableRuntimeCount,
+    assignments: Object.freeze(assignments),
+    reports: Object.freeze(reports),
+    requests: Object.freeze(requests),
+    modeledCommitMs: summary(requests.map(value => value.modeledCommitMs)),
+    modeledTotalMs: summary(requests.map(value => value.modeledTotalMs)),
+    exactRequests: requests.every(value => value.exactRequest),
+    exactTerminals: requests.every(value => value.exactTerminal),
+    upstreamMaxActive: reports.reduce((total, report) => total + report.upstream.maxActive, 0),
+    retransmissions: reports.reduce(
+      (total, report) => total + report.transport.retransmissions,
+      0,
+    ),
+  });
 }

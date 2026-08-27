@@ -13,6 +13,7 @@ import {
   V2_PERFORMANCE_PAYLOAD_BYTES,
   V2_PERFORMANCE_RTTS_MS,
   createExactSizedV2Request,
+  runV2FleetPerformanceHarness,
   runV2PerformanceHarness,
   type V2PerformanceHarnessReport,
 } from "./support/v2-performance-harness";
@@ -429,7 +430,7 @@ describe("V2 deterministic performance harness", () => {
     expect(report.transport.retransmissions).toBe(0);
   }, 30_000);
 
-  it("reproduces the observed 2.9 MiB admission cliff on a 600 ms, 400 KiB/s link", async () => {
+  it("improves but does not hide the physical three-body single-link limit", async () => {
     const requestBytes = Math.floor(2.9 * 1024 * 1024);
     const report = await runV2PerformanceHarness({
       protocolRevision: "r2",
@@ -446,8 +447,44 @@ describe("V2 deterministic performance harness", () => {
     expectExactAndBounded(report);
     expect(report.upstream.maxActive).toBe(3);
     expect(report.transport.retransmissions).toBe(0);
-    expect(report.timings.modeledLink.commitMs.p95).toBeGreaterThan(40_000);
+    expect(report.timings.modeledLink.commitMs.p95).toBeGreaterThan(30_000);
+    expect(report.timings.modeledLink.commitMs.p95).toBeLessThan(39_500);
   }, 30_000);
+
+  it("models fourteen observed-size agents across eight independent runtime links", async () => {
+    const requestBytes = Math.floor(2.9 * 1024 * 1024);
+    const common = {
+      runtimeCount: 8,
+      protocolRevision: "r2" as const,
+      transportProfile: "bulk-v1" as const,
+      corpus: "incompressible" as const,
+      rttMs: 600,
+      linkBandwidthBytesPerSecond: 400 * 1024,
+      serializationBytesPerSecond: 100 * 1024 * 1024,
+      requestBytes,
+      requestBytesByRequest: Array.from({ length: 14 }, () => requestBytes),
+      timeoutMs: 60_000,
+    };
+    const degraded = await runV2FleetPerformanceHarness({
+      ...common,
+      unavailableRuntimeCount: 4,
+    });
+    expect(degraded.modeledCommitMs.p95).toBeGreaterThan(30_000);
+
+    const healthy = await runV2FleetPerformanceHarness(common);
+    expect(healthy).toMatchObject({
+      runtimeCount: 8,
+      usableRuntimeCount: 8,
+      exactRequests: true,
+      exactTerminals: true,
+      upstreamMaxActive: 14,
+      retransmissions: 0,
+    });
+    expect(healthy.modeledCommitMs.p95).toBeLessThan(30_000);
+    expect(Math.max(...healthy.assignments.map(runtimeIndex => (
+      healthy.assignments.filter(value => value === runtimeIndex).length
+    )))).toBe(2);
+  }, 60_000);
 
   it("keeps tiny p95 exact while accelerating a 24-way 128/512 KiB production-deadline mix", async () => {
     const requestBytesByRequest = Array.from(

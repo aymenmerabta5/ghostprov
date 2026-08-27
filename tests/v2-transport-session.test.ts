@@ -414,7 +414,9 @@ describe("V2TransportSession", () => {
     expect(v2RequestTransferCost(2 * 1024 ** 2, "standard")).toBe(3);
     expect(v2RequestTransferCost(2 * 1024 ** 2, "bulk-v1")).toBe(1);
     expect(v2RequestTransferCost(2 * 1024 ** 2 + 1, "standard")).toBe(4);
-    expect(v2RequestTransferCost(2 * 1024 ** 2 + 1, "bulk-v1")).toBe(4);
+    expect(v2RequestTransferCost(2 * 1024 ** 2 + 1, "bulk-v1")).toBe(2);
+    expect(v2RequestTransferCost(3 * 1024 ** 2, "bulk-v1")).toBe(2);
+    expect(v2RequestTransferCost(3 * 1024 ** 2 + 1, "bulk-v1")).toBe(4);
     expect(() => v2HostTransferBudget("invalid" as never)).toThrow(RangeError);
   });
 
@@ -1361,8 +1363,15 @@ describe("V2TransportSession", () => {
     expect(harness.session.snapshot()).toMatchObject({active:4,queued:0});
     await harness.close();await Promise.allSettled(pending);
 
+    const observedHarness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await observedHarness.start();
+    const observed=createExactSizedV2Request(3*1024*1024,11,"incompressible");
+    const observedPending=Array.from({length:4},()=>observedHarness.session.run(observed));
+    await observedHarness.settle();
+    expect(observedHarness.session.snapshot()).toMatchObject({active:3,queued:1});
+    await observedHarness.close();await Promise.allSettled(observedPending);
+
     const bulkHarness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await bulkHarness.start();
-    const bulk=createExactSizedV2Request(3*1024*1024,11,"incompressible");
+    const bulk=createExactSizedV2Request(3*1024*1024+1,12,"incompressible");
     const bulkPending=[bulkHarness.session.run(bulk),bulkHarness.session.run(bulk)];
     await bulkHarness.settle();
     expect(bulkHarness.session.snapshot()).toMatchObject({active:1,queued:1});

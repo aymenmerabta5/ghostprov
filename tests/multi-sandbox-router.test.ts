@@ -260,6 +260,26 @@ describe("MultiSandboxRouter", () => {
     expect(bulk.runtimes[0]!.executions).toBe(4);
     await bulk.router.close();
     await Promise.allSettled(bulkPending);
+
+    const observed = createSystem(1, 8, 100, undefined, undefined, undefined, 20);
+    observed.runtimes[0]!.transportProfile = "bulk-v1";
+    observed.runtimes[0]!.waitForAdmissionAbort = true;
+    observed.runtimes[0]!.notify();
+    const observedPending = Array.from({ length: 4 }, (_, index) =>
+      observed.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: `observed-cost-${index}`,
+        service_tier: "fast",
+        stream: true,
+      }, {
+        clientId: `observed-cost-${index}`,
+        source: "websocket",
+        encodedBodyBytes: 3 * 1024 ** 2,
+      }));
+    await flush();
+    expect(observed.runtimes[0]!.executions).toBe(3);
+    await observed.router.close();
+    await Promise.allSettled(observedPending);
   });
 
   it("keeps small deadlines exact and scales only genuinely large request admission", () => {
