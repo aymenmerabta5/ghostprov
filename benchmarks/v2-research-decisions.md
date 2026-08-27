@@ -70,3 +70,44 @@ Target host-side O(n) request-state scans performed for every Awareness
 publication. The next experiment must preserve wire bytes, flight membership,
 ACK rounds, and all modeled timings exactly; only measured host CPU/wall cost
 may improve.
+
+## 2026-08-27 - Phase 3 repair - protected six-body R5 pipeline - KEEP
+
+Candidate: `06ea865`
+Accepted baseline: `6f0734f`
+
+The rejected attempt was repaired rather than abandoned. R5 can now transfer
+six medium bodies into a distinct prefetch layer, while a separate prepared
+start queue holds the irreversible `request_start` boundary to four. Snapshot
+and router accounting expose the two body-only reservations separately instead
+of pretending they are active execution slots.
+
+Latency-critical requests through 256 KiB always take the next pending and
+frame-scheduler position. Their admission also returns body depth to four until
+the last such request leaves the transport. This recovered exact mixed-load
+behavior after the first repair iteration still showed a repeatable 1.65%
+mixed p95 slowdown.
+
+| Scenario | Phase 2 p95 | Repaired p95 | Result |
+|---|---:|---:|---:|
+| 128 KiB x40, 50 ms RTT | 2.095499 s | 2.095499 s | exact within 0.0002 ms |
+| 128 KiB x24, 400 ms RTT | 10.219169 s | 10.219170 s | exact within 0.0006 ms |
+| 512 KiB x1, 400 ms RTT | 1.029817 s | 1.029817 s | unchanged |
+| 512 KiB x40, 400 ms RTT | 22.795819 s | 18.760867 s | 17.70% faster |
+| mixed 128/512 KiB x24 | 11.986227 s | 11.986227 s | unchanged |
+| 2 MiB x16, 400 ms RTT | 22.558793 s | 21.920255 s | 2.83% faster |
+| 13 MiB x1, 400 ms RTT | 8.772264 s | 8.772264 s | unchanged |
+| 1 MiB x4, 1,000 ms RTT commit | 8.195500 s | 8.195500 s | unchanged; total varied one RTT |
+
+The final three-repetition comparator reported KEEP with no regressions. The
+full suite passed 1,627 tests; focused fault, cancellation, recovery, exact
+tiny ACK-round, standard rollback, and mixed-load tests passed. Both opt-in
+16/64 MiB exact-integrity gates, reproducible R5 release check, Deno bundle
+check, and real Deno journal suite also passed.
+
+## Next investigation after Phase 3 repair
+
+Proceed with the previously identified host CPU experiment: replace repeated
+O(n) request-state scans on Awareness publication with mutation-maintained
+counters. Accept it only if every wire byte, flight, ACK round, modeled timing,
+and safety result remains identical while measured host wall cost improves.
