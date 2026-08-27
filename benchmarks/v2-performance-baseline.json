@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "suite": "ghostprov-v2-performance-research",
-  "commit": "906595e5ffa44965d1b53a52d672b457650611c0",
+  "commit": "0a5658a73bee8ba9201d51c5b0be44334f739ccf",
   "transportProfile": "bulk-v1",
   "results": [
     {
@@ -14,14 +14,14 @@
         "timeoutMs": 30000
       },
       "repetitions": 3,
-      "commitP50Ms": 1118.7071838378906,
-      "commitP95Ms": 2095.391902923584,
-      "commitMaxMs": 2220.5969276428223,
-      "virtualElapsedMs": 2624.2492713928223,
-      "wallCommitP95Ms": 454.6702,
-      "wallTotalP95Ms": 536.2750000000001,
-      "hostPeakWindowBytes": 400851,
-      "attemptedWireBytes": 7522632,
+      "commitP50Ms": 1118.8135566711426,
+      "commitP95Ms": 2095.4989471435547,
+      "commitMaxMs": 2220.703929901123,
+      "virtualElapsedMs": 2624.356273651123,
+      "wallCommitP95Ms": 451.4267000000001,
+      "wallTotalP95Ms": 530.7443,
+      "hostPeakWindowBytes": 403395,
+      "attemptedWireBytes": 7522673,
       "usefulRequestBytes": 5242880,
       "retransmissions": 0,
       "upstreamMaxActive": 40,
@@ -30,8 +30,8 @@
       "classes": {
         "tiny": {
           "requests": 40,
-          "commitP95Ms": 2095.391902923584,
-          "commitMaxMs": 2220.5969276428223,
+          "commitP95Ms": 2095.4989471435547,
+          "commitMaxMs": 2220.703929901123,
           "ackRoundsP95": 3
         }
       }
@@ -46,14 +46,14 @@
         "timeoutMs": 30000
       },
       "repetitions": 3,
-      "commitP50Ms": 5017.939914703369,
-      "commitP95Ms": 10219.063312530518,
-      "commitMaxMs": 10219.063312530518,
-      "virtualElapsedMs": 12621.42537689209,
-      "wallCommitP95Ms": 274.55700000000024,
-      "wallTotalP95Ms": 313.1373000000003,
-      "hostPeakWindowBytes": 400851,
-      "attemptedWireBytes": 4514939,
+      "commitP50Ms": 5018.04670715332,
+      "commitP95Ms": 10219.170021057129,
+      "commitMaxMs": 10219.170021057129,
+      "virtualElapsedMs": 12621.53267288208,
+      "wallCommitP95Ms": 274.68820000000005,
+      "wallTotalP95Ms": 307.3910000000001,
+      "hostPeakWindowBytes": 403395,
+      "attemptedWireBytes": 4514964,
       "usefulRequestBytes": 3145728,
       "retransmissions": 0,
       "upstreamMaxActive": 24,
@@ -62,8 +62,8 @@
       "classes": {
         "tiny": {
           "requests": 24,
-          "commitP95Ms": 10219.063312530518,
-          "commitMaxMs": 10219.063312530518,
+          "commitP95Ms": 10219.170021057129,
+          "commitMaxMs": 10219.170021057129,
           "ackRoundsP95": 3
         }
       }
@@ -78,14 +78,14 @@
         "timeoutMs": 30000
       },
       "repetitions": 3,
-      "commitP50Ms": 1029.8295440673828,
-      "commitP95Ms": 1029.8295440673828,
-      "commitMaxMs": 1029.8295440673828,
-      "virtualElapsedMs": 2230.195281982422,
-      "wallCommitP95Ms": 30.233400000000074,
-      "wallTotalP95Ms": 39.16179999999986,
-      "hostPeakWindowBytes": 707134,
-      "attemptedWireBytes": 737690,
+      "commitP50Ms": 1029.8166618347168,
+      "commitP95Ms": 1029.8166618347168,
+      "commitMaxMs": 1029.8166618347168,
+      "virtualElapsedMs": 2230.1825256347656,
+      "wallCommitP95Ms": 32.3429000000001,
+      "wallTotalP95Ms": 41.55250000000024,
+      "hostPeakWindowBytes": 706830,
+      "attemptedWireBytes": 737387,
       "usefulRequestBytes": 524288,
       "retransmissions": 0,
       "upstreamMaxActive": 1,
@@ -94,8 +94,8 @@
       "classes": {
         "medium": {
           "requests": 1,
-          "commitP95Ms": 1029.8295440673828,
-          "commitMaxMs": 1029.8295440673828,
+          "commitP95Ms": 1029.8166618347168,
+          "commitMaxMs": 1029.8166618347168,
           "ackRoundsP95": 2
         }
       }
@@ -110,14 +110,14 @@
         "timeoutMs": 120000
       },
       "repetitions": 3,
-      "commitP50Ms": 13640.926517486572,
-      "commitP95Ms": 25042.944370269775,
-      "commitMaxMs": 26043.150150299072,
-      "virtualElapsedMs": 29246.80366897583,
-      "wallCommitP95Ms": 762.8099999999995,
-      "wallTotalP95Ms": 851.6677,
-      "hostPeakWindowBytes": 949765,
-      "attemptedWireBytes": 28811004,
+      "commitP50Ms": 11376.371799468994,
+      "commitP95Ms": 22795.81855392456,
+      "commitMaxMs": 22795.81855392456,
+      "virtualElapsedMs": 25999.468673706055,
+      "wallCommitP95Ms": 673.3949000000002,
+      "wallTotalP95Ms": 735.7026999999998,
+      "hostPeakWindowBytes": 1010015,
+      "attemptedWireBytes": 28756231,
       "usefulRequestBytes": 20971520,
       "retransmissions": 0,
       "upstreamMaxActive": 40,
@@ -126,8 +126,8 @@
       "classes": {
         "medium": {
           "requests": 40,
-          "commitP95Ms": 25042.944370269775,
-          "commitMaxMs": 26043.150150299072,
+          "commitP95Ms": 22795.81855392456,
+          "commitMaxMs": 22795.81855392456,
           "ackRoundsP95": 4
         }
       }
@@ -167,14 +167,14 @@
         "timeoutMs": 30000
       },
       "repetitions": 3,
-      "commitP50Ms": 5017.939998626709,
-      "commitP95Ms": 12619.284534454346,
-      "commitMaxMs": 12619.284534454346,
-      "virtualElapsedMs": 15021.648025512695,
-      "wallCommitP95Ms": 372.20130000000063,
-      "wallTotalP95Ms": 404.96250000000055,
-      "hostPeakWindowBytes": 949701,
-      "attemptedWireBytes": 10899667,
+      "commitP50Ms": 5018.04691696167,
+      "commitP95Ms": 11986.227527618408,
+      "commitMaxMs": 11986.227527618408,
+      "virtualElapsedMs": 14388.58980178833,
+      "wallCommitP95Ms": 357.28539999999975,
+      "wallTotalP95Ms": 385.21230000000014,
+      "hostPeakWindowBytes": 1009951,
+      "attemptedWireBytes": 10885548,
       "usefulRequestBytes": 7864320,
       "retransmissions": 0,
       "upstreamMaxActive": 24,
@@ -183,14 +183,14 @@
       "classes": {
         "tiny": {
           "requests": 12,
-          "commitP95Ms": 5017.939998626709,
-          "commitMaxMs": 5017.939998626709,
+          "commitP95Ms": 5018.04691696167,
+          "commitMaxMs": 5018.04691696167,
           "ackRoundsP95": 3
         },
         "medium": {
           "requests": 12,
-          "commitP95Ms": 12619.284534454346,
-          "commitMaxMs": 12619.284534454346,
+          "commitP95Ms": 11986.227527618408,
+          "commitMaxMs": 11986.227527618408,
           "ackRoundsP95": 4
         }
       }
@@ -205,14 +205,14 @@
         "timeoutMs": 60000
       },
       "repetitions": 3,
-      "commitP50Ms": 15351.706871032715,
-      "commitP95Ms": 30703.47169113159,
-      "commitMaxMs": 30703.47169113159,
-      "virtualElapsedMs": 32705.190399169922,
-      "wallCommitP95Ms": 981.6153999999988,
-      "wallTotalP95Ms": 1018.7709999999988,
-      "hostPeakWindowBytes": 971137,
-      "attemptedWireBytes": 45612870,
+      "commitP50Ms": 15351.180084228516,
+      "commitP95Ms": 30702.418537139893,
+      "commitMaxMs": 30702.418537139893,
+      "virtualElapsedMs": 32704.137035369873,
+      "wallCommitP95Ms": 976.1957000000002,
+      "wallTotalP95Ms": 999.2921999999999,
+      "hostPeakWindowBytes": 1025413,
+      "attemptedWireBytes": 45587761,
       "usefulRequestBytes": 33554432,
       "retransmissions": 0,
       "upstreamMaxActive": 16,
@@ -221,8 +221,8 @@
       "classes": {
         "medium": {
           "requests": 16,
-          "commitP95Ms": 30703.47169113159,
-          "commitMaxMs": 30703.47169113159,
+          "commitP95Ms": 30702.418537139893,
+          "commitMaxMs": 30702.418537139893,
           "ackRoundsP95": 4
         }
       }
@@ -237,14 +237,14 @@
         "timeoutMs": 30000
       },
       "repetitions": 3,
-      "commitP50Ms": 9172.801780700684,
-      "commitP95Ms": 9172.801780700684,
-      "commitMaxMs": 9172.801780700684,
-      "virtualElapsedMs": 10773.222110748291,
-      "wallCommitP95Ms": 312.83179999999993,
-      "wallTotalP95Ms": 328.14589999999953,
-      "hostPeakWindowBytes": 971328,
-      "attemptedWireBytes": 18445036,
+      "commitP50Ms": 8772.263999938965,
+      "commitP95Ms": 8772.263999938965,
+      "commitMaxMs": 8772.263999938965,
+      "virtualElapsedMs": 10372.684246063232,
+      "wallCommitP95Ms": 298.14530000000013,
+      "wallTotalP95Ms": 314.5038999999997,
+      "hostPeakWindowBytes": 1025600,
+      "attemptedWireBytes": 18432243,
       "usefulRequestBytes": 13631488,
       "retransmissions": 0,
       "upstreamMaxActive": 1,
@@ -253,9 +253,9 @@
       "classes": {
         "large": {
           "requests": 1,
-          "commitP95Ms": 9172.801780700684,
-          "commitMaxMs": 9172.801780700684,
-          "ackRoundsP95": 20
+          "commitP95Ms": 8772.263999938965,
+          "commitMaxMs": 8772.263999938965,
+          "ackRoundsP95": 19
         }
       }
     },
@@ -269,14 +269,14 @@
         "timeoutMs": 60000
       },
       "repetitions": 3,
-      "commitP50Ms": 8197.793632507324,
-      "commitP95Ms": 10697.949729919434,
-      "commitMaxMs": 10697.949729919434,
-      "virtualElapsedMs": 14698.667526245117,
-      "wallCommitP95Ms": 156.67469999999958,
-      "wallTotalP95Ms": 166.3107999999993,
-      "hostPeakWindowBytes": 971008,
-      "attemptedWireBytes": 5731880,
+      "commitP50Ms": 8195.500469207764,
+      "commitP95Ms": 8195.500469207764,
+      "commitMaxMs": 8195.500469207764,
+      "virtualElapsedMs": 13196.2709274292,
+      "wallCommitP95Ms": 131.65489999999772,
+      "wallTotalP95Ms": 143.46119999999792,
+      "hostPeakWindowBytes": 1025280,
+      "attemptedWireBytes": 5721053,
       "usefulRequestBytes": 4194304,
       "retransmissions": 0,
       "upstreamMaxActive": 4,
@@ -285,9 +285,9 @@
       "classes": {
         "medium": {
           "requests": 4,
-          "commitP95Ms": 10697.949729919434,
-          "commitMaxMs": 10697.949729919434,
-          "ackRoundsP95": 7
+          "commitP95Ms": 8195.500469207764,
+          "commitMaxMs": 8195.500469207764,
+          "ackRoundsP95": 6
         }
       }
     }
