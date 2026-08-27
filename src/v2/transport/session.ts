@@ -127,7 +127,7 @@ export interface V2TransportSnapshot {
   ambiguityLimit?: number;
   credits: number;
   admissionCredits?: number;
-  /** Safe host run calls, including bounded body-only R5 prefetch capacity. */
+  /** Safe host run calls, including bounded body-only bulk-profile prefetch capacity. */
   prefetchCredits?: number;
   admissionBlockReason?: V2AdmissionBlockReason;
   retransmissions: number;
@@ -3103,7 +3103,7 @@ export class V2TransportSession {
         !candidate.admitted && candidate.transferCost <= transferAvailable
       );
       // A queued interactive request always claims the next body slot before
-      // medium prefetch. Once one is admitted the R5 precommit depth returns to
+      // medium prefetch. Once one is admitted the bulk-profile precommit depth returns to
       // the established four-request contract.
       const state = this.#pending.find(candidate => (
         eligible(candidate) &&

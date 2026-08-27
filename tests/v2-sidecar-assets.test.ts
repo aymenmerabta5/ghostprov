@@ -11,6 +11,7 @@ import {
   V2_R3_RELEASE,
   V2_R4_RELEASE,
   V2_R5_RELEASE,
+  V2_R6_RELEASE,
 } from "../src/v2/sidecar/assets";
 import { protocolSchemaHash } from "../src/v2/protocol/shared";
 
@@ -21,7 +22,7 @@ describe("V2 sidecar assets", () => {
 
     expect(first).toEqual(second);
     expect(first.revision).toBe("r1");
-    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r5");
+    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r6");
     expect(first.buildHash).toBe(V2_R1_RELEASE.buildHash);
     expect(first.schemaHash).toBe(V2_R1_RELEASE.schemaHash);
     expect(first.files[0]!.sha256).toBe(V2_R1_RELEASE.bundleSha256);
@@ -54,15 +55,22 @@ describe("V2 sidecar assets", () => {
     await expect(assertV2SidecarAssets(first, "r1")).resolves.toBeUndefined();
   });
 
-  it("selects frozen R5 bulk transport while preserving prior releases", async () => {
+  it("selects frozen R6 bulk transport while preserving prior releases", async () => {
     const assets = await loadV2SidecarAssets();
-    expect(assets.revision).toBe("r5");
+    expect(assets.revision).toBe("r6");
     expect(assets.protocolRevision).toBe("r2");
     expect(assets.transportProfile).toBe("bulk-v1");
-    expect(assets.buildHash).toBe(V2_R5_RELEASE.buildHash);
-    expect(assets.schemaHash).toBe(V2_R5_RELEASE.schemaHash);
-    expect(assets.files[0]!.sha256).toBe(V2_R5_RELEASE.bundleSha256);
-    await expect(assertV2SidecarAssets(assets, "r5")).resolves.toBeUndefined();
+    expect(assets.buildHash).toBe(V2_R6_RELEASE.buildHash);
+    expect(assets.schemaHash).toBe(V2_R6_RELEASE.schemaHash);
+    expect(assets.files[0]!.sha256).toBe(V2_R6_RELEASE.bundleSha256);
+    await expect(assertV2SidecarAssets(assets, "r6")).resolves.toBeUndefined();
+    await expect(loadV2SidecarAssets({ revision: "r5" }))
+      .resolves.toMatchObject({
+        revision: "r5",
+        protocolRevision: "r2",
+        transportProfile: "bulk-v1",
+        buildHash: V2_R5_RELEASE.buildHash,
+      });
     await expect(loadV2SidecarAssets({ revision: "r4" }))
       .resolves.toMatchObject({
         revision: "r4",
@@ -108,6 +116,10 @@ describe("V2 sidecar assets", () => {
       "f".repeat(64),
     )).toThrow(/R5 schema hash.*live protocol/i);
     expect(() => assertV2SidecarReleaseSchema(
+      V2_R6_RELEASE,
+      "f".repeat(64),
+    )).toThrow(/R6 schema hash.*live protocol/i);
+    expect(() => assertV2SidecarReleaseSchema(
       V2_R1_RELEASE,
       V2_R1_RELEASE.schemaHash,
     )).not.toThrow();
@@ -116,6 +128,7 @@ describe("V2 sidecar assets", () => {
     expect(V2_R3_RELEASE.schemaHash).toBe(await protocolSchemaHash("r2"));
     expect(V2_R4_RELEASE.schemaHash).toBe(await protocolSchemaHash("r2"));
     expect(V2_R5_RELEASE.schemaHash).toBe(await protocolSchemaHash("r2", "bulk-v1"));
+    expect(V2_R6_RELEASE.schemaHash).toBe(await protocolSchemaHash("r2", "bulk-v1"));
   });
 
   it("produces one executable bundle with no runtime package resolution", async () => {
@@ -173,12 +186,13 @@ describe("V2 sidecar assets", () => {
   });
 
   it("fails closed on unsupported or mismatched revision selection", async () => {
-    expect(resolveV2SidecarRevision()).toBe("r5");
+    expect(resolveV2SidecarRevision()).toBe("r6");
     expect(resolveV2SidecarRevision("r2")).toBe("r2");
     expect(resolveV2SidecarRevision("r3")).toBe("r3");
     expect(resolveV2SidecarRevision("r4")).toBe("r4");
     expect(resolveV2SidecarRevision("r5")).toBe("r5");
-    expect(() => resolveV2SidecarRevision("r6")).toThrow(/unsupported.*r6/i);
+    expect(resolveV2SidecarRevision("r6")).toBe("r6");
+    expect(() => resolveV2SidecarRevision("r7")).toThrow(/unsupported.*r7/i);
     await expect(loadV2SidecarAssets({ revision: "r2" }))
       .resolves.toMatchObject({ revision: "r2", buildHash: V2_R2_RELEASE.buildHash });
 

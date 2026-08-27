@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  V2_R5_SIDECAR_BUILD_RECIPE,
+  V2_R6_SIDECAR_BUILD_RECIPE,
   buildV2SidecarRelease,
   canonicalV2SidecarBundle,
   checkV2SidecarRelease,
@@ -17,9 +17,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
-describe("V2-R5 sidecar release build", () => {
+describe("V2-R6 sidecar release build", () => {
   it("pins the browser ESM recipe without chunks, source maps, or identifier mangling", () => {
-    expect(V2_R5_SIDECAR_BUILD_RECIPE).toEqual({
+    expect(V2_R6_SIDECAR_BUILD_RECIPE).toEqual({
       target: "browser",
       format: "esm",
       splitting: false,
@@ -31,9 +31,9 @@ describe("V2-R5 sidecar release build", () => {
         identifiers: false,
       },
     });
-    expect(Object.isFrozen(V2_R5_SIDECAR_BUILD_RECIPE)).toBe(true);
-    expect(Object.isFrozen(V2_R5_SIDECAR_BUILD_RECIPE.minify)).toBe(true);
-    expect(Object.isFrozen(V2_R5_SIDECAR_BUILD_RECIPE.external)).toBe(true);
+    expect(Object.isFrozen(V2_R6_SIDECAR_BUILD_RECIPE)).toBe(true);
+    expect(Object.isFrozen(V2_R6_SIDECAR_BUILD_RECIPE.minify)).toBe(true);
+    expect(Object.isFrozen(V2_R6_SIDECAR_BUILD_RECIPE.external)).toBe(true);
   });
 
   it("canonicalizes platform line endings to exactly one trailing LF", () => {
@@ -44,7 +44,7 @@ describe("V2-R5 sidecar release build", () => {
 
   it("builds twice to identical safe bytes while preserving identifiers", async () => {
     const built = await buildV2SidecarRelease();
-    expect(built.revision).toBe("r5");
+    expect(built.revision).toBe("r6");
     expect(built.protocolRevision).toBe("r2");
     expect(built.bytes.byteLength).toBeGreaterThan(1_000);
     expect(built.content).toContain("DenoJournalStorage");
@@ -61,13 +61,13 @@ describe("V2-R5 sidecar release build", () => {
   });
 
   it("makes --check fail closed for missing or corrupt release bytes", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-r5-release-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-r6-release-"));
     roots.push(root);
     const missing = path.join(root, "missing.bundle.js");
     await expect(checkV2SidecarRelease(missing)).rejects.toThrow(/artifact is missing/i);
 
     const corrupt = path.join(root, "corrupt.bundle.js");
-    await writeFile(corrupt, "not the deterministic R5 bundle\n");
+    await writeFile(corrupt, "not the deterministic R6 bundle\n");
     await expect(checkV2SidecarRelease(corrupt)).rejects.toThrow(/differs/i);
     await expect(main(["--unknown"])).rejects.toThrow(/usage/i);
   });
@@ -93,10 +93,10 @@ describe("V2-R5 sidecar release build", () => {
   });
 
   it(
-    "matches the checked-in frozen R5 artifact and pinned identity to current source",
+    "matches the checked-in frozen R6 artifact and pinned identity to current source",
     async () => {
       await expect(checkV2SidecarRelease()).resolves.toMatchObject({
-        revision: "r5",
+        revision: "r6",
         protocolRevision: "r2",
       });
     },

@@ -90,8 +90,9 @@ describe("DirectResponsesClient", () => {
       apiKey: secret("api-secret"),
       fetch: async (_url, init) => {
         order.push("fetch");
-        expect(init?.body).toBe(body);
-        bodies.push(JSON.parse(new TextDecoder().decode(init?.body as Uint8Array)));
+        expect(init?.body).toBeInstanceOf(Blob);
+        body.fill(0);
+        bodies.push(JSON.parse(await (init?.body as Blob).text()));
         expect(new Headers(init?.headers).get("authorization")).toBe("Bearer api-secret");
         return completeSse();
       },

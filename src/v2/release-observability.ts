@@ -1,10 +1,10 @@
 const SHA256 = /^[a-f0-9]{64}$/;
-const RELEASE_REVISIONS = new Set(["r1", "r2", "r3", "r4", "r5"]);
+const RELEASE_REVISIONS = new Set(["r1", "r2", "r3", "r4", "r5", "r6"]);
 const PROTOCOL_REVISIONS = new Set(["r1", "r2"]);
 const MAX_RELEASE_SELECTIONS = 256;
 
 export interface SafeV2ReleaseIdentity {
-  releaseRevision: "r1" | "r2" | "r3" | "r4" | "r5";
+  releaseRevision: "r1" | "r2" | "r3" | "r4" | "r5" | "r6";
   protocolRevision: "r1" | "r2";
   buildHash: string;
   schemaHash: string;
@@ -43,7 +43,7 @@ export function safeV2ReleaseIdentity(value: unknown): SafeV2ReleaseIdentity | n
     !SHA256.test(raw.schemaHash)
   ) return null;
   return Object.freeze({
-    releaseRevision: raw.releaseRevision as "r1" | "r2" | "r3" | "r4" | "r5",
+    releaseRevision: raw.releaseRevision as "r1" | "r2" | "r3" | "r4" | "r5" | "r6",
     protocolRevision: raw.protocolRevision as "r1" | "r2",
     buildHash: raw.buildHash,
     schemaHash: raw.schemaHash,

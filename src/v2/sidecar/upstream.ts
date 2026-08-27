@@ -1052,7 +1052,13 @@ export class DirectResponsesClient {
     let requestBody: BodyInit;
     let model: unknown;
     if (input.bodyIsCanonicalStream) {
-      requestBody = input.body as BodyInit;
+      // The request assembler owns and securely erases its mutable Uint8Array.
+      // Give fetch an immutable snapshot so a runtime that consumes BodyInit
+      // lazily cannot observe reuse/erasure while uploading a large request.
+      // V2 request working-set accounting already reserves one fetch copy.
+      requestBody = new Blob([input.body as unknown as BlobPart], {
+        type: "application/json",
+      });
       model = canonicalRequestModel(input.body);
     } else {
       const body: Record<string, unknown> = { ...parseBody(input.body), stream: true };

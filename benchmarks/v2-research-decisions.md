@@ -262,3 +262,32 @@ seven usable 400 KiB/s runtimes keep this 14-request workload below 30 seconds,
 while six produce 39.043 s p95 and four produce 51.378 s p95. Those are true
 capacity shortfalls, not router bugs, and cannot be promised away without more
 usable links, a longer deadline, or a different wire architecture.
+
+## 2026-08-27 - real shared-link R6 validation - KEEP
+
+The eight-project live fleet disproved the synthetic assumption that Prism/Y-Sweet
+provides eight independent request links. Simultaneous 1 MiB flights synchronize
+across projects, and eight incompressible 2.9 MiB bodies require more aggregate
+goodput than the shared service supplied inside the fixed 30-second bound. R6
+therefore preserves R2/`bulk-v1`, snapshots each verified mutable body into an
+accounted immutable `Blob` at the final fetch boundary, and combines a four-unit
+fleet transfer gate with a weighted 500 ms start pacer. Requests through 256 KiB
+bypass both controls; standard/R4 behavior is unchanged.
+
+| Isolated real-sandbox workload | Exact expected terminals | Capacity 503 | p50 | p95 / max |
+|---|---:|---:|---:|---:|
+| R5, 8 x 1 MiB reproduction | 6 / 8 | 0 | n/a | failed oracle |
+| R6, 5 waves x 8 x 1 MiB | 40 / 40 | 0 | 6.37 s | 19.40 / 20.83 s |
+| R6, 5 waves x 3 x 2.9 MiB | 15 / 15 | 0 | 6.26 s | 20.27 / 20.27 s |
+| R6, 14-agent mixed 128 KiB/1 MiB/2.9 MiB | 14 / 14 | 0 | 3.89 s | 27.94 / 27.94 s |
+| R6, 14 x 128 KiB WebSocket | 14 / 14 | 0 | 1.58 s | 8.94 / 8.94 s |
+| R6, 14 x 1 MiB WebSocket | 14 / 14 | 0 | 8.38 s | 19.21 / 19.21 s |
+| R6, 8 x 128 KiB HTTP | 8 / 8 | 0 | n/a | 1.88 / 1.88 s |
+
+R5 produced two definitive upstream `invalid_json` responses in one eight-way
+1 MiB reproduction and one `missing_required_parameter` in an earlier run even
+though transport digest verification succeeded. Across the listed R6 runs the
+same strong unknown-parameter oracle observed no body corruption. The rejected
+six-unit fleet candidate and the eight-way incompressible 2.9 MiB overload are
+retained as negative evidence; neither was relabeled as success or used to
+weaken the fixed deadline.
