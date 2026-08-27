@@ -2,7 +2,9 @@ import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
   type IncomingResourceLease,
+  admissionProgressFreshnessMs,
   MultiSandboxRouter,
+  nextAdmissionProgressCheckAtMs,
   requestRoutingTimeouts,
 } from "../src/router/router";
 import {
@@ -10,7 +12,11 @@ import {
   type ResourceLease,
 } from "../src/router/resource-governor";
 import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
-import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
+import {
+  SandboxRegistry,
+  type RoutableSandboxRuntime,
+  type SandboxRunOptions,
+} from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 import type { Clock } from "../src/core/ports";
@@ -49,6 +55,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   lastRunSignal?: AbortSignal;
   pulseAdmissionOnFailure = false;
   readonly executionStartedAtMs: number[] = [];
+  readonly admissionProgressCallbacks: Array<() => void> = [];
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
   readonly listeners = new Set<() => void>();
@@ -101,10 +108,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   async run(
     body: Record<string, unknown>,
     signal?: AbortSignal,
-    options?: {
-      onAdmissionReflected(): void;
-      onExecutionRiskReflected?(): void;
-    },
+    options?: SandboxRunOptions,
   ): Promise<RunHandle> {
     this.lastRunSignal = signal;
     this.executions++;
@@ -142,7 +146,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.active++;
     this.uncommitted++;
     this.uncommittedPeak = Math.max(this.uncommittedPeak, this.uncommitted);
-    options?.onAdmissionReflected();
+    if (options?.onAdmissionProgress) {
+      this.admissionProgressCallbacks.push(options.onAdmissionProgress);
+    }
+    options?.onAdmissionReflected?.();
     if (this.reflectExecutionRisk) options?.onExecutionRiskReflected?.();
     if (this.waitForPostAdmissionAbort) {
       try {
@@ -178,6 +185,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
   rejectOne(error: unknown): void {
     this.finals.shift()?.reject(error);
+  }
+  emitAdmissionProgress(index = this.admissionProgressCallbacks.length - 1): void {
+    this.admissionProgressCallbacks[index]?.();
   }
 }
 
@@ -301,6 +311,17 @@ describe("MultiSandboxRouter", () => {
     });
     expect(() => requestRoutingTimeouts(-1, 30_000, 15_000)).toThrow(RangeError);
     expect(() => requestRoutingTimeouts(1, 10_000, 15_000)).toThrow(RangeError);
+
+    expect(admissionProgressFreshnessMs(600)).toBe(5_000);
+    expect(admissionProgressFreshnessMs(2_000)).toBe(8_000);
+    expect(admissionProgressFreshnessMs(4_000)).toBe(10_000);
+    // At the production 15-second attempt boundary, no progress retries;
+    // progress one millisecond earlier stays on this runtime until 19.999s.
+    expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, null, 5_000)).toBeNull();
+    expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, 14_999, 5_000)).toBe(19_999);
+    expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, 10_000, 5_000)).toBeNull();
+    // Fresh progress can never cross the absolute 30-second deadline.
+    expect(nextAdmissionProgressCheckAtMs(30_000, 30_000, 29_999, 5_000)).toBeNull();
   });
 
   it("hands the payload-aware global deadline through an HTTP ingress lease", async () => {
@@ -642,6 +663,10 @@ describe("MultiSandboxRouter", () => {
 
   it("fails over after transport admission while R2 execution is still provably safe", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
     const selected = system.runtimes[1]!;
     selected.reflectExecutionRisk = false;
     selected.waitForPostAdmissionAbort = true;
@@ -650,7 +675,11 @@ describe("MultiSandboxRouter", () => {
     const outcome = await Promise.race([
       system.router.startRelay(
         { model: "gpt-5.6-sol", input: "admitted-but-not-started", stream: true },
-        { clientId: "admitted-but-not-started", source: "websocket" },
+        {
+          clientId: "admitted-but-not-started",
+          source: "websocket",
+          encodedBodyBytes: 128 * 1024,
+        },
       ).then(handle => ({ kind: "handle" as const, handle })),
       Bun.sleep(120).then(() => ({ kind: "timeout" as const })),
     ]);
@@ -661,8 +690,108 @@ describe("MultiSandboxRouter", () => {
     }
     expect(performance.now() - started).toBeLessThan(100);
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    expect(selected.admissionProgressCallbacks).toHaveLength(0);
     system.runtimes[0]!.completeOne();
     await outcome.handle.final;
+    await system.router.close();
+  });
+
+  it("retries a 2.9 MiB R5 attempt at its first deadline when no progress arrives", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 25);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const selected = system.runtimes[1]!;
+    selected.reflectExecutionRisk = false;
+    selected.waitForPostAdmissionAbort = true;
+    const started = performance.now();
+
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "large-no-progress", stream: true },
+      {
+        clientId: "large-no-progress",
+        source: "websocket",
+        encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+      },
+    );
+    const elapsed = performance.now() - started;
+
+    expect(elapsed).toBeGreaterThanOrEqual(20);
+    expect(elapsed).toBeLessThan(120);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    expect(selected.admissionProgressCallbacks).toHaveLength(1);
+    expect(selected.lastRunSignal?.aborted).toBe(true);
+    // A late ACK callback from the retired attempt cannot mutate the accepted
+    // replacement or dispatch a third copy.
+    selected.emitAdmissionProgress();
+    await flush();
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("keeps fresh 2.9 MiB R5 progress on one runtime but never extends the hard deadline", async () => {
+    const system = createSystem(2, 1, 70, undefined, undefined, undefined, 20);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const selected = system.runtimes[1]!;
+    selected.ackEwmaMs = 600;
+    selected.reflectExecutionRisk = false;
+    selected.waitForPostAdmissionAbort = true;
+    const started = performance.now();
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "large-progressing", stream: true },
+      {
+        clientId: "large-progressing",
+        source: "websocket",
+        encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+      },
+    );
+    await flush();
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    expect(selected.admissionProgressCallbacks).toHaveLength(1);
+
+    const progressTimer = setTimeout(() => selected.emitAdmissionProgress(), 15);
+    await Bun.sleep(40);
+    clearTimeout(progressTimer);
+    expect(selected.lastRunSignal?.aborted).toBe(false);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+
+    const result = await pending.then(() => null, error => error);
+    const elapsed = performance.now() - started;
+    expect(result).toMatchObject({ code: "router_capacity_timeout" });
+    expect(elapsed).toBeGreaterThanOrEqual(55);
+    expect(elapsed).toBeLessThan(130);
+    expect(selected.lastRunSignal?.aborted).toBe(true);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    selected.emitAdmissionProgress();
+    await Bun.sleep(30);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    await system.router.close();
+  });
+
+  it("keeps standard-profile large requests on the original retry behavior", async () => {
+    const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
+    const selected = system.runtimes[1]!;
+    selected.reflectExecutionRisk = false;
+    selected.waitForPostAdmissionAbort = true;
+
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "large-standard", stream: true },
+      {
+        clientId: "large-standard",
+        source: "websocket",
+        encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+      },
+    );
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    expect(selected.admissionProgressCallbacks).toHaveLength(0);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
     await system.router.close();
   });
 

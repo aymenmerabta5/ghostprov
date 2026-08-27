@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
 import { MultiSandboxRouter } from "../src/router/router";
 import { ResourceGovernor } from "../src/router/resource-governor";
-import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
+import {
+  SandboxRegistry,
+  type RoutableSandboxRuntime,
+  type SandboxRunOptions,
+} from "../src/sandbox/registry";
 import { projectId } from "../src/sandbox/types";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
@@ -25,6 +29,9 @@ class Runtime implements RoutableSandboxRuntime {
   readonly projectId;
   readonly terminal = deferred<any>();
   waitForAdmissionAbort = false;
+  transportProfile: "standard" | "bulk-v1" | null = null;
+  emitAdmissionProgress = false;
+  afterAdmissionProgress?: () => void;
   constructor(
     id = "00000000-0000-4000-8000-000000000001",
     readonly active = 0,
@@ -37,6 +44,7 @@ class Runtime implements RoutableSandboxRuntime {
   snapshot() {
     return {
       projectId: this.projectId,
+      transportProfile: this.transportProfile,
       state: "ready" as const,
       capacity: 128,
       active: this.active,
@@ -54,7 +62,15 @@ class Runtime implements RoutableSandboxRuntime {
       failure: null,
     };
   }
-  async run(_body?: Record<string, unknown>, signal?: AbortSignal): Promise<RunHandle> {
+  async run(
+    _body?: Record<string, unknown>,
+    signal?: AbortSignal,
+    options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    if (this.emitAdmissionProgress) {
+      options?.onAdmissionProgress?.();
+      this.afterAdmissionProgress?.();
+    }
     if (this.waitForAdmissionAbort) {
       await new Promise<never>((_resolve, reject) => {
         if (signal?.aborted) return reject(signal.reason);
@@ -191,6 +207,73 @@ describe("router observability", () => {
       for (const event of expired) {
         expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
       }
+    } finally {
+      await router.close();
+    }
+  });
+
+  it("records observed progress and its age when a large R5 attempt becomes stale", async () => {
+    const logger = new MemoryLogger();
+    let clockOffsetMs = 0;
+    const clock = {
+      now: () => performance.timeOrigin + performance.now() + clockOffsetMs,
+      sleep: async (ms: number) => { await Bun.sleep(ms); },
+      waitUntil: async (deadlineMs: number) => {
+        const remaining = deadlineMs - (performance.timeOrigin + performance.now() + clockOffsetMs);
+        if (remaining > 0) await Bun.sleep(remaining);
+      },
+    };
+    const fallback = new Runtime("00000000-0000-4000-8000-000000000001");
+    const stalled = new Runtime("00000000-0000-4000-8000-000000000002");
+    fallback.transportProfile = "bulk-v1";
+    stalled.transportProfile = "bulk-v1";
+    stalled.waitForAdmissionAbort = true;
+    stalled.emitAdmissionProgress = true;
+    stalled.afterAdmissionProgress = () => { clockOffsetMs = 6_000; };
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([fallback, stalled]),
+      governor: new ResourceGovernor({
+        probe: { sample: () => ({
+          totalBytes: 32 * 1024 ** 3,
+          freeBytes: 20 * 1024 ** 3,
+          rssBytes: 100 * 1024 ** 2,
+          heapBytes: 50 * 1024 ** 2,
+          externalBytes: 10 * 1024 ** 2,
+          logicalProcessors: 12,
+        }) },
+        now: () => clock.now(),
+      }),
+      logger,
+      clock,
+      queueTimeoutMs: 10_000,
+      routeAttemptTimeoutMs: 10,
+      random: { next: () => 0.5, uuid: () => "trace-progress-timeout" },
+    });
+    try {
+      const handle = await router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "must not be logged",
+        stream: true,
+      }, {
+        source: "http",
+        encodedBodyBytes: Math.floor(2.9 * 1024 * 1024),
+      });
+      const expired = logger.events.filter(event => event.event === "route.attempt_expired");
+      expect(expired).toHaveLength(1);
+      const progressAge = (expired[0] as unknown as Record<string, unknown>).progress_age_ms;
+      expect(typeof progressAge).toBe("number");
+      expect(progressAge as number).toBeGreaterThanOrEqual(5_999);
+      expect(progressAge as number).toBeLessThan(6_100);
+      expect(expired[0]).toMatchObject({
+        project_id: stalled.projectId,
+        route_attempt: 1,
+        progress_observed: true,
+        progress_age_ms: expect.any(Number),
+        capacity_reason: "available",
+      });
+      expect(JSON.stringify(expired)).not.toContain("must not be logged");
+      fallback.terminal.resolve({ id: "resp_progress_fallback", status: "completed" });
+      await handle.final;
     } finally {
       await router.close();
     }

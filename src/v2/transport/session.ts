@@ -182,6 +182,8 @@ export interface V2GzipOptions {
 export interface V2TransportRunOptions {
   /** Ownership handoff after this session charges its admission credit. */
   onAdmissionReflected?(): void;
+  /** Safe pre-execution progress; observer exceptions are isolated. */
+  onAdmissionProgress?(): void;
   /** Irreversible execution handoff after the protocol-specific start fence. */
   onExecutionRiskReflected?(): void;
 }
@@ -281,6 +283,7 @@ interface RequestState {
   signal?: AbortSignal;
   onAbort?: () => void;
   onAdmissionReflected?: () => void;
+  onAdmissionProgress?: () => void;
   onExecutionRiskReflected?: () => void;
   admitted: boolean;
   transferCost: number;
@@ -524,6 +527,7 @@ export class V2TransportSession {
   #committedRequestCount = 0;
   #admittedUncommittedRequestCount = 0;
   #unadmittedRequestCount = 0;
+  #admissionProgressObservers = 0;
   readonly #rotations = new Map<string, RotationWaiter>();
   readonly #rotationStreams = new Set<string>();
   readonly #pending: RequestState[] = [];
@@ -909,6 +913,7 @@ export class V2TransportSession {
       rejectRun,
       signal,
       onAdmissionReflected: options?.onAdmissionReflected,
+      onAdmissionProgress: options?.onAdmissionProgress,
       onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
@@ -934,6 +939,7 @@ export class V2TransportSession {
       diagnostics,
       firstResponseSeen: false,
     };
+    if (state.onAdmissionProgress) this.#admissionProgressObservers++;
     state.onAbort = () => this.#abortRequest(state);
     signal?.addEventListener("abort", state.onAbort, { once: true });
     this.#requests.set(requestId, state);
@@ -1080,6 +1086,7 @@ export class V2TransportSession {
       state.startReserved = false;
       state.preparedStart = null;
       state.onAdmissionReflected = undefined;
+      this.#clearAdmissionProgress(state);
       state.onExecutionRiskReflected = undefined;
       const prefix = state.transcript.snapshot();
       state.responseBytes = prefix.byteCount;
@@ -1841,6 +1848,8 @@ export class V2TransportSession {
           return;
         }
         if (state.startQueued || state.startRisk || state.preparedStart) return;
+        this.#reflectAdmissionProgress(state);
+        if (!this.#requests.has(state.requestId)) return;
         state.preparedStart = this.#requestStartFromPrepared(frame);
         this.#preparedStarts.push(state);
         this.#stagePreparedStarts();
@@ -2138,6 +2147,7 @@ export class V2TransportSession {
 
   #reflectExecutionRisk(state: RequestState): void {
     if (!this.#hasExecutionRisk(state)) return;
+    this.#clearAdmissionProgress(state);
     const onExecutionRiskReflected = state.onExecutionRiskReflected;
     state.onExecutionRiskReflected = undefined;
     // Risk is already recorded in authoritative transport state. An observer
@@ -2889,7 +2899,24 @@ export class V2TransportSession {
   }
 
   #acknowledgeOutbound(cursor: { epoch: number; sequence: number }): void {
+    let progressed: RequestState[] | null = null;
+    if (this.#admissionProgressObservers > 0) {
+      for (const frame of this.#outbound.snapshot().frames) {
+        if (
+          frame.epoch !== cursor.epoch || frame.sequence > cursor.sequence ||
+          frame.kind !== "request_data"
+        ) continue;
+        const state = this.#requests.get(frame.requestId);
+        if (!state?.onAdmissionProgress) continue;
+        (progressed ??= []).push(state);
+      }
+    }
     this.#outbound.acknowledge(cursor);
+    // Validate and apply the cumulative ACK before notifying observers. A
+    // forged future cursor must never look like transfer progress.
+    if (progressed) {
+      for (const state of progressed) this.#reflectAdmissionProgress(state);
+    }
     for (const [requestId, receipt] of this.#terminalReceipts) {
       if (
         receipt.cursor?.epoch === cursor.epoch &&
@@ -3629,6 +3656,7 @@ export class V2TransportSession {
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
     this.#scheduler.removeStream(state.requestId);
     state.signal?.removeEventListener("abort", state.onAbort!);
+    this.#clearAdmissionProgress(state);
     if (state.admissionTimer) clearTimeout(state.admissionTimer);
     state.admissionTimer = undefined;
     if (this.#requests.size === 0) {
@@ -3776,6 +3804,7 @@ export class V2TransportSession {
     }
     state.signal?.removeEventListener("abort", state.onAbort!);
     state.onAdmissionReflected = undefined;
+    this.#clearAdmissionProgress(state);
     state.onExecutionRiskReflected = undefined;
     if (state.admissionTimer) clearTimeout(state.admissionTimer);
     state.admissionTimer = undefined;
@@ -3784,6 +3813,19 @@ export class V2TransportSession {
       this.#idleWaiters.clear();
     }
     this.#admitPending();
+  }
+
+  #reflectAdmissionProgress(state: RequestState): void {
+    const onAdmissionProgress = state.onAdmissionProgress;
+    // Progress is already proven in authoritative protocol state. Observers
+    // are advisory and can neither roll it back nor poison frame processing.
+    try { onAdmissionProgress?.(); } catch {}
+  }
+
+  #clearAdmissionProgress(state: RequestState): void {
+    if (!state.onAdmissionProgress) return;
+    state.onAdmissionProgress = undefined;
+    this.#admissionProgressObservers = Math.max(0, this.#admissionProgressObservers - 1);
   }
 
   #stopTrackingLatencyCriticalPreCommit(state: RequestState): void {

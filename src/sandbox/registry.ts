@@ -79,6 +79,13 @@ export interface SandboxRunOptions {
    */
   onAdmissionReflected?(): void;
   /**
+   * Reports request-body progress which is safe to use only while the request
+   * remains before its execution-risk fence. V2 emits this for newly
+   * cumulatively acknowledged request_data and one exact request_prepared
+   * proof; observer failures never affect transport state.
+   */
+  onAdmissionProgress?(): void;
+  /**
    * Called exactly once when execution can no longer be safely retried on a
    * different runtime. R2 reports this only after request_start enters the
    * cumulative reliable window; admission alone is still pre-execution.

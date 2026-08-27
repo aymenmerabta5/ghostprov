@@ -194,28 +194,46 @@ class R2Harness {
 }
 
 describe("R2 prepared/start host boundary", () => {
-  it("reports admission before execution risk and reports start risk exactly once", async () => {
+  it("reports only new data ACK and exact prepared progress before start risk", async () => {
     const harness = new R2Harness();
     await harness.start();
     let admissions = 0;
+    let progress = 0;
     let executionRisks = 0;
     const pending = harness.session.run(BODY, undefined, {
       onAdmissionReflected: () => { admissions++; },
+      onAdmissionProgress: () => {
+        progress++;
+        if (progress === 1) throw new Error("synthetic progress observer failure");
+      },
       onExecutionRiskReflected: () => { executionRisks++; },
     });
     await harness.settle();
 
     expect(admissions).toBe(1);
+    expect(progress).toBe(0);
     expect(executionRisks).toBe(0);
+
+    // A cumulative ACK reports the newly acknowledged request_data frame, but
+    // never request_open/request_commit. The throwing observer cannot poison
+    // the already-authoritative ACK or the following prepared handshake.
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    expect(progress).toBe(1);
+    expect(executionRisks).toBe(0);
+    expect(harness.starts()).toHaveLength(0);
+
     const prepared = harness.prepared();
     harness.publish([prepared]);
     await harness.settle();
     expect(harness.starts()).toHaveLength(1);
+    expect(progress).toBe(2);
     expect(executionRisks).toBe(1);
 
     harness.publish([prepared]);
     await harness.settle();
     expect(harness.starts()).toHaveLength(1);
+    expect(progress).toBe(2);
     expect(executionRisks).toBe(1);
     harness.publish([{
       kind: "request_ack",
@@ -336,13 +354,20 @@ describe("R2 prepared/start host boundary", () => {
   it("rejects a mismatched prepared proof before start-risk", async () => {
     const harness = new R2Harness();
     await harness.start();
-    const pending = harness.session.run(BODY);
+    let progress = 0;
+    const pending = harness.session.run(BODY, undefined, {
+      onAdmissionProgress: () => { progress++; },
+    });
     const failed = pending.catch(error => error);
     await harness.settle();
-    harness.publish([harness.prepared({ requestDigest: "f".repeat(64) })]);
+    harness.publish(
+      [harness.prepared({ requestDigest: "f".repeat(64) })],
+      { ackSequence: -1 },
+    );
     await harness.settle();
 
     expect(await failed).toBeInstanceOf(V2PreCommitError);
+    expect(progress).toBe(0);
     expect(harness.starts()).toHaveLength(0);
     expect(harness.session.snapshot().quarantined).toBe(0);
     await harness.close();

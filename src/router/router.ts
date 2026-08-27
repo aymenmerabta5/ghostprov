@@ -4,6 +4,7 @@ import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
   type RoutableSandboxSnapshot,
+  type SandboxRunOptions,
 } from "../sandbox/registry";
 import type { ProjectId } from "../sandbox/types";
 import {
@@ -55,7 +56,33 @@ const PRECOMMIT_RETRY_MAX_MS = 250;
 const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 const PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
+const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
+const MIN_ADMISSION_PROGRESS_FRESHNESS_MS = 5_000;
+const MAX_ADMISSION_PROGRESS_FRESHNESS_MS = 10_000;
 const MAX_TIMER_MS = 2_147_483_647;
+
+/** @internal Deterministic R5 admission-progress policy; exported for timing proofs. */
+export function admissionProgressFreshnessMs(selectedRttMs: number): number {
+  const finiteRttMs = Number.isFinite(selectedRttMs) ? Math.max(0, selectedRttMs) : 0;
+  return Math.min(
+    MAX_ADMISSION_PROGRESS_FRESHNESS_MS,
+    Math.max(MIN_ADMISSION_PROGRESS_FRESHNESS_MS, Math.ceil(4 * finiteRttMs)),
+  );
+}
+
+/** @internal Returns the next bounded progress check, or null when retry is due. */
+export function nextAdmissionProgressCheckAtMs(
+  nowMs: number,
+  absoluteDeadlineMs: number,
+  lastProgressAtMs: number | null,
+  freshnessMs: number,
+): number | null {
+  if (
+    nowMs >= absoluteDeadlineMs || lastProgressAtMs === null ||
+    nowMs - lastProgressAtMs >= freshnessMs
+  ) return null;
+  return Math.min(absoluteDeadlineMs, lastProgressAtMs + freshnessMs);
+}
 
 export interface RequestRoutingTimeouts {
   queueTimeoutMs: number;
@@ -1454,6 +1481,8 @@ export class MultiSandboxRouter {
         selection.incarnationKey,
         selection.retryEpoch,
         candidate.availabilityReason ?? "available",
+        candidate.transportProfile === "bulk-v1",
+        candidate.ackEwmaMs,
       );
       if (candidates.length === 0) return;
     }
@@ -1607,6 +1636,8 @@ export class MultiSandboxRouter {
     selectedIncarnation: string,
     selectedRetryEpoch: number,
     selectedCapacityReason: NonNullable<RoutableSandboxSnapshot["availabilityReason"]>,
+    selectedBulkProfile: boolean,
+    selectedRttMs: number,
   ): Promise<void> {
     const started = this.#clock.now();
     const requestModel = typeof job.body.model === "string"
@@ -1615,8 +1646,17 @@ export class MultiSandboxRouter {
     const admissionController = new AbortController();
     let admissionDeadlineExpired = false;
     let routeAttemptExpired = false;
+    let routeAttemptProgressObserved = false;
+    let routeAttemptProgressAgeMs: number | null = null;
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
     let cancellationProofTimer: ReturnType<typeof setTimeout> | undefined;
+    const progressAwareAttempt = selectedBulkProfile &&
+      job.workload.requestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
+      job.workload.requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES;
+    const progressFreshnessMs = progressAwareAttempt
+      ? admissionProgressFreshnessMs(selectedRttMs)
+      : 0;
+    let admissionProgressAtMs: number | null = null;
     let rejectAdmissionWait!: (error: unknown) => void;
     const admissionWait = new Promise<never>((_resolve, reject) => {
       rejectAdmissionWait = reject;
@@ -1631,6 +1671,51 @@ export class MultiSandboxRouter {
     };
     if (job.signal?.aborted) onCallerAbort();
     else job.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const expireAdmissionAttempt = () => {
+      admissionTimer = undefined;
+      const now = this.#clock.now();
+      if (now >= job.queueDeadlineMs) {
+        admissionDeadlineExpired = true;
+        const error = new RouterCapacityTimeoutError();
+        admissionController.abort(error);
+        cancellationProofTimer = setTimeout(
+          () => rejectAdmissionWait(error),
+          ROUTE_CANCELLATION_PROOF_GRACE_MS,
+        );
+        cancellationProofTimer.unref?.();
+        return;
+      }
+      const nextProgressCheckAtMs = progressAwareAttempt
+        ? nextAdmissionProgressCheckAtMs(
+            now,
+            job.queueDeadlineMs,
+            admissionProgressAtMs,
+            progressFreshnessMs,
+          )
+        : null;
+      if (nextProgressCheckAtMs !== null) {
+        // Do not restart the attempt budget. Check again when this exact proof
+        // becomes stale, always capped by the one public admission deadline.
+        admissionTimer = setTimeout(
+          expireAdmissionAttempt,
+          Math.max(1, Math.ceil(nextProgressCheckAtMs - now)),
+        );
+        admissionTimer.unref?.();
+        return;
+      }
+      routeAttemptExpired = true;
+      routeAttemptProgressObserved = admissionProgressAtMs !== null;
+      routeAttemptProgressAgeMs = admissionProgressAtMs === null
+        ? null
+        : Math.max(0, now - admissionProgressAtMs);
+      const error = new RouterRouteAttemptTimeoutError();
+      admissionController.abort(error);
+      cancellationProofTimer = setTimeout(
+        () => rejectAdmissionWait(error),
+        ROUTE_CANCELLATION_PROOF_GRACE_MS,
+      );
+      cancellationProofTimer.unref?.();
+    };
     const remainingAdmissionMs = job.queueDeadlineMs - this.#clock.now();
     if (admissionController.signal.aborted) {
       // Caller cancellation already owns the outcome.
@@ -1644,28 +1729,7 @@ export class MultiSandboxRouter {
         remainingAdmissionMs,
         job.routeAttemptTimeoutMs,
       );
-      admissionTimer = setTimeout(() => {
-        admissionTimer = undefined;
-        if (this.#clock.now() >= job.queueDeadlineMs) {
-          admissionDeadlineExpired = true;
-          const error = new RouterCapacityTimeoutError();
-          admissionController.abort(error);
-          cancellationProofTimer = setTimeout(
-            () => rejectAdmissionWait(error),
-            ROUTE_CANCELLATION_PROOF_GRACE_MS,
-          );
-          cancellationProofTimer.unref?.();
-        } else {
-          routeAttemptExpired = true;
-          const error = new RouterRouteAttemptTimeoutError();
-          admissionController.abort(error);
-          cancellationProofTimer = setTimeout(
-            () => rejectAdmissionWait(error),
-            ROUTE_CANCELLATION_PROOF_GRACE_MS,
-          );
-          cancellationProofTimer.unref?.();
-        }
-      }, attemptTimeoutMs);
+      admissionTimer = setTimeout(expireAdmissionAttempt, attemptTimeoutMs);
       admissionTimer.unref?.();
     }
     const clearAdmissionDeadline = () => {
@@ -1683,7 +1747,7 @@ export class MultiSandboxRouter {
       // The selected-runtime attempt deadline remains active until V2 reports
       // its irreversible execution fence; an admitted R2 request is still safe
       // to move while request_start has not entered the cumulative window.
-      const runtimeRun = Promise.resolve(runtime.run(job.body, admissionController.signal, {
+      const runOptions: SandboxRunOptions = {
         onAdmissionReflected: () => {
           if (admissionController.signal.aborted) return;
           this.#refreshRuntimeSafely(runtime);
@@ -1694,7 +1758,26 @@ export class MultiSandboxRouter {
           if (admissionController.signal.aborted) return;
           clearAdmissionDeadline();
         },
-      }));
+      };
+      if (progressAwareAttempt) {
+        runOptions.onAdmissionProgress = () => {
+          // Late ACK/prepared callbacks cannot revive an aborted attempt or
+          // move its absolute deadline. Standard, rollback, and <=2 MiB runs
+          // never install this observer or its transport ACK scan.
+          if (
+            admissionController.signal.aborted || routeAttemptExpired ||
+            admissionDeadlineExpired
+          ) return;
+          const now = this.#clock.now();
+          if (now >= job.queueDeadlineMs) return;
+          admissionProgressAtMs = now;
+        };
+      }
+      const runtimeRun = Promise.resolve(runtime.run(
+        job.body,
+        admissionController.signal,
+        runOptions,
+      ));
       // Promise.race installs terminal handlers on runtimeRun. If a broken test
       // seam ignores cancellation, its late rejection remains consumed. V2's
       // abort path synchronously proves pre-execution safety or committed risk
@@ -1890,8 +1973,8 @@ export class MultiSandboxRouter {
           project_id: runtime.projectId,
           route_attempt: job.attempts + 1,
           attempt_ms: Math.max(0, this.#clock.now() - started),
-          progress_observed: false,
-          progress_age_ms: null,
+          progress_observed: routeAttemptProgressObserved,
+          progress_age_ms: routeAttemptProgressAgeMs,
           capacity_reason: selectedCapacityReason,
           transfer_admission_cost: job.admissionCost,
         });

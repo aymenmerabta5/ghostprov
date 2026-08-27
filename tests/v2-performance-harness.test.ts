@@ -481,9 +481,51 @@ describe("V2 deterministic performance harness", () => {
       retransmissions: 0,
     });
     expect(healthy.modeledCommitMs.p95).toBeLessThan(30_000);
+    expect(healthy.modeledCommitMs.max).toBeLessThan(30_000);
+    expect(healthy.requests.filter(request => request.modeledCommitMs >= 30_000)).toHaveLength(0);
     expect(Math.max(...healthy.assignments.map(runtimeIndex => (
       healthy.assignments.filter(value => value === runtimeIndex).length
     )))).toBe(2);
+  }, 60_000);
+
+  it("keeps tiny latency exact in the observed 128 KiB/2.9 MiB eight-runtime mix", async () => {
+    const largeBytes = Math.floor(2.9 * 1024 * 1024);
+    const requestBytesByRequest = Array.from(
+      { length: 14 },
+      (_, index) => index % 2 === 0 ? 128 * 1024 : largeBytes,
+    );
+    const common = {
+      runtimeCount: 8,
+      protocolRevision: "r2" as const,
+      corpus: "incompressible" as const,
+      rttMs: 600,
+      linkBandwidthBytesPerSecond: 400 * 1024,
+      serializationBytesPerSecond: 100 * 1024 * 1024,
+      requestBytes: largeBytes,
+      requestBytesByRequest,
+      timeoutMs: 60_000,
+    };
+    const [standard, bulk] = await Promise.all([
+      runV2FleetPerformanceHarness({ ...common, transportProfile: "standard" }),
+      runV2FleetPerformanceHarness({ ...common, transportProfile: "bulk-v1" }),
+    ]);
+    const tiny = (report: typeof standard) => report.requests.filter(
+      request => request.requestBytes === 128 * 1024,
+    );
+    const standardTiny = tiny(standard);
+    const bulkTiny = tiny(bulk);
+
+    expect(standard.exactRequests && standard.exactTerminals).toBe(true);
+    expect(bulk.exactRequests && bulk.exactTerminals).toBe(true);
+    expect(Math.abs(
+      p95(bulkTiny.map(request => request.modeledCommitMs)) -
+      p95(standardTiny.map(request => request.modeledCommitMs)),
+    )).toBeLessThanOrEqual(0.01);
+    expect(bulkTiny.map(request => request.ackRoundsAtCommit)).toEqual(
+      standardTiny.map(request => request.ackRoundsAtCommit),
+    );
+    expect(bulk.requests.filter(request => request.modeledCommitMs >= 30_000)).toHaveLength(0);
+    expect(bulk.modeledCommitMs.max).toBeLessThan(30_000);
   }, 60_000);
 
   it("keeps tiny p95 exact while accelerating a 24-way 128/512 KiB production-deadline mix", async () => {
@@ -663,3 +705,46 @@ describe("V2 deterministic performance harness", () => {
     expect(report.timings.measuredWall.totalMs.p95).toBeLessThan(10_000);
   }, 60_000);
 });
+
+const capacitySoak = process.env.GP_RUN_V2_CAPACITY_SOAK === "1" ? it : it.skip;
+
+capacitySoak("soaks ten observed 14-agent waves with zero modeled false-capacity timeouts", async () => {
+  const largeBytes = Math.floor(2.9 * 1024 * 1024);
+  const commits: number[] = [];
+  let exactRequests = 0;
+  let exactTerminals = 0;
+  let capacityTimeouts = 0;
+  let retransmissions = 0;
+  for (let wave = 0; wave < 10; wave++) {
+    const report = await runV2FleetPerformanceHarness({
+      runtimeCount: 8,
+      protocolRevision: "r2",
+      transportProfile: "bulk-v1",
+      corpus: "incompressible",
+      rttMs: 600,
+      linkBandwidthBytesPerSecond: 400 * 1024,
+      serializationBytesPerSecond: 100 * 1024 * 1024,
+      requestBytes: largeBytes,
+      requestBytesByRequest: Array.from({ length: 14 }, () => largeBytes),
+      timeoutMs: 60_000,
+    });
+    for (const request of report.requests) {
+      commits.push(request.modeledCommitMs);
+      if (request.exactRequest) exactRequests++;
+      if (request.exactTerminal) exactTerminals++;
+      // Every request proves request-data ACK progress. Under the production
+      // progress policy, only the unchanged absolute deadline can reject it.
+      expect(request.ackRoundsAtCommit).toBeGreaterThan(0);
+      if (request.modeledCommitMs >= 30_000) capacityTimeouts++;
+    }
+    retransmissions += report.retransmissions;
+  }
+
+  expect(commits).toHaveLength(140);
+  expect(exactRequests).toBe(140);
+  expect(exactTerminals).toBe(140);
+  expect(capacityTimeouts).toBe(0);
+  expect(retransmissions).toBe(0);
+  expect(p95(commits)).toBeLessThan(30_000);
+  expect(Math.max(...commits)).toBeLessThan(30_000);
+}, 120_000);

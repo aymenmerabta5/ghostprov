@@ -238,6 +238,8 @@ describe("project documentation", () => {
   it("documents active-flight credits and bounded completion recovery", () => {
     expect(readme).toContain("ACK-stall age starts with the active reliable flight");
     expect(readme).toContain("a fully drained transport restores credits immediately");
+    expect(readme).toContain("a second independent sample two seconds later");
+    expect(readme).toContain("one slow sample never relaunches");
     expect(readme).toContain("completion estimates cap extreme model durations");
     expect(readme).toContain("neutral ten-second baseline every idle minute");
   });
@@ -246,6 +248,9 @@ describe("project documentation", () => {
     expect(readme).toContain("exact bootstrap-bound V2 sidecar");
     expect(readme).toContain("Admission-credit ownership does not end R2 failover");
     expect(readme).toContain("request_start");
+    expect(readme).toContain("four times the selected RTT clamped to 5–10 seconds");
+    expect(readme).toContain("can never extend the unchanged absolute 30-second deadline");
+    expect(readme).toContain("Requests through 2 MiB and standard/R4 rollback retain their exact prior attempt behavior");
     expect(readme).toContain("never duplicated");
   });
 
