@@ -209,3 +209,56 @@ network RTT at supported queue depths. The next useful evidence is a fresh
 post-restart live R5 trace comparing commit, first-event, total, CPU, event-loop,
 and router-capacity timeouts against these deterministic baselines. Do not
 restart or touch the protected port as part of offline research.
+
+## 2026-08-27 - false-capacity remediation below 16 agents - KEEP
+
+Production evidence from the fixed PID 17232 snapshot showed that this was not
+CPU, memory, WebSocket, or configured-agent saturation: 109 of 2,774 accepted
+requests ended in `router_capacity_timeout` (3.93%), while timeout context had
+only 11 active requests at p50. The median timeout nevertheless saw seven of
+eight runtimes availability-zero and four capacity-zero even though most still
+reported lifecycle `ready`. Requests above 2 MiB timed out at 13.03%; their
+successful commit p95 was 14.325 seconds.
+
+The remediation was kept as four separately committed phases:
+
+| Phase | Commit | Evidence | Decision |
+|---|---|---|---|
+| Sanitized bottleneck telemetry and repro | `80210a2` | 3 x 2.9 MiB, 600 ms RTT, 400 KiB/s single-link baseline: 27.942 s p50, 41.913 s p95 | KEEP |
+| Smooth R5 observed-size admission | `24cdacd` | >2-3 MiB costs 2 of 6 transfer units; >3 MiB remains cost 4; R4/standard unchanged | KEEP |
+| Accelerated proven-stall confirmation | `54a65ac` | reliable recovery 20 s -> 12 s; suspect window 10 s -> 2 s; one sample still causes zero relaunches | KEEP |
+| Progress-aware use of the fixed deadline | `b74e423` | fresh data ACK/exact prepared proof retains >2-8 MiB R5 work after 15 s; no progress retries; absolute 30 s unchanged | KEEP |
+
+The deterministic eight-runtime observed-load result is:
+
+| Scenario | Result |
+|---|---:|
+| 14 simultaneous incompressible 2.9 MiB requests | 14 exact requests and terminals |
+| commit p50 / p95 / max | 25.725 / 27.234 / 27.234 s |
+| modeled 30-second capacity timeouts | 0 / 14 |
+| commits after the old destructive 15-second cutoff | 12 / 14 |
+| ten-wave explicit soak | 140 / 140 exact, 0 timeouts, 0 retransmissions |
+| mixed 128 KiB tiny p95, standard / R5 | 2,382.126 / 2,382.124 ms |
+| mixed tiny delta and ACK rounds | -0.00245 ms; 2 vs 2 exact |
+
+No-progress, stale-progress, late-observer, caller-cancellation, 25 ms proof
+fence, execution-risk, standard rollback, and R5-small paths have explicit
+tests. Only newly cumulatively acknowledged `request_data` frames and one exact
+`request_prepared` proof count as progress; malformed and duplicate prepared
+frames do not. Observer exceptions are isolated after authoritative transport
+state changes.
+
+Verification on the integrated candidate: the research comparator was stable;
+the full suite passed 1,640 tests with 3 explicit large/soak opt-ins skipped and
+0 failures; the ten-wave opt-in soak passed separately; the explicit 16 MiB and
+64 MiB gates both passed; the frozen R5 release reproduced byte-for-byte; Deno
+bundle checking passed; and the real Deno journal suite passed 12 with 3
+platform/large opt-ins ignored and 0 failures.
+
+This proves zero false-capacity failures only inside the stated deterministic
+envelope. It does not claim that an external sandbox, network, OS, or provider
+can never fail. The physical test also proves why that distinction matters:
+seven usable 400 KiB/s runtimes keep this 14-request workload below 30 seconds,
+while six produce 39.043 s p95 and four produce 51.378 s p95. Those are true
+capacity shortfalls, not router bugs, and cannot be promised away without more
+usable links, a longer deadline, or a different wire architecture.
