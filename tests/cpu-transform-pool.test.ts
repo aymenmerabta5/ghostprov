@@ -107,6 +107,45 @@ describe("CpuTransformPool", () => {
     expect(workers[0].terminated).toBe(true);
   });
 
+  it("reserves one worker for latency while bulk compression remains backlogged", async () => {
+    const workers: FakeWorker[] = [];
+    const assignments: Array<{ worker: FakeWorker; id: number; value: number }> = [];
+    const pool = new CpuTransformPool({
+      workers: 2,
+      workerFactory: () => {
+        const worker = new FakeWorker((owner, message) => {
+          assignments.push({ worker: owner, id: message.id, value: message.data[0]! });
+        });
+        workers.push(worker);
+        return asWorker(worker);
+      },
+    });
+
+    const bulkOne = pool.gzip(new Uint8Array([1]), { priority: "bulk" });
+    const bulkTwo = pool.gzip(new Uint8Array([2]), { priority: "bulk" });
+    expect(pool.snapshot()).toMatchObject({ active: 1, queued: 1 });
+    expect(assignments.map(value => value.value)).toEqual([1]);
+
+    const latency = pool.gzip(new Uint8Array([3]), { priority: "latency" });
+    expect(pool.snapshot()).toMatchObject({ active: 2, queued: 1 });
+    expect(assignments.map(value => value.value)).toEqual([1, 3]);
+    const latencyAssignment = assignments.find(value => value.value === 3)!;
+    latencyAssignment.worker.result(latencyAssignment.id, new Uint8Array([30]));
+    expect(await latency).toEqual(new Uint8Array([30]));
+    await Promise.resolve();
+    expect(pool.snapshot()).toMatchObject({ active: 1, queued: 1 });
+
+    const firstBulk = assignments.find(value => value.value === 1)!;
+    firstBulk.worker.result(firstBulk.id, new Uint8Array([10]));
+    expect(await bulkOne).toEqual(new Uint8Array([10]));
+    await Promise.resolve();
+    expect(assignments.map(value => value.value)).toEqual([1, 3, 2]);
+    const secondBulk = assignments.find(value => value.value === 2)!;
+    secondBulk.worker.result(secondBulk.id, new Uint8Array([20]));
+    expect(await bulkTwo).toEqual(new Uint8Array([20]));
+    await pool.close();
+  });
+
   it("removes an aborted queued transform without disturbing active work", async () => {
     const pool = new CpuTransformPool({
       workers: 1,

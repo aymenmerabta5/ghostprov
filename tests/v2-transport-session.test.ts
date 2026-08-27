@@ -1,11 +1,15 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { gzipSync } from "fflate";
+import { gunzipSync, gzipSync } from "fflate";
 import type { RunHandle } from "../src/relay/run-handle";
 import { sseFrame } from "../src/relay/sse";
 import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
 import {
   base64UrlEncode,
+  base64UrlDecode,
+  canonicalJson,
+  GP_V2_R1_SCHEMA_VERSION,
+  GP_V2_R2_SCHEMA_VERSION,
   utf8Bytes,
   type AwarenessEnvelope,
   type AwarenessLiveness,
@@ -13,6 +17,7 @@ import {
   type ProtocolBinding,
   type ReliableFrame,
   type SidecarFrame,
+  type V2TransportProfile,
 } from "../src/v2/protocol/shared";
 import { TranscriptProof } from "../src/v2/protocol/transcript";
 import { WeightedFrameScheduler } from "../src/v2/protocol/scheduler";
@@ -29,6 +34,7 @@ import { FakeAwarenessNetwork } from "./support/fake-awareness";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
+import { createExactSizedV2Request } from "./support/v2-performance-harness";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
@@ -40,6 +46,12 @@ const BINDING: ProtocolBinding = {
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
 };
+const R2_BINDING: ProtocolBinding = {
+  ...BINDING,
+  protocolRevision: "r2",
+  launchNonce: "launch-nonce-r2",
+};
+const HOST_INSTANCE_ID = "host-instance-1";
 const BODY = { model: "gpt-5.6-sol", input: "hello", stream: true };
 
 async function promiseState(value: Promise<unknown>): Promise<"pending" | "settled"> {
@@ -122,6 +134,7 @@ class TransportHarness {
   readonly host: AwarenessChannel<HostFrame, SidecarFrame>;
   readonly sidecar: AwarenessChannel<SidecarFrame, HostFrame>;
   readonly session: V2TransportSession;
+  readonly binding: ProtocolBinding;
   readonly hostFrames = new Map<number, ReliableFrame<HostFrame>>();
   readonly hostEnvelopes: AwarenessEnvelope<HostFrame>[] = [];
   readonly sidecarOutstanding: ReliableFrame<SidecarFrame>[] = [];
@@ -155,6 +168,8 @@ class TransportHarness {
     expectedSidecarInstanceId?: string | null;
     eventMemoryPool?: AtomicBytePermitPool;
     transportStallMs?: number;
+    binding?: ProtocolBinding;
+    transportProfile?: V2TransportProfile;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.autoPong = options.autoPong ?? false;
@@ -175,6 +190,7 @@ class TransportHarness {
       ? throwOneReconnectablePublish(selected, options.reconnectableFault)
       : selected;
     this.sidecar = this.network.connectSidecar("sidecar", PROJECT);
+    this.binding = options.binding ?? BINDING;
     this.sidecar.subscribe(update => {
       const envelope = update.envelope;
       this.hostEnvelopes.push(envelope);
@@ -198,7 +214,8 @@ class TransportHarness {
       }
     });
     this.session = new V2TransportSession({
-      binding: BINDING,
+      binding: this.binding,
+      transportProfile: options.transportProfile,
       channel: this.host,
       maxResponseBytes: options.maxResponseBytes ?? 2 * 1024 * 1024,
       maxBufferedResponseBytes: options.maxBufferedResponseBytes,
@@ -210,6 +227,7 @@ class TransportHarness {
       ...(options.expectedSidecarInstanceId === null
         ? {}
         : { expectedSidecarInstanceId: options.expectedSidecarInstanceId ?? "sidecar-instance-1" }),
+      hostInstanceId: HOST_INSTANCE_ID,
       livenessTimeoutMs: options.livenessTimeoutMs,
       eventMemoryPool: options.eventMemoryPool,
       transportStallMs: options.transportStallMs,
@@ -241,16 +259,15 @@ class TransportHarness {
         sequence: this.sidecarSequence++,
       } as ReliableFrame<SidecarFrame>);
     }
-    const envelope: AwarenessEnvelope<SidecarFrame> = {
-      protocol: "gp-awareness-v2",
-      schemaVersion: 1,
-      schemaHash: BINDING.schemaHash,
-      buildHash: BINDING.buildHash,
+    const common = {
+      protocol: "gp-awareness-v2" as const,
+      schemaHash: this.binding.schemaHash,
+      buildHash: this.binding.buildHash,
       projectId: PROJECT,
-      sessionId: BINDING.sessionId,
+      sessionId: this.binding.sessionId,
       peerId: "sidecar",
       instanceId: options.instanceId ?? this.sidecarInstanceId,
-      leaderGeneration: BINDING.leaderGeneration,
+      leaderGeneration: this.binding.leaderGeneration,
       epoch: this.sidecarEpoch,
       revision: options.revision ?? this.revision++,
       ack: { epoch: 1, sequence: options.ackSequence ?? this.hostAck },
@@ -262,6 +279,15 @@ class TransportHarness {
       ...(options.lane ? { lane: options.lane } : {}),
       ...(options.liveness ? { liveness: options.liveness } : {}),
     };
+    const envelope: AwarenessEnvelope<SidecarFrame> = this.binding.protocolRevision === "r2"
+      ? {
+          ...common,
+          schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+          protocolRevision: "r2",
+          launchNonce: this.binding.launchNonce,
+          targetInstanceId: HOST_INSTANCE_ID,
+        }
+      : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
     this.sidecar.publish(envelope);
   }
 
@@ -1021,6 +1047,93 @@ describe("V2TransportSession", () => {
     await Promise.allSettled(pending);
   });
 
+  it("bounds a concurrent 128 KiB request to one standard flight during a 13 MiB bulk transfer", async () => {
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      publicationIntervalMs: 1,
+      unadmittedTimeoutMs: 10_000,
+    });
+    await harness.start();
+    harness.hostEnvelopes.length = 0;
+    const large = harness.session.run(createExactSizedV2Request(
+      13 * 1024 ** 2,
+      1,
+      "incompressible",
+    ));
+    const smallController = new AbortController();
+    let small: Promise<RunHandle> | null = null;
+    try {
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.some(envelope => (
+          envelope.lane === "data" && envelope.frames.length > 32
+        ))
+      ), 10_000);
+      const first = harness.hostEnvelopes.find(envelope => (
+        envelope.lane === "data" && envelope.frames.length > 32
+      ))!;
+      expect(first.frames).toHaveLength(64);
+      expect(first.frames.reduce(
+        (bytes, frame) => bytes + utf8Bytes(JSON.stringify(frame)).byteLength,
+        0,
+      )).toBeGreaterThan(512 * 1024);
+
+      small = harness.session.run(
+        createExactSizedV2Request(128 * 1024, 2, "incompressible"),
+        smallController.signal,
+      );
+      await harness.settleUntil(() => harness.session.snapshot().active === 2, 5_000);
+      const beforeProtectedFlight = harness.hostEnvelopes.filter(
+        envelope => envelope.lane === "data",
+      ).length;
+      harness.publish([], {
+        lane: "control",
+        ackSequence: first.frames.at(-1)!.sequence,
+      });
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.filter(envelope => envelope.lane === "data").length >
+          beforeProtectedFlight
+      ), 5_000);
+      const protectedFlight = harness.hostEnvelopes.filter(
+        envelope => envelope.lane === "data",
+      )[beforeProtectedFlight]!;
+      expect(protectedFlight.frames.length).toBeLessThanOrEqual(32);
+      const smallOpen = protectedFlight.frames.find(
+        (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+          frame.kind === "request_open" && frame.decodedBytes === 128 * 1024
+        ),
+      );
+      expect(smallOpen).toBeDefined();
+      expect(protectedFlight.frames.some(frame => (
+        frame.kind === "request_commit" && frame.requestId === smallOpen!.requestId
+      ))).toBe(true);
+
+      smallController.abort();
+      await expect(small).rejects.toBeInstanceOf(DOMException);
+      await harness.settleUntil(() => harness.session.snapshot().active === 1, 5_000);
+      const beforeBulkResume = harness.hostEnvelopes.filter(
+        envelope => envelope.lane === "data",
+      ).length;
+      harness.publish([], {
+        lane: "control",
+        ackSequence: protectedFlight.frames.at(-1)!.sequence,
+      });
+      await harness.settleUntil(() => (
+        harness.hostEnvelopes.filter(envelope => envelope.lane === "data").length >
+          beforeBulkResume
+      ), 5_000);
+      const resumedBulk = harness.hostEnvelopes.filter(
+        envelope => envelope.lane === "data",
+      )[beforeBulkResume]!;
+      expect(resumedBulk.frames.length).toBeGreaterThan(32);
+      expect(resumedBulk.frames.length).toBeLessThanOrEqual(64);
+    } finally {
+      smallController.abort();
+      await harness.close();
+      await Promise.allSettled(small ? [large, small] : [large]);
+    }
+  }, 30_000);
+
   it("measures ACK RTT from first sequence send instead of a later cumulative publish", async () => {
     const harness = new TransportHarness({ publicationIntervalMs: 1 });
     await harness.start();
@@ -1145,12 +1258,12 @@ describe("V2TransportSession", () => {
     await harness.settle();expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,queued:1});
     await harness.close();await Promise.allSettled(pending);
   });
-  it("admits only one multi-megabyte transfer at a time per sandbox", async () => {
+  it("admits only one multi-megabyte transfer while retaining one ordinary slot", async () => {
     const harness=new TransportHarness();await harness.start();
     const body={...BODY,input:"x".repeat(2*1024*1024)};
     const pending=[harness.session.run(body),harness.session.run(body)];
     await harness.settle();
-    expect(harness.session.snapshot()).toMatchObject({admissionCredits:0,active:1,queued:1});
+    expect(harness.session.snapshot()).toMatchObject({ admissionCredits: 1, active: 1, queued: 1 });
     await harness.commit(pending[0]!);
     await harness.settle();
     expect(harness.session.snapshot()).toMatchObject({active:2,queued:0});
@@ -1752,17 +1865,51 @@ describe("V2TransportSession", () => {
     expect(observedOptions).toEqual({
       signal: controller.signal,
       inputOwnership: "owned",
+      priority: "latency",
     });
     await harness.commit(pending);
     await harness.close();
   });
 
-  it("skips provably useless gzip for one-part and large inline-base64 requests", async () => {
-    for (const body of [{
+  it("skips gzip only for one-part requests", async () => {
+    const body = {
       model: "gpt-5.6-sol",
       input: "tiny",
       stream: true,
-    }, {
+    };
+    let gzipCalls = 0;
+    const harness = new TransportHarness({
+      gzip: async bytes => {
+        gzipCalls++;
+        return gzipSync(bytes);
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run(body);
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
+    const open = [...harness.hostFrames.values()].find(
+      (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+        frame.kind === "request_open"
+      ),
+    )!;
+    expect(open.encoding).toBe("identity");
+    expect(gzipCalls).toBe(0);
+    await harness.commit(pending);
+    await harness.close();
+  });
+
+  it("keeps sub-bulk inline base64 off the compression workers", async () => {
+    let gzipCalls = 0;
+    const harness = new TransportHarness({
+      gzip: async bytes => {
+        gzipCalls++;
+        return gzipSync(bytes);
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run({
       model: "gpt-5.6-sol",
       input: [{
         role: "user",
@@ -1772,29 +1919,88 @@ describe("V2TransportSession", () => {
         }],
       }],
       stream: true,
-    }]) {
-      let gzipCalls = 0;
-      const harness = new TransportHarness({
-        gzip: async bytes => {
-          gzipCalls++;
-          return gzipSync(bytes);
-        },
-      });
-      await harness.start();
-      const pending = harness.session.run(body);
-      await harness.settleUntil(() => (
-        [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
-      ));
-      const open = [...harness.hostFrames.values()].find(
-        (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
-          frame.kind === "request_open"
-        ),
-      )!;
-      expect(open.encoding).toBe("identity");
-      expect(gzipCalls).toBe(0);
-      await harness.commit(pending);
-      await harness.close();
+    });
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
+    expect(gzipCalls).toBe(0);
+    await harness.commit(pending);
+    await harness.close();
+  });
+
+  it("recovers base64 expansion for a large high-entropy inline image", async () => {
+    let state = 0x12345678;
+    const bytes = new Uint8Array(2 * 1024 * 1024);
+    for (let index = 0; index < bytes.length; index++) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      bytes[index] = state & 0xff;
     }
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{
+        role: "user",
+        content: [{
+          type: "input_image",
+          image_url: `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`,
+        }],
+      }],
+      stream: true,
+    };
+    let gzipCalls = 0;
+    const gzipOptions: Array<V2GzipOptions | undefined> = [];
+    const harness = new TransportHarness({
+      gzip: async (input, options) => {
+        gzipCalls++;
+        gzipOptions.push(options);
+        return gzipSync(input, { level: 1 });
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run(body);
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
+    const open = [...harness.hostFrames.values()].find(
+      (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+        frame.kind === "request_open"
+      ),
+    )!;
+    expect(open.encoding).toBe("gzip+base64");
+    expect(open.encodedBytes).toBeLessThan(open.decodedBytes * 0.8);
+    expect(gzipCalls).toBe(2);
+    expect(gzipOptions).toEqual([
+      { inputOwnership: "owned", priority: "bulk", signal: undefined },
+      { inputOwnership: "owned", priority: "bulk", signal: undefined },
+    ]);
+    for (let round = 0; round < 64; round++) {
+      if ([...harness.hostFrames.values()].some(frame => (
+        frame.kind === "request_commit" && frame.requestId === open.requestId
+      ))) break;
+      harness.publish([]);
+      await harness.settle();
+    }
+    expect([...harness.hostFrames.values()].some(frame => (
+      frame.kind === "request_commit" && frame.requestId === open.requestId
+    ))).toBe(true);
+    const data = [...harness.hostFrames.values()]
+      .filter((frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_data" }> => (
+        frame.kind === "request_data" && frame.requestId === open.requestId
+      ))
+      .sort((left, right) => left.partIndex - right.partIndex);
+    expect(data).toHaveLength(open.partCount);
+    expect(data.every((frame, index) => frame.partIndex === index)).toBe(true);
+    const encoded = Buffer.concat(data.map(frame => Buffer.from(
+      base64UrlDecode(frame.dataBase64Url),
+    )));
+    expect(encoded.byteLength).toBe(open.encodedBytes);
+    expect(Buffer.compare(
+      Buffer.from(gunzipSync(encoded)),
+      Buffer.from(utf8Bytes(canonicalJson(body))),
+    )).toBe(0);
+    await harness.commit(pending);
+    await harness.close();
   });
 
   it("uses one bounded sample and skips full gzip when savings are negligible", async () => {

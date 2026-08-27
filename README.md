@@ -301,7 +301,7 @@ journalctl --user -u ghostprov.service -f
 
 Use `restart` only for a rolling code restart with the current startup configuration. After editing `GP_V2_SIDECAR_REVISION`, `GP_V2_SIDECAR_PROJECT_REVISIONS`, project IDs, credentials, or any other `.env` setting, use `config-restart`. It requests a graceful drain of the whole supervisor/fleet, applies the configured bounded fallback if a drain cannot finish, launches a fresh supervisor that reloads `.env`, and on both Windows and Linux waits boundedly for a new descriptor nonce plus matching ready status, supervisor PID, worker PID, start time, and readiness time. A timeout exits nonzero rather than reporting a Type=simple/systemd launch as ready. Windows also reports whether the old process proved a clean drain instead of silently calling a forced stop graceful. Every new sandbox session is acquired inside the same explicitly configured Prism project; this path never creates, adopts, deletes, or silently falls back to another project or protocol revision. Environment variables explicitly supplied by the service manager still take precedence over `.env` and must be updated there as well.
 
-`GP_V2_SIDECAR_REVISION=r4` selects the frozen production release for every configured project. R4 is an implementation release that deliberately keeps the stable R2 wire protocol. `GP_V2_SIDECAR_PROJECT_REVISIONS` accepts only exact configured `project-id=r1|r2|r3|r4` overrides. To roll back, select the pinned `r3`, `r2`, or `r1` release and run `config-restart`—never the rolling `restart`. The old fleet drains first; the replacement uses a **fresh sandbox session in the same existing Prism project**, proves the selected build/schema, and only then becomes routable. There is no in-place sidecar downgrade, protocol fallback, or project creation.
+`GP_V2_SIDECAR_REVISION=r5` selects the frozen production release for every configured project. R5 keeps the fenced R2 frame protocol while negotiating the `bulk-v1` transport profile: small admitted requests retain the exact R4 32-frame/512-KiB host flight, while bulk-only pre-commit transfer may use 64 frames/1 MiB. `GP_V2_SIDECAR_PROJECT_REVISIONS` accepts only exact configured `project-id=r1|r2|r3|r4|r5` overrides. To roll back, select the pinned `r4`, `r3`, `r2`, or `r1` release and run `config-restart`—never the rolling `restart`. The old fleet drains first; the replacement uses a **fresh sandbox session in the same existing Prism project**, proves the selected build/schema/profile, and only then becomes routable. There is no in-place sidecar downgrade, protocol fallback, or project creation.
 
 Before shipping or starting a pinned R2 release, run both independent release gates:
 
@@ -310,7 +310,7 @@ bun run check:v2-sidecar-release
 bun run check:v2-sidecar-deno
 ```
 
-The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and stable R2 wire-schema hash with the checked-in R4 artifact. The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
+The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and R2 `bulk-v1` schema-profile hash with the checked-in R5 artifact. The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
@@ -345,11 +345,11 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8` | Initial transport-safe active request limit |
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
 | `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
-| `GP_V2_SIDECAR_REVISION` | `r4` | Frozen global sidecar release; R4 uses wire protocol R2, while R3/R2/R1 remain explicit rollback choices |
-| `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact configured `project-id=r1|r2|r3|r4` overrides; no wildcard or fallback |
+| `GP_V2_SIDECAR_REVISION` | `r5` | Frozen global sidecar release; R5 uses R2 `bulk-v1`, while R4/R3/R2/R1 remain explicit rollback choices |
+| `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact configured `project-id=r1|r2|r3|r4|r5` overrides; no wildcard or fallback |
 | `GP_MAX_PROJECTS` | `32` minimum | Safety ceiling, not a fixed fleet size |
 | `GP_HEARTBEAT_MS` | `10000` | Exact per-sandbox heartbeat period |
-| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000` | Maximum global wait for any sandbox capacity |
+| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000` | Exact ingress-to-transport admission deadline through 8 MiB; larger payloads scale linearly by size (13 MiB: 53.75 s, 64 MiB: 245 s), while each selected-runtime attempt scales from the unchanged 15 s base |
 | `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216` | Host capacity estimate per active V2 stream |
 | `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912` | Sidecar request/queue admission budget |
 | `GP_V2_YSWEET_REFRESH_MS` | `2700000` | Encrypted reconnect-credential rotation horizon |

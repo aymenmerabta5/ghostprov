@@ -26,12 +26,16 @@ import {
   type SidecarFrame,
   utf8Bytes,
 } from "../src/v2/protocol/shared";
-import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
+import {
+  loadV2SidecarAssets,
+  type V2SidecarRevision,
+} from "../src/v2/sidecar/assets";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
 const R2_ASSETS = await loadV2SidecarAssets({ revision: "r2" });
 const R4_ASSETS = await loadV2SidecarAssets({ revision: "r4" });
+const R5_ASSETS = await loadV2SidecarAssets({ revision: "r5" });
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
@@ -268,7 +272,7 @@ function readyEnvelope(
 
 function bootstrapHarness(
   fault: Fault = "none",
-  revision?: "r1" | "r2" | "r3" | "r4",
+  revision?: V2SidecarRevision,
   maxActivePerSandbox = 8,
   assets = ASSETS,
   controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number } = {},
@@ -366,6 +370,22 @@ describe("V2BootstrapController", () => {
     );
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!))
       .toMatchObject({ revision: "r4", protocolRevision: "r2" });
+  });
+
+  it("binds immutable R5 and bulk-v1 into the exact sidecar static config", async () => {
+    const harness = bootstrapHarness("none", "r5", 8, R5_ASSETS);
+    await expect(harness.controller.ensureReady()).resolves.toMatchObject({
+      protocolRevision: "r2",
+      buildHash: R5_ASSETS.buildHash,
+      schemaHash: R5_ASSETS.schemaHash,
+    });
+    expect(harness.gateway.launchers[0]).toContain(
+      `/workspace/${R5_ASSETS.entrypointPath}`,
+    );
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!))
+      .toMatchObject({ transportProfile: "bulk-v1" });
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!))
+      .toMatchObject({ revision: "r5", protocolRevision: "r2" });
   });
 
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
@@ -613,7 +633,7 @@ describe("V2BootstrapController", () => {
     expect(launcher).toContain("if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner)");
     expect(launcher).toContain("sub gp_exact_r2_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      "/workspace/\\.ghostprov-v2/revisions/r[2345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
     );
     expect(launcher).toContain(
       "gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
@@ -641,7 +661,7 @@ describe("V2BootstrapController", () => {
     );
     expect(launcher).toContain("sub gp_exact_sidecar_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[1234]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      "/workspace/\\.ghostprov-v2/revisions/r[12345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
     );
     expect(launcher).toContain(
       "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint, $gp_static_path, $gp_expected_static)",

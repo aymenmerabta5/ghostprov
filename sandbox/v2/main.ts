@@ -26,6 +26,7 @@ import {
 import {
   AtomicBytePermitPool,
 } from "../../src/v2/memory/atomic-byte-permits.ts";
+import type { V2TransportProfile } from "../../src/v2/protocol/shared.ts";
 import { deriveV2SidecarEventMemorySizing } from "../../src/v2/memory/event-memory-sizing.ts";
 import {
   V2_TERMINAL_SPOOL_CAPACITY,
@@ -43,6 +44,7 @@ interface StaticSidecarConfig {
   initialActivePerSandbox: number;
   maxActivePerSandbox: number;
   memoryBudgetBytes: number;
+  transportProfile: V2TransportProfile;
   diagnostics: { enabled: boolean; intervalMs: number };
   batching: boolean;
 }
@@ -69,6 +71,7 @@ function readConfig(value: unknown): StaticSidecarConfig {
     (raw.maxActivePerSandbox as number) > V2_TERMINAL_SPOOL_CAPACITY ||
     !Number.isInteger(raw.memoryBudgetBytes) ||
     (raw.memoryBudgetBytes as number) < 64 * 1024 * 1024 ||
+    (raw.transportProfile !== "standard" && raw.transportProfile !== "bulk-v1") ||
     !raw.diagnostics || typeof raw.diagnostics !== "object" ||
     typeof (raw.diagnostics as any).enabled !== "boolean" ||
     !Number.isInteger((raw.diagnostics as any).intervalMs) ||
@@ -83,6 +86,7 @@ function readConfig(value: unknown): StaticSidecarConfig {
     initialActivePerSandbox: raw.initialActivePerSandbox as number,
     maxActivePerSandbox: raw.maxActivePerSandbox as number,
     memoryBudgetBytes: raw.memoryBudgetBytes as number,
+    transportProfile: raw.transportProfile as V2TransportProfile,
     diagnostics: raw.diagnostics as StaticSidecarConfig["diagnostics"],
     batching: raw.batching as boolean,
   };
@@ -299,6 +303,7 @@ async function run(): Promise<void> {
     peer = new DenoAwarenessPeer({
       credential: bootstrap.credential,
       binding,
+      transportProfile: config.transportProfile,
       instanceId,
       engine,
       diagnostics: diagnosticObserver,

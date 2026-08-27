@@ -28,6 +28,8 @@ export interface CpuTransformJobOptions {
   signal?: AbortSignal;
   /** Total time in the queue and worker. */
   timeoutMs?: number;
+  /** Latency work may use every worker; bulk work leaves one worker reserved. */
+  priority?: "latency" | "bulk";
 }
 
 export interface CpuTransformPoolOptions {
@@ -68,6 +70,7 @@ interface Job {
   onAbort?: () => void;
   timer?: ReturnType<typeof setTimeout>;
   settled: boolean;
+  priority: "latency" | "bulk";
 }
 
 interface WorkerState {
@@ -180,9 +183,11 @@ export class CpuTransformPool {
       return Promise.reject(error);
     }
 
-    const willQueue = !this.#states.some(
-      state => state.worker !== null && !state.retiring && state.job === null,
-    );
+    const priority = options.priority ?? "latency";
+    if (priority !== "latency" && priority !== "bulk") {
+      return Promise.reject(new RangeError("CPU transform priority is invalid"));
+    }
+    const willQueue = !this.#hasImmediateWorker(priority);
     if (willQueue && (
       this.#queue.length >= this.#maxQueued ||
       this.#queuedBytes + data.byteLength > this.#maxQueuedBytes
@@ -205,6 +210,7 @@ export class CpuTransformPool {
         reject,
         signal: options.signal,
         settled: false,
+        priority,
       };
       job.onAbort = () => this.#cancel(job, abortError(options.signal!));
       options.signal?.addEventListener("abort", job.onAbort, { once: true });
@@ -212,7 +218,13 @@ export class CpuTransformPool {
         () => this.#cancel(job, new CpuTransformTimeoutError(timeoutMs)),
         timeoutMs,
       );
-      this.#queue.push(job);
+      if (priority === "latency") {
+        const firstBulk = this.#queue.findIndex(queued => queued.priority === "bulk");
+        if (firstBulk < 0) this.#queue.push(job);
+        else this.#queue.splice(firstBulk, 0, job);
+      } else {
+        this.#queue.push(job);
+      }
       this.#queuedBytes += ownedData.byteLength;
       this.#dispatch();
     });
@@ -357,6 +369,33 @@ export class CpuTransformPool {
     }, delayMs);
   }
 
+  #hasImmediateWorker(priority: "latency" | "bulk"): boolean {
+    const last = this.#states.length - 1;
+    return this.#states.some((state, index) => (
+      state.worker !== null && !state.retiring && state.job === null &&
+      (priority === "latency" || this.#states.length === 1 || index < last)
+    ));
+  }
+
+  #takeNextJob(workerIndex: number): Job | undefined {
+    if (this.#queue.length === 0) return undefined;
+    const latency = this.#queue.findIndex(job => job.priority === "latency");
+    const bulk = this.#queue.findIndex(job => job.priority === "bulk");
+    let selected = -1;
+    if (this.#states.length === 1) {
+      selected = latency >= 0 ? latency : bulk;
+    } else if (workerIndex === this.#states.length - 1) {
+      // Keep one physical worker immediately available to interactive work.
+      selected = latency;
+    } else {
+      // Bulk owns the non-reserved workers while backlogged; otherwise latency
+      // may use the entire pool rather than paying for an artificial partition.
+      selected = bulk >= 0 ? bulk : latency;
+    }
+    if (selected < 0) return undefined;
+    return this.#queue.splice(selected, 1)[0];
+  }
+
   #dispatch(): void {
     if (this.#closed) return;
     if (this.#dispatching) {
@@ -367,11 +406,12 @@ export class CpuTransformPool {
     try {
       do {
         this.#dispatchRequested = false;
-        for (const state of this.#states) {
+        for (let workerIndex = 0; workerIndex < this.#states.length; workerIndex++) {
+          const state = this.#states[workerIndex]!;
           const worker = state.worker;
           if (!worker || state.retiring || state.job) continue;
-          const job = this.#queue.shift();
-          if (!job) break;
+          const job = this.#takeNextJob(workerIndex);
+          if (!job) continue;
           this.#queuedBytes -= job.data.byteLength;
           state.job = job;
           const active = this.#states.reduce((count, value) => count + (value.job ? 1 : 0), 0);

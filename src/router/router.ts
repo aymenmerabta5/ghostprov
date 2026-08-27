@@ -54,6 +54,64 @@ const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
 const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
+const PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
+const MAX_TIMER_MS = 2_147_483_647;
+
+export interface RequestRoutingTimeouts {
+  queueTimeoutMs: number;
+  routeAttemptTimeoutMs: number;
+}
+
+function scaledRouteAttemptTimeoutMs(requestBytes: number, baseTimeoutMs: number): number {
+  if (requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
+  return Math.min(
+    MAX_TIMER_MS,
+    Math.ceil(baseTimeoutMs * (requestBytes / PAYLOAD_AWARE_DEADLINE_BYTES)),
+  );
+}
+
+function scaledQueueTimeoutMs(requestBytes: number, baseTimeoutMs: number): number {
+  if (requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
+  const scale = requestBytes / PAYLOAD_AWARE_DEADLINE_BYTES;
+  const failoverSlackMs = Math.max(1, Math.ceil(baseTimeoutMs / 6));
+  return Math.min(
+    MAX_TIMER_MS,
+    Math.ceil(baseTimeoutMs * scale) + failoverSlackMs,
+  );
+}
+
+/**
+ * Keep the established deadlines byte-for-byte for requests through 8 MiB.
+ * Above that boundary, scale by payload size so a legal 64 MiB transfer gets
+ * enough ACK rounds even on a 400 ms link. The global deadline retains one-sixth
+ * of its base as failover slack beyond two normal 15-second attempts.
+ */
+export function requestRoutingTimeouts(
+  requestBytes: number,
+  baseQueueTimeoutMs: number,
+  baseRouteAttemptTimeoutMs: number,
+): RequestRoutingTimeouts {
+  if (!Number.isSafeInteger(requestBytes) || requestBytes < 0) {
+    throw new RangeError("requestBytes must be a non-negative safe integer");
+  }
+  for (const [label, value] of [
+    ["baseQueueTimeoutMs", baseQueueTimeoutMs],
+    ["baseRouteAttemptTimeoutMs", baseRouteAttemptTimeoutMs],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMER_MS) {
+      throw new RangeError(`${label} must be between 1 and ${MAX_TIMER_MS}`);
+    }
+  }
+  if (baseRouteAttemptTimeoutMs > baseQueueTimeoutMs) {
+    throw new RangeError("baseRouteAttemptTimeoutMs must not exceed baseQueueTimeoutMs");
+  }
+  const routeAttemptTimeoutMs = scaledRouteAttemptTimeoutMs(
+    requestBytes,
+    baseRouteAttemptTimeoutMs,
+  );
+  const queueTimeoutMs = scaledQueueTimeoutMs(requestBytes, baseQueueTimeoutMs);
+  return Object.freeze({ queueTimeoutMs, routeAttemptTimeoutMs });
+}
 
 interface ClientLane {
   readonly key: string;
@@ -139,6 +197,7 @@ interface QueuedJob {
   queuedAtMs: number;
   queueWaitMs: number;
   queueDeadlineMs: number;
+  routeAttemptTimeoutMs: number;
   queueClass: RouterQueueClass;
   fairCostBytes: number;
   admissionCost: number;
@@ -392,7 +451,11 @@ export class MultiSandboxRouter {
     this.#slowRequestMs = options.observability?.slowRequestMs ?? 10_000;
     this.#transport = options.observability?.transport ?? "unknown";
     this.#queueTimeoutMs = options.queueTimeoutMs ?? 30_000;
-    if (!Number.isSafeInteger(this.#queueTimeoutMs) || this.#queueTimeoutMs < 1) {
+    if (
+      !Number.isSafeInteger(this.#queueTimeoutMs) ||
+      this.#queueTimeoutMs < 1 ||
+      this.#queueTimeoutMs > MAX_TIMER_MS
+    ) {
       throw new RangeError("queueTimeoutMs must be a positive safe integer");
     }
     this.#routeAttemptTimeoutMs = options.routeAttemptTimeoutMs ?? Math.min(
@@ -402,6 +465,7 @@ export class MultiSandboxRouter {
     if (
       !Number.isSafeInteger(this.#routeAttemptTimeoutMs) ||
       this.#routeAttemptTimeoutMs < 1 ||
+      this.#routeAttemptTimeoutMs > MAX_TIMER_MS ||
       this.#routeAttemptTimeoutMs > this.#queueTimeoutMs
     ) {
       throw new RangeError(
@@ -460,10 +524,6 @@ export class MultiSandboxRouter {
       ? inheritedAcceptedAtMs
       : now;
     const inheritedDeadlineMs = options.incomingLease?.deadlineMs;
-    const admissionDeadlineMs = typeof inheritedDeadlineMs === "number" &&
-        Number.isFinite(inheritedDeadlineMs) && inheritedDeadlineMs >= acceptedAtMs
-      ? inheritedDeadlineMs
-      : acceptedAtMs + this.#queueTimeoutMs;
     const traceId = this.#random.uuid();
     const source = options.source ?? "internal";
     const imageGeneration = usesImageGeneration(body);
@@ -492,6 +552,16 @@ export class MultiSandboxRouter {
             encodedBodyBytes + (injectFastTier ? 64 : 0),
           ),
         });
+    const queueTimeoutMs = scaledQueueTimeoutMs(workload.requestBytes, this.#queueTimeoutMs);
+    const routeAttemptTimeoutMs = scaledRouteAttemptTimeoutMs(
+      workload.requestBytes,
+      this.#routeAttemptTimeoutMs,
+    );
+    const payloadDeadlineMs = acceptedAtMs + queueTimeoutMs;
+    const admissionDeadlineMs = typeof inheritedDeadlineMs === "number" &&
+        Number.isFinite(inheritedDeadlineMs) && inheritedDeadlineMs >= acceptedAtMs
+      ? Math.max(inheritedDeadlineMs, payloadDeadlineMs)
+      : payloadDeadlineMs;
     // Multipart image input and its base64 relay representation remain live
     // together until the compatibility request finishes. The first fan-out
     // job receives the one-shot ingress lease and conservatively reserves both
@@ -611,6 +681,7 @@ export class MultiSandboxRouter {
         // accepted; governor wait, fair queueing, safe failover, preparation,
         // and transport admission cannot each restart it.
         queueDeadlineMs: admissionDeadlineMs,
+        routeAttemptTimeoutMs,
         queueClass: queueClassFor(workload),
         fairCostBytes: fairCostBytes(workload),
         admissionCost: transferAdmissionCost,
@@ -673,7 +744,7 @@ export class MultiSandboxRouter {
       throw new RangeError("Incoming body reservation exceeds its structural maximum");
     }
     const acceptedAtMs = this.#clock.now();
-    const deadlineMs = acceptedAtMs + this.#queueTimeoutMs;
+    let deadlineMs = acceptedAtMs + scaledQueueTimeoutMs(bytes, this.#queueTimeoutMs);
     const controller = new AbortController();
     const tracker: IncomingRequestTracker = { controller };
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -681,6 +752,16 @@ export class MultiSandboxRouter {
     let lease: ResourceLease | null = null;
     let observedBodyBytes = bytes;
     const onCallerAbort = () => controller.abort(signal?.reason ?? abortError());
+    const armDeadline = () => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      deadlineTimer = setTimeout(() => {
+        deadlineTimer = undefined;
+        controller.abort(new RouterCapacityTimeoutError(
+          "Request body was not received before the routing deadline",
+        ));
+      }, Math.max(0, deadlineMs - this.#clock.now()));
+      deadlineTimer.unref?.();
+    };
     const cleanup = () => {
       if (!active) return;
       active = false;
@@ -691,13 +772,7 @@ export class MultiSandboxRouter {
     };
     if (signal?.aborted) onCallerAbort();
     else signal?.addEventListener("abort", onCallerAbort, { once: true });
-    deadlineTimer = setTimeout(() => {
-      deadlineTimer = undefined;
-      controller.abort(new RouterCapacityTimeoutError(
-        "Request body was not received before the routing deadline",
-      ));
-    }, Math.max(0, deadlineMs - this.#clock.now()));
-    deadlineTimer.unref?.();
+    armDeadline();
     this.#incomingRequests.add(tracker);
 
     const incomingWorkload = (
@@ -730,7 +805,7 @@ export class MultiSandboxRouter {
       get reservedBytes() { return lease?.reservedBytes ?? 0; },
       get bodyBytes() { return observedBodyBytes; },
       acceptedAtMs,
-      deadlineMs,
+      get deadlineMs() { return deadlineMs; },
       signal: controller.signal,
       ensureBytes: async nextBytes => {
         if (!Number.isSafeInteger(nextBytes) || nextBytes < 0) {
@@ -738,6 +813,16 @@ export class MultiSandboxRouter {
         }
         if (!active || !lease) throw new Error("Incoming body lease is no longer active");
         observedBodyBytes = Math.max(observedBodyBytes, nextBytes);
+        if (observedBodyBytes > PAYLOAD_AWARE_DEADLINE_BYTES) {
+          const nextDeadlineMs = acceptedAtMs + scaledQueueTimeoutMs(
+            observedBodyBytes,
+            this.#queueTimeoutMs,
+          );
+          if (nextDeadlineMs > deadlineMs) {
+            deadlineMs = nextDeadlineMs;
+            armDeadline();
+          }
+        }
         const required = incomingWorkload(nextBytes).reservedBytes;
         if (required <= lease.reservedBytes) return;
         const maximum = maxBytes === undefined
@@ -753,11 +838,19 @@ export class MultiSandboxRouter {
       replace: async (workload, replacementSignal, options) => {
         if (!active || !lease) throw new Error("Incoming body lease is no longer active");
         if (replacementSignal?.aborted) throw replacementSignal.reason ?? abortError();
+        const maximumDeadline = acceptedAtMs + scaledQueueTimeoutMs(
+          workload.requestBytes,
+          this.#queueTimeoutMs,
+        );
         const requestedDeadline = options?.deadlineMs;
         const effectiveDeadline = typeof requestedDeadline === "number" &&
             Number.isFinite(requestedDeadline)
-          ? Math.min(deadlineMs, requestedDeadline)
-          : deadlineMs;
+          ? Math.min(maximumDeadline, requestedDeadline)
+          : maximumDeadline;
+        // Body collection is complete before production calls replace(). The
+        // replacement governor wait now owns its payload-aware deadline.
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
         const replacement = await lease.replace(
           workload,
           controller.signal,
@@ -1531,7 +1624,7 @@ export class MultiSandboxRouter {
     } else {
       const attemptTimeoutMs = Math.min(
         remainingAdmissionMs,
-        this.#routeAttemptTimeoutMs,
+        job.routeAttemptTimeoutMs,
       );
       admissionTimer = setTimeout(() => {
         admissionTimer = undefined;

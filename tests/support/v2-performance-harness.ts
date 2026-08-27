@@ -40,6 +40,7 @@ import {
   type ReliableFrame,
   type RequestEncoding,
   type SidecarFrame,
+  type V2TransportProfile,
 } from "../../src/v2/protocol/shared";
 import { AdmissionController } from "../../src/v2/sidecar/admission";
 import { RequestAssembler } from "../../src/v2/sidecar/assembler";
@@ -106,6 +107,7 @@ export interface V2HarnessTransientDisconnect {
 export interface V2PerformanceHarnessOptions {
   /** Defaults to R2. R1 selects source-level wire limits, not the frozen bundle. */
   protocolRevision?: ProtocolRevision;
+  transportProfile?: V2TransportProfile;
   rttMs: number;
   requestBytes: number;
   concurrency: number;
@@ -191,6 +193,7 @@ export interface V2PerformanceHarnessReport {
   /** This harness executes mutable TypeScript production components. */
   implementation: "mutable-source-components";
   protocolRevision: ProtocolRevision;
+  transportProfile: V2TransportProfile;
   corpus: V2PerformanceCorpus;
   rttMs: number;
   requestBytes: number;
@@ -893,12 +896,13 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       ? 5
       : Math.max(1_000, Math.ceil(options.requestBytes / MiB) * 500);
     const protocolRevision = options.protocolRevision ?? "r2";
+    const transportProfile = options.transportProfile ?? "standard";
     const bindingBase = {
       projectId: PROJECT,
       sessionId: "sandbox-session-perf",
       leaderGeneration: 7,
       buildHash: "a".repeat(64),
-      schemaHash: await protocolSchemaHash(protocolRevision),
+      schemaHash: await protocolSchemaHash(protocolRevision, transportProfile),
       launchNonce: LAUNCH_NONCE,
     };
     const binding: ProtocolBinding = protocolRevision === "r2"
@@ -922,7 +926,12 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       envelope: ySweet,
       localPeerId: `host:${lane}`,
       field,
-      parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+      parseRemote: value => parseAwarenessEnvelope(
+        value,
+        binding,
+        "sidecar",
+        transportProfile,
+      ),
       providerFactory: doc => hub.create(doc, "host", lane),
       syncTimeoutMs: 1_000,
     });
@@ -932,6 +941,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     });
     const session = new V2TransportSession({
       binding,
+      transportProfile,
       channel,
       clock,
       maxResponseBytes: 2 * MiB,
@@ -1011,6 +1021,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     peer = new DenoAwarenessPeer({
       credential,
       binding,
+      transportProfile,
       instanceId: SIDECAR_INSTANCE,
       engine,
       diagnostics,
@@ -1356,6 +1367,16 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
   ) {
     throw new RangeError("corpus is invalid");
   }
+  if (
+    options.transportProfile !== undefined &&
+    options.transportProfile !== "standard" &&
+    options.transportProfile !== "bulk-v1"
+  ) {
+    throw new RangeError("transportProfile is invalid");
+  }
+  if (options.protocolRevision === "r1" && options.transportProfile === "bulk-v1") {
+    throw new RangeError("bulk-v1 requires R2");
+  }
   for (const [label, value] of [
     ["linkBandwidthBytesPerSecond", options.linkBandwidthBytesPerSecond],
     ["serializationBytesPerSecond", options.serializationBytesPerSecond],
@@ -1596,6 +1617,7 @@ export async function runV2PerformanceHarness(
     return {
       implementation: "mutable-source-components",
       protocolRevision: options.protocolRevision ?? "r2",
+      transportProfile: options.transportProfile ?? "standard",
       corpus,
       rttMs: options.rttMs,
       requestBytes: options.requestBytes,

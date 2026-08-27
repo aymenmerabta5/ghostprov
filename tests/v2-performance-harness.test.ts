@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
-  GP_V2_WINDOW_MAX_BYTES,
-  GP_V2_WINDOW_MAX_FRAMES,
   canonicalJson,
+  protocolTransportLimits,
   utf8Bytes,
 } from "../src/v2/protocol/shared";
 import {
@@ -22,6 +21,10 @@ function expectExactAndBounded(
   report: V2PerformanceHarnessReport,
   expectedEventCount = 2,
 ): void {
+  const limits = protocolTransportLimits(
+    report.protocolRevision,
+    report.transportProfile,
+  );
   expect(report.requests).toHaveLength(report.concurrency);
   expect(report.upstream.calls).toBe(report.concurrency);
   expect(report.upstream.maxActive).toBe(report.concurrency);
@@ -43,16 +46,16 @@ function expectExactAndBounded(
   expect(report.wire.postCompressionRequestBytes).toBeGreaterThan(0);
   expect(report.wire.attemptedBytes).toBeGreaterThan(report.wire.postCompressionRequestBytes);
   expect(report.transport.peaks.hostWindowFrames).toBeLessThanOrEqual(
-    GP_V2_WINDOW_MAX_FRAMES,
+    limits.windowMaxFrames,
   );
   expect(report.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(
-    GP_V2_WINDOW_MAX_BYTES,
+    limits.windowMaxBytes,
   );
   expect(report.transport.peaks.sidecarWindowFrames).toBeLessThanOrEqual(
-    GP_V2_WINDOW_MAX_FRAMES,
+    limits.windowMaxFrames,
   );
   expect(report.transport.peaks.sidecarWindowBytes).toBeLessThanOrEqual(
-    GP_V2_WINDOW_MAX_BYTES,
+    limits.windowMaxBytes,
   );
   expect(report.transport.sidecar).not.toBeNull();
   if (report.transport.retransmissions === 0) {
@@ -275,9 +278,53 @@ describe("V2 deterministic performance harness", () => {
     expect(report.wire.droppedUpdates).toBe(0);
   }, 30_000);
 
-  it("preserves a 3.35 MiB R2 request across disconnect, loss, duplicate, and reorder faults", async () => {
+  it("cuts a real-world 13 MiB request below ten seconds without changing the small R2 flight", async () => {
+    const standardSmall = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      corpus: "incompressible",
+      rttMs: 400,
+      requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.kib128,
+      concurrency: 1,
+    });
+    const acceleratedSmall = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      corpus: "incompressible",
+      rttMs: 400,
+      requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.kib128,
+      concurrency: 1,
+      transportProfile: "bulk-v1",
+    });
+    const acceleratedLarge = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      corpus: "incompressible",
+      rttMs: 400,
+      requestBytes: 13 * 1024 * 1024,
+      concurrency: 1,
+      maxAggregateRequestBytes: 16 * 1024 * 1024,
+      timeoutMs: 120_000,
+      transportProfile: "bulk-v1",
+    });
+
+    expectExactAndBounded(standardSmall);
+    expectExactAndBounded(acceleratedSmall);
+    expectExactAndBounded(acceleratedLarge);
+    expect(acceleratedSmall.requests[0]!.ackRoundsAtCommit)
+      .toBe(standardSmall.requests[0]!.ackRoundsAtCommit);
+    expect(acceleratedSmall.wire.uniqueRequestDataBytes)
+      .toBe(standardSmall.wire.uniqueRequestDataBytes);
+    expect(Math.abs(
+      acceleratedSmall.timings.modeledLink.commitMs.p50 -
+      standardSmall.timings.modeledLink.commitMs.p50,
+    )).toBeLessThanOrEqual(0.001);
+    expect(acceleratedLarge.timings.modeledLink.commitMs.p50).toBeLessThan(10_000);
+    expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
+    expect(acceleratedLarge.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(1024 * 1024);
+  }, 30_000);
+
+  it("preserves a 3.35 MiB R5 bulk request across disconnect, loss, duplicate, and reorder faults", async () => {
     const report = await runV2PerformanceHarness({
       protocolRevision: "r2",
+      transportProfile: "bulk-v1",
       corpus: "incompressible",
       rttMs: 300,
       requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.mib3_35,
@@ -312,11 +359,13 @@ describe("V2 deterministic performance harness", () => {
     expect(report.wire.duplicateDeliveries).toBe(1);
     expect(report.wire.reorderedUpdates).toBe(1);
     expect(report.transport.retransmissions).toBeGreaterThanOrEqual(3);
+    expect(report.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
   }, 45_000);
 
-  it("rotates the credential while a 3.35 MiB R2 request is in transport", async () => {
+  it("rotates the credential while a 3.35 MiB R5 bulk request is in transport", async () => {
     const report = await runV2PerformanceHarness({
       protocolRevision: "r2",
+      transportProfile: "bulk-v1",
       corpus: "incompressible",
       rttMs: 300,
       requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.mib3_35,
@@ -329,6 +378,7 @@ describe("V2 deterministic performance harness", () => {
     expect(report.operations.credentialRotations).toBe(1);
     expect(report.upstream.calls).toBe(1);
     expect(report.transport.retransmissions).toBe(0);
+    expect(report.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
   }, 45_000);
 
   it("survives loss, duplication, update reordering, and a transient disconnect exactly once", async () => {
@@ -367,17 +417,33 @@ describe("V2 deterministic performance harness", () => {
     expect(report.wire.reorderedUpdates).toBe(1);
   }, 30_000);
 
-  it("dispatches 1/4/16/32/40 Sol requests without a provider concurrency gate", async () => {
+  it("dispatches 1/4/16/32/40 Sol requests identically under standard and bulk-v1", async () => {
     for (const concurrency of V2_PERFORMANCE_CONCURRENCY) {
-      const report = await runV2PerformanceHarness({
+      const standard = await runV2PerformanceHarness({
         rttMs: 50,
         requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.kib128,
         concurrency,
       });
-      expectExactAndBounded(report);
+      const bulk = await runV2PerformanceHarness({
+        protocolRevision: "r2",
+        transportProfile: "bulk-v1",
+        rttMs: 50,
+        requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.kib128,
+        concurrency,
+      });
+      expectExactAndBounded(standard);
+      expectExactAndBounded(bulk);
       // The upstream gate is held until every request arrives. Reaching this
       // exact maximum proves no model-wide 16-request gate delayed dispatch.
-      expect(report.upstream.maxActive).toBe(concurrency);
+      expect(standard.upstream.maxActive).toBe(concurrency);
+      expect(bulk.upstream.maxActive).toBe(concurrency);
+      expect(bulk.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(512 * 1024);
+      expect(bulk.wire.uniqueRequestDataBytes).toBe(standard.wire.uniqueRequestDataBytes);
+      expect(bulk.requests.map(request => request.ackRoundsAtCommit).sort((a, b) => a - b))
+        .toEqual(standard.requests.map(request => request.ackRoundsAtCommit).sort((a, b) => a - b));
+      expect(Math.abs(
+        bulk.timings.modeledLink.commitMs.p95 - standard.timings.modeledLink.commitMs.p95,
+      )).toBeLessThanOrEqual(0.01);
     }
   }, 60_000);
 

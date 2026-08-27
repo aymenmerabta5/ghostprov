@@ -8,6 +8,7 @@ import type {
 import {
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
+  GP_V2_R2_TRANSPORT_LIMITS,
   awarenessEnvelopeEncodedBytes,
   base64UrlDecode,
   base64UrlEncode,
@@ -29,6 +30,7 @@ import {
   type SidecarFrame,
   type UpstreamPrelude,
   type V2ProtocolTransportLimits,
+  type V2TransportProfile,
 } from "../protocol/shared";
 import { AckClockedFlight } from "../protocol/flight";
 import { WeightedFrameScheduler } from "../protocol/scheduler";
@@ -58,6 +60,7 @@ import {
 } from "./run-handle";
 import { createNativeTranscriptHasher } from "./native-transcript-hasher";
 import {
+  V2_BULK_TRANSFER_COST,
   V2_HOST_TRANSFER_BUDGET,
   v2RequestTransferCost,
 } from "./admission-cost";
@@ -78,6 +81,7 @@ const R1_REQUEST_PART_BYTES = 8 * 1024;
 const R2_REQUEST_PART_BYTES = 11 * 1024;
 const MIN_GZIP_SAVINGS_RATIO = 0.05;
 const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
+const BULK_GZIP_MIN_BYTES = 2 * 1024 * 1024;
 const GZIP_SAMPLE_BYTES = 64 * 1024;
 const DEFAULT_TRANSPORT_STALL_MS = 2_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
@@ -149,6 +153,7 @@ export interface V2GzipOptions {
   signal?: AbortSignal;
   /** The supplied view is a disposable, complete buffer owned by the caller. */
   inputOwnership?: "owned";
+  priority?: "latency" | "bulk";
 }
 
 export interface V2TransportRunOptions {
@@ -160,6 +165,7 @@ export interface V2TransportRunOptions {
 
 export interface V2TransportSessionOptions {
   binding: ProtocolBinding;
+  transportProfile?: V2TransportProfile;
   channel: AwarenessChannel<HostFrame, SidecarFrame>;
   clock?: Clock;
   gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
@@ -255,6 +261,7 @@ interface RequestState {
   onExecutionRiskReflected?: () => void;
   admitted: boolean;
   transferCost: number;
+  smallPreCommitTracked: boolean;
   published: boolean;
   commitStaged: boolean;
   commitPublished: boolean;
@@ -463,6 +470,7 @@ function strongestUrgency(
 export class V2TransportSession {
   readonly #binding: ProtocolBinding;
   readonly #limits: V2ProtocolTransportLimits;
+  readonly #transportProfile: V2TransportProfile;
   readonly #channel: AwarenessChannel<HostFrame, SidecarFrame>;
   readonly #clock: Clock;
   readonly #gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
@@ -478,8 +486,8 @@ export class V2TransportSession {
   readonly #expectedSidecarInstanceId: string | null;
   readonly #livenessTimeoutMs: number;
   readonly #hostInstanceId: string;
-  readonly #outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
-  readonly #inbound = new InboundFrameCursor<SidecarFrame>({ epoch: 1 });
+  readonly #outbound: OutboundFrameWindow<HostFrame>;
+  readonly #inbound: InboundFrameCursor<SidecarFrame>;
   #processedInboundAck = { epoch: 1, sequence: -1 };
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
   readonly #delivery: ReliableDeliveryTiming;
@@ -523,6 +531,7 @@ export class V2TransportSession {
   #remoteCredits = 0;
   #creditReservations = 0;
   #transferReservations = 0;
+  #smallPreCommitTransfers = 0;
   #quarantined = 0;
   #ambiguousQuarantined = 0;
   #retransmissions = 0;
@@ -610,7 +619,19 @@ export class V2TransportSession {
       throw new RangeError("livenessTimeoutMs must be a positive safe integer");
     }
     this.#binding = options.binding;
-    this.#limits = protocolTransportLimits(options.binding.protocolRevision);
+    this.#transportProfile = options.transportProfile ?? "standard";
+    this.#limits = protocolTransportLimits(
+      options.binding.protocolRevision,
+      this.#transportProfile,
+    );
+    this.#outbound = new OutboundFrameWindow<HostFrame>({
+      epoch: 1,
+      limits: this.#limits,
+    });
+    this.#inbound = new InboundFrameCursor<SidecarFrame>({
+      epoch: 1,
+      limits: this.#limits,
+    });
     this.#channel = options.channel;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#gzip = options.gzip;
@@ -847,6 +868,7 @@ export class V2TransportSession {
       onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes),
+      smallPreCommitTracked: false,
       published: false,
       commitStaged: false,
       commitPublished: false,
@@ -1026,6 +1048,7 @@ export class V2TransportSession {
     }
     this.#creditReservations = 0;
     this.#transferReservations = 0;
+    this.#smallPreCommitTransfers = 0;
     for (const [requestId, receipt] of this.#terminalReceipts) {
       this.#scheduler.removeStream(requestId);
       receipt.queued = false;
@@ -1841,6 +1864,7 @@ export class V2TransportSession {
           return;
         }
         if (state.committed) return;
+        this.#stopTrackingSmallPreCommit(state);
         state.committed = true;
         state.diagnostics.committed(frame.diagnostics);
         this.#creditReservations = Math.max(0, this.#creditReservations - 1);
@@ -2787,10 +2811,12 @@ export class V2TransportSession {
       : R1_REQUEST_PART_BYTES;
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
+    const gzipPriority = decoded.byteLength >= BULK_GZIP_MIN_BYTES ? "bulk" : "latency";
+    const inlineBase64 = containsLargeInlineBase64(body);
     if (
       this.#gzip &&
       decoded.byteLength > partBytes &&
-      !containsLargeInlineBase64(body)
+      (!inlineBase64 || gzipPriority === "bulk")
     ) {
       const sampleLength = Math.min(decoded.byteLength, GZIP_SAMPLE_BYTES);
       const sample = new Uint8Array(sampleLength);
@@ -2803,6 +2829,7 @@ export class V2TransportSession {
       const sampleCompressed = await this.#gzip(sample, {
         signal,
         inputOwnership: "owned",
+        priority: gzipPriority,
       });
       const sampleSavings = sampleLength - sampleCompressed.byteLength;
       const sampleWorthwhile = sampleCompressed.byteLength > 0 &&
@@ -2816,6 +2843,7 @@ export class V2TransportSession {
           : await this.#gzip(decoded.slice(), {
               signal,
               inputOwnership: "owned",
+              priority: gzipPriority,
             });
       const identityParts = Math.ceil(decoded.byteLength / partBytes);
       const compressedParts = compressed && compressed.byteLength > 0
@@ -2939,6 +2967,10 @@ export class V2TransportSession {
       state.admissionTimer = undefined;
       this.#creditReservations++;
       this.#transferReservations += state.transferCost;
+      if (state.transferCost < V2_BULK_TRANSFER_COST) {
+        state.smallPreCommitTracked = true;
+        this.#smallPreCommitTransfers++;
+      }
       const onAdmissionReflected = state.onAdmissionReflected;
       state.onAdmissionReflected = undefined;
       // The credit is owned by the transport before the router is notified.
@@ -2962,18 +2994,32 @@ export class V2TransportSession {
     ));
   }
 
+  #hostFlightLimits(): Pick<
+    V2ProtocolTransportLimits,
+    "hostFlightMaxFrames" | "hostFlightMaxBytes"
+  > {
+    if (this.#transportProfile !== "bulk-v1") return this.#limits;
+    // Preserve the established small-request flight exactly. This counter is
+    // maintained at admission/commit/removal boundaries, so the publication
+    // hot path stays O(1) regardless of retained committed request count.
+    return this.#smallPreCommitTransfers > 0
+      ? GP_V2_R2_TRANSPORT_LIMITS
+      : this.#limits;
+  }
+
   #pump(): PublicationUrgency | null {
     if (!this.#connected || this.#closed) return null;
     if (this.#flight.active) return null;
+    const flightLimits = this.#hostFlightLimits();
     let urgency: PublicationUrgency | null = null;
     for (;;) {
       const snapshot = this.#outbound.snapshot();
       const frameBudget = Math.min(
-        this.#limits.hostFlightMaxFrames - snapshot.frames.length,
+        flightLimits.hostFlightMaxFrames - snapshot.frames.length,
         this.#limits.windowMaxFrames - snapshot.frames.length,
       );
       const byteBudget = Math.min(
-        this.#limits.hostFlightMaxBytes - snapshot.encodedBytes,
+        flightLimits.hostFlightMaxBytes - snapshot.encodedBytes,
         this.#limits.windowMaxBytes - snapshot.encodedBytes,
       );
       if (frameBudget < 1 || byteBudget < 512) break;
@@ -3336,6 +3382,7 @@ export class V2TransportSession {
   }
 
   #detachStateForRecovery(state: RequestState): void {
+    this.#stopTrackingSmallPreCommit(state);
     this.#requests.delete(state.requestId);
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
@@ -3453,6 +3500,7 @@ export class V2TransportSession {
         );
       }
     }
+    this.#stopTrackingSmallPreCommit(state);
     // commitPublished is deliberately promoted to committed-risk here so
     // removal cannot release capacity for work that may still be executing.
     state.committed = true;
@@ -3462,6 +3510,7 @@ export class V2TransportSession {
   }
 
   #removeState(state: RequestState): void {
+    this.#stopTrackingSmallPreCommit(state);
     this.#requests.delete(state.requestId);
     state.preparedRequest = null;
     state.recoveryPrefix = undefined;
@@ -3489,6 +3538,12 @@ export class V2TransportSession {
       this.#idleWaiters.clear();
     }
     this.#admitPending();
+  }
+
+  #stopTrackingSmallPreCommit(state: RequestState): void {
+    if (!state.smallPreCommitTracked) return;
+    state.smallPreCommitTracked = false;
+    this.#smallPreCommitTransfers = Math.max(0, this.#smallPreCommitTransfers - 1);
   }
 
   #failProtocol(cause: unknown): void {

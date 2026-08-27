@@ -11,6 +11,8 @@ export const GP_V2_R2_SCHEMA_VERSION = 2 as const;
 export const GP_V2_SCHEMA_VERSION = GP_V2_R1_SCHEMA_VERSION;
 
 export type ProtocolRevision = "r1" | "r2";
+export type V2TransportProfile = "standard" | "bulk-v1";
+export const DEFAULT_V2_TRANSPORT_PROFILE: V2TransportProfile = "standard";
 
 export interface V2ProtocolTransportLimits {
   readonly frameMaxBytes: number;
@@ -59,9 +61,38 @@ export const GP_V2_R2_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freez
   requestMaxBytes: 64 * 1024 * 1024,
 });
 
+/**
+ * Release-negotiated R2 bulk profile. Frame shape and execution fencing remain
+ * R2; only the host request window grows. Response egress stays conservative,
+ * and the host dynamically falls back to the standard flight whenever a
+ * smaller admitted request is present.
+ */
+export const GP_V2_R2_BULK_V1_TRANSPORT_LIMITS: V2ProtocolTransportLimits = Object.freeze({
+  frameMaxBytes: 16 * 1024,
+  windowMaxFrames: 128,
+  windowMaxBytes: 1024 * 1024,
+  flightMaxFrames: 64,
+  flightMaxBytes: 1024 * 1024,
+  hostFlightMaxFrames: 64,
+  hostFlightMaxBytes: 1024 * 1024,
+  sidecarFlightMaxFrames: 32,
+  sidecarFlightMaxBytes: 128 * 1024,
+  requestMaxBytes: 64 * 1024 * 1024,
+});
+
 export function protocolTransportLimits(
   revision: ProtocolRevision,
+  profile: V2TransportProfile = DEFAULT_V2_TRANSPORT_PROFILE,
 ): V2ProtocolTransportLimits {
+  if (profile !== "standard" && profile !== "bulk-v1") {
+    throw new TypeError(`Unsupported V2 transport profile: ${String(profile)}`);
+  }
+  if (profile === "bulk-v1") {
+    if (revision !== "r2") {
+      throw new TypeError(`Transport profile ${profile} requires R2`);
+    }
+    return GP_V2_R2_BULK_V1_TRANSPORT_LIMITS;
+  }
   switch (revision) {
     case "r1": return GP_V2_R1_TRANSPORT_LIMITS;
     case "r2": return GP_V2_R2_TRANSPORT_LIMITS;
@@ -516,9 +547,22 @@ export const GP_V2_R2_SCHEMA_DESCRIPTOR = Object.freeze({
   ],
 });
 
+export const GP_V2_R2_BULK_V1_SCHEMA_DESCRIPTOR = Object.freeze({
+  ...GP_V2_R2_SCHEMA_DESCRIPTOR,
+  transportProfile: "bulk-v1",
+  windowMaxFrames: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.windowMaxFrames,
+  windowMaxBytes: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.windowMaxBytes,
+  flightMaxFrames: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.flightMaxFrames,
+  flightMaxBytes: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.flightMaxBytes,
+  hostFlightMaxFrames: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.hostFlightMaxFrames,
+  hostFlightMaxBytes: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.hostFlightMaxBytes,
+  sidecarFlightMaxFrames: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.sidecarFlightMaxFrames,
+  sidecarFlightMaxBytes: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.sidecarFlightMaxBytes,
+});
+
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
-const schemaHashPromises: Partial<Record<ProtocolRevision, Promise<string>>> = {};
+const schemaHashPromises = new Map<string, Promise<string>>();
 
 function canonicalValue(value: unknown, seen: WeakSet<object>): string {
   if (value === null) return "null";
@@ -641,13 +685,20 @@ export function base64UrlDecode(value: string): Uint8Array {
   return output;
 }
 
-export function protocolSchemaHash(revision: ProtocolRevision): Promise<string> {
-  const existing = schemaHashPromises[revision];
+export function protocolSchemaHash(
+  revision: ProtocolRevision,
+  profile: V2TransportProfile = DEFAULT_V2_TRANSPORT_PROFILE,
+): Promise<string> {
+  protocolTransportLimits(revision, profile);
+  const key = `${revision}:${profile}`;
+  const existing = schemaHashPromises.get(key);
   if (existing) return existing;
   const descriptor = revision === "r1"
     ? GP_V2_R1_SCHEMA_DESCRIPTOR
-    : GP_V2_R2_SCHEMA_DESCRIPTOR;
+    : profile === "bulk-v1"
+      ? GP_V2_R2_BULK_V1_SCHEMA_DESCRIPTOR
+      : GP_V2_R2_SCHEMA_DESCRIPTOR;
   const created = sha256Hex(canonicalJson(descriptor));
-  schemaHashPromises[revision] = created;
+  schemaHashPromises.set(key, created);
   return created;
 }

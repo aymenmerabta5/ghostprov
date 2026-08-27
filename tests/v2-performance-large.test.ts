@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { GP_V2_R2_TRANSPORT_LIMITS } from "../src/v2/protocol/shared";
+import { protocolTransportLimits } from "../src/v2/protocol/shared";
 import {
   V2_PERFORMANCE_PAYLOAD_BYTES,
   runV2PerformanceHarness,
@@ -10,8 +10,10 @@ const largeDescribe = process.env.GP_V2_PERF_LARGE === "1"
   : describe.skip;
 
 largeDescribe("V2 opt-in large transport performance", () => {
-  it("preserves one 16 MiB R2 request with bounded windows", async () => {
+  it("preserves one 16 MiB R5 bulk-v1 request with bounded windows", async () => {
     const report = await runV2PerformanceHarness({
+      protocolRevision: "r2",
+      transportProfile: "bulk-v1",
       rttMs: 300,
       requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.mib16,
       concurrency: 1,
@@ -41,9 +43,10 @@ const veryLargeDescribe = process.env.GP_V2_PERF_64M === "1"
   : describe.skip;
 
 veryLargeDescribe("V2 opt-in maximum request integrity", () => {
-  it("preserves one exact 64 MiB R2 request with bounded windows", async () => {
+  it("preserves one exact 64 MiB R5 bulk-v1 request with bounded windows", async () => {
     const report = await runV2PerformanceHarness({
       protocolRevision: "r2",
+      transportProfile: "bulk-v1",
       corpus: "incompressible",
       rttMs: 300,
       requestBytes: V2_PERFORMANCE_PAYLOAD_BYTES.mib64,
@@ -70,11 +73,13 @@ veryLargeDescribe("V2 opt-in maximum request integrity", () => {
     expect(report.wire.uniqueRequestDataBytes).toBe(
       report.wire.postCompressionRequestBytes,
     );
+    const limits = protocolTransportLimits("r2", "bulk-v1");
     expect(report.transport.peaks.hostWindowFrames).toBeLessThanOrEqual(
-      GP_V2_R2_TRANSPORT_LIMITS.windowMaxFrames,
+      limits.windowMaxFrames,
     );
+    expect(report.transport.peaks.hostWindowBytes).toBeGreaterThan(512 * 1024);
     expect(report.transport.peaks.hostWindowBytes).toBeLessThanOrEqual(
-      GP_V2_R2_TRANSPORT_LIMITS.windowMaxBytes,
+      limits.windowMaxBytes,
     );
     expect(report.transport.retransmissions).toBe(0);
     expect(report.timings.measuredWall.hostPreparationMs.p50).toBeGreaterThan(0);

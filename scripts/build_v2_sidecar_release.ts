@@ -5,20 +5,20 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { protocolSchemaHash, sha256Hex, utf8Bytes } from "../src/v2/protocol/shared";
-import { V2_R4_RELEASE } from "../src/v2/sidecar/assets";
+import { V2_R5_RELEASE } from "../src/v2/sidecar/assets";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dir, "..");
-export const V2_R4_SIDECAR_ENTRYPOINT = path.join(
+export const V2_R5_SIDECAR_ENTRYPOINT = path.join(
   REPOSITORY_ROOT,
   "sandbox/v2/main.ts",
 );
-export const V2_R4_SIDECAR_ARTIFACT = path.join(
+export const V2_R5_SIDECAR_ARTIFACT = path.join(
   REPOSITORY_ROOT,
-  "src/v2/sidecar/releases/r4/sidecar.bundle.js",
+  "src/v2/sidecar/releases/r5/sidecar.bundle.js",
 );
 const LOGICAL_BUNDLE_PATH = "sidecar.bundle.js";
 
-export const V2_R4_SIDECAR_BUILD_RECIPE = Object.freeze({
+export const V2_R5_SIDECAR_BUILD_RECIPE = Object.freeze({
   target: "browser" as const,
   format: "esm" as const,
   splitting: false,
@@ -43,8 +43,9 @@ const RUNTIME_IMPORT_SPECIFIER = /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g;
 const ALLOWED_RUNTIME_IMPORTS = new Set(["node:crypto"]);
 
 export interface V2SidecarReleaseBuild {
-  readonly revision: "r4";
+  readonly revision: "r5";
   readonly protocolRevision: "r2";
+  readonly transportProfile: "bulk-v1";
   readonly content: string;
   readonly bytes: Uint8Array;
   readonly bundleSha256: string;
@@ -67,40 +68,40 @@ export function canonicalV2SidecarBundle(value: string): string {
 
 function assertReleaseBundle(content: string): void {
   if (!content.endsWith("\n") || content.endsWith("\n\n") || content.includes("\r")) {
-    throw new Error("V2-R4 sidecar bundle must use LF and end in exactly one LF");
+    throw new Error("V2-R5 sidecar bundle must use LF and end in exactly one LF");
   }
   if (RUNTIME_NETWORK_IMPORT.test(content) || content.includes("registry.npmjs.org")) {
-    throw new Error("V2-R4 sidecar bundle contains a runtime network import");
+    throw new Error("V2-R5 sidecar bundle contains a runtime network import");
   }
   for (const match of content.matchAll(RUNTIME_IMPORT_SPECIFIER)) {
     if (!ALLOWED_RUNTIME_IMPORTS.has(match[1]!)) {
-      throw new Error(`V2-R4 sidecar bundle contains an unsupported runtime import: ${match[1]}`);
+      throw new Error(`V2-R5 sidecar bundle contains an unsupported runtime import: ${match[1]}`);
     }
   }
   if (![...content.matchAll(RUNTIME_IMPORT_SPECIFIER)].some(match => match[1] === "node:crypto")) {
-    throw new Error("V2-R4 sidecar bundle is missing its native node:crypto import");
+    throw new Error("V2-R5 sidecar bundle is missing its native node:crypto import");
   }
   if (CREDENTIAL_PATTERNS.some(pattern => pattern.test(content))) {
-    throw new Error("V2-R4 sidecar bundle contains a credential-shaped literal");
+    throw new Error("V2-R5 sidecar bundle contains a credential-shaped literal");
   }
   if (/sourceMappingURL=/.test(content)) {
-    throw new Error("V2-R4 sidecar bundle contains a source map reference");
+    throw new Error("V2-R5 sidecar bundle contains a source map reference");
   }
   if (utf8Bytes(content).byteLength < 1_000 || !content.includes("Deno.")) {
-    throw new Error("V2-R4 sidecar bundle is not a complete Deno entrypoint");
+    throw new Error("V2-R5 sidecar bundle is not a complete Deno entrypoint");
   }
 }
 
 async function buildOnce(): Promise<Uint8Array> {
   const result = await Bun.build({
-    entrypoints: [V2_R4_SIDECAR_ENTRYPOINT],
-    ...V2_R4_SIDECAR_BUILD_RECIPE,
-    external: [...V2_R4_SIDECAR_BUILD_RECIPE.external],
+    entrypoints: [V2_R5_SIDECAR_ENTRYPOINT],
+    ...V2_R5_SIDECAR_BUILD_RECIPE,
+    external: [...V2_R5_SIDECAR_BUILD_RECIPE.external],
   });
   if (!result.success || result.outputs.length !== 1 || result.logs.length !== 0) {
     const diagnostics = result.logs.map(log => log.message).join("\n");
     throw new Error(
-      `V2-R4 sidecar build failed, warned, or emitted multiple files${diagnostics ? `:\n${diagnostics}` : ""}`,
+      `V2-R5 sidecar build failed, warned, or emitted multiple files${diagnostics ? `:\n${diagnostics}` : ""}`,
     );
   }
   const content = canonicalV2SidecarBundle(await result.outputs[0]!.text());
@@ -116,17 +117,18 @@ export async function buildV2SidecarRelease(): Promise<V2SidecarReleaseBuild> {
   const first = await buildOnce();
   const second = await buildOnce();
   if (!equalBytes(first, second)) {
-    throw new Error("V2-R4 sidecar build is nondeterministic: consecutive bytes differ");
+    throw new Error("V2-R5 sidecar build is nondeterministic: consecutive bytes differ");
   }
   const content = new TextDecoder("utf-8", { fatal: true }).decode(first);
   const [bundleSha256, buildHash, schemaHash] = await Promise.all([
     sha256Hex(first),
     sha256Hex(utf8Bytes(`${LOGICAL_BUNDLE_PATH}\0${content}`)),
-    protocolSchemaHash("r2"),
+    protocolSchemaHash("r2", "bulk-v1"),
   ]);
   return Object.freeze({
-    revision: "r4",
+    revision: "r5",
     protocolRevision: "r2",
+    transportProfile: "bulk-v1",
     content,
     bytes: first,
     bundleSha256,
@@ -136,38 +138,39 @@ export async function buildV2SidecarRelease(): Promise<V2SidecarReleaseBuild> {
 }
 
 export async function checkV2SidecarRelease(
-  artifactPath = V2_R4_SIDECAR_ARTIFACT,
+  artifactPath = V2_R5_SIDECAR_ARTIFACT,
 ): Promise<V2SidecarReleaseBuild> {
   const built = await buildV2SidecarRelease();
   let checkedIn: Uint8Array;
   try {
     checkedIn = new Uint8Array(await readFile(artifactPath));
   } catch (cause) {
-    throw new Error("Frozen V2-R4 sidecar artifact is missing", { cause });
+    throw new Error("Frozen V2-R5 sidecar artifact is missing", { cause });
   }
   if (!equalBytes(checkedIn, built.bytes)) {
-    throw new Error("Frozen V2-R4 sidecar artifact differs from the deterministic build");
+    throw new Error("Frozen V2-R5 sidecar artifact differs from the deterministic build");
   }
   if (
-    V2_R4_RELEASE.revision !== built.revision ||
-    V2_R4_RELEASE.protocolRevision !== built.protocolRevision ||
-    V2_R4_RELEASE.bundleSha256 !== built.bundleSha256 ||
-    V2_R4_RELEASE.buildHash !== built.buildHash ||
-    V2_R4_RELEASE.schemaHash !== built.schemaHash
+    V2_R5_RELEASE.revision !== built.revision ||
+    V2_R5_RELEASE.protocolRevision !== built.protocolRevision ||
+    V2_R5_RELEASE.transportProfile !== built.transportProfile ||
+    V2_R5_RELEASE.bundleSha256 !== built.bundleSha256 ||
+    V2_R5_RELEASE.buildHash !== built.buildHash ||
+    V2_R5_RELEASE.schemaHash !== built.schemaHash
   ) {
-    throw new Error("Frozen V2-R4 sidecar release identity differs from the deterministic build");
+    throw new Error("Frozen V2-R5 sidecar release identity differs from the deterministic build");
   }
   return built;
 }
 
 async function writeV2SidecarRelease(): Promise<V2SidecarReleaseBuild> {
   const built = await buildV2SidecarRelease();
-  await mkdir(path.dirname(V2_R4_SIDECAR_ARTIFACT), { recursive: true });
+  await mkdir(path.dirname(V2_R5_SIDECAR_ARTIFACT), { recursive: true });
   try {
-    const existing = new Uint8Array(await readFile(V2_R4_SIDECAR_ARTIFACT));
+    const existing = new Uint8Array(await readFile(V2_R5_SIDECAR_ARTIFACT));
     if (!equalBytes(existing, built.bytes)) {
       throw new Error(
-        "Refusing to overwrite an immutable V2-R4 sidecar artifact with different bytes",
+        "Refusing to overwrite an immutable V2-R5 sidecar artifact with different bytes",
       );
     }
     return built;
@@ -176,15 +179,15 @@ async function writeV2SidecarRelease(): Promise<V2SidecarReleaseBuild> {
   }
 
   try {
-    await writeFile(V2_R4_SIDECAR_ARTIFACT, built.bytes, { flag: "wx" });
+    await writeFile(V2_R5_SIDECAR_ARTIFACT, built.bytes, { flag: "wx" });
   } catch (error) {
     // An independent writer may have won the create-only race. It is safe only
     // if it published the exact same deterministic bytes.
     if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-    const existing = new Uint8Array(await readFile(V2_R4_SIDECAR_ARTIFACT));
+    const existing = new Uint8Array(await readFile(V2_R5_SIDECAR_ARTIFACT));
     if (!equalBytes(existing, built.bytes)) {
       throw new Error(
-        "Refusing to overwrite an immutable V2-R4 sidecar artifact with different bytes",
+        "Refusing to overwrite an immutable V2-R5 sidecar artifact with different bytes",
       );
     }
   }
@@ -195,6 +198,7 @@ function releaseIdentity(build: V2SidecarReleaseBuild): Record<string, string> {
   return {
     revision: build.revision,
     protocolRevision: build.protocolRevision,
+    transportProfile: build.transportProfile,
     buildHash: build.buildHash,
     schemaHash: build.schemaHash,
     bundleSha256: build.bundleSha256,
@@ -209,7 +213,7 @@ export async function main(args: readonly string[] = process.argv.slice(2)): Pro
     : await writeV2SidecarRelease();
   console.log(JSON.stringify({
     mode: checked ? "check" : "write",
-    artifact: path.relative(REPOSITORY_ROOT, V2_R4_SIDECAR_ARTIFACT).replaceAll("\\", "/"),
+    artifact: path.relative(REPOSITORY_ROOT, V2_R5_SIDECAR_ARTIFACT).replaceAll("\\", "/"),
     bytes: build.bytes.byteLength,
     ...releaseIdentity(build),
   }, null, 2));

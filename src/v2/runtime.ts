@@ -274,6 +274,7 @@ export interface V2SandboxRuntimeOptions {
   }): V2RuntimeBootstrap;
   createTransport(input: {
     binding: ProtocolBinding;
+    transportProfile: V2SidecarAssets["transportProfile"];
     channel: AwarenessChannel<HostFrame, SidecarFrame>;
     maxResponseBytes: number;
     gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
@@ -759,6 +760,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       let transport!: V2RuntimeTransport;
       transport = this.#options.createTransport({
         binding,
+        transportProfile: this.#options.assets.transportProfile,
         channel: awareness,
         maxResponseBytes: this.#options.maxResponseBytes ?? 64 * 1024 * 1024,
         gzip: this.#options.gzip,
@@ -1072,6 +1074,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#assertSidecarRelaunchCurrent(context, signal);
       context.transport = this.#options.createTransport({
         binding: nextBinding,
+        transportProfile: this.#options.assets.transportProfile,
         channel: context.awareness,
         maxResponseBytes: this.#options.maxResponseBytes ?? 64 * 1024 * 1024,
         gzip: this.#options.gzip,

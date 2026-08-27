@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
+  GP_V2_R2_BULK_V1_TRANSPORT_LIMITS,
   GP_V2_R2_TRANSPORT_LIMITS,
   GP_V2_R2_SCHEMA_VERSION,
   protocolSchemaHash,
+  protocolTransportLimits,
   type AwarenessEnvelope,
   type HostFrame,
   type ProtocolBinding,
@@ -156,6 +158,53 @@ describe("V2-R2 fenced wire protocol", () => {
       BINDING,
       "sidecar",
     )).toThrow("131072-byte flight");
+  });
+
+  it("negotiates bulk-v1 explicitly and rejects standard/profile mismatches", async () => {
+    const standardHash = await protocolSchemaHash("r2", "standard");
+    const bulkHash = await protocolSchemaHash("r2", "bulk-v1");
+    const standardBinding = { ...BINDING, schemaHash: standardHash };
+    const bulkBinding = { ...BINDING, schemaHash: bulkHash };
+    const ping = (sequence: number): ReliableFrame<HostFrame> => ({
+      kind: "ping",
+      sentAtMs: sequence,
+      epoch: 1,
+      sequence,
+    });
+    const bulkFrames = Array.from(
+      { length: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS.hostFlightMaxFrames },
+      (_, index) => ping(index),
+    );
+    const bulkEnvelope = hostEnvelope({ schemaHash: bulkHash, frames: bulkFrames });
+
+    expect(standardHash).not.toBe(bulkHash);
+    expect(parseAwarenessEnvelope(
+      bulkEnvelope,
+      bulkBinding,
+      "host",
+      "bulk-v1",
+    ).frames).toHaveLength(64);
+    expect(() => parseAwarenessEnvelope(
+      bulkEnvelope,
+      bulkBinding,
+      "host",
+      "standard",
+    )).toThrow("32-frame flight");
+    expect(() => parseAwarenessEnvelope(
+      hostEnvelope({ schemaHash: standardHash, frames: [] }),
+      bulkBinding,
+      "host",
+      "bulk-v1",
+    )).toThrow("binding");
+    expect(() => parseAwarenessEnvelope(
+      hostEnvelope({ schemaHash: bulkHash, frames: [] }),
+      standardBinding,
+      "host",
+      "standard",
+    )).toThrow("binding");
+    expect(() => protocolTransportLimits("r1", "bulk-v1")).toThrow("requires R2");
+    expect(() => protocolTransportLimits("r2", "invalid" as never))
+      .toThrow("Unsupported V2 transport profile");
   });
 
   it("parses only an exact complete R2 envelope and commit fence", () => {

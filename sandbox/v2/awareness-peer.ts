@@ -18,6 +18,7 @@ import {
   type R2RequestStartFrame,
   type SidecarFrame,
   type V2ProtocolTransportLimits,
+  type V2TransportProfile,
 } from "../../src/v2/protocol/shared.ts";
 import { AckClockedFlight } from "../../src/v2/protocol/flight.ts";
 import {
@@ -58,6 +59,7 @@ function sidecarFrameCarriesResponseData(frame: ReliableFrame<SidecarFrame>): bo
 export interface DenoAwarenessPeerOptions {
   credential: BootstrapCredentialPayload;
   binding: ProtocolBinding;
+  transportProfile?: V2TransportProfile;
   instanceId: string;
   engine: SidecarEngine;
   retransmitMs?: number;
@@ -175,6 +177,7 @@ function sleepWithSignal(delayMs: number, signal: AbortSignal): Promise<void> {
 export class DenoAwarenessPeer {
   readonly #binding: ProtocolBinding;
   readonly #limits: V2ProtocolTransportLimits;
+  readonly #transportProfile: V2TransportProfile;
   readonly #instanceId: string;
   readonly #engine: SidecarEngine;
   readonly #rotator: SidecarCredentialRotator;
@@ -182,9 +185,9 @@ export class DenoAwarenessPeer {
   readonly #controlDoc: Y.Doc;
   readonly #dataProvider: DenoAwarenessProviderLike;
   readonly #controlProvider: DenoAwarenessProviderLike;
-  readonly #outbound = new OutboundFrameWindow<SidecarFrame>({ epoch: 1 });
-  readonly #inbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
-  readonly #bootstrapInbound = new InboundFrameCursor<HostFrame>({ epoch: 1 });
+  readonly #outbound: OutboundFrameWindow<SidecarFrame>;
+  readonly #inbound: InboundFrameCursor<HostFrame>;
+  readonly #bootstrapInbound: InboundFrameCursor<HostFrame>;
   #processedAck = { epoch: 1, sequence: -1 };
   #bootstrapProcessedAck = { epoch: 1, sequence: -1 };
   #processedFlightHigh = -1;
@@ -271,7 +274,23 @@ export class DenoAwarenessPeer {
 
   constructor(options: DenoAwarenessPeerOptions) {
     this.#binding = options.binding;
-    this.#limits = protocolTransportLimits(options.binding.protocolRevision);
+    this.#transportProfile = options.transportProfile ?? "standard";
+    this.#limits = protocolTransportLimits(
+      options.binding.protocolRevision,
+      this.#transportProfile,
+    );
+    this.#outbound = new OutboundFrameWindow<SidecarFrame>({
+      epoch: 1,
+      limits: this.#limits,
+    });
+    this.#inbound = new InboundFrameCursor<HostFrame>({
+      epoch: 1,
+      limits: this.#limits,
+    });
+    this.#bootstrapInbound = new InboundFrameCursor<HostFrame>({
+      epoch: 1,
+      limits: this.#limits,
+    });
     this.#instanceId = options.instanceId;
     if (
       options.binding.protocolRevision === "r2" &&
@@ -372,6 +391,7 @@ export class DenoAwarenessPeer {
         raw,
         this.#binding,
         "host",
+        this.#transportProfile,
       ).envelope as R2AwarenessEnvelope<HostFrame>;
       if (
         current.peerId !== "host" ||
@@ -728,7 +748,12 @@ export class DenoAwarenessPeer {
       }
       let envelope: AwarenessEnvelope<HostFrame>;
       try {
-        const parsed = parseAwarenessEnvelopeWithDiagnostics(raw, this.#binding, "host");
+        const parsed = parseAwarenessEnvelopeWithDiagnostics(
+          raw,
+          this.#binding,
+          "host",
+          this.#transportProfile,
+        );
         envelope = parsed.envelope as AwarenessEnvelope<HostFrame>;
         if (parsed.malformed) this.#diagnostics?.malformed();
       } catch {

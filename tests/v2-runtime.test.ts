@@ -51,6 +51,7 @@ const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS: V2SidecarAssets = {
   revision: "r1",
   protocolRevision: "r1",
+  transportProfile: "standard",
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
   entrypointPath: `.ghostprov-v2/revisions/r1/${"b".repeat(64)}/${"a".repeat(64)}/sidecar.bundle.js`,

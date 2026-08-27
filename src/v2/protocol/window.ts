@@ -6,6 +6,7 @@ import {
   utf8Bytes,
   type AckCursor,
   type ReliableFrame,
+  type V2ProtocolTransportLimits,
 } from "./shared";
 
 export class V2WindowError extends Error {
@@ -31,7 +32,45 @@ function validEpoch(value: number): void {
   }
 }
 
-export function encodedFrameBytes(value: unknown): number {
+type WindowLimits = Pick<
+  V2ProtocolTransportLimits,
+  "frameMaxBytes" | "windowMaxFrames" | "windowMaxBytes"
+>;
+
+const DEFAULT_WINDOW_LIMITS: WindowLimits = Object.freeze({
+  frameMaxBytes: GP_V2_FRAME_MAX_BYTES,
+  windowMaxFrames: GP_V2_WINDOW_MAX_FRAMES,
+  windowMaxBytes: GP_V2_WINDOW_MAX_BYTES,
+});
+const MAX_WINDOW_BYTES = 1024 * 1024;
+
+function checkedWindowLimits(limits: WindowLimits | undefined): WindowLimits {
+  if (limits === undefined) return DEFAULT_WINDOW_LIMITS;
+  const copy: WindowLimits = {
+    frameMaxBytes: limits.frameMaxBytes,
+    windowMaxFrames: limits.windowMaxFrames,
+    windowMaxBytes: limits.windowMaxBytes,
+  };
+  if (
+    !Number.isSafeInteger(copy.frameMaxBytes) || copy.frameMaxBytes < 1 ||
+    copy.frameMaxBytes > GP_V2_FRAME_MAX_BYTES
+  ) throw new V2WindowError("frameMaxBytes exceeds the physical frame boundary", "frame_size");
+  if (
+    !Number.isSafeInteger(copy.windowMaxFrames) || copy.windowMaxFrames < 1 ||
+    copy.windowMaxFrames > GP_V2_WINDOW_MAX_FRAMES
+  ) throw new V2WindowError("windowMaxFrames exceeds the physical window boundary", "window_frames");
+  if (
+    !Number.isSafeInteger(copy.windowMaxBytes) ||
+    copy.windowMaxBytes < copy.frameMaxBytes ||
+    copy.windowMaxBytes > MAX_WINDOW_BYTES
+  ) throw new V2WindowError("windowMaxBytes exceeds the physical window boundary", "window_bytes");
+  return Object.freeze(copy);
+}
+
+export function encodedFrameBytes(
+  value: unknown,
+  frameMaxBytes = GP_V2_FRAME_MAX_BYTES,
+): number {
   let json: string;
   try {
     json = JSON.stringify(value);
@@ -39,13 +78,17 @@ export function encodedFrameBytes(value: unknown): number {
     throw new V2WindowError("frame must be JSON serializable", "frame_size");
   }
   const bytes = utf8Bytes(json).byteLength;
-  if (bytes > GP_V2_FRAME_MAX_BYTES) {
-    throw new V2WindowError("frame exceeds the hard 16 KiB limit", "frame_size");
+  if (bytes > frameMaxBytes) {
+    const limit = frameMaxBytes % 1024 === 0
+      ? `${frameMaxBytes / 1024} KiB`
+      : `${frameMaxBytes} bytes`;
+    throw new V2WindowError(`frame exceeds the hard ${limit} limit`, "frame_size");
   }
   return bytes;
 }
 
 export class OutboundFrameWindow<T extends object> {
+  readonly #limits: WindowLimits;
   #epoch: number;
   #nextSequence = 0;
   #acknowledgedSequence = -1;
@@ -58,15 +101,16 @@ export class OutboundFrameWindow<T extends object> {
     frames: readonly ReliableFrame<T>[];
   } | null = null;
 
-  constructor(options: { epoch: number }) {
+  constructor(options: { epoch: number; limits?: WindowLimits }) {
     validEpoch(options.epoch);
     this.#epoch = options.epoch;
+    this.#limits = checkedWindowLimits(options.limits);
   }
 
   push(frame: T): ReliableFrame<T> {
-    if (this.#frames.length >= GP_V2_WINDOW_MAX_FRAMES) {
+    if (this.#frames.length >= this.#limits.windowMaxFrames) {
       throw new V2WindowError(
-        `Outbound state exceeds the ${GP_V2_WINDOW_MAX_FRAMES}-frame window`,
+        `Outbound state exceeds the ${this.#limits.windowMaxFrames}-frame window`,
         "window_frames",
       );
     }
@@ -75,10 +119,10 @@ export class OutboundFrameWindow<T extends object> {
       epoch: this.#epoch,
       sequence: this.#nextSequence,
     }) as ReliableFrame<T>;
-    const encodedBytes = encodedFrameBytes(reliable);
-    if (this.#encodedBytes + encodedBytes > GP_V2_WINDOW_MAX_BYTES) {
+    const encodedBytes = encodedFrameBytes(reliable, this.#limits.frameMaxBytes);
+    if (this.#encodedBytes + encodedBytes > this.#limits.windowMaxBytes) {
       throw new V2WindowError(
-        `Outbound state exceeds the ${GP_V2_WINDOW_MAX_BYTES}-byte window`,
+        `Outbound state exceeds the ${this.#limits.windowMaxBytes}-byte window`,
         "window_bytes",
       );
     }
@@ -150,14 +194,16 @@ export class OutboundFrameWindow<T extends object> {
 }
 
 export class InboundFrameCursor<T extends object> {
+  readonly #limits: WindowLimits;
   #epoch: number;
   #nextSequence = 0;
   #bufferBytes = 0;
   readonly #buffer = new Map<number, InboundStoredFrame<T>>();
 
-  constructor(options: { epoch: number }) {
+  constructor(options: { epoch: number; limits?: WindowLimits }) {
     validEpoch(options.epoch);
     this.#epoch = options.epoch;
+    this.#limits = checkedWindowLimits(options.limits);
   }
 
   accept(frames: readonly ReliableFrame<T>[]): ReliableFrame<T>[] {
@@ -180,18 +226,18 @@ export class InboundFrameCursor<T extends object> {
         continue;
       }
       if (
-        frame.sequence - this.#nextSequence > GP_V2_WINDOW_MAX_FRAMES ||
-        this.#buffer.size >= GP_V2_WINDOW_MAX_FRAMES
+        frame.sequence - this.#nextSequence > this.#limits.windowMaxFrames ||
+        this.#buffer.size >= this.#limits.windowMaxFrames
       ) {
         throw new V2WindowError(
-          `Inbound gap exceeds the ${GP_V2_WINDOW_MAX_FRAMES}-frame window`,
+          `Inbound gap exceeds the ${this.#limits.windowMaxFrames}-frame window`,
           "window_frames",
         );
       }
-      const encodedBytes = encodedFrameBytes(frame);
-      if (this.#bufferBytes + encodedBytes > GP_V2_WINDOW_MAX_BYTES) {
+      const encodedBytes = encodedFrameBytes(frame, this.#limits.frameMaxBytes);
+      if (this.#bufferBytes + encodedBytes > this.#limits.windowMaxBytes) {
         throw new V2WindowError(
-          `Inbound state exceeds the ${GP_V2_WINDOW_MAX_BYTES}-byte window`,
+          `Inbound state exceeds the ${this.#limits.windowMaxBytes}-byte window`,
           "window_bytes",
         );
       }

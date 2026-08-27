@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
-import { MultiSandboxRouter } from "../src/router/router";
-import { ResourceGovernor } from "../src/router/resource-governor";
+import {
+  type IncomingResourceLease,
+  MultiSandboxRouter,
+  requestRoutingTimeouts,
+} from "../src/router/router";
+import {
+  ResourceGovernor,
+  type ResourceLease,
+} from "../src/router/resource-governor";
 import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
@@ -217,6 +224,82 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("keeps small deadlines exact and scales only genuinely large request admission", () => {
+    expect(requestRoutingTimeouts(128 * 1024, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 30_000,
+      routeAttemptTimeoutMs: 15_000,
+    });
+    expect(requestRoutingTimeouts(8 * 1024 ** 2, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 30_000,
+      routeAttemptTimeoutMs: 15_000,
+    });
+    expect(requestRoutingTimeouts(13 * 1024 ** 2, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 53_750,
+      routeAttemptTimeoutMs: 24_375,
+    });
+    expect(requestRoutingTimeouts(64 * 1024 ** 2, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 245_000,
+      routeAttemptTimeoutMs: 120_000,
+    });
+    expect(() => requestRoutingTimeouts(-1, 30_000, 15_000)).toThrow(RangeError);
+    expect(() => requestRoutingTimeouts(1, 10_000, 15_000)).toThrow(RangeError);
+  });
+
+  it("hands the payload-aware global deadline through an HTTP ingress lease", async () => {
+    const system = createSystem(1, 1);
+    const acceptedAtMs = performance.timeOrigin + performance.now() - 1;
+    let replacementDeadlineMs: number | undefined;
+    let replacementRequestBytes = 0;
+    let resourceLease!: ResourceLease;
+    resourceLease = {
+      reservedBytes: 96 * 1024 ** 2,
+      replace: async () => resourceLease,
+      release: () => undefined,
+    };
+    const incomingLease: IncomingResourceLease = {
+      reservedBytes: 32 * 1024 ** 2,
+      bodyBytes: 13 * 1024 ** 2,
+      acceptedAtMs,
+      deadlineMs: acceptedAtMs + 30_000,
+      replace: async (workload, _signal, options) => {
+        replacementRequestBytes = workload.requestBytes;
+        replacementDeadlineMs = options?.deadlineMs;
+        return resourceLease;
+      },
+      release: () => undefined,
+    };
+
+    const handle = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "body bytes are carried by the ingress lease",
+      service_tier: "fast",
+      stream: true,
+    }, { source: "http", incomingLease });
+    expect(replacementRequestBytes).toBe(13 * 1024 ** 2);
+    expect(replacementDeadlineMs).toBe(acceptedAtMs + 53_750);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("extends declared and chunked large-body ingress without changing the small base", async () => {
+    const system = createSystem(1, 1);
+    const declared = await system.router.acquireIncomingBody(13 * 1024 ** 2, undefined, {
+      maxBytes: 64 * 1024 ** 2,
+    });
+    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(53_750);
+    declared.release();
+
+    const chunked = await system.router.acquireIncomingBody(0, undefined, {
+      maxBytes: 64 * 1024 ** 2,
+    });
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(30_000);
+    await chunked.ensureBytes!(13 * 1024 ** 2);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(53_750);
+    chunked.release();
+    await system.router.close();
+  });
+
   it("does not retry host-local CPU overload through another sandbox", async () => {
     const system = createSystem(2, 1);
     for (const runtime of system.runtimes) {

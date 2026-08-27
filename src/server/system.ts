@@ -288,6 +288,7 @@ export function createV2CpuGzip(
   if (!cpuPool.gzip) throw new Error("CPU transform pool does not provide gzip");
   return (bytes, gzipOptions) => cpuPool.gzip!(bytes, {
     signal: gzipOptions?.signal,
+    ...(gzipOptions?.priority ? { priority: gzipOptions.priority } : {}),
     // Only a disposable full-buffer view may be detached. The V2 transport
     // explicitly marks its scratch copy as owned; arbitrary subviews still use
     // the pool's copying path.
@@ -434,7 +435,12 @@ function defaultRuntimeFactory(options: {
           envelope: credentials.ySweet,
           localPeerId: `host-${workerIndex}:${lane}`,
           field,
-          parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+          parseRemote: value => parseAwarenessEnvelope(
+            value,
+            binding,
+            "sidecar",
+            release.assets.transportProfile,
+          ),
         });
         return new SplitAwarenessChannel({
           data: createLane("data", "ghostprovV2Data"),
@@ -467,6 +473,7 @@ function defaultRuntimeFactory(options: {
       }),
       createTransport: transport => new V2TransportSession({
         binding: transport.binding,
+        transportProfile: transport.transportProfile,
         channel: transport.channel,
         maxResponseBytes: transport.maxResponseBytes,
         gzip: transport.gzip,

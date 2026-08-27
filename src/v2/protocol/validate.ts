@@ -14,6 +14,7 @@ import {
   type R2RequestPreparedFrame,
   type R2RequestStartFrame,
   type SidecarFrame,
+  type V2TransportProfile,
 } from "./shared";
 import { parseDiagnosticObject, parseFirstEventDiagnostics, parseRequestAckDiagnostics, parseTerminalDiagnostics } from "../diagnostics/types";
 import { MAX_RATE_LIMIT_DELAY_MS, type RateLimitHint } from "../rate-limit";
@@ -215,8 +216,12 @@ function frameIdentity(raw: Record<string, unknown>): { epoch: number; sequence:
   };
 }
 
-function frameBytes(value: unknown, protocolRevision: ProtocolRevision): number {
-  const limits = protocolTransportLimits(protocolRevision);
+function frameBytes(
+  value: unknown,
+  protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
+): number {
+  const limits = protocolTransportLimits(protocolRevision, transportProfile);
   let encoded: Uint8Array;
   try {
     encoded = utf8Bytes(JSON.stringify(value));
@@ -277,8 +282,9 @@ function parseR2FencedFrame(
 function parseHostFrame(
   raw: Record<string, unknown>,
   protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
 ): ReliableFrame<HostFrame> {
-  const limits = protocolTransportLimits(protocolRevision);
+  const limits = protocolTransportLimits(protocolRevision, transportProfile);
   const kind = raw.kind;
   const identity = frameIdentity(raw);
   switch (kind) {
@@ -372,8 +378,9 @@ function parseHostFrame(
 function parseSidecarFrame(
   raw: Record<string, unknown>,
   protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
 ): ReliableFrame<SidecarFrame> {
-  const limits = protocolTransportLimits(protocolRevision);
+  const limits = protocolTransportLimits(protocolRevision, transportProfile);
   const kind = raw.kind;
   const identity = frameIdentity(raw);
   switch (kind) {
@@ -545,40 +552,46 @@ export function parseFrame(
   value: unknown,
   direction: "host",
   protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
 ): ReliableFrame<HostFrame>;
 export function parseFrame(
   value: unknown,
   direction: "sidecar",
   protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
 ): ReliableFrame<SidecarFrame>;
 export function parseFrame(
   value: unknown,
   direction: FrameDirection,
   protocolRevision: ProtocolRevision,
+  transportProfile?: V2TransportProfile,
 ): ReliableFrame<HostFrame> | ReliableFrame<SidecarFrame> {
-  frameBytes(value, protocolRevision);
+  frameBytes(value, protocolRevision, transportProfile);
   const raw = object(value, "frame");
   return direction === "host"
-    ? parseHostFrame(raw, protocolRevision)
-    : parseSidecarFrame(raw, protocolRevision);
+    ? parseHostFrame(raw, protocolRevision, transportProfile)
+    : parseSidecarFrame(raw, protocolRevision, transportProfile);
 }
 
 export function parseAwarenessEnvelope(
   value: unknown,
   expected: ProtocolBinding,
   direction: "host",
+  transportProfile?: V2TransportProfile,
 ): AwarenessEnvelope<HostFrame>;
 export function parseAwarenessEnvelope(
   value: unknown,
   expected: ProtocolBinding,
   direction: "sidecar",
+  transportProfile?: V2TransportProfile,
 ): AwarenessEnvelope<SidecarFrame>;
 export function parseAwarenessEnvelope(
   value: unknown,
   expected: ProtocolBinding,
   direction: FrameDirection,
+  transportProfile?: V2TransportProfile,
 ): AwarenessEnvelope<HostFrame | SidecarFrame> {
-  const limits = protocolTransportLimits(expected.protocolRevision);
+  const limits = protocolTransportLimits(expected.protocolRevision, transportProfile);
   const flightMaxFrames = direction === "host"
     ? limits.hostFlightMaxFrames
     : limits.sidecarFlightMaxFrames;
@@ -635,11 +648,11 @@ export function parseAwarenessEnvelope(
   let encodedBytes = 0;
   let previousSequence = -1;
   const frames = raw.frames.map(frame => {
-    encodedBytes += frameBytes(frame, expected.protocolRevision);
+    encodedBytes += frameBytes(frame, expected.protocolRevision, transportProfile);
     const frameObject = object(frame, "frame");
     const parsed = direction === "host"
-      ? parseHostFrame(frameObject, expected.protocolRevision)
-      : parseSidecarFrame(frameObject, expected.protocolRevision);
+      ? parseHostFrame(frameObject, expected.protocolRevision, transportProfile)
+      : parseSidecarFrame(frameObject, expected.protocolRevision, transportProfile);
     if (parsed.epoch !== epoch) fail("Frame epoch differs from envelope epoch", "epoch");
     if (parsed.sequence <= previousSequence) fail("Frame sequences must be strictly increasing", "sequence");
     previousSequence = parsed.sequence;
@@ -761,8 +774,17 @@ export function parseAwarenessEnvelopeWithDiagnostics(
   value: unknown,
   expected: ProtocolBinding,
   direction: FrameDirection,
+  transportProfile?: V2TransportProfile,
 ): { envelope: AwarenessEnvelope<HostFrame | SidecarFrame>; malformed: boolean } {
   const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
   const malformed = raw?.diagnostics !== undefined && parseDiagnosticObject(raw.diagnostics) === null;
-  return { envelope: parseAwarenessEnvelope(value, expected, direction as any) as AwarenessEnvelope<HostFrame | SidecarFrame>, malformed };
+  return {
+    envelope: parseAwarenessEnvelope(
+      value,
+      expected,
+      direction as any,
+      transportProfile,
+    ) as AwarenessEnvelope<HostFrame | SidecarFrame>,
+    malformed,
+  };
 }

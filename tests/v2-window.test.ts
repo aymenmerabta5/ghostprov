@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type { HostFrame, ReliableFrame } from "../src/v2/protocol/shared";
+import {
+  GP_V2_R2_BULK_V1_TRANSPORT_LIMITS,
+  type HostFrame,
+  type ReliableFrame,
+} from "../src/v2/protocol/shared";
 import {
   InboundFrameCursor,
   OutboundFrameWindow,
@@ -73,6 +77,38 @@ describe("V2 reliable frame windows", () => {
     expect(() => oversized.push({ kind: "credential_rotate", sealedJson: "x".repeat(20_000) })).toThrow("16 KiB");
   });
 
+  it("enforces the negotiated 1 MiB bulk window without changing physical limits", () => {
+    type Payload = { kind: "payload"; value: string };
+    const bulk = new OutboundFrameWindow<Payload>({
+      epoch: 1,
+      limits: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS,
+    });
+    const frames = Array.from({ length: 100 }, () => bulk.push({
+      kind: "payload",
+      value: "x".repeat(6_000),
+    }));
+    expect(bulk.snapshot()).toMatchObject({
+      frames: expect.any(Array),
+      nextSequence: 100,
+    });
+    expect(bulk.snapshot().encodedBytes).toBeGreaterThan(512 * 1024);
+    expect(bulk.snapshot().encodedBytes).toBeLessThan(1024 * 1024);
+
+    const standard = new OutboundFrameWindow<Payload>({ epoch: 1 });
+    expect(() => {
+      for (let index = 0; index < 100; index++) {
+        standard.push({ kind: "payload", value: "x".repeat(6_000) });
+      }
+    }).toThrow("524288-byte window");
+
+    const inbound = new InboundFrameCursor<Payload>({
+      epoch: 1,
+      limits: GP_V2_R2_BULK_V1_TRANSPORT_LIMITS,
+    });
+    expect(inbound.accept([...frames].reverse())).toHaveLength(100);
+    expect(inbound.ack()).toEqual({ epoch: 1, sequence: 99 });
+  });
+
   it("resets epochs without accepting stale frames", () => {
     const outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
     outbound.push(ping(1));
@@ -111,5 +147,13 @@ describe("V2 reliable frame windows", () => {
   it("uses typed errors for invalid construction", () => {
     expect(() => new OutboundFrameWindow({ epoch: -1 })).toThrow(V2WindowError);
     expect(() => new InboundFrameCursor({ epoch: -1 })).toThrow(V2WindowError);
+    expect(() => new OutboundFrameWindow({
+      epoch: 1,
+      limits: { frameMaxBytes: 16 * 1024, windowMaxFrames: 129, windowMaxBytes: 1024 ** 2 },
+    })).toThrow(V2WindowError);
+    expect(() => new InboundFrameCursor({
+      epoch: 1,
+      limits: { frameMaxBytes: 16 * 1024, windowMaxFrames: 128, windowMaxBytes: 1024 ** 2 + 1 },
+    })).toThrow(V2WindowError);
   });
 });
