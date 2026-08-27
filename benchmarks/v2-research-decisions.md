@@ -146,3 +146,37 @@ fan-out, which also clones one full transport diagnostic object per live
 request per publication. Investigate a shared live view that freezes one exact
 copy only when a request leaves the transport; reject it if request-local
 diagnostic lifetime semantics or observer isolation changes.
+
+## 2026-08-27 - Phase 5 - lazy isolated diagnostic snapshots - KEEP
+
+Candidate: `f893b51`
+Accepted baseline: `8c85a5a`
+
+Normal host publication now installs one versioned transport-diagnostic
+snapshot. Each request lazily clones that snapshot only on observation and
+freezes one isolated final copy when it exits. A request created after a prior
+publication does not inherit that older sample. Recovered requests freeze the
+old generation and follow the replacement only after its next publication.
+
+Using 128 queued requests, a no-op Awareness channel, 2,000 warmups, and seven
+samples of 10,000 urgent publications produced:
+
+| Metric | Previous | Candidate | Result |
+|---|---:|---:|---:|
+| median host publication | 6.932 us | 1.134 us | 83.6% faster |
+| eager diagnostic clones per publication | 128 | 0 | eliminated |
+
+The regression test observed all 128 eager clones before the change and now
+requires zero. Additional tests prove lazy refresh, stable identity between
+publications, cross-request mutation isolation, freeze-on-exit, and exact
+replacement-generation following. The modeled transport matrix remained
+stable. The full suite passed 1,631 tests; the 16/64 MiB gates and release/Deno
+checks passed.
+
+## Next investigation after Phase 5
+
+Measure the unadmitted request queue under 128-way churn. Admitted and committed
+states currently remain in the same array, so every later admission and final
+removal can scan or splice through unrelated live work. First try removing a
+state from that queue at its admission boundary, preserving priority and
+failover ordering exactly; keep it only with a material measured gain.
