@@ -238,6 +238,7 @@ export interface V2SandboxRuntimeOptions {
   resourceRefreshLeadMs?: number;
   ySweetRefreshMs?: number;
   sidecarProbePeriodMs?: number;
+  sidecarSuspectRecheckMs?: number;
   sidecarFailureThreshold?: number;
   sidecarCommitStallMs?: number;
   sidecarStallSampleThreshold?: number;
@@ -307,6 +308,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   readonly #resourceRefreshLeadMs: number;
   readonly #ySweetRefreshMs: number;
   readonly #sidecarProbePeriodMs: number;
+  readonly #sidecarSuspectRecheckMs: number;
   readonly #sidecarFailureThreshold: number;
   readonly #sidecarCommitStallMs: number;
   readonly #sidecarStallSampleThreshold: number;
@@ -385,10 +387,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#resourceRefreshLeadMs = refreshLead;
     this.#ySweetRefreshMs = ySweetRefreshMs;
     this.#sidecarProbePeriodMs = options.sidecarProbePeriodMs ?? 10_000;
+    this.#sidecarSuspectRecheckMs = options.sidecarSuspectRecheckMs ?? 2_000;
     this.#sidecarFailureThreshold = options.sidecarFailureThreshold ?? 3;
     // A reliable-window stall is stronger evidence than one missed out-of-band
-    // pong. Observe it twice, one probe period apart, so the effective default
-    // recovery boundary is 20 seconds without reacting to a single slow ACK.
+    // pong. Observe it twice, but confirm a suspect runtime on the shorter
+    // cadence so the default recovery boundary is 12 seconds without reacting
+    // to a single slow ACK.
     this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? this.#sidecarProbePeriodMs;
     this.#sidecarStallSampleThreshold = options.sidecarStallSampleThreshold ?? 2;
     // Recovery includes authenticated session proof, old-PID retirement, one
@@ -398,6 +402,13 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#stopTimeoutMs = options.stopTimeoutMs ?? 15_000;
     if (!Number.isSafeInteger(this.#sidecarProbePeriodMs) || this.#sidecarProbePeriodMs < 1) {
       throw new RangeError("sidecarProbePeriodMs must be positive");
+    }
+    if (
+      !Number.isSafeInteger(this.#sidecarSuspectRecheckMs) ||
+      this.#sidecarSuspectRecheckMs < 1 ||
+      this.#sidecarSuspectRecheckMs > this.#sidecarProbePeriodMs
+    ) {
+      throw new RangeError("sidecarSuspectRecheckMs must be between one and sidecarProbePeriodMs");
     }
     if (!Number.isSafeInteger(this.#sidecarFailureThreshold) || this.#sidecarFailureThreshold < 1) {
       throw new RangeError("sidecarFailureThreshold must be positive");
@@ -897,6 +908,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       }
     };
     while (!signal.aborted && generation === this.#generation) {
+      let acceleratedRecheck = false;
       try {
         await this.#clock.waitUntil(deadline, signal);
       } catch {
@@ -928,6 +940,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             reliableStallReady = true;
             throw new Error("V2 reliable host transport stopped making progress");
           }
+          acceleratedRecheck = true;
         } else {
           consecutiveReliableStalls = 0;
           await monitoredTransport.probeLiveness!(signal);
@@ -953,10 +966,16 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           consecutiveFailures >= this.#sidecarFailureThreshold
         ) {
           if (!await recover()) return;
+        } else {
+          acceleratedRecheck = true;
         }
       }
-      deadline += this.#sidecarProbePeriodMs;
-      while (deadline <= this.#clock.now()) deadline += this.#sidecarProbePeriodMs;
+      if (acceleratedRecheck) {
+        deadline = this.#clock.now() + this.#sidecarSuspectRecheckMs;
+      } else {
+        deadline += this.#sidecarProbePeriodMs;
+        while (deadline <= this.#clock.now()) deadline += this.#sidecarProbePeriodMs;
+      }
     }
   }
 

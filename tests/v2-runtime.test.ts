@@ -352,6 +352,7 @@ function runtimeHarness(options: {
   sidecarRecoveryTimeoutMs?: number;
   sidecarCommitStallMs?: number;
   sidecarStallSampleThreshold?: number;
+  sidecarSuspectRecheckMs?: number;
   enableR2Recovery?: boolean;
   recoveryAdoptError?: Error;
   heartbeatSessionId?: string;
@@ -490,6 +491,7 @@ function runtimeHarness(options: {
     sidecarRecoveryTimeoutMs: options.sidecarRecoveryTimeoutMs,
     sidecarCommitStallMs: options.sidecarCommitStallMs,
     sidecarStallSampleThreshold: options.sidecarStallSampleThreshold,
+    sidecarSuspectRecheckMs: options.sidecarSuspectRecheckMs,
     initialSandbox: options.initialSandbox,
     onCredentialRefresh: outcome => credentialOutcomes.push(outcome),
     createGateway: (_sandbox: ProvisionedSandbox) => ({
@@ -1057,6 +1059,15 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("bounds the suspect recheck cadence by the normal liveness period", () => {
+    expect(() => runtimeHarness({ sidecarSuspectRecheckMs: 0 })).toThrow(
+      "sidecarSuspectRecheckMs must be between one and sidecarProbePeriodMs",
+    );
+    expect(() => runtimeHarness({ sidecarSuspectRecheckMs: 10_001 })).toThrow(
+      "sidecarSuspectRecheckMs must be between one and sidecarProbePeriodMs",
+    );
+  });
+
   it("removes capacity on a missed sidecar probe, heals, then fails after three misses", async () => {
     const miss = () => new Error("sidecar pong timed out");
     const harness = runtimeHarness({
@@ -1072,13 +1083,22 @@ describe("V2SandboxRuntime", () => {
       availabilityReason: "sidecar_suspect",
     });
 
-    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(1_999);
+    expect(harness.runtime.snapshot().capacity).toBe(0);
+    expect(harness.transport.livenessProbes).toBe(2);
+    await harness.clock.advanceBy(1);
     expect(harness.runtime.snapshot().capacity).toBe(128);
+    expect(harness.transport.livenessProbes).toBe(3);
 
     await harness.clock.advanceBy(10_000);
-    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot().availabilityReason).toBe("sidecar_suspect");
+    expect(harness.transport.livenessProbes).toBe(4);
+    await harness.clock.advanceBy(2_000);
     expect(harness.runtime.snapshot().state).toBe("ready");
-    await harness.clock.advanceBy(10_000);
+    expect(harness.transport.livenessProbes).toBe(5);
+    await harness.clock.advanceBy(1_999);
+    expect(harness.runtime.snapshot().state).toBe("ready");
+    await harness.clock.advanceBy(1);
     expect(harness.runtime.snapshot()).toMatchObject({
       state: "failed",
       capacity: 0,
@@ -1087,6 +1107,7 @@ describe("V2SandboxRuntime", () => {
         operation: "sidecar_liveness",
       },
     });
+    expect(harness.transport.livenessProbes).toBe(6);
     await harness.runtime.stop();
   });
 
@@ -1099,9 +1120,15 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
     const originalNonce = harness.transport.binding!.launchNonce;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await harness.clock.advanceBy(10_000);
-    }
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot().availabilityReason).toBe("sidecar_suspect");
+    expect(harness.transport.livenessProbes).toBe(2);
+    await harness.clock.advanceBy(2_000);
+    expect(harness.transport.livenessProbes).toBe(3);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    await harness.clock.advanceBy(1_999);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    await harness.clock.advanceBy(1);
     for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
       await Promise.resolve();
     }
@@ -1137,7 +1164,10 @@ describe("V2SandboxRuntime", () => {
     await harness.clock.advanceBy(10_000);
     expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
     expect(harness.transports).toHaveLength(1);
-    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(1_999);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    await harness.clock.advanceBy(1);
     for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
       await Promise.resolve();
     }
@@ -1164,11 +1194,14 @@ describe("V2SandboxRuntime", () => {
     await harness.clock.advanceBy(10_000);
     expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
     harness.transport.snapshotValue.diagnostics = undefined;
-    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(1_999);
+    expect(harness.runtime.snapshot().capacity).toBe(0);
+    await harness.clock.advanceBy(1);
 
     expect(harness.transport.recoverySuspends).toBe(0);
     expect(harness.transports).toHaveLength(1);
     expect(harness.runtime.snapshot().capacity).toBe(128);
+    expect(harness.transport.livenessProbes).toBe(2);
     await harness.runtime.stop();
   });
 
