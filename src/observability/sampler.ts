@@ -257,6 +257,8 @@ export class FleetSampler {
         transform_workers: transforms?.workers ?? router.resources.cpuTransformWorkers,
         transform_active: transforms?.active ?? 0,
         transform_queued: transforms?.queued ?? 0,
+        fleet_transfer_reserved: router.fleetTransferReserved,
+        fleet_transfer_budget: router.fleetTransferBudget,
         event_memory: this.#hostEventMemorySnapshot
           ? (() => {
               const value = this.#hostEventMemorySnapshot!();

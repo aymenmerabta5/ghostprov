@@ -116,6 +116,13 @@ class DeferredMissingProjects extends FakeProjects {
   }
 }
 
+class ReverseMetadataProjects extends FakeProjects {
+  override async get(id: ProjectId): Promise<PrismProjectSummary> {
+    if (id === A) await Bun.sleep(20);
+    return super.get(id);
+  }
+}
+
 class FakeRuntime implements RoutableSandboxRuntime {
   state = "configured";
   starts = 0;
@@ -532,6 +539,31 @@ async function waitForCondition(
 }
 
 describe("ProjectFleetManager", () => {
+  it("keeps fresh worker indexes in configured order when metadata completes in reverse", async () => {
+    const files = await state();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B], provisionConcurrency: 2 }),
+      manifest: files.manifest,
+      projects: new ReverseMetadataProjects([project(A), project(B)]),
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 2 });
+    const manifest = await files.manifest.load();
+    expect(manifest.workers.map(worker => ({ index: worker.index, projectId: worker.projectId })))
+      .toEqual([
+        { index: 1, projectId: A },
+        { index: 2, projectId: B },
+      ]);
+    expect(harness.factory.created.map(value => ({
+      index: value.workerIndex,
+      projectId: value.projectId,
+    })).sort((left, right) => left.index - right.index)).toEqual([
+      { index: 1, projectId: A },
+      { index: 2, projectId: B },
+    ]);
+    await harness.value.shutdown("test-complete");
+  });
+
   it("fails an all-missing explicit fleet before provisioning or project creation", async () => {
     const files = await state();
     const projects = new FakeProjects([project(B, "Unlisted project")]);

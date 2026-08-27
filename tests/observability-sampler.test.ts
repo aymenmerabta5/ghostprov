@@ -88,6 +88,8 @@ describe("FleetSampler", () => {
         available: 496,
         queued: 0,
         queuedBytes: 1_234,
+        fleetTransferReserved: 4,
+        fleetTransferBudget: 4,
         resources: {
           totalBytes: 32 * 1024 ** 3,
           startupFreeBytes: 20 * 1024 ** 3,
@@ -292,6 +294,8 @@ describe("FleetSampler", () => {
       array_buffer_bytes: 100,
     });
     expect((event.resources as any).transform_workers).toBe(6);
+    expect((event.resources as any).fleet_transfer_reserved).toBe(4);
+    expect((event.resources as any).fleet_transfer_budget).toBe(4);
     expect((event.resources as any).event_memory).toMatchObject({
       ordinary_capacity_bytes: 64 * 1024 ** 2,
       ordinary_used_bytes: 2 * 1024 ** 2,

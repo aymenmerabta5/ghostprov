@@ -57,11 +57,17 @@ const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 const PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
 const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
+const FLEET_TRANSFER_EXEMPT_BYTES = 256 * KiB;
+const FLEET_TRANSFER_PACED_MAX_BYTES = 3 * MiB;
+const FLEET_TRANSFER_BUDGET = 4;
+const FLEET_TRANSFER_PACER_BURST = 2;
+const FLEET_TRANSFER_PACER_REFILL_TOKENS = 2;
+const FLEET_TRANSFER_PACER_INTERVAL_MS = 500;
 const MIN_ADMISSION_PROGRESS_FRESHNESS_MS = 5_000;
 const MAX_ADMISSION_PROGRESS_FRESHNESS_MS = 10_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
-/** @internal Deterministic R5 admission-progress policy; exported for timing proofs. */
+/** @internal Deterministic bulk-profile admission-progress policy; exported for timing proofs. */
 export function admissionProgressFreshnessMs(selectedRttMs: number): number {
   const finiteRttMs = Number.isFinite(selectedRttMs) ? Math.max(0, selectedRttMs) : 0;
   return Math.min(
@@ -246,6 +252,12 @@ interface RouteSelection {
   eligibleCandidates: number;
   retryEpoch: number;
   admissionCost: number;
+  fleetTransferCost: number;
+}
+
+interface FleetTransferLease {
+  readonly cost: number;
+  released: boolean;
 }
 
 interface CachedRuntime {
@@ -277,6 +289,8 @@ export interface MultiSandboxRouterSnapshot {
   available: number;
   queued: number;
   queuedBytes?: number;
+  fleetTransferReserved: number;
+  fleetTransferBudget: number;
   runtimes: ReturnType<SandboxRegistry["snapshots"]>;
   resources: ReturnType<ResourceGovernor["snapshot"]>;
 }
@@ -455,6 +469,10 @@ export class MultiSandboxRouter {
   #classCursor: RouterQueueClass = "latency";
   #queuedJobs = 0;
   #queuedBytes = 0;
+  #fleetTransferReserved = 0;
+  #fleetTransferPacerTokens = FLEET_TRANSFER_PACER_BURST;
+  #fleetTransferPacerNextTokenAtMs: number | null = null;
+  #fleetTransferPacerTimer?: ReturnType<typeof setTimeout>;
   #deadlineTimer?: ReturnType<typeof setTimeout>;
   #deadlineTimerAtMs: number | null = null;
   #drainScheduled = false;
@@ -934,6 +952,65 @@ export class MultiSandboxRouter {
     if (jobs.size === 0) this.#reserved.delete(projectId);
   }
 
+  #reserveFleetTransfer(cost: number): FleetTransferLease | null {
+    if (cost <= 0) return null;
+    if (this.#fleetTransferReserved + cost > FLEET_TRANSFER_BUDGET) {
+      throw new Error("Fleet transfer budget was oversubscribed after route selection");
+    }
+    this.#fleetTransferReserved += cost;
+    return { cost, released: false };
+  }
+
+  #releaseFleetTransfer(lease: FleetTransferLease | null): boolean {
+    if (!lease || lease.released) return false;
+    lease.released = true;
+    this.#fleetTransferReserved = Math.max(0, this.#fleetTransferReserved - lease.cost);
+    return true;
+  }
+
+  #refillFleetTransferPacer(now = this.#clock.now()): void {
+    const nextAt = this.#fleetTransferPacerNextTokenAtMs;
+    if (nextAt === null || now < nextAt) return;
+    const intervals = 1 + Math.floor(
+      (now - nextAt) / FLEET_TRANSFER_PACER_INTERVAL_MS,
+    );
+    const tokens = intervals * FLEET_TRANSFER_PACER_REFILL_TOKENS;
+    this.#fleetTransferPacerTokens = Math.min(
+      FLEET_TRANSFER_PACER_BURST,
+      this.#fleetTransferPacerTokens + tokens,
+    );
+    this.#fleetTransferPacerNextTokenAtMs =
+      this.#fleetTransferPacerTokens >= FLEET_TRANSFER_PACER_BURST
+        ? null
+        : nextAt + intervals * FLEET_TRANSFER_PACER_INTERVAL_MS;
+  }
+
+  #consumeFleetTransferPacer(cost: number, now: number): void {
+    this.#refillFleetTransferPacer(now);
+    if (cost < 1 || this.#fleetTransferPacerTokens < cost) {
+      throw new Error("Fleet transfer pacer was consumed without a token");
+    }
+    this.#fleetTransferPacerTokens -= cost;
+    this.#fleetTransferPacerNextTokenAtMs ??= now + FLEET_TRANSFER_PACER_INTERVAL_MS;
+  }
+
+  #armFleetTransferPacer(): void {
+    if (this.#fleetTransferPacerTimer || this.#fleetTransferPacerNextTokenAtMs === null) return;
+    const wakeAt = this.#fleetTransferPacerNextTokenAtMs;
+    this.#fleetTransferPacerTimer = setTimeout(() => {
+      this.#fleetTransferPacerTimer = undefined;
+      this.#refillFleetTransferPacer();
+      this.#scheduleDrain();
+      if (this.#fleetTransferPacerTokens < 1) this.#armFleetTransferPacer();
+    }, Math.max(0, Math.ceil(wakeAt - this.#clock.now())));
+    this.#fleetTransferPacerTimer.unref?.();
+  }
+
+  #clearFleetTransferPacerTimer(): void {
+    if (this.#fleetTransferPacerTimer) clearTimeout(this.#fleetTransferPacerTimer);
+    this.#fleetTransferPacerTimer = undefined;
+  }
+
   snapshot(): MultiSandboxRouterSnapshot {
     const runtimes = [...this.#runtimeCache.values()].map(cached => {
       const runtime = this.#agedSnapshot(cached);
@@ -987,6 +1064,8 @@ export class MultiSandboxRouter {
       available,
       queued: this.#queuedJobs,
       queuedBytes: this.#queuedBytes,
+      fleetTransferReserved: this.#fleetTransferReserved,
+      fleetTransferBudget: FLEET_TRANSFER_BUDGET,
       runtimes,
       resources: this.#governor.snapshot(),
     };
@@ -1012,6 +1091,7 @@ export class MultiSandboxRouter {
       job.reject(error);
     }
     this.#clearDeadlineTimer();
+    this.#clearFleetTransferPacerTimer();
   }
 
   async awaitIdle(timeoutMs: number, signal?: AbortSignal): Promise<void> {
@@ -1461,10 +1541,14 @@ export class MultiSandboxRouter {
         queue_class: job.queueClass,
         fair_cost_bytes: job.fairCostBytes,
         transfer_admission_cost: job.admissionCost,
+        fleet_transfer_cost: selection.fleetTransferCost,
+        fleet_transfer_reserved: this.#fleetTransferReserved + selection.fleetTransferCost,
+        fleet_transfer_budget: FLEET_TRANSFER_BUDGET,
         route_attempt: job.attempts + 1,
         capacity_reason: candidate.availabilityReason ?? "available",
       });
       this.#reserveRuntime(job, runtime.projectId);
+      const fleetTransferLease = this.#reserveFleetTransfer(selection.fleetTransferCost);
       // This drain pass uses one immutable fleet snapshot. Charge its local
       // admission credit immediately so queued jobs cannot trigger repeated
       // all-runtime snapshots/scans on every Awareness publication.
@@ -1483,6 +1567,7 @@ export class MultiSandboxRouter {
         candidate.availabilityReason ?? "available",
         candidate.transportProfile === "bulk-v1",
         candidate.ackEwmaMs,
+        fleetTransferLease,
       );
       if (candidates.length === 0) return;
     }
@@ -1594,14 +1679,27 @@ export class MultiSandboxRouter {
     return Math.max(0, advertised - current.reserved);
   }
 
+  #fleetTransferCost(job: QueuedJob, candidate: RouteCandidate): number {
+    return this.#runtimeCache.size > 1 &&
+        candidate.transportProfile === "bulk-v1" &&
+        job.workload.requestBytes > FLEET_TRANSFER_EXEMPT_BYTES
+      ? job.bulkAdmissionCost
+      : 0;
+  }
+
   #choose(job: QueuedJob, available: readonly RouteCandidate[]): RouteSelection | null {
     const now = this.#clock.now();
-    const candidates = available.filter(
+    let candidates = available.filter(
       candidate => {
         const profile = candidate.transportProfile === "bulk-v1" ? "bulk-v1" : "standard";
         const admissionCost = profile === "bulk-v1"
           ? job.bulkAdmissionCost
           : job.standardAdmissionCost;
+        const fleetTransferCost = this.#fleetTransferCost(job, candidate);
+        if (
+          fleetTransferCost > 0 &&
+          this.#fleetTransferReserved + fleetTransferCost > FLEET_TRANSFER_BUDGET
+        ) return false;
         if (
           v2HostTransferBudget(profile) - (candidate.reservedTransferCost ?? 0) <
             admissionCost
@@ -1612,20 +1710,46 @@ export class MultiSandboxRouter {
         return retryEpoch > block.retryEpoch || now >= block.retryAtMs;
       },
     );
+    const eligibleCandidates = candidates.filter(isRuntimeEligible);
+    const fleetTransferPacerCost = job.workload.requestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES
+      ? FLEET_TRANSFER_PACER_BURST
+      : 1;
+    const paceFleetTransfer =
+      job.workload.requestBytes > FLEET_TRANSFER_EXEMPT_BYTES &&
+      job.workload.requestBytes <= FLEET_TRANSFER_PACED_MAX_BYTES &&
+      eligibleCandidates.length > 1 &&
+      eligibleCandidates.every(candidate => candidate.transportProfile === "bulk-v1");
+    if (paceFleetTransfer) {
+      this.#refillFleetTransferPacer(now);
+      if (this.#fleetTransferPacerTokens < fleetTransferPacerCost) {
+        this.#armFleetTransferPacer();
+        return null;
+      }
+      const leastActive = Math.min(...eligibleCandidates.map(candidate => (
+        candidate.active + candidate.reserved
+      )));
+      candidates = eligibleCandidates.filter(candidate => (
+        candidate.active + candidate.reserved === leastActive
+      ));
+    }
     const decision = chooseRuntime(job.workload, candidates, this.#random);
     if (!decision) return null;
     const runtime = this.#runtimeCache.get(decision.projectId)?.runtime;
     const candidate = candidates.find(value => value.projectId === decision.projectId);
+    if (runtime && candidate && paceFleetTransfer) {
+      this.#consumeFleetTransferPacer(fleetTransferPacerCost, now);
+    }
     return runtime && candidate
       ? {
           runtime,
           candidate,
           incarnationKey: runtimeIncarnationKey(candidate),
-          eligibleCandidates: candidates.filter(isRuntimeEligible).length,
+          eligibleCandidates: eligibleCandidates.length,
           retryEpoch: this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0,
           admissionCost: candidate.transportProfile === "bulk-v1"
             ? job.bulkAdmissionCost
             : job.standardAdmissionCost,
+          fleetTransferCost: this.#fleetTransferCost(job, candidate),
         }
       : null;
   }
@@ -1638,6 +1762,7 @@ export class MultiSandboxRouter {
     selectedCapacityReason: NonNullable<RoutableSandboxSnapshot["availabilityReason"]>,
     selectedBulkProfile: boolean,
     selectedRttMs: number,
+    fleetTransferLease: FleetTransferLease | null,
   ): Promise<void> {
     const started = this.#clock.now();
     const requestModel = typeof job.body.model === "string"
@@ -1756,6 +1881,7 @@ export class MultiSandboxRouter {
         },
         onExecutionRiskReflected: () => {
           if (admissionController.signal.aborted) return;
+          if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
           clearAdmissionDeadline();
         },
       };
@@ -1783,6 +1909,7 @@ export class MultiSandboxRouter {
       // abort path synchronously proves pre-execution safety or committed risk
       // before the short cancellation-proof fence permits a retry.
       const handle = await Promise.race([runtimeRun, admissionWait]);
+      if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
       // Commitment also ends any remaining attempt deadline immediately.
       // Optional memory accounting work must never turn an accepted upstream
       // request into a local timeout or inflate measured commit ACK latency.
@@ -1914,6 +2041,7 @@ export class MultiSandboxRouter {
     } catch (error) {
       detachAdmission();
       this.#releaseRuntimeReservation(job, runtime.projectId);
+      if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
       const commitment = error && typeof error === "object"
         ? error as { committed?: unknown; ambiguous?: unknown }
         : {};

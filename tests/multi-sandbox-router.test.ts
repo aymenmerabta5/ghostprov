@@ -56,6 +56,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   pulseAdmissionOnFailure = false;
   readonly executionStartedAtMs: number[] = [];
   readonly admissionProgressCallbacks: Array<() => void> = [];
+  readonly executionRiskCallbacks: Array<() => void> = [];
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
   readonly listeners = new Set<() => void>();
@@ -150,7 +151,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
       this.admissionProgressCallbacks.push(options.onAdmissionProgress);
     }
     options?.onAdmissionReflected?.();
-    if (this.reflectExecutionRisk) options?.onExecutionRiskReflected?.();
+    if (options?.onExecutionRiskReflected) {
+      if (this.reflectExecutionRisk) options.onExecutionRiskReflected();
+      else this.executionRiskCallbacks.push(options.onExecutionRiskReflected);
+    }
     if (this.waitForPostAdmissionAbort) {
       try {
         await new Promise<never>((_resolve, reject) => {
@@ -188,6 +192,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
   emitAdmissionProgress(index = this.admissionProgressCallbacks.length - 1): void {
     this.admissionProgressCallbacks[index]?.();
+  }
+  emitExecutionRisk(index = this.executionRiskCallbacks.length - 1): void {
+    this.executionRiskCallbacks[index]?.();
   }
 }
 
@@ -236,6 +243,182 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("caps R5 fleet bursts at four weighted units while tiny work bypasses the gate", async () => {
+    const system = createSystem(8, 8, 10_000, undefined, undefined, undefined, 5_000);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.reflectExecutionRisk = false;
+      runtime.waitForPostAdmissionAbort = true;
+      runtime.notify();
+    }
+    const controllers = Array.from({ length: 9 }, () => new AbortController());
+    const large = Array.from({ length: 8 }, (_, index) => system.router.startRelay(
+      { model: "gpt-5.6-sol", input: `fleet-gate-large-${index}`, stream: true },
+      {
+        clientId: `fleet-gate-large-${index}`,
+        source: "websocket",
+        signal: controllers[index]!.signal,
+        encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+      },
+    ));
+    await flush(100);
+
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
+    expect(system.runtimes.filter(runtime => runtime.executions > 0)).toHaveLength(2);
+    expect(system.router.snapshot()).toMatchObject({
+      queued: 6,
+      fleetTransferReserved: 4,
+      fleetTransferBudget: 4,
+    });
+
+    const tiny = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "fleet-gate-tiny", stream: true },
+      {
+        clientId: "fleet-gate-tiny",
+        source: "websocket",
+        signal: controllers[8]!.signal,
+        encodedBodyBytes: 128 * 1024,
+      },
+    );
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot().fleetTransferReserved).toBe(4);
+
+    await Bun.sleep(510);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 4 });
+
+    const holding = system.runtimes.find(runtime => (
+      runtime.admissionProgressCallbacks.length > 0 &&
+      runtime.executionRiskCallbacks.length > 0
+    ))!;
+    holding.emitExecutionRisk(0);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
+    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 4 });
+
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled([...large, tiny]);
+    await system.router.close();
+    expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+  });
+
+  it("paces a synchronized R5 medium burst while preserving single-start and tiny-request fast paths", async () => {
+    let now = performance.timeOrigin + performance.now();
+    const clock: Clock = {
+      now: () => now,
+      sleep: () => Promise.resolve(),
+      waitUntil: () => Promise.resolve(),
+    };
+    const system = createSystem(8, 8, 20_000, undefined, undefined, clock, 10_000);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.reflectExecutionRisk = false;
+      runtime.waitForPostAdmissionAbort = true;
+      runtime.notify();
+    }
+    const controllers = Array.from({ length: 5 }, () => new AbortController());
+    const medium = Array.from({ length: 4 }, (_, index) => system.router.startRelay(
+      { model: "gpt-5.6-sol", input: `paced-medium-${index}`, stream: true },
+      {
+        clientId: `paced-medium-${index}`,
+        source: "websocket",
+        signal: controllers[index]!.signal,
+        encodedBodyBytes: 1024 ** 2,
+      },
+    ));
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.runtimes.filter(runtime => runtime.executions > 0)).toHaveLength(1);
+    expect(system.router.snapshot()).toMatchObject({ queued: 3, fleetTransferReserved: 1 });
+
+    const tiny = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "paced-tiny-bypass", stream: true },
+      {
+        clientId: "paced-tiny-bypass",
+        source: "websocket",
+        signal: controllers[4]!.signal,
+        encodedBodyBytes: 128 * 1024,
+      },
+    );
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
+    expect(system.router.snapshot()).toMatchObject({ queued: 3, fleetTransferReserved: 1 });
+
+    now += 500;
+    system.runtimes.forEach(runtime => runtime.notify());
+    await Bun.sleep(510);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 2, fleetTransferReserved: 2 });
+
+    now += 500;
+    system.runtimes.forEach(runtime => runtime.notify());
+    await Bun.sleep(510);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
+    expect(system.router.snapshot()).toMatchObject({ queued: 1, fleetTransferReserved: 3 });
+
+    now += 500;
+    system.runtimes.forEach(runtime => runtime.notify());
+    await Bun.sleep(510);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(5);
+    expect(system.router.snapshot()).toMatchObject({ queued: 0, fleetTransferReserved: 4 });
+
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled([...medium, tiny]);
+    await system.router.close();
+    expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+  });
+
+  for (const scenario of [
+    { name: "R5 medium", profile: "bulk-v1" as const, bytes: 1024 ** 2, expected: 1, reserved: 1 },
+    { name: "R5 true bulk", profile: "bulk-v1" as const, bytes: Math.floor(3.35 * 1024 ** 2), expected: 1, reserved: 4 },
+    { name: "standard rollback", profile: "standard" as const, bytes: Math.floor(2.9 * 1024 ** 2), expected: 8, reserved: 0 },
+  ]) {
+    it(`keeps ${scenario.name} fleet transfer concurrency exact`, async () => {
+      const system = createSystem(8, 8, 1_000, undefined, undefined, undefined, 500);
+      for (const runtime of system.runtimes) {
+        runtime.transportProfile = scenario.profile;
+        runtime.reflectExecutionRisk = false;
+        runtime.waitForPostAdmissionAbort = true;
+        runtime.notify();
+      }
+      // A historically fast project must not absorb a synchronized R5 burst
+      // while equally idle projects are available. Standard rollback keeps its
+      // existing policy and is constrained independently per runtime.
+      system.runtimes[0]!.ackEwmaMs = 25;
+      system.runtimes.slice(1).forEach(runtime => { runtime.ackEwmaMs = 2_000; });
+      system.runtimes.forEach(runtime => runtime.notify());
+      const controllers = Array.from({ length: 8 }, () => new AbortController());
+      const pending = Array.from({ length: 8 }, (_, index) => system.router.startRelay(
+        { model: "gpt-5.6-sol", input: `${scenario.name}-${index}`, stream: true },
+        {
+          clientId: `${scenario.name}-${index}`,
+          source: "websocket",
+          signal: controllers[index]!.signal,
+          encodedBodyBytes: scenario.bytes,
+        },
+      ));
+      await flush(100);
+
+      expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0))
+        .toBe(scenario.expected);
+      if (scenario.profile === "bulk-v1") {
+        expect(system.runtimes.filter(runtime => runtime.executions > 0))
+          .toHaveLength(scenario.expected);
+      }
+      expect(system.router.snapshot().fleetTransferReserved).toBe(scenario.reserved);
+
+      for (const controller of controllers) controller.abort();
+      await Promise.allSettled(pending);
+      await system.router.close();
+      expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+    });
+  }
+
   it("uses profile-specific transfer reservations without oversubscribing standard rollback", async () => {
     const launch = (system: ReturnType<typeof createSystem>) => Array.from(
       { length: 4 },

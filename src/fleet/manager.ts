@@ -280,6 +280,14 @@ export class ProjectFleetManager {
   ): Promise<FleetSnapshot> {
     if (signal?.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
     let manifest = await this.#manifest.initialize(this.#identity.kind);
+    // A brand-new explicit fleet owns a deterministic index namespace. Remote
+    // metadata calls intentionally run in parallel and may finish out of
+    // order, but that network race must never change project-to-worker
+    // ownership or conflict with an existing worker marker in the project.
+    const preserveConfiguredOrder = manifest.workers.length === 0;
+    const configuredIndexes = new Map(
+      projectIds.map((projectId, index) => [projectId, index + 1] as const),
+    );
     if (signal?.aborted || this.#shuttingDown) {
       throw new DOMException("Fleet reconciliation aborted", "AbortError");
     }
@@ -310,7 +318,9 @@ export class ProjectFleetManager {
         manifest = await this.#manifest.load();
         let worker = manifest.workers.find(value => value.projectId === project.projectId);
         if (!worker) {
-          const index = nextWorkerIndex(manifest.workers);
+          const index = preserveConfiguredOrder
+            ? configuredIndexes.get(project.projectId)!
+            : nextWorkerIndex(manifest.workers);
           manifest = await this.#manifest.reserveWorker({
             index,
             projectId: project.projectId,
