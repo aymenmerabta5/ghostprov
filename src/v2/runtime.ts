@@ -538,9 +538,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const verifiedRelease = this.#state === "ready" ? this.#descriptor : null;
     const descriptorCapacity = this.#descriptor?.capacity ?? 0;
     const active = transport?.active ?? 0;
+    const prefetched = transport?.prefetched ?? 0;
     const quarantined = transport?.quarantined ?? 0;
     const creditCapacity = transport
-      ? Math.max(0, transport.credits + active)
+      ? Math.max(0, transport.credits + active + prefetched)
       : 0;
     const capacity = this.#state === "ready" && !this.#sidecarSuspect &&
         !this.#credentialRefreshPending && !this.#ySweetReconnectPending
@@ -563,7 +564,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       active,
       available: this.#state === "ready" && !this.#sidecarSuspect &&
           !this.#credentialRefreshPending && !this.#ySweetReconnectPending && transport
-        ? Math.max(0, Math.min(transport.admissionCredits ?? transport.credits, capacity - active - quarantined))
+        ? Math.max(0, Math.min(
+            transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+            capacity - active - prefetched - quarantined,
+          ))
         : 0,
       quarantined,
       ambiguousQuarantined: transport?.ambiguousQuarantined ?? 0,

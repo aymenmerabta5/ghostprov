@@ -1161,16 +1161,18 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   #notifyIfRoutingChanged(): void {
     const transport = this.#session.snapshot();
     const capacity = this.#state === "ready" ? this.#physical : 0;
+    const prefetched = transport.prefetched ?? 0;
     const available = this.#state === "ready"
       ? Math.max(0, Math.min(
-        transport.admissionCredits ?? transport.credits,
-        capacity - transport.active - transport.quarantined,
+        transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+        capacity - transport.active - prefetched - transport.quarantined,
       ))
       : 0;
     const signal = [
       this.#state,
       capacity,
       transport.active,
+      prefetched,
       available,
       transport.queued,
       transport.quarantined,
@@ -1184,6 +1186,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     const transport = this.#session.snapshot();
     this.sample();
     const capacity = this.#state === "ready" ? this.#physical : 0;
+    const prefetched = transport.prefetched ?? 0;
     return {
       projectId: this.projectId,
       transportProfile: this.#transportProfile,
@@ -1192,8 +1195,8 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       active: transport.active,
       available: this.#state === "ready"
         ? Math.max(0, Math.min(
-          transport.admissionCredits ?? transport.credits,
-          capacity - transport.active - transport.quarantined,
+          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+          capacity - transport.active - prefetched - transport.quarantined,
         ))
         : 0,
       quarantined: transport.quarantined,

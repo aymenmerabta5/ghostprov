@@ -439,6 +439,7 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
   snapshot(): RoutableSandboxSnapshot {
     const transport = this.#session.snapshot();
     const capacity = this.#state === "ready" ? this.#physical : 0;
+    const prefetched = transport.prefetched ?? 0;
     return {
       projectId: this.projectId,
       state: this.#state,
@@ -446,8 +447,8 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
       active: transport.active,
       available: this.#state === "ready"
         ? Math.max(0, Math.min(
-            transport.admissionCredits ?? transport.credits,
-            capacity - transport.active - transport.quarantined,
+            transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+            capacity - transport.active - prefetched - transport.quarantined,
           ))
         : 0,
       quarantined: transport.quarantined,

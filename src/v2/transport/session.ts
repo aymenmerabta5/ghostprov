@@ -84,6 +84,8 @@ const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
 const BULK_GZIP_MIN_BYTES = 2 * 1024 * 1024;
 const GZIP_SAMPLE_BYTES = 64 * 1024;
 const LATENCY_CRITICAL_REQUEST_BYTES = 256 * 1024;
+const MAX_PRECOMMIT_EXECUTION_RESERVATIONS = 4;
+const MAX_BULK_BODY_PREFETCH_RESERVATIONS = 6;
 const ACCELERATION_RECOVERY_CLEAN_FLIGHTS = 2;
 const DEFAULT_TRANSPORT_STALL_MS = 2_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
@@ -114,12 +116,16 @@ export interface V2TransportSnapshot {
   connected: boolean;
   committed: number;
   active: number;
+  /** Body-only R2 reservations waiting behind the four-start safety gate. */
+  prefetched?: number;
   queued: number;
   quarantined: number;
   ambiguousQuarantined?: number;
   ambiguityLimit?: number;
   credits: number;
   admissionCredits?: number;
+  /** Safe host run calls, including bounded body-only R5 prefetch capacity. */
+  prefetchCredits?: number;
   retransmissions: number;
   awarenessRttMs: number | null;
   /** Age of the newest valid envelope from the bootstrap-bound sidecar instance. */
@@ -264,6 +270,7 @@ interface RequestState {
   admitted: boolean;
   transferCost: number;
   latencyCriticalPreCommitTracked: boolean;
+  latencyCriticalRequestTracked: boolean;
   published: boolean;
   commitStaged: boolean;
   commitPublished: boolean;
@@ -271,6 +278,8 @@ interface RequestState {
   startRisk: boolean;
   startQueued: boolean;
   startStaged: boolean;
+  startReserved: boolean;
+  preparedStart: R2RequestStartFrame | null;
   committed: boolean;
   cancelled: boolean;
   quarantineKind: "cancellation" | "ambiguity" | null;
@@ -500,6 +509,7 @@ export class V2TransportSession {
   readonly #rotations = new Map<string, RotationWaiter>();
   readonly #rotationStreams = new Set<string>();
   readonly #pending: RequestState[] = [];
+  readonly #preparedStarts: RequestState[] = [];
   readonly #idleWaiters = new Set<() => void>();
   readonly #retiredSidecarInstances = new Set<string>();
   readonly #terminalReceipts = new Map<string, TerminalReceipt>();
@@ -534,7 +544,9 @@ export class V2TransportSession {
   #remoteCredits = 0;
   #creditReservations = 0;
   #transferReservations = 0;
+  #startReservations = 0;
   #latencyCriticalPreCommitTransfers = 0;
+  #latencyCriticalRequests = 0;
   #quarantined = 0;
   #ambiguousQuarantined = 0;
   #retransmissions = 0;
@@ -876,12 +888,15 @@ export class V2TransportSession {
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
       latencyCriticalPreCommitTracked: false,
+      latencyCriticalRequestTracked: false,
       published: false,
       commitStaged: false,
       commitPublished: false,
       startRisk: false,
       startQueued: false,
       startStaged: false,
+      startReserved: false,
+      preparedStart: null,
       committed: false,
       cancelled: false,
       quarantineKind: null,
@@ -1036,6 +1051,8 @@ export class V2TransportSession {
       state.terminal = null;
       state.startQueued = false;
       state.startStaged = false;
+      state.startReserved = false;
+      state.preparedStart = null;
       state.onAdmissionReflected = undefined;
       state.onExecutionRiskReflected = undefined;
       const prefix = state.transcript.snapshot();
@@ -1055,7 +1072,10 @@ export class V2TransportSession {
     }
     this.#creditReservations = 0;
     this.#transferReservations = 0;
+    this.#startReservations = 0;
+    this.#preparedStarts.length = 0;
     this.#latencyCriticalPreCommitTransfers = 0;
+    this.#latencyCriticalRequests = 0;
     for (const [requestId, receipt] of this.#terminalReceipts) {
       this.#scheduler.removeStream(requestId);
       receipt.queued = false;
@@ -1453,6 +1473,8 @@ export class V2TransportSession {
       this.#terminalReceipts.clear();
       this.#creditReservations = 0;
       this.#transferReservations = 0;
+      this.#startReservations = 0;
+      this.#preparedStarts.length = 0;
       const nextEpoch = this.#outbound.snapshot().epoch + 1;
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
@@ -1471,19 +1493,33 @@ export class V2TransportSession {
 
   snapshot(): V2TransportSnapshot {
     let committed = 0;
+    let admittedUncommitted = 0;
+    let unadmitted = 0;
     for (const state of this.#requests.values()) {
       if (state.committed) committed++;
+      else if (state.admitted) admittedUncommitted++;
+      else unadmitted++;
     }
+    const executionReservations = Math.min(
+      admittedUncommitted,
+      Math.max(
+        0,
+        MAX_PRECOMMIT_EXECUTION_RESERVATIONS - this.#ambiguousQuarantined,
+      ),
+    );
+    const prefetched = admittedUncommitted - executionReservations;
     return {
       connected: this.#connected && !this.#closed && !this.#sidecarRecovery,
       committed,
-      active: this.#requests.size - this.#pending.filter(state => !state.admitted).length,
-      queued: this.#pending.filter(state => !state.admitted).length,
+      active: committed + executionReservations,
+      prefetched,
+      queued: unadmitted + prefetched,
       quarantined: this.#quarantined,
       ambiguousQuarantined: this.#ambiguousQuarantined,
       ambiguityLimit: Math.max(1, Math.min(4, this.#hostCeiling)),
       credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
       admissionCredits: this.#availableCredits(),
+      prefetchCredits: this.#availablePrefetchCredits(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#delivery.roundTripEwmaMs,
       sidecarPeerAgeMs: this.#lastValidPeerAtMs === null
@@ -1783,21 +1819,10 @@ export class V2TransportSession {
           }
           return;
         }
-        if (state.startQueued || state.startRisk) return;
-        state.startQueued = true;
-        try {
-          this.#scheduler.enqueue(
-            "commit",
-            state.requestId,
-            this.#requestStartFromPrepared(frame),
-          );
-        } catch (cause) {
-          state.startQueued = false;
-          this.#failPreCommit(state, new V2PreCommitError(
-            cause instanceof Error ? cause.message : "R2 request start could not be staged",
-            "start_stage",
-          ));
-        }
+        if (state.startQueued || state.startRisk || state.preparedStart) return;
+        state.preparedStart = this.#requestStartFromPrepared(frame);
+        this.#preparedStarts.push(state);
+        this.#stagePreparedStarts();
         return;
       }
       case "upstream_prelude": {
@@ -1874,6 +1899,7 @@ export class V2TransportSession {
           return;
         }
         if (state.committed) return;
+        this.#releaseStartReservation(state);
         this.#stopTrackingLatencyCriticalPreCommit(state);
         state.committed = true;
         state.diagnostics.committed(frame.diagnostics);
@@ -2241,6 +2267,56 @@ export class V2TransportSession {
       encoding: frame.encoding,
       partCount: frame.partCount,
     };
+  }
+
+  #stagePreparedStarts(): void {
+    if (
+      this.#binding.protocolRevision !== "r2" ||
+      this.#closed || this.#draining || this.#sidecarRecovery
+    ) return;
+    while (
+      this.#preparedStarts.length > 0 &&
+      this.#startReservations + this.#ambiguousQuarantined <
+        MAX_PRECOMMIT_EXECUTION_RESERVATIONS
+    ) {
+      const latencyIndex = this.#preparedStarts.findIndex(state => (
+        state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
+      ));
+      const index = latencyIndex >= 0 ? latencyIndex : 0;
+      const state = this.#preparedStarts.splice(index, 1)[0]!;
+      const start = state.preparedStart;
+      if (!start || !this.#requests.has(state.requestId) || state.startQueued || state.startRisk) {
+        continue;
+      }
+      state.preparedStart = null;
+      state.startQueued = true;
+      state.startReserved = true;
+      this.#startReservations++;
+      try {
+        this.#scheduler.enqueue("commit", state.requestId, start);
+      } catch (cause) {
+        state.startQueued = false;
+        state.startReserved = false;
+        this.#startReservations = Math.max(0, this.#startReservations - 1);
+        this.#failPreCommit(state, new V2PreCommitError(
+          cause instanceof Error ? cause.message : "R2 request start could not be staged",
+          "start_stage",
+        ));
+      }
+    }
+  }
+
+  #discardPreparedStart(state: RequestState): void {
+    state.preparedStart = null;
+    const index = this.#preparedStarts.indexOf(state);
+    if (index >= 0) this.#preparedStarts.splice(index, 1);
+  }
+
+  #releaseStartReservation(state: RequestState): void {
+    if (!state.startReserved) return;
+    state.startReserved = false;
+    this.#startReservations = Math.max(0, this.#startReservations - 1);
+    this.#stagePreparedStarts();
   }
 
   #tryAcquireEventPermit(
@@ -2961,16 +3037,30 @@ export class V2TransportSession {
     }
     // One frame per request is enough for weighted fairness; #pump replenishes
     // it only after the scheduler transfers ownership of the previous frame.
-    this.#scheduler.enqueue("data", state.requestId, frame);
+    this.#scheduler.enqueue(
+      this.#transportProfile === "bulk-v1" &&
+          state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
+        ? "commit"
+        : "data",
+      state.requestId,
+      frame,
+    );
     if (plan.stage === "done") state.preparedRequest = null;
   }
 
   #admitPending(): void {
-    while (this.#availableCredits() > 0) {
+    while (this.#availablePrefetchCredits() > 0) {
       const transferAvailable = this.#transferBudget - this.#transferReservations;
-      const state = this.#pending.find(candidate => (
+      const eligible = (candidate: RequestState) => (
         !candidate.admitted && candidate.transferCost <= transferAvailable
-      ));
+      );
+      // A queued interactive request always claims the next body slot before
+      // medium prefetch. Once one is admitted the R5 precommit depth returns to
+      // the established four-request contract.
+      const state = this.#pending.find(candidate => (
+        eligible(candidate) &&
+        candidate.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
+      )) ?? this.#pending.find(eligible);
       if (!state) return;
       state.admitted = true;
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
@@ -2980,6 +3070,8 @@ export class V2TransportSession {
       if (state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES) {
         state.latencyCriticalPreCommitTracked = true;
         this.#latencyCriticalPreCommitTransfers++;
+        state.latencyCriticalRequestTracked = true;
+        this.#latencyCriticalRequests++;
       }
       const onAdmissionReflected = state.onAdmissionReflected;
       state.onAdmissionReflected = undefined;
@@ -2999,7 +3091,26 @@ export class V2TransportSession {
     return Math.max(0, Math.min(
       this.#remoteCredits - this.#creditReservations,
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
-      4 - this.#creditReservations - this.#ambiguousQuarantined,
+      MAX_PRECOMMIT_EXECUTION_RESERVATIONS -
+        this.#creditReservations - this.#ambiguousQuarantined,
+      this.#transferBudget - this.#transferReservations,
+    ));
+  }
+
+  #availablePrefetchCredits(): number {
+    if (
+      this.#sidecarRecovery || !this.#connected || this.#closed || this.#draining ||
+      this.#congestion.congested
+    ) return 0;
+    const limit = this.#transportProfile === "bulk-v1" &&
+        this.#binding.protocolRevision === "r2" &&
+        this.#latencyCriticalRequests === 0
+      ? MAX_BULK_BODY_PREFETCH_RESERVATIONS
+      : MAX_PRECOMMIT_EXECUTION_RESERVATIONS;
+    return Math.max(0, Math.min(
+      this.#remoteCredits - this.#creditReservations,
+      this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined,
+      limit - this.#creditReservations - this.#ambiguousQuarantined,
       this.#transferBudget - this.#transferReservations,
     ));
   }
@@ -3427,7 +3538,10 @@ export class V2TransportSession {
   }
 
   #detachStateForRecovery(state: RequestState): void {
+    this.#discardPreparedStart(state);
+    this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
+    this.#stopTrackingLatencyCriticalRequest(state);
     this.#requests.delete(state.requestId);
     const pendingIndex = this.#pending.indexOf(state);
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
@@ -3555,7 +3669,10 @@ export class V2TransportSession {
   }
 
   #removeState(state: RequestState): void {
+    this.#discardPreparedStart(state);
+    this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
+    this.#stopTrackingLatencyCriticalRequest(state);
     this.#requests.delete(state.requestId);
     state.preparedRequest = null;
     state.recoveryPrefix = undefined;
@@ -3592,6 +3709,12 @@ export class V2TransportSession {
       0,
       this.#latencyCriticalPreCommitTransfers - 1,
     );
+  }
+
+  #stopTrackingLatencyCriticalRequest(state: RequestState): void {
+    if (!state.latencyCriticalRequestTracked) return;
+    state.latencyCriticalRequestTracked = false;
+    this.#latencyCriticalRequests = Math.max(0, this.#latencyCriticalRequests - 1);
   }
 
   #failProtocol(cause: unknown): void {

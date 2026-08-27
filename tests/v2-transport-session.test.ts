@@ -15,6 +15,7 @@ import {
   type AwarenessLiveness,
   type HostFrame,
   type ProtocolBinding,
+  type R2RequestCommitFrame,
   type ReliableFrame,
   type SidecarFrame,
   type V2TransportProfile,
@@ -1347,7 +1348,12 @@ describe("V2TransportSession", () => {
     const controllers=Array.from({length:5},()=>new AbortController());
     const pending=controllers.map(controller=>harness.session.run(medium,controller.signal));
     await harness.settle();
-    expect(harness.session.snapshot()).toMatchObject({ admissionCredits: 0, active: 4, queued: 1 });
+    expect(harness.session.snapshot()).toMatchObject({
+      admissionCredits: 0,
+      active: 4,
+      prefetched: 1,
+      queued: 1,
+    });
     controllers[0]!.abort();
     await expect(pending[0]!).rejects.toBeInstanceOf(DOMException);
     await harness.settle();
@@ -1361,6 +1367,126 @@ describe("V2TransportSession", () => {
     expect(bulkHarness.session.snapshot()).toMatchObject({active:1,queued:1});
     await bulkHarness.close();await Promise.allSettled(bulkPending);
   });
+  it("keeps the R5 tiny-request precommit ceiling at four", async () => {
+    const harness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});
+    await harness.start();
+    const controllers=Array.from({length:6},()=>new AbortController());
+    const pending=controllers.map((controller,index)=>harness.session.run(
+      createExactSizedV2Request(128*1024,20+index,"incompressible"),
+      controller.signal,
+    ));
+    try {
+      for(let round=0;round<12;round++){
+        if([...harness.hostFrames.values()].filter(frame=>frame.kind==="request_commit").length===4)break;
+        harness.publish([],{lane:"control"});
+        await harness.settle();
+      }
+      expect(harness.session.snapshot()).toMatchObject({active:4,queued:2});
+      expect([...harness.hostFrames.values()].filter(frame=>frame.kind==="request_commit"))
+        .toHaveLength(4);
+    }finally{
+      for(const controller of controllers)controller.abort();
+      await harness.close();
+      await Promise.allSettled(pending);
+    }
+  });
+  it("admits and frames a queued tiny R5 request ahead of medium prefetch", async () => {
+    const harness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});
+    await harness.start();
+    harness.credits=0;
+    harness.publish([],{lane:"control"});
+    await harness.settle();
+    const controllers=Array.from({length:5},()=>new AbortController());
+    const pending=[
+      ...controllers.slice(0,4).map((controller,index)=>harness.session.run(
+        createExactSizedV2Request(512*1024,40+index,"incompressible"),
+        controller.signal,
+      )),
+      harness.session.run(
+        createExactSizedV2Request(128*1024,44,"incompressible"),
+        controllers[4]!.signal,
+      ),
+    ];
+    try {
+      await harness.settleUntil(()=>harness.session.snapshot().queued===5);
+      harness.credits=128;
+      harness.publish([],{lane:"control"});
+      await harness.settleUntil(()=>(
+        [...harness.hostFrames.values()].some(frame=>frame.kind==="request_open")
+      ));
+      const firstOpen=[...harness.hostFrames.values()].find(
+        (frame):frame is Extract<ReliableFrame<HostFrame>,{kind:"request_open"}>=>(
+          frame.kind==="request_open"
+        ),
+      );
+      expect(firstOpen?.decodedBytes).toBe(128*1024);
+      expect(harness.session.snapshot()).toMatchObject({active:4,queued:1,prefetched:0});
+    }finally{
+      for(const controller of controllers)controller.abort();
+      await harness.close();
+      await Promise.allSettled(pending);
+    }
+  });
+  it("prefetches six R5 medium bodies while reserving at most four execution starts", async () => {
+    const harness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});
+    await harness.start();
+    const controllers=Array.from({length:6},()=>new AbortController());
+    const pending=controllers.map((controller,index)=>harness.session.run(
+      createExactSizedV2Request(512*1024,30+index,"incompressible"),
+      controller.signal,
+    ));
+    const hostFrames=()=>[...harness.hostFrames.values()];
+    try {
+      for(let round=0;round<24;round++){
+        if(hostFrames().filter(frame=>frame.kind==="request_commit").length===6)break;
+        harness.publish([],{lane:"control"});
+        await harness.settle();
+      }
+      const commits=hostFrames().filter(
+        (frame):frame is ReliableFrame<R2RequestCommitFrame>=>(
+          frame.kind==="request_commit" &&
+          "protocolRevision" in frame && frame.protocolRevision==="r2"
+        ),
+      );
+      expect(commits).toHaveLength(6);
+      harness.publish(commits.map(commit=>({...commit,kind:"request_prepared" as const})));
+      await harness.settleUntil(()=>(
+        hostFrames().filter(frame=>frame.kind==="request_start").length===4
+      ));
+      await harness.settle();
+      let starts=hostFrames().filter(
+        (frame):frame is Extract<ReliableFrame<HostFrame>,{kind:"request_start"}>=>(
+          frame.kind==="request_start"
+        ),
+      );
+      expect(starts).toHaveLength(4);
+
+      let acknowledgedStarts=0;
+      for(const expectedStarts of [5,6]){
+        const acknowledged=starts[acknowledgedStarts++]!;
+        harness.publish([{
+          kind:"request_ack",
+          requestId:acknowledged.requestId,
+          requestDigest:acknowledged.requestDigest,
+          committed:true,
+        }]);
+        await harness.settleUntil(()=>(
+          hostFrames().filter(frame=>frame.kind==="request_start").length===expectedStarts
+        ));
+        starts=hostFrames().filter(
+          (frame):frame is Extract<ReliableFrame<HostFrame>,{kind:"request_start"}>=>(
+            frame.kind==="request_start"
+          ),
+        );
+        expect(starts.length-acknowledgedStarts).toBeLessThanOrEqual(4);
+      }
+      expect(starts).toHaveLength(6);
+    }finally{
+      for(const controller of controllers)controller.abort();
+      await harness.close();
+      await Promise.allSettled(pending);
+    }
+  },20_000);
   it("derives retransmission delay from the RTT floor plus bounded jitter", () => {
     expect(computeV2RetransmitDelayMs(null, 0)).toBe(1_500);
     expect(computeV2RetransmitDelayMs(200, 0)).toBe(400);
