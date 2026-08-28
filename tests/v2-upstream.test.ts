@@ -462,6 +462,134 @@ describe("DirectResponsesClient", () => {
     }
   });
 
+  it("retries one provider invalid_json rejection with validated immutable text", async () => {
+    const body = new TextEncoder().encode(JSON.stringify({
+      model: "gpt-5.6-sol",
+      input: [{ role: "user", content: "large canonical context" }],
+      stream: true,
+    }));
+    let fetches = 0;
+    let fetchBoundaries = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async (_url, init) => {
+        fetches++;
+        if (fetches === 1) {
+          expect(init?.body).toBeInstanceOf(Blob);
+          return Response.json({
+            error: {
+              message: "Invalid body: failed to parse JSON value.",
+              type: "invalid_request_error",
+              code: "invalid_json",
+            },
+          }, { status: 400 });
+        }
+        expect(typeof init?.body).toBe("string");
+        body.fill(0);
+        expect(JSON.parse(init?.body as string)).toEqual({
+          model: "gpt-5.6-sol",
+          input: [{ role: "user", content: "large canonical context" }],
+          stream: true,
+        });
+        return completeSse();
+      },
+    });
+
+    const terminal = await client.execute({
+      body,
+      bodyIsCanonicalStream: true,
+      beforeFetch: async () => { fetchBoundaries++; },
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    });
+
+    expect(terminal.status).toBe("completed");
+    expect(fetches).toBe(2);
+    expect(fetchBoundaries).toBe(1);
+  });
+
+  it("never retries a non-JSON provider rejection", async () => {
+    let fetches = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => {
+        fetches++;
+        return Response.json({
+          error: {
+            message: "Unknown parameter",
+            type: "invalid_request_error",
+            code: "unknown_parameter",
+          },
+        }, { status: 400 });
+      },
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+      bodyIsCanonicalStream: true,
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    })).rejects.toMatchObject({ code: "unknown_parameter", status: 400 });
+    expect(fetches).toBe(1);
+  });
+
+  it("bounds repeated invalid_json rejection to one safe retry", async () => {
+    let fetches = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => {
+        fetches++;
+        return Response.json({
+          error: {
+            message: "Invalid body: failed to parse JSON value.",
+            type: "invalid_request_error",
+            code: "invalid_json",
+          },
+        }, { status: 400 });
+      },
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x","stream":true}'),
+      bodyIsCanonicalStream: true,
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    })).rejects.toMatchObject({ code: "invalid_json", status: 400, ambiguous: false });
+    expect(fetches).toBe(2);
+  });
+
+  it("refuses to retry invalid_json when the retained canonical body is not locally valid", async () => {
+    let fetches = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async () => {
+        fetches++;
+        return Response.json({
+          error: {
+            message: "Invalid body: failed to parse JSON value.",
+            type: "invalid_request_error",
+            code: "invalid_json",
+          },
+        }, { status: 400 });
+      },
+    });
+
+    await expect(client.execute({
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol"'),
+      bodyIsCanonicalStream: true,
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    })).rejects.toMatchObject({ code: "invalid_body", ambiguous: false });
+    expect(fetches).toBe(1);
+  });
+
   it("clears the total error-body deadline after an early body completion", async () => {
     let clearedTimers = 0;
     const originalClearTimeout = globalThis.clearTimeout;

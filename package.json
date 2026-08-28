@@ -13,9 +13,10 @@
     "test": "bun test --isolate",
     "build:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts --write",
     "check:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts",
-    "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r6/sidecar.bundle.js",
+    "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r7/sidecar.bundle.js",
     "test:v2-deno-fs": "bunx deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
-    "test:unit": "bun test --isolate tests/sse.test.ts tests/response-graph.test.ts tests/responses-validation.test.ts tests/ydoc.test.ts tests/http-errors.test.ts tests/http-body.test.ts tests/images-compat.test.ts tests/images-service.test.ts tests/prism-protocol.test.ts tests/multi-sandbox-config.test.ts tests/account-session.test.ts tests/session-manager.test.ts tests/provisioning-client.test.ts tests/sandbox-ydoc.test.ts tests/sandbox-gateway.test.ts tests/heartbeat.test.ts tests/workload.test.ts tests/resource-governor.test.ts tests/cpu-transform-pool.test.ts tests/supervised-runtime.test.ts tests/recovery-coordinator.test.ts tests/recovery-observability.test.ts tests/host-supervisor-service-control.test.ts tests/host-supervisor.test.ts tests/v2-rate-limit-protocol.test.ts tests/v2-upstream.test.ts tests/router-policy.test.ts tests/no-playwright.test.ts tests/documentation.test.ts",
+    "test:v2-deno-upstream": "bunx deno@2.9.5 test --no-check --unstable-sloppy-imports tests/deno/v2-upstream-retry.deno.ts",
+    "test:unit": "bun test --isolate tests/sse.test.ts tests/response-graph.test.ts tests/responses-validation.test.ts tests/ydoc.test.ts tests/http-errors.test.ts tests/http-body.test.ts tests/images-compat.test.ts tests/images-service.test.ts tests/prism-protocol.test.ts tests/multi-sandbox-config.test.ts tests/account-session.test.ts tests/session-manager.test.ts tests/provisioning-client.test.ts tests/sandbox-ydoc.test.ts tests/sandbox-gateway.test.ts tests/heartbeat.test.ts tests/workload.test.ts tests/resource-governor.test.ts tests/cpu-transform-pool.test.ts tests/sandbox-liveness.test.ts tests/supervised-runtime.test.ts tests/recovery-coordinator.test.ts tests/recovery-observability.test.ts tests/host-supervisor-service-control.test.ts tests/host-supervisor.test.ts tests/v2-rate-limit-protocol.test.ts tests/v2-upstream.test.ts tests/router-policy.test.ts tests/no-playwright.test.ts tests/documentation.test.ts",
     "test:integration": "bun test --isolate tests/http-streaming.test.ts tests/websocket.test.ts tests/images-http.test.ts tests/router-http.test.ts tests/router-rate-limit.test.ts tests/multi-sandbox-router.test.ts tests/multi-sandbox-integration.test.ts tests/recovery-chaos.test.ts",
     "typecheck": "tsc --noEmit",
     "verify:live": "bun scripts/live_verify.ts",
@@ -33,7 +34,8 @@
     "benchmark:v2-research:record": "bun scripts/v2_performance_research.ts --record benchmarks/v2-performance-baseline.json",
     "monitor:v2": "bun scripts/monitor_v2.ts",
     "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
-    "verify:v2-transport-stability": "bun scripts/live_transport_stability.ts"
+    "verify:v2-transport-stability": "bun scripts/live_transport_stability.ts",
+    "verify:v2-dual-channel-live": "bun scripts/live_dual_channel_liveness.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",

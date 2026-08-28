@@ -2,6 +2,7 @@ import { SYSTEM_CLOCK, SYSTEM_RANDOM, type Clock, type RandomSource } from "../c
 import type { RunHandle } from "../relay/run-handle";
 import {
   SandboxRegistry,
+  type SandboxAdmissionProgress,
   type RoutableSandboxRuntime,
   type RoutableSandboxSnapshot,
   type SandboxRunOptions,
@@ -57,6 +58,7 @@ const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 const PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
 const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
+const MEDIUM_PROGRESS_PROBE_MIN_BYTES = 256 * KiB;
 const FLEET_TRANSFER_EXEMPT_BYTES = 256 * KiB;
 const FLEET_TRANSFER_PACED_MAX_BYTES = 3 * MiB;
 const FLEET_TRANSFER_BUDGET = 4;
@@ -65,6 +67,10 @@ const FLEET_TRANSFER_PACER_REFILL_TOKENS = 2;
 const FLEET_TRANSFER_PACER_INTERVAL_MS = 500;
 const MIN_ADMISSION_PROGRESS_FRESHNESS_MS = 5_000;
 const MAX_ADMISSION_PROGRESS_FRESHNESS_MS = 10_000;
+const MIN_PREPARED_PROOF_GRACE_MS = 3_000;
+const MAX_PREPARED_PROOF_GRACE_MS = 5_000;
+const MIN_FIRST_PROGRESS_TIMEOUT_MS = 5_000;
+const MAX_FIRST_PROGRESS_TIMEOUT_MS = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
 /** @internal Deterministic bulk-profile admission-progress policy; exported for timing proofs. */
@@ -76,18 +82,97 @@ export function admissionProgressFreshnessMs(selectedRttMs: number): number {
   );
 }
 
+/** @internal Bounded final-body-ACK to exact prepared-proof allowance. */
+export function preparedProofGraceMs(selectedRttMs: number): number {
+  const finiteRttMs = Number.isFinite(selectedRttMs) ? Math.max(0, selectedRttMs) : 0;
+  return Math.min(
+    MAX_PREPARED_PROOF_GRACE_MS,
+    Math.max(MIN_PREPARED_PROOF_GRACE_MS, Math.ceil(4 * finiteRttMs)),
+  );
+}
+
+/** @internal First cumulative-ACK bound for medium bulk-profile transfers. */
+export function mediumFirstProgressTimeoutMs(selectedRttMs: number): number {
+  const finiteRttMs = Number.isFinite(selectedRttMs) ? Math.max(0, selectedRttMs) : 0;
+  return Math.min(
+    MAX_FIRST_PROGRESS_TIMEOUT_MS,
+    Math.max(MIN_FIRST_PROGRESS_TIMEOUT_MS, Math.ceil(8 * finiteRttMs)),
+  );
+}
+
 /** @internal Returns the next bounded progress check, or null when retry is due. */
 export function nextAdmissionProgressCheckAtMs(
   nowMs: number,
   absoluteDeadlineMs: number,
   lastProgressAtMs: number | null,
   freshnessMs: number,
+  retainStaleProgress = false,
 ): number | null {
+  if (nowMs >= absoluteDeadlineMs || lastProgressAtMs === null) return null;
+  if (nowMs - lastProgressAtMs < freshnessMs) {
+    return Math.min(absoluteDeadlineMs, lastProgressAtMs + freshnessMs);
+  }
+  if (retainStaleProgress) return absoluteDeadlineMs;
+  // A late-admitted multi-megabyte request may spend most of its global
+  // deadline waiting behind the bounded fleet transfer gate. Once less than
+  // one RTT-derived freshness window remains, a full retransmit cannot receive
+  // stronger liveness evidence before the same hard deadline. Preserve the
+  // already-acknowledged attempt instead of deterministically discarding its
+  // bytes for a doomed retry. No-progress attempts still retry unchanged.
+  return absoluteDeadlineMs - nowMs <= freshnessMs ? absoluteDeadlineMs : null;
+}
+
+/**
+ * Keep a stale transfer only when protocol proof shows that the current copy
+ * can still finish but retransmitting the full body at its measured unique-ACK
+ * rate cannot. This is deliberately stricter than a byte-percentage heuristic:
+ * scant progress, implausibly fast samples, and transfers which no longer fit
+ * all retain the established retry behavior.
+ *
+ * @internal Exported for deterministic timing proofs.
+ */
+export function shouldRetainStaleAdmissionProgress(
+  nowMs: number,
+  absoluteDeadlineMs: number,
+  attemptStartedAtMs: number,
+  lastProgressAtMs: number | null,
+  freshnessMs: number,
+  progress: SandboxAdmissionProgress | null,
+): boolean {
   if (
-    nowMs >= absoluteDeadlineMs || lastProgressAtMs === null ||
-    nowMs - lastProgressAtMs >= freshnessMs
-  ) return null;
-  return Math.min(absoluteDeadlineMs, lastProgressAtMs + freshnessMs);
+    lastProgressAtMs === null || progress === null ||
+    nowMs >= absoluteDeadlineMs || freshnessMs < 1 ||
+    !Number.isFinite(nowMs) || !Number.isFinite(absoluteDeadlineMs) ||
+    !Number.isFinite(attemptStartedAtMs) || !Number.isFinite(lastProgressAtMs) ||
+    !Number.isSafeInteger(progress.acknowledgedEncodedBytes) ||
+    !Number.isSafeInteger(progress.totalEncodedBytes) ||
+    progress.totalEncodedBytes < 1 ||
+    progress.acknowledgedEncodedBytes < 1 ||
+    progress.acknowledgedEncodedBytes > progress.totalEncodedBytes
+  ) return false;
+  if (
+    progress.stage === "request_prepared" &&
+    progress.acknowledgedEncodedBytes === progress.totalEncodedBytes
+  ) return true;
+  if (progress.stage !== "request_data") return false;
+  // All body frames are present, but the sidecar has not produced the exact
+  // durable request_prepared proof within its bounded proof grace. That is a
+  // preparation stall, not useful transfer progress; another sandbox is the
+  // only remaining pre-execution recovery path.
+  if (progress.acknowledgedEncodedBytes === progress.totalEncodedBytes) return false;
+  // A single early flight is not enough evidence to sacrifice failover. At
+  // least half of the exact encoded body must already be cumulatively ACKed.
+  if (progress.acknowledgedEncodedBytes * 2 < progress.totalEncodedBytes) return false;
+  const progressElapsedMs = lastProgressAtMs - attemptStartedAtMs;
+  if (!Number.isFinite(progressElapsedMs) || progressElapsedMs < 1) return false;
+  const remainingBudgetMs = absoluteDeadlineMs - nowMs;
+  const millisecondsPerByte = progressElapsedMs / progress.acknowledgedEncodedBytes;
+  const currentRemainingMs = Math.ceil(
+    (progress.totalEncodedBytes - progress.acknowledgedEncodedBytes) * millisecondsPerByte,
+  );
+  const fullRetransmitMs = Math.ceil(progress.totalEncodedBytes * millisecondsPerByte);
+  return currentRemainingMs + freshnessMs <= remainingBudgetMs &&
+    fullRetransmitMs + freshnessMs > remainingBudgetMs;
 }
 
 export interface RequestRoutingTimeouts {
@@ -256,7 +341,7 @@ interface RouteSelection {
 }
 
 interface FleetTransferLease {
-  readonly cost: number;
+  cost: number;
   released: boolean;
 }
 
@@ -965,6 +1050,17 @@ export class MultiSandboxRouter {
     if (!lease || lease.released) return false;
     lease.released = true;
     this.#fleetTransferReserved = Math.max(0, this.#fleetTransferReserved - lease.cost);
+    return true;
+  }
+
+  #downgradeFleetTransferToControl(lease: FleetTransferLease | null): boolean {
+    if (!lease || lease.released || lease.cost <= 1) return false;
+    const releasedCost = lease.cost - 1;
+    lease.cost = 1;
+    this.#fleetTransferReserved = Math.max(
+      0,
+      this.#fleetTransferReserved - releasedCost,
+    );
     return true;
   }
 
@@ -1774,33 +1870,82 @@ export class MultiSandboxRouter {
     let routeAttemptProgressObserved = false;
     let routeAttemptProgressAgeMs: number | null = null;
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+    let admissionTimerAtMs: number | null = null;
     let cancellationProofTimer: ReturnType<typeof setTimeout> | undefined;
     const progressAwareAttempt = selectedBulkProfile &&
       job.workload.requestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
       job.workload.requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES;
+    const mediumProgressProbe = selectedBulkProfile &&
+      job.workload.requestBytes > MEDIUM_PROGRESS_PROBE_MIN_BYTES &&
+      job.workload.requestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES;
+    const observeAdmissionProgress = progressAwareAttempt || mediumProgressProbe;
     const progressFreshnessMs = progressAwareAttempt
       ? admissionProgressFreshnessMs(selectedRttMs)
       : 0;
+    const preparedProofGrace = progressAwareAttempt
+      ? preparedProofGraceMs(selectedRttMs)
+      : 0;
+    const firstProgressTimeoutMs = mediumProgressProbe
+      ? mediumFirstProgressTimeoutMs(selectedRttMs)
+      : 0;
+    let initialAttemptDeadlineMs: number | null = null;
+    let firstProgressCheckAtMs: number | null = null;
     let admissionProgressAtMs: number | null = null;
+    let admissionProgress: SandboxAdmissionProgress | null = null;
     let rejectAdmissionWait!: (error: unknown) => void;
     const admissionWait = new Promise<never>((_resolve, reject) => {
       rejectAdmissionWait = reject;
     });
     void admissionWait.catch(() => undefined);
+    const captureAttemptProgress = (now: number) => {
+      routeAttemptExpired = true;
+      routeAttemptProgressObserved = admissionProgressAtMs !== null;
+      routeAttemptProgressAgeMs = admissionProgressAtMs === null
+        ? null
+        : Math.max(0, now - admissionProgressAtMs);
+    };
     const onCallerAbort = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
       admissionTimer = undefined;
+      admissionTimerAtMs = null;
       const error = job.signal?.reason ?? abortError();
+      const value = error && typeof error === "object"
+        ? error as { code?: unknown }
+        : {};
+      // The ingress lease owns the same public deadline and can win the timer
+      // race by a few milliseconds. Preserve the selected-attempt diagnostics
+      // rather than misreporting a live transfer as an unexplained queue 503.
+      if (value.code === "router_capacity_timeout" && !routeAttemptExpired) {
+        admissionDeadlineExpired = true;
+        captureAttemptProgress(this.#clock.now());
+      }
       admissionController.abort(error);
       rejectAdmissionWait(error);
     };
     if (job.signal?.aborted) onCallerAbort();
     else job.signal?.addEventListener("abort", onCallerAbort, { once: true });
-    const expireAdmissionAttempt = () => {
+    let expireAdmissionAttempt!: () => void;
+    const armAdmissionTimerAt = (atMs: number) => {
+      const boundedAtMs = Math.min(job.queueDeadlineMs, atMs);
+      if (
+        admissionTimer && admissionTimerAtMs !== null &&
+        admissionTimerAtMs <= boundedAtMs
+      ) return;
+      if (admissionTimer) clearTimeout(admissionTimer);
+      admissionTimerAtMs = boundedAtMs;
+      admissionTimer = setTimeout(
+        expireAdmissionAttempt,
+        Math.max(1, Math.ceil(boundedAtMs - this.#clock.now())),
+      );
+      admissionTimer.unref?.();
+    };
+    expireAdmissionAttempt = () => {
       admissionTimer = undefined;
+      admissionTimerAtMs = null;
       const now = this.#clock.now();
       if (now >= job.queueDeadlineMs) {
         admissionDeadlineExpired = true;
+        captureAttemptProgress(now);
         const error = new RouterCapacityTimeoutError();
         admissionController.abort(error);
         cancellationProofTimer = setTimeout(
@@ -1810,29 +1955,54 @@ export class MultiSandboxRouter {
         cancellationProofTimer.unref?.();
         return;
       }
-      const nextProgressCheckAtMs = progressAwareAttempt
-        ? nextAdmissionProgressCheckAtMs(
-            now,
-            job.queueDeadlineMs,
-            admissionProgressAtMs,
-            progressFreshnessMs,
-          )
-        : null;
+      if (mediumProgressProbe && initialAttemptDeadlineMs !== null) {
+        if (
+          admissionProgressAtMs === null && firstProgressCheckAtMs !== null &&
+          now < firstProgressCheckAtMs
+        ) {
+          armAdmissionTimerAt(firstProgressCheckAtMs);
+          return;
+        }
+        if (admissionProgressAtMs !== null && now < initialAttemptDeadlineMs) {
+          // Any exact cumulative data ACK proves this medium transfer is alive.
+          // Preserve its established 15-second attempt after that first proof.
+          armAdmissionTimerAt(initialAttemptDeadlineMs);
+          return;
+        }
+      }
+      const completeBodyAwaitingPrepared = admissionProgress?.stage === "request_data" &&
+        admissionProgress.acknowledgedEncodedBytes === admissionProgress.totalEncodedBytes &&
+        admissionProgressAtMs !== null;
+      let nextProgressCheckAtMs: number | null = null;
+      if (progressAwareAttempt && completeBodyAwaitingPrepared) {
+        const preparedCheckAtMs = admissionProgressAtMs! + preparedProofGrace;
+        nextProgressCheckAtMs = now < preparedCheckAtMs
+          ? Math.min(job.queueDeadlineMs, preparedCheckAtMs)
+          : null;
+      } else if (progressAwareAttempt) {
+        const retainStaleProgress = shouldRetainStaleAdmissionProgress(
+          now,
+          job.queueDeadlineMs,
+          started,
+          admissionProgressAtMs,
+          progressFreshnessMs,
+          admissionProgress,
+        );
+        nextProgressCheckAtMs = nextAdmissionProgressCheckAtMs(
+          now,
+          job.queueDeadlineMs,
+          admissionProgressAtMs,
+          progressFreshnessMs,
+          retainStaleProgress,
+        );
+      }
       if (nextProgressCheckAtMs !== null) {
         // Do not restart the attempt budget. Check again when this exact proof
         // becomes stale, always capped by the one public admission deadline.
-        admissionTimer = setTimeout(
-          expireAdmissionAttempt,
-          Math.max(1, Math.ceil(nextProgressCheckAtMs - now)),
-        );
-        admissionTimer.unref?.();
+        armAdmissionTimerAt(nextProgressCheckAtMs);
         return;
       }
-      routeAttemptExpired = true;
-      routeAttemptProgressObserved = admissionProgressAtMs !== null;
-      routeAttemptProgressAgeMs = admissionProgressAtMs === null
-        ? null
-        : Math.max(0, now - admissionProgressAtMs);
+      captureAttemptProgress(now);
       const error = new RouterRouteAttemptTimeoutError();
       admissionController.abort(error);
       cancellationProofTimer = setTimeout(
@@ -1854,12 +2024,19 @@ export class MultiSandboxRouter {
         remainingAdmissionMs,
         job.routeAttemptTimeoutMs,
       );
-      admissionTimer = setTimeout(expireAdmissionAttempt, attemptTimeoutMs);
-      admissionTimer.unref?.();
+      initialAttemptDeadlineMs = this.#clock.now() + attemptTimeoutMs;
+      firstProgressCheckAtMs = mediumProgressProbe
+        ? Math.min(
+            initialAttemptDeadlineMs,
+            this.#clock.now() + firstProgressTimeoutMs,
+          )
+        : initialAttemptDeadlineMs;
+      armAdmissionTimerAt(firstProgressCheckAtMs);
     }
     const clearAdmissionDeadline = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
       admissionTimer = undefined;
+      admissionTimerAtMs = null;
       if (cancellationProofTimer) clearTimeout(cancellationProofTimer);
       cancellationProofTimer = undefined;
     };
@@ -1885,10 +2062,10 @@ export class MultiSandboxRouter {
           clearAdmissionDeadline();
         },
       };
-      if (progressAwareAttempt) {
-        runOptions.onAdmissionProgress = () => {
+      if (observeAdmissionProgress) {
+        runOptions.onAdmissionProgress = progress => {
           // Late ACK/prepared callbacks cannot revive an aborted attempt or
-          // move its absolute deadline. Standard, rollback, and <=2 MiB runs
+          // move its absolute deadline. Standard, rollback, and <=256 KiB runs
           // never install this observer or its transport ACK scan.
           if (
             admissionController.signal.aborted || routeAttemptExpired ||
@@ -1896,7 +2073,49 @@ export class MultiSandboxRouter {
           ) return;
           const now = this.#clock.now();
           if (now >= job.queueDeadlineMs) return;
+          if (
+            !Number.isSafeInteger(progress.acknowledgedEncodedBytes) ||
+            !Number.isSafeInteger(progress.totalEncodedBytes) ||
+            progress.totalEncodedBytes < 1 ||
+            progress.acknowledgedEncodedBytes < 1 ||
+            progress.acknowledgedEncodedBytes > progress.totalEncodedBytes ||
+            (progress.stage !== "request_data" && progress.stage !== "request_prepared") ||
+            (progress.stage === "request_prepared" &&
+              progress.acknowledgedEncodedBytes !== progress.totalEncodedBytes) ||
+            (admissionProgress !== null &&
+              (progress.totalEncodedBytes !== admissionProgress.totalEncodedBytes ||
+                progress.acknowledgedEncodedBytes <
+                  admissionProgress.acknowledgedEncodedBytes ||
+                admissionProgress.stage === "request_prepared" ||
+                (progress.stage === "request_data" &&
+                  progress.acknowledgedEncodedBytes ===
+                    admissionProgress.acknowledgedEncodedBytes)))
+          ) return;
+          admissionProgress = Object.freeze({
+            stage: progress.stage,
+            acknowledgedEncodedBytes: progress.acknowledgedEncodedBytes,
+            totalEncodedBytes: progress.totalEncodedBytes,
+          });
           admissionProgressAtMs = now;
+          if (progressAwareAttempt &&
+            progress.acknowledgedEncodedBytes === progress.totalEncodedBytes
+          ) {
+            if (progress.stage === "request_prepared") {
+              // Exact assembly/claim proof ends shared-link body ownership.
+              // Local transport/start reservations remain unchanged.
+              if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
+            } else {
+              // The payload is complete, but assembly/claim still consumes the
+              // shared path. Retain one control unit rather than releasing the
+              // lease entirely: two outstanding proofs can admit only one new
+              // observed-size body, avoiding both head-of-line starvation and
+              // the overload reproduced by a zero-cost prepared handshake.
+              if (this.#downgradeFleetTransferToControl(fleetTransferLease)) {
+                this.#scheduleDrain();
+              }
+              armAdmissionTimerAt(now + preparedProofGrace);
+            }
+          }
         };
       }
       const runtimeRun = Promise.resolve(runtime.run(
@@ -2045,6 +2264,33 @@ export class MultiSandboxRouter {
       const commitment = error && typeof error === "object"
         ? error as { committed?: unknown; ambiguous?: unknown }
         : {};
+      const committed = commitment.committed === true;
+      const ambiguous = commitment.ambiguous === true;
+      const timedOutBeforeCommit = routeAttemptExpired &&
+        !isDeterministicRequestTooLarge(error) &&
+        !committed &&
+        !ambiguous;
+      if (timedOutBeforeCommit) {
+        // TypeScript does not model assignments performed by the asynchronous
+        // transport callback above; capture its actual runtime value here.
+        const finalAdmissionProgress = admissionProgress as
+          SandboxAdmissionProgress | null;
+        this.#emit("route.attempt_expired", {
+          trace_id: job.traceId,
+          project_id: runtime.projectId,
+          route_attempt: job.attempts + 1,
+          attempt_ms: Math.max(0, this.#clock.now() - started),
+          progress_observed: routeAttemptProgressObserved,
+          progress_age_ms: routeAttemptProgressAgeMs,
+          progress_stage: finalAdmissionProgress?.stage ?? null,
+          progress_acknowledged_encoded_bytes:
+            finalAdmissionProgress?.acknowledgedEncodedBytes ?? null,
+          progress_total_encoded_bytes: finalAdmissionProgress?.totalEncodedBytes ?? null,
+          deadline_exhausted: admissionDeadlineExpired,
+          capacity_reason: selectedCapacityReason,
+          transfer_admission_cost: job.admissionCost,
+        });
+      }
       if (
         admissionDeadlineExpired &&
         !isDeterministicRequestTooLarge(error) &&
@@ -2085,28 +2331,7 @@ export class MultiSandboxRouter {
         this.#scheduleDrain();
         return;
       }
-      const value = error && typeof error === "object"
-        ? error as { committed?: unknown; ambiguous?: unknown }
-        : {};
-      const committed = value.committed === true;
-      const ambiguous = value.ambiguous === true;
-      const timedOutBeforeCommit = routeAttemptExpired &&
-        !isDeterministicRequestTooLarge(error) &&
-        !committed &&
-        !ambiguous;
       const retryablePreCommit = timedOutBeforeCommit || isRetryablePreCommitFailure(error);
-      if (timedOutBeforeCommit) {
-        this.#emit("route.attempt_expired", {
-          trace_id: job.traceId,
-          project_id: runtime.projectId,
-          route_attempt: job.attempts + 1,
-          attempt_ms: Math.max(0, this.#clock.now() - started),
-          progress_observed: routeAttemptProgressObserved,
-          progress_age_ms: routeAttemptProgressAgeMs,
-          capacity_reason: selectedCapacityReason,
-          transfer_admission_cost: job.admissionCost,
-        });
-      }
       if (
         retryablePreCommit &&
         !job.signal?.aborted &&

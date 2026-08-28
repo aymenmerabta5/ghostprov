@@ -90,6 +90,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
   stops = 0;
   drains = 0;
   heartbeatAgeMs: number | null = 0;
+  sidecarPeerAgeMs: number | null = null;
+  transportConnected: boolean | undefined;
   credentialExpiresInMs: number | null = 60_000;
   readonly listeners = new Set<() => void>();
   stopBehavior?: () => void | Promise<void>;
@@ -129,7 +131,11 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.runCalls++;
     if (this.runFailure) throw this.runFailure;
     options?.onAdmissionReflected?.();
-    options?.onAdmissionProgress?.();
+    options?.onAdmissionProgress?.({
+      stage: "request_data",
+      acknowledgedEncodedBytes: 1,
+      totalEncodedBytes: 1,
+    });
     options?.onExecutionRiskReflected?.();
     return {
       async *events() {},
@@ -156,6 +162,8 @@ class FakeRuntime implements RoutableSandboxRuntime {
       available: this.state === "ready" ? 128 : 0,
       quarantined: 0,
       heartbeatAgeMs: this.heartbeatAgeMs,
+      sidecarPeerAgeMs: this.sidecarPeerAgeMs,
+      transportConnected: this.transportConnected,
       credentialExpiresInMs: this.credentialExpiresInMs,
       ackEwmaMs: 1,
       completionEwmaMs: 1,
@@ -509,6 +517,108 @@ describe("SupervisedSandboxRuntime", () => {
     await waitFor(() => creates === 1);
     await waitFor(() => runtime.snapshot().state === "ready");
     await runtime.stop();
+  });
+
+  it("accepts fresh exact-sidecar proof while heartbeat is missing at startup", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    initial.heartbeatAgeMs = null;
+    initial.sidecarPeerAgeMs = 0;
+    initial.transportConnected = true;
+    let creates = 0;
+    const runtime = supervisor({
+      clock,
+      initial,
+      heartbeatGraceMs: 2_000,
+      create: () => { creates++; return new FakeRuntime(); },
+    });
+
+    await runtime.start();
+
+    expect(runtime.supervisorSnapshot().phase).toBe("healthy");
+    expect(runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128 });
+    expect(creates).toBe(0);
+    await runtime.stop();
+  });
+
+  it("does not replace a heartbeat-stale runtime until exact-sidecar proof is also lost", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    initial.heartbeatAgeMs = 40_001;
+    initial.sidecarPeerAgeMs = 500;
+    initial.transportConnected = true;
+    const replacement = new FakeRuntime();
+    let creates = 0;
+    const runtime = supervisor({
+      clock,
+      initial,
+      create: () => { creates++; return replacement; },
+    });
+    await runtime.start();
+
+    for (let sample = 0; sample < 5; sample++) {
+      clock.advanceBy(1_000);
+      initial.heartbeatAgeMs += 1_000;
+      initial.sidecarPeerAgeMs = 500;
+      initial.emit();
+      await flush();
+    }
+    expect(runtime.supervisorSnapshot().phase).toBe("healthy");
+    expect(runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128 });
+    expect(creates).toBe(0);
+
+    initial.transportConnected = false;
+    initial.emit();
+    await waitFor(() => creates === 1);
+    await waitFor(() => runtime.snapshot().state === "ready");
+    initial.emit();
+    await flush();
+    expect(creates).toBe(1);
+    expect(initial.stops).toBe(1);
+    await runtime.stop();
+  });
+
+  it("preserves an eight-runtime fleet during correlated heartbeat loss", async () => {
+    const clock = new ManualClock();
+    const children = Array.from({ length: 8 }, (_, index) => {
+      const child = new FakeRuntime(projectId(
+        `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      ));
+      child.heartbeatAgeMs = 40_001;
+      child.sidecarPeerAgeMs = 250 + index * 1_250;
+      child.transportConnected = true;
+      return child;
+    });
+    const replacementCounts = Array.from({ length: 8 }, () => 0);
+    const supervisors = children.map((child, index) => new SupervisedSandboxRuntime({
+      projectId: child.projectId,
+      initialChild: child,
+      createChild: () => {
+        replacementCounts[index]++;
+        return new FakeRuntime(child.projectId);
+      },
+      clock,
+      random: { next: () => 0 },
+      checkIntervalMs: 1_000,
+      heartbeatGraceMs: 40_000,
+      startupTimeoutMs: 10_000,
+      initialBackoffMs: 1_000,
+      maxBackoffMs: 60_000,
+    }));
+    await Promise.all(supervisors.map(runtime => runtime.start()));
+
+    for (let phase = 0; phase < children.length; phase++) {
+      children[phase]!.emit();
+      clock.advanceBy(1_000);
+      await flush();
+    }
+
+    expect(replacementCounts).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(supervisors.map(runtime => runtime.supervisorSnapshot().phase))
+      .toEqual(Array.from({ length: 8 }, () => "healthy"));
+    expect(supervisors.reduce((total, runtime) => total + runtime.snapshot().capacity, 0))
+      .toBe(8 * 128);
+    await Promise.all(supervisors.map(runtime => runtime.stop()));
   });
 
   it("reprovisions auth-required and expired-credential generations", async () => {

@@ -693,9 +693,16 @@ export class ProjectFleetManager {
     const snapshots = this.#registry.snapshots().filter(
       snapshot => selectedProjects.has(snapshot.projectId),
     );
-    const unavailableProjects = projects.filter(
-      id => this.#unavailableProjects.has(id) && !this.#registry.get(id),
+    const snapshotsByProject = new Map(
+      snapshots.map(snapshot => [snapshot.projectId, snapshot] as const),
     );
+    const unavailableProjects = projects.filter(
+      id => {
+        const snapshot = snapshotsByProject.get(id);
+        return !snapshot || !isRuntimeHealthy(snapshot);
+      },
+    );
+    const missingRuntimeCount = projects.filter(id => !snapshotsByProject.has(id)).length;
     this.#snapshot = Object.freeze({
       desired,
       ready: snapshots.filter(isRuntimeHealthy).length,
@@ -710,7 +717,7 @@ export class ProjectFleetManager {
       ].includes(value.state)).length,
       draining: snapshots.filter(value => value.state === "draining").length,
       failed: snapshots.filter(value => value.state === "failed" || value.state === "auth_required").length +
-        unavailableProjects.length,
+        missingRuntimeCount,
       unavailable: unavailableProjects.length,
       unavailableProjects: Object.freeze([...unavailableProjects]),
       projects: Object.freeze([...projects]),

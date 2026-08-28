@@ -56,20 +56,29 @@ describe("chooseRuntime", () => {
     expect(isRuntimeHealthy(candidate("5", {
       heartbeatAgeMs: 30_000,
       sidecarPeerAgeMs: 1_000,
+      transportConnected: true,
     }))).toBe(true);
     expect(isRuntimeHealthy(candidate("6", {
       heartbeatAgeMs: 30_000,
       sidecarPeerAgeMs: 20_001,
+      transportConnected: true,
     }))).toBe(false);
     expect(isRuntimeHealthy(candidate("7", {
       state: "draining",
       heartbeatAgeMs: 30_000,
       sidecarPeerAgeMs: 1_000,
+      transportConnected: true,
     }))).toBe(false);
     expect(isRuntimeHealthy(candidate("8", {
       heartbeatAgeMs: 30_000,
       sidecarPeerAgeMs: 1_000,
+      transportConnected: true,
       credentialExpiresInMs: 29_999,
+    }))).toBe(false);
+    expect(isRuntimeHealthy(candidate("9", {
+      heartbeatAgeMs: 30_000,
+      sidecarPeerAgeMs: 1_000,
+      transportConnected: false,
     }))).toBe(false);
   });
 

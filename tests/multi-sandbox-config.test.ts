@@ -127,19 +127,19 @@ describe("multi-sandbox configuration", () => {
     }
   });
 
-  it("supports immutable R1/R2/R3/R4/R5/R6 releases and exact known-project overrides", () => {
+  it("supports immutable R1/R2/R3/R4/R5/R6/R7 releases and exact known-project overrides", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: `${A},${B}`,
       GP_V2_SIDECAR_REVISION: "r1",
-      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r6`,
+      GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r7`,
     }, MACHINE);
     expect(config.v2SidecarRevision).toBe("r1");
-    expect(config.v2SidecarProjectRevisions).toEqual({ [B]: "r6" });
+    expect(config.v2SidecarProjectRevisions).toEqual({ [B]: "r7" });
     expect(Object.isFrozen(config.v2SidecarProjectRevisions)).toBe(true);
 
     for (const revisions of [
-      `${B}=r7`,
+      `${B}=r8`,
       `${B}=r1,${B}=r2`,
       "*=r1",
       "not-an-assignment",

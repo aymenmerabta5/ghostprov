@@ -16,6 +16,7 @@ import type {
   SandboxRunOptions,
 } from "./registry";
 import { describeSandboxFailure } from "./failure";
+import { hasFreshExactSidecarLiveness } from "./liveness";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import { V2PreCommitError } from "../v2/transport/run-handle";
 
@@ -854,14 +855,17 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       return "credentials-expiring";
     }
     if (snapshot.state === "ready") {
+      const exactSidecarFresh = hasFreshExactSidecarLiveness(snapshot);
       if (
         snapshot.heartbeatAgeMs !== null &&
-        snapshot.heartbeatAgeMs >= this.#heartbeatGraceMs
+        snapshot.heartbeatAgeMs >= this.#heartbeatGraceMs &&
+        !exactSidecarFresh
       ) return "heartbeat-stale";
       if (
         snapshot.heartbeatAgeMs === null &&
         this.#heartbeatMissingSinceMs !== null &&
-        this.#clock.now() - this.#heartbeatMissingSinceMs >= this.#heartbeatGraceMs
+        this.#clock.now() - this.#heartbeatMissingSinceMs >= this.#heartbeatGraceMs &&
+        !exactSidecarFresh
       ) return "heartbeat-missing";
       return null;
     }
@@ -883,7 +887,10 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       if (snapshot.state !== "ready") {
         throw new UnhealthyChildError(`start-returned:${snapshot.state}`);
       }
-      if (snapshot.heartbeatAgeMs !== null) {
+      if (
+        snapshot.heartbeatAgeMs !== null ||
+        hasFreshExactSidecarLiveness(snapshot)
+      ) {
         const problem = this.#childProblem(snapshot, true);
         if (problem) throw new UnhealthyChildError(problem);
         return;

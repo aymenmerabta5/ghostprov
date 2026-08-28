@@ -5,7 +5,10 @@ import {
   admissionProgressFreshnessMs,
   MultiSandboxRouter,
   nextAdmissionProgressCheckAtMs,
+  mediumFirstProgressTimeoutMs,
+  preparedProofGraceMs,
   requestRoutingTimeouts,
+  shouldRetainStaleAdmissionProgress,
 } from "../src/router/router";
 import {
   ResourceGovernor,
@@ -15,6 +18,7 @@ import { CpuTransformQueueFullError } from "../src/router/cpu-transform-pool";
 import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
+  type SandboxAdmissionProgress,
   type SandboxRunOptions,
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
@@ -50,12 +54,13 @@ class FakeRuntime implements RoutableSandboxRuntime {
   ackEwmaMs = 1_000;
   heartbeatAgeMs: number | null = 1_000;
   sidecarPeerAgeMs: number | null = null;
+  transportConnected: boolean | undefined;
   diagnostics: any = undefined;
   transportProfile: "standard" | "bulk-v1" | null = null;
   lastRunSignal?: AbortSignal;
   pulseAdmissionOnFailure = false;
   readonly executionStartedAtMs: number[] = [];
-  readonly admissionProgressCallbacks: Array<() => void> = [];
+  readonly admissionProgressCallbacks: Array<(progress: SandboxAdmissionProgress) => void> = [];
   readonly executionRiskCallbacks: Array<() => void> = [];
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
@@ -96,6 +101,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
       quarantined: 0,
       heartbeatAgeMs: this.heartbeatAgeMs,
       sidecarPeerAgeMs: this.sidecarPeerAgeMs,
+      transportConnected: this.transportConnected,
       credentialExpiresInMs: 3_600_000,
       ackEwmaMs: this.ackEwmaMs,
       completionEwmaMs: 10_000,
@@ -190,8 +196,15 @@ class FakeRuntime implements RoutableSandboxRuntime {
   rejectOne(error: unknown): void {
     this.finals.shift()?.reject(error);
   }
-  emitAdmissionProgress(index = this.admissionProgressCallbacks.length - 1): void {
-    this.admissionProgressCallbacks[index]?.();
+  emitAdmissionProgress(
+    progress: SandboxAdmissionProgress = {
+      stage: "request_data",
+      acknowledgedEncodedBytes: 768 * 1024,
+      totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+    },
+    index = this.admissionProgressCallbacks.length - 1,
+  ): void {
+    this.admissionProgressCallbacks[index]?.(progress);
   }
   emitExecutionRisk(index = this.executionRiskCallbacks.length - 1): void {
     this.executionRiskCallbacks[index]?.();
@@ -293,10 +306,49 @@ describe("MultiSandboxRouter", () => {
       runtime.admissionProgressCallbacks.length > 0 &&
       runtime.executionRiskCallbacks.length > 0
     ))!;
-    holding.emitExecutionRisk(0);
+    const otherHolding = system.runtimes.find(runtime => (
+      runtime !== holding &&
+      runtime.admissionProgressCallbacks.length > 0 &&
+      runtime.executionRiskCallbacks.length > 0
+    ))!;
+    holding.emitAdmissionProgress();
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 4 });
+
+    holding.emitAdmissionProgress({
+      stage: "request_data",
+      acknowledgedEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+      totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+    });
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 3 });
+
+    otherHolding.emitAdmissionProgress({
+      stage: "request_data",
+      acknowledgedEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+      totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+    });
     await flush(100);
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
     expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 4 });
+
+    holding.emitAdmissionProgress({
+      stage: "request_prepared",
+      acknowledgedEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+      totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+    });
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
+    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 3 });
+
+    // A later execution-risk handoff is idempotent for the released control
+    // unit and cannot accidentally admit another large body.
+    holding.emitExecutionRisk(0);
+    await flush(100);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
+    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 3 });
 
     for (const controller of controllers) controller.abort();
     await Promise.allSettled([...large, tiny]);
@@ -498,13 +550,90 @@ describe("MultiSandboxRouter", () => {
     expect(admissionProgressFreshnessMs(600)).toBe(5_000);
     expect(admissionProgressFreshnessMs(2_000)).toBe(8_000);
     expect(admissionProgressFreshnessMs(4_000)).toBe(10_000);
+    expect(preparedProofGraceMs(0)).toBe(3_000);
+    expect(preparedProofGraceMs(600)).toBe(3_000);
+    expect(preparedProofGraceMs(1_000)).toBe(4_000);
+    expect(preparedProofGraceMs(2_000)).toBe(5_000);
+    expect(mediumFirstProgressTimeoutMs(0)).toBe(5_000);
+    expect(mediumFirstProgressTimeoutMs(600)).toBe(5_000);
+    expect(mediumFirstProgressTimeoutMs(750)).toBe(6_000);
+    expect(mediumFirstProgressTimeoutMs(2_000)).toBe(8_000);
     // At the production 15-second attempt boundary, no progress retries;
     // progress one millisecond earlier stays on this runtime until 19.999s.
     expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, null, 5_000)).toBeNull();
     expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, 14_999, 5_000)).toBe(19_999);
     expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, 10_000, 5_000)).toBeNull();
+    // A late-admitted request must not discard transferred bytes when less
+    // than one freshness window remains for a full retry. With more time left,
+    // the existing stale-progress failover behavior is preserved.
+    expect(nextAdmissionProgressCheckAtMs(27_800, 30_000, 21_800, 5_000)).toBe(30_000);
+    expect(nextAdmissionProgressCheckAtMs(24_000, 30_000, 18_000, 5_000)).toBeNull();
+    expect(nextAdmissionProgressCheckAtMs(15_000, 30_000, 9_337, 5_000, true))
+      .toBe(30_000);
     // Fresh progress can never cross the absolute 30-second deadline.
     expect(nextAdmissionProgressCheckAtMs(30_000, 30_000, 29_999, 5_000)).toBeNull();
+
+    const totalEncodedBytes = Math.floor(2.9 * 1024 ** 2);
+    const nearComplete = {
+      stage: "request_data" as const,
+      acknowledgedEncodedBytes: Math.floor(2.25 * 1024 ** 2),
+      totalEncodedBytes,
+    };
+    // Exact reproduction of the live edge: the final ACK is 5.663 seconds old
+    // at the 15-second attempt boundary. The remaining copy fits at its proven
+    // unique-ACK rate, while a full retransmit plus one freshness window does not.
+    expect(shouldRetainStaleAdmissionProgress(
+      15_000,
+      30_000,
+      0,
+      9_337,
+      5_000,
+      nearComplete,
+    )).toBe(true);
+    // Scant progress still retries, and a comfortably sized retry budget does
+    // not pin work to the first runtime.
+    expect(shouldRetainStaleAdmissionProgress(
+      15_000,
+      30_000,
+      0,
+      9_337,
+      5_000,
+      { ...nearComplete, acknowledgedEncodedBytes: 512 * 1024 },
+    )).toBe(false);
+    expect(shouldRetainStaleAdmissionProgress(
+      15_000,
+      40_000,
+      0,
+      9_337,
+      5_000,
+      nearComplete,
+    )).toBe(false);
+    // A complete body without the exact prepared proof is stalled processing,
+    // not useful fresh transfer progress, and must retain failover.
+    expect(shouldRetainStaleAdmissionProgress(
+      15_000,
+      30_000,
+      0,
+      9_337,
+      5_000,
+      {
+        stage: "request_data",
+        acknowledgedEncodedBytes: totalEncodedBytes,
+        totalEncodedBytes,
+      },
+    )).toBe(false);
+    expect(shouldRetainStaleAdmissionProgress(
+      15_000,
+      30_000,
+      0,
+      1_000,
+      5_000,
+      {
+        stage: "request_prepared",
+        acknowledgedEncodedBytes: totalEncodedBytes,
+        totalEncodedBytes,
+      },
+    )).toBe(true);
   });
 
   it("hands the payload-aware global deadline through an HTTP ingress lease", async () => {
@@ -957,6 +1086,105 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("retains a stale but provably near-complete 2.9 MiB transfer instead of a doomed retry", async () => {
+    let clockOffsetMs = 0;
+    const clock: Clock = {
+      now: () => performance.timeOrigin + performance.now() + clockOffsetMs,
+      sleep: async ms => { await Bun.sleep(ms); },
+      waitUntil: async deadlineMs => {
+        const remaining = deadlineMs - (performance.timeOrigin + performance.now() + clockOffsetMs);
+        if (remaining > 0) await Bun.sleep(remaining);
+      },
+    };
+    const system = createSystem(2, 1, 30_000, undefined, undefined, clock, 25);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const selected = system.runtimes[1]!;
+    selected.ackEwmaMs = 600;
+    selected.reflectExecutionRisk = false;
+    selected.waitForPostAdmissionAbort = true;
+    const totalEncodedBytes = Math.floor(2.9 * 1024 ** 2);
+    const controller = new AbortController();
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "near-complete-live-shape", stream: true },
+      {
+        clientId: "near-complete-live-shape",
+        source: "websocket",
+        encodedBodyBytes: totalEncodedBytes,
+        signal: controller.signal,
+      },
+    );
+    await flush();
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+
+    // Model the live trace without sleeping 15 seconds: 2.25 MiB was uniquely
+    // acknowledged by 9.337s, then the 15s timer observes it 5.663s later.
+    clockOffsetMs = 9_337;
+    selected.emitAdmissionProgress({
+      stage: "request_data",
+      acknowledgedEncodedBytes: Math.floor(2.25 * 1024 ** 2),
+      totalEncodedBytes,
+    });
+    clockOffsetMs = 15_000;
+    await Bun.sleep(60);
+
+    expect(selected.lastRunSignal?.aborted).toBe(false);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    controller.abort(new DOMException("test complete", "AbortError"));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await system.router.close();
+  });
+
+  it("retries a fully acknowledged 2.9 MiB body when its exact prepared proof stalls", async () => {
+    let clockOffsetMs = 0;
+    const clock: Clock = {
+      now: () => performance.timeOrigin + performance.now() + clockOffsetMs,
+      sleep: async ms => { await Bun.sleep(ms); },
+      waitUntil: async deadlineMs => {
+        const remaining = deadlineMs - (performance.timeOrigin + performance.now() + clockOffsetMs);
+        if (remaining > 0) await Bun.sleep(remaining);
+      },
+    };
+    const system = createSystem(2, 1, 30_000, undefined, undefined, clock, 25);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const stalled = system.runtimes[1]!;
+    stalled.reflectExecutionRisk = false;
+    stalled.waitForPostAdmissionAbort = true;
+    const totalEncodedBytes = Math.floor(2.9 * 1024 ** 2);
+    const pending = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "body-acked-prepared-stalled", stream: true },
+      {
+        clientId: "body-acked-prepared-stalled",
+        source: "websocket",
+        encodedBodyBytes: totalEncodedBytes,
+      },
+    );
+    await flush();
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+
+    clockOffsetMs = 9_000;
+    stalled.emitAdmissionProgress({
+      stage: "request_data",
+      acknowledgedEncodedBytes: totalEncodedBytes,
+      totalEncodedBytes,
+    });
+    // Four seconds is still inside the general five-second body freshness
+    // floor, but it exhausts the RTT-derived prepared-proof grace.
+    clockOffsetMs = 13_001;
+    const handle = await pending;
+
+    expect(stalled.lastRunSignal?.aborted).toBe(true);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
   it("keeps standard-profile large requests on the original retry behavior", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
     const selected = system.runtimes[1]!;
@@ -1244,6 +1472,7 @@ describe("MultiSandboxRouter", () => {
     system.runtimes.forEach((runtime, index) => {
       runtime.heartbeatAgeMs = 24_000 + index * 1_000;
       runtime.sidecarPeerAgeMs = sidecarAges[index]!;
+      runtime.transportConnected = true;
       runtime.notify();
     });
 
@@ -1251,6 +1480,23 @@ describe("MultiSandboxRouter", () => {
       capacity: 64,
       available: 64,
     });
+
+    const handles = await Promise.all(Array.from({ length: 14 }, (_, index) =>
+      system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: `correlated-heartbeat-outage-${index}`,
+        stream: true,
+      }, {
+        clientId: `outage-${index}`,
+        source: index % 2 === 0 ? "websocket" : "http",
+      })
+    ));
+    expect(system.runtimes.reduce((total, runtime) => total + runtime.executions, 0)).toBe(14);
+    expect(Math.max(...system.runtimes.map(runtime => runtime.active))).toBeLessThanOrEqual(2);
+    for (const runtime of system.runtimes) {
+      while (runtime.finals.length > 0) runtime.completeOne();
+    }
+    await Promise.all(handles.map(handle => handle.final));
     await system.router.close();
   });
 

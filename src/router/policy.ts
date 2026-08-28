@@ -2,6 +2,7 @@ import type { RandomSource } from "../core/ports";
 import type { ProjectId } from "../sandbox/types";
 import type { SandboxAvailabilityReason } from "../sandbox/registry";
 import type { WorkloadDescriptor } from "./workload";
+import { hasFreshSandboxLiveness } from "../sandbox/liveness";
 
 export interface RouteCandidate {
   projectId: ProjectId;
@@ -32,6 +33,7 @@ export interface RouteCandidate {
   heartbeatAgeMs: number | null;
   /** Freshness of the exact bootstrap-bound V2 sidecar transport peer. */
   sidecarPeerAgeMs?: number | null;
+  transportConnected?: boolean;
   credentialExpiresInMs: number | null;
   memoryPressure: number;
   /** Requests accepted by the transport but not yet commit-acknowledged. */
@@ -65,15 +67,12 @@ export interface RouteDecision {
 
 export type RuntimeHealthCandidate = Pick<
   RouteCandidate,
-  "state" | "heartbeatAgeMs" | "sidecarPeerAgeMs" | "credentialExpiresInMs"
+  | "state"
+  | "heartbeatAgeMs"
+  | "sidecarPeerAgeMs"
+  | "transportConnected"
+  | "credentialExpiresInMs"
 >;
-
-const RUNTIME_LIVENESS_MAX_AGE_MS = 20_000;
-
-function isFreshLivenessAge(value: number | null | undefined): boolean {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
-    value <= RUNTIME_LIVENESS_MAX_AGE_MS;
-}
 
 /**
  * Reports whether a runtime is alive and safe to count toward fleet capacity.
@@ -86,10 +85,7 @@ export function isRuntimeHealthy(candidate: RuntimeHealthCandidate): boolean {
   // The sidecar signal is accepted only when it belongs to the exact instance
   // fenced during bootstrap; a stale/missing sidecar retains the old fail-closed
   // direct-heartbeat behavior.
-  if (
-    !isFreshLivenessAge(candidate.heartbeatAgeMs) &&
-    !isFreshLivenessAge(candidate.sidecarPeerAgeMs)
-  ) return false;
+  if (!hasFreshSandboxLiveness(candidate)) return false;
   if (candidate.credentialExpiresInMs !== null && candidate.credentialExpiresInMs < 30_000) return false;
   return true;
 }

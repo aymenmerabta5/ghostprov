@@ -221,7 +221,11 @@ class FakeTransport implements V2RuntimeTransport {
     this.snapshotValue.active++;
     this.snapshotValue.committed++;
     options?.onAdmissionReflected?.();
-    options?.onAdmissionProgress?.();
+    options?.onAdmissionProgress?.({
+      stage: "request_data",
+      acknowledgedEncodedBytes: 1,
+      totalEncodedBytes: 1,
+    });
     options?.onExecutionRiskReflected?.();
     const final = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pending.push({ resolve, reject });
@@ -1017,6 +1021,72 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
     harness.heartbeatExpired(410);
     expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("keeps all eight exact-sidecar runtimes routable through a phased heartbeat outage", async () => {
+    const fleet = Array.from({ length: 8 }, () => runtimeHarness());
+    await Promise.all(fleet.map(harness => harness.runtime.start()));
+
+    for (const [phase, harness] of fleet.entries()) {
+      harness.transport.snapshotValue.sidecarPeerAgeMs = 250 + (phase * 1_250);
+      harness.heartbeatUnreachable(503);
+
+      expect(harness.runtime.snapshot()).toMatchObject({
+        state: "ready",
+        capacity: 128,
+        available: 128,
+        transportConnected: true,
+        failure: null,
+      });
+      expect(harness.sandboxFailures).toHaveLength(0);
+    }
+
+    expect(fleet.reduce((total, harness) => total + harness.runtime.snapshot().capacity, 0))
+      .toBe(8 * 128);
+    await Promise.all(fleet.map(harness => harness.runtime.stop()));
+  });
+
+  it("fails closed when heartbeat and exact-sidecar liveness are both lost", async () => {
+    const stale = runtimeHarness();
+    await stale.runtime.start();
+    stale.transport.snapshotValue.sidecarPeerAgeMs = 20_001;
+    stale.heartbeatUnreachable(503);
+    expect(stale.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      failure: { kind: "heartbeat_unreachable", status: 503 },
+    });
+    expect(stale.sandboxFailures).toHaveLength(1);
+    await stale.runtime.stop();
+
+    const disconnected = runtimeHarness();
+    await disconnected.runtime.start();
+    disconnected.transport.snapshotValue.sidecarPeerAgeMs = 1;
+    disconnected.transport.snapshotValue.connected = false;
+    disconnected.heartbeatUnreachable(503);
+    expect(disconnected.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      transportConnected: false,
+      failure: { kind: "heartbeat_unreachable", status: 503 },
+    });
+    expect(disconnected.sandboxFailures).toHaveLength(1);
+    await disconnected.runtime.stop();
+  });
+
+  it("keeps session-change heartbeat statuses fail-closed despite fresh sidecar proof", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+    harness.transport.snapshotValue.sidecarPeerAgeMs = 1;
+
+    harness.heartbeatExpired(409);
+
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      failure: { kind: "heartbeat_expired", status: 409 },
+    });
+    await harness.runtime.stop();
   });
 
   it("fails closed with a sanitized lifecycle failure when resource refresh expires", async () => {

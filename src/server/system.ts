@@ -36,7 +36,12 @@ import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
 import { V2BootstrapController } from "../v2/bootstrap/controller";
 import type { HostFrame, SidecarFrame } from "../v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../v2/protocol/validate";
-import { V2SandboxRuntime } from "../v2/runtime";
+import {
+  V2SandboxRuntime,
+  type V2RuntimeGateway,
+  type V2RuntimeHeartbeat,
+  type V2RuntimeHeartbeatCallbacks,
+} from "../v2/runtime";
 import type { V2SidecarAssets } from "../v2/sidecar/assets";
 import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
 import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session";
@@ -261,6 +266,13 @@ export interface BrowserlessSystemDependencies {
   revisionSelector?: BrowserlessV2RevisionSelector;
   logger?: LoggerLike;
   sampler?: BrowserlessFleetSampler;
+  /** Test/integration seam; production omits it and uses SandboxHeartbeat. */
+  heartbeatFactory?: (input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    gateway: V2RuntimeGateway;
+    callbacks: V2RuntimeHeartbeatCallbacks;
+  }) => V2RuntimeHeartbeat;
 }
 
 export interface BrowserlessSystem {
@@ -340,6 +352,7 @@ function defaultRuntimeFactory(options: {
   recoveryCoordinator: FleetRecoveryCoordinator;
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
+  heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
 }): ManagedRuntimeFactory {
   const {
     config,
@@ -353,6 +366,7 @@ function defaultRuntimeFactory(options: {
     recoveryCoordinator,
     revalidateAccount,
     logger,
+    heartbeatFactory,
   } = options;
   const gzip = createV2CpuGzip(cpuPool);
 
@@ -398,15 +412,17 @@ function defaultRuntimeFactory(options: {
         account: identity.account,
         sandbox,
       }),
-      createHeartbeat: (gateway, callbacks) => new SandboxHeartbeat({
-        projectId,
-        gateway,
-        onSuccess: callbacks.onSuccess,
-        onAuthenticationFailure: callbacks.onAuthenticationFailure,
-        onExpired: callbacks.onExpired,
-        onTransientFailure: callbacks.onTransientFailure,
-        onUnreachable: callbacks.onUnreachable,
-      }),
+      createHeartbeat: (gateway, callbacks) => heartbeatFactory
+        ? heartbeatFactory({ projectId, workerIndex, gateway, callbacks })
+        : new SandboxHeartbeat({
+            projectId,
+            gateway,
+            onSuccess: callbacks.onSuccess,
+            onAuthenticationFailure: callbacks.onAuthenticationFailure,
+            onExpired: callbacks.onExpired,
+            onTransientFailure: callbacks.onTransientFailure,
+            onUnreachable: callbacks.onUnreachable,
+          }),
       createYDoc: credentials => {
         let first = true;
         return new SandboxYDoc({
@@ -734,6 +750,7 @@ export async function createBrowserlessSystem(
       ? sessionManager.revalidate(signal)
       : Promise.resolve(identity),
     logger,
+    heartbeatFactory: dependencies.heartbeatFactory,
   });
   const registry = dependencies.registry ?? new SandboxRegistry();
   const fleet = new ProjectFleetManager({

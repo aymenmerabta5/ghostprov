@@ -68,7 +68,11 @@ class Runtime implements RoutableSandboxRuntime {
     options?: SandboxRunOptions,
   ): Promise<RunHandle> {
     if (this.emitAdmissionProgress) {
-      options?.onAdmissionProgress?.();
+      options?.onAdmissionProgress?.({
+        stage: "request_data",
+        acknowledgedEncodedBytes: 64 * 1024,
+        totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
+      });
       this.afterAdmissionProgress?.();
     }
     if (this.waitForAdmissionAbort) {
@@ -201,6 +205,10 @@ describe("router observability", () => {
         route_attempt: 1,
         progress_observed: false,
         progress_age_ms: null,
+        progress_stage: null,
+        progress_acknowledged_encoded_bytes: null,
+        progress_total_encoded_bytes: null,
+        deadline_exhausted: false,
         capacity_reason: "available",
       });
       expect(JSON.stringify(expired)).not.toContain("must not be logged");
@@ -245,7 +253,10 @@ describe("router observability", () => {
       }),
       logger,
       clock,
-      queueTimeoutMs: 10_000,
+      // Preserve enough global slack that stale progress must still retry;
+      // the separate late-budget policy test covers retaining bytes when a
+      // fresh full transfer can no longer fit before the absolute deadline.
+      queueTimeoutMs: 20_000,
       routeAttemptTimeoutMs: 10,
       random: { next: () => 0.5, uuid: () => "trace-progress-timeout" },
     });
@@ -269,6 +280,10 @@ describe("router observability", () => {
         route_attempt: 1,
         progress_observed: true,
         progress_age_ms: expect.any(Number),
+        progress_stage: "request_data",
+        progress_acknowledged_encoded_bytes: 64 * 1024,
+        progress_total_encoded_bytes: Math.floor(2.9 * 1024 ** 2),
+        deadline_exhausted: false,
         capacity_reason: "available",
       });
       expect(JSON.stringify(expired)).not.toContain("must not be logged");

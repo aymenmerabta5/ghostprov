@@ -18,6 +18,7 @@ import type {
   SandboxRunOptions,
 } from "../sandbox/registry";
 import { describeSandboxFailure } from "../sandbox/failure";
+import { hasFreshExactSidecarLiveness } from "../sandbox/liveness";
 import type { ProjectId } from "../sandbox/types";
 import type { AwarenessChannel } from "./awareness/channel";
 import type { V2ReadyDescriptor } from "./bootstrap/controller";
@@ -608,6 +609,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       ),
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
       sidecarPeerAgeMs: transport?.sidecarPeerAgeMs ?? null,
+      transportConnected: transport?.connected ?? false,
       credentialExpiresInMs: this.#credentials
         ? Math.max(0, this.#credentials.resource.expiresAtMs - this.#clock.now())
         : null,
@@ -715,6 +717,23 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         },
         onUnreachable: status => {
           if (!callbackIsCurrent()) return;
+          const transport = this.#transport?.snapshot();
+          if (
+            this.#state === "ready" &&
+            transport &&
+            hasFreshExactSidecarLiveness({
+              sidecarPeerAgeMs: transport.sidecarPeerAgeMs,
+              transportConnected: transport.connected,
+            })
+          ) {
+            // Heartbeat and exact-sidecar envelopes travel over independent
+            // control paths. Preserve the live generation when the bound peer
+            // is still proving liveness, while retaining a health penalty so
+            // routing naturally prefers an entirely healthy peer.
+            this.#runtimeHealth.record("unhealthy");
+            this.#emit();
+            return;
+          }
           this.#failGeneration(
             generation,
             new V2RuntimeLifecycleFailure("heartbeat_unreachable", status),

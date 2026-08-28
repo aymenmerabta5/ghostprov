@@ -630,6 +630,8 @@ describe("ProjectFleetManager", () => {
       desired: 2,
       ready: 1,
       provisioning: 1,
+      unavailable: 1,
+      unavailableProjects: [B],
     });
 
     // A supervised runtime may recover entirely in the background after the

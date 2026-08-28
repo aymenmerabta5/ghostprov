@@ -50,9 +50,9 @@ export interface FleetSnapshot {
   provisioning: number;
   draining: number;
   failed: number;
-  /** Explicit projects which could not yet be verified or registered locally. */
+  /** Explicit projects without a currently healthy runtime, including recovery. */
   unavailable: number;
-  /** Bounded to the configured explicit allowlist; never contains substitutes. */
+  /** Configured explicit projects lacking healthy capacity; never contains substitutes. */
   unavailableProjects: readonly ProjectId[];
   projects: readonly ProjectId[];
 }

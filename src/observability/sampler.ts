@@ -302,6 +302,7 @@ export class FleetSampler {
         recent_failure_rate: runtime.recentFailureRate,
         heartbeat_age_ms: runtime.heartbeatAgeMs,
         sidecar_peer_age_ms: runtime.sidecarPeerAgeMs ?? null,
+        transport_connected: runtime.transportConnected ?? null,
         credential_expires_in_ms: runtime.credentialExpiresInMs,
         memory_pressure: runtime.memoryPressure,
         error_kind: runtime.failure?.kind ?? null,

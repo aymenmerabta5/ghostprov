@@ -291,3 +291,37 @@ same strong unknown-parameter oracle observed no body corruption. The rejected
 six-unit fleet candidate and the eight-way incompressible 2.9 MiB overload are
 retained as negative evidence; neither was relabeled as success or used to
 weaken the fixed deadline.
+
+## 2026-08-28 - dual-channel liveness and R7 parser-rejection recovery - KEEP
+
+Production forensics found 26 capacity 503s only after all eight runtimes were
+simultaneously evicted for `heartbeat_unreachable`; each still had fresh exact
+sidecar proof. Runtime and supervisor health now accept either independent
+channel, while 401/403/404/409/410, stale/disconnected sidecars, credential
+expiry, and loss of both channels remain fail-closed. Fleet telemetry now counts
+registered recovering runtimes as unavailable and records transport connection.
+
+Codex session records contained 11 real `invalid_json` turn terminations. Older
+live GhostProv logs independently showed three committed upstream parser
+rejections for exact 1 MiB bodies. R7 retains R6's immutable body snapshot and,
+only after a definitive HTTP 400 `invalid_json`, locally validates the retained
+canonical object and retries exactly once from immutable text. Repeated parser
+rejection, all other 4xx responses, cancellation, and invalid local bytes do not
+retry. Bun and Deno tests prove one execution-boundary transition and a maximum
+of two fetch attempts.
+
+| Live R7 evidence | Result |
+|---|---:|
+| exact observed-distribution waves | 5 x 14 = 70 / 70 terminals |
+| capacity 503 / `invalid_json` | 0 / 0 |
+| total p50 / p95 / max | 4.893 / 25.788 / 29.412 s |
+| load-time recovery starts | 0 |
+| minimum healthy runtimes / capacity | 8 / 34 |
+| heartbeat-only injected recoveries | 0 / 8 runtimes |
+| deliberate session-change control | one targeted fenced recovery, returned to 8 healthy |
+
+An arbitrary 14-agent mix with five 2.9 MiB bodies exceeded the captured
+production distribution and intermittently crossed the physical shared-link
+deadline. A large-first scheduler experiment was worse (7/14 timeouts) and was
+fully rolled back. The accepted scheduler remains the previously proven
+four-unit gate and tiny-request bypass; tests were not loosened or relabeled.

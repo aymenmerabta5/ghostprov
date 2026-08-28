@@ -237,6 +237,15 @@ function parseBody(bytes: Uint8Array): Record<string, unknown> {
   return decoded as Record<string, unknown>;
 }
 
+function validatedImmutableJsonText(bytes: Uint8Array): string {
+  // Reuse the strict object validation before creating the immutable fallback.
+  // This is reached only after an upstream parser rejected the byte-backed
+  // request, so its extra decode/parse allocation is absent from the healthy
+  // path and cannot affect ordinary or tiny-request latency.
+  parseBody(bytes);
+  return utf8Text(bytes);
+}
+
 function canonicalRequestModel(bytes: Uint8Array): string | undefined {
   let depth = 0;
   let inString = false;
@@ -1083,29 +1092,59 @@ export class DirectResponsesClient {
       );
     }
 
-    let response: Response;
-    try {
-      response = await this.#fetch(this.#url, {
-        method: "POST",
-        signal: input.signal,
-        headers: {
-          accept: "text/event-stream",
-          authorization: `Bearer ${this.#apiKey.reveal()}`,
-          "content-type": "application/json",
-        },
-        body: requestBody,
-      });
-    } catch (error) {
-      const rateLimited = rateLimitTransportError(error);
-      if (rateLimited) throw rateLimited;
-      throw new UpstreamExecutionError(
-        "Upstream Responses transport failed after request start",
-        "transport",
-        true,
-      );
-    }
+    const fetchOnce = async (body: BodyInit): Promise<Response> => {
+      try {
+        return await this.#fetch(this.#url, {
+          method: "POST",
+          signal: input.signal,
+          headers: {
+            accept: "text/event-stream",
+            authorization: `Bearer ${this.#apiKey.reveal()}`,
+            "content-type": "application/json",
+          },
+          body,
+        });
+      } catch (error) {
+        const rateLimited = rateLimitTransportError(error);
+        if (rateLimited) throw rateLimited;
+        throw new UpstreamExecutionError(
+          "Upstream Responses transport failed after request start",
+          "transport",
+          true,
+        );
+      }
+    };
+    let response = await fetchOnce(requestBody);
     if (!response.ok) {
-      throw await httpError(response, model, this.#httpErrorReadTimeoutMs, input.signal);
+      const failure = await httpError(
+        response,
+        model,
+        this.#httpErrorReadTimeoutMs,
+        input.signal,
+      );
+      if (
+        input.bodyIsCanonicalStream &&
+        failure.status === 400 &&
+        failure.code === "invalid_json" &&
+        !input.signal?.aborted
+      ) {
+        // `invalid_json` is a definitive pre-execution parser rejection. Retry
+        // it exactly once from a locally revalidated immutable string. This
+        // repairs a transient BodyInit/upload serialization failure without
+        // replaying provider execution, and leaves every other 4xx untouched.
+        requestBody = validatedImmutableJsonText(input.body);
+        response = await fetchOnce(requestBody);
+        if (!response.ok) {
+          throw await httpError(
+            response,
+            model,
+            this.#httpErrorReadTimeoutMs,
+            input.signal,
+          );
+        }
+      } else {
+        throw failure;
+      }
     }
     const responseRateLimit = rateLimitHintFromHeaders(response.headers);
     if (!response.body) {

@@ -199,10 +199,16 @@ describe("R2 prepared/start host boundary", () => {
     await harness.start();
     let admissions = 0;
     let progress = 0;
+    const progressEvents: Array<{
+      stage: "request_data" | "request_prepared";
+      acknowledgedEncodedBytes: number;
+      totalEncodedBytes: number;
+    }> = [];
     let executionRisks = 0;
     const pending = harness.session.run(BODY, undefined, {
       onAdmissionReflected: () => { admissions++; },
-      onAdmissionProgress: () => {
+      onAdmissionProgress: value => {
+        progressEvents.push(value);
         progress++;
         if (progress === 1) throw new Error("synthetic progress observer failure");
       },
@@ -220,6 +226,12 @@ describe("R2 prepared/start host boundary", () => {
     harness.publish([], { lane: "control" });
     await harness.settle();
     expect(progress).toBe(1);
+    expect(progressEvents[0]!.stage).toBe("request_data");
+    expect(typeof progressEvents[0]!.acknowledgedEncodedBytes).toBe("number");
+    expect(typeof progressEvents[0]!.totalEncodedBytes).toBe("number");
+    expect(progressEvents[0]!.acknowledgedEncodedBytes)
+      .toBe(progressEvents[0]!.totalEncodedBytes);
+    expect(progressEvents[0]!.totalEncodedBytes).toBeGreaterThan(0);
     expect(executionRisks).toBe(0);
     expect(harness.starts()).toHaveLength(0);
 
@@ -228,6 +240,11 @@ describe("R2 prepared/start host boundary", () => {
     await harness.settle();
     expect(harness.starts()).toHaveLength(1);
     expect(progress).toBe(2);
+    expect(progressEvents[1]).toEqual({
+      stage: "request_prepared",
+      acknowledgedEncodedBytes: progressEvents[0]!.totalEncodedBytes,
+      totalEncodedBytes: progressEvents[0]!.totalEncodedBytes,
+    });
     expect(executionRisks).toBe(1);
 
     harness.publish([prepared]);

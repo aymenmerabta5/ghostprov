@@ -1,5 +1,6 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
+import type { SandboxAdmissionProgress } from "../../sandbox/registry";
 import { sseFrame, type SseFrame } from "../../relay/sse";
 import type {
   AwarenessChannel,
@@ -183,7 +184,7 @@ export interface V2TransportRunOptions {
   /** Ownership handoff after this session charges its admission credit. */
   onAdmissionReflected?(): void;
   /** Safe pre-execution progress; observer exceptions are isolated. */
-  onAdmissionProgress?(): void;
+  onAdmissionProgress?(progress: SandboxAdmissionProgress): void;
   /** Irreversible execution handoff after the protocol-specific start fence. */
   onExecutionRiskReflected?(): void;
 }
@@ -283,7 +284,8 @@ interface RequestState {
   signal?: AbortSignal;
   onAbort?: () => void;
   onAdmissionReflected?: () => void;
-  onAdmissionProgress?: () => void;
+  onAdmissionProgress?: (progress: SandboxAdmissionProgress) => void;
+  acknowledgedEncodedBytes: number;
   onExecutionRiskReflected?: () => void;
   admitted: boolean;
   transferCost: number;
@@ -914,6 +916,7 @@ export class V2TransportSession {
       signal,
       onAdmissionReflected: options?.onAdmissionReflected,
       onAdmissionProgress: options?.onAdmissionProgress,
+      acknowledgedEncodedBytes: 0,
       onExecutionRiskReflected: options?.onExecutionRiskReflected,
       admitted: false,
       transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
@@ -1848,7 +1851,12 @@ export class V2TransportSession {
           return;
         }
         if (state.startQueued || state.startRisk || state.preparedStart) return;
-        this.#reflectAdmissionProgress(state);
+        state.acknowledgedEncodedBytes = state.manifest.encodedBytes;
+        this.#reflectAdmissionProgress(state, {
+          stage: "request_prepared",
+          acknowledgedEncodedBytes: state.manifest.encodedBytes,
+          totalEncodedBytes: state.manifest.encodedBytes,
+        });
         if (!this.#requests.has(state.requestId)) return;
         state.preparedStart = this.#requestStartFromPrepared(frame);
         this.#preparedStarts.push(state);
@@ -2899,7 +2907,7 @@ export class V2TransportSession {
   }
 
   #acknowledgeOutbound(cursor: { epoch: number; sequence: number }): void {
-    let progressed: RequestState[] | null = null;
+    let progressed: Map<RequestState, number> | null = null;
     if (this.#admissionProgressObservers > 0) {
       for (const frame of this.#outbound.snapshot().frames) {
         if (
@@ -2908,14 +2916,27 @@ export class V2TransportSession {
         ) continue;
         const state = this.#requests.get(frame.requestId);
         if (!state?.onAdmissionProgress) continue;
-        (progressed ??= []).push(state);
+        const acknowledgedBytes = base64UrlDecodedBytes(frame.dataBase64Url);
+        if (acknowledgedBytes === null) continue;
+        const values = progressed ??= new Map();
+        values.set(state, (values.get(state) ?? 0) + acknowledgedBytes);
       }
     }
     this.#outbound.acknowledge(cursor);
     // Validate and apply the cumulative ACK before notifying observers. A
     // forged future cursor must never look like transfer progress.
     if (progressed) {
-      for (const state of progressed) this.#reflectAdmissionProgress(state);
+      for (const [state, acknowledgedBytes] of progressed) {
+        state.acknowledgedEncodedBytes = Math.min(
+          state.manifest.encodedBytes,
+          state.acknowledgedEncodedBytes + acknowledgedBytes,
+        );
+        this.#reflectAdmissionProgress(state, {
+          stage: "request_data",
+          acknowledgedEncodedBytes: state.acknowledgedEncodedBytes,
+          totalEncodedBytes: state.manifest.encodedBytes,
+        });
+      }
     }
     for (const [requestId, receipt] of this.#terminalReceipts) {
       if (
@@ -3815,11 +3836,14 @@ export class V2TransportSession {
     this.#admitPending();
   }
 
-  #reflectAdmissionProgress(state: RequestState): void {
+  #reflectAdmissionProgress(
+    state: RequestState,
+    progress: SandboxAdmissionProgress,
+  ): void {
     const onAdmissionProgress = state.onAdmissionProgress;
     // Progress is already proven in authoritative protocol state. Observers
     // are advisory and can neither roll it back nor poison frame processing.
-    try { onAdmissionProgress?.(); } catch {}
+    try { onAdmissionProgress?.(progress); } catch {}
   }
 
   #clearAdmissionProgress(state: RequestState): void {

@@ -29,7 +29,7 @@ export interface UpstreamRateLimitObservation {
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
   /** Exact verified V2 release; null until this generation proves readiness. */
-  releaseRevision?: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | null;
+  releaseRevision?: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | null;
   protocolRevision?: "r1" | "r2" | null;
   transportProfile?: "standard" | "bulk-v1" | null;
   buildHash?: string | null;
@@ -47,6 +47,8 @@ export interface RoutableSandboxSnapshot {
   ambiguityLimit?: number;
   heartbeatAgeMs: number | null;
   sidecarPeerAgeMs?: number | null;
+  /** Exact V2 transport connection state used with sidecar-peer liveness proof. */
+  transportConnected?: boolean;
   credentialExpiresInMs: number | null;
   ackEwmaMs: number;
   completionEwmaMs: number;
@@ -84,13 +86,23 @@ export interface SandboxRunOptions {
    * cumulatively acknowledged request_data and one exact request_prepared
    * proof; observer failures never affect transport state.
    */
-  onAdmissionProgress?(): void;
+  onAdmissionProgress?(progress: SandboxAdmissionProgress): void;
   /**
    * Called exactly once when execution can no longer be safely retried on a
    * different runtime. R2 reports this only after request_start enters the
    * cumulative reliable window; admission alone is still pre-execution.
    */
   onExecutionRiskReflected?(): void;
+}
+
+/**
+ * Monotonic, protocol-proven request-body progress. Byte counts describe the
+ * encoded payload actually carried by request_data frames, not JSON input size.
+ */
+export interface SandboxAdmissionProgress {
+  readonly stage: "request_data" | "request_prepared";
+  readonly acknowledgedEncodedBytes: number;
+  readonly totalEncodedBytes: number;
 }
 
 export interface RoutableSandboxRuntime {

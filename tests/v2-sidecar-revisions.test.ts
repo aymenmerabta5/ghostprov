@@ -11,6 +11,7 @@ import {
   V2_R2_RELEASE,
   V2_R5_RELEASE,
   V2_R6_RELEASE,
+  V2_R7_RELEASE,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
@@ -150,18 +151,18 @@ describe("V2SidecarRevisionSelector", () => {
     await expect(mutable.preload()).rejects.toThrow(/not frozen/i);
   });
 
-  it("provides a production R6 default backed by the pinned bundled release", async () => {
+  it("provides a production R7 default backed by the pinned bundled release", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2],
     });
 
     await selector.preload();
-    expect(selector.defaultRevision).toBe("r6");
+    expect(selector.defaultRevision).toBe("r7");
     expect(selector.loadedForProject(PROJECT_1).assets).toMatchObject({
-      revision: "r6",
+      revision: "r7",
       protocolRevision: "r2",
       transportProfile: "bulk-v1",
-      buildHash: V2_R6_RELEASE.buildHash,
+      buildHash: V2_R7_RELEASE.buildHash,
     });
     expect(selector.loadedForProject(PROJECT_2).assets).toBe(
       selector.loadedForProject(PROJECT_1).assets,
@@ -175,11 +176,11 @@ describe("V2SidecarRevisionSelector", () => {
     });
     await selector.preload();
     expect(selector.loadedForProject(PROJECT_1)).toMatchObject({
-      revision: "r6",
+      revision: "r7",
       assets: {
         protocolRevision: "r2",
         transportProfile: "bulk-v1",
-        buildHash: V2_R6_RELEASE.buildHash,
+        buildHash: V2_R7_RELEASE.buildHash,
       },
     });
     expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
