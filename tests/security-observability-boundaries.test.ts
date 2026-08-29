@@ -83,11 +83,11 @@ function routerWithPrivateCanaries(): RouterLike {
 }
 
 describe("public authentication and authority boundaries", () => {
-  it("requires an explicit high-entropy inbound API key", () => {
+  it("requires an explicit inbound API key and accepts personal-project keys", () => {
     expect(() => resolveGhostProvApiKey(undefined)).toThrow("required");
     expect(() => resolveGhostProvApiKey("")).toThrow("required");
-    expect(() => resolveGhostProvApiKey("GHOST_IS_KING")).toThrow();
-    expect(() => resolveGhostProvApiKey("short-key")).toThrow("at least 32");
+    expect(resolveGhostProvApiKey("local-secret")).toBe("local-secret");
+    expect(() => resolveGhostProvApiKey("short-key")).toThrow("at least 12");
     expect(() => resolveGhostProvApiKey(`${"x".repeat(31)} y`)).toThrow("single-token");
     expect(resolveGhostProvApiKey(API_KEY)).toBe(API_KEY);
     expect(apiKeyAuthorized({ authorization: `Bearer ${API_KEY}` }, API_KEY, "openai"))

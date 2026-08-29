@@ -79,7 +79,7 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
     expect(envExample).toContain("PORT=18888");
     expect(envExample.split(/\r?\n/)).toContain("GHOSTPROV_API_KEY=");
-    expect(envExample).not.toContain("GHOST_IS_KING");
+    expect(envExample).toContain("Personal loopback installs may use a private key");
     expect(readme).toContain("RandomNumberGenerator]::Create()");
     expect(readme).toContain("$rng.GetBytes($keyBytes)");
   });
@@ -281,7 +281,7 @@ describe("project documentation", () => {
   });
 
   it("documents explicit authentication and isolated candidate ports", () => {
-    expect(readme).toContain("there is no shared development-key fallback");
+    expect(readme.toLowerCase()).toContain("there is no shared development-key fallback");
     expect(readme).toContain(
       "`GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential",
     );
@@ -290,7 +290,7 @@ describe("project documentation", () => {
     expect(readme).toContain("refuses protected port `18787`");
     expect(readme).not.toContain("port 8787 health");
     expect(readme).not.toContain("service on 8787");
-    expect(readme).not.toContain("GHOST_IS_KING");
+    expect(readme).toContain("single-token value of at least 12 characters");
     expect(envExample).toContain("GP_V2_DIAGNOSTIC_ROOT=http://127.0.0.1:18888");
   });
 

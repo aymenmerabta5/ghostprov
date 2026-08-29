@@ -9,6 +9,7 @@ import { createGhostProvApp, type RouterLike } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 
 const API_KEY = "test-api-key-0123456789abcdef-0123456789";
+const PERSONAL_TEST_KEY = "personal-key";
 
 function router(): RouterLike {
   const authorizationScope = createAuthenticatedTenantScope();
@@ -29,7 +30,8 @@ function router(): RouterLike {
 describe("GhostProv inbound API-key authentication", () => {
   it("uses constant-size comparison and exact standard header forms", () => {
     expect(() => resolveGhostProvApiKey(undefined)).toThrow("required");
-    expect(() => resolveGhostProvApiKey("short-key")).toThrow("at least 32");
+    expect(() => resolveGhostProvApiKey("short-key")).toThrow("at least 12");
+    expect(resolveGhostProvApiKey(PERSONAL_TEST_KEY)).toBe(PERSONAL_TEST_KEY);
     expect(resolveGhostProvApiKey(API_KEY)).toBe(API_KEY);
     expect(apiKeyMatches(API_KEY, API_KEY)).toBe(true);
     expect(apiKeyMatches("wrong", API_KEY)).toBe(false);

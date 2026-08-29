@@ -125,7 +125,7 @@ curl.exe -X POST http://127.0.0.1:18787/v1/responses `
   -d '{"model":"gpt-5.6-sol","store":true,"input":"Reply with hello"}'
 ```
 
-Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. `GHOSTPROV_API_KEY` is an explicit single-token value of at least 32 characters; there is no shared development-key fallback. `GET /health` remains unauthenticated, while `GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential. Use `stream:true` for incremental SSE; omitted or false client `stream` still produces a JSON final while the upstream body is normalized to `stream:true`. Client `store` hints are accepted for compatibility but the upstream body is always `store:true`. Every non-image upstream request is forced to `service_tier:"fast"`; image-tool requests continue to omit unsupported service tiers. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
+Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. `GHOSTPROV_API_KEY` must be explicitly configured as a single-token value of at least 12 characters; a random 32-byte value remains recommended. There is no shared development-key fallback. `GET /health` remains unauthenticated, while `GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential. Use `stream:true` for incremental SSE; omitted or false client `stream` still produces a JSON final while the upstream body is normalized to `stream:true`. Client `store` hints are accepted for compatibility but the upstream body is always `store:true`. Every non-image upstream request is forced to `service_tier:"fast"`; image-tool requests continue to omit unsupported service tiers. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
 ## Anthropic Messages and Claude Code
 
@@ -350,7 +350,7 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `PORT` in candidate mode | `18888` | Dedicated candidate listener; protected port `18787` is rejected |
-| `GHOSTPROV_API_KEY` | required | Explicit single-token key of at least 32 characters, shared by every protected HTTP route and Responses WebSocket upgrade |
+| `GHOSTPROV_API_KEY` | required | Explicit single-token key of at least 12 characters; a random 32-byte value is recommended |
 | `GP_SUPERVISOR_READY_TIMEOUT_MS` | `120000` | Maximum internal-worker startup time |
 | `GP_SHUTDOWN_DRAIN_MS` | `300000` | Maximum wait for active terminal proofs during graceful shutdown |
 | `GP_SUPERVISOR_GRACE_MS` | `330000` | Graceful drain before force-stopping only the owned worker |

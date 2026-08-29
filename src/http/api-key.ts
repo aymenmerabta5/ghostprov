@@ -44,7 +44,7 @@ export function authenticatedTenantScopeHmac(
 }
 
 export type ApiKeySurface = "openai" | "anthropic";
-const MIN_GHOSTPROV_API_KEY_CHARACTERS = 32;
+const MIN_GHOSTPROV_API_KEY_CHARACTERS = 12;
 
 export interface ApiKeyHeaders {
   authorization?: string | readonly string[] | null;
