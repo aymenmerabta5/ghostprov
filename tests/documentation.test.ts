@@ -77,7 +77,8 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r8");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
-    expect(envExample).toContain("PORT=18888");
+    expect(envExample).toContain("GP_CANDIDATE=0");
+    expect(envExample).toContain("PORT=18787");
     expect(envExample.split(/\r?\n/)).toContain("GHOSTPROV_API_KEY=");
     expect(envExample).toContain("Personal loopback installs may use a private key");
     expect(readme).toContain("RandomNumberGenerator]::Create()");
@@ -262,6 +263,12 @@ describe("project documentation", () => {
     expect(protectedPortGuard).not.toContain("18888/(?:health|__sandboxes)");
     expect(protectedPortGuard).toContain("check:v2-sidecar");
     expect(protectedPortGuard).toContain("tsconfig\\.scripts\\.json");
+    expect(protectedPortGuard).toContain("'^bun(?:\\.exe)?\\s+(?:run\\s+)?dev$'");
+    expect(protectedPortGuard).toContain(
+      "'^bun(?:\\.exe)?\\s+src[/\\\\]server\\.ts$'",
+    );
+    expect(pkg.scripts.dev).toBe("bun src/server.ts");
+    expect(protectedPortGuard).toContain("lifecycle, replacement, kill");
 
     for (const obsolete of [
       "dump_doc_files.ts",
@@ -287,6 +294,11 @@ describe("project documentation", () => {
     );
     expect(readme).toContain("bearer-authenticated `GET /__supervisor`");
     expect(readme).toContain("| `PORT` in candidate mode | `18888`");
+    expect(readme).toContain("Port `18787` is the normal production listener used by `bun run dev`");
+    expect(readme).toContain(
+      "persisted-continuation verifier is the only live verification command",
+    );
+    expect(readme).not.toContain("the only live command authorized");
     expect(readme).toContain("refuses protected port `18787`");
     expect(readme).not.toContain("port 8787 health");
     expect(readme).not.toContain("service on 8787");

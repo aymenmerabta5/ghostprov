@@ -16,14 +16,14 @@ $keyBytes = New-Object byte[] 32
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $rng.GetBytes($keyBytes) } finally { $rng.Dispose() }
 $env:GHOSTPROV_API_KEY = [Convert]::ToBase64String($keyBytes)
-$env:GP_CANDIDATE = "1"
-$env:PORT = "18888"
+$env:GP_CANDIDATE = "0"
+$env:PORT = "18787"
 bun run dev
 ```
 
 `PRISM_COOKIE` accepts an initial Cookie header when a persisted cookie jar is unavailable. `PRISM_DOC_ID` remains a single-project compatibility fallback. The account session consumes `Set-Cookie`, persists rotations atomically, and hot-reloads a newer cookie file.
 
-Port `18787` is the protected existing inference gateway and is never a candidate or test listener. Development and live verification use `18888` or an OS-assigned port; lifecycle commands must not target the protected service. Stable project UUIDs and worker indexes are persisted in `.ghostprov/fleet.json`; restarts reuse them and never create a new fleet blindly.
+Port `18787` is the normal production listener used by `bun run dev`. Candidate and automated-test listeners must use `18888` or an OS-assigned port. Safety guards prevent candidate binding and destructive lifecycle commands from targeting the running production service; they do not prohibit normal production startup. Stable project UUIDs and worker indexes are persisted in `.ghostprov/fleet.json`; restarts reuse them and never create a new fleet blindly.
 
 V2-only mode requires an explicit allowlist of existing `PRISM_PROJECT_IDS`. GhostProv never creates or adopts an unlisted project. The signed-in session is the production default. Explicit guest mode uses `GP_PRISM_SESSION=anonymous` and remains capped separately by `GP_GUEST_MAX_PROJECTS`; `GP_ALLOW_ANONYMOUS=1` only permits `GP_PRISM_SESSION=auto` to create a guest when no authenticated session is available.
 
@@ -581,7 +581,7 @@ The deterministic integration test fills 120 lanes as `30 + 30 + 30 + 30`, verif
 
 ## Live proof
 
-The persisted-continuation verifier is the only live command authorized by the local protected-port allowlist. It hardcodes candidate port `18888`, requires 2-8 explicitly named dedicated test projects, never creates or deletes projects, and touches `18787` only with read-only `/health` checks. It proves explicit and inferred HTTP suffixes, public WebSocket and Claude full-history continuation, same-project restart hydration, different-project hydration, and 1/4/8/16-agent two-turn isolation:
+The persisted-continuation verifier is the only live verification command authorized by the local protected-port allowlist. Normal production startup is separate. The verifier hardcodes candidate port `18888`, requires 2-8 explicitly named dedicated test projects, never creates or deletes projects, and touches `18787` only with read-only `/health` checks. It proves explicit and inferred HTTP suffixes, public WebSocket and Claude full-history continuation, same-project restart hydration, different-project hydration, and 1/4/8/16-agent two-turn isolation:
 
 ```powershell
 $env:GP_PERSISTED_CONTINUATION_LIVE = "1"

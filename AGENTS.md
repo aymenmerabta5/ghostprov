@@ -114,6 +114,9 @@ Additional rules:
 
 Live operations are opt-in and are not implied by a request to implement or test code.
 
+- Production port semantics are explicit: normal production mode (`GP_CANDIDATE=0` or omitted) may bind `PORT=18787`, and `bun run dev` is the standard production entrypoint. The protected-port rule must never be implemented as a blanket configuration rejection of production `18787`.
+- Candidate and automated-test listeners must use `18888` or an OS-assigned port. "Protected" means that tests and agent tooling must not kill, replace, restart, reconfigure, or take over an already-running production listener.
+
 - Do not read cookies, API keys, token files, credential environment variables, or other secrets without explicit user authorization for that exact live operation.
 - Do not create, adopt, delete, or mutate Prism projects without the corresponding explicit live guard and dedicated project IDs.
 - Port `18787` is a protected existing service. Never stop, restart, kill, signal, reconfigure, replace, or rebind it. Never run supervisor lifecycle commands against it.

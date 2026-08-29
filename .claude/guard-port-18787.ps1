@@ -13,7 +13,7 @@ function Deny-ProtectedPortCommand {
     exit 0
 }
 
-$protectedReason = 'Blocked: port 18787 is the protected GhostProv inference gateway. The project shell guard permits only explicit offline checks, read-only Git inspection, and the dedicated isolated-port verifier.'
+$protectedReason = 'Blocked: port 18787 is the GhostProv production gateway. Production startup is allowed, but lifecycle, replacement, kill, and unapproved live commands remain denied.'
 $raw = [Console]::In.ReadToEnd()
 try {
     $payload = $raw | ConvertFrom-Json
@@ -52,6 +52,8 @@ $allowed = @(
     '^git(?:\.exe)?\s+rev-parse\s+(?:--show-toplevel|--show-prefix|--abbrev-ref\s+HEAD)$',
     '^git(?:\.exe)?\s+--no-pager\s+(?:log|show)(?:\s+--oneline)?$',
     '^bun(?:\.exe)?\s+--version$',
+    '^bun(?:\.exe)?\s+(?:run\s+)?dev$',
+    '^bun(?:\.exe)?\s+src[/\\]server\.ts$',
     '^bun(?:\.exe)?\s+--no-env-file\s+test\s+--isolate(?:\s+tests[/\\][A-Za-z0-9_.@/\\-]+\.test\.ts)*$',
     "^bun(?:\.exe)?\s+run\s+$offlineRun$",
     '^bun(?:\.exe)?\s+--no-env-file\s+node_modules[/\\]typescript[/\\]bin[/\\]tsc\s+--project\s+tsconfig\.scripts\.json$',
