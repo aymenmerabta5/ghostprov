@@ -98,7 +98,7 @@ describe("Anthropic request translation", () => {
     expect(translated.estimatedInputTokens).toBeGreaterThan(0);
     expect(translated.relayBody).toMatchObject({
       model: "gpt-5.6-terra",
-      store: false,
+      store: true,
       stream: true,
       max_output_tokens: 32000,
       include: ["reasoning.encrypted_content"],
@@ -144,6 +144,56 @@ describe("Anthropic request translation", () => {
     expect(JSON.stringify(translated.relayBody)).not.toContain("cache_control");
   });
 
+  it("rejects a malformed GhostProv reasoning signature without rejecting foreign signatures", () => {
+    const signature = encodeReasoningItem({
+      type: "reasoning",
+      id: "rs_mismatch",
+      encrypted_content: "cipher",
+      summary: [{ type: "summary_text", text: "private summary" }],
+    });
+    expectInvalid(request({
+      messages: [{
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "short", signature }],
+      }],
+    }), "signature is malformed");
+
+    const translated = translateAnthropicRequest(request({
+      messages: [{
+        role: "assistant",
+        content: [{
+          type: "thinking",
+          thinking: "foreign thinking",
+          signature: "anthropic-native-signature",
+        }],
+      }],
+    }), OPTIONS);
+    expect(translated.relayBody.input).toEqual([]);
+  });
+
+  it("bounds decoded reasoning summary segments across the whole request", () => {
+    const summary = Array.from({ length: 4_096 }, () => ({
+      type: "summary_text" as const,
+      text: "",
+    }));
+    const signature = encodeReasoningItem({
+      type: "reasoning",
+      id: "rs_many_segments",
+      encrypted_content: "cipher",
+      summary,
+    });
+    expectInvalid(request({
+      messages: [{
+        role: "assistant",
+        content: Array.from({ length: 3 }, () => ({
+          type: "thinking",
+          thinking: "",
+          signature,
+        })),
+      }],
+    }), "signature is malformed");
+  });
+
   it("preserves reasoning, assistant text, tool calls, tool outputs, and media order", () => {
     const signature = encodeReasoningItem({
       type: "reasoning",
@@ -158,7 +208,7 @@ describe("Anthropic request translation", () => {
           role: "assistant",
           content: [
             { type: "text", text: "before" },
-            { type: "thinking", thinking: "never forward this", signature },
+            { type: "thinking", thinking: "summary", signature },
             { type: "text", text: "between" },
             { type: "tool_use", id: "call_order", name: "Read", input: { path: "a" } },
             { type: "text", text: "after" },
@@ -205,7 +255,7 @@ describe("Anthropic request translation", () => {
       type: "reasoning",
       id: "rs_order",
       encrypted_content: "ordered-cipher",
-      summary: [],
+      summary: [{ type: "summary_text", text: "summary" }],
     });
     expect(input[3]).toMatchObject({
       role: "assistant",

@@ -10,7 +10,11 @@ import {
   attachAtomicBytePermit,
   releaseAtomicBytePermit,
 } from "../src/v2/memory/permit-carrier";
-import { ResponseGraph, SharedByteBudget } from "../src/ws/response-graph";
+import {
+  ResponseGraph,
+  SharedByteBudget,
+  SYNTHETIC_WARMUP_ID_PREFIX,
+} from "../src/ws/response-graph";
 import { deriveV2HostEventMemorySizing } from "../src/v2/memory/event-memory-sizing";
 import { WebSocketProcessBudget } from "../src/ws/session";
 
@@ -90,10 +94,11 @@ describe("ResponseGraph fixed governor memory", () => {
     expect(value.snapshot().reservedBytes).toBe(budget.limit);
 
     const graph = new ResponseGraph({ sharedBudget: budget });
-    graph.record(resolved(graph, "one"), {
-      id: "resp_one",
-      status: "completed",
-      output: [{ type: "message", content: "cached" }],
+    graph.recordWarmup(`${SYNTHETIC_WARMUP_ID_PREFIX}governor`, {
+      type: "response.create",
+      generate: false,
+      store: false,
+      input: "one",
     });
     expect(budget.used).toBeGreaterThan(0);
     expect(() => memory.close()).toThrow("retained bytes");
@@ -105,7 +110,7 @@ describe("ResponseGraph fixed governor memory", () => {
     value.close();
   });
 
-  it("does not pin transport permits across many cached terminals", async () => {
+  it("does not pin transport permits or graph bytes across generated terminals", async () => {
     const budget = new SharedByteBudget(4 * 1024 * 1024);
     const graph = new ResponseGraph({
       maxNodes: 128,
@@ -124,11 +129,11 @@ describe("ResponseGraph fixed governor memory", () => {
       releaseAtomicBytePermit(final);
       expect(permits.snapshot().ordinaryUsedBytes).toBe(0);
     }
-    expect(graph.stats()).toMatchObject({ nodes: 100 });
-    expect(budget.used).toBeGreaterThan(0);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(budget.used).toBe(0);
 
-    // Cached history remains live while unrelated event traffic can still use
-    // the complete transport allocation domain.
+    // Generated histories are provider-backed, so unrelated event traffic can
+    // still use the complete transport allocation domain.
     const unrelated = permits.tryAcquire(64 * 1024);
     expect(unrelated).not.toBeNull();
     unrelated!.release();

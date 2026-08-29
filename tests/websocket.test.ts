@@ -19,8 +19,17 @@ import {
   WebSocketProcessBudget,
 } from "../src/ws/session";
 import { WebSocketTelemetry } from "../src/ws/telemetry";
-import { ResponseGraph, SharedByteBudget } from "../src/ws/response-graph";
+import {
+  ResponseGraph,
+  SharedByteBudget,
+  SYNTHETIC_WARMUP_ID_PREFIX,
+} from "../src/ws/response-graph";
 import { ApiError } from "../src/http/errors";
+import {
+  createAuthenticatedTenantScope,
+  isAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../src/http/api-key";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { RouterQueueFullError } from "../src/router/router";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
@@ -187,7 +196,7 @@ describe("Responses WebSocket server", () => {
     });
   });
 
-  it("validates adaptive parser and fast-path limits before installing an upgrade", () => {
+  it("validates parser, fast-path, and trusted scope limits before upgrade", () => {
     const startRelay = async () => relayHandle(Promise.resolve(completed("unused")));
     for (const maxPayloadBytes of [0, Number.NaN, MAX_WS_PAYLOAD_BYTES + 1]) {
       const server = createServer();
@@ -204,6 +213,11 @@ describe("Responses WebSocket server", () => {
         startRelay,
       })).toThrow(RangeError);
     }
+    const server = createServer();
+    expect(() => attachResponsesWebSocket(server, {
+      authorizationScope: {} as AuthenticatedTenantScope,
+      startRelay,
+    })).toThrow(TypeError);
   });
 
   it("reserves enough raw parser memory when a custom fast path is smaller", async () => {
@@ -621,7 +635,7 @@ describe("Responses WebSocket server", () => {
     expect(bodies).toHaveLength(2);
     expect(bodies[0]).toMatchObject({
       stream: true,
-      store: false,
+      store: true,
       reasoning: {
         effort: "max",
         mode: "pro",
@@ -710,63 +724,196 @@ describe("Responses WebSocket server", () => {
     await waitFor(() => messages.filter(message => message.type === "response.completed").length === 3);
   });
 
-  it("reconstructs a Codex store:false tool continuation from previous_response_id", async () => {
+  it("forwards a Codex continuation as store:true with only its current delta", async () => {
     const bodies: Record<string, unknown>[] = [];
     const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "tool", arguments: "{}" };
     const startRelay: WebSocketRelayStarter = async body => {
       bodies.push(body);
-      return relayHandle(Promise.resolve(
-        bodies.length === 1 ? completed("resp_parent", [call]) : completed("resp_child"),
-      ));
+      const final = bodies.length === 1
+        ? completed("resp_parent", [call])
+        : {
+            ...completed("resp_child"),
+            previous_response_id: body.previous_response_id,
+          };
+      return relayHandle(Promise.resolve(final));
     };
     const socket = await startServer(startRelay);
     const messages = collect(socket);
     socket.send(JSON.stringify({ type: "response.create", stream_id: "main", model: "gpt-5.6-sol", store: false, input: "use tool" }));
     await waitFor(() => messages.some(message => message.response?.id === "resp_parent"));
+    const delta = [{ type: "function_call_output", call_id: "call_1", output: "ok" }];
     socket.send(JSON.stringify({
       type: "response.create",
       stream_id: "main",
       model: "gpt-5.6-sol",
       store: false,
       previous_response_id: "resp_parent",
-      input: [{ type: "function_call_output", call_id: "call_1", output: "ok" }],
+      input: delta,
     }));
     await waitFor(() => messages.some(message => message.response?.id === "resp_child"));
     expect(messages.find(message => message.response?.id === "resp_child").response.previous_response_id).toBe("resp_parent");
-    expect(bodies[1]).not.toHaveProperty("previous_response_id");
-    expect(JSON.stringify(bodies[1].input)).toContain("function_call");
-    expect(JSON.stringify(bodies[1].input)).toContain("function_call_output");
+    expect(bodies[1]).toMatchObject({
+      previous_response_id: "resp_parent",
+      input: delta,
+      store: true,
+      stream: true,
+    });
+    expect(JSON.stringify(bodies[1].input)).not.toContain('"type":"function_call"');
   });
 
-  it("records a store:false response before exposing its terminal across lanes", async () => {
-    const parent = completed("resp_record_barrier");
+  it("expands only scoped warmup state into the first persisted generated child", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const graph = new ResponseGraph();
+    const relays: Array<{
+      body: Record<string, unknown>;
+      authorizationScope: AuthenticatedTenantScope;
+      encodedBodyBytes?: number;
+    }> = [];
+    const socket = await startServer(async (body, options) => {
+      relays.push({
+        body,
+        authorizationScope: options.authorizationScope,
+        encodedBodyBytes: options.encodedBodyBytes,
+      });
+      const final = {
+        ...completed(relays.length === 1
+          ? "resp_generated_after_warmup"
+          : "resp_provider_next"),
+        previous_response_id: body.previous_response_id ?? null,
+      };
+      return relayHandle(Promise.resolve(final));
+    }, {
+      authorizationScope,
+      graphFactory: () => graph,
+    });
+    const messages = collect(socket);
+    const normalizedUser = (text: string) => ({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      generate: false,
+      stream_id: "warmup-lane",
+      model: "gpt-5.6-sol",
+      store: false,
+      previous_response_id: "resp_provider_before_warmup",
+      input: "warmup one",
+    }));
+    await waitFor(() => messages.some(message =>
+      typeof message.response?.id === "string" &&
+      message.response.id.startsWith(SYNTHETIC_WARMUP_ID_PREFIX)));
+    const firstAliasMessage = messages.find(message =>
+      message.response?.id?.startsWith(SYNTHETIC_WARMUP_ID_PREFIX));
+    const firstAlias = firstAliasMessage.response.id as string;
+    expect(firstAliasMessage.response.previous_response_id)
+      .toBe("resp_provider_before_warmup");
+
+    const warmupDelta = {
+      type: "function_call_output",
+      call_id: "warm_call",
+      output: "warmup two",
+    };
+    socket.send(JSON.stringify({
+      type: "response.create",
+      generate: false,
+      stream_id: "warmup-lane",
+      store: true,
+      previous_response_id: firstAlias,
+      input: [warmupDelta],
+    }));
+    await waitFor(() => messages.filter(message =>
+      message.response?.id?.startsWith(SYNTHETIC_WARMUP_ID_PREFIX)).length === 2);
+    const aliasMessages = messages.filter(message =>
+      message.response?.id?.startsWith(SYNTHETIC_WARMUP_ID_PREFIX));
+    const secondAlias = aliasMessages[1]!.response.id as string;
+    expect(aliasMessages[1]!.response.previous_response_id).toBe(firstAlias);
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "warmup-lane",
+      store: false,
+      previous_response_id: secondAlias,
+      client_metadata: { authorization_scope: "client-controlled" },
+      input: "generate now",
+    }));
+    await waitFor(() => messages.some(message =>
+      message.response?.id === "resp_generated_after_warmup"));
+
+    expect(relays).toHaveLength(1);
+    expect(relays[0]).toEqual({
+      authorizationScope,
+      encodedBodyBytes: undefined,
+      body: expect.objectContaining({
+        model: "gpt-5.6-sol",
+        previous_response_id: "resp_provider_before_warmup",
+        input: [normalizedUser("warmup one"), warmupDelta, normalizedUser("generate now")],
+        store: true,
+        stream: true,
+      }),
+    });
+    expect(JSON.stringify(relays[0]!.body)).not.toContain(SYNTHETIC_WARMUP_ID_PREFIX);
+    expect(JSON.stringify(relays[0]!.body)).not.toContain("authorizationScope");
+    expect(messages.find(message =>
+      message.response?.id === "resp_generated_after_warmup").response.previous_response_id)
+      .toBe(secondAlias);
+    expect(graph.stats().nodes).toBe(2);
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "warmup-lane",
+      store: false,
+      previous_response_id: "resp_generated_after_warmup",
+      input: "provider continuation",
+    }));
+    await waitFor(() => messages.some(message => message.response?.id === "resp_provider_next"));
+    expect(relays[1]!.body).toMatchObject({
+      previous_response_id: "resp_generated_after_warmup",
+      input: [normalizedUser("provider continuation")],
+      store: true,
+      stream: true,
+    });
+    expect(relays[1]!.encodedBodyBytes).toBeGreaterThan(0);
+    expect(graph.stats().nodes).toBe(2);
+  });
+
+  it("withholds a provider terminal before allowing cross-lane persisted forks", async () => {
+    const parent = completed("resp_terminal_barrier");
     const parentFinal = deferred<any>();
-    let calls = 0;
-    const socket = await startServer(async () => {
-      calls++;
-      if (calls === 1) {
+    const bodies: Record<string, unknown>[] = [];
+    const socket = await startServer(async body => {
+      bodies.push(body);
+      if (bodies.length === 1) {
         return relayHandle(parentFinal.promise, [{
           event: "response.completed",
           data: JSON.stringify({ type: "response.completed", response: parent }),
         }]);
       }
-      return relayHandle(Promise.resolve(completed("resp_record_child")));
+      const text = (body.input as any[])[0]?.content?.[0]?.text as string;
+      return relayHandle(Promise.resolve({
+        ...completed(`resp_fork_${text}`),
+        previous_response_id: body.previous_response_id,
+      }));
     });
     const messages: any[] = [];
-    let continuationSent = false;
+    let forksSent = false;
     socket.on("message", data => {
       const message = JSON.parse(data.toString());
       messages.push(message);
-      if (message.response?.id === parent.id && !continuationSent) {
-        continuationSent = true;
-        socket.send(JSON.stringify({
-          type: "response.create",
-          stream_id: "child-lane",
-          model: "gpt-5.6-sol",
-          store: false,
-          previous_response_id: parent.id,
-          input: "continue immediately",
-        }));
+      if (message.response?.id === parent.id && !forksSent) {
+        forksSent = true;
+        for (const fork of ["left", "right"]) {
+          socket.send(JSON.stringify({
+            type: "response.create",
+            stream_id: `child-${fork}`,
+            model: "gpt-5.6-sol",
+            store: false,
+            previous_response_id: parent.id,
+            input: fork,
+          }));
+        }
       }
     });
     socket.send(JSON.stringify({
@@ -777,18 +924,31 @@ describe("Responses WebSocket server", () => {
       input: "parent",
     }));
     await new Promise(resolve => setTimeout(resolve, 25));
-    const terminalExposedBeforeFinal = continuationSent;
+    const terminalExposedBeforeFinal = forksSent;
     parentFinal.resolve(parent);
-    await waitFor(() =>
-      messages.some(message => message.response?.id === "resp_record_child") ||
+    await waitFor(() => ["left", "right"].every(fork =>
+      messages.some(message => message.response?.id === `resp_fork_${fork}`)) ||
       messages.some(message => message.error?.code === "previous_response_not_found")
     );
+
     expect(terminalExposedBeforeFinal).toBe(false);
     expect(messages.some(message => message.error?.code === "previous_response_not_found")).toBe(false);
-    expect(messages.some(message => message.response?.id === "resp_record_child")).toBe(true);
+    expect(bodies).toHaveLength(3);
+    for (const fork of ["left", "right"]) {
+      expect(bodies).toContainEqual(expect.objectContaining({
+        previous_response_id: parent.id,
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: fork }],
+        }],
+        store: true,
+        stream: true,
+      }));
+    }
   });
 
-  it("preserves one exact large image across a small store:false continuation", async () => {
+  it("does not replay a large image across a small provider-backed continuation", async () => {
     const MiB = 1024 * 1024;
     const imageUrl = `data:image/png;base64,${"A".repeat(10 * MiB)}`;
     const bodies: Record<string, unknown>[] = [];
@@ -825,56 +985,64 @@ describe("Responses WebSocket server", () => {
     expect(Buffer.byteLength(continuation)).toBeLessThan(DEFAULT_WS_MAX_PAYLOAD_BYTES);
     socket.send(continuation);
     await waitFor(() => messages.some(message => message.response?.id === "resp_image_child"), 5_000);
-    const materialized = JSON.stringify(bodies[1]?.input);
-    expect(materialized.split(imageUrl).length - 1).toBe(1);
-    expect(materialized).toContain("now inspect the same image again");
+    const forwardedDelta = JSON.stringify(bodies[1]?.input);
+    expect(forwardedDelta).not.toContain(imageUrl);
+    expect(forwardedDelta).toContain("now inspect the same image again");
+    expect(bodies[1]).toMatchObject({
+      previous_response_id: "resp_image_parent",
+      store: true,
+      stream: true,
+    });
     expect(telemetry.snapshotAndReset()).toMatchObject({
       ingressPromotions: 1,
       ingressRejections: 0,
     });
   }, 15_000);
 
-  it("holds lineage capacity only until router handoff completes", async () => {
+  it("holds warmup materialization capacity only until router handoff completes", async () => {
     const shared = new SharedByteBudget(16 * 1024 * 1024);
     const graph = new ResponseGraph({
       maxBytes: 8 * 1024 * 1024,
       sharedBudget: shared,
     });
-    const root = graph.resolve({
+    const authorizationScope = createAuthenticatedTenantScope();
+    const warmupId = `${SYNTHETIC_WARMUP_ID_PREFIX}lineage_root`;
+    graph.recordWarmup(warmupId, {
       type: "response.create",
+      generate: false,
       store: false,
-      input: "root",
-    });
-    graph.record(root, {
-      id: "resp_lineage_root",
-      status: "completed",
-      output: [{ type: "message", content: "x".repeat(1024 * 1024) }],
-    });
+      input: [{ type: "message", content: "x".repeat(1024 * 1024) }],
+    }, { authorizationScope });
     const storedBytes = shared.used;
     const handoff = deferred<RunHandle>();
     let started = false;
     const socket = await startServer(async () => {
       started = true;
       return handoff.promise;
-    }, { graphFactory: () => graph });
+    }, {
+      authorizationScope,
+      graphFactory: () => graph,
+    });
     const messages = collect(socket);
     socket.send(JSON.stringify({
       type: "response.create",
       stream_id: "lineage",
       model: "gpt-5.6-sol",
       store: false,
-      previous_response_id: "resp_lineage_root",
+      previous_response_id: warmupId,
       input: "next",
     }));
     await waitFor(() => started);
     expect(shared.used).toBeGreaterThan(storedBytes);
 
     handoff.resolve(relayHandle(Promise.resolve({
+      id: "resp_warmup_child",
       status: "completed",
       output: [],
     })));
     await waitFor(() => messages.some(message => message.type === "response.completed"));
     expect(shared.used).toBe(storedBytes);
+    expect(graph.stats().nodes).toBe(1);
     socket.close();
   });
 
@@ -919,6 +1087,41 @@ describe("Responses WebSocket server", () => {
     await waitFor(() => messages.some(message => message.type === "response.completed"));
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(messages.filter(message => message.type === "response.completed")).toHaveLength(1);
+  });
+
+  it("synthesizes the terminal event type from a final-only response", async () => {
+    const socket = await startServer(async body => {
+      const label = (body.input as any[])[0]?.content?.[0]?.text as string;
+      const status = label === "failed" ? "failed" : "incomplete";
+      return relayHandle(Promise.resolve({
+        ...completed(`resp_${status}`),
+        status,
+      }));
+    });
+    const messages = collect(socket);
+    for (const status of ["failed", "incomplete"]) {
+      socket.send(JSON.stringify({
+        type: "response.create",
+        stream_id: status,
+        model: "gpt-5.6-sol",
+        input: status,
+      }));
+    }
+
+    await waitFor(() => messages.filter(message =>
+      message.type === "response.failed" || message.type === "response.incomplete").length === 2);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "response.failed",
+        stream_id: "failed",
+        response: expect.objectContaining({ status: "failed" }),
+      }),
+      expect.objectContaining({
+        type: "response.incomplete",
+        stream_id: "incomplete",
+        response: expect.objectContaining({ status: "incomplete" }),
+      }),
+    ]));
   });
 
   it("returns direct validation errors without closing other lanes", async () => {
@@ -1061,10 +1264,12 @@ describe("Responses WebSocket server", () => {
     gate.resolve(completed("resp_large_one"));
   });
 
-  it("uses one stable relay client identity per WebSocket session", async () => {
+  it("uses stable server-derived relay identity and authorization scope per session", async () => {
     const clientIds: string[] = [];
+    const authorizationScopes: AuthenticatedTenantScope[] = [];
     const socket = await startServer(async (_body, options) => {
       clientIds.push(options.clientId);
+      authorizationScopes.push(options.authorizationScope);
       return relayHandle(Promise.resolve(completed(`resp_${clientIds.length}`)));
     });
     const messages = collect(socket);
@@ -1074,6 +1279,7 @@ describe("Responses WebSocket server", () => {
         stream_id,
         model: "gpt-5.6-sol",
         store: false,
+        client_metadata: { authorization_scope: stream_id },
         input: stream_id,
       }));
     }
@@ -1081,6 +1287,11 @@ describe("Responses WebSocket server", () => {
     expect(clientIds).toHaveLength(2);
     expect(clientIds[0]).toMatch(/^ws-/);
     expect(clientIds[1]).toBe(clientIds[0]);
+    expect(authorizationScopes).toHaveLength(2);
+    expect(isAuthenticatedTenantScope(authorizationScopes[0])).toBe(true);
+    expect(authorizationScopes[1]).toBe(authorizationScopes[0]);
+    expect(JSON.stringify(authorizationScopes)).not.toContain("identity-a");
+    expect(JSON.stringify(authorizationScopes)).not.toContain("identity-b");
   });
 
   it("preserves normalized provider status and error identity", async () => {
@@ -1285,6 +1496,115 @@ class FakeSocket {
 }
 
 describe("Responses WebSocket bounded delivery", () => {
+  it("normalizes omitted, false, and true client store hints before relay", async () => {
+    const socket = new FakeSocket();
+    const graph = new ResponseGraph();
+    const bodies: Record<string, unknown>[] = [];
+    const authorizationScope = createAuthenticatedTenantScope();
+    const scopes: AuthenticatedTenantScope[] = [];
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope,
+      graph,
+      startRelay: async (body, options) => {
+        bodies.push(body);
+        scopes.push(options.authorizationScope);
+        return relayHandle(Promise.resolve(completed(`resp_store_${bodies.length}`)));
+      },
+    });
+
+    for (const [index, store] of [undefined, false, true].entries()) {
+      session.receive(JSON.stringify({
+        type: "response.create",
+        stream_id: `store-${index}`,
+        model: "gpt-5.6-sol",
+        ...(store === undefined ? {} : { store }),
+        input: `delta-${index}`,
+      }));
+    }
+    await waitFor(() => socket.sent.length === 3);
+
+    expect(bodies).toHaveLength(3);
+    expect(bodies.map(body => body.store)).toEqual([true, true, true]);
+    expect(bodies.map(body => body.stream)).toEqual([true, true, true]);
+    expect(scopes).toEqual([
+      authorizationScope,
+      authorizationScope,
+      authorizationScope,
+    ]);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    session.close();
+  });
+
+  it("preserves the prior warmup LRU when a new terminal cannot enter the send queue", async () => {
+    const socket = new FakeSocket();
+    const authorizationScope = createAuthenticatedTenantScope();
+    const graph = new ResponseGraph({ maxNodes: 1 });
+    const existing = `${SYNTHETIC_WARMUP_ID_PREFIX}existing`;
+    graph.recordWarmup(existing, {
+      type: "response.create",
+      generate: false,
+      input: "keep me",
+    }, { authorizationScope, inputOwnership: "owned" });
+    const retained = graph.stats();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope,
+      graph,
+      maxSendQueueBytes: 64,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+
+    session.receive(JSON.stringify({
+      type: "response.create",
+      generate: false,
+      stream_id: "warmup-overflow",
+      model: "gpt-5.6-sol",
+      input: "must not replace the prior alias",
+    }));
+    await waitFor(() => session.isIdle());
+
+    expect(socket.sent).toHaveLength(0);
+    expect(graph.stats()).toEqual(retained);
+    session.close();
+  });
+
+  it("never retries an unknown provider ID by dropping the continuation", async () => {
+    const socket = new FakeSocket();
+    const bodies: Record<string, unknown>[] = [];
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
+      startRelay: async body => {
+        bodies.push(structuredClone(body));
+        throw new ApiError(404, "Provider continuation was not found", {
+          type: "invalid_request_error",
+          param: "previous_response_id",
+          code: "previous_response_not_found",
+        });
+      },
+    });
+
+    session.receive(JSON.stringify({
+      type: "response.create",
+      stream_id: "unknown-provider",
+      model: "gpt-5.6-sol",
+      store: false,
+      previous_response_id: "resp_provider_unknown_exact",
+      input: "current delta",
+    }));
+    await waitFor(() => socket.sent.length === 1);
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toMatchObject({
+      previous_response_id: "resp_provider_unknown_exact",
+      store: true,
+      stream: true,
+    });
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({
+      stream_id: "unknown-provider",
+      error: { code: "previous_response_not_found" },
+    });
+    session.close();
+  });
+
   it("holds transferred event memory until the socket send callback settles", async () => {
     const socket = new FakeSocket();
     socket.holdCallbacks = true;
@@ -1312,7 +1632,7 @@ describe("Responses WebSocket bounded delivery", () => {
     permits.close();
   });
 
-  it("keeps graph storage decoupled from its caller's transport permit", async () => {
+  it("keeps generated results out of graph storage and decoupled from transport permits", async () => {
     const permits = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
     const final = attachAtomicBytePermit(
       completed("resp_cached", [{ type: "message", content: "remember" }]),
@@ -1325,10 +1645,11 @@ describe("Responses WebSocket bounded delivery", () => {
       input: "remember",
     });
     graph.record(resolved, final);
-    expect(graph.stats().nodes).toBe(1);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(permits.snapshot().ordinaryUsedBytes).toBe(8_192);
     graph.clear();
-    // Graph storage is covered by its fixed governor region, not this permit.
+    // Generated output remains solely under its transport permit; the graph
+    // keeps no response-history copy.
     expect(permits.snapshot().ordinaryUsedBytes).toBe(8_192);
     releaseAtomicBytePermit(final);
     expect(permits.snapshot().ordinaryUsedBytes).toBe(0);

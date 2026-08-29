@@ -38,6 +38,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   uncommitted = 0;
   uncommittedPeak = 0;
   executions = 0;
+  completedResponses = 0;
   snapshotCalls = 0;
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
@@ -190,7 +191,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
       stats: { bytes: 0, firstByteMs: 1, frames: 0 },
     };
   }
-  completeOne(value: unknown = { id: "resp", status: "completed" }): void {
+  completeOne(value: unknown = {
+    id: `resp_${this.projectId}_${++this.completedResponses}`,
+    status: "completed",
+  }): void {
     this.finals.shift()?.resolve(value);
   }
   rejectOne(error: unknown): void {
@@ -478,6 +482,7 @@ describe("MultiSandboxRouter", () => {
         model: "gpt-5.6-sol",
         input: `profile-cost-${index}`,
         service_tier: "fast",
+        store: true,
         stream: true,
       }, {
         clientId: `profile-cost-${index}`,
@@ -515,6 +520,7 @@ describe("MultiSandboxRouter", () => {
         model: "gpt-5.6-sol",
         input: `observed-cost-${index}`,
         service_tier: "fast",
+        store: true,
         stream: true,
       }, {
         clientId: `observed-cost-${index}`,
@@ -666,8 +672,8 @@ describe("MultiSandboxRouter", () => {
       service_tier: "fast",
       stream: true,
     }, { source: "http", incomingLease });
-    expect(replacementRequestBytes).toBe(13 * 1024 ** 2);
-    expect(replacementDeadlineMs).toBe(acceptedAtMs + 53_750);
+    expect(replacementRequestBytes).toBe(13 * 1024 ** 2 + 13);
+    expect(replacementDeadlineMs).toBe(acceptedAtMs + 53_751);
     system.runtimes[0]!.completeOne();
     await handle.final;
     await system.router.close();

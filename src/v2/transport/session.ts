@@ -1,5 +1,6 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
+import { normalizeUpstreamResponsesRequest } from "../../relay/upstream-policy";
 import type { SandboxAdmissionProgress } from "../../sandbox/registry";
 import { sseFrame, type SseFrame } from "../../relay/sse";
 import type {
@@ -2953,9 +2954,11 @@ export class V2TransportSession {
     signal?: AbortSignal,
   ): Promise<PreparedRequestPlan> {
     // The sidecar forwards these proven canonical bytes directly to fetch to
-    // avoid a decoded-string + parsed-object + reserialized-string peak. Force
-    // streaming here while the outer HTTP handler still owns client semantics.
-    const upstreamBody = body.stream === true ? body : { ...body, stream: true };
+    // avoid a decoded-string + parsed-object + reserialized-string peak. Apply
+    // both upstream policy fields before canonicalization so byte accounting,
+    // digest, compression, frames, and the immutable R8 fetch body all describe
+    // exactly the same bytes. Outer HTTP streaming remains a separate contract.
+    const upstreamBody = normalizeUpstreamResponsesRequest(body);
     const decoded = utf8Bytes(canonicalJson(upstreamBody));
     if (decoded.byteLength < 1 || decoded.byteLength > this.#limits.requestMaxBytes) {
       throw new V2PreCommitError("V2 request exceeds the 64 MiB limit", "request_too_large");
@@ -2967,7 +2970,7 @@ export class V2TransportSession {
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
     const gzipPriority = decoded.byteLength >= BULK_GZIP_MIN_BYTES ? "bulk" : "latency";
-    const inlineBase64 = containsLargeInlineBase64(body);
+    const inlineBase64 = containsLargeInlineBase64(upstreamBody);
     if (
       this.#gzip &&
       decoded.byteLength > partBytes &&

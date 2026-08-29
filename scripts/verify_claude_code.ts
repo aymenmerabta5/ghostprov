@@ -1,6 +1,7 @@
 import type { FetchLike } from "../src/core/ports";
 import { ApiError } from "../src/http/errors";
 import { RelayError, type RunHandle } from "../src/relay/run-handle";
+import { normalizeUpstreamResponsesRequest } from "../src/relay/upstream-policy";
 import type { SseFrame } from "../src/relay/sse";
 import { createGhostProvApp, type RouterLike } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
@@ -19,7 +20,10 @@ import {
   listen,
   trackVerifierUpgrades,
 } from "./claude-code-verifier/shutdown";
-import { resolveGhostProvApiKey } from "../src/http/api-key";
+import {
+  createAuthenticatedTenantScope,
+  resolveGhostProvApiKey,
+} from "../src/http/api-key";
 
 export { closeVerifierServer, trackVerifierUpgrades };
 
@@ -273,7 +277,7 @@ function terminalFinal(frame: SseFrame): Record<string, unknown> | null {
 
 function serializableStreamingBody(body: Record<string, unknown>): string {
   try {
-    const serialized = JSON.stringify({ ...body, stream: true });
+    const serialized = JSON.stringify(normalizeUpstreamResponsesRequest(body));
     if (typeof serialized === "string") return serialized;
   } catch {
     // The public error must not include request values or serialization details.
@@ -562,13 +566,15 @@ export async function main(
   const options = optionsFromEnvironment(environment);
   const apiKey = resolveGhostProvApiKey(environment.GHOSTPROV_API_KEY);
   const router = createForwardingRouter(options.upstream, { apiKey });
-  const app = createGhostProvApp({ router, apiKey });
+  const authorizationScope = createAuthenticatedTenantScope();
+  const app = createGhostProvApp({ router, apiKey, authorizationScope });
   const server = createGhostProvServer({
     app,
     router,
     apiKey,
     port: options.port,
     candidate: true,
+    authorizationScope,
   });
   const upgrades = trackVerifierUpgrades(server);
   try {

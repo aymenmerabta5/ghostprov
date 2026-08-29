@@ -1,5 +1,7 @@
 # GhostProv Images Compatibility Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add non-streaming OpenAI Images generation/edit compatibility over GhostProv's Responses-only relay, with concurrent `n` fan-out, accurate upstream errors, safe large-body transport, and explicit unsupported audio behavior.

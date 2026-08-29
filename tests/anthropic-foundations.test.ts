@@ -69,7 +69,7 @@ describe("Anthropic foundations", () => {
     expect(resolveAnthropicModel("claude-unknown", models)).toBe("gpt-5.6-sol");
   });
 
-  it("round-trips only encrypted reasoning continuity without summary plaintext", () => {
+  it("round-trips reasoning summary segmentation without summary plaintext", () => {
     const item = {
       type: "reasoning",
       id: "rs_1",
@@ -77,10 +77,14 @@ describe("Anthropic foundations", () => {
       summary: [{ type: "summary_text", text: "private summary" }],
     } as const;
     const signature = encodeReasoningItem(item);
-    expect(signature.startsWith("ghostprov-r1.")).toBe(true);
-    const rawEnvelope = Buffer.from(signature.slice("ghostprov-r1.".length), "base64url")
+    expect(signature.startsWith("ghostprov-r2.")).toBe(true);
+    const rawEnvelope = Buffer.from(signature.slice("ghostprov-r2.".length), "base64url")
       .toString("utf8");
-    expect(JSON.parse(rawEnvelope)).toEqual({ id: "rs_1", encrypted_content: "cipher" });
+    expect(JSON.parse(rawEnvelope)).toEqual({
+      id: "rs_1",
+      encrypted_content: "cipher",
+      summary_layout: "15",
+    });
     expect(rawEnvelope).not.toContain("private summary");
     expect(decodeReasoningItem(signature)).toEqual({
       type: "reasoning",
@@ -88,6 +92,8 @@ describe("Anthropic foundations", () => {
       encrypted_content: "cipher",
       summary: [],
     });
+    expect(decodeReasoningItem(signature, "private summary")).toEqual(item);
+    expect(decodeReasoningItem(signature, "short")).toBeNull();
     expect(decodeReasoningItem("anthropic-native-signature")).toBeNull();
     expect(decodeReasoningItem("ghostprov-r1.not-base64")).toBeNull();
     expect(decodeReasoningItem("ghostprov-r1.%%%")).toBeNull();
@@ -117,6 +123,27 @@ describe("Anthropic foundations", () => {
       const malformed = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
       expect(decodeReasoningItem(`ghostprov-r1.${malformed}`)).toBeNull();
     }
+
+    const tooManySummaryLengths = Buffer.from(JSON.stringify({
+      id: "rs_many_summaries",
+      encrypted_content: "cipher",
+      summary_layout: Array.from({ length: 100_001 }, () => "0").join(","),
+    }), "utf8").toString("base64url");
+    expect(decodeReasoningItem(`ghostprov-r2.${tooManySummaryLengths}`, "")).toBeNull();
+
+    const structuralArrayBomb = Buffer.from(
+      '{"id":"rs_array_bomb","encrypted_content":"cipher","summary_layout":[' +
+        `${"0,".repeat(500_000)}0]}`,
+      "utf8",
+    ).toString("base64url");
+    expect(decodeReasoningItem(`ghostprov-r2.${structuralArrayBomb}`, "")).toBeNull();
+
+    const invalidSummaryLength = Buffer.from(JSON.stringify({
+      id: "rs_invalid_summary",
+      encrypted_content: "cipher",
+      summary_layout: String(Number.MAX_SAFE_INTEGER),
+    }), "utf8").toString("base64url");
+    expect(decodeReasoningItem(`ghostprov-r2.${invalidSummaryLength}`, "")).toBeNull();
 
     const duplicateKeys = Buffer.from(
       '{"id":"rs_first","id":"rs_second","encrypted_content":"cipher"}',

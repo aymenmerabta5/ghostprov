@@ -46,6 +46,13 @@ import type { V2SidecarAssets } from "../v2/sidecar/assets";
 import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
 import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session";
 import { createGhostProvApp } from "./app";
+import { ResponsesHttpContinuationIndex } from "../http/responses-continuation";
+import { AnthropicContinuationIndex } from "../anthropic/continuation";
+import {
+  createAuthenticatedTenantScope,
+  isAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../http/api-key";
 import { createGhostProvServer } from "./runtime";
 import { resolveObservabilityConfig } from "../observability/config";
 import {
@@ -259,6 +266,12 @@ export interface BrowserlessSystemDependencies {
   runtimeFactory?: ManagedRuntimeFactory;
   registry?: SandboxRegistry;
   router?: MultiSandboxRouter;
+  /** One opaque authority shared by every public continuation surface. */
+  authorizationScope?: AuthenticatedTenantScope;
+  /** Test seam for the app-scoped native Responses full-history index. */
+  responsesContinuationIndex?: ResponsesHttpContinuationIndex;
+  /** Test seam for the one app-scoped, bounded Claude continuation index. */
+  anthropicContinuationIndex?: AnthropicContinuationIndex;
   webSocketProcessBudget?: WebSocketProcessBudget;
   server?: BrowserlessSystemServer;
   cpuPool?: BrowserlessCpuPool;
@@ -285,6 +298,10 @@ export interface BrowserlessSystem {
   responseGraphMemory: BrowserlessResponseGraphMemory;
   webSocketIngressMemory: BrowserlessWebSocketIngressMemory;
   router: MultiSandboxRouter;
+  /** App-scoped native Responses full-history continuation metadata. */
+  responsesContinuationIndex: ResponsesHttpContinuationIndex;
+  /** Shared by the app's stable and beta Anthropic Messages routes. */
+  anthropicContinuationIndex: AnthropicContinuationIndex;
   fleet: ProjectFleetManager;
   app: ReturnType<typeof createGhostProvApp>;
   server: BrowserlessSystemServer;
@@ -645,6 +662,20 @@ export async function createBrowserlessSystem(
 ): Promise<BrowserlessSystem> {
   const machineProbe = dependencies.machineProbe ?? new SystemMachineProbe();
   const config = resolveMultiSandboxConfig(env, machineProbe.sample());
+  const existingRouterScope = dependencies.router?.responseProvenanceAuthorizationScope();
+  if (
+    dependencies.authorizationScope !== undefined &&
+    existingRouterScope !== null &&
+    existingRouterScope !== undefined &&
+    dependencies.authorizationScope !== existingRouterScope
+  ) {
+    throw new TypeError("Injected router and system authorization scopes must match");
+  }
+  const authorizationScope = dependencies.authorizationScope ?? existingRouterScope ??
+    createAuthenticatedTenantScope();
+  if (!isAuthenticatedTenantScope(authorizationScope)) {
+    throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
+  }
   const revisionSelector: BrowserlessV2RevisionSelector = dependencies.revisionSelector ??
     (dependencies.assets
       ? fixedV2RevisionSelector(config.projectIds, dependencies.assets)
@@ -766,11 +797,16 @@ export async function createBrowserlessSystem(
     governor,
     logger,
     queueTimeoutMs: config.routerQueueTimeoutMs,
+    authorizationScope,
     observability: {
       slowRequestMs: observabilityConfig.slowRequestMs,
       transport: "v2",
     },
   });
+  const responsesContinuationIndex = dependencies.responsesContinuationIndex ??
+    new ResponsesHttpContinuationIndex();
+  const anthropicContinuationIndex = dependencies.anthropicContinuationIndex ??
+    new AnthropicContinuationIndex();
   const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const sampler = dependencies.sampler ?? new FleetSampler({
     logger,
@@ -788,6 +824,9 @@ export async function createBrowserlessSystem(
     router,
     apiKey: config.apiKey,
     fleetSnapshot: () => fleet.snapshot(),
+    authorizationScope,
+    responsesContinuationIndex,
+    anthropicContinuationIndex,
   });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -797,6 +836,7 @@ export async function createBrowserlessSystem(
     candidate: config.candidate,
     webSocketTelemetry,
     webSocketProcessBudget: webSocketIngressMemory.budget,
+    authorizationScope,
   }) as BrowserlessSystemServer;
   let reconciliation: Promise<unknown> | null = null;
   let starting: Promise<void> | null = null;
@@ -860,6 +900,8 @@ export async function createBrowserlessSystem(
     responseGraphMemory,
     webSocketIngressMemory,
     router,
+    responsesContinuationIndex,
+    anthropicContinuationIndex,
     fleet,
     app,
     server,
@@ -933,6 +975,8 @@ export async function createBrowserlessSystem(
             })()
           : closeServer(server);
         router.beginShutdown();
+        responsesContinuationIndex.beginShutdown();
+        anthropicContinuationIndex.beginShutdown();
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
         try {
@@ -952,6 +996,11 @@ export async function createBrowserlessSystem(
         await router.close().catch(error => { firstError ??= error; });
         const serverClose = await settleServerClose(server, serverClosing, shutdownDeadlineMs);
         if (serverClose.error !== undefined) firstError ??= serverClose.error;
+        // HTTP/SSE outputs are now drained (or timed out), and beginShutdown has
+        // made every late translator callback a no-op. Clear once more so no
+        // continuation metadata survives process teardown.
+        responsesContinuationIndex.clear();
+        anthropicContinuationIndex.clear();
         // Reject any governor waiters which are not owned by the router (for
         // example a body reservation or CPU transform waiting during teardown).
         // Never close the permit pool while a slow HTTP/SSE output may still

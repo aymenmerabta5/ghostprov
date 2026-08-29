@@ -59,6 +59,10 @@ export type TranslatedAnthropicRequest = {
   thinkingDisplay: AnthropicThinkingDisplay;
   stopSequences: string[];
   estimatedInputTokens: number;
+  /** Exact canonical JSON bytes measured during inbound validation. */
+  inboundBytes: number;
+  /** Exact canonical JSON bytes measured for the translated relay body. */
+  relayBytes: number;
   maxTokensZero: boolean;
 };
 
@@ -202,7 +206,12 @@ export function translateAnthropicRequest(
   options: TranslateAnthropicRequestOptions,
 ): TranslatedAnthropicRequest {
   const limits = resolveAnthropicRequestLimits(options.limits);
-  measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
+  const inboundBytes = measureBoundedJson(
+    value,
+    "inbound request",
+    limits.inboundBytes,
+    limits,
+  );
   const { body, requestedModel, maxTokens, messages, stream } = requireRequest(value, limits);
   const {
     input,
@@ -227,7 +236,7 @@ export function translateAnthropicRequest(
 
   const relayBody: ResponsesRequestBody = {
     model: resolveAnthropicModel(requestedModel, options.models),
-    store: false,
+    store: true,
     stream,
     input,
     include: ["reasoning.encrypted_content"],
@@ -253,6 +262,8 @@ export function translateAnthropicRequest(
     thinkingDisplay: thinking.display,
     stopSequences,
     estimatedInputTokens: Math.max(1, Math.ceil(relayBytes / 4)),
+    inboundBytes,
+    relayBytes,
     maxTokensZero,
   };
 }

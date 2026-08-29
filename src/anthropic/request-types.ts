@@ -83,7 +83,7 @@ export type ResponsesTextConfig = {
 
 export type ResponsesRequestBody = Record<string, unknown> & {
   model: string;
-  store: false;
+  store: true;
   stream: boolean;
   input: ResponsesInputItem[];
   include: ["reasoning.encrypted_content"];

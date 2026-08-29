@@ -21,6 +21,10 @@ import { closeResponsesWebSockets } from "../src/ws/server";
 import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { resolveHttpClientId } from "../src/http/request-lease";
+import {
+  createAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../src/http/api-key";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { v2EventPhysicalWorkingSetBytes } from "../src/v2/memory/event-memory-sizing";
 
@@ -93,6 +97,8 @@ class FakeRouter {
     source?: string;
     clientId?: string;
     incomingLease?: IncomingResourceLease;
+    authorizationScope?: AuthenticatedTenantScope;
+    encodedBodyBytes?: number;
   }> = [];
   bodyReservations: number[] = [];
   bodyReservationGrowths: number[] = [];
@@ -121,6 +127,8 @@ class FakeRouter {
     source?: string;
     clientId?: string;
     incomingLease?: IncomingResourceLease;
+    authorizationScope?: AuthenticatedTenantScope;
+    encodedBodyBytes?: number;
   } = {}): Promise<RunHandle> {
     expect(this.bodyReservationActive).toBeGreaterThanOrEqual(0);
     this.workloads.push({ body, ...options });
@@ -172,6 +180,314 @@ describe("router HTTP composition", () => {
     }
     expect(() => createGhostProvApp({ router, keepAliveMs: 1 })).not.toThrow();
     expect(() => createGhostProvApp({ router, keepAliveMs: 2_147_483_647 })).not.toThrow();
+    expect(() => createGhostProvApp({
+      router,
+      authorizationScope: {} as AuthenticatedTenantScope,
+    })).toThrow(TypeError);
+  });
+
+  it("forces upstream persistence and streaming without changing the public nonstream contract", async () => {
+    const router = new FakeRouter();
+    const authorizationScope = createAuthenticatedTenantScope();
+    const app = createGhostProvApp({
+      router,
+      authorizationScope,
+    });
+
+    const publicBody = {
+      model: "gpt-5.6-sol",
+      input: "persist this upstream",
+      stream: false,
+      store: false,
+      previous_response_id: "resp_parent_exact",
+    };
+    const publicJson = JSON.stringify(publicBody);
+    const incomingLease: IncomingResourceLease = {
+      bodyBytes: Buffer.byteLength(publicJson),
+      release() {},
+    };
+    const response = await app.fetch(new Request("http://ghostprov.test/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: publicJson,
+    }), { incomingBodyLease: incomingLease });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.json()).toMatchObject({ status: "completed" });
+    expect(router.workloads[0]!.authorizationScope).toBe(authorizationScope);
+    const expectedUpstreamBody = {
+      model: "gpt-5.6-sol",
+      input: "persist this upstream",
+      stream: true,
+      store: true,
+      previous_response_id: "resp_parent_exact",
+    };
+    expect(router.workloads[0]!.body).toEqual(expectedUpstreamBody);
+    expect(router.workloads[0]!.encodedBodyBytes).toBe(
+      Buffer.byteLength(JSON.stringify(expectedUpstreamBody)),
+    );
+  });
+
+  it("converts an exact native Responses full history into a stored suffix", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const calls: Array<{
+      body: Record<string, unknown>;
+      options: Record<string, unknown>;
+    }> = [];
+    const firstUser = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "first" }],
+    };
+    const answer = {
+      type: "message",
+      id: "msg_parent",
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "answer",
+        annotations: [],
+        logprobs: [],
+      }],
+    };
+    const nextUser = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "next" }],
+    };
+    const router = {
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (
+        body: Record<string, unknown>,
+        options: Record<string, unknown> = {},
+      ) => {
+        calls.push({ body: structuredClone(body), options });
+        return handle(final(
+          calls.length === 1 ? "resp_full_parent" : "resp_full_child",
+          calls.length === 1 ? [answer] : [],
+        ));
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+
+    const first = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        input: [firstUser],
+      }),
+    });
+    expect(first.status).toBe(200);
+    await first.json();
+
+    const second = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        input: [firstUser, answer, nextUser],
+      }),
+    });
+    expect(second.status).toBe(200);
+    await second.json();
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.body).toMatchObject({
+      stream: true,
+      store: true,
+      previous_response_id: "resp_full_parent",
+      input: [nextUser],
+    });
+    expect(calls[1]!.options.authorizationScope).toBe(authorizationScope);
+    expect(Number(calls[1]!.options.fairnessRequestBytes)).toBeGreaterThan(
+      Buffer.byteLength(JSON.stringify(nextUser)),
+    );
+  });
+
+  it("commits a native Responses prefix before exposing an SSE terminal", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const calls: Record<string, unknown>[] = [];
+    const root = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "root" }],
+    };
+    const answer = {
+      type: "message",
+      id: "msg_sse_parent",
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "answer",
+        annotations: [],
+        logprobs: [],
+      }],
+    };
+    const parent = final("resp_sse_parent", [answer]);
+    let resolveParent!: (value: Record<string, unknown>) => void;
+    const parentFinal = new Promise<Record<string, unknown>>(resolve => {
+      resolveParent = resolve;
+    });
+    const router = {
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (body: Record<string, unknown>) => {
+        calls.push(structuredClone(body));
+        if (calls.length === 1) {
+          return handle(parentFinal, [{
+            event: "response.completed",
+            data: JSON.stringify({ type: "response.completed", response: parent }),
+          }]);
+        }
+        return handle(final("resp_sse_child"));
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+    const streamed = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: [root] }),
+    });
+    const reader = streamed.body!.getReader();
+    let terminalVisible = false;
+    const terminal = reader.read().then(value => {
+      terminalVisible = true;
+      return value;
+    });
+    await Bun.sleep(10);
+    expect(terminalVisible).toBe(false);
+
+    resolveParent(parent);
+    expect(new TextDecoder().decode((await terminal).value)).toContain("response.completed");
+    await reader.cancel();
+
+    const next = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "next" }],
+    };
+    const continued = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        input: [root, answer, next],
+      }),
+    });
+    expect(continued.status).toBe(200);
+    await continued.json();
+    expect(calls[1]).toMatchObject({
+      previous_response_id: "resp_sse_parent",
+      input: [next],
+    });
+  });
+
+  it("retries one definitive stale auto-inferred Responses parent with full history", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 400,
+      value: {
+        error: {
+          message: "Previous response was not found",
+          type: "invalid_request_error",
+          param: "previous_response_id",
+          code: "previous_response_not_found",
+        },
+      },
+    });
+    const stale = new V2CommittedError(
+      providerError.error.message,
+      providerError.error.code!,
+      false,
+      undefined,
+      providerError,
+    );
+    const root = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "root" }],
+    };
+    const answer = {
+      type: "message",
+      id: "msg_stale_parent",
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "answer",
+        annotations: [],
+        logprobs: [],
+      }],
+    };
+    const next = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "next" }],
+    };
+    const calls: Record<string, unknown>[] = [];
+    const router = {
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (body: Record<string, unknown>) => {
+        calls.push(structuredClone(body));
+        if (calls.length === 1) return handle(final("resp_stale_parent", [answer]));
+        if (calls.length === 2) throw stale;
+        return handle(final("resp_rehydrated"));
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+    await (await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", stream: false, input: [root] }),
+    })).json();
+
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        input: [root, answer, next],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.json();
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toMatchObject({
+      previous_response_id: "resp_stale_parent",
+      input: [next],
+    });
+    expect(calls[2]).not.toHaveProperty("previous_response_id");
+    expect(calls[2]!.input).toEqual([root, answer, next]);
   });
 
   it("drains bounded relay events for non-streaming responses", async () => {
@@ -608,6 +924,9 @@ describe("router HTTP composition", () => {
     expect(response.status).toBe(200);
     expect(image.status).toBe(200);
     expect(router.workloads.map(workload => workload.source)).toEqual(["http", "image", "image"]);
+    expect(router.workloads.every(workload => (
+      workload.body.stream === true && workload.body.store === true
+    ))).toBe(true);
     expect(router.workloads[0]!.clientId).toMatch(/^http-request-\d{4}$/);
     expect(router.workloads[1]!.clientId).toMatch(/^http-request-\d{4}$/);
     expect(router.workloads[2]!.clientId).toBe(router.workloads[1]!.clientId);
@@ -641,6 +960,55 @@ describe("router HTTP composition", () => {
       expect(frames.map(frame => frame.event)).toEqual([terminal]);
     },
   );
+
+  it("withholds an SSE terminal until the authoritative final has settled", async () => {
+    const responseFinal = final("resp_terminal_commit_gate");
+    let settleFinal!: (value: typeof responseFinal) => void;
+    const authoritative = new Promise<typeof responseFinal>(resolve => {
+      settleFinal = resolve;
+    });
+    const router = {
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (): Promise<RunHandle> => ({
+        async *events() {
+          yield {
+            event: "response.completed",
+            data: JSON.stringify({
+              type: "response.completed",
+              sequence_number: 3,
+              response: responseFinal,
+            }),
+          };
+        },
+        final: authoritative,
+        stats: { bytes: 0, firstByteMs: 0, frames: 1 },
+      }),
+    };
+    const appResponse = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+    const reader = appResponse.body!.getReader();
+    const firstRead = reader.read();
+    await Promise.resolve();
+    expect(await Promise.race([
+      firstRead.then(() => "settled" as const),
+      Promise.resolve("pending" as const),
+    ])).toBe("pending");
+
+    settleFinal(responseFinal);
+    const firstChunk = await firstRead;
+    expect(new TextDecoder().decode(firstChunk.value)).toContain("event: response.completed");
+    await reader.cancel();
+  });
 
   it.each(["completed", "incomplete", "failed"] as const)(
     "synthesizes a missing response.%s terminal with the next sequence",
@@ -958,6 +1326,21 @@ describe("router HTTP composition", () => {
       await router.close();
       blocker.release();
       governor.close();
+    }
+  });
+
+  it("detaches ingress cancellation while retaining byte ownership", async () => {
+    const caller = new AbortController();
+    const router = healthRouter([]);
+    const ingress = await router.acquireIncomingBody(1024, caller.signal);
+    try {
+      ingress.completeAdmission?.();
+      caller.abort(new DOMException("late caller abort", "AbortError"));
+      expect(ingress.signal?.aborted).toBe(false);
+      expect(ingress.reservedBytes).toBeGreaterThan(0);
+    } finally {
+      ingress.release();
+      await router.close();
     }
   });
 

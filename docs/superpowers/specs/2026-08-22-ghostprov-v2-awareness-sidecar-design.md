@@ -1,5 +1,7 @@
 # GhostProv v2 Awareness Sidecar Transport
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 **Status:** Proposed, empirically validated prototype
 **Date:** 2026-08-22
 **Branch:** `br/v2-awareness-sidecar`

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { MachineProbe } from "../src/core/ports";
+import { isAuthenticatedTenantScope } from "../src/http/api-key";
 import { FleetManifestStore } from "../src/fleet/manifest";
 import type { ManagedRuntimeFactory } from "../src/fleet/types";
 import type { RunHandle } from "../src/relay/run-handle";
@@ -361,6 +362,10 @@ describe("V2 browserless system composition", () => {
   it("binds after one ready runtime while remaining projects reconcile independently", async () => {
     const value = await harness();
     const system = await createBrowserlessSystem(value.env, value.dependencies);
+    expect(isAuthenticatedTenantScope(
+      system.router.responseProvenanceAuthorizationScope(),
+    )).toBe(true);
+    expect(system.anthropicContinuationIndex.snapshot()).toMatchObject({ entries: 0 });
 
     await system.start();
 

@@ -48,3 +48,36 @@ export function takeIncomingBodyLease(env: unknown): IncomingResourceLease | und
   bindings.incomingBodyLease = undefined;
   return lease;
 }
+
+/** Links an ingress deadline/disconnect signal into downstream preparation. */
+export function linkIncomingLeaseAbort(
+  controller: AbortController,
+  lease: IncomingResourceLease | undefined,
+): () => void {
+  const signal = lease?.signal;
+  if (!signal) return () => undefined;
+  const abort = () => controller.abort(signal.reason);
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
+}
+
+/**
+ * Preserves ingress timing authority while the original lease remains attached
+ * to a full history that a suffix optimization cannot release yet.
+ */
+export function incomingLeaseTimingView(
+  lease: IncomingResourceLease | undefined,
+): IncomingResourceLease | undefined {
+  if (!lease || (
+    lease.acceptedAtMs === undefined &&
+    lease.deadlineMs === undefined &&
+    lease.signal === undefined
+  )) return undefined;
+  return {
+    release() {},
+    ...(lease.acceptedAtMs === undefined ? {} : { acceptedAtMs: lease.acceptedAtMs }),
+    ...(lease.deadlineMs === undefined ? {} : { deadlineMs: lease.deadlineMs }),
+    ...(lease.signal === undefined ? {} : { signal: lease.signal }),
+  };
+}

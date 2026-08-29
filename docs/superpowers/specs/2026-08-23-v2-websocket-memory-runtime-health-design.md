@@ -1,5 +1,7 @@
 # V2 WebSocket Memory and Runtime Health Design
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 ## Context
 
 The first eight-sandbox, sixteen-agent trace proved that V2 transport admission is stable: the router never queued work, cancellation quarantine returned to zero, the memory governor never paused, and WebSocket delivery never backpressured. It also exposed two host-side scaling defects:

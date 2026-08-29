@@ -80,8 +80,8 @@ describe("Anthropic final response conversion", () => {
     expect(message.content[0]).toMatchObject({ type: "thinking", thinking: "considering" });
     const signature = message.content[0].signature;
     expect(typeof signature).toBe("string");
-    expect((signature as string).startsWith("ghostprov-r1.")).toBe(true);
-    expect(decodeReasoningItem(signature as string)).toEqual({ ...reasoning, summary: [] });
+    expect((signature as string).startsWith("ghostprov-r2.")).toBe(true);
+    expect(decodeReasoningItem(signature as string, "considering")).toEqual(reasoning);
     expect(message.content[1]).toEqual({ type: "text", text: "checking", citations: null });
     expect(message.content.slice(2)).toEqual([
       {
@@ -121,11 +121,40 @@ describe("Anthropic final response conversion", () => {
     expect(message.content).toHaveLength(1);
     expect(message.content[0]).toMatchObject({ type: "thinking", thinking: "" });
     const signature = message.content[0].signature as string;
-    const rawEnvelope = Buffer.from(signature.slice("ghostprov-r1.".length), "base64url")
+    const rawEnvelope = Buffer.from(signature.slice("ghostprov-r2.".length), "base64url")
       .toString("utf8");
     expect(rawEnvelope).not.toContain("first");
     expect(rawEnvelope).not.toContain("second");
     expect(decodeReasoningItem(signature)).toEqual({ ...reasoning, summary: [] });
+  });
+
+  it("bounds aggregate reasoning signatures before retaining every encoded block", () => {
+    const output = ["left", "right"].map(id => ({
+      type: "reasoning",
+      id: `rs_${id}`,
+      status: "completed",
+      encrypted_content: id.repeat(100),
+      summary: [],
+    }));
+
+    expect(() => responseToAnthropic({
+      id: "resp_signature_budget",
+      status: "completed",
+      output,
+    }, context({ limits: { outputBytes: 1_024 } }))).toThrow(
+      "Responses relay returned a malformed final response.",
+    );
+  });
+
+  it("applies the aggregate output bound to max_tokens zero responses", () => {
+    expect(() => responseToAnthropic({
+      id: `resp_${"x".repeat(512)}`,
+      status: "completed",
+      output: [],
+    }, context({
+      maxTokensZero: true,
+      limits: { outputBytes: 128 },
+    }))).toThrow("oversized Anthropic response");
   });
 
   it("preserves every message content part and uses an empty object for blank tool arguments", () => {

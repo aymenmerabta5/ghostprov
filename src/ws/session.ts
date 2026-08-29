@@ -6,6 +6,7 @@ import {
   PreviousResponseNotFoundError,
   ResponseGraph,
   ResponseGraphCapacityError,
+  SYNTHETIC_WARMUP_ID_PREFIX,
   releaseResponseGraphPayload,
   releaseResponseGraphResolution,
   type ResponseCreateEvent,
@@ -17,12 +18,19 @@ import {
   transferAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
 
+import {
+  createAuthenticatedTenantScope,
+  isAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../http/api-key";
+
 const MiB = 1024 * 1024;
 const DEFAULT_MAX_PENDING_REQUESTS = 128;
 const DEFAULT_MAX_PENDING_REQUEST_BYTES = 64 * MiB;
 const DEFAULT_MAX_SEND_QUEUE_ITEMS = 512;
 const DEFAULT_MAX_SEND_QUEUE_BYTES = 64 * MiB;
 const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+const UPSTREAM_POLICY_HEADROOM_BYTES = 64;
 const SOCKET_POLL_MS = 5;
 
 export interface WebSocketProcessBudgetOptions {
@@ -167,7 +175,12 @@ export class WebSocketProcessBudget {
 
 export type WebSocketRelayStarter = (
   body: Record<string, unknown>,
-  options: { signal: AbortSignal; clientId: string; encodedBodyBytes?: number },
+  options: {
+    signal: AbortSignal;
+    clientId: string;
+    authorizationScope: AuthenticatedTenantScope;
+    encodedBodyBytes?: number;
+  },
 ) => Promise<RunHandle>;
 
 export interface ResponsesWebSocketSessionOptions {
@@ -186,6 +199,8 @@ export interface ResponsesWebSocketSessionOptions {
   maxSendQueueBytes?: number;
   /** Maximum queue/backpressure/send-callback lifetime for one outgoing message. */
   sendTimeoutMs?: number;
+  /** Stable trusted tenant scope supplied by the server integration. */
+  authorizationScope?: AuthenticatedTenantScope;
   /** Stable routing identity reused by every response on this connection. */
   clientId?: string;
   /** Shared process-level session and retained-byte fence. */
@@ -400,6 +415,20 @@ function parseEventData(data: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function terminalEventType(final: unknown):
+  | "response.completed"
+  | "response.failed"
+  | "response.incomplete" {
+  if (!final || typeof final !== "object" || Array.isArray(final)) {
+    throw new TypeError("WebSocket relay returned a malformed final response");
+  }
+  const status = (final as Record<string, unknown>).status;
+  if (status === "completed" || status === "failed" || status === "incomplete") {
+    return `response.${status}`;
+  }
+  throw new TypeError("WebSocket relay returned an invalid final response status");
+}
+
 export class ResponsesWebSocketSession {
   readonly #startRelay: WebSocketRelayStarter;
   readonly #maxNamedStreams: number;
@@ -409,6 +438,7 @@ export class ResponsesWebSocketSession {
   readonly #maxSendQueueItems: number;
   readonly #maxSendQueueBytes: number;
   readonly #sendTimeoutMs: number;
+  readonly #authorizationScope: AuthenticatedTenantScope;
   readonly #clientId: string;
   readonly #graph: ResponseGraph;
   readonly #semaphore: AsyncSemaphore;
@@ -467,6 +497,11 @@ export class ResponsesWebSocketSession {
       options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
       "sendTimeoutMs",
     );
+    this.#authorizationScope = options.authorizationScope ??
+      createAuthenticatedTenantScope();
+    if (!isAuthenticatedTenantScope(this.#authorizationScope)) {
+      throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
+    }
     this.#clientId = options.clientId ?? `ws-${crypto.randomUUID()}`;
     if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(this.#clientId)) {
       throw new TypeError("clientId must be 1-128 safe characters");
@@ -632,9 +667,10 @@ export class ResponsesWebSocketSession {
         return;
       }
       const streamId = event.stream_id;
-      const localContinuation = event.store === false &&
-        typeof event.previous_response_id === "string";
-      resolved = this.#graph.resolve(event, { inputOwnership: "owned" });
+      resolved = this.#graph.resolve(event, {
+        authorizationScope: this.#authorizationScope,
+        inputOwnership: "owned",
+      });
       const relayBody = resolved.relayBody;
       // resolve() owns independent graph and relay representations now; avoid
       // retaining the original payload for the complete streamed response.
@@ -643,12 +679,15 @@ export class ResponsesWebSocketSession {
         handle = await this.#startRelay(relayBody, {
           signal: controller.signal,
           clientId: this.#clientId,
-          // A normal response.create envelope is at least as large as relayBody.
-          // Local continuations materialize graph history, so they intentionally
-          // fall back to structural sizing instead of under-accounting it.
-          encodedBodyBytes: localContinuation
+          authorizationScope: resolved.authorizationScope,
+          // Public type/stream metadata normally covers the two enforced policy
+          // fields; retain a small conservative allowance for minimal envelopes.
+          encodedBodyBytes: resolved.materializedLocally
             ? undefined
-            : requestBytes,
+            : Math.min(
+                Number.MAX_SAFE_INTEGER,
+                requestBytes + UPSTREAM_POLICY_HEADROOM_BYTES,
+              ),
         });
       } finally {
         // Router/transport preparation has taken ownership of its encoded
@@ -694,7 +733,7 @@ export class ResponsesWebSocketSession {
           await this.#send(outbound);
         } else if (!sawTerminal) {
           const outbound = this.#graph.sanitizeOutbound({
-            type: "response.completed",
+            type: terminalEventType(final),
             response: final,
             ...(streamId ? { stream_id: streamId } : {}),
           }, resolved);
@@ -766,8 +805,7 @@ export class ResponsesWebSocketSession {
   }
 
   async #completeWarmup(event: ResponseCreateEvent): Promise<void> {
-    const id = `resp_gp_warmup_${crypto.randomUUID().replaceAll("-", "")}`;
-    const resolved = this.#graph.resolve({ ...event, generate: true });
+    const id = `${SYNTHETIC_WARMUP_ID_PREFIX}${crypto.randomUUID().replaceAll("-", "")}`;
     const final = {
       id,
       object: "response",
@@ -776,16 +814,26 @@ export class ResponsesWebSocketSession {
       model: event.model ?? null,
       output: [],
       store: event.store ?? true,
+      ...(Object.hasOwn(event, "previous_response_id")
+        ? { previous_response_id: event.previous_response_id ?? null }
+        : {}),
     };
+    let recorded = false;
     try {
-      this.#graph.record(resolved, final);
-      await this.#send(this.#graph.sanitizeOutbound({
+      await this.#send({
         type: "response.completed",
         response: final,
         ...(event.stream_id ? { stream_id: event.stream_id } : {}),
-      }, resolved));
-    } finally {
-      releaseResponseGraphResolution(resolved);
+      }, () => {
+        this.#graph.recordWarmup(id, event, {
+          authorizationScope: this.#authorizationScope,
+          inputOwnership: "owned",
+        });
+        recorded = true;
+      });
+    } catch (error) {
+      if (recorded) this.#graph.evict(id);
+      throw error;
     }
   }
 
@@ -818,7 +866,7 @@ export class ResponsesWebSocketSession {
     });
   }
 
-  #send(value: unknown): Promise<void> {
+  #send(value: unknown, beforeEnqueue?: () => void): Promise<void> {
     if (this.#closed) return Promise.reject(new WebSocketDeliveryError(
       "WebSocket connection is closed",
       "websocket_closed",
@@ -831,7 +879,7 @@ export class ResponsesWebSocketSession {
       releaseAtomicBytePermit(value);
       return Promise.reject(error);
     }
-    return this.#enqueueSend(encoded);
+    return this.#enqueueSend(encoded, beforeEnqueue);
   }
 
   async #sendWhenAvailable(value: unknown): Promise<void> {
@@ -901,11 +949,11 @@ export class ResponsesWebSocketSession {
       (!this.#processLease || this.#processLease.canReserve(bytes));
   }
 
-  #enqueueSend(encoded: { data: string; bytes: number }): Promise<void> {
-    if (
-      !this.#hasSendCapacity(encoded.bytes) ||
-      (this.#processLease && !this.#processLease.tryReserve(encoded.bytes))
-    ) {
+  #enqueueSend(
+    encoded: { data: string; bytes: number },
+    beforeEnqueue?: () => void,
+  ): Promise<void> {
+    if (!this.#hasSendCapacity(encoded.bytes)) {
       releaseAtomicBytePermit(encoded);
       this.#telemetry?.sendRejected();
       return Promise.reject(new WebSocketRequestOutputError(
@@ -914,6 +962,24 @@ export class ResponsesWebSocketSession {
         503,
         "overloaded_error",
       ));
+    }
+    const processReserved = this.#processLease?.tryReserve(encoded.bytes) ?? true;
+    if (!processReserved) {
+      releaseAtomicBytePermit(encoded);
+      this.#telemetry?.sendRejected();
+      return Promise.reject(new WebSocketRequestOutputError(
+        "WebSocket output queue exceeded its configured limit",
+        "websocket_output_queue_full",
+        503,
+        "overloaded_error",
+      ));
+    }
+    try {
+      beforeEnqueue?.();
+    } catch (error) {
+      this.#processLease?.release(encoded.bytes);
+      releaseAtomicBytePermit(encoded);
+      return Promise.reject(error);
     }
     return new Promise<void>((resolve, reject) => {
       const item: PendingSend = {

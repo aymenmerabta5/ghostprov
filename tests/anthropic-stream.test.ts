@@ -144,7 +144,7 @@ describe("Responses to Anthropic stream translation", () => {
       .map(event => event.index)).toEqual([0, 1, 2, 3]);
     expect(events.find(event =>
       event.type === "content_block_delta" && event.delta.type === "signature_delta"
-    )).toMatchObject({ delta: { signature: expect.stringContaining("ghostprov-r1.") } });
+    )).toMatchObject({ delta: { signature: expect.stringContaining("ghostprov-r2.") } });
     expect(deltas(events, "thinking_delta", "thinking")).toEqual(["considering"]);
     expect(deltas(events, "text_delta", "text")).toEqual(["answer"]);
     expect(deltas(events, "input_json_delta", "partial_json")).toEqual([
@@ -672,7 +672,7 @@ describe("Responses to Anthropic stream translation", () => {
     ]);
 
     expect(deltas(events, "thinking_delta", "thinking")).toEqual(["partial thought"]);
-    expect(deltas(events, "signature_delta", "signature")[0]).toStartWith("ghostprov-r1.");
+    expect(deltas(events, "signature_delta", "signature")[0]).toStartWith("ghostprov-r2.");
     expect(events.at(-2)).toMatchObject({ delta: { stop_reason: "max_tokens" } });
   });
 

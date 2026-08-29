@@ -72,6 +72,7 @@ describe("Images compatibility HTTP routes", () => {
       size: "1024x1024",
     });
     expect(bodies).toHaveLength(2);
+    expect(bodies.every(body => body.stream === true && body.store === true)).toBe(true);
     expect((bodies[0].tools as any[])[0]).not.toHaveProperty("n");
   });
 
@@ -89,6 +90,7 @@ describe("Images compatibility HTTP routes", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ data: [{ b64_json: "EDITED" }] });
+    expect(body).toMatchObject({ stream: true, store: true });
     expect((body!.tools as any[])[0]).toMatchObject({
       type: "image_generation",
       model: "gpt-image-2",

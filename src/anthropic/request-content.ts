@@ -1,5 +1,9 @@
 import { AnthropicRequestError } from "./errors";
-import { decodeReasoningItem } from "./reasoning";
+import {
+  decodeReasoningItem,
+  isGhostProvReasoningSignature,
+  ReasoningDecodeBudget,
+} from "./reasoning";
 import type {
   ResponsesFunctionCallInput,
   ResponsesFunctionCallOutput,
@@ -377,6 +381,7 @@ function appendAssistantMessage(
   messageName: string,
   history: ToolHistory,
   limits: AnthropicRequestLimits,
+  reasoningBudget: ReasoningDecodeBudget,
 ): string[] {
   const pendingText: string[] = [];
   const callsInTurn = new Set<string>();
@@ -400,10 +405,13 @@ function appendAssistantMessage(
       pendingText.push(requireString(block, "text", `${name} text`, true));
     } else if (type === "thinking") {
       flushAssistantText();
-      requireString(block, "thinking", `${name} thinking`, true);
+      const thinking = requireString(block, "thinking", `${name} thinking`, true);
       const signature = requireString(block, "signature", `${name} signature`, true);
-      const restored = decodeReasoningItem(signature);
+      const restored = decodeReasoningItem(signature, thinking, reasoningBudget);
       if (restored) input.push(restored);
+      else if (isGhostProvReasoningSignature(signature)) {
+        throw new AnthropicRequestError(400, `${name} signature is malformed`);
+      }
     } else if (type === "redacted_thinking") {
       flushAssistantText();
       requireString(block, "data", `${name} data`, true);
@@ -485,6 +493,7 @@ export function translateMessages(
   rolePolicy: AnthropicMessageRolePolicy = "standard",
 ): ResponsesInputItem[] {
   const input: ResponsesInputItem[] = [];
+  const reasoningBudget = new ReasoningDecodeBudget();
   const history: ToolHistory = {
     seen: new Set(),
     completed: new Set(),
@@ -501,7 +510,14 @@ export function translateMessages(
         throw new AnthropicRequestError(400, "assistant turn intervened before pending tool_result blocks");
       }
       history.pending = new Set(
-        appendAssistantMessage(input, message.content, message.name, history, limits),
+        appendAssistantMessage(
+          input,
+          message.content,
+          message.name,
+          history,
+          limits,
+          reasoningBudget,
+        ),
       );
     } else {
       if (history.pending.size) {
@@ -548,6 +564,27 @@ export function translateMessages(
   if (history.pending.size) {
     throw new AnthropicRequestError(400, "missing tool_result blocks for final pending tool_use IDs");
   }
+  return input;
+}
+
+export function translateAnthropicAssistantReplay(
+  content: unknown,
+  limits: AnthropicRequestLimits,
+): ResponsesInputItem[] {
+  const input: ResponsesInputItem[] = [];
+  const history: ToolHistory = {
+    seen: new Set(),
+    completed: new Set(),
+    pending: new Set(),
+  };
+  appendAssistantMessage(
+    input,
+    content,
+    "assistant replay",
+    history,
+    limits,
+    new ReasoningDecodeBudget(),
+  );
   return input;
 }
 

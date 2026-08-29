@@ -1,5 +1,7 @@
 # GhostProv Browserless Multi-Sandbox Router Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace GhostProv's Playwright-backed singleton Prism transport with a typed browserless router over independent Prism projects, providing adaptive machine-aware admission, intelligent least-work routing, exact 10-second per-sandbox heartbeats, and up to 120 physical lanes across four 30-slot daemons.

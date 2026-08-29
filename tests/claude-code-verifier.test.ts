@@ -524,7 +524,11 @@ describe("Claude Code forwarding verifier", () => {
     expect(new Headers(requests[0]?.init?.headers).get("content-type")).toBe("application/json");
     expect(new Headers(requests[0]?.init?.headers).get("authorization"))
       .toBe("Bearer GHOST_IS_KING");
-    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({ ...body, stream: true });
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      ...body,
+      stream: true,
+      store: true,
+    });
     expect(events).toEqual(completedFrames().map(([event, data]) => ({
       event,
       data: JSON.stringify(data),

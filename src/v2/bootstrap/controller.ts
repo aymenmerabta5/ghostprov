@@ -28,7 +28,16 @@ import {
   assertV2SidecarAssets,
   protocolRevisionForV2SidecarRevision,
   resolveV2SidecarRevision,
+  V2_R1_RELEASE,
+  V2_R2_RELEASE,
+  V2_R3_RELEASE,
+  V2_R4_RELEASE,
+  V2_R5_RELEASE,
+  V2_R6_RELEASE,
+  V2_R7_RELEASE,
+  V2_R8_RELEASE,
   type V2SidecarAssets,
+  type V2SidecarReleaseIdentity,
   type V2SidecarRevision,
 } from "../sidecar/assets";
 import { deriveV2SidecarEventMemorySizing } from "../memory/event-memory-sizing";
@@ -49,6 +58,38 @@ const BOOTSTRAP_ATTEMPT_CLAIM_LIMIT = 256;
 function perlSingleQuoted(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
+
+function perlRegexLiteral(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function frozenSidecarEntrypoint(release: V2SidecarReleaseIdentity): string {
+  return `/workspace/.ghostprov-v2/revisions/${release.revision}/${release.schemaHash}/${release.buildHash}/sidecar.bundle.js`;
+}
+
+function perlRegexAlternation(values: readonly string[]): string {
+  if (values.length === 0) throw new Error("Perl entrypoint alternation cannot be empty");
+  return values.map(perlRegexLiteral).join("|");
+}
+
+const PRIOR_SIDECAR_RELEASES = Object.freeze([
+  V2_R1_RELEASE,
+  V2_R2_RELEASE,
+  V2_R3_RELEASE,
+  V2_R4_RELEASE,
+  V2_R5_RELEASE,
+  V2_R6_RELEASE,
+  V2_R7_RELEASE,
+  V2_R8_RELEASE,
+]);
+const REGISTERED_SIDECAR_ENTRYPOINTS = perlRegexAlternation(
+  PRIOR_SIDECAR_RELEASES.map(frozenSidecarEntrypoint),
+);
+const REGISTERED_R2_SIDECAR_ENTRYPOINTS = perlRegexAlternation(
+  PRIOR_SIDECAR_RELEASES
+    .filter(release => release.protocolRevision === "r2")
+    .map(frozenSidecarEntrypoint),
+);
 
 /**
  * Shared Perl helpers for the launcher PID interlock. A PID is never trusted
@@ -112,17 +153,32 @@ function processInterlockHelpers(): string[] {
     "  my ($gp_state, $gp_live_start) = gp_process_state_start($gp_pid);",
     "  return defined($gp_state) && $gp_state ne 'Z' && $gp_state ne 'X' && $gp_state ne 'x' && $gp_live_start eq $gp_start;",
     "}",
+    "sub gp_sidecar_args {",
+    "  my ($gp_pid) = @_;",
+    "  return () unless $gp_pid =~ /^\\d+$/ && $gp_pid > 1;",
+    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
+    "  return () unless defined $gp_cmd;",
+    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
+    "  return () unless @gp_args == 11;",
+    "  return () unless $gp_args[0] =~ m{(?:^|/)deno$};",
+    "  return () unless $gp_args[1] eq 'run';",
+    "  return () unless $gp_args[2] eq '--cached-only';",
+    "  return () unless $gp_args[3] eq \"--cert=$ENV{PROXY_CA_CERT_PATH}\";",
+    "  return () unless $gp_args[4] eq '--allow-env=OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM';",
+    "  return () unless $gp_args[5] eq '--allow-net';",
+    "  return () unless $gp_args[6] eq '--allow-read=/workspace/.ghostprov-v2,/tmp/ghostprov-v2';",
+    "  return () unless $gp_args[7] eq '--allow-write=/tmp/ghostprov-v2';",
+    "  return () unless $gp_args[9] =~ /^--ghostprov-launch-nonce=[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;",
+    "  return () unless $gp_args[10] =~ /^--ghostprov-process-start=\\d+$/;",
+    "  return @gp_args;",
+    "}",
     "sub gp_process_matches {",
     "  my ($gp_pid, $gp_nonce, $gp_start, $gp_expected_entrypoint) = @_;",
-    "  return 0 unless $gp_pid =~ /^\\d+$/ && $gp_pid > 1;",
-    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
-    "  return 0 unless defined $gp_cmd;",
-    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  return 0 unless @gp_args && $gp_args[0] =~ m{(?:^|/)deno$};",
-    "  my @gp_entries = grep { $_ eq $gp_expected_entrypoint } @gp_args;",
-    "  my @gp_nonces = grep { $_ eq \"--ghostprov-launch-nonce=$gp_nonce\" } @gp_args;",
-    "  my @gp_starts = grep { $_ eq \"--ghostprov-process-start=$gp_start\" } @gp_args;",
-    "  return 0 unless @gp_entries == 1 && @gp_nonces == 1 && @gp_starts == 1;",
+    "  my @gp_args = gp_sidecar_args($gp_pid);",
+    "  return 0 unless @gp_args;",
+    "  return 0 unless $gp_args[8] eq $gp_expected_entrypoint;",
+    "  return 0 unless $gp_args[9] eq \"--ghostprov-launch-nonce=$gp_nonce\";",
+    "  return 0 unless $gp_args[10] eq \"--ghostprov-process-start=$gp_start\";",
     "  my @gp_fields = gp_proc_fields($gp_pid);",
     "  return 0 unless @gp_fields > 18;",
     "  return 0 unless $gp_fields[1] eq \"$gp_pid\" && $gp_fields[2] eq \"$gp_pid\";",
@@ -131,19 +187,15 @@ function processInterlockHelpers(): string[] {
     "}",
     "sub gp_exact_r2_entrypoint {",
     "  my ($gp_pid) = @_;",
-    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
-    "  return undef unless defined $gp_cmd;",
-    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[2345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
-    "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
+    "  my @gp_args = gp_sidecar_args($gp_pid);",
+    "  return undef unless @gp_args;",
+    `  return $gp_args[8] =~ m{^(?:${REGISTERED_R2_SIDECAR_ENTRYPOINTS})\\z} ? $gp_args[8] : undef;`,
     "}",
     "sub gp_exact_sidecar_entrypoint {",
     "  my ($gp_pid) = @_;",
-    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384);",
-    "  return undef unless defined $gp_cmd;",
-    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_entries = grep { m{^/workspace/\\.ghostprov-v2/revisions/r[12345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$} } @gp_args;",
-    "  return @gp_entries == 1 ? $gp_entries[0] : undef;",
+    "  my @gp_args = gp_sidecar_args($gp_pid);",
+    "  return undef unless @gp_args;",
+    `  return $gp_args[8] =~ m{^(?:${REGISTERED_SIDECAR_ENTRYPOINTS})\\z} ? $gp_args[8] : undef;`,
     "}",
     "sub gp_group_alive {",
     "  my ($gp_group) = @_;",
@@ -465,7 +517,7 @@ function temporaryLauncher(
     "if (!$gp_deno) { my $gp_path_deno = `command -v deno 2>/dev/null`; chomp $gp_path_deno; $gp_deno = $gp_path_deno if $gp_path_deno && -x $gp_path_deno; }",
     "if (!$gp_deno && !$gp_launch_error) { open my $gp_missing, '>', $gp_log or die 'sidecar log'; print $gp_missing 'Deno executable not found on PATH or standard paths'; close $gp_missing; }",
     // A host restart does not imply a sandbox restart. Retire a prior immutable
-    // R1, R2, R3, or R4 owner before forking the selected release; otherwise tryLock
+    // registered owner before forking the selected release; otherwise tryLock
     // correctly makes every new child lose forever. The locked owner record,
     // canonical PID record, Linux start tick, process group/session, immutable
     // entrypoint, and argv nonce are all revalidated immediately before signal.

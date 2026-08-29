@@ -127,8 +127,15 @@ describe("Anthropic stream reasoning privacy", () => {
 
     expect(thinkingDeltas(events)).toEqual(["visible summary"]);
     expect(JSON.stringify(events)).not.toContain("private raw chain");
+    const signature = events.find(event =>
+      event.type === "content_block_delta" && event.delta.type === "signature_delta");
+    const signatureBytes = signature?.type === "content_block_delta" &&
+        signature.delta.type === "signature_delta"
+      ? Buffer.byteLength(signature.delta.signature, "utf8")
+      : 0;
+    expect(signatureBytes).toBeGreaterThan(0);
     expect(translator.snapshot().reasoningBytes).toBe(
-      Buffer.byteLength("private raw chainvisible summary", "utf8"),
+      Buffer.byteLength("private raw chainvisible summary", "utf8") + signatureBytes,
     );
   });
 

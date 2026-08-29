@@ -81,6 +81,7 @@ describe("V2 deterministic performance harness", () => {
       V2_PERFORMANCE_PAYLOAD_BYTES.kib512,
     ]) {
       const request = createExactSizedV2Request(bytes, 7);
+      expect(request).toMatchObject({ stream: true, store: true });
       expect(utf8Bytes(canonicalJson(request)).byteLength).toBe(bytes);
     }
   });

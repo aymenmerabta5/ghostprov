@@ -70,10 +70,14 @@ describe("V2 live bootstrap probe guards", () => {
       ...VALID,
       GP_LIVE_V2_REVISION: "r7",
     })).toMatchObject({ revision: "r7" });
-    expect(() => resolveV2BootstrapProbeOptions({
+    expect(resolveV2BootstrapProbeOptions({
       ...VALID,
       GP_LIVE_V2_REVISION: "r8",
-    })).toThrow(/unsupported.*r8/i);
+    })).toMatchObject({ revision: "r8" });
+    expect(() => resolveV2BootstrapProbeOptions({
+      ...VALID,
+      GP_LIVE_V2_REVISION: "r9",
+    })).toThrow(/unsupported.*r9/i);
     expect(() => resolveV2BootstrapProbeOptions({
       ...VALID,
       GP_LIVE_V2_REVISION: "r2",

@@ -2,11 +2,15 @@ import { describe, expect, it } from "bun:test";
 import {
   PreviousResponseNotFoundError,
   ResponseGraph,
+  ResponseGraphCapacityError,
   SharedByteBudget,
-  releaseResponseGraphResolution,
+  SYNTHETIC_WARMUP_ID_PREFIX,
   releaseResponseGraphPayload,
+  releaseResponseGraphResolution,
   type ResponseCreateEvent,
 } from "../src/ws/response-graph";
+
+import { createAuthenticatedTenantScope } from "../src/http/api-key";
 
 const user = (text: string) => ({
   type: "message",
@@ -14,382 +18,532 @@ const user = (text: string) => ({
   content: [{ type: "input_text", text }],
 });
 
-const assistant = (text: string) => ({
-  id: `msg_${text}`,
-  type: "message",
-  role: "assistant",
-  status: "completed",
-  content: [{ type: "output_text", text, annotations: [] }],
-});
+const alias = (label: string) => `${SYNTHETIC_WARMUP_ID_PREFIX}${label}`;
 
 function request(input: unknown, extra: Partial<ResponseCreateEvent> = {}): ResponseCreateEvent {
-  return { type: "response.create", model: "gpt-5.6-sol", store: false, input, ...extra };
+  return { type: "response.create", model: "gpt-5.6-sol", input, ...extra };
 }
 
-describe("ResponseGraph", () => {
-  it("reconstructs incremental store:false continuation without leaking websocket fields", () => {
+describe("ResponseGraph persisted generated lane", () => {
+  it.each([
+    { label: "omitted", event: request([user("omitted")]) },
+    { label: "false", event: request([user("false")], { store: false }) },
+    { label: "true", event: request([user("true")], { store: true }) },
+  ])("normalizes client store:$label to upstream store:true", ({ event }) => {
     const graph = new ResponseGraph();
-    const first = graph.resolve(request([user("first")], { stream_id: "main", instructions: "initial" }));
-    graph.record(first, { id: "resp_1", model: "gpt-5.6-sol", output: [assistant("one")] });
-
-    const nextInput = [{ type: "function_call_output", call_id: "call_1", output: "42" }];
-    const next = graph.resolve(request(nextInput, {
-      model: undefined,
-      stream_id: "main",
-      previous_response_id: "resp_1",
-    }));
-
-    expect(next.relayBody).toMatchObject({ model: "gpt-5.6-sol", store: false, stream: true });
-    expect(next.relayBody).not.toHaveProperty("type");
-    expect(next.relayBody).not.toHaveProperty("stream_id");
-    expect(next.relayBody).not.toHaveProperty("previous_response_id");
-    expect(next.relayBody).not.toHaveProperty("instructions");
-    expect(next.relayBody.input).toEqual([user("first"), assistant("one"), ...nextInput]);
-    expect(next.relayBody.include).toContain("reasoning.encrypted_content");
-    releaseResponseGraphResolution(next);
-  });
-
-  it("supports two cross-lane forks from the same cached parent", () => {
-    const graph = new ResponseGraph();
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "resp_root", output: [assistant("root answer")] });
-
-    const left = graph.resolve(request([user("left")], { stream_id: "left", previous_response_id: "resp_root" }));
-    const right = graph.resolve(request([user("right")], { stream_id: "right", previous_response_id: "resp_root" }));
-
-    expect(left.relayBody.input).toEqual([user("root"), assistant("root answer"), user("left")]);
-    expect(right.relayBody.input).toEqual([user("root"), assistant("root answer"), user("right")]);
-    expect(graph.stats().nodes).toBe(1);
-    releaseResponseGraphResolution(left);
-    releaseResponseGraphResolution(right);
-  });
-
-  it("shares frozen JSON values without allowing caller or transport mutation", () => {
-    const graph = new ResponseGraph();
-    const source = [user("immutable")];
-    const root = graph.resolve(request(source));
-    (source[0]!.content[0] as { text: string }).text = "caller-mutated";
-    expect(root.relayBody.input).toEqual([user("immutable")]);
-    expect(Object.isFrozen(root.relayBody.input)).toBe(true);
-    expect(Object.isFrozen((root.relayBody.input as any[])[0])).toBe(true);
-
-    const final = { id: "immutable-root", output: [assistant("original-output")] };
-    graph.record(root, final);
-    final.output[0]!.content[0]!.text = "final-mutated";
-    const continuation = graph.resolve(request([user("next")], {
-      previous_response_id: "immutable-root",
-    }));
-    expect(JSON.stringify(continuation.relayBody.input)).toContain("original-output");
-    expect(JSON.stringify(continuation.relayBody.input)).not.toContain("caller-mutated");
-    expect(JSON.stringify(continuation.relayBody.input)).not.toContain("final-mutated");
-    releaseResponseGraphResolution(continuation);
-  });
-
-  it("takes ownership of an isolated parsed input without cloning its objects", () => {
-    const graph = new ResponseGraph();
-    const input = [user("owned")];
-    const resolved = graph.resolve(request(input), { inputOwnership: "owned" });
-    expect(resolved.inputDelta).toBe(input);
-    expect((resolved.relayBody.input as any[])[0]).toBe(input[0]);
-    expect(Object.isFrozen(input)).toBe(true);
-    expect(Object.isFrozen(input[0])).toBe(true);
-    graph.record(resolved, { id: "owned", output: [] });
-  });
-
-  it("precharges a store:false root input and transfers it into the cached node", () => {
-    const shared = new SharedByteBudget(2 * 1024 * 1024);
-    const graph = new ResponseGraph({ maxBytes: 2 * 1024 * 1024, sharedBudget: shared });
-    const resolved = graph.resolve(request([user("x".repeat(256 * 1024))]), {
-      inputOwnership: "owned",
+    Object.assign(event, {
+      stream_id: "public-lane",
+      stream: true,
+      generate: true,
+      previous_response_id: "resp_provider_parent_exact",
+      instructions: "current instructions",
+      include: ["file_search_call.results"],
+      vendor_extension: { exact: true },
     });
-    expect(shared.used).toBeGreaterThan(256 * 1024);
-    graph.record(resolved, { id: "precharged-root", output: [] });
+
+    const resolved = graph.resolve(event);
+
+    expect(resolved.relayBody).toMatchObject({
+      store: true,
+      stream: true,
+      previous_response_id: "resp_provider_parent_exact",
+      input: event.input,
+      instructions: "current instructions",
+      include: ["file_search_call.results"],
+      vendor_extension: { exact: true },
+    });
+    expect(resolved.relayBody).not.toHaveProperty("type");
+    expect(resolved.relayBody).not.toHaveProperty("stream_id");
+    expect(resolved.relayBody).not.toHaveProperty("generate");
+    expect(resolved.relayBody.include).not.toContain("reasoning.encrypted_content");
+    expect(resolved.materializedLocally).toBe(false);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+
+    graph.record(resolved, {
+      id: `resp_generated_${String(event.store)}`,
+      output: [{ type: "message", content: "not locally retained" }],
+    });
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("passes an unknown provider ID through unchanged with only the current delta", () => {
+    const graph = new ResponseGraph();
+    const delta = [{ type: "function_call_output", call_id: "call_1", output: "42" }];
+    const resolved = graph.resolve(request(delta, {
+      store: false,
+      previous_response_id: "resp_unknown_but_provider_owned",
+    }));
+
+    expect(resolved.relayBody.previous_response_id).toBe("resp_unknown_but_provider_owned");
+    expect(resolved.relayBody.input).toEqual(delta);
+    expect(resolved.relayBody.store).toBe(true);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("does not replay a large image or generated output into provider continuation", () => {
+    const graph = new ResponseGraph();
+    const imageUrl = `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}`;
+    const first = graph.resolve(request([{
+      role: "user",
+      content: [
+        { type: "input_text", text: "inspect" },
+        { type: "input_image", image_url: imageUrl },
+      ],
+    }], { store: false }));
+    graph.record(first, {
+      id: "resp_image_provider",
+      output: [{ type: "message", content: "provider output" }],
+    });
+
+    const continuation = graph.resolve(request("follow up", {
+      store: false,
+      previous_response_id: "resp_image_provider",
+    }));
+    const encoded = JSON.stringify(continuation.relayBody);
+
+    expect(continuation.relayBody.previous_response_id).toBe("resp_image_provider");
+    expect(continuation.relayBody.input).toEqual([user("follow up")]);
+    expect(encoded).not.toContain(imageUrl);
+    expect(encoded).not.toContain("provider output");
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("does not inject encrypted reasoning for replay and redacts unrequested provider fields", () => {
+    const graph = new ResponseGraph();
+    const hidden = graph.resolve(request("think", { store: false }));
+    expect(hidden.relayBody).not.toHaveProperty("include");
+
+    const final = {
+      id: "resp_reasoning",
+      output: [{ type: "reasoning", id: "rs_1", encrypted_content: "secret", summary: [] }],
+    };
+    expect(graph.sanitizeOutbound(final, hidden) as unknown).toEqual({
+      id: "resp_reasoning",
+      output: [{ type: "reasoning", id: "rs_1", summary: [] }],
+    });
+    graph.record(hidden, final);
+
+    const visible = graph.resolve(request([], {
+      include: ["reasoning.encrypted_content"],
+    }));
+    expect(visible.relayBody.include).toEqual(["reasoning.encrypted_content"]);
+    expect(graph.sanitizeOutbound(final, visible)).toBe(final);
+    graph.record(visible, final);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("keeps ordinary generated graph nodes and bytes at zero under sustained use", () => {
+    const shared = new SharedByteBudget(2 * 1024 * 1024);
+    const graph = new ResponseGraph({
+      maxNodes: 8,
+      maxBytes: 1024 * 1024,
+      sharedBudget: shared,
+    });
+
+    for (let index = 0; index < 500; index++) {
+      const resolved = graph.resolve(request(`delta-${index}`, {
+        store: index % 2 === 0,
+        previous_response_id: index === 0 ? undefined : `resp_provider_${index - 1}`,
+      }), { inputOwnership: "owned" });
+      graph.record(resolved, {
+        id: `resp_provider_${index}`,
+        output: [{ type: "message", content: "x".repeat(1024) }],
+      });
+    }
+
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(shared.used).toBe(0);
+  });
+});
+
+describe("ResponseGraph synthetic warmup aliases", () => {
+  it("admits only explicit generate:false requests into local state", () => {
+    const graph = new ResponseGraph();
+    expect(() => graph.recordWarmup(alias("generated"), request("not a warmup")))
+      .toThrow("generate:false");
+    expect(() => graph.recordWarmup("resp_provider_id", request("warmup", {
+      generate: false,
+    }))).toThrow("Warmup alias IDs");
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("accumulates exact warmup deltas over an optional provider ancestor", () => {
+    const shared = new SharedByteBudget(1024 * 1024);
+    const graph = new ResponseGraph({ sharedBudget: shared });
+    const root = alias("root");
+    const child = alias("child");
+
+    graph.recordWarmup(root, request([user("warmup one")], {
+      generate: false,
+      store: false,
+      previous_response_id: "resp_provider_ancestor",
+    }));
+    graph.recordWarmup(child, request([
+      { type: "function_call_output", call_id: "warm_call", output: "warmup two" },
+    ], {
+      generate: false,
+      store: true,
+      model: undefined,
+      previous_response_id: root,
+    }));
+
+    const generatedDelta = [user("generate now")];
+    const resolved = graph.resolve(request(generatedDelta, {
+      store: false,
+      model: undefined,
+      stream_id: "branch",
+      previous_response_id: child,
+    }));
+
+    expect(resolved.relayBody).toMatchObject({
+      store: true,
+      stream: true,
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_provider_ancestor",
+      input: [
+        user("warmup one"),
+        { type: "function_call_output", call_id: "warm_call", output: "warmup two" },
+        ...generatedDelta,
+      ],
+    });
+    expect(JSON.stringify(resolved.relayBody)).not.toContain(SYNTHETIC_WARMUP_ID_PREFIX);
+    expect(resolved.materializedLocally).toBe(true);
+    expect(graph.stats().nodes).toBe(2);
+
+    const providerTerminal = {
+      type: "response.completed",
+      response: {
+        id: "resp_generated_child",
+        previous_response_id: "resp_provider_ancestor",
+      },
+    };
+    expect(graph.sanitizeOutbound(providerTerminal, resolved)).toMatchObject({
+      response: { previous_response_id: child },
+    });
+    graph.record(resolved, providerTerminal.response);
+    expect(graph.stats().nodes).toBe(2);
     expect(shared.used).toBe(graph.stats().bytes);
     graph.clear();
     expect(shared.used).toBe(0);
   });
 
-  it("rejects an unknown store:false previous_response_id", () => {
+  it.each([undefined, false, true])(
+    "caches generate:false warmup independent of client store %p",
+    store => {
+      const graph = new ResponseGraph();
+      const id = alias(`store-${String(store)}`);
+      const event = request(`warm-${String(store)}`, {
+        generate: false,
+        ...(store === undefined ? {} : { store }),
+      });
+
+      graph.recordWarmup(id, event);
+
+      expect(graph.stats().nodes).toBe(1);
+      const resolved = graph.resolve(request("child", {
+        previous_response_id: id,
+      }));
+      expect(resolved.relayBody).toMatchObject({
+        store: true,
+        input: [user(`warm-${String(store)}`), user("child")],
+      });
+      expect(resolved.relayBody).not.toHaveProperty("previous_response_id");
+      releaseResponseGraphResolution(resolved);
+      graph.clear();
+    },
+  );
+
+  it("keeps one immutable alias reusable for two generated forks", () => {
     const graph = new ResponseGraph();
-    expect(() => graph.resolve(request([], { previous_response_id: "resp_missing" }))).toThrow(
-      PreviousResponseNotFoundError,
-    );
-  });
-
-  it("passes an unknown store:true previous_response_id to persisted upstream state", () => {
-    const graph = new ResponseGraph();
-    const resolved = graph.resolve(request([], { store: true, previous_response_id: "resp_persisted" }));
-    expect(resolved.relayBody.previous_response_id).toBe("resp_persisted");
-  });
-
-  it("retains encrypted reasoning internally and redacts it unless requested", () => {
-    const graph = new ResponseGraph();
-    const resolved = graph.resolve(request([user("think")]));
-    const final: any = {
-      id: "resp_reasoning",
-      output: [{ type: "reasoning", id: "rs_1", encrypted_content: "secret", summary: [] }],
-    };
-    graph.record(resolved, final);
-
-    expect(graph.sanitizeOutbound(final, resolved)).toEqual({
-      id: "resp_reasoning",
-      output: [{ type: "reasoning", id: "rs_1", summary: [] }],
-    });
-
-    const continuation = graph.resolve(request([user("continue")], { previous_response_id: "resp_reasoning" }));
-    expect(JSON.stringify(continuation.relayBody.input)).toContain("secret");
-    releaseResponseGraphResolution(continuation);
-
-    const visible = graph.resolve(request([], { include: ["reasoning.encrypted_content"] }));
-    expect(graph.sanitizeOutbound(final, visible)).toBe(final);
-  });
-
-  it("reuses unchanged streaming objects and copy-on-writes only redacted paths", () => {
-    const graph = new ResponseGraph();
-    const hidden = graph.resolve(request([]));
-    const plain = {
-      type: "response.output_text.delta",
-      delta: "token",
-      nested: { annotations: [] },
-    };
-    expect(graph.sanitizeOutbound(plain, hidden)).toBe(plain);
-
-    const encrypted = {
-      type: "response.reasoning.done",
-      item: {
-        id: "rs_copy_on_write",
-        encrypted_content: "secret",
-        summary: [],
-      },
-      unchanged: { marker: true },
-    };
-    const sanitized = graph.sanitizeOutbound(encrypted, hidden);
-    expect(sanitized).not.toBe(encrypted);
-    expect(sanitized.item).not.toBe(encrypted.item);
-    expect(sanitized.unchanged).toBe(encrypted.unchanged);
-    expect(sanitized.item).not.toHaveProperty("encrypted_content");
-    expect(encrypted.item.encrypted_content).toBe("secret");
-  });
-
-  it("rewrites continuation IDs without mutating the terminal object", () => {
-    const graph = new ResponseGraph();
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "resp_parent", output: [] });
-    const continuation = graph.resolve(request([], {
-      previous_response_id: "resp_parent",
+    const root = alias("fork-root");
+    graph.recordWarmup(root, request([user("shared warmup")], {
+      generate: false,
+      previous_response_id: "resp_provider_before_fork",
     }));
-    const terminal = {
-      type: "response.completed",
-      response: { id: "resp_child", previous_response_id: null as string | null },
-    };
-    const outbound = graph.sanitizeOutbound(terminal, continuation);
-    expect(outbound).not.toBe(terminal);
-    expect(outbound.response).not.toBe(terminal.response);
-    expect(outbound.response.previous_response_id).toBe("resp_parent");
-    expect(terminal.response.previous_response_id).toBeNull();
-    releaseResponseGraphResolution(continuation);
-  });
 
-  it("evicts least-recently-used independent leaves within count and shared byte budgets", () => {
-    const shared = new SharedByteBudget(10_000);
-    const graph = new ResponseGraph({ maxNodes: 2, maxBytes: 10_000, sharedBudget: shared });
-    for (let index = 1; index <= 3; index++) {
-      const resolved = graph.resolve(request([user(String(index))]));
-      graph.record(resolved, { id: `resp_${index}`, output: [assistant(String(index))] });
-    }
-    expect(graph.stats().nodes).toBe(2);
-    expect(() => graph.resolve(request([], { previous_response_id: "resp_1" }))).toThrow(
-      PreviousResponseNotFoundError,
-    );
-    const latest = graph.resolve(request([], { previous_response_id: "resp_3" }));
-    expect(latest.parentId).toBe("resp_3");
-    releaseResponseGraphResolution(latest);
+    const left = graph.resolve(request([user("left")], {
+      store: false,
+      previous_response_id: root,
+    }));
+    const right = graph.resolve(request([user("right")], {
+      store: true,
+      previous_response_id: root,
+    }));
+
+    expect(left.relayBody).toMatchObject({
+      previous_response_id: "resp_provider_before_fork",
+      input: [user("shared warmup"), user("left")],
+      store: true,
+    });
+    expect(right.relayBody).toMatchObject({
+      previous_response_id: "resp_provider_before_fork",
+      input: [user("shared warmup"), user("right")],
+      store: true,
+    });
+    expect(graph.stats().nodes).toBe(1);
+    graph.record(left, { id: "resp_left", output: [] });
+    graph.record(right, { id: "resp_right", output: [] });
+    expect(graph.stats().nodes).toBe(1);
+
+    const third = graph.resolve(request("third", { previous_response_id: root }));
+    expect(third.relayBody.input).toEqual([user("shared warmup"), user("third")]);
+    releaseResponseGraphResolution(third);
     graph.clear();
-    expect(shared.used).toBe(0);
   });
 
-  it("cascades explicit eviction through descendants while preserving other forks", () => {
+  it("binds warmup aliases and provider ancestors to the trusted authorization scope", () => {
     const graph = new ResponseGraph();
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "root", output: [assistant("root")] });
-    const left = graph.resolve(request([user("left")], { previous_response_id: "root" }));
-    graph.record(left, { id: "left", output: [assistant("left")] });
-    const right = graph.resolve(request([user("right")], { previous_response_id: "root" }));
-    graph.record(right, { id: "right", output: [assistant("right")] });
+    const root = alias("scoped-root");
+    const trustedScope = createAuthenticatedTenantScope();
+    const otherScope = createAuthenticatedTenantScope();
+    const clientControlledScope = "tenant:client-controlled";
+    graph.recordWarmup(root, request("scoped warmup", {
+      generate: false,
+      stream_id: clientControlledScope,
+      previous_response_id: "resp_provider_scoped",
+      client_metadata: { authorization_scope: clientControlledScope },
+    }), { authorizationScope: trustedScope });
 
-    graph.evict("left");
-    expect(() => graph.resolve(request([], { previous_response_id: "left" }))).toThrow();
-    const retained = graph.resolve(request([], { previous_response_id: "right" }));
-    expect(retained.parentId).toBe("right");
-    releaseResponseGraphResolution(retained);
+    expect(() => graph.resolve(request("wrong-scope child", {
+      previous_response_id: root,
+    }), { authorizationScope: otherScope })).toThrow(PreviousResponseNotFoundError);
+    expect(() => graph.recordWarmup(alias("wrong-scope-parent"), request("warm", {
+      generate: false,
+      previous_response_id: root,
+    }), { authorizationScope: otherScope })).toThrow(PreviousResponseNotFoundError);
+
+    const resolved = graph.resolve(request("trusted child", {
+      previous_response_id: root,
+    }), { authorizationScope: trustedScope });
+    expect(resolved.authorizationScope).toBe(trustedScope);
+    expect(resolved.relayBody).toMatchObject({
+      previous_response_id: "resp_provider_scoped",
+      input: [user("scoped warmup"), user("trusted child")],
+      store: true,
+    });
+    expect(graph.stats().nodes).toBe(1);
+    releaseResponseGraphResolution(resolved);
+    graph.clear();
   });
 
-  it("never evicts the parent required by a continuation being recorded", () => {
-    const graph = new ResponseGraph({ maxNodes: 1, maxBytes: 10_000, sharedBudget: new SharedByteBudget(10_000) });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "root", output: [assistant("root")] });
-    const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
-    expect(() => graph.record(child, {
-      id: "child",
-      output: [assistant("child")],
-    })).toThrow("capacity");
+  it("keeps provider IDs opaque across scopes instead of authorizing them locally", () => {
+    const graph = new ResponseGraph();
+    const providerId = "resp_provider_opaque";
+    const serverScope = createAuthenticatedTenantScope();
+    const resolved = graph.resolve(request("delta", {
+      store: false,
+      stream_id: "client-controlled-scope",
+      previous_response_id: providerId,
+      client_metadata: { authorization_scope: "client-controlled-scope" },
+    }), { authorizationScope: serverScope });
 
-    const retained = graph.resolve(request([], { previous_response_id: "root" }));
-    expect(retained.parentId).toBe("root");
-    releaseResponseGraphResolution(retained);
-    expect(() => graph.resolve(request([], { previous_response_id: "child" }))).toThrow(
-      PreviousResponseNotFoundError,
-    );
+    expect(resolved.authorizationScope).toBe(serverScope);
+    expect(resolved.parentId).toBeUndefined();
+    expect(resolved.relayBody).toMatchObject({
+      previous_response_id: providerId,
+      input: [user("delta")],
+      store: true,
+    });
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
   });
 
-  it("retains a continuation parent from payload handoff through child recording", () => {
+  it("never forwards a missing or evicted synthetic alias as a provider ID", () => {
+    const graph = new ResponseGraph();
+    const missing = alias("missing");
+    expect(() => graph.resolve(request("child", {
+      previous_response_id: missing,
+    }))).toThrow(PreviousResponseNotFoundError);
+    expect(() => graph.recordWarmup(alias("child-of-missing"), request("warm", {
+      generate: false,
+      previous_response_id: missing,
+    }))).toThrow(PreviousResponseNotFoundError);
+
+    const retained = alias("retained");
+    graph.recordWarmup(retained, request("warm", { generate: false }));
+    graph.evict(retained);
+    expect(() => graph.resolve(request("child", {
+      previous_response_id: retained,
+    }))).toThrow(PreviousResponseNotFoundError);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("evicts least-recently-used alias leaves and clears all retained bytes", () => {
+    const shared = new SharedByteBudget(64 * 1024);
     const graph = new ResponseGraph({
       maxNodes: 2,
-      maxBytes: 10_000,
-      sharedBudget: new SharedByteBudget(10_000),
+      maxBytes: shared.limit,
+      sharedBudget: shared,
     });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "root", output: [assistant("root")] });
-    const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
+    const first = alias("lru-first");
+    const second = alias("lru-second");
+    const third = alias("lru-third");
+    graph.recordWarmup(first, request("first", { generate: false }));
+    graph.recordWarmup(second, request("second", { generate: false }));
 
-    // This models the current router-handoff release before the child settles.
-    releaseResponseGraphPayload(child);
-    const pressureOne = graph.resolve(request([user("pressure-one")]));
-    graph.record(pressureOne, { id: "pressure-one", output: [] });
-    const pressureTwo = graph.resolve(request([user("pressure-two")]));
-    graph.record(pressureTwo, { id: "pressure-two", output: [] });
-    graph.record(child, { id: "child", output: [assistant("child")] });
+    const touch = graph.resolve(request("touch", { previous_response_id: first }));
+    releaseResponseGraphResolution(touch);
+    graph.recordWarmup(third, request("third", { generate: false }));
 
-    const grandchild = graph.resolve(request([user("grandchild")], {
-      previous_response_id: "child",
-    }));
-    expect(grandchild.relayBody.input).toEqual([
-      user("root"),
-      assistant("root"),
-      user("child"),
-      assistant("child"),
-      user("grandchild"),
-    ]);
-    releaseResponseGraphResolution(grandchild);
-  });
-
-  it("reports cache admission failure instead of silently publishing an unusable id", () => {
-    const graph = new ResponseGraph({
-      maxNodes: 1,
-      maxBytes: 10_000,
-      sharedBudget: new SharedByteBudget(10_000),
-    });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "root", output: [assistant("root")] });
-    const child = graph.resolve(request([user("child")], { previous_response_id: "root" }));
-    expect(() => graph.record(child, {
-      id: "child",
-      output: [assistant("child")],
-    })).toThrow("capacity");
-  });
-
-  it("does not evict valid local history when shared cache admission cannot succeed", () => {
-    const shared = new SharedByteBudget(5_000);
-    const graph = new ResponseGraph({ maxNodes: 8, maxBytes: 5_000, sharedBudget: shared });
-    const competing = new ResponseGraph({ maxNodes: 8, maxBytes: 5_000, sharedBudget: shared });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "root", output: [assistant("a".repeat(1_000))] });
-    const other = competing.resolve(request([user("other")]));
-    competing.record(other, {
-      id: "other",
-      output: [{ type: "message", content: "b".repeat(1_500) }],
-    });
-
-    const impossible = graph.resolve(request([user("impossible")]));
-    expect(() => graph.record(impossible, {
-      id: "impossible",
-      output: [assistant("c".repeat(2_000))],
-    })).toThrow("capacity");
-
-    expect(graph.stats().nodes).toBe(1);
-    competing.clear();
-    const retained = graph.resolve(request([], { previous_response_id: "root" }));
-    expect(retained.parentId).toBe("root");
+    expect(graph.stats().nodes).toBe(2);
+    expect(() => graph.resolve(request([], { previous_response_id: second })))
+      .toThrow(PreviousResponseNotFoundError);
+    const retained = graph.resolve(request([], { previous_response_id: first }));
     releaseResponseGraphResolution(retained);
     graph.clear();
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(shared.used).toBe(0);
   });
 
-  it("retains only byte-accounted deltas across a deep continuation chain", () => {
-    const MiB = 1024 * 1024;
-    Bun.gc(true);
-    const before = process.memoryUsage().heapUsed;
-    const shared = new SharedByteBudget(256 * MiB);
+  it("cascades explicit root eviction through accumulated aliases", () => {
+    const graph = new ResponseGraph();
+    const root = alias("cascade-root");
+    const child = alias("cascade-child");
+    graph.recordWarmup(root, request("root", { generate: false }));
+    graph.recordWarmup(child, request("child", {
+      generate: false,
+      previous_response_id: root,
+    }));
+    expect(graph.stats().nodes).toBe(2);
+
+    graph.evict(root);
+
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(() => graph.resolve(request("next", { previous_response_id: child })))
+      .toThrow(PreviousResponseNotFoundError);
+  });
+
+  it("rejects oversized warmup state without retaining unaccounted bytes", () => {
+    const shared = new SharedByteBudget(2048);
     const graph = new ResponseGraph({
-      maxNodes: 256,
-      maxBytes: 256 * MiB,
+      maxNodes: 4,
+      maxBytes: 2048,
       sharedBudget: shared,
     });
-    let previousResponseId: string | undefined;
 
-    for (let index = 0; index < 80; index++) {
-      const resolved = graph.resolve(request([
-        user(`${index}:` + "x".repeat(32 * 1024)),
-      ], previousResponseId ? { previous_response_id: previousResponseId } : {}));
-      previousResponseId = `resp_${index}`;
-      graph.record(resolved, {
-        id: previousResponseId,
-        model: "gpt-5.6-sol",
-        output: [],
-      });
-    }
-
-    Bun.gc(true);
-    const retainedHeap = Math.max(0, process.memoryUsage().heapUsed - before);
-    expect(graph.stats().bytes).toBeLessThan(3 * MiB);
-    expect(retainedHeap).toBeLessThan(25 * MiB);
-    graph.clear();
+    expect(() => graph.recordWarmup(alias("oversized"), request("x".repeat(4096), {
+      generate: false,
+      store: false,
+    }))).toThrow(ResponseGraphCapacityError);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(shared.used).toBe(0);
   });
 
-  it("charges only frozen-reference materialization arrays for large lineages", () => {
-    const MiB = 1024 * 1024;
-    const shared = new SharedByteBudget(70 * MiB);
+  it("charges retained containers instead of their compact wire encoding", () => {
+    const shared = new SharedByteBudget(1024 * 1024);
     const graph = new ResponseGraph({
-      maxNodes: 32,
-      maxBytes: 8 * MiB,
+      maxBytes: shared.limit,
+      maxRetainedItems: 2_000,
       sharedBudget: shared,
     });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, {
-      id: "resp_large_root",
-      model: "gpt-5.6-sol",
-      output: [assistant("x".repeat(2 * MiB))],
-    });
-    const storedBytes = shared.used;
-    const active = Array.from({ length: 128 }, (_, index) => graph.resolve(request(
-      [user(`child-${index}`)],
-      { previous_response_id: "resp_large_root", stream_id: `lane-${index}` },
-    )));
-    expect(shared.used).toBeLessThanOrEqual(shared.limit);
-    expect(shared.used - storedBytes).toBeLessThan(256 * 1024);
+    const input = Array.from({ length: 1_000 }, () => ({}));
+    const wireBytes = Buffer.byteLength(JSON.stringify(input));
 
-    for (const resolved of active) {
-      releaseResponseGraphResolution(resolved);
-    }
-    expect(shared.used).toBe(storedBytes);
-    graph.clear();
-    expect(shared.used).toBe(0);
-  });
-
-  it("charges current continuation delta slots as well as stored lineage slots", () => {
-    const shared = new SharedByteBudget(4 * 1024 * 1024);
-    const graph = new ResponseGraph({ maxBytes: 4 * 1024 * 1024, sharedBudget: shared });
-    const root = graph.resolve(request([user("root")]));
-    graph.record(root, { id: "delta-root", output: [] });
-    const storedBytes = shared.used;
-    const delta = Array.from({ length: 10_000 }, () => null);
-    const continuation = graph.resolve(request(delta, {
-      previous_response_id: "delta-root",
+    graph.recordWarmup(alias("container-accounting"), request(input, {
+      generate: false,
     }), { inputOwnership: "owned" });
-    expect(shared.used - storedBytes).toBeGreaterThanOrEqual(10_000 * 16);
-    releaseResponseGraphResolution(continuation);
+
+    expect(graph.stats().bytes).toBeGreaterThan(wireBytes * 20);
+    expect(shared.used).toBe(graph.stats().bytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
+  it("rejects pathological retained item and depth graphs before admission", () => {
+    const shared = new SharedByteBudget(64 * 1024 * 1024);
+    const graph = new ResponseGraph({ sharedBudget: shared });
+    const distinctEmptyObjects = Array.from({ length: 200_000 }, () => ({}));
+
+    expect(() => graph.recordWarmup(alias("too-many-items"), request(
+      distinctEmptyObjects,
+      { generate: false },
+    ), { inputOwnership: "owned" })).toThrow("retained item limit");
+
+    let nested: Record<string, unknown> = {};
+    for (let depth = 0; depth < 80; depth++) nested = { child: nested };
+    expect(() => graph.recordWarmup(alias("too-deep"), request(nested, {
+      generate: false,
+    }), { inputOwnership: "owned" })).toThrow("retained depth limit");
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(shared.used).toBe(0);
+  });
+
+  it("charges only bounded reference arrays while a warmup lineage is materialized", () => {
+    const shared = new SharedByteBudget(8 * 1024 * 1024);
+    const graph = new ResponseGraph({
+      maxNodes: 8,
+      maxBytes: 4 * 1024 * 1024,
+      sharedBudget: shared,
+    });
+    const root = alias("materialized-root");
+    graph.recordWarmup(root, request([user("x".repeat(1024 * 1024))], {
+      generate: false,
+    }));
+    const storedBytes = shared.used;
+
+    const resolved = graph.resolve(request([user("child")], {
+      previous_response_id: root,
+    }));
+    expect(shared.used).toBeGreaterThan(storedBytes);
+    expect(shared.used - storedBytes).toBeLessThan(4096);
+
+    releaseResponseGraphPayload(resolved);
     expect(shared.used).toBe(storedBytes);
+    releaseResponseGraphResolution(resolved);
+    expect(shared.used).toBe(storedBytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
+  it("keeps retired warmup bytes charged until an active materialization releases", () => {
+    const shared = new SharedByteBudget(8 * 1024 * 1024);
+    const graph = new ResponseGraph({
+      maxNodes: 2,
+      maxBytes: 4 * 1024 * 1024,
+      sharedBudget: shared,
+    });
+    const root = alias("clear-while-materialized");
+    graph.recordWarmup(root, request([user("x".repeat(1024 * 1024))], {
+      generate: false,
+    }));
+    const resolved = graph.resolve(request("child", { previous_response_id: root }));
+
+    graph.clear();
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(shared.used).toBeGreaterThan(1024 * 1024);
+    expect(() => graph.recordWarmup(root, request("replacement", { generate: false })))
+      .toThrow("already cached");
+
+    releaseResponseGraphPayload(resolved);
+    expect(shared.used).toBe(0);
+    releaseResponseGraphResolution(resolved);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+  it("releases warmup lineage pins at router handoff before provider final", () => {
+    const shared = new SharedByteBudget(1024 * 1024);
+    const graph = new ResponseGraph({
+      maxNodes: 1,
+      maxBytes: shared.limit,
+      sharedBudget: shared,
+    });
+    const first = alias("handoff-first");
+    const second = alias("handoff-second");
+    graph.recordWarmup(first, request("first", { generate: false }));
+    const resolved = graph.resolve(request("generated child", {
+      previous_response_id: first,
+    }));
+
+    // startRelay has accepted/encoded the request, but its final may remain
+    // pending for an arbitrarily long provider generation.
+    releaseResponseGraphPayload(resolved);
+    graph.recordWarmup(second, request("second", { generate: false }));
+
+    expect(graph.stats().nodes).toBe(1);
+    expect(() => graph.resolve(request("evicted", { previous_response_id: first })))
+      .toThrow(PreviousResponseNotFoundError);
+    const retained = graph.resolve(request("retained", { previous_response_id: second }));
+    releaseResponseGraphResolution(retained);
+    releaseResponseGraphResolution(resolved);
     graph.clear();
     expect(shared.used).toBe(0);
   });

@@ -1,5 +1,7 @@
 # GhostProv Mirror Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build `http://localhost:8787/v1` — an OpenAI-compatible mirror that proxies `POST /v1/responses` (tools, `tool_choice`, `previous_response_id`, `stream`, `prompt_cache_key`/`prompt_cache_breakpoint`, `input_image`) and `WSS /v1/responses` (WebSocket mode) to the Prism sandbox relay `https://proxy:18080/v1` via the proven Yjs+render+zip loop, with concurrent subagent support and file upload/download.

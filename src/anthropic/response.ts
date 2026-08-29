@@ -1,4 +1,8 @@
-import { encodeReasoningItem, type ResponsesReasoningItem } from "./reasoning";
+import {
+  encodeReasoningItem,
+  type ReasoningSignatureBudget,
+  type ResponsesReasoningItem,
+} from "./reasoning";
 import type { TranslatedAnthropicRequest } from "./request";
 import {
   measureBoundedJson,
@@ -83,6 +87,7 @@ function reasoningBlock(
   item: ResponsesFinalReasoningItem,
   encryptedContent: string,
   display: AnthropicResponseContext["thinkingDisplay"],
+  signatureBudget: ReasoningSignatureBudget,
 ): AnthropicThinkingBlock {
   const summaryText: string[] = [];
   for (const summaryValue of item.summary) {
@@ -102,7 +107,7 @@ function reasoningBlock(
   };
   let signature: string;
   try {
-    signature = encodeReasoningItem(reasoning);
+    signature = encodeReasoningItem(reasoning, signatureBudget);
   } catch {
     malformedFinal();
   }
@@ -201,12 +206,30 @@ function estimatedOutputTokens(
   return Math.ceil(bytes / 4);
 }
 
+function boundedAnthropicMessage(
+  message: AnthropicAdapterMessage,
+  limits: AnthropicRequestLimits,
+): AnthropicAdapterMessage {
+  try {
+    measureBoundedJson(message, "Anthropic response", limits.outputBytes, limits);
+  } catch {
+    throw invalidUpstream("Responses relay returned an oversized Anthropic response.");
+  }
+  return message;
+}
+
 export function responseToAnthropic(
   finalValue: unknown,
   context: AnthropicResponseContext,
 ): AnthropicAdapterMessage {
   const terminal = validateTerminalResponseProjection(finalValue);
   const id = terminal.record.id as string;
+  let limits: AnthropicRequestLimits;
+  try {
+    limits = resolveAnthropicRequestLimits(context.limits);
+  } catch {
+    throw invalidUpstream("Anthropic response context is malformed.");
+  }
 
   if (context.maxTokensZero) {
     if (terminal.record.usage === null) {
@@ -217,7 +240,7 @@ export function responseToAnthropic(
       context.estimatedInputTokens,
       terminal.record.service_tier,
     );
-    return {
+    return boundedAnthropicMessage({
       id: `msg_${id}`,
       type: "message",
       role: "assistant",
@@ -235,15 +258,18 @@ export function responseToAnthropic(
           ? null
           : { thinking_tokens: 0 },
       },
-    };
+    }, limits);
   }
 
-  let limits: AnthropicRequestLimits;
-  try {
-    limits = resolveAnthropicRequestLimits(context.limits);
-  } catch {
-    throw invalidUpstream("Anthropic response context is malformed.");
-  }
+  let signatureBytes = 0;
+  const signatureBudget: ReasoningSignatureBudget = {
+    reserve(bytes) {
+      const next = signatureBytes + bytes;
+      if (!Number.isSafeInteger(next) || next > limits.outputBytes) return false;
+      signatureBytes = next;
+      return true;
+    },
+  };
   const stopSequences = responseStopSequences(context.stopSequences);
   const items = terminal.output.map(
     item => validateTerminalOutputItemProjection(item, terminal.status),
@@ -265,7 +291,12 @@ export function responseToAnthropic(
         stopBlockIndexes.push(converted.length);
         continue;
       }
-      converted.push(reasoningBlock(item, item.encrypted_content, context.thinkingDisplay));
+      converted.push(reasoningBlock(
+        item,
+        item.encrypted_content,
+        context.thinkingDisplay,
+        signatureBudget,
+      ));
       ordinaryText.push(null);
       stopBlockIndexes.push(converted.length - 1);
     } else if (item.type === "message") {
@@ -308,7 +339,7 @@ export function responseToAnthropic(
     terminal.record.service_tier,
     estimatedOutputTokens(content, limits),
   );
-  return {
+  const message: AnthropicAdapterMessage = {
     id: `msg_${id}`,
     type: "message",
     role: "assistant",
@@ -321,4 +352,5 @@ export function responseToAnthropic(
     ...betaResponseFields(context),
     usage,
   };
+  return boundedAnthropicMessage(message, limits);
 }

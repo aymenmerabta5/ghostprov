@@ -136,7 +136,7 @@ describe("V2 public API compatibility", () => {
       ]);
       expect(value.upstream.receivedBodies[0]).toMatchObject({
         stream: true,
-        store: false,
+        store: true,
         reasoning: { effort: "max", mode: "pro" },
         service_tier: "fast",
       });
@@ -145,7 +145,7 @@ describe("V2 public API compatibility", () => {
     }
   });
 
-  it("accepts Codex stream:true compatibility and reconstructs store:false continuation", async () => {
+  it("accepts Codex stream:true compatibility and preserves stored continuation deltas", async () => {
     const value = await harness();
     const client = await openSocket(value.baseUrl);
     try {
@@ -221,11 +221,18 @@ describe("V2 public API compatibility", () => {
         message.stream_id === "tool-lane" && message.type === "response.completed"
       ));
       const continuation = value.upstream.receivedBodies.at(-1)!;
-      expect(continuation).not.toHaveProperty("previous_response_id");
+      expect(continuation).toMatchObject({
+        store: true,
+        stream: true,
+        previous_response_id: first.response.id,
+        input: [{
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: "V2_TOOL_OK",
+        }],
+      });
       expect(continuation).not.toHaveProperty("stream_id");
-      expect(continuation.stream).toBe(true);
-      expect(JSON.stringify(continuation.input)).toContain("function_call_output");
-      expect(JSON.stringify(continuation.input)).toContain("call_fake_1");
+      expect((continuation.input as any[]).some(item => item?.type === "function_call")).toBe(false);
     } finally {
       client.socket.close();
       await value.close();

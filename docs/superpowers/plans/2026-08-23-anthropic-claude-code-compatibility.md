@@ -1,5 +1,7 @@
 # GhostProv Anthropic and Claude Code Compatibility Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Serve a current Anthropic Messages API and the existing OpenAI API from one GhostProv listener, with stateless reasoning/tool continuity and verified Claude Code 2.1.241 operation.

@@ -3,7 +3,10 @@ import WebSocket from "ws";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { createFakeV2System } from "../tests/support/fake-v2-system";
-import { resolveGhostProvApiKey } from "../src/http/api-key";
+import {
+  createAuthenticatedTenantScope,
+  resolveGhostProvApiKey,
+} from "../src/http/api-key";
 
 export function resolveSmokeProtectedRoot(
   env: Record<string, string | undefined>,
@@ -48,13 +51,15 @@ export async function main(): Promise<void> {
   const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
   await primaryHealthy(protectedRoot);
   const system = await createFakeV2System({ runtimes: 1, physicalPerRuntime: 8 });
-  const app = createGhostProvApp({ router: system.router, apiKey });
+  const authorizationScope = createAuthenticatedTenantScope();
+  const app = createGhostProvApp({ router: system.router, apiKey, authorizationScope });
   const server = createGhostProvServer({
     app,
     router: system.router,
     apiKey,
     port: 18_787,
     candidate: true,
+    authorizationScope,
   });
   try {
     await new Promise<void>((resolve, reject) => {

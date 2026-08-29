@@ -1,4 +1,47 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+
+const AUTHENTICATED_TENANT_SCOPE_BYTES = 32;
+const AUTHENTICATED_TENANT_SCOPES = new WeakMap<object, Buffer>();
+declare const AUTHENTICATED_TENANT_SCOPE: unique symbol;
+
+/**
+ * Opaque process-local proof that a request crossed GhostProv's server-owned
+ * authentication boundary. Scope authority cannot be reconstructed from a
+ * request body, header, client ID, or serialized value.
+ */
+export type AuthenticatedTenantScope = Readonly<{
+  readonly [AUTHENTICATED_TENANT_SCOPE]: true;
+}>;
+
+/** Creates one application scope for all authenticated protocol surfaces. */
+export function createAuthenticatedTenantScope(): AuthenticatedTenantScope {
+  const scope = Object.freeze(Object.create(null)) as AuthenticatedTenantScope;
+  AUTHENTICATED_TENANT_SCOPES.set(scope, randomBytes(AUTHENTICATED_TENANT_SCOPE_BYTES));
+  return scope;
+}
+
+export function isAuthenticatedTenantScope(value: unknown): value is AuthenticatedTenantScope {
+  return !!value && typeof value === "object" && AUTHENTICATED_TENANT_SCOPES.has(value);
+}
+
+/**
+ * Derives a fixed-size index key without exposing or retaining the underlying
+ * application scope bytes.
+ */
+export function authenticatedTenantScopeHmac(
+  scope: AuthenticatedTenantScope,
+  key: Uint8Array,
+  domain: string,
+): string {
+  if (!isAuthenticatedTenantScope(scope)) {
+    throw new TypeError("Authenticated tenant scope is missing or invalid");
+  }
+  const secret = AUTHENTICATED_TENANT_SCOPES.get(scope)!;
+  return createHmac("sha256", Buffer.from(key))
+    .update(domain, "utf8")
+    .update(secret)
+    .digest("base64url");
+}
 
 export type ApiKeySurface = "openai" | "anthropic";
 export const DEFAULT_GHOSTPROV_API_KEY = "GHOST_IS_KING";

@@ -1,3 +1,4 @@
+import { normalizeUpstreamResponsesRequest } from "../../relay/upstream-policy";
 import type { FetchLike } from "../../core/ports";
 import type { SseFrame } from "../../relay/sse";
 import {
@@ -40,7 +41,7 @@ export interface SecretSource {
 
 export interface DirectResponsesExecution {
   body: Uint8Array;
-  /** Host-proven canonical JSON with top-level `stream:true`; forward verbatim. */
+  /** Host-proven canonical JSON; R8 verifies stream/store policy before byte reuse. */
   bodyIsCanonicalStream?: boolean;
   signal?: AbortSignal;
   beforeFetch(): Promise<void>;
@@ -237,32 +238,85 @@ function parseBody(bytes: Uint8Array): Record<string, unknown> {
   return decoded as Record<string, unknown>;
 }
 
-function validatedImmutableJsonText(bytes: Uint8Array): string {
-  // Reuse the strict object validation before creating the immutable fallback.
-  // This is reached only after an upstream parser rejected the byte-backed
-  // request, so its extra decode/parse allocation is absent from the healthy
-  // path and cannot affect ordinary or tiny-request latency.
-  parseBody(bytes);
-  return utf8Text(bytes);
+type CanonicalRequestMetadata = Readonly<{
+  model: string | undefined;
+  stream: boolean;
+  store: boolean;
+}>;
+
+type PolicyKey = "model" | "stream" | "store" | "other";
+
+function asciiKey(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  expected: string,
+): boolean {
+  if (end - start !== expected.length) return false;
+  for (let index = 0; index < expected.length; index++) {
+    if (bytes[start + index] !== expected.charCodeAt(index)) return false;
+  }
+  return true;
 }
 
-function canonicalRequestModel(bytes: Uint8Array): string | undefined {
+function policyKey(bytes: Uint8Array, start: number, end: number): PolicyKey {
+  if (asciiKey(bytes, start, end, "model")) return "model";
+  if (asciiKey(bytes, start, end, "stream")) return "stream";
+  if (asciiKey(bytes, start, end, "store")) return "store";
+  return "other";
+}
+
+function escapedPolicyKey(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): PolicyKey | null {
+  // Six ASCII policy characters need at most six \uXXXX escapes. Longer raw
+  // keys cannot be a semantic alias and must not force a large request off the
+  // immutable Blob fast path merely because an extension key contains escapes.
+  if (end - start > 36) return "other";
+  try {
+    const decoded = JSON.parse(utf8Text(bytes.subarray(start - 1, end + 1)));
+    if (typeof decoded !== "string") return null;
+    if (decoded === "model" || decoded === "stream" || decoded === "store") {
+      return decoded;
+    }
+    return "other";
+  } catch {
+    return null;
+  }
+}
+
+function trueLiteralAt(bytes: Uint8Array, start: number): boolean {
+  if (bytes[start] !== 0x74 || bytes[start + 1] !== 0x72 ||
+    bytes[start + 2] !== 0x75 || bytes[start + 3] !== 0x65) return false;
+  const next = bytes[start + 4];
+  return next === 0x2c || next === 0x7d || next === 0x20 ||
+    next === 0x09 || next === 0x0a || next === 0x0d;
+}
+
+/**
+ * Reads only the three top-level fields needed by the R8 fast path. Any policy
+ * uncertainty falls back to the ordinary parse/copy-on-write normalizer before
+ * the durable execution boundary.
+ */
+function canonicalRequestMetadata(bytes: Uint8Array): CanonicalRequestMetadata | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
   let stringStart = 0;
   let stringKind: "key" | "model" | "other" = "other";
+  let keyEscaped = false;
   let expectingTopKey = false;
-  let lastKeyIsModel = false;
-  let awaitingModelValue = false;
-  const isModelKey = (start: number, end: number): boolean => (
-    end - start === 5 &&
-    bytes[start] === 0x6d &&
-    bytes[start + 1] === 0x6f &&
-    bytes[start + 2] === 0x64 &&
-    bytes[start + 3] === 0x65 &&
-    bytes[start + 4] === 0x6c
-  );
+  let lastKey: PolicyKey = "other";
+  let awaitingValue: PolicyKey | null = null;
+  let modelSeen = false;
+  let streamSeen = false;
+  let storeSeen = false;
+  let model: string | undefined;
+  let stream = false;
+  let store = false;
+
   for (let index = 0; index < bytes.byteLength; index++) {
     const byte = bytes[index]!;
     if (inString) {
@@ -271,62 +325,93 @@ function canonicalRequestModel(bytes: Uint8Array): string | undefined {
         continue;
       }
       if (byte === 0x5c) {
+        if (stringKind === "key") keyEscaped = true;
         escaped = true;
         continue;
       }
       if (byte !== 0x22) continue;
       inString = false;
       if (stringKind === "key") {
-        lastKeyIsModel = isModelKey(stringStart, index);
+        // Decode only a bounded escaped key that could semantically alias one
+        // of the three policy keys; unrelated extension keys remain zero-copy.
+        const key = keyEscaped
+          ? escapedPolicyKey(bytes, stringStart, index)
+          : policyKey(bytes, stringStart, index);
+        if (key === null) return null;
+        if (
+          (key === "model" && modelSeen) ||
+          (key === "stream" && streamSeen) ||
+          (key === "store" && storeSeen)
+        ) return null;
+        if (key === "model") modelSeen = true;
+        else if (key === "stream") streamSeen = true;
+        else if (key === "store") storeSeen = true;
+        lastKey = key;
       } else if (stringKind === "model") {
-        if (index - stringStart > 1_024) return undefined;
+        if (index - stringStart > 1_024) return null;
         try {
           const decoded = JSON.parse(utf8Text(bytes.subarray(stringStart - 1, index + 1)));
-          return typeof decoded === "string" && decoded.length <= 256 ? decoded : undefined;
+          if (typeof decoded !== "string" || decoded.length > 256) return null;
+          model = decoded;
         } catch {
-          return undefined;
+          return null;
         }
       }
       continue;
     }
+
     if (byte === 0x22) {
       inString = true;
       escaped = false;
+      keyEscaped = false;
       stringStart = index + 1;
       if (depth === 1 && expectingTopKey) {
         stringKind = "key";
         expectingTopKey = false;
-      } else if (depth === 1 && awaitingModelValue) {
+      } else if (depth === 1 && awaitingValue === "model") {
         stringKind = "model";
-        awaitingModelValue = false;
+        awaitingValue = null;
       } else {
+        if (depth === 1 && (awaitingValue === "stream" || awaitingValue === "store")) {
+          awaitingValue = null;
+        }
         stringKind = "other";
       }
       continue;
     }
     if (byte === 0x7b || byte === 0x5b) {
-      depth++;
+      depth += 1;
       if (depth === 1) expectingTopKey = true;
       continue;
     }
     if (byte === 0x7d || byte === 0x5d) {
-      depth--;
+      depth -= 1;
+      if (depth < 0) return null;
       continue;
     }
     if (depth !== 1) continue;
     if (byte === 0x3a) {
-      awaitingModelValue = lastKeyIsModel;
-      lastKeyIsModel = false;
-    } else if (byte === 0x2c) {
-      expectingTopKey = true;
-      awaitingModelValue = false;
-      lastKeyIsModel = false;
-    } else if (awaitingModelValue && byte !== 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
-      return undefined;
+      awaitingValue = lastKey;
+      lastKey = "other";
+      continue;
     }
+    if (byte === 0x2c) {
+      expectingTopKey = true;
+      awaitingValue = null;
+      lastKey = "other";
+      continue;
+    }
+    const whitespace = byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
+    if (whitespace || awaitingValue === null) continue;
+    if (awaitingValue === "stream") stream = trueLiteralAt(bytes, index);
+    else if (awaitingValue === "store") store = trueLiteralAt(bytes, index);
+    awaitingValue = null;
   }
-  return undefined;
+
+  if (depth !== 0 || inString || bytes.byteLength === 0) return null;
+  return { model, stream, store };
 }
+
 
 const HTTP_ERROR_READ_MAX_BYTES = 64 * 1024;
 const HTTP_ERROR_READ_TIMEOUT_MS = 250;
@@ -1060,7 +1145,10 @@ export class DirectResponsesClient {
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
     let requestBody: BodyInit;
     let model: unknown;
-    if (input.bodyIsCanonicalStream) {
+    const metadata = input.bodyIsCanonicalStream
+      ? canonicalRequestMetadata(input.body)
+      : null;
+    if (metadata?.stream === true && metadata.store === true) {
       // The request assembler owns and securely erases its mutable Uint8Array.
       // Give fetch an immutable snapshot so a runtime that consumes BodyInit
       // lazily cannot observe reuse/erasure while uploading a large request.
@@ -1068,9 +1156,9 @@ export class DirectResponsesClient {
       requestBody = new Blob([input.body as unknown as BlobPart], {
         type: "application/json",
       });
-      model = canonicalRequestModel(input.body);
+      model = metadata.model;
     } else {
-      const body: Record<string, unknown> = { ...parseBody(input.body), stream: true };
+      const body = normalizeUpstreamResponsesRequest(parseBody(input.body));
       model = body.model;
       try {
         requestBody = JSON.stringify(body);
@@ -1114,37 +1202,14 @@ export class DirectResponsesClient {
         );
       }
     };
-    let response = await fetchOnce(requestBody);
+    const response = await fetchOnce(requestBody);
     if (!response.ok) {
-      const failure = await httpError(
+      throw await httpError(
         response,
         model,
         this.#httpErrorReadTimeoutMs,
         input.signal,
       );
-      if (
-        input.bodyIsCanonicalStream &&
-        failure.status === 400 &&
-        failure.code === "invalid_json" &&
-        !input.signal?.aborted
-      ) {
-        // `invalid_json` is a definitive pre-execution parser rejection. Retry
-        // it exactly once from a locally revalidated immutable string. This
-        // repairs a transient BodyInit/upload serialization failure without
-        // replaying provider execution, and leaves every other 4xx untouched.
-        requestBody = validatedImmutableJsonText(input.body);
-        response = await fetchOnce(requestBody);
-        if (!response.ok) {
-          throw await httpError(
-            response,
-            model,
-            this.#httpErrorReadTimeoutMs,
-            input.signal,
-          );
-        }
-      } else {
-        throw failure;
-      }
     }
     const responseRateLimit = rateLimitHintFromHeaders(response.headers);
     if (!response.body) {

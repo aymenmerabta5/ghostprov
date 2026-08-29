@@ -243,14 +243,14 @@ describe("Anthropic HTTP routes", () => {
     expect(calls[0]).toMatchObject({
       source: "anthropic",
       model: "custom-sonnet",
-      stream: false,
+      stream: true,
     });
     expect(calls[0]!.clientId).toMatch(/^http-request-\d{4}$/);
     expect(calls[1]).toEqual({
       source: "anthropic",
       clientId: resolveHttpClientId({}, "claude-session"),
       model: "custom-opus",
-      stream: false,
+      stream: true,
     });
     expect(calls[1]!.clientId).not.toContain("claude-session");
   });

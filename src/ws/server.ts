@@ -9,7 +9,12 @@ import {
   type WebSocketRelayStarter,
 } from "./session";
 import type { ResponseGraph } from "./response-graph";
-import { apiKeyAuthorized } from "../http/api-key";
+import {
+  apiKeyAuthorized,
+  createAuthenticatedTenantScope,
+  isAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../http/api-key";
 
 export type { WebSocketRelayStarter } from "./session";
 
@@ -72,9 +77,12 @@ export function decodeWebSocketRawData(data: RawData): {
 
 export interface AttachResponsesWebSocketOptions extends Omit<
   ResponsesWebSocketSessionOptions,
-  "startRelay" | "graph" | "clientId" | "processLease" | "parserReservationBytes" | "onActivity"
+  "startRelay" | "graph" | "authorizationScope" | "clientId" | "processLease" |
+    "parserReservationBytes" | "onActivity"
 > {
   startRelay: WebSocketRelayStarter;
+  /** Trusted tenant/provider-account scope shared by this attached listener. */
+  authorizationScope?: AuthenticatedTenantScope;
   /** Shared OpenAI-compatible bearer credential for the upgrade request. */
   apiKey?: string;
   /** Application limit; Bun's node:http shim may assemble up to 16 MiB before this check. */
@@ -158,6 +166,11 @@ export function attachResponsesWebSocket(
     options.idleTimeoutMs ?? DEFAULT_WS_IDLE_TIMEOUT_MS,
     "idleTimeoutMs",
   );
+  const authorizationScope = options.authorizationScope ??
+    createAuthenticatedTenantScope();
+  if (!isAuthenticatedTenantScope(authorizationScope)) {
+    throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
+  }
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
   const pendingLeases = new WeakMap<object, WebSocketProcessLease>();
@@ -178,6 +191,7 @@ export function attachResponsesWebSocket(
     try {
       session = new ResponsesWebSocketSession(socket, {
         ...options,
+        authorizationScope,
         processBudget,
         processLease,
         graph: options.graphFactory?.(),

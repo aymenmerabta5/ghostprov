@@ -1,4 +1,5 @@
 import { ApiError } from "../http/errors";
+import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
 import type { ImageGenerationTool, InputImage } from "../relay/types";
 
 export interface ImageCompatOptions {
@@ -294,13 +295,12 @@ export function buildGenerationBodies(request: ParsedGenerationRequest): Record<
   return Array.from({ length: request.n }, () => {
     const body: Record<string, unknown> = {
       model: request.responsesModel,
-      store: false,
       input: request.prompt,
       tools: [generationTool(request)],
       tool_choice: { type: "image_generation" },
     };
     if (request.user !== undefined) body.user = request.user;
-    return body;
+    return normalizeUpstreamResponsesRequest(body);
   });
 }
 
@@ -515,12 +515,11 @@ export function buildEditBodies(request: ParsedEditRequest): Record<string, unkn
   return Array.from({ length: request.n }, () => {
     const body: Record<string, unknown> = {
       model: request.responsesModel,
-      store: false,
       input,
       tools: [editTool(request)],
       tool_choice: { type: "image_generation" },
     };
     if (request.user !== undefined) body.user = request.user;
-    return body;
+    return normalizeUpstreamResponsesRequest(body);
   });
 }

@@ -4,65 +4,68 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-function completeSse(): Response {
-  const final = {
-    id: "resp_deno_retry",
-    object: "response",
-    status: "completed",
-    output: [],
-  };
-  return new Response(
-    `event: response.created\ndata: ${JSON.stringify({
-      type: "response.created",
-      response: { id: final.id },
-    })}\n\nevent: response.completed\ndata: ${JSON.stringify({
-      type: "response.completed",
-      response: final,
-    })}\n\n`,
-    { status: 200, headers: { "content-type": "text/event-stream" } },
-  );
-}
-
-Deno.test("R7 retries one definitive invalid_json from immutable validated text", async () => {
-  const body = new TextEncoder().encode(JSON.stringify({
+Deno.test("R8 normalizes stored streaming policy and never replays invalid_json", async () => {
+  const input = {
     model: "gpt-5.6-sol",
     input: [{ role: "user", content: "deno canonical body" }],
-    stream: true,
-  }));
+    stream: false,
+    store: false,
+    previous_response_id: "resp_deno_parent",
+    vendor_extension: { retain: "verbatim" },
+  };
+  const body = new TextEncoder().encode(JSON.stringify(input));
+  const original = body.slice();
   let calls = 0;
   let boundaries = 0;
+  const forwarded: Record<string, unknown>[] = [];
   const client = new DirectResponsesClient({
     baseUrl: "https://openai.invalid/v1",
     apiKey: { reveal: () => "test-key" },
     fetch: async (_url, init) => {
       calls++;
-      if (calls === 1) {
-        assert(init?.body instanceof Blob, "first R7 body must be an immutable Blob");
-        return Response.json({
-          error: {
-            message: "Invalid body: failed to parse JSON value.",
-            type: "invalid_request_error",
-            code: "invalid_json",
-          },
-        }, { status: 400 });
-      }
-      assert(typeof init?.body === "string", "retry body must be immutable text");
-      body.fill(0);
-      const parsed = JSON.parse(init.body) as Record<string, unknown>;
-      assert(parsed.model === "gpt-5.6-sol", "retry body did not preserve the model");
-      return completeSse();
+      assert(typeof init?.body === "string", "R8 policy repair must serialize immutable text");
+      forwarded.push(JSON.parse(init.body) as Record<string, unknown>);
+      return Response.json({
+        error: {
+          message: "Invalid body: failed to parse JSON value.",
+          type: "invalid_request_error",
+          code: "invalid_json",
+        },
+      }, { status: 400 });
     },
   });
 
-  const terminal = await client.execute({
-    body,
-    bodyIsCanonicalStream: true,
-    beforeFetch: async () => { boundaries++; },
-    onPrelude: async () => {},
-    onEvent: async () => {},
-  });
+  let error: unknown;
+  try {
+    await client.execute({
+      body,
+      bodyIsCanonicalStream: true,
+      beforeFetch: async () => { boundaries++; },
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    });
+  } catch (cause) {
+    error = cause;
+  }
 
-  assert(terminal.status === "completed", "retry did not complete");
-  assert(calls === 2, `expected two fetches, received ${calls}`);
+  assert(error instanceof Error, "expected the definitive provider rejection");
+  assert("code" in error && error.code === "invalid_json", "unexpected provider error code");
+  assert(calls === 1, `expected one fetch, received ${calls}`);
   assert(boundaries === 1, `execution boundary repeated ${boundaries} times`);
+  assert(forwarded.length === 1, "normalized body was not forwarded exactly once");
+  const normalized = forwarded[0]!;
+  assert(normalized.stream === true, "R8 did not force stream:true");
+  assert(normalized.store === true, "R8 did not force store:true");
+  assert(
+    normalized.previous_response_id === input.previous_response_id,
+    "R8 did not preserve previous_response_id",
+  );
+  assert(
+    JSON.stringify(normalized.vendor_extension) === JSON.stringify(input.vendor_extension),
+    "R8 did not preserve extension fields",
+  );
+  assert(
+    body.every((value, index) => value === original[index]),
+    "R8 mutated caller-owned request bytes",
+  );
 });

@@ -1,5 +1,14 @@
 import type { Hono } from "hono";
+import { BoundedPreparationScheduler } from "../relay/preparation-scheduler";
 import type { RunHandle } from "../relay/run-handle";
+import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import type { AuthenticatedTenantScope } from "../http/api-key";
+import {
+  AnthropicContinuationIndex,
+  projectAnthropicReplay,
+  terminalProviderResponseId,
+  type PreparedAnthropicContinuation,
+} from "./continuation";
 import {
   AnthropicRequestError,
   anthropicErrorResponse,
@@ -15,8 +24,14 @@ import {
   validateAnthropicCountTokenRequest,
 } from "./token-count";
 import type { AnthropicContextManagementResponse } from "./types";
+import { definitivePreviousResponseNotFound } from "../relay/continuation-error";
 import type { IncomingResourceLease } from "../router/router";
-import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
+import {
+  incomingLeaseTimingView,
+  linkIncomingLeaseAbort,
+  resolveHttpClientId,
+  takeIncomingBodyLease,
+} from "../http/request-lease";
 import { permittedJsonResponse } from "../http/permitted-json";
 import {
   releaseAtomicBytePermit,
@@ -28,12 +43,17 @@ export type AnthropicRelayStarter = (
   signal: AbortSignal,
   clientId: string,
   incomingLease?: IncomingResourceLease,
+  admission?: AnthropicRelayAdmission,
 ) => Promise<RunHandle>;
 
 export type AnthropicRouteDependencies = {
   keepAliveMs: number;
   models: AnthropicModelOptions;
   startRelay: AnthropicRelayStarter;
+  /** One bounded index shared by every stable/beta route in this app. */
+  continuationIndex?: AnthropicContinuationIndex;
+  /** Opaque app-owned authority. Missing scope disables continuation reuse. */
+  continuationScope?: AuthenticatedTenantScope;
 };
 
 const ANTHROPIC_SSE_HEADERS = {
@@ -44,6 +64,13 @@ const ANTHROPIC_SSE_HEADERS = {
 
 const ANTHROPIC_VERSION = "2023-06-01";
 const NONSTREAM_CLEANUP_MS = 25;
+const CONTINUATION_PREPARE_MAX_QUEUED = 64;
+const CONTINUATION_PREPARE_MAX_QUEUED_BYTES = 256 * 1024 * 1024;
+
+export type AnthropicRelayAdmission = Readonly<{
+  /** Full preprocessing bytes charged only to fair scheduling. */
+  fairnessBytes?: number;
+}>;
 
 async function jsonBody(request: { json(): Promise<unknown> }): Promise<unknown> {
   try {
@@ -130,8 +157,12 @@ function methodNotAllowed(requestId: string): Response {
   return response;
 }
 
-async function discardRelayEvents(iterator: AsyncGenerator<unknown>): Promise<void> {
+async function discardRelayEvents(
+  iterator: AsyncGenerator<unknown>,
+  onEvent: () => void,
+): Promise<void> {
   for await (const _event of iterator) {
+    onEvent();
     // V2 must be drained, but a non-streaming HTTP response never retains the transcript.
   }
 }
@@ -184,9 +215,14 @@ async function boundedCleanup(promises: readonly Promise<unknown>[]): Promise<vo
 async function nonStreamingFinal(
   handle: RunHandle,
   controller: AbortController,
+  onFailure: (
+    source: "final" | "events" | "cancelled",
+    sawRelayEvent: boolean,
+  ) => void = () => undefined,
 ): Promise<unknown> {
   const iterator = handle.events();
-  const drain = discardRelayEvents(iterator);
+  let sawRelayEvent = false;
+  const drain = discardRelayEvents(iterator, () => { sawRelayEvent = true; });
   let iteratorReturned = false;
   const returnIterator = (): void => {
     if (iteratorReturned) return;
@@ -212,13 +248,23 @@ async function nonStreamingFinal(
   const drainOutcome = settle(drain);
   const work = Promise.race([
     finalOutcome.then(result => ({ source: "final" as const, result })),
-    drainOutcome.then(result => ({ source: "drain" as const, result })),
+    drainOutcome.then(result => ({ source: "events" as const, result })),
   ]).then(async first => {
     if (!first.result.ok) {
-      return { completed: false as const, error: first.result.error };
+      return {
+        completed: false as const,
+        error: first.result.error,
+        source: first.source,
+      };
     }
     const second = first.source === "final" ? await drainOutcome : await finalOutcome;
-    if (!second.ok) return { completed: false as const, error: second.error };
+    if (!second.ok) {
+      return {
+        completed: false as const,
+        error: second.error,
+        source: first.source === "final" ? "events" as const : "final" as const,
+      };
+    }
     const finalResult = first.source === "final" ? first.result : second;
     return { completed: true as const, value: finalResult.value };
   });
@@ -227,6 +273,7 @@ async function nonStreamingFinal(
   cancelled.dispose();
 
   if ("cancelled" in winner) {
+    onFailure("cancelled", sawRelayEvent);
     releaseFinalOutcome();
     returnIterator();
     void Promise.all([finalOutcome, drainOutcome]);
@@ -237,15 +284,90 @@ async function nonStreamingFinal(
     if (!controller.signal.aborted) controller.abort(winner.error);
     returnIterator();
     await boundedCleanup([finalOutcome, drainOutcome]);
+    onFailure(winner.source, sawRelayEvent);
     throw winner.error;
   }
   return winner.value;
+}
+
+function continuationPreparationBytes(
+  translated: ReturnType<typeof translateAnthropicRequest>,
+  incomingLease: IncomingResourceLease | undefined,
+): number {
+  const leased = incomingLease?.bodyBytes ?? incomingLease?.reservedBytes;
+  const inbound = Number.isSafeInteger(leased) && Number(leased) >= 0
+    ? Number(leased)
+    : translated.inboundBytes;
+  return Math.min(Number.MAX_SAFE_INTEGER, inbound + translated.relayBytes);
+}
+
+async function prepareContinuation(
+  index: AnthropicContinuationIndex,
+  scheduler: BoundedPreparationScheduler<PreparedAnthropicContinuation>,
+  translated: ReturnType<typeof translateAnthropicRequest>,
+  scope: AuthenticatedTenantScope | null,
+  signal: AbortSignal,
+  costBytes: number,
+): Promise<PreparedAnthropicContinuation | null> {
+  if (scope === null || translated.maxTokensZero || translated.stopSequences.length > 0) {
+    return null;
+  }
+  return scheduler.prepare(async () => {
+    try {
+      return await index.prepareAsync(translated.relayBody, scope, signal);
+    } catch {
+      // Continuations are an optimization. Canonicalization must never alter the
+      // existing Anthropic request surface.
+      return null;
+    }
+  }, costBytes, signal);
+}
+
+type AnthropicContinuationCommitToken = Pick<
+  PreparedAnthropicContinuation,
+  "decision" | "inputDigest" | "settingsDigest" | "scopeDigest"
+>;
+
+function commitContinuation(
+  index: AnthropicContinuationIndex,
+  prepared: AnthropicContinuationCommitToken | null,
+  scope: AuthenticatedTenantScope | null,
+  finalValue: unknown,
+  projected: ReturnType<typeof responseToAnthropic>,
+): void {
+  if (!prepared || scope === null || prepared.decision === "empty_suffix") return;
+  try {
+    const replay = projectAnthropicReplay(finalValue, projected);
+    const responseId = terminalProviderResponseId(finalValue);
+    if (!replay || !responseId) return;
+    index.commit(prepared, scope, responseId, replay);
+  } catch {
+    // A failed metadata commit cannot replace an otherwise valid response.
+  }
+}
+
+function releaseFailedPreludeHandle(
+  handle: RunHandle,
+  controller: AbortController,
+  error: unknown,
+): void {
+  if (!controller.signal.aborted) controller.abort(error);
+  try {
+    void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined);
+  } catch {
+    // A throwing final accessor has no terminal allocation to release.
+  }
 }
 
 export function registerAnthropicRoutes(
   app: Hono,
   dependencies: AnthropicRouteDependencies,
 ): void {
+  const continuationIndex = dependencies.continuationIndex ?? new AnthropicContinuationIndex();
+  const continuationScheduler = new BoundedPreparationScheduler<PreparedAnthropicContinuation>({
+    maxQueued: CONTINUATION_PREPARE_MAX_QUEUED,
+    maxQueuedBytes: CONTINUATION_PREPARE_MAX_QUEUED_BYTES,
+  });
   app.post("/v1/messages/count_tokens", async c => {
     const requestId = newAnthropicRequestId();
     try {
@@ -268,8 +390,11 @@ export function registerAnthropicRoutes(
 
   app.post("/v1/messages", async c => {
     const requestId = newAnthropicRequestId();
-    const linked = linkedAbortController(c.req.raw.signal);
+    const requestLink = linkedAbortController(c.req.raw.signal);
     let streamOwnsLink = false;
+    let unlinkIncomingSignal: () => void = () => undefined;
+    let completeIncomingAdmission: () => void = () => undefined;
+    let retainedIncomingLease: IncomingResourceLease | undefined;
     try {
       validateProtocolHeaders(c.req);
       const body = await jsonBody(c.req);
@@ -282,50 +407,170 @@ export function registerAnthropicRoutes(
         betaContextManagement(body, beta),
       );
       const clientId = resolveHttpClientId(c.env, c.req.header("x-ghostprov-client-id"));
-      const handle = await dependencies.startRelay(
-        translated.relayBody,
-        linked.controller.signal,
-        clientId,
-        takeIncomingBodyLease(c.env),
+      const scope = dependencies.continuationScope ?? null;
+      const incomingLease = takeIncomingBodyLease(c.env);
+      unlinkIncomingSignal = linkIncomingLeaseAbort(
+        requestLink.controller,
+        incomingLease,
       );
+      let incomingAdmissionCompleted = false;
+      completeIncomingAdmission = () => {
+        if (incomingAdmissionCompleted) return;
+        incomingAdmissionCompleted = true;
+        incomingLease?.completeAdmission?.();
+        unlinkIncomingSignal();
+      };
+      const prepared = await prepareContinuation(
+        continuationIndex,
+        continuationScheduler,
+        translated,
+        scope,
+        requestLink.controller.signal,
+        continuationPreparationBytes(translated, incomingLease),
+      );
+      const preparedDecision = prepared?.decision ?? null;
+      const preparedMatch = prepared?.match ?? null;
+      const commitToken: AnthropicContinuationCommitToken | null = prepared
+        ? {
+            decision: prepared.decision,
+            inputDigest: prepared.inputDigest,
+            settingsDigest: prepared.settingsDigest,
+            scopeDigest: prepared.scopeDigest,
+          }
+        : null;
+      if (preparedDecision === "hit") retainedIncomingLease = incomingLease;
+      const continuationLease = retainedIncomingLease
+        ? incomingLeaseTimingView(retainedIncomingLease)
+        : undefined;
+      const initialRelayBody = prepared?.relayBody ?? translated.relayBody;
+      let fallbackRelayBody: Record<string, unknown> | null = translated.relayBody;
+      const clientWantsStream = translated.stream;
+      let attempt = 0;
 
-      if (!translated.stream) {
-        const final = await nonStreamingFinal(handle, linked.controller);
-        let response: ReturnType<typeof responseToAnthropic> | null = null;
+      for (;;) {
+        const attemptLink = linkedAbortController(requestLink.controller.signal);
+        let relayBody: Record<string, unknown> = normalizeUpstreamResponsesRequest(
+          attempt === 0 ? initialRelayBody : fallbackRelayBody!,
+        );
+        let handle: RunHandle | null = null;
+        let stream: ReadableStream<Uint8Array> | null = null;
+        let streamOwnsAttempt = false;
+        let stage: "start" | "nonstream" | "projection" | "prelude" | "sse-commit" = "start";
+        const nonstreamFailure: {
+          source: "final" | "events" | "cancelled" | null;
+          sawRelayEvent: boolean;
+        } = { source: null, sawRelayEvent: false };
         try {
-          response = responseToAnthropic(final, context);
-          transferAtomicBytePermit(final, response, "anthropic-json-output");
-          return permittedJsonResponse(response, {
-            headers: { "request-id": requestId },
+          handle = await dependencies.startRelay(
+            relayBody,
+            attemptLink.controller.signal,
+            clientId,
+            attempt === 0 && !retainedIncomingLease ? incomingLease : continuationLease,
+            attempt === 0 && preparedDecision === "hit"
+              ? {
+                  fairnessBytes: Math.max(
+                    incomingLease?.bodyBytes ?? 0,
+                    commitToken!.inputDigest.canonicalBytes,
+                  ),
+                }
+              : undefined,
+          );
+          completeIncomingAdmission();
+
+          if (attempt > 0) {
+            fallbackRelayBody = null;
+            relayBody = {};
+            if (retainedIncomingLease) {
+              retainedIncomingLease.release();
+              retainedIncomingLease = undefined;
+            }
+          }
+
+          if (!clientWantsStream) {
+            stage = "nonstream";
+            const final = await nonStreamingFinal(
+              handle,
+              attemptLink.controller,
+              (source, sawRelayEvent) => {
+                nonstreamFailure.source = source;
+                nonstreamFailure.sawRelayEvent = sawRelayEvent;
+              },
+            );
+            stage = "projection";
+            let response: ReturnType<typeof responseToAnthropic> | null = null;
+            try {
+              response = responseToAnthropic(final, context);
+              commitContinuation(continuationIndex, commitToken, scope, final, response);
+              transferAtomicBytePermit(final, response, "anthropic-json-output");
+              return permittedJsonResponse(response, {
+                headers: { "request-id": requestId },
+              });
+            } catch (error) {
+              releaseAtomicBytePermit(final);
+              releaseAtomicBytePermit(response);
+              throw error;
+            }
+          }
+
+          // Do not commit an Anthropic SSE 200 until R2 has proven successful
+          // upstream headers. Initial provider failures then use the normal
+          // Anthropic HTTP error mapping; failures after this point stay in-band.
+          stage = "prelude";
+          if (handle.upstreamPrelude) await handle.upstreamPrelude;
+          stage = "sse-commit";
+          stream = createAnthropicPullStream({
+            handle,
+            translator: new AnthropicStreamTranslator(context, {
+              beforeMessageStop: (final, response) => {
+                commitContinuation(continuationIndex, commitToken, scope, final, response);
+              },
+            }),
+            keepAliveMs: dependencies.keepAliveMs,
+            abortController: attemptLink.controller,
+            onClose: () => {
+              attemptLink.unlink();
+              requestLink.unlink();
+            },
           });
+          const response = new Response(stream, {
+            headers: { ...ANTHROPIC_SSE_HEADERS, "request-id": requestId },
+          });
+          streamOwnsAttempt = true;
+          streamOwnsLink = true;
+          return response;
         } catch (error) {
-          releaseAtomicBytePermit(final);
-          releaseAtomicBytePermit(response);
+          if (handle && stage === "prelude") {
+            releaseFailedPreludeHandle(handle, attemptLink.controller, error);
+          } else if (!attemptLink.controller.signal.aborted) {
+            attemptLink.controller.abort(error);
+          }
+          if (stream && !streamOwnsAttempt) void stream.cancel(error).catch(() => undefined);
+
+          const safeNonstreamFailure = stage === "nonstream" &&
+            nonstreamFailure?.source === "final" && !nonstreamFailure.sawRelayEvent;
+          const safePreStreamFailure = stage === "start" || stage === "prelude";
+          const safePreJsonFailure = stage === "start" || safeNonstreamFailure;
+          const retry = attempt === 0 && preparedDecision === "hit" &&
+            preparedMatch !== null && definitivePreviousResponseNotFound(error) &&
+            (clientWantsStream ? safePreStreamFailure : safePreJsonFailure);
+          if (retry && continuationIndex.compareDelete(preparedMatch!)) {
+            completeIncomingAdmission();
+            attempt += 1;
+            continue;
+          }
           throw error;
+        } finally {
+          if (!streamOwnsAttempt) attemptLink.unlink();
         }
       }
-
-      // Do not commit an Anthropic SSE 200 until R2 has proven successful
-      // upstream headers. Initial provider failures then use the normal
-      // Anthropic HTTP error mapping; failures after this point stay in-band.
-      if (handle.upstreamPrelude) await handle.upstreamPrelude;
-
-      const stream = createAnthropicPullStream({
-        handle,
-        translator: new AnthropicStreamTranslator(context),
-        keepAliveMs: dependencies.keepAliveMs,
-        abortController: linked.controller,
-        onClose: linked.unlink,
-      });
-      streamOwnsLink = true;
-      return new Response(stream, {
-        headers: { ...ANTHROPIC_SSE_HEADERS, "request-id": requestId },
-      });
     } catch (error) {
-      if (!linked.controller.signal.aborted) linked.controller.abort(error);
+      if (!requestLink.controller.signal.aborted) requestLink.controller.abort(error);
       return anthropicErrorResponse(error, requestId);
     } finally {
-      if (!streamOwnsLink) linked.unlink();
+      completeIncomingAdmission();
+      retainedIncomingLease?.release();
+      retainedIncomingLease = undefined;
+      if (!streamOwnsLink) requestLink.unlink();
     }
   });
 

@@ -79,7 +79,8 @@ describe("Images API compatibility", () => {
       for (const body of bodies) {
         expect(body).toEqual({
           model: "gpt-5.6-sol",
-          store: false,
+          store: true,
+          stream: true,
           input: "a red circle",
           user: "user-123",
           tools: [{
@@ -140,7 +141,8 @@ describe("Images API compatibility", () => {
       expect(parsed.n).toBe(1);
       expect(buildGenerationBodies(parsed)[0]).toEqual({
         model: "gpt-5.6-sol",
-        store: false,
+        store: true,
+        stream: true,
         input: "snapshot",
         tools: [{ type: "image_generation", model: "gpt-image-2-2026-04-21" }],
         tool_choice: { type: "image_generation" },
@@ -217,7 +219,8 @@ describe("Images API compatibility", () => {
       });
       expect(bodies[0]).toMatchObject({
         model: "gpt-5.6-sol",
-        store: false,
+        store: true,
+        stream: true,
         user: "editor-1",
         tools: [{
           type: "image_generation",

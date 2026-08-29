@@ -10,6 +10,7 @@ import {
   canonicalJson,
   GP_V2_R1_SCHEMA_VERSION,
   GP_V2_R2_SCHEMA_VERSION,
+  sha256Hex,
   utf8Bytes,
   type AwarenessEnvelope,
   type AwarenessLiveness,
@@ -2103,6 +2104,67 @@ describe("V2TransportSession", () => {
     await active.close();
   });
 
+  it("digests, accounts, compresses, and frames the exact normalized R8 request bytes", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING });
+    await harness.start();
+    const controller = new AbortController();
+    const body = Object.freeze({
+      model: "gpt-5.6-sol",
+      input: "persisted continuation",
+      previous_response_id: "resp_parent_exact",
+      stream: false,
+      store: false,
+      vendor_extension: { preserved: true },
+    });
+    const expectedBody = { ...body, stream: true, store: true };
+    const expectedBytes = utf8Bytes(canonicalJson(expectedBody));
+    const pending = harness.session.run(body, controller.signal);
+    void pending.catch(() => undefined);
+
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_commit")
+    ));
+    const frames = [...harness.hostFrames.values()];
+    const open = frames.find(
+      (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+        frame.kind === "request_open"
+      ),
+    )!;
+    const data = frames
+      .filter((frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_data" }> => (
+        frame.kind === "request_data"
+      ))
+      .sort((left, right) => left.partIndex - right.partIndex);
+    const commit = frames.find(
+      (frame): frame is ReliableFrame<R2RequestCommitFrame> => frame.kind === "request_commit",
+    )!;
+    const carried = Buffer.concat(data.map(frame => Buffer.from(
+      base64UrlDecode(frame.dataBase64Url),
+    )));
+
+    expect(open).toMatchObject({
+      requestDigest: await sha256Hex(expectedBytes),
+      decodedBytes: expectedBytes.byteLength,
+      encodedBytes: expectedBytes.byteLength,
+      encoding: "identity",
+      partCount: data.length,
+    });
+    expect(commit).toMatchObject({
+      requestDigest: open.requestDigest,
+      decodedBytes: open.decodedBytes,
+      encodedBytes: open.encodedBytes,
+      encoding: open.encoding,
+      partCount: open.partCount,
+    });
+    expect(Buffer.compare(carried, Buffer.from(expectedBytes))).toBe(0);
+    expect(JSON.parse(carried.toString("utf8"))).toEqual(expectedBody);
+    expect(body).toMatchObject({ stream: false, store: false });
+
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await harness.close();
+  });
+
   it("advances a large request across multiple windows without commit overtaking data", async () => {
     const harness = new TransportHarness();
     await harness.start();
@@ -2296,7 +2358,7 @@ describe("V2TransportSession", () => {
     expect(encoded.byteLength).toBe(open.encodedBytes);
     expect(Buffer.compare(
       Buffer.from(gunzipSync(encoded)),
-      Buffer.from(utf8Bytes(canonicalJson(body))),
+      Buffer.from(utf8Bytes(canonicalJson({ ...body, store: true }))),
     )).toBe(0);
     await harness.commit(pending);
     await harness.close();

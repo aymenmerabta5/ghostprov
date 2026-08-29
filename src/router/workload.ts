@@ -15,6 +15,8 @@ export interface WorkloadDescriptor {
 
 export interface WorkloadOptions {
   encodedBytes?: number;
+  /** Exact JSON structural bytes already measured by the caller. */
+  structuralBytes?: number;
 }
 
 const MiB = 1024 ** 2;
@@ -119,13 +121,15 @@ export function classifyWorkload(
   body: Record<string, unknown>,
   options: WorkloadOptions = {},
 ): WorkloadDescriptor {
-  if (
-    options.encodedBytes !== undefined &&
-    (!Number.isSafeInteger(options.encodedBytes) || options.encodedBytes < 0)
-  ) {
-    throw new RangeError("encodedBytes must be a non-negative safe integer");
+  for (const [name, value] of [
+    ["encodedBytes", options.encodedBytes],
+    ["structuralBytes", options.structuralBytes],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
   }
-  const structuralBytes = jsonEncodedByteLength(body);
+  const structuralBytes = options.structuralBytes ?? jsonEncodedByteLength(body);
   const requestBytes = Math.max(options.encodedBytes ?? 0, structuralBytes);
   const tools = Array.isArray(body.tools) ? body.tools : [];
   const imageTool = tools.find(tool => tool && typeof tool === "object" && (tool as any).type === "image_generation") as Record<string, unknown> | undefined;

@@ -6,6 +6,16 @@ const root = path.resolve(import.meta.dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
 const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
+const agentsGuide = fs.readFileSync(path.join(root, "AGENTS.md"), "utf8");
+const claudeGuide = fs.readFileSync(path.join(root, "CLAUDE.md"), "utf8");
+const historicalContinuationDocs = ["plans", "specs"].flatMap(section => (
+  fs.readdirSync(path.join(root, "docs", "superpowers", section))
+    .filter(name => name.endsWith(".md"))
+    .map(name => path.join(root, "docs", "superpowers", section, name))
+)).filter(file => /store:false|store: false|"store":false|"store": false/.test(
+  fs.readFileSync(file, "utf8"),
+));
+const historicalPolicyMarker = "Historical and superseded continuation policy (2026-08-28)";
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const liveMultiSandbox = fs.readFileSync(path.join(root, "scripts", "live_multi_sandbox.ts"), "utf8");
 const liveVerify = fs.readFileSync(path.join(root, "scripts", "live_verify.ts"), "utf8");
@@ -55,8 +65,8 @@ describe("project documentation", () => {
     expect(readme).toContain("two true bulk transfers remain forbidden");
     expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=8");
-    expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r7");
-    expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r5");
+    expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r8");
+    expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
     expect(envExample).toContain("GHOSTPROV_API_KEY=GHOST_IS_KING");
   });
@@ -188,7 +198,7 @@ describe("project documentation", () => {
       "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
       "build:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts --write",
       "check:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts",
-      "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r7/sidecar.bundle.js",
+      "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r8/sidecar.bundle.js",
       "test:v2-deno-fs": "bunx deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
     });
     expect(pkg.scripts).not.toHaveProperty("test:daemon");
@@ -196,8 +206,21 @@ describe("project documentation", () => {
     expect(unitScript.includes("tests/images-compat.test.ts")).toBe(true);
     expect(unitScript.includes("tests/images-service.test.ts")).toBe(true);
     expect(unitScript.includes("tests/http-errors.test.ts")).toBe(true);
+    expect(unitScript.includes("tests/upstream-policy.test.ts")).toBe(true);
+    expect(unitScript.includes("tests/anthropic-continuation.test.ts")).toBe(true);
+    expect(unitScript.includes("tests/router-provenance.test.ts")).toBe(true);
     expect(integrationScript.includes("tests/images-http.test.ts")).toBe(true);
+    expect(integrationScript.includes("tests/anthropic-continuation-http.test.ts")).toBe(true);
     expect(integrationScript.includes("tests/multi-sandbox-integration.test.ts")).toBe(true);
+    for (const [name, command] of Object.entries(pkg.scripts) as Array<[string, string]>) {
+      expect(`${name} ${command}`).not.toMatch(
+        /native[-_: ]*upstream[-_: ]*(?:wss|websocket)|(?:wss|websocket)[-_: ]*upstream[-_: ]*native/i,
+      );
+    }
+    const obsoletePhaseZeroFiles = ["src", "scripts", "tests"].flatMap(directory => (
+      fs.readdirSync(path.join(root, directory), { recursive: true }) as string[]
+    )).filter(file => /upstream/i.test(file) && /(?:wss|websocket)/i.test(file));
+    expect(obsoletePhaseZeroFiles).toEqual([]);
     expect(fs.existsSync(path.join(root, "scripts", "live_verify.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "probe_browserless_prism.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_multi_sandbox.ts"))).toBe(true);
@@ -228,11 +251,40 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_MONITOR_ROOT=http://127.0.0.1:18787");
   });
 
-  it("documents bounded continuations and outcome-aware sandbox health", () => {
-    expect(readme).toContain("retain only byte-budgeted deltas");
-    expect(readme).toContain("never cached quadratically");
+  it("documents persisted continuation bounds, scope, affinity, and terminal ordering", () => {
+    for (const value of [
+      "normalized, copy-on-write, to explicit `stream:true` and `store:true`",
+      "Generated WebSocket turns are provider-backed",
+      "explicit `generate:false` warmup aliases",
+      "separate app-scoped, content-free prefix index",
+      "one app-scoped, process-local continuation index",
+      "at most 4,096 records",
+      "60-minute absolute TTL",
+      "reserves bounded concurrent commit capacity",
+      "exact project/incarnation before public terminal exposure",
+      "one-hour, content-free routing hint",
+      "approximately 30-day retention window",
+    ]) expect(readme).toContain(value);
+    for (const value of [
+      "AuthenticatedTenantScope",
+      "Generated WebSocket responses are provider-persisted",
+      "Authoritative terminal proof, router provenance",
+      "before WebSocket graph handling and before V2 canonical bytes/digests",
+    ]) expect(agentsGuide).toContain(value);
+    expect(claudeGuide).toBe("@AGENTS.md\n");
     expect(readme).toContain("Client cancellations and definitive upstream errors are routing-neutral");
     expect(readme).toContain("sixty-second decaying sandbox health score");
+  });
+
+  it("marks historical store:false plans and specs as superseded without rewriting them", () => {
+    expect(historicalContinuationDocs.length).toBeGreaterThan(0);
+    for (const file of historicalContinuationDocs) {
+      const source = fs.readFileSync(file, "utf8");
+      expect(source, path.relative(root, file)).toContain(historicalPolicyMarker);
+      expect(source, path.relative(root, file)).toMatch(
+        /store:false|store: false|"store":false|"store": false/,
+      );
+    }
   });
 
   it("documents active-flight credits and bounded completion recovery", () => {

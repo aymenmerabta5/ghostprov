@@ -1,5 +1,7 @@
 # GhostProv Concurrency and Codex WebSocket Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver a concurrency-first Responses API mirror with real HTTP streaming, Codex-compatible WebSockets, bounded `store:false` continuation memory, efficient slot polling, negotiated daemon v6.3 transport, and a portable Playwright bridge.

@@ -31,6 +31,7 @@ import { ResponsesStreamProtocol } from "./stream-protocol";
 import { assertUnicodeWellFormed, UnicodeStopFilter } from "./stream-stop-filter";
 import type { AnthropicContentBlockDelta, AnthropicSseEvent } from "./stream-types";
 import type {
+  AnthropicAdapterMessage,
   AnthropicResponseContentBlock,
   AnthropicThinkingBlock,
   AnthropicToolUseBlock,
@@ -77,6 +78,14 @@ function outputItemId(item: Record<string, unknown>): string | null {
   return typeof item.id === "string" && item.id.length > 0 ? item.id : null;
 }
 
+export type AnthropicStreamTranslatorOptions = {
+  /** Runs after terminal reconciliation and immediately before message_stop. */
+  beforeMessageStop?(
+    finalValue: unknown,
+    projected: AnthropicAdapterMessage,
+  ): void;
+};
+
 /**
  * Pure, pull-safe Responses-frame translator.
  *
@@ -86,6 +95,7 @@ function outputItemId(item: Record<string, unknown>): string | null {
  */
 export class AnthropicStreamTranslator {
   readonly #context: AnthropicResponseContext;
+  readonly #beforeMessageStop: AnthropicStreamTranslatorOptions["beforeMessageStop"];
   readonly #limits: AnthropicRequestLimits;
   readonly #streamLimits: AnthropicStreamLimits;
   readonly #stopSequences: string[];
@@ -106,7 +116,10 @@ export class AnthropicStreamTranslator {
   #drainCursor = 0;
   #nextBlockIndex = 0;
 
-  constructor(context: AnthropicResponseContext) {
+  constructor(
+    context: AnthropicResponseContext,
+    options: AnthropicStreamTranslatorOptions = {},
+  ) {
     this.#stopSequences = [...responseStopSequences(context.stopSequences)];
     try {
       this.#limits = resolveAnthropicRequestLimits(context.limits);
@@ -117,6 +130,7 @@ export class AnthropicStreamTranslator {
     this.#protocol = new ResponsesStreamProtocol(this.#streamLimits);
     this.#budget = new AnthropicStreamBudget(this.#streamLimits);
     this.#context = { ...context, stopSequences: this.#stopSequences };
+    this.#beforeMessageStop = options.beforeMessageStop;
     this.#textFilter = new UnicodeStopFilter(this.#stopSequences);
   }
 
@@ -438,16 +452,20 @@ export class AnthropicStreamTranslator {
       );
       const encryptedContent = item.encrypted_content;
       if (typeof encryptedContent !== "string" || encryptedContent.length === 0) return;
-      const converted = responseToAnthropic(terminalForStreamItem(item), this.#context);
-      const thinking = converted.content[0];
-      if (!thinking || thinking.type !== "thinking" || thinking.thinking !==
-        (this.#context.thinkingDisplay === "omitted" ? "" : summary)) {
-        malformedEvent();
-      }
       block.itemId = id;
-      block.signature = thinking.signature;
       block.forceStart = true;
       block.done = true;
+      const canEmitSignature = this.#blocks[this.#drainCursor] === block &&
+        this.#protocol.canExpose(outputIndex);
+      if (canEmitSignature) {
+        const converted = responseToAnthropic(terminalForStreamItem(item), this.#context);
+        const thinking = converted.content[0];
+        if (!thinking || thinking.type !== "thinking" || thinking.thinking !==
+          (this.#context.thinkingDisplay === "omitted" ? "" : summary)) {
+          malformedEvent();
+        }
+        this.#reconcileSignature(block, thinking.signature);
+      }
       this.#drain(events);
       return;
     }
@@ -548,12 +566,12 @@ export class AnthropicStreamTranslator {
           block.seenUnits = thinking.thinking.length;
         }
         this.#assertStreamedPrefix(block, thinking.thinking);
+        this.#reconcileSignature(block, thinking.signature);
         if (!block.stopped) {
           this.#clearPending(block);
           if (thinking.thinking.length > block.emittedUnits) {
             this.#appendPending(block, thinking.thinking.slice(block.emittedUnits));
           }
-          block.signature = thinking.signature;
         }
       } else {
         const toolBlock = descriptor.block as AnthropicToolUseBlock;
@@ -630,6 +648,13 @@ export class AnthropicStreamTranslator {
       },
       usage: converted.usage,
     });
+    if (this.#beforeMessageStop) {
+      try {
+        this.#beforeMessageStop(finalValue, converted);
+      } catch {
+        // Continuation metadata is advisory and must never alter public SSE.
+      }
+    }
     events.push({ type: "message_stop" });
     this.#protocol.markTerminal();
     this.#terminal = true;
@@ -882,6 +907,21 @@ export class AnthropicStreamTranslator {
     block.seenUnits = text.length;
   }
 
+  #reconcileSignature(block: StreamBlock, signature: string): void {
+    const digest = createHash("sha256").update(signature, "utf8").digest("base64url");
+    if (block.signatureDigest !== null) {
+      if (block.signatureDigest !== digest) {
+        throw invalidUpstream(
+          "Responses stream could not be reconciled with its final response.",
+        );
+      }
+      return;
+    }
+    this.#budget.countPayload("reasoning", signature);
+    block.signatureDigest = digest;
+    if (!block.signatureEmitted) block.signature = signature;
+  }
+
   #drain(events: AnthropicSseEvent[]): void {
     while (this.#drainCursor < this.#blocks.length) {
       const block = this.#blocks[this.#drainCursor];
@@ -926,17 +966,19 @@ export class AnthropicStreamTranslator {
 
       if (block.kind === "thinking" && block.done && block.signature !== null &&
         !block.signatureEmitted) {
+        const signature = block.signature;
         events.push({
           type: "content_block_delta",
           index: block.index!,
-          delta: { type: "signature_delta", signature: block.signature },
+          delta: { type: "signature_delta", signature },
         });
         block.signatureEmitted = true;
+        block.signature = null;
       }
 
       const hasBufferedText = block.kind === "text" && this.#textFilter.hasPending(block);
       const canStop = block.done && block.pending.length === 0 && !hasBufferedText &&
-        (block.kind !== "thinking" || block.signature !== null) &&
+        (block.kind !== "thinking" || block.signatureEmitted) &&
         (this.#finishing || this.#matchedStop === null);
       if (!canStop) return;
 

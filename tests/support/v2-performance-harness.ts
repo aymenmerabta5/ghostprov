@@ -1308,7 +1308,7 @@ export function createExactSizedV2Request(
     model: "gpt-5.6-sol",
     input: prefix,
     service_tier: "fast",
-    store: false,
+    store: true,
     stream: true,
   };
   const fixedBytes = utf8Bytes(canonicalJson(request)).byteLength;

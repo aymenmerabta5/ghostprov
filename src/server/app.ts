@@ -1,16 +1,27 @@
+import { ResponsesHttpContinuationIndex } from "../http/responses-continuation";
 import { Hono } from "hono";
 import type { RunHandle } from "../relay/run-handle";
+import { definitivePreviousResponseNotFound } from "../relay/continuation-error";
+import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
 import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
 import type { ImageCompatOptions } from "../images/compat";
 import { registerAnthropicRoutes } from "../anthropic/routes";
+import { AnthropicContinuationIndex } from "../anthropic/continuation";
 import {
   anthropicModelsFromEnv,
   type AnthropicModelOptions,
 } from "../anthropic/model";
+import type { ResponseProvenanceLookup } from "../router/provenance";
+import { jsonEncodedByteLength } from "../router/workload";
 import type { IncomingResourceLease } from "../router/router";
-import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
+import {
+  incomingLeaseTimingView,
+  linkIncomingLeaseAbort,
+  resolveHttpClientId,
+  takeIncomingBodyLease,
+} from "../http/request-lease";
 import {
   releaseAtomicBytePermit,
   transferAtomicBytePermit,
@@ -20,7 +31,11 @@ import {
   summarizeV2Releases,
 } from "../v2/release-observability";
 import type { FleetSnapshot } from "../fleet/types";
-import { apiKeyAuthorized } from "../http/api-key";
+import {
+  apiKeyAuthorized,
+  isAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../http/api-key";
 import { isAnthropicRequestPath } from "../http/request-policy";
 import {
   AnthropicRequestError,
@@ -36,7 +51,11 @@ export interface RouterLike {
       source?: "http" | "websocket" | "image" | "anthropic" | "internal";
       signal?: AbortSignal;
       incomingLease?: IncomingResourceLease;
+      /** Trusted server-derived tenant/provider-account scope; never request data. */
+      authorizationScope?: AuthenticatedTenantScope;
       encodedBodyBytes?: number;
+      structuralBodyBytes?: number;
+      fairnessRequestBytes?: number;
     },
   ): Promise<RunHandle>;
   acquireIncomingBody?(
@@ -44,6 +63,11 @@ export interface RouterLike {
     signal?: AbortSignal,
     options?: { maxBytes?: number },
   ): Promise<IncomingResourceLease>;
+  responseProvenanceAuthorizationScope?(): AuthenticatedTenantScope | null;
+  lookupResponseProvenance?(
+    responseId: unknown,
+    authorizationScope?: AuthenticatedTenantScope,
+  ): ResponseProvenanceLookup;
   snapshot(): {
     capacity: number;
     active: number;
@@ -61,6 +85,12 @@ export interface GhostProvAppOptions {
   fleetSnapshot?: () => FleetSnapshot;
   imageOptions?: ImageCompatOptions;
   anthropicModels?: AnthropicModelOptions;
+  /** One bounded, content-free native Responses full-history index. */
+  responsesContinuationIndex?: ResponsesHttpContinuationIndex;
+  /** One bounded, content-free Claude continuation index owned by this app. */
+  anthropicContinuationIndex?: AnthropicContinuationIndex;
+  /** Trusted server-derived tenant/provider-account scope; never request data. */
+  authorizationScope?: AuthenticatedTenantScope;
   keepAliveMs?: number;
 }
 
@@ -184,20 +214,50 @@ function nextResponseSequence(data: string, current: number | null): number | nu
   return current === null ? next : Math.max(current, next);
 }
 
+function linkedAbortController(signal: AbortSignal): {
+  controller: AbortController;
+  unlink(): void;
+} {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal.reason);
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return {
+    controller,
+    unlink: () => signal.removeEventListener("abort", abort),
+  };
+}
+
 async function nonStreamingFinal(
   handle: RunHandle,
   cancelRelay: (reason?: unknown) => void,
+  onFailure: (
+    source: "final" | "events" | "unknown",
+    sawRelayEvent: boolean,
+  ) => void = () => undefined,
 ): Promise<any> {
   const iterator = handle.events();
+  let sawRelayEvent = false;
+  let finalRejected = false;
+  let eventsRejected = false;
   let settledFinal: any = null;
   const final = handle.final.then(value => {
     settledFinal = value;
     return value;
+  }, error => {
+    finalRejected = true;
+    throw error;
   });
   const drain = (async () => {
-    while (!(await iterator.next()).done) {
-      // Non-streaming callers still have to consume the bounded transport
-      // queue. The authoritative response is provided by handle.final.
+    try {
+      while (!(await iterator.next()).done) {
+        sawRelayEvent = true;
+        // Non-streaming callers still have to consume the bounded transport
+        // queue. The authoritative response is provided by handle.final.
+      }
+    } catch (error) {
+      eventsRejected = true;
+      throw error;
     }
   })();
   try {
@@ -208,7 +268,24 @@ async function nonStreamingFinal(
     else void final.then(releaseAtomicBytePermit, () => undefined);
     cancelRelay(error);
     void iterator.return(undefined).catch(() => undefined);
+    onFailure(
+      finalRejected ? "final" : eventsRejected ? "events" : "unknown",
+      sawRelayEvent,
+    );
     throw error;
+  }
+}
+
+function releaseFailedPreludeHandle(
+  handle: RunHandle,
+  controller: AbortController,
+  error: unknown,
+): void {
+  if (!controller.signal.aborted) controller.abort(error);
+  try {
+    void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined);
+  } catch {
+    // A throwing final accessor has no terminal allocation to release.
   }
 }
 
@@ -277,6 +354,7 @@ function responseEventStream(
   const encoder = new TextEncoder();
   const iterator = handle.events();
   let deliveredChunk: Uint8Array | null = null;
+  let dequeuedFrame: SseFrame | null = null;
   let pendingNext: Promise<NextOutcome> | null = null;
   let sawTerminal = false;
   let nextSequence: number | null = null;
@@ -316,6 +394,8 @@ function responseEventStream(
     finished = true;
     releaseAtomicBytePermit(deliveredChunk);
     deliveredChunk = null;
+    releaseAtomicBytePermit(dequeuedFrame);
+    dequeuedFrame = null;
     releaseAtomicBytePermit(finalForCleanup);
     finalForCleanup = null;
     options.close();
@@ -341,7 +421,19 @@ function responseEventStream(
     | { kind: "keepalive" }
     | CancelledOutcome
   > => {
-    const next = pendingNext ??= iterator.next().then(result => ({ kind: "next", result }));
+    const next = pendingNext ??= iterator.next().then(result => {
+      if (!result.done) {
+        if (cancelled || finished) {
+          releaseAtomicBytePermit(result.value);
+        } else {
+          // Own a frame as soon as iterator.next resolves. Cancellation may run
+          // before the awaiting pull continuation is scheduled.
+          releaseAtomicBytePermit(dequeuedFrame);
+          dequeuedFrame = result.value;
+        }
+      }
+      return { kind: "next" as const, result };
+    });
     const cancellation = cancellationWaiter();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const keepAlive = new Promise<{ kind: "keepalive" }>(resolve => {
@@ -383,17 +475,30 @@ function responseEventStream(
 
         if (!outcome.result.done) {
           const frame = outcome.result.value;
-          if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) sawTerminal = true;
+          if (RESPONSE_TERMINAL_EVENTS.has(frame.event)) {
+            // A terminal transcript frame can reach the bounded event queue just
+            // before the authoritative final/provenance Promise settles. Never
+            // expose it until that commit is observable through handle.final.
+            const cancellation = cancellationWaiter();
+            const finalOutcome = await Promise.race([
+              handle.final.then(() => ({ kind: "final" as const })),
+              cancellation.promise,
+            ]).finally(cancellation.dispose);
+            if (cancelled || finalOutcome.kind === "cancelled") return;
+            sawTerminal = true;
+          }
           nextSequence = nextResponseSequence(frame.data, nextSequence);
           let encoded: Uint8Array | null = null;
           try {
             encoded = encoder.encode(sseFrame(frame.event, frame.data));
             transferAtomicBytePermit(frame, encoded, "http-sse-chunk");
+            if (dequeuedFrame === frame) dequeuedFrame = null;
             controller.enqueue(encoded);
             deliveredChunk = encoded;
           } catch (error) {
             releaseAtomicBytePermit(encoded);
             releaseAtomicBytePermit(frame);
+            if (dequeuedFrame === frame) dequeuedFrame = null;
             throw error;
           }
           return;
@@ -440,6 +545,8 @@ function responseEventStream(
       finished = true;
       releaseAtomicBytePermit(deliveredChunk);
       deliveredChunk = null;
+      releaseAtomicBytePermit(dequeuedFrame);
+      dequeuedFrame = null;
       releaseAtomicBytePermit(finalForCleanup);
       finalForCleanup = null;
       wakeCancellation?.();
@@ -553,6 +660,17 @@ const CODEX_MODELS = Object.freeze([
 export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const app = new Hono();
   const keepAliveMs = options.keepAliveMs ?? 15_000;
+  const scopeValue = options.authorizationScope ??
+    options.router.responseProvenanceAuthorizationScope?.() ??
+    null;
+  if (scopeValue !== null && !isAuthenticatedTenantScope(scopeValue)) {
+    throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
+  }
+  const authorizationScope = scopeValue;
+  const responsesContinuationIndex = options.responsesContinuationIndex ??
+    new ResponsesHttpContinuationIndex();
+  const anthropicContinuationIndex = options.anthropicContinuationIndex ??
+    new AnthropicContinuationIndex();
   if (!Number.isSafeInteger(keepAliveMs) || keepAliveMs < 1 || keepAliveMs > MAX_TIMER_MS) {
     throw new RangeError(`keepAliveMs must be an integer from 1 through ${MAX_TIMER_MS}`);
   }
@@ -634,50 +752,167 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     } catch {
       return c.json({ error: { message: "invalid JSON body" } }, 400);
     }
+    const clientWantsStream = body.stream === true;
+    const rawStructuralBytes = jsonEncodedByteLength(body);
+    let upstreamBody: Record<string, unknown> = normalizeUpstreamResponsesRequest(body);
+    const upstreamStructuralBytes = upstreamBody === body
+      ? rawStructuralBytes
+      : jsonEncodedByteLength(upstreamBody);
+    const incomingLease = takeIncomingBodyLease(c.env);
     const requestSignal = c.req.raw.signal;
     const relayAbort = new AbortController();
     const abortRelay = () => relayAbort.abort(requestSignal.reason);
     if (requestSignal.aborted) abortRelay();
     else requestSignal.addEventListener("abort", abortRelay, { once: true });
+    const unlinkIncomingSignal = linkIncomingLeaseAbort(relayAbort, incomingLease);
+    let incomingAdmissionCompleted = false;
+    const completeIncomingAdmission = () => {
+      if (incomingAdmissionCompleted) return;
+      incomingAdmissionCompleted = true;
+      incomingLease?.completeAdmission?.();
+      unlinkIncomingSignal();
+    };
+    let incomingLeaseOwned = true;
+    const releaseIncomingLease = () => {
+      if (!incomingLeaseOwned) return;
+      incomingLeaseOwned = false;
+      incomingLease?.release();
+    };
     let streamOwnsCleanup = false;
     const cleanupSignal = () => requestSignal.removeEventListener("abort", abortRelay);
     try {
-      const handle = await options.router.startRelay(body, {
-        source: "http",
-        clientId: resolveHttpClientId(c.env, c.req.header("x-ghostprov-client-id")),
-        signal: relayAbort.signal,
-        incomingLease: takeIncomingBodyLease(c.env),
-      });
-      if (body.stream !== true) {
-        const final = await nonStreamingFinal(handle, reason => relayAbort.abort(reason));
-        return permittedJsonResponse(final);
-      }
+      const preparation = authorizationScope === null
+        ? null
+        : await responsesContinuationIndex.prepare(
+            upstreamBody,
+            authorizationScope,
+            relayAbort.signal,
+            incomingLease?.bodyBytes ?? incomingLease?.reservedBytes ?? upstreamStructuralBytes,
+          );
+      const continuationToken = preparation?.token ?? null;
+      const initialRelayBody = preparation?.relayBody ?? upstreamBody;
+      const hit = continuationToken?.decision === "hit";
+      const continuationLease = hit ? incomingLeaseTimingView(incomingLease) : undefined;
+      if (!hit) incomingLeaseOwned = false;
+      const clientId = resolveHttpClientId(c.env, c.req.header("x-ghostprov-client-id"));
+      let attempt = 0;
 
-      // R2 proves successful upstream HTTP headers before any response event.
-      // Waiting here lets an initial provider non-2xx remain an actual HTTP
-      // error instead of first committing a misleading outer 200. Legacy
-      // handles have no prelude and retain their established behavior.
-      let upstreamPrelude: Awaited<NonNullable<RunHandle["upstreamPrelude"]>> | undefined;
-      try {
-        upstreamPrelude = await handle.upstreamPrelude;
-      } catch (error) {
-        relayAbort.abort(error);
-        throw error;
-      }
+      for (;;) {
+        const attemptLink = linkedAbortController(relayAbort.signal);
+        let relayBody = attempt === 0 ? initialRelayBody : upstreamBody;
+        const relayStructuralBytes = relayBody === upstreamBody
+          ? upstreamStructuralBytes
+          : jsonEncodedByteLength(relayBody);
+        const encodedBodyBytes = typeof incomingLease?.bodyBytes === "number"
+          ? Math.min(
+              Number.MAX_SAFE_INTEGER,
+              Math.max(0, incomingLease.bodyBytes - rawStructuralBytes) + relayStructuralBytes,
+            )
+          : undefined;
+        let rawHandle: RunHandle | null = null;
+        let stream: ReadableStream<Uint8Array> | null = null;
+        let streamOwnsAttempt = false;
+        let stage: "start" | "nonstream" | "prelude" | "sse-commit" = "start";
+        let sawRelayEvent = false;
+        let nonstreamFailureSource: "final" | "events" | "unknown" | null = null;
+        try {
+          rawHandle = await options.router.startRelay(relayBody, {
+            source: "http",
+            clientId,
+            signal: attemptLink.controller.signal,
+            incomingLease: hit
+              ? continuationLease
+              : attempt === 0 ? incomingLease : undefined,
+            encodedBodyBytes,
+            structuralBodyBytes: relayStructuralBytes,
+            fairnessRequestBytes: attempt === 0 && hit
+              ? Math.max(incomingLease?.bodyBytes ?? 0, upstreamStructuralBytes)
+              : undefined,
+            authorizationScope: authorizationScope ?? undefined,
+          });
+          completeIncomingAdmission();
+          if (attempt > 0 && hit) {
+            releaseIncomingLease();
+            relayBody = {};
+            upstreamBody = {};
+            body = {};
+          }
+          const handle: RunHandle = {
+            events: () => rawHandle!.events(),
+            get rateLimit() { return rawHandle!.rateLimit; },
+            get upstreamPrelude() { return rawHandle!.upstreamPrelude; },
+            stats: rawHandle.stats,
+            final: rawHandle.final.then(final => {
+              if (authorizationScope !== null) {
+                responsesContinuationIndex.commit(continuationToken, authorizationScope, final);
+              }
+              return final;
+            }),
+          };
+          if (!clientWantsStream) {
+            stage = "nonstream";
+            const final = await nonStreamingFinal(
+              handle,
+              reason => attemptLink.controller.abort(reason),
+              (source, sawEvent) => {
+                nonstreamFailureSource = source;
+                sawRelayEvent = sawEvent;
+              },
+            );
+            return permittedJsonResponse(final);
+          }
 
-      const stream = responseEventStream(handle, keepAliveMs, {
-        cancelRelay: reason => relayAbort.abort(reason),
-        close: cleanupSignal,
-      });
-      streamOwnsCleanup = true;
-      const headers = new Headers(SSE_HEADERS);
-      if (upstreamPrelude?.upstreamRequestId) {
-        headers.set("x-request-id", upstreamPrelude.upstreamRequestId);
+          // R2 proves successful upstream HTTP headers before any response event.
+          // Waiting here lets an initial provider non-2xx remain an actual HTTP
+          // error instead of first committing a misleading outer 200. Legacy
+          // handles have no prelude and retain their established behavior.
+          stage = "prelude";
+          let upstreamPrelude: Awaited<NonNullable<RunHandle["upstreamPrelude"]>> | undefined;
+          try {
+            upstreamPrelude = await handle.upstreamPrelude;
+          } catch (error) {
+            releaseFailedPreludeHandle(handle, attemptLink.controller, error);
+            throw error;
+          }
+          stage = "sse-commit";
+          stream = responseEventStream(handle, keepAliveMs, {
+            cancelRelay: reason => attemptLink.controller.abort(reason),
+            close: () => {
+              attemptLink.unlink();
+              cleanupSignal();
+            },
+          });
+          const headers = new Headers(SSE_HEADERS);
+          if (upstreamPrelude?.upstreamRequestId) {
+            headers.set("x-request-id", upstreamPrelude.upstreamRequestId);
+          }
+          const response = new Response(stream, {
+            status: upstreamPrelude?.status ?? 200,
+            headers,
+          });
+          streamOwnsAttempt = true;
+          streamOwnsCleanup = true;
+          return response;
+        } catch (error) {
+          if (rawHandle && stage !== "prelude" && !attemptLink.controller.signal.aborted) {
+            attemptLink.controller.abort(error);
+          }
+          if (stream && !streamOwnsAttempt) void stream.cancel(error).catch(() => undefined);
+          const safeFailure = stage === "start" || stage === "prelude" ||
+            (stage === "nonstream" && nonstreamFailureSource === "final" && !sawRelayEvent);
+          const retry = attempt === 0 && hit && continuationToken !== null &&
+            continuationToken.match !== null && safeFailure &&
+            definitivePreviousResponseNotFound(error);
+          if (retry && responsesContinuationIndex.compareDelete(continuationToken!)) {
+            completeIncomingAdmission();
+            attempt += 1;
+            continue;
+          }
+          throw error;
+        } finally {
+          if (!streamOwnsAttempt) attemptLink.unlink();
+        }
       }
-      return new Response(stream, {
-        status: upstreamPrelude?.status ?? 200,
-        headers,
-      });
     } catch (error) {
       const normalized = normalizeApiError(error);
       if (normalized.status !== 499) {
@@ -685,6 +920,8 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       }
       return apiErrorResponse(error);
     } finally {
+      completeIncomingAdmission();
+      releaseIncomingLease();
       if (!streamOwnsCleanup) cleanupSignal();
     }
   });
@@ -699,17 +936,22 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       clientId,
       signal,
       incomingLease,
+      authorizationScope: authorizationScope ?? undefined,
     }),
   });
 
   registerAnthropicRoutes(app, {
     keepAliveMs,
     models: options.anthropicModels ?? anthropicModelsFromEnv(),
-    startRelay: (body, signal, clientId, incomingLease) => options.router.startRelay(body, {
+    continuationIndex: anthropicContinuationIndex,
+    continuationScope: authorizationScope ?? undefined,
+    startRelay: (body, signal, clientId, incomingLease, admission) => options.router.startRelay(body, {
       source: "anthropic",
       clientId,
       signal,
       incomingLease,
+      authorizationScope: authorizationScope ?? undefined,
+      fairnessRequestBytes: admission?.fairnessBytes,
     }),
   });
 

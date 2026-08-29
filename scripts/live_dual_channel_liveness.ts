@@ -191,7 +191,7 @@ export async function main(): Promise<void> {
     GP_AUTO_CREATE_PROJECTS: "0",
     GP_MAX_PROJECTS: "8",
     GP_PROVISION_CONCURRENCY: "4",
-    GP_V2_SIDECAR_REVISION: "r7",
+    GP_V2_SIDECAR_REVISION: "r8",
     GP_V2_DIAGNOSTICS: "1",
     GP_V2_DIAGNOSTICS_INTERVAL_MS: "1000",
     GP_METRICS_INTERVAL_MS: "1000",
@@ -257,12 +257,12 @@ export async function main(): Promise<void> {
   let monitor: Promise<void> | null = null;
   try {
     await system.start();
-    await waitFor("eight live R7 runtimes", () => {
+    await waitFor("eight live R8 runtimes", () => {
       const snapshots = system.registry.snapshots();
       return captured.size === 8 && snapshots.length === 8 && snapshots.every(snapshot =>
         snapshot.state === "ready" &&
         snapshot.protocolRevision === "r2" &&
-        snapshot.releaseRevision === "r7" &&
+        snapshot.releaseRevision === "r8" &&
         snapshot.transportConnected === true &&
         isRuntimeHealthy(snapshot)
       );

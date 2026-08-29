@@ -37,7 +37,7 @@ function terminalHarness(
   return { final, frame, handle, pool, retainedBytes };
 }
 
-function appFor(handle: V2RunHandle) {
+function appFor(handle: RunHandle) {
   const router: RouterLike = {
     async startRelay() { return handle; },
     snapshot: () => ({
@@ -52,7 +52,7 @@ function appFor(handle: V2RunHandle) {
   return createGhostProvApp({ router });
 }
 
-async function responseFrom(handle: V2RunHandle, stream: boolean): Promise<Response> {
+async function responseFrom(handle: RunHandle, stream: boolean): Promise<Response> {
   return appFor(handle).request("/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -128,7 +128,7 @@ describe("terminal final-object permit ownership", () => {
     value.pool.close();
   });
 
-  it("decouples cached finals so sequential jumbo sockets share one live lane", async () => {
+  it("decouples provider-persisted finals so sequential jumbo sockets share one live lane", async () => {
     const first = terminalHarness();
     const firstSocket = new SlowSocket();
     const firstGraph = new ResponseGraph();
@@ -149,11 +149,11 @@ describe("terminal final-object permit ownership", () => {
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 1, jumboUsedBytes: first.retainedBytes });
     firstSocket.flush();
     await waitFor(() => first.pool.snapshot().activePermits === 0);
-    expect(firstGraph.stats().nodes).toBe(1);
+    expect(firstGraph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 0, jumboUsedBytes: 0 });
 
-    // Keep the first socket and its 1 MiB continuation cache open. A second
-    // above-soft terminal must still acquire the sole process jumbo lane.
+    // Keep the first socket open without retaining a generated-history copy. A
+    // second above-soft terminal must still acquire the sole process jumbo lane.
     const second = terminalHarness(1024 * 1024, first.pool);
     const secondSocket = new SlowSocket();
     const secondGraph = new ResponseGraph();
@@ -172,12 +172,50 @@ describe("terminal final-object permit ownership", () => {
     await waitFor(() => secondSocket.sent.length === 1);
     secondSocket.flush();
     await waitFor(() => first.pool.snapshot().activePermits === 0);
-    expect(secondGraph.stats().nodes).toBe(1);
+    expect(secondGraph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(first.pool.snapshot()).toMatchObject({ activePermits: 0, jumboUsedBytes: 0 });
 
     firstSession.close();
     secondSession.close();
     first.pool.close();
+  });
+
+  it("releases a dequeued terminal permit when HTTP SSE cancels during final proof", async () => {
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    const permit = await pool.acquire(8_192);
+    const frame = attachAtomicBytePermit({
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_waiting", status: "completed", output: [] },
+      }),
+    }, permit);
+    let yielded = false;
+    let resolveFinal!: (value: Record<string, unknown>) => void;
+    const final = new Promise<Record<string, unknown>>(resolve => { resolveFinal = resolve; });
+    const handle: RunHandle = {
+      async *events() {
+        yielded = true;
+        yield frame;
+      },
+      final,
+      stats: { bytes: 0, firstByteMs: null, frames: 1 },
+    };
+    const response = await responseFrom(handle, true);
+    const reader = response.body!.getReader();
+    const pendingRead = reader.read();
+    await waitFor(() => yielded && pool.snapshot().activePermits === 1);
+
+    await reader.cancel("client disconnected during terminal proof");
+    await waitFor(() => pool.snapshot().activePermits === 0);
+    resolveFinal({ id: "resp_waiting", status: "completed", output: [] });
+    await pendingRead;
+
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+    });
+    pool.close();
   });
 
   it("releases a definitive final that settles after WebSocket cancellation", async () => {

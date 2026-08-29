@@ -34,8 +34,22 @@ import {
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
 const R2_ASSETS = await loadV2SidecarAssets({ revision: "r2" });
+const R3_ASSETS = await loadV2SidecarAssets({ revision: "r3" });
 const R4_ASSETS = await loadV2SidecarAssets({ revision: "r4" });
 const R5_ASSETS = await loadV2SidecarAssets({ revision: "r5" });
+const R6_ASSETS = await loadV2SidecarAssets({ revision: "r6" });
+const R7_ASSETS = await loadV2SidecarAssets({ revision: "r7" });
+const R8_ASSETS = await loadV2SidecarAssets({ revision: "r8" });
+const RELEASE_ASSETS = Object.freeze([
+  ASSETS,
+  R2_ASSETS,
+  R3_ASSETS,
+  R4_ASSETS,
+  R5_ASSETS,
+  R6_ASSETS,
+  R7_ASSETS,
+  R8_ASSETS,
+]);
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
@@ -272,7 +286,7 @@ function readyEnvelope(
 
 function bootstrapHarness(
   fault: Fault = "none",
-  revision?: V2SidecarRevision,
+  revision?: V2SidecarRevision | string,
   maxActivePerSandbox = 8,
   assets = ASSETS,
   controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number } = {},
@@ -386,6 +400,79 @@ describe("V2BootstrapController", () => {
       .toMatchObject({ transportProfile: "bulk-v1" });
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/revision.json")!))
       .toMatchObject({ revision: "r5", protocolRevision: "r2" });
+  });
+
+  it("matches only exact frozen R1-R8 prior sidecar entrypoints", async () => {
+    const harness = bootstrapHarness("none", "r8", 8, R8_ASSETS);
+    await harness.controller.ensureReady();
+    const launcher = harness.gateway.launchers[0]!;
+
+    const patternFor = (helper: "gp_exact_r2_entrypoint" | "gp_exact_sidecar_entrypoint") => {
+      const helperStart = launcher.indexOf(`sub ${helper}`);
+      const patternStart = launcher.indexOf("m{", helperStart) + 2;
+      const patternEnd = launcher.indexOf("} ? $gp_args[8] : undef;", patternStart);
+      expect(helperStart).toBeGreaterThan(-1);
+      expect(patternStart).toBeGreaterThan(1);
+      expect(patternEnd).toBeGreaterThan(patternStart);
+      const source = launcher.slice(patternStart, patternEnd);
+      expect(source.endsWith("\\z")).toBe(true);
+      return {
+        source,
+        regex: new RegExp(`${source.slice(0, -2)}(?![\\s\\S])`),
+      };
+    };
+
+    const allReleases = patternFor("gp_exact_sidecar_entrypoint");
+    const r2Releases = patternFor("gp_exact_r2_entrypoint");
+    expect(allReleases.source).not.toContain("[a-f0-9]{64}");
+    expect(r2Releases.source).not.toContain("[a-f0-9]{64}");
+    for (const exactArgvProof of [
+      "return () unless @gp_args == 11;",
+      "return () unless $gp_args[1] eq 'run';",
+      "return () unless $gp_args[2] eq '--cached-only';",
+      "return () unless $gp_args[7] eq '--allow-write=/tmp/ghostprov-v2';",
+      "return 0 unless $gp_args[8] eq $gp_expected_entrypoint;",
+      'return 0 unless $gp_args[9] eq "--ghostprov-launch-nonce=$gp_nonce";',
+      'return 0 unless $gp_args[10] eq "--ghostprov-process-start=$gp_start";',
+    ]) expect(launcher).toContain(exactArgvProof);
+
+    for (const assets of RELEASE_ASSETS) {
+      const entrypoint = `/workspace/${assets.entrypointPath}`;
+      expect(allReleases.regex.test(entrypoint)).toBe(true);
+      expect(r2Releases.regex.test(entrypoint)).toBe(assets.protocolRevision === "r2");
+
+      const foreignBuild = RELEASE_ASSETS.find(candidate => (
+        candidate.buildHash !== assets.buildHash
+      ))!;
+      const foreignSchema = RELEASE_ASSETS.find(candidate => (
+        candidate.schemaHash !== assets.schemaHash
+      ))!;
+      const root = `/workspace/.ghostprov-v2/revisions/${assets.revision}`;
+      const invalidEntrypoints = [
+        `${root}/${"0".repeat(64)}/${assets.buildHash}/sidecar.bundle.js`,
+        `${root}/${assets.schemaHash}/${"f".repeat(64)}/sidecar.bundle.js`,
+        `${root}/${assets.schemaHash}/${foreignBuild.buildHash}/sidecar.bundle.js`,
+        `${root}/${foreignSchema.schemaHash}/${assets.buildHash}/sidecar.bundle.js`,
+        `prefix${entrypoint}`,
+        `${entrypoint}.old`,
+        `${entrypoint}/suffix`,
+        `${entrypoint}\n`,
+        `${entrypoint}\r\n`,
+      ];
+      for (const invalid of invalidEntrypoints) {
+        expect(allReleases.regex.test(invalid)).toBe(false);
+        expect(r2Releases.regex.test(invalid)).toBe(false);
+      }
+    }
+
+    const r9Entrypoint = `/workspace/.ghostprov-v2/revisions/r9/${R8_ASSETS.schemaHash}/${R8_ASSETS.buildHash}/sidecar.bundle.js`;
+    expect(allReleases.regex.test(r9Entrypoint)).toBe(false);
+    expect(r2Releases.regex.test(r9Entrypoint)).toBe(false);
+  });
+
+  it("rejects an unregistered sidecar revision before generating a launcher", () => {
+    expect(() => bootstrapHarness("none", "r9", 8, R8_ASSETS))
+      .toThrow("Unsupported V2 sidecar revision: r9");
   });
 
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
@@ -633,7 +720,13 @@ describe("V2BootstrapController", () => {
     expect(launcher).toContain("if ($gp_deno && !$gp_launch_error && defined $gp_prior_owner)");
     expect(launcher).toContain("sub gp_exact_r2_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[2345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      `/workspace/\\.ghostprov-v2/revisions/r2/${R2_ASSETS.schemaHash}/${R2_ASSETS.buildHash}/sidecar\\.bundle\\.js`,
+    );
+    expect(launcher).toContain(
+      `/workspace/\\.ghostprov-v2/revisions/r7/${R7_ASSETS.schemaHash}/${R7_ASSETS.buildHash}/sidecar\\.bundle\\.js`,
+    );
+    expect(launcher).toContain(
+      `/workspace/\\.ghostprov-v2/revisions/r8/${R8_ASSETS.schemaHash}/${R8_ASSETS.buildHash}/sidecar\\.bundle\\.js`,
     );
     expect(launcher).toContain(
       "gp_process_matches($gp_prior_pid, $gp_prior_nonce, $gp_prior_start, $gp_prior_entrypoint)",
@@ -661,7 +754,7 @@ describe("V2BootstrapController", () => {
     );
     expect(launcher).toContain("sub gp_exact_sidecar_entrypoint");
     expect(launcher).toContain(
-      "/workspace/\\.ghostprov-v2/revisions/r[12345]/[a-f0-9]{64}/[a-f0-9]{64}/sidecar\\.bundle\\.js$",
+      `/workspace/\\.ghostprov-v2/revisions/r1/${ASSETS.schemaHash}/${ASSETS.buildHash}/sidecar\\.bundle\\.js`,
     );
     expect(launcher).toContain(
       "gp_stop_if_current($gp_pid_file, $gp_unowned_pid_record, 0, $gp_unowned_pid, $gp_unowned_nonce, $gp_unowned_start, $gp_unowned_entrypoint, $gp_static_path, $gp_expected_static)",

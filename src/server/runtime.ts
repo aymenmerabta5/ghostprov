@@ -23,7 +23,13 @@ import type { WebSocketTelemetry } from "../ws/telemetry";
 import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
-import { apiKeyAuthorized, isProtectedApiPath } from "../http/api-key";
+import {
+  apiKeyAuthorized,
+  createAuthenticatedTenantScope,
+  isAuthenticatedTenantScope,
+  isProtectedApiPath,
+  type AuthenticatedTenantScope,
+} from "../http/api-key";
 
 export interface GhostProvServerOptions {
   app: Hono;
@@ -35,6 +41,8 @@ export interface GhostProvServerOptions {
   maxBodyBytes?: number;
   webSocketTelemetry?: WebSocketTelemetry;
   webSocketProcessBudget?: WebSocketProcessBudget;
+  /** Shared trusted scope for HTTP, Anthropic, and WebSocket continuations. */
+  authorizationScope?: AuthenticatedTenantScope;
 }
 
 export { requestBodyLimitForUrl } from "../http/request-policy";
@@ -56,6 +64,13 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
   if (options.candidate && options.port === 8787) {
     throw new RangeError("Candidate server cannot bind protected port 8787");
   }
+  const scopeValue = options.authorizationScope ??
+    options.router.responseProvenanceAuthorizationScope?.() ??
+    createAuthenticatedTenantScope();
+  if (!isAuthenticatedTenantScope(scopeValue)) {
+    throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
+  }
+  const authorizationScope = scopeValue;
   const connectionIds = new WeakMap<object, string>();
   let nextConnectionId = 0;
   const server = createHttpServer((request, response) => {
@@ -174,10 +189,12 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     apiKey: options.apiKey,
     telemetry: options.webSocketTelemetry,
     processBudget: options.webSocketProcessBudget,
+    authorizationScope,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {
       source: "websocket",
       clientId: relayOptions.clientId,
       signal: relayOptions.signal,
+      authorizationScope: relayOptions.authorizationScope,
       encodedBodyBytes: relayOptions.encodedBodyBytes,
     }),
   });

@@ -92,20 +92,25 @@ describe("DirectResponsesClient", () => {
         order.push("fetch");
         expect(init?.body).toBeInstanceOf(Blob);
         body.fill(0);
-        bodies.push(JSON.parse(await (init?.body as Blob).text()));
+        const forwarded = await (init?.body as Blob).text();
+        expect(forwarded).toBe(canonicalText);
+        bodies.push(JSON.parse(forwarded));
         expect(new Headers(init?.headers).get("authorization")).toBe("Bearer api-secret");
         return completeSse();
       },
     });
     const events: SseFrame[] = [];
     let spooledBytes = 0;
-    const body = new TextEncoder().encode(JSON.stringify({
+    const canonicalText = JSON.stringify({
       model: "gpt-5.6-sol",
       input: "hello",
       stream: true,
+      store: true,
       reasoning: { effort: "max", mode: "pro" },
       service_tier: "fast",
-    }));
+      "vendor\\key": { preserved: true },
+    });
+    const body = new TextEncoder().encode(canonicalText);
 
     const terminal = await client.execute({
       body,
@@ -124,8 +129,10 @@ describe("DirectResponsesClient", () => {
       model: "gpt-5.6-sol",
       input: "hello",
       stream: true,
+      store: true,
       reasoning: { effort: "max", mode: "pro" },
       service_tier: "fast",
+      "vendor\\key": { preserved: true },
     }]);
     expect(events.map(event => event.event)).toEqual([
       "response.created",
@@ -140,6 +147,41 @@ describe("DirectResponsesClient", () => {
     });
     expect(spooledBytes).toBe(terminal.byteCount);
     expect("transcriptBytes" in terminal).toBe(false);
+  });
+
+  it("normalizes the legacy noncanonical seam to the R8 upstream policy", async () => {
+    // Production R8 calls normally set bodyIsCanonicalStream after the host
+    // transport has enforced the policy. This fallback remains defensive for
+    // compatible custom handles and must preserve every unrelated field.
+    let forwarded: Record<string, unknown> | null = null;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1/",
+      apiKey: secret("api-secret"),
+      fetch: async (_url, init) => {
+        expect(typeof init?.body).toBe("string");
+        forwarded = JSON.parse(init?.body as string);
+        return completeSse();
+      },
+    });
+    const input = {
+      model: "gpt-5.6-sol",
+      input: "continue",
+      stream: false,
+      store: false,
+      previous_response_id: "resp_parent_exact",
+      vendor_extension: { retain: "verbatim" },
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(input));
+
+    await client.execute({
+      body: bytes,
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async () => {},
+    });
+
+    expect(forwarded as unknown).toEqual({ ...input, stream: true, store: true });
+    expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual(input);
   });
 
   it("classifies a transport exception after FETCH_STARTING as ambiguous", async () => {
@@ -462,11 +504,12 @@ describe("DirectResponsesClient", () => {
     }
   });
 
-  it("retries one provider invalid_json rejection with validated immutable text", async () => {
+  it("returns one definitive invalid_json rejection without replay after FETCH_STARTING", async () => {
     const body = new TextEncoder().encode(JSON.stringify({
       model: "gpt-5.6-sol",
       input: [{ role: "user", content: "large canonical context" }],
       stream: true,
+      store: true,
     }));
     let fetches = 0;
     let fetchBoundaries = 0;
@@ -475,41 +518,30 @@ describe("DirectResponsesClient", () => {
       apiKey: secret("key"),
       fetch: async (_url, init) => {
         fetches++;
-        if (fetches === 1) {
-          expect(init?.body).toBeInstanceOf(Blob);
-          return Response.json({
-            error: {
-              message: "Invalid body: failed to parse JSON value.",
-              type: "invalid_request_error",
-              code: "invalid_json",
-            },
-          }, { status: 400 });
-        }
-        expect(typeof init?.body).toBe("string");
-        body.fill(0);
-        expect(JSON.parse(init?.body as string)).toEqual({
-          model: "gpt-5.6-sol",
-          input: [{ role: "user", content: "large canonical context" }],
-          stream: true,
-        });
-        return completeSse();
+        expect(init?.body).toBeInstanceOf(Blob);
+        return Response.json({
+          error: {
+            message: "Invalid body: failed to parse JSON value.",
+            type: "invalid_request_error",
+            code: "invalid_json",
+          },
+        }, { status: 400 });
       },
     });
 
-    const terminal = await client.execute({
+    await expect(client.execute({
       body,
       bodyIsCanonicalStream: true,
       beforeFetch: async () => { fetchBoundaries++; },
       onPrelude: async () => {},
       onEvent: async () => {},
-    });
+    })).rejects.toMatchObject({ code: "invalid_json", status: 400, ambiguous: false });
 
-    expect(terminal.status).toBe("completed");
-    expect(fetches).toBe(2);
+    expect(fetches).toBe(1);
     expect(fetchBoundaries).toBe(1);
   });
 
-  it("never retries a non-JSON provider rejection", async () => {
+  it("returns a non-JSON provider rejection without replay", async () => {
     let fetches = 0;
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",
@@ -536,58 +568,119 @@ describe("DirectResponsesClient", () => {
     expect(fetches).toBe(1);
   });
 
-  it("bounds repeated invalid_json rejection to one safe retry", async () => {
-    let fetches = 0;
+  it("defensively normalizes canonical bytes with false or omitted policy fields", async () => {
+    const inputs = [
+      {
+        model: "gpt-5.6-sol",
+        input: "false policy",
+        stream: false,
+        store: false,
+        previous_response_id: "resp_parent_false",
+        vendor_extension: { retain: "false-case", stream: true, store: true },
+      },
+      {
+        model: "gpt-5.6-terra",
+        input: "omitted policy",
+        previous_response_id: "resp_parent_omitted",
+        vendor_extension: { retain: "omitted-case" },
+      },
+    ] as const;
+    const forwarded: Record<string, unknown>[] = [];
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",
       apiKey: secret("key"),
-      fetch: async () => {
-        fetches++;
-        return Response.json({
-          error: {
-            message: "Invalid body: failed to parse JSON value.",
-            type: "invalid_request_error",
-            code: "invalid_json",
-          },
-        }, { status: 400 });
+      fetch: async (_url, init) => {
+        expect(typeof init?.body).toBe("string");
+        forwarded.push(JSON.parse(init?.body as string));
+        return completeSse();
       },
     });
 
-    await expect(client.execute({
-      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x","stream":true}'),
-      bodyIsCanonicalStream: true,
-      beforeFetch: async () => {},
-      onPrelude: async () => {},
-      onEvent: async () => {},
-    })).rejects.toMatchObject({ code: "invalid_json", status: 400, ambiguous: false });
-    expect(fetches).toBe(2);
+    for (const input of inputs) {
+      const bytes = new TextEncoder().encode(JSON.stringify(input));
+      const original = bytes.slice();
+      await client.execute({
+        body: bytes,
+        bodyIsCanonicalStream: true,
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      });
+      expect(bytes).toEqual(original);
+    }
+
+    expect(forwarded).toEqual(inputs.map(input => ({
+      ...input,
+      stream: true,
+      store: true,
+    })));
   });
 
-  it("refuses to retry invalid_json when the retained canonical body is not locally valid", async () => {
+  it("falls back before FETCH_STARTING for escaped or duplicate policy keys", async () => {
+    const encoded = [
+      '{"model":"gpt-5.6-sol","stream":true,"store":true,"\\u0073tore":false,"previous_response_id":"resp_escaped"}',
+      '{"model":"gpt-5.6-sol","stream":true,"stream":{"unexpected":true},"store":true,"previous_response_id":"resp_duplicate"}',
+    ].map(value => new TextEncoder().encode(value));
+    const forwarded: Record<string, unknown>[] = [];
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("key"),
+      fetch: async (_url, init) => {
+        expect(typeof init?.body).toBe("string");
+        forwarded.push(JSON.parse(init?.body as string));
+        return completeSse();
+      },
+    });
+
+    for (const body of encoded) {
+      const original = body.slice();
+      await client.execute({
+        body,
+        bodyIsCanonicalStream: true,
+        beforeFetch: async () => {},
+        onPrelude: async () => {},
+        onEvent: async () => {},
+      });
+      expect(body).toEqual(original);
+    }
+
+    expect(forwarded).toEqual([
+      {
+        model: "gpt-5.6-sol",
+        stream: true,
+        store: true,
+        previous_response_id: "resp_escaped",
+      },
+      {
+        model: "gpt-5.6-sol",
+        stream: true,
+        store: true,
+        previous_response_id: "resp_duplicate",
+      },
+    ]);
+  });
+
+  it("rejects invalid local JSON before FETCH_STARTING or fetch", async () => {
     let fetches = 0;
+    let fetchBoundaries = 0;
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",
       apiKey: secret("key"),
       fetch: async () => {
         fetches++;
-        return Response.json({
-          error: {
-            message: "Invalid body: failed to parse JSON value.",
-            type: "invalid_request_error",
-            code: "invalid_json",
-          },
-        }, { status: 400 });
+        return completeSse();
       },
     });
 
     await expect(client.execute({
       body: new TextEncoder().encode('{"model":"gpt-5.6-sol"'),
       bodyIsCanonicalStream: true,
-      beforeFetch: async () => {},
+      beforeFetch: async () => { fetchBoundaries++; },
       onPrelude: async () => {},
       onEvent: async () => {},
     })).rejects.toMatchObject({ code: "invalid_body", ambiguous: false });
-    expect(fetches).toBe(1);
+    expect(fetches).toBe(0);
+    expect(fetchBoundaries).toBe(0);
   });
 
   it("clears the total error-body deadline after an early body completion", async () => {

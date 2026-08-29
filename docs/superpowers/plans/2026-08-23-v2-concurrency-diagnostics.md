@@ -1,5 +1,7 @@
 # GhostProv V2 Concurrency Diagnostics Implementation Plan
 
+> **Historical and superseded continuation policy (2026-08-28):** This document preserves the design record as written. Any upstream `store:false`, stateless replay, or local generated-history requirement below is superseded by the active `stream:true`/`store:true` persisted-continuation policy in `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add opt-in, privacy-safe boundary diagnostics that determine whether 16-agent latency originates in the Windows host, Y-Sweet/Awareness transport, Linux/Deno sandbox resources, upstream OpenAI execution, or client WebSocket backpressure.

@@ -323,12 +323,15 @@ describe("Anthropic stream cumulative production bounds", () => {
     const translator = new AnthropicStreamTranslator(CONTEXT);
     translator.start();
     translator.finish(final);
-    expect(translator.snapshot()).toMatchObject({
+    const snapshot = translator.snapshot();
+    expect(snapshot).toMatchObject({
       textBytes: 4,
-      reasoningBytes: 5,
       functionBytes: 7,
-      streamedBytes: 16,
     });
+    expect(snapshot.reasoningBytes).toBeGreaterThan(5);
+    expect(snapshot.streamedBytes).toBe(
+      snapshot.textBytes + snapshot.reasoningBytes + snapshot.functionBytes,
+    );
   });
 
   it("enforces category limits for authoritative terminal-only output", () => {

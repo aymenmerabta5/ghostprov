@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  V2_R7_SIDECAR_BUILD_RECIPE,
+  V2_R8_SIDECAR_BUILD_RECIPE,
   buildV2SidecarRelease,
   canonicalV2SidecarBundle,
   checkV2SidecarRelease,
@@ -17,9 +17,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
-describe("V2-R7 sidecar release build", () => {
+describe("V2-R8 sidecar release build", () => {
   it("pins the browser ESM recipe without chunks, source maps, or identifier mangling", () => {
-    expect(V2_R7_SIDECAR_BUILD_RECIPE).toEqual({
+    expect(V2_R8_SIDECAR_BUILD_RECIPE).toEqual({
       target: "browser",
       format: "esm",
       splitting: false,
@@ -31,9 +31,9 @@ describe("V2-R7 sidecar release build", () => {
         identifiers: false,
       },
     });
-    expect(Object.isFrozen(V2_R7_SIDECAR_BUILD_RECIPE)).toBe(true);
-    expect(Object.isFrozen(V2_R7_SIDECAR_BUILD_RECIPE.minify)).toBe(true);
-    expect(Object.isFrozen(V2_R7_SIDECAR_BUILD_RECIPE.external)).toBe(true);
+    expect(Object.isFrozen(V2_R8_SIDECAR_BUILD_RECIPE)).toBe(true);
+    expect(Object.isFrozen(V2_R8_SIDECAR_BUILD_RECIPE.minify)).toBe(true);
+    expect(Object.isFrozen(V2_R8_SIDECAR_BUILD_RECIPE.external)).toBe(true);
   });
 
   it("canonicalizes platform line endings to exactly one trailing LF", () => {
@@ -44,7 +44,7 @@ describe("V2-R7 sidecar release build", () => {
 
   it("builds twice to identical safe bytes while preserving identifiers", async () => {
     const built = await buildV2SidecarRelease();
-    expect(built.revision).toBe("r7");
+    expect(built.revision).toBe("r8");
     expect(built.protocolRevision).toBe("r2");
     expect(built.bytes.byteLength).toBeGreaterThan(1_000);
     expect(built.content).toContain("DenoJournalStorage");
@@ -61,13 +61,13 @@ describe("V2-R7 sidecar release build", () => {
   });
 
   it("makes --check fail closed for missing or corrupt release bytes", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-r7-release-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-r8-release-"));
     roots.push(root);
     const missing = path.join(root, "missing.bundle.js");
     await expect(checkV2SidecarRelease(missing)).rejects.toThrow(/artifact is missing/i);
 
     const corrupt = path.join(root, "corrupt.bundle.js");
-    await writeFile(corrupt, "not the deterministic R7 bundle\n");
+    await writeFile(corrupt, "not the deterministic R8 bundle\n");
     await expect(checkV2SidecarRelease(corrupt)).rejects.toThrow(/differs/i);
     await expect(main(["--unknown"])).rejects.toThrow(/usage/i);
   });
@@ -77,6 +77,22 @@ describe("V2-R7 sidecar release build", () => {
     expect(v2SidecarReleaseMode(["--check"])).toBe("check");
     expect(v2SidecarReleaseMode(["--write"])).toBe("write");
     expect(() => v2SidecarReleaseMode(["--write", "extra"])).toThrow(/usage/i);
+  });
+
+  it("checks the pinned identity before any create-only artifact write", async () => {
+    const source = await readFile(
+      path.resolve(import.meta.dir, "../scripts/build_v2_sidecar_release.ts"),
+      "utf8",
+    );
+    const writer = source.indexOf("async function writeV2SidecarRelease");
+    const identityCheck = source.indexOf("assertV2SidecarReleaseIdentity(built)", writer);
+    const directoryCreate = source.indexOf("await mkdir", writer);
+    const artifactWrite = source.indexOf("flag: \"wx\"", writer);
+
+    expect(writer).toBeGreaterThan(-1);
+    expect(identityCheck).toBeGreaterThan(writer);
+    expect(directoryCreate).toBeGreaterThan(identityCheck);
+    expect(artifactWrite).toBeGreaterThan(directoryCreate);
   });
 
   it("publishes separate safe-default release and frozen-bundle Deno gates", async () => {
@@ -93,10 +109,10 @@ describe("V2-R7 sidecar release build", () => {
   });
 
   it(
-    "matches the checked-in frozen R7 artifact and pinned identity to current source",
+    "matches the checked-in frozen R8 artifact and pinned identity to current source",
     async () => {
       await expect(checkV2SidecarRelease()).resolves.toMatchObject({
-        revision: "r7",
+        revision: "r8",
         protocolRevision: "r2",
       });
     },

@@ -12,6 +12,7 @@ import {
   V2_R5_RELEASE,
   V2_R6_RELEASE,
   V2_R7_RELEASE,
+  V2_R8_RELEASE,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
@@ -151,18 +152,18 @@ describe("V2SidecarRevisionSelector", () => {
     await expect(mutable.preload()).rejects.toThrow(/not frozen/i);
   });
 
-  it("provides a production R7 default backed by the pinned bundled release", async () => {
+  it("provides a production R8 default backed by the pinned bundled release", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2],
     });
 
     await selector.preload();
-    expect(selector.defaultRevision).toBe("r7");
+    expect(selector.defaultRevision).toBe("r8");
     expect(selector.loadedForProject(PROJECT_1).assets).toMatchObject({
-      revision: "r7",
+      revision: "r8",
       protocolRevision: "r2",
       transportProfile: "bulk-v1",
-      buildHash: V2_R7_RELEASE.buildHash,
+      buildHash: V2_R8_RELEASE.buildHash,
     });
     expect(selector.loadedForProject(PROJECT_2).assets).toBe(
       selector.loadedForProject(PROJECT_1).assets,
@@ -172,20 +173,20 @@ describe("V2SidecarRevisionSelector", () => {
   it("retains explicit pinned prior-release rollback and supports a mixed exact-project fleet", async () => {
     const selector = createBundledV2SidecarRevisionSelector({
       projectIds: [PROJECT_1, PROJECT_2, PROJECT_3],
-      projectOverrides: { [PROJECT_2]: "r2", [PROJECT_3]: "r1" },
+      projectOverrides: { [PROJECT_2]: "r7", [PROJECT_3]: "r1" },
     });
     await selector.preload();
     expect(selector.loadedForProject(PROJECT_1)).toMatchObject({
-      revision: "r7",
+      revision: "r8",
       assets: {
         protocolRevision: "r2",
         transportProfile: "bulk-v1",
-        buildHash: V2_R7_RELEASE.buildHash,
+        buildHash: V2_R8_RELEASE.buildHash,
       },
     });
     expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
-      revision: "r2",
-      assets: { buildHash: V2_R2_RELEASE.buildHash },
+      revision: "r7",
+      assets: { buildHash: V2_R7_RELEASE.buildHash },
     });
     expect(selector.loadedForProject(PROJECT_3)).toMatchObject({
       revision: "r1",

@@ -19,6 +19,7 @@ export type StreamBlock = {
   fingerprint: Hash;
   seenUnits: number;
   signature: string | null;
+  signatureDigest: string | null;
   signatureEmitted: boolean;
   toolId: string | null;
   toolName: string | null;
@@ -59,6 +60,7 @@ export function createStreamBlock(
     fingerprint: createHash("sha256"),
     seenUnits: 0,
     signature: null,
+    signatureDigest: null,
     signatureEmitted: false,
     toolId: null,
     toolName: null,
