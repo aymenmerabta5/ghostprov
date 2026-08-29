@@ -47,6 +47,18 @@ export interface RenderSyncState {
   clientDeleteSetUpdate: string;
 }
 
+export type GuardedYDocPathMutation =
+  | { readonly kind: "write"; readonly path: string; readonly content: string }
+  | { readonly kind: "tombstone"; readonly path: string };
+
+export interface GuardedYDocMutation {
+  readonly guards: readonly {
+    readonly path: string;
+    readonly equals: string | null;
+  }[];
+  readonly mutations: readonly GuardedYDocPathMutation[];
+}
+
 export type YDocSessionErrorKind = "auth" | "sync" | "missing" | "stopped";
 
 export class YDocSessionError extends Error {
@@ -76,6 +88,9 @@ const DEFAULT_PROVIDER_FACTORY: YProviderFactory = {
     ) as unknown as YProviderLike;
   },
 };
+
+const MAX_GUARDED_PATH_OPERATIONS = 128;
+const MAX_GUARDED_PATH_CONTENT_CHARS = 2 * 1024 * 1024;
 
 interface Connection {
   doc: Y.Doc;
@@ -185,8 +200,7 @@ export function tombstoneYDocEntry(doc: Y.Doc, map: Y.Map<any>): void {
   });
 }
 
-function tombstoneYDocTree(
-  doc: Y.Doc,
+function collectYDocTreeTargets(
   content: Y.Map<any>,
   uuid: string,
   map: Y.Map<any>,
@@ -208,6 +222,16 @@ function tombstoneYDocTree(
     targets.push(entry);
   };
   visit(uuid, map);
+  return targets;
+}
+
+function tombstoneYDocTree(
+  doc: Y.Doc,
+  content: Y.Map<any>,
+  uuid: string,
+  map: Y.Map<any>,
+): Y.Map<any>[] {
+  const targets = collectYDocTreeTargets(content, uuid, map);
   doc.transact(() => {
     for (const target of targets) {
       const value = target.get("content");
@@ -329,6 +353,211 @@ export class SandboxYDoc {
         throw new YDocSessionError(`Project path disappeared: ${path}`, "missing");
       }
       writeContent(connection.doc, map, content);
+    });
+  }
+
+  /**
+   * Compare and mutate project paths in one local Y.Doc transaction. Guards
+   * are evaluated before any mutation, so a superseded bootstrap generation
+   * cannot partially delete or overwrite the current generation's files.
+   */
+  async compareAndMutatePaths(input: GuardedYDocMutation): Promise<boolean> {
+    if (
+      !input || !Array.isArray(input.guards) || !Array.isArray(input.mutations) ||
+      input.guards.length < 1 || input.guards.length > MAX_GUARDED_PATH_OPERATIONS ||
+      input.mutations.length < 1 || input.mutations.length > MAX_GUARDED_PATH_OPERATIONS
+    ) throw new YDocSessionError("Guarded project mutation is invalid", "missing");
+    const guardPaths = new Set<string>();
+    const mutationPaths = new Set<string>();
+    let contentChars = 0;
+    const guards = input.guards.map(guard => {
+      if (
+        !guard || typeof guard.path !== "string" ||
+        !(guard.equals === null || typeof guard.equals === "string") ||
+        guardPaths.has(guard.path)
+      ) throw new YDocSessionError("Guarded project mutation guard is invalid", "missing");
+      guardPaths.add(guard.path);
+      contentChars += guard.equals?.length ?? 0;
+      if (!Number.isSafeInteger(contentChars) || contentChars > MAX_GUARDED_PATH_CONTENT_CHARS) {
+        throw new YDocSessionError("Guarded project mutation content is too large", "missing");
+      }
+      return { ...guard, parts: normalizedPath(guard.path) };
+    });
+    const mutations = input.mutations.map(mutation => {
+      if (
+        !mutation || typeof mutation.path !== "string" ||
+        (mutation.kind !== "write" && mutation.kind !== "tombstone") ||
+        mutationPaths.has(mutation.path)
+      ) throw new YDocSessionError("Guarded project path mutation is invalid", "missing");
+      mutationPaths.add(mutation.path);
+      if (mutation.kind === "write") {
+        if (typeof mutation.content !== "string") {
+          throw new YDocSessionError("Guarded project write content is invalid", "missing");
+        }
+        contentChars += mutation.content.length;
+        if (!Number.isSafeInteger(contentChars) || contentChars > MAX_GUARDED_PATH_CONTENT_CHARS) {
+          throw new YDocSessionError("Guarded project mutation content is too large", "missing");
+        }
+      }
+      return { ...mutation, parts: normalizedPath(mutation.path) };
+    });
+    for (let left = 0; left < mutations.length; left++) {
+      for (let right = left + 1; right < mutations.length; right++) {
+        const a = mutations[left]!.parts;
+        const b = mutations[right]!.parts;
+        const prefix = (shorter: readonly string[], longer: readonly string[]) =>
+          shorter.length < longer.length &&
+          shorter.every((part, index) => longer[index] === part);
+        if (prefix(a, b) || prefix(b, a)) {
+          throw new YDocSessionError(
+            "Guarded project mutations contain overlapping paths",
+            "missing",
+          );
+        }
+      }
+    }
+
+    return this.#withConnection(connection => {
+      for (const guard of guards) {
+        const entry = this.#findPathNode(connection, guard.parts);
+        if (entry?.map.get("type") === "folder") return false;
+        const current = entry ? readContent(entry.map) : null;
+        if (current !== guard.equals) return false;
+      }
+
+      type PlannedEntry = {
+        uuid: string;
+        id: string;
+        type: "folder" | "text";
+        map: Y.Map<any>;
+      };
+      const root = this.#rootFolderId(connection);
+      if (!root) throw new YDocSessionError("root folder not found", "missing");
+      const plannedChildren = new Map<string, PlannedEntry>();
+      const plannedEntries: PlannedEntry[] = [];
+      const existingWrites: Array<{
+        entry: PlannedEntry;
+        parentId: string;
+        content: string;
+        integratedText: Y.Text | null;
+      }> = [];
+      const tombstones = new Set<Y.Map<any>>();
+      const childKey = (parentId: string, filename: string) => `${parentId}\0${filename}`;
+      const child = (parentId: string, filename: string): PlannedEntry | null => {
+        const planned = plannedChildren.get(childKey(parentId, filename));
+        if (planned) return planned;
+        const existing = this.#findChild(connection, parentId, filename);
+        if (!existing) return null;
+        return {
+          ...existing,
+          id: String(existing.map.get("id") ?? existing.uuid),
+          type: existing.map.get("type") === "folder" ? "folder" : "text",
+        };
+      };
+      const detachedText = (content: string): Y.Text => {
+        const text = new Y.Text();
+        if (content) text.insert(0, content);
+        return text;
+      };
+      const plannedEntry = (
+        parentId: string,
+        filename: string,
+        type: "folder" | "text",
+        content?: string,
+      ): PlannedEntry => {
+        const uuid = crypto.randomUUID();
+        const map = new Y.Map();
+        map.set("id", uuid);
+        map.set("filename", filename);
+        map.set("deleted", false);
+        map.set("inFolder", parentId);
+        map.set("type", type);
+        if (type === "text") map.set("content", detachedText(content ?? ""));
+        const entry = { uuid, id: uuid, type, map };
+        plannedChildren.set(childKey(parentId, filename), entry);
+        plannedEntries.push(entry);
+        return entry;
+      };
+
+      // Build the complete semantic plan without touching the connected doc.
+      // Any later collision therefore fails before an earlier write is visible.
+      for (const mutation of mutations) {
+        if (mutation.kind === "tombstone") {
+          const entry = this.#findPathNode(connection, mutation.parts);
+          if (entry) {
+            for (const target of collectYDocTreeTargets(
+              connection.content,
+              entry.uuid,
+              entry.map,
+            )) tombstones.add(target);
+          }
+          continue;
+        }
+
+        let parentId = root;
+        for (const folderName of mutation.parts.slice(0, -1)) {
+          let folder = child(parentId, folderName);
+          if (folder && folder.type !== "folder") {
+            throw new YDocSessionError(
+              `Path component is not a folder: ${folderName}`,
+              "missing",
+            );
+          }
+          folder ??= plannedEntry(parentId, folderName, "folder");
+          parentId = folder.id;
+        }
+
+        const filename = mutation.parts.at(-1)!;
+        const existing = child(parentId, filename);
+        if (existing?.type === "folder") {
+          throw new YDocSessionError(
+            `Project path is an existing folder: ${mutation.path}`,
+            "missing",
+          );
+        }
+        if (existing) {
+          const currentContent = existing.map.get("content");
+          existingWrites.push({
+            entry: existing,
+            parentId,
+            content: mutation.content,
+            integratedText: currentContent instanceof Y.Text ? currentContent : null,
+          });
+        } else {
+          plannedEntry(parentId, filename, "text", mutation.content);
+        }
+      }
+
+      connection.doc.transact(() => {
+        for (const entry of plannedEntries) {
+          connection.content.set(entry.uuid, entry.map);
+        }
+        for (const write of existingWrites) {
+          if (typeof write.entry.map.get("id") !== "string") {
+            write.entry.map.set("id", write.entry.uuid);
+          }
+          write.entry.map.set("deleted", false);
+          write.entry.map.set("inFolder", write.parentId);
+          write.entry.map.set("type", "text");
+          if (write.integratedText) {
+            write.integratedText.delete(0, write.integratedText.length);
+            if (write.content) write.integratedText.insert(0, write.content);
+          } else {
+            // Legacy scalar content has no shared-type identity to preserve.
+            // New Y.Text instances are reserved for newly planned files.
+            write.entry.map.set("content", write.content);
+          }
+        }
+        for (const target of tombstones) {
+          const content = target.get("content");
+          if (content instanceof Y.Text) content.delete(0, content.length);
+          else if (content != null) target.set("content", "");
+          target.set("deleted", true);
+          const filename = target.get("filename");
+          if (typeof filename === "string") connection.index.delete(filename);
+        }
+      });
+      return true;
     });
   }
 
@@ -699,6 +928,23 @@ export class SandboxYDoc {
         connection.index.set(filename, entry);
         return entry;
       }
+    }
+    return null;
+  }
+
+  #findPathNode(
+    connection: Connection,
+    parts: readonly string[],
+  ): { uuid: string; map: Y.Map<any> } | null {
+    const root = this.#rootFolderId(connection);
+    if (!root) return null;
+    let parentId = root;
+    for (let index = 0; index < parts.length; index++) {
+      const child = this.#findChild(connection, parentId, parts[index]!);
+      if (!child) return null;
+      if (index === parts.length - 1) return child;
+      if (child.map.get("type") !== "folder") return null;
+      parentId = String(child.map.get("id") ?? child.uuid);
     }
     return null;
   }

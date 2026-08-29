@@ -7,6 +7,7 @@ import { projectAnthropicReplay } from "../src/anthropic/continuation";
 import { sanitizeDiagnosticMessage } from "../src/observability/redaction";
 import {
   createAuthenticatedTenantScope,
+  resolveGhostProvApiKey,
 } from "../src/http/api-key";
 import { V2_R8_RELEASE } from "../src/v2/sidecar/assets";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
@@ -316,14 +317,47 @@ function counterValue(value: unknown, label: string): number {
   return value as number;
 }
 
-export async function candidateTransportSnapshot(): Promise<CandidateTransportSnapshot> {
-  const response = await fetch(`http://127.0.0.1:${CANDIDATE_PORT}/__sandboxes`, {
-    signal: AbortSignal.timeout(10_000),
-  });
-  const text = await response.text();
-  if (!response.ok || Buffer.byteLength(text, "utf8") > 2 * 1024 * 1024) {
+async function boundedResponseText(response: Response, maxBytes: number): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maxBytes) {
+    void response.body?.cancel().catch(() => undefined);
     throw new Error("Candidate sandbox snapshot is unavailable or oversized");
   }
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        void reader.cancel().catch(() => undefined);
+        throw new Error("Candidate sandbox snapshot is unavailable or oversized");
+      }
+      chunks.push(next.value.slice());
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  return Buffer.concat(chunks.map(chunk => Buffer.from(
+    chunk.buffer,
+    chunk.byteOffset,
+    chunk.byteLength,
+  )), total).toString("utf8");
+}
+
+export async function candidateTransportSnapshot(apiKey: string): Promise<CandidateTransportSnapshot> {
+  const response = await fetch(`http://127.0.0.1:${CANDIDATE_PORT}/__sandboxes`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new Error("Candidate sandbox snapshot is unavailable or oversized");
+  }
+  const text = await boundedResponseText(response, 2 * 1024 * 1024);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -434,16 +468,16 @@ export function transportDelta(
   });
 }
 
-async function measureAction<T>(action: () => Promise<T>): Promise<{
+async function measureAction<T>(apiKey: string, action: () => Promise<T>): Promise<{
   value: T;
   latencyMs: number;
   transport: TransportDelta;
 }> {
-  const before = await candidateTransportSnapshot();
+  const before = await candidateTransportSnapshot(apiKey);
   const started = performance.now();
   const value = await action();
   const latencyMs = performance.now() - started;
-  const after = await candidateTransportSnapshot();
+  const after = await candidateTransportSnapshot(apiKey);
   return {
     value,
     latencyMs,
@@ -457,7 +491,7 @@ async function measuredPostJson(
   body: Record<string, unknown>,
 ): Promise<MeasuredResponse> {
   const clientBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
-  const measured = await measureAction(() => postJson(path, apiKey, body));
+  const measured = await measureAction(apiKey, () => postJson(path, apiKey, body));
   if (measured.transport.flightCompletions < 1) {
     throw new Error("Candidate transport did not record a completed request flight");
   }
@@ -918,7 +952,7 @@ async function verifyClaudeMeasured(
 
   const postLocal = async (body: Record<string, unknown>): Promise<MeasuredResponse> => {
     const clientBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
-    const measured = await measureAction(async () => {
+    const measured = await measureAction(apiKey, async () => {
       const response = await app.request("/v1/messages", {
         method: "POST",
         headers: {
@@ -1103,7 +1137,7 @@ async function verifyWebSocketMeasured(
   apiKey: string,
   model: string,
 ): Promise<Record<string, unknown>> {
-  const measured = await measureAction(() => verifyWebSocket(apiKey, model));
+  const measured = await measureAction(apiKey, () => verifyWebSocket(apiKey, model));
   if (measured.transport.flightCompletions < 2) {
     throw new Error("Candidate transport did not record both WebSocket flights");
   }
@@ -1280,7 +1314,7 @@ async function verifyConcurrencyMeasured(
       reasoning: { effort: "low" },
     }));
     const waveStarted = performance.now();
-    const before = await candidateTransportSnapshot();
+    const before = await candidateTransportSnapshot(apiKey);
     const rootWaveStarted = performance.now();
     const roots = await Promise.all(rootBodies.map(async (body, index) => {
       const started = performance.now();
@@ -1296,7 +1330,7 @@ async function verifyConcurrencyMeasured(
       };
     }));
     const rootWallMs = performance.now() - rootWaveStarted;
-    const afterRoots = await candidateTransportSnapshot();
+    const afterRoots = await candidateTransportSnapshot(apiKey);
     const rootTransport = transportDelta(before, afterRoots);
     if (rootTransport.flightCompletions !== width) {
       throw new Error(`Unexpected root flight count at width ${width}`);
@@ -1328,7 +1362,7 @@ async function verifyConcurrencyMeasured(
       };
     }));
     const continuationWallMs = performance.now() - continuationWaveStarted;
-    const afterChildren = await candidateTransportSnapshot();
+    const afterChildren = await candidateTransportSnapshot(apiKey);
     const continuationTransport = transportDelta(afterRoots, afterChildren);
     if (continuationTransport.flightCompletions !== width) {
       throw new Error(`Unexpected continuation flight count at width ${width}`);
@@ -1409,10 +1443,9 @@ async function verifyExistingCandidate(
   options: PersistedContinuationLiveOptions,
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const apiKey = env.GHOSTPROV_API_KEY?.trim();
-  if (!apiKey) throw new Error("GHOSTPROV_API_KEY is required for the existing candidate verifier");
+  const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   progress("existing-candidate.snapshot.start");
-  const initial = await candidateTransportSnapshot();
+  const initial = await candidateTransportSnapshot(apiKey);
   progress("existing-candidate.snapshot.passed", {
     ready: initial.ready,
     unavailable: initial.unavailable,
@@ -1455,7 +1488,7 @@ async function verifyExistingCandidate(
   results.concurrency = await verifyConcurrencyMeasured(apiKey, options.model);
   progress("concurrency.matrix.passed");
 
-  const final = await candidateTransportSnapshot();
+  const final = await candidateTransportSnapshot(apiKey);
   if (final.quarantined !== initial.quarantined ||
     final.ambiguousQuarantined !== initial.ambiguousQuarantined) {
     throw new Error("Live matrix changed candidate quarantine counters");

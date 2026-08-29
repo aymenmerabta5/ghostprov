@@ -399,7 +399,8 @@ function abortable<T>(
   });
 }
 
-function disposeLateHandle(handle: RunHandle): void {
+async function disposeLateHandle(handle: RunHandle): Promise<void> {
+  const cleanup: Promise<unknown>[] = [];
   try {
     const discard = handle.discardUnconsumedEvents;
     if (typeof discard === "function") {
@@ -412,19 +413,25 @@ function disposeLateHandle(handle: RunHandle): void {
       // Async generators which have never started do not execute their `finally`
       // block when return() is called first. Claim exactly one buffered frame so
       // its permit can be released, then close the generic iterator.
-      void Promise.resolve()
+      cleanup.push(Promise.resolve()
         .then(() => iterator.next())
         .then(async result => {
           if (!result.done) releaseAtomicBytePermit(result.value);
           await iterator.return(undefined);
         })
-        .catch(() => undefined);
+        .catch(() => undefined));
     }
   } catch {}
-  try { void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined); }
-  catch {}
-  try { if (handle.upstreamPrelude) void handle.upstreamPrelude.catch(() => undefined); }
-  catch {}
+  try {
+    cleanup.push(Promise.resolve(handle.final).then(
+      releaseAtomicBytePermit,
+      () => undefined,
+    ));
+  } catch {}
+  try {
+    if (handle.upstreamPrelude) cleanup.push(handle.upstreamPrelude.catch(() => undefined));
+  } catch {}
+  await Promise.allSettled(cleanup);
 }
 
 function positiveInteger(value: number, label: string): number {
@@ -537,6 +544,7 @@ export class ResponsesWebSocketSession {
   #pendingRequestBytes = 0;
   #pendingSends = 0;
   #pendingSendBytes = 0;
+  #pendingHandoffs = 0;
   #sending = false;
   #closed = false;
 
@@ -734,6 +742,7 @@ export class ResponsesWebSocketSession {
     let eventIteratorFinished = false;
     let resolved: ResolvedRelayRequest | undefined;
     let pendingTerminal: Record<string, unknown> | undefined;
+    let pendingHandoffCleanup: Promise<void> | null = null;
     let finalObserved = false;
     let requestReleased = false;
     const releaseRequest = () => {
@@ -759,6 +768,23 @@ export class ResponsesWebSocketSession {
       // The relay body now owns the parsed input reference; avoid retaining a
       // second path through the client event for the streamed response.
       delete event.input;
+      this.#pendingHandoffs++;
+      let handoffAccountingHeld = true;
+      const finishHandoffAccounting = () => {
+        if (!handoffAccountingHeld) return;
+        handoffAccountingHeld = false;
+        this.#pendingHandoffs = Math.max(0, this.#pendingHandoffs - 1);
+        this.#maybeCloseProcessLease();
+      };
+      const releaseHandoffPayload = () => {
+        try {
+          releaseResponseGraphPayload(resolution);
+          resolution.relayBody = {};
+          relayBody = {};
+        } finally {
+          finishHandoffAccounting();
+        }
+      };
       try {
         const structuralBodyBytes = await jsonEncodedByteLengthAsync(relayBody, {
           signal: controller.signal,
@@ -771,19 +797,44 @@ export class ResponsesWebSocketSession {
           // fields; retain a small conservative allowance for minimal envelopes.
           encodedBodyBytes: resolution.materializedLocally
             ? undefined
-            : Math.min(
+              : Math.min(
                 Number.MAX_SAFE_INTEGER,
                 requestBytes + UPSTREAM_POLICY_HEADROOM_BYTES,
               ),
           structuralBodyBytes,
         }));
-        handle = await abortable(starting, controller.signal, disposeLateHandle);
+        const retainUntilLateCleanup = (late: Promise<RunHandle>) => {
+          const lateCleanup = late.then(
+            lateHandle => disposeLateHandle(lateHandle),
+            () => undefined,
+          ).catch(() => undefined);
+          pendingHandoffCleanup = lateCleanup.then(
+            releaseHandoffPayload,
+            releaseHandoffPayload,
+          );
+        };
+        try {
+          handle = await abortable(starting, controller.signal);
+          if (this.#closed || controller.signal.aborted) {
+            const lateHandle = handle;
+            handle = undefined;
+            retainUntilLateCleanup(Promise.resolve(lateHandle));
+            throw abortError();
+          }
+          releaseHandoffPayload();
+        } catch (error) {
+          // Cancellation may win while startRelay still owns the exact request
+          // graph. Keep every graph pin and process/request byte charged until
+          // that handoff settles and any returned handle is fully discarded.
+          if (pendingHandoffCleanup === null) retainUntilLateCleanup(starting);
+          throw error;
+        }
       } finally {
-        // Router/transport preparation has taken ownership of its encoded
-        // request by this boundary; the large reconstructed lineage can drop.
-        releaseResponseGraphPayload(resolution);
-        resolution.relayBody = {};
-        relayBody = {};
+        // A synchronous sizing failure occurred before startRelay could own the
+        // request. There is no late handoff to await in that case.
+        if (handoffAccountingHeld && pendingHandoffCleanup === null) {
+          releaseHandoffPayload();
+        }
       }
       let sawTerminal = false;
       eventIterator = handle.events();
@@ -913,6 +964,7 @@ export class ResponsesWebSocketSession {
         }
       }
     } finally {
+      if (pendingHandoffCleanup) await pendingHandoffCleanup;
       if (handle && !finalObserved) {
         // A socket/send failure can leave the iterator before it reaches
         // handle.final. Release a definitive late terminal carrier even when
@@ -983,6 +1035,11 @@ export class ResponsesWebSocketSession {
     this.#pendingRequestBytes = Math.max(0, this.#pendingRequestBytes - bytes);
     this.#processLease?.release(bytes);
     this.#telemetry?.requestSettled(bytes);
+  }
+
+  #maybeCloseProcessLease(): void {
+    if (!this.#closed || this.#pendingHandoffs !== 0) return;
+    this.#processLease?.close();
   }
 
   #sendWithoutWaiting(value: unknown): void {
@@ -1264,6 +1321,6 @@ export class ResponsesWebSocketSession {
     this.#namedStreamRefs.clear();
     if (this.#activeSend) this.#settleSend(this.#activeSend, error);
     for (const item of this.#sendQueue.splice(0)) this.#settleSend(item, error);
-    this.#processLease?.close();
+    this.#maybeCloseProcessLease();
   }
 }

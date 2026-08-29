@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   runGhostProvMain,
   type GhostProvWorkerProcess,
@@ -100,8 +104,8 @@ describe("server main lifecycle", () => {
     await Bun.sleep(0);
     expect(value.starts()).toBe(0);
     expect(value.closes()).toBe(1);
-    // Handlers remain installed until the one shared cleanup actually ends.
-    expect(worker.listenerCount("SIGTERM")).toBeGreaterThan(0);
+    // Construction cannot hold process handlers or stopped IPC open forever.
+    expect(worker.listenerCount("SIGTERM")).toBe(0);
     releaseClose();
     await running;
 
@@ -110,6 +114,81 @@ describe("server main lifecycle", () => {
     expect(stopped[0]).toMatchObject({ exitCode: 1 });
     expect(worker.exitCode).toBe(1);
     expect(value.closes()).toBe(1);
+  });
+
+  it("does not wait forever for non-cooperative creation and closes a late system", async () => {
+    const worker = new FakeWorkerProcess();
+    let resolveCreation!: (system: BrowserlessSystem) => void;
+    const creation = new Promise<BrowserlessSystem>(resolve => { resolveCreation = resolve; });
+    let observedSignal: AbortSignal | null = null;
+    const value = fakeSystem();
+    const running = runGhostProvMain({ GP_SUPERVISED_CHILD: "1" }, {
+      process: worker,
+      createSystem: async (_env, signal) => {
+        observedSignal = signal;
+        return creation;
+      },
+    });
+
+    for (let attempt = 0; attempt < 100 && !observedSignal; attempt++) await Bun.sleep(0);
+    worker.emit("SIGTERM");
+    const stoppedBeforeLateCreation = await Promise.race([
+      waitForStopped(worker),
+      Bun.sleep(100).then(() => null),
+    ]);
+    resolveCreation(value.system);
+    await running;
+    for (let attempt = 0; attempt < 100 && value.closes() === 0; attempt++) await Bun.sleep(0);
+
+    expect((observedSignal as AbortSignal | null)?.aborted).toBe(true);
+    expect(stoppedBeforeLateCreation).toMatchObject({ type: "ghostprov.stopped", exitCode: 0 });
+    expect(value.starts()).toBe(0);
+    expect(value.closes()).toBe(1);
+  });
+
+  it("marks the actual process failed when late system cleanup rejects", async () => {
+    const worker = new FakeWorkerProcess();
+    let resolveCreation!: (system: BrowserlessSystem) => void;
+    const creation = new Promise<BrowserlessSystem>(resolve => { resolveCreation = resolve; });
+    const value = fakeSystem({ close: async () => { throw new Error("late cleanup failed"); } });
+    const running = runGhostProvMain({ GP_SUPERVISED_CHILD: "1" }, {
+      process: worker,
+      createSystem: async () => creation,
+    });
+
+    worker.emit("SIGTERM");
+    await running;
+    expect(worker.exitCode).toBe(0);
+    resolveCreation(value.system);
+    for (let attempt = 0; attempt < 100 && worker.exitCode === 0; attempt++) await Bun.sleep(0);
+
+    expect(value.closes()).toBe(1);
+    expect(worker.exitCode).toBe(1);
+  });
+
+  it("is import-safe from another entrypoint whose filename ends in server.ts", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "ghostprov-import-safe-"));
+    const entrypoint = path.join(directory, "consumer-server.ts");
+    await writeFile(
+      entrypoint,
+      `await import(${JSON.stringify(pathToFileURL(path.resolve(import.meta.dir, "../src/server.ts")).href)});\n`,
+      "utf8",
+    );
+    try {
+      const child = Bun.spawn([process.execPath, "--no-env-file", entrypoint], {
+        cwd: directory,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stderr).text(),
+      ]);
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe("");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("closes a partial system exactly once when start/listen fails", async () => {
@@ -159,20 +238,20 @@ describe("server main lifecycle", () => {
     expect(worker.exitCode).toBe(75);
   });
 
-  it("rejects supervised candidate port 8787 before create or listen", async () => {
+  it("rejects supervised candidate port 18787 before create or listen", async () => {
     const worker = new FakeWorkerProcess();
     let creates = 0;
     await expect(runGhostProvMain({
       GP_SUPERVISED_CHILD: "1",
       GP_CANDIDATE: "1",
-      PORT: "8787",
+      PORT: "18787",
     }, {
       process: worker,
       createSystem: async () => {
         creates++;
         return fakeSystem().system;
       },
-    })).rejects.toThrow(/protected port 8787/i);
+    })).rejects.toThrow(/protected service port 18787/i);
     expect(creates).toBe(0);
     expect(worker.exitCode).toBe(1);
   });

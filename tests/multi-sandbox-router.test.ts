@@ -4,6 +4,7 @@ import {
   type IncomingResourceLease,
   admissionProgressFreshnessMs,
   MultiSandboxRouter,
+  RouterCapacityTimeoutError,
   nextAdmissionProgressCheckAtMs,
   mediumFirstProgressTimeoutMs,
   preparedProofGraceMs,
@@ -53,6 +54,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
   admissionAbortError: Error | null = null;
   admissionAbortDelayMs = 0;
   ignoreAdmissionAbortMs = 0;
+  holdBeforeExecutionRisk = false;
+  reflectTransferCosts = false;
+  reflectedTransferUsed = 0;
   postAdmissionDelayMs = 0;
   waitForPostAdmissionAbort = false;
   reflectExecutionRisk = true;
@@ -74,6 +78,10 @@ class FakeRuntime implements RoutableSandboxRuntime {
   readonly executionStartedAtMs: number[] = [];
   readonly admissionProgressCallbacks: Array<(progress: SandboxAdmissionProgress) => void> = [];
   readonly executionRiskCallbacks: Array<() => void> = [];
+  readonly preExecutionHolds: Array<{
+    body: Record<string, unknown>;
+    release: () => void;
+  }> = [];
   readonly finals: Array<ReturnType<typeof deferred<any>>> = [];
   readonly bodies: Record<string, unknown>[] = [];
   readonly listeners = new Set<() => void>();
@@ -129,7 +137,9 @@ class FakeRuntime implements RoutableSandboxRuntime {
       ),
       ...(admissionCredits === undefined ? {} : { admissionCredits }),
       ...(prefetchCredits === undefined ? {} : { prefetchCredits }),
-      ...(this.transferCredits === undefined ? {} : { transferCredits: this.transferCredits }),
+      ...(this.transferCredits === undefined ? {} : {
+        transferCredits: Math.max(0, this.transferCredits - this.reflectedTransferUsed),
+      }),
       quarantined: 0,
       heartbeatAgeMs: this.heartbeatAgeMs,
       sidecarPeerAgeMs: this.sidecarPeerAgeMs,
@@ -192,10 +202,25 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.active++;
     this.uncommitted++;
     this.uncommittedPeak = Math.max(this.uncommittedPeak, this.uncommitted);
+    const reflectedTransferCost = this.reflectTransferCosts &&
+        Number.isSafeInteger(body.test_transfer_cost) &&
+        Number(body.test_transfer_cost) > 0
+      ? Number(body.test_transfer_cost)
+      : 0;
+    this.reflectedTransferUsed += reflectedTransferCost;
     if (options?.onAdmissionProgress) {
       this.admissionProgressCallbacks.push(options.onAdmissionProgress);
     }
     options?.onAdmissionReflected?.();
+    if (this.holdBeforeExecutionRisk) {
+      const gate = deferred<void>();
+      this.preExecutionHolds.push({ body, release: () => gate.resolve() });
+      await gate.promise;
+    }
+    if (reflectedTransferCost > 0) {
+      this.reflectedTransferUsed = Math.max(0, this.reflectedTransferUsed - reflectedTransferCost);
+      this.notify();
+    }
     if (options?.onExecutionRiskReflected) {
       if (this.reflectExecutionRisk) options.onExecutionRiskReflected();
       else this.executionRiskCallbacks.push(options.onExecutionRiskReflected);
@@ -395,7 +420,9 @@ describe("MultiSandboxRouter", () => {
       source: "websocket",
       structuralBodyBytes: Buffer.byteLength(JSON.stringify(body)),
     });
-    await flush(100);
+    for (let turn = 0; turn < 100 && system.router.snapshot().queued === 0; turn++) {
+      await Bun.sleep(1);
+    }
     expect(runtime.executions).toBe(0);
     expect(system.router.snapshot().queued).toBe(1);
 
@@ -635,6 +662,92 @@ describe("MultiSandboxRouter", () => {
     await Promise.allSettled([...medium, tiny]);
     await system.router.close();
     expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+  });
+
+  it("paces medium work pinned by persisted provenance", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const system = createSystem(
+      2,
+      4,
+      2_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      authorizationScope,
+    );
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const seed = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "pacing provenance seed",
+      stream: true,
+    }, { authorizationScope });
+    const bound = system.runtimes.find(runtime => runtime.finals.length > 0)!;
+    bound.completeOne({ id: "resp_pacing_seed", status: "completed" });
+    await seed.final;
+    for (const runtime of system.runtimes) {
+      runtime.reflectExecutionRisk = false;
+      runtime.waitForPostAdmissionAbort = true;
+      runtime.notify();
+    }
+    const controllers = Array.from({ length: 4 }, () => new AbortController());
+    const pending = controllers.map((controller, index) => system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: `pinned-medium-${index}`,
+      previous_response_id: "resp_pacing_seed",
+      stream: true,
+    }, {
+      authorizationScope,
+      signal: controller.signal,
+      encodedBodyBytes: 1024 ** 2,
+      structuralBodyBytes: 1024 ** 2,
+    }));
+    await flush(100);
+
+    expect(bound.executions).toBe(2);
+    expect(system.runtimes.find(runtime => runtime !== bound)!.executions).toBe(0);
+    expect(system.router.snapshot().queued).toBe(3);
+
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(pending);
+    await system.router.close();
+  });
+
+  it("paces a selected bulk target in a mixed transport fleet", async () => {
+    const system = createSystem(2, 4, 2_000);
+    const standard = system.runtimes[0]!;
+    const bulk = system.runtimes[1]!;
+    standard.transportProfile = "standard";
+    standard.ackEwmaMs = 1_000_000;
+    bulk.transportProfile = "bulk-v1";
+    bulk.ackEwmaMs = 1;
+    for (const runtime of system.runtimes) {
+      runtime.reflectExecutionRisk = false;
+      runtime.waitForPostAdmissionAbort = true;
+      runtime.notify();
+    }
+    const controllers = Array.from({ length: 4 }, () => new AbortController());
+    const pending = controllers.map((controller, index) => system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: `mixed-medium-${index}`,
+      stream: true,
+    }, {
+      signal: controller.signal,
+      encodedBodyBytes: 1024 ** 2,
+      structuralBodyBytes: 1024 ** 2,
+    }));
+    await flush(100);
+
+    expect(bulk.executions).toBe(1);
+    expect(standard.executions).toBe(0);
+    expect(system.router.snapshot().queued).toBe(3);
+
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(pending);
+    await system.router.close();
   });
 
   for (const scenario of [
@@ -1405,6 +1518,65 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("re-measures a frozen mutation after an exact structural hint becomes stale", async () => {
+    const system = createSystem(1, 1, 1_000);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    system.runtimes[0]!.postAdmissionDelayMs = 50;
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "input_text", text: "x" }],
+      service_tier: "fast",
+      store: true,
+      stream: true,
+    };
+    const initialBytes = Buffer.byteLength(JSON.stringify(body));
+    const pending = system.router.startRelay(body, {
+      clientId: "mutation-stale-structural-hint",
+      source: "internal",
+      encodedBodyBytes: initialBytes,
+      structuralBodyBytes: initialBytes,
+    });
+    while (system.governor.snapshot().queued === 0) await Promise.resolve();
+    body.input[0]!.text = "x".repeat(2 * 1024 ** 2);
+    blocker.release();
+    for (let turn = 0; turn < 100 && system.runtimes[0]!.executions === 0; turn++) {
+      await Bun.sleep(1);
+    }
+
+    const executed = system.runtimes[0]!.bodies[0]!;
+    const executedBytes = Buffer.byteLength(JSON.stringify(executed));
+    expect((executed.input as any[])[0].text.length).toBe(2 * 1024 ** 2);
+    expect(system.governor.snapshot().reservedBytes)
+      .toBeGreaterThanOrEqual(executedBytes * 6 + 4 * 1024 ** 2);
+    const handle = await pending;
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("preserves a typed router deadline while queued for resource admission", async () => {
+    const system = createSystem(0, 1, 1_000);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    const controller = new AbortController();
+    const deadline = new RouterCapacityTimeoutError("synthetic ingress deadline");
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "typed admission deadline",
+      stream: true,
+    }, { signal: controller.signal });
+    while (system.governor.snapshot().queued === 0) await Promise.resolve();
+    controller.abort(deadline);
+
+    await expect(pending).rejects.toBe(deadline);
+    blocker.release();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("re-normalizes store and stream on the exact frozen admission snapshot", async () => {
     const system = createSystem(1, 1, 1_000);
     const blocker = system.governor.reserveFixedBytes(
@@ -1643,6 +1815,63 @@ describe("MultiSandboxRouter", () => {
     await flush();
     await expect(system.router.awaitIdle(100)).resolves.toBeUndefined();
     expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("retains fleet transfer weight until an ambiguous late runtime settles", async () => {
+    const system = createSystem(2, 1, 1_000);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.holdBeforeExecutionRisk = true;
+      runtime.reflectExecutionRisk = false;
+      runtime.transferCredits = 6;
+      runtime.notify();
+    }
+    const controller = new AbortController();
+    const body = {
+      model: "gpt-5.6-sol",
+      input: "late weighted transfer",
+      stream: true,
+    };
+    const bytes = Math.floor(3.1 * 1024 ** 2);
+    const first = system.router.startRelay(body, {
+      signal: controller.signal,
+      encodedBodyBytes: bytes,
+      structuralBodyBytes: bytes,
+    });
+    for (let turn = 0;
+      turn < 100 && system.runtimes.reduce((sum, runtime) => (
+        sum + runtime.preExecutionHolds.length
+      ), 0) < 1;
+      turn++) await Bun.sleep(1);
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+    await expect(first).rejects.toMatchObject({
+      code: "caller_cancellation_unproven",
+      committed: true,
+      ambiguous: true,
+    });
+
+    const second = system.router.startRelay({ ...body, input: "second weighted transfer" }, {
+      encodedBodyBytes: bytes,
+      structuralBodyBytes: bytes,
+    });
+    await Bun.sleep(20);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    expect(system.router.snapshot().fleetTransferReserved).toBe(4);
+
+    const firstRuntime = system.runtimes.find(runtime => runtime.preExecutionHolds.length > 0)!;
+    firstRuntime.preExecutionHolds.shift()!.release();
+    for (let turn = 0;
+      turn < 100 && system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0) < 2;
+      turn++) await Bun.sleep(1);
+    const secondRuntime = system.runtimes.find(runtime => runtime.preExecutionHolds.length > 0)!;
+    secondRuntime.preExecutionHolds.shift()!.release();
+    const secondHandle = await second;
+    for (const runtime of system.runtimes) {
+      while (runtime.finals.length > 0) runtime.completeOne();
+    }
+    await secondHandle.final;
+    await expect(system.router.awaitIdle(1_000)).resolves.toBeUndefined();
     await system.router.close();
   });
 
@@ -2097,7 +2326,7 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("forwards caller cancellation after commit until the terminal settles", async () => {
+  it("forwards sanitized caller cancellation after commit until the terminal settles", async () => {
     const system = createSystem(1, 1);
     const controller = new AbortController();
     const handle = await system.router.startRelay(
@@ -2108,7 +2337,8 @@ describe("MultiSandboxRouter", () => {
     const reason = new Error("client disconnected");
     controller.abort(reason);
     expect(system.runtimes[0].lastRunSignal?.aborted).toBe(true);
-    expect(system.runtimes[0].lastRunSignal?.reason).toBe(reason);
+    expect(system.runtimes[0].lastRunSignal?.reason).toMatchObject({ name: "AbortError" });
+    expect(system.runtimes[0].lastRunSignal?.reason).not.toBe(reason);
     system.runtimes[0].completeOne();
     await handle.final;
     await system.router.close();
@@ -2579,6 +2809,134 @@ describe("MultiSandboxRouter", () => {
     await healthy.final;
     await system.router.close();
   });
+
+  for (const scenario of [
+    { name: "global fleet", projects: 2, slots: 1, transferCredits: 6 },
+    { name: "exact runtime", projects: 1, slots: 2, transferCredits: 4 },
+  ] as const) {
+    it(`protects bounded weighted headroom from ${scenario.name} starvation`, async () => {
+      let now = performance.timeOrigin + performance.now();
+      const clock: Clock = {
+        now: () => now,
+        sleep: async ms => { now += ms; },
+        waitUntil: async deadline => { now = Math.max(now, deadline); },
+      };
+      const system = createSystem(
+        scenario.projects,
+        scenario.slots,
+        20_000,
+        undefined,
+        undefined,
+        clock,
+      );
+      for (const runtime of system.runtimes) {
+        runtime.transportProfile = "bulk-v1";
+        runtime.holdBeforeExecutionRisk = true;
+        runtime.reflectTransferCosts = true;
+        runtime.transferCredits = scenario.transferCredits;
+        runtime.notify();
+      }
+      const controllers: AbortController[] = [];
+      const outcomes: Promise<unknown>[] = [];
+      let sequence = 0;
+      const launch = (kind: "tiny" | "medium" | "large") => {
+        const controller = new AbortController();
+        controllers.push(controller);
+        const bytes = kind === "tiny"
+          ? 128 * 1024
+          : kind === "medium"
+            ? Math.floor(2.5 * 1024 ** 2)
+            : Math.floor(3.2 * 1024 ** 2);
+        const transferCost = kind === "tiny" ? 1 : kind === "medium" ? 2 : 4;
+        const pending = system.router.startRelay({
+          model: "gpt-5.6-sol",
+          input: `${kind}-${sequence++}`,
+          tag: kind,
+          test_transfer_cost: transferCost,
+          stream: true,
+        }, {
+          clientId: `${kind}-${sequence}`,
+          signal: controller.signal,
+          encodedBodyBytes: bytes,
+          structuralBodyBytes: bytes,
+        });
+        outcomes.push(pending.then(handle => handle.final, () => undefined));
+      };
+
+      launch("medium");
+      launch("medium");
+      for (let turn = 0;
+        turn < 100 && system.runtimes.reduce((sum, runtime) => (
+          sum + runtime.preExecutionHolds.length
+        ), 0) < 2;
+        turn++) await Bun.sleep(1);
+      launch("large");
+      for (let index = 0; index < 24; index++) launch("medium");
+
+      const largeExecutions = () => system.runtimes.reduce((sum, runtime) => (
+        sum + runtime.bodies.filter(body => body.tag === "large").length
+      ), 0);
+      for (let cycle = 0; cycle < 24 && largeExecutions() === 0; cycle++) {
+        now += 500;
+        const runtime = system.runtimes.find(candidate => (
+          candidate.preExecutionHolds.some(hold => hold.body.tag === "medium")
+        ));
+        expect(runtime).toBeDefined();
+        const index = runtime!.preExecutionHolds.findIndex(hold => hold.body.tag === "medium");
+        runtime!.preExecutionHolds.splice(index, 1)[0]!.release();
+        for (let turn = 0; turn < 100 && runtime!.finals.length === 0; turn++) {
+          await Promise.resolve();
+        }
+        runtime!.completeOne();
+        await flush(20);
+        if (cycle === 7 && largeExecutions() === 0) {
+          launch("tiny");
+          for (let turn = 0;
+            turn < 100 && !system.runtimes.some(candidate => (
+              candidate.preExecutionHolds.some(hold => hold.body.tag === "tiny")
+            ));
+            turn++) await Promise.resolve();
+          const tinyRuntime = system.runtimes.find(candidate => (
+            candidate.preExecutionHolds.some(hold => hold.body.tag === "tiny")
+          ));
+          expect(tinyRuntime).toBeDefined();
+          const tinyIndex = tinyRuntime!.preExecutionHolds.findIndex(
+            hold => hold.body.tag === "tiny",
+          );
+          tinyRuntime!.preExecutionHolds.splice(tinyIndex, 1)[0]!.release();
+          for (let turn = 0; turn < 100 && tinyRuntime!.finals.length === 0; turn++) {
+            await Promise.resolve();
+          }
+          tinyRuntime!.completeOne();
+          await flush(20);
+        }
+      }
+
+      expect(largeExecutions()).toBe(1);
+
+      for (const controller of controllers) controller.abort();
+      for (let round = 0; round < 20; round++) {
+        let progressed = false;
+        for (const runtime of system.runtimes) {
+          while (runtime.preExecutionHolds.length > 0) {
+            runtime.preExecutionHolds.shift()!.release();
+            progressed = true;
+          }
+        }
+        await flush(20);
+        for (const runtime of system.runtimes) {
+          while (runtime.finals.length > 0) {
+            runtime.completeOne();
+            progressed = true;
+          }
+        }
+        await flush(20);
+        if (!progressed && system.router.snapshot().active === 0) break;
+      }
+      await Promise.allSettled(outcomes);
+      await system.router.close();
+    });
+  }
 
   it("keeps latency work fast without starving a backlogged bulk class", async () => {
     const system = createSystem(1, 1);

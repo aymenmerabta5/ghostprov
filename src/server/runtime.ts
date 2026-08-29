@@ -26,10 +26,12 @@ import type { WebSocketTelemetry } from "../ws/telemetry";
 import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
+import { assertCandidatePort } from "../core/ports";
 import {
   apiKeyAuthorized,
   isAuthenticatedTenantScope,
   isProtectedApiPath,
+  publicRequestAuthorityFailure,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
 
@@ -45,6 +47,8 @@ export interface GhostProvServerOptions {
   webSocketProcessBudget?: WebSocketProcessBudget;
   /** Shared trusted scope for HTTP, Anthropic, and WebSocket continuations. */
   authorizationScope?: AuthenticatedTenantScope;
+  /** Additional explicit Host/Origin authorities shared with the Hono app. */
+  allowedHosts?: readonly string[];
 }
 
 export { requestBodyLimitForUrl } from "../http/request-policy";
@@ -63,9 +67,9 @@ function requestErrorResponse(error: unknown, anthropic: boolean): Response {
 }
 
 export function createGhostProvServer(options: GhostProvServerOptions): Server {
-  if (options.candidate && options.port === 8787) {
-    throw new RangeError("Candidate server cannot bind protected port 8787");
-  }
+  if (options.candidate) assertCandidatePort(options.port, "Candidate server");
+  const allowedHosts = Object.freeze([...(options.allowedHosts ?? [])]);
+  publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
   const routerScope = options.router.responseProvenanceAuthorizationScope?.() ?? null;
   if (routerScope !== null && !isAuthenticatedTenantScope(routerScope)) {
     throw new TypeError("router authorization scope must be an AuthenticatedTenantScope");
@@ -107,9 +111,28 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
       const path = requestPath(request.url);
       const anthropicPath = isAnthropicRequestPath(path);
       try {
+        const authorityFailure = publicRequestAuthorityFailure({
+          host: request.headers.host,
+          forwardedHost: request.headers["x-forwarded-host"],
+          origin: request.headers.origin,
+        }, allowedHosts);
+        if (authorityFailure) {
+          request.resume();
+          await writeFetchResponse(response, requestErrorResponse(new ApiError(
+            authorityFailure === "host" ? 421 : 403,
+            authorityFailure === "host"
+              ? "Request host is not allowed"
+              : "Request origin is not allowed",
+            {
+              type: "permission_error",
+              code: authorityFailure === "host" ? "invalid_host" : "invalid_origin",
+            },
+          ), anthropicPath));
+          return;
+        }
         if (
           options.apiKey &&
-          isProtectedApiPath(path) &&
+          (isProtectedApiPath(path) || path === "/__sandboxes") &&
           !apiKeyAuthorized({
             authorization: request.headers.authorization,
             xApiKey: request.headers["x-api-key"],
@@ -131,7 +154,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
           await writeFetchResponse(response, unauthorized);
           return;
         }
-        const host = request.headers.host ?? `127.0.0.1:${options.port}`;
+        const host = request.headers.host!;
         const headers = new Headers();
         for (const [name, value] of Object.entries(request.headers)) {
           if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(",") : String(value));
@@ -208,6 +231,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
   });
   attachResponsesWebSocket(server, {
     apiKey: options.apiKey,
+    allowedHosts,
     telemetry: options.webSocketTelemetry,
     processBudget: options.webSocketProcessBudget,
     authorizationScope,

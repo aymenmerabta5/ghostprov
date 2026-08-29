@@ -12,6 +12,7 @@ import type { SseFrame } from "../src/relay/sse";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { V2CommittedError } from "../src/v2/transport/run-handle";
 import { classifyWorkload } from "../src/router/workload";
+import { translateAnthropicRequest } from "../src/anthropic/request";
 import {
   finalResponse,
   messageOutput,
@@ -665,6 +666,88 @@ describe("Anthropic persisted continuation HTTP integration", () => {
     expect(calls[1]).not.toHaveProperty("previous_response_id");
   });
 
+  it("does not index lossy streamed tool arguments", async () => {
+    const lossy = finalResponse("resp_lossy_stream_tool", [
+      toolOutput("fc_lossy_stream", "call_lossy_stream", "Calculate", '{"value":1e-400}'),
+    ]);
+    const { app, calls } = testApp((_body, call) => {
+      if (call === 1) {
+        return relayHandle(lossy, async function* () {
+          yield streamFrame("response.completed", { response: lossy });
+        }, Promise.resolve({ status: 200 }));
+      }
+      return relayHandle(completed("resp_after_lossy_stream", "done"));
+    });
+
+    const streamed = await post(app, request([{ role: "user", content: "calculate" }], {
+      stream: true,
+    }));
+    expect(await streamed.text()).toContain("event: message_stop");
+    const next = await post(app, request([
+      { role: "user", content: "calculate" },
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "call_lossy_stream",
+          name: "Calculate",
+          input: { value: 0 },
+        }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_lossy_stream", content: "done" }],
+      },
+    ]), "/v1/messages?beta=true");
+
+    expect(next.status).toBe(200);
+    expect(calls[1]).not.toHaveProperty("previous_response_id");
+    expect(calls[1]?.input).toHaveLength(3);
+  });
+
+  it("validates the complete replay before an inferred prefix can hide invalid Unicode", async () => {
+    const continuationIndex = new AnthropicContinuationIndex({
+      key: new Uint8Array(32).fill(0x41),
+    });
+    const rootRequest = request([{ role: "user", content: "root" }]);
+    const rootRelay = translateAnthropicRequest(rootRequest, { models: MODELS }).relayBody;
+    const prepared = continuationIndex.prepare(rootRelay, SCOPE);
+    expect(continuationIndex.commit(prepared, SCOPE, "resp_invalid_unicode_parent", [{
+      type: "function_call",
+      call_id: "call_invalid_unicode",
+      name: "Read",
+      arguments: '{"value":"\\ud800"}',
+    }])).toBe(true);
+    const { app, calls } = testApp(
+      () => relayHandle(completed("resp_must_not_run", "unexpected")),
+      { continuationIndex },
+    );
+
+    const response = await post(app, request([
+      { role: "user", content: "root" },
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "call_invalid_unicode",
+          name: "Read",
+          input: { value: "\ud800" },
+        }],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "call_invalid_unicode",
+          content: "done",
+        }],
+      },
+    ]), "/v1/messages?beta=true");
+
+    expect(response.status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
   it("retains a streaming miss graph until the handler clears its prelude", async () => {
     let releasePrelude!: () => void;
     const prelude = new Promise<void>(resolve => { releasePrelude = resolve; });
@@ -729,6 +812,41 @@ describe("Anthropic persisted continuation HTTP integration", () => {
       { role: "user", content: "different fork" },
     ]));
     expect(calls[3]).not.toHaveProperty("previous_response_id");
+  });
+
+  it("lets every concurrent definitive stale hit retry its own immutable full history once", async () => {
+    const missing = await previousResponseNotFound();
+    let staleArrivals = 0;
+    let releaseStale!: () => void;
+    const bothStale = new Promise<void>(resolve => { releaseStale = resolve; });
+    const { app, calls } = testApp(async (body, call) => {
+      if (call === 1) return relayHandle(completed("resp_concurrent_parent", "parent"));
+      if (Object.hasOwn(body, "previous_response_id")) {
+        staleArrivals += 1;
+        if (staleArrivals === 2) releaseStale();
+        await bothStale;
+        throw missing;
+      }
+      return relayHandle(completed(`resp_concurrent_fallback_${call}`, "fallback"));
+    });
+
+    await post(app, request([{ role: "user", content: "root" }]));
+    const history = [
+      { role: "user", content: "root" },
+      { role: "assistant", content: assistantContent("parent") },
+    ];
+    const responses = await Promise.all([
+      post(app, request([...history, { role: "user", content: "next-a" }])),
+      post(app, request([...history, { role: "user", content: "next-b" }])),
+    ]);
+
+    expect(responses.map(response => response.status)).toEqual([200, 200]);
+    const inferred = calls.filter(body => Object.hasOwn(body, "previous_response_id"));
+    const fullFallbacks = calls.slice(1)
+      .filter(body => !Object.hasOwn(body, "previous_response_id"));
+    expect(inferred).toHaveLength(2);
+    expect(fullFallbacks).toHaveLength(2);
+    expect(calls).toHaveLength(5);
   });
 
   it("sizes a tiny stored suffix separately from its multi-megabyte fallback", async () => {

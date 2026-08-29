@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { createServer, get, type Server } from "node:http";
+import { EventEmitter } from "node:events";
+import { createServer, get, type Server, type ServerResponse } from "node:http";
 import { writeFetchResponse } from "../src/http/adapter";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { attachAtomicBytePermit } from "../src/v2/memory/permit-carrier";
@@ -140,5 +141,68 @@ describe("writeFetchResponse", () => {
     expect(reads).toBe(0);
     expect(cancellations).toBe(1);
     expect(releases).toBe(1);
+  });
+
+  it("times out a non-draining write and releases its permit only after destroying output", async () => {
+    class StalledResponse extends EventEmitter {
+      destroyed = false;
+      closed = false;
+      headersSent = false;
+
+      writeHead(): this {
+        this.headersSent = true;
+        return this;
+      }
+
+      write(): boolean {
+        return false;
+      }
+
+      end(): void {}
+
+      destroy(): this {
+        this.destroyed = true;
+        this.closed = true;
+        queueMicrotask(() => this.emit("close"));
+        return this;
+      }
+    }
+
+    const permits = new AtomicBytePermitPool({ ordinaryBytes: 1_024, jumboBytes: 1 });
+    const chunk = attachAtomicBytePermit(
+      new Uint8Array(1_024),
+      (await permits.acquire(1_024)).transfer("stalled-http-write"),
+    );
+    let cancelled = false;
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }));
+    const output = new StalledResponse();
+
+    const writing = writeFetchResponse(
+      output as unknown as ServerResponse,
+      response,
+      { writeTimeoutMs: 10 },
+    );
+    await expect(Promise.race([
+      writing,
+      new Promise<never>((_resolve, reject) => setTimeout(
+        () => reject(new Error("HTTP write deadline did not settle output")),
+        250,
+      )),
+    ])).rejects.toMatchObject({ name: "HttpResponseWriteTimeoutError" });
+
+    expect(output.destroyed).toBe(true);
+    expect(cancelled).toBe(true);
+    expect(permits.snapshot()).toMatchObject({
+      ordinaryUsedBytes: 0,
+      activePermits: 0,
+    });
+    permits.close();
   });
 });

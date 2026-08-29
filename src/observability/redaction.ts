@@ -24,9 +24,30 @@ import {
   safeV2ReleaseIdentity,
 } from "../v2/release-observability";
 
-const CREDENTIAL = /(?:\b(?:Bearer|Basic|Digest)\s+(?!\[REDACTED\](?:\s|$))[^\s]+|\bsk-[A-Za-z0-9_-]{16,}|\bgAAAA[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{8,})?|\b(?:token|key|secret)\s*[=:](?!\s*\[REDACTED\](?:[\s,;]|$))\s*[^\s,;]+|\b(?:set-cookie|cookie|authorization)\s*[=:](?!\s*\[REDACTED\](?:\s|$))\s*[^\r\n]+)/gi;
-const URL_VALUE = /https?:\/\/[^\s"'<>]+/gi;
-const FORBIDDEN_KEY = /(?:prompt|instructions|output|content|arguments|headers?|cookie|authorization|token|secret|encrypted|body|url)/i;
+const CREDENTIAL_LABEL =
+  "(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|api[-_]?key|" +
+  "access[-_]?token|refresh[-_]?token|session[-_]?token|token|secret|password)";
+const JSON_CREDENTIAL = new RegExp(
+  `("${CREDENTIAL_LABEL}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`,
+  "gi",
+);
+const LABELED_CREDENTIAL = new RegExp(
+  `(^|[\\s,;{[(])((?:"|')?${CREDENTIAL_LABEL}(?:"|')?\\s*[=:]\\s*)` +
+    `("(?:[^"\\\\]|\\\\.)*"|'[^']*'|[^\\r\\n,;}\\]]+)`,
+  "gi",
+);
+const SAFE_REDACTED_CREDENTIAL = new RegExp(
+  `(?:"|')?${CREDENTIAL_LABEL}(?:"|')?\\s*[=:]\\s*(?:"|')?\\[REDACTED\\](?:"|')?` +
+    `|\\b(?:Bearer|Basic|Digest)\\s+\\[REDACTED\\]`,
+  "gi",
+);
+const AUTHORIZATION_CREDENTIAL = /\b(Bearer|Basic|Digest)\s+(?!\[REDACTED\](?:\s|$))[^\s,;"']+/gi;
+const OPAQUE_CREDENTIAL = /(?:\bsk-[A-Za-z0-9_-]{16,}|\bgAAAA[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{8,})?)/gi;
+const URL_VALUE = /\b(?:https?|wss?|ftp|file|data|blob|mailto):[^\s"'<>]+/gi;
+const ORGANIZATION_VALUE = /\b(in\s+organization\s+)[A-Za-z0-9][A-Za-z0-9_-]{0,127}\b/gi;
+const JSON_ORGANIZATION_VALUE = /("organization"\s*:\s*)"(?:[^"\\]|\\.)*"/gi;
+const FORBIDDEN_KEY = /(?:prompt|instructions|output|content|arguments|headers?|cookie|authorization|api.?key|password|token|secret|encrypted|body|url|client.?id|organization)/i;
+const DIAGNOSTIC_SOURCE_MAX_UNITS = 4_096;
 const COMMON = new Set(["schema", "event", "ts", "mono_ms"]);
 const RECOVERY_FIELDS = new Set([
   "project_id",
@@ -152,27 +173,50 @@ const ROUTER_NUMERIC_FIELDS = new Set([
 ]);
 const RUNTIME_PRIVATE_FIELD_NAMES = new Set([
   "token", "cookie", "authorization", "sessionid", "sandboxsessionid",
-  "instanceid", "resourcetoken", "ysweettoken",
+  "instanceid", "resourcetoken", "ysweettoken", "apikey", "password",
+  "accesstoken", "refreshtoken", "sessiontoken",
 ]);
 
+function redactCredentialText(value: string): string {
+  return value
+    .replace(JSON_CREDENTIAL, '$1"[REDACTED]"')
+    .replace(AUTHORIZATION_CREDENTIAL, "$1 [REDACTED]")
+    .replace(LABELED_CREDENTIAL, "$1$2[REDACTED]")
+    .replace(OPAQUE_CREDENTIAL, "[REDACTED]");
+}
+
+function redactUrlText(value: string): string {
+  return value.replace(URL_VALUE, "[URL]");
+}
+
+function redactIdentifierText(value: string): string {
+  return value
+    .replace(JSON_ORGANIZATION_VALUE, '$1"[REDACTED]"')
+    .replace(ORGANIZATION_VALUE, "$1[REDACTED]");
+}
+
+/** A request model is telemetry only when it is a small opaque protocol atom. */
+export function safeObservabilityModel(value: unknown): string {
+  if (typeof value !== "string" || value.length > 128) return "unknown";
+  const normalized = value.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9._:-]{0,127}$/.test(normalized) ? normalized : "unknown";
+}
+
 export function sanitizeDiagnosticMessage(value: unknown): string {
-  const normalized = String(value ?? "unknown")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(CREDENTIAL, match => {
-      const separator = /^([^:=]+\s*[=:]\s*)/.exec(match)?.[1];
-      if (/^Bearer\s/i.test(match)) return "Bearer [REDACTED]";
-      return separator ? `${separator}[REDACTED]` : "[REDACTED]";
-    })
-    .replace(URL_VALUE, "[URL]")
-    .trim();
+  const source = String(value ?? "unknown");
+  const controlled = source.slice(0, DIAGNOSTIC_SOURCE_MAX_UNITS)
+    .replace(/[\u0000-\u001f\u007f]/g, " ");
+  const normalized = redactIdentifierText(redactUrlText(redactCredentialText(controlled))).trim();
   return normalized.slice(0, 256) || "unknown";
 }
 
 function containsCredential(value: unknown): boolean {
   if (typeof value === "string") {
-    CREDENTIAL.lastIndex = 0;
-    URL_VALUE.lastIndex = 0;
-    return CREDENTIAL.test(value) || URL_VALUE.test(value);
+    if (value.length > DIAGNOSTIC_SOURCE_MAX_UNITS) return true;
+    const withoutSafeRedactions = value.replace(SAFE_REDACTED_CREDENTIAL, "[REDACTED]");
+    return redactCredentialText(withoutSafeRedactions) !== withoutSafeRedactions ||
+      redactUrlText(withoutSafeRedactions) !== withoutSafeRedactions ||
+      redactIdentifierText(withoutSafeRedactions) !== withoutSafeRedactions;
   }
   if (Array.isArray(value)) return value.some(containsCredential);
   if (value && typeof value === "object") {

@@ -243,6 +243,43 @@ describe("Images API compatibility", () => {
       expect(bodies[0].tools).not.toBe(bodies[1].tools);
     });
 
+    it("accepts OpenAI SDK image[] fields without changing reference bytes or order", async () => {
+      const form = new FormData();
+      form.append("prompt", "combine both references");
+      // openai-python 2.31 serializes Sequence[FileTypes] with this repeated key.
+      form.append("image[]", new File([PNG], "one.png", { type: "image/png" }));
+      form.append("image[]", new File([JPEG], "two.jpg", { type: "image/jpeg" }));
+
+      const parsed = await parseEditRequest(form, OPTIONS);
+      expect(parsed.images.map(image => image.image_url)).toEqual([
+        `data:image/png;base64,${Buffer.from(PNG).toString("base64")}`,
+        `data:image/jpeg;base64,${Buffer.from(JPEG).toString("base64")}`,
+      ]);
+
+      const [body] = buildEditBodies(parsed);
+      const content = (body.input as any[])[0].content;
+      expect(content.map((part: Record<string, unknown>) => part.type)).toEqual([
+        "input_text",
+        "input_image",
+        "input_image",
+      ]);
+      expect(content.slice(1).map((part: Record<string, unknown>) => part.image_url)).toEqual(
+        parsed.images.map(image => image.image_url),
+      );
+    });
+
+    it("rejects mixed image and image[] multipart spellings as ambiguous", async () => {
+      const form = new FormData();
+      form.append("prompt", "ambiguous references");
+      form.append("image", new File([PNG], "direct.png", { type: "image/png" }));
+      form.append("image[]", new File([JPEG], "array.jpg", { type: "image/jpeg" }));
+
+      await expectAsyncApiError(
+        () => parseEditRequest(form, OPTIONS),
+        { status: 400, param: "image", code: "invalid_value" },
+      );
+    });
+
     it("accepts WebP references by matching type, extension, and magic bytes", async () => {
       const form = new FormData();
       form.append("prompt", "use this reference");
@@ -253,22 +290,49 @@ describe("Images API compatibility", () => {
       expect(content[1].image_url).toStartWith("data:image/webp;base64,");
     });
 
-    it("enforces the configured total raw edit-input budget before encoding", async () => {
+    it("applies image type validation to OpenAI SDK image[] fields", async () => {
       const form = new FormData();
-      form.append("prompt", "too large");
-      form.append("image", new File([PNG], "large.png", { type: "image/png" }));
+      form.append("prompt", "reject mismatched SDK reference");
+      form.append("image[]", new File([JPEG], "reference.png", { type: "image/png" }));
 
       await expectAsyncApiError(
-        () => parseEditRequest(form, { ...OPTIONS, maxEditInputBytes: PNG.byteLength - 1 }),
-        { status: 413, param: "image", code: "request_too_large" },
+        () => parseEditRequest(form, OPTIONS),
+        { status: 400, param: "image", code: "invalid_image" },
       );
     });
+
+    it.each(["image", "image[]"] as const)(
+      "enforces the configured total raw edit-input budget for %s before encoding",
+      async imageField => {
+        const form = new FormData();
+        form.append("prompt", "too large");
+        form.append(imageField, new File([PNG], "large.png", { type: "image/png" }));
+
+        await expectAsyncApiError(
+          () => parseEditRequest(form, { ...OPTIONS, maxEditInputBytes: PNG.byteLength - 1 }),
+          { status: 413, param: "image", code: "request_too_large" },
+        );
+      },
+    );
 
     it("rejects more than sixteen reference images", async () => {
       const form = new FormData();
       form.append("prompt", "too many");
       for (let index = 0; index < 17; index++) {
         form.append("image", new File([PNG], `${index}.png`, { type: "image/png" }));
+      }
+
+      await expectAsyncApiError(
+        () => parseEditRequest(form, OPTIONS),
+        { status: 400, param: "image", code: "too_many_files" },
+      );
+    });
+
+    it("applies the reference count bound to OpenAI SDK image[] fields", async () => {
+      const form = new FormData();
+      form.append("prompt", "too many SDK references");
+      for (let index = 0; index < 17; index++) {
+        form.append("image[]", new File([PNG], `${index}.png`, { type: "image/png" }));
       }
 
       await expectAsyncApiError(

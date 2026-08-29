@@ -4,6 +4,7 @@ import {
   sanitizeDiagnosticMessage,
 } from "../src/observability/redaction";
 import { observabilityEvent, type ObservabilityEvent } from "../src/observability/events";
+import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 
 describe("observability privacy", () => {
   it("redacts credential-shaped values and control characters", () => {
@@ -119,7 +120,7 @@ describe("observability privacy", () => {
     }
   });
 
-  it("accepts credential-free soak telemetry rollups", () => {
+  it("accepts credential-free soak telemetry rollups without provider identifiers", () => {
     expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
       traffic: {
         accepted: 10,
@@ -130,7 +131,6 @@ describe("observability privacy", () => {
         project_id: "e631d12c-d917-4434-b360-41b4715d6679",
         rate_limit_observations: [{
           model: "gpt-5.6-sol",
-          organization: "org-Example123",
           limit: 40_000_000,
           used: 40_000_000,
           requested: 609_930,
@@ -139,6 +139,9 @@ describe("observability privacy", () => {
         }],
       }],
     }))).not.toThrow();
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
+      runtimes: [{ organization: "org-Example123" }],
+    }))).toThrow("credential-shaped");
   });
 
   it("accepts only bounded router fairness telemetry", () => {
@@ -182,8 +185,8 @@ describe("observability privacy", () => {
   });
 
   it("accepts only exact release hashes and rejects lifecycle binding fields", () => {
-    const buildHash = "a".repeat(64);
-    const schemaHash = "b".repeat(64);
+    const buildHash = V2_R3_RELEASE.buildHash;
+    const schemaHash = V2_R3_RELEASE.schemaHash;
     expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
       release: {
         knownRuntimes: 1,

@@ -12,7 +12,9 @@ import type { ResponseGraph } from "./response-graph";
 import {
   apiKeyAuthorized,
   isAuthenticatedTenantScope,
+  publicRequestAuthorityFailure,
   type AuthenticatedTenantScope,
+  type PublicRequestAuthorityFailure,
 } from "../http/api-key";
 
 export type { WebSocketRelayStarter } from "./session";
@@ -84,6 +86,8 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   authorizationScope: AuthenticatedTenantScope;
   /** Shared OpenAI-compatible bearer credential for the upgrade request. */
   apiKey?: string;
+  /** Additional public Host/Origin authorities accepted before authentication. */
+  allowedHosts?: readonly string[];
   /** Application limit; Bun's node:http shim may assemble up to 16 MiB before this check. */
   maxPayloadBytes?: number;
   /** Normal-path threshold before automatic per-message memory promotion. */
@@ -98,6 +102,30 @@ export interface AttachResponsesWebSocketOptions extends Omit<
 }
 
 const attachedServers = new WeakMap<Server, readonly WebSocketServer[]>();
+
+function rejectUpgradeAuthority(
+  socket: { end(data: string): unknown },
+  failure: PublicRequestAuthorityFailure,
+): void {
+  const status = failure === "host" ? 421 : 403;
+  const reason = failure === "host" ? "Misdirected Request" : "Forbidden";
+  const body = JSON.stringify({
+    error: {
+      message: failure === "host"
+        ? "Request host is not allowed"
+        : "Request origin is not allowed",
+      type: "permission_error",
+      param: null,
+      code: failure === "host" ? "invalid_host" : "invalid_origin",
+    },
+  });
+  socket.end(
+    `HTTP/1.1 ${status} ${reason}\r\n` +
+    "Connection: close\r\n" +
+    "Content-Type: application/json\r\n" +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+}
 
 export function attachResponsesWebSocket(
   server: Server,
@@ -169,6 +197,10 @@ export function attachResponsesWebSocket(
   if (!isAuthenticatedTenantScope(authorizationScope)) {
     throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
   }
+  const allowedHosts = Object.freeze([...(options.allowedHosts ?? [])]);
+  // Validate composition eagerly rather than discovering a malformed allowlist
+  // only after the listener begins accepting upgrade requests.
+  publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
   const pendingLeases = new WeakMap<object, WebSocketProcessLease>();
@@ -321,6 +353,15 @@ export function attachResponsesWebSocket(
   ));
   server.on("upgrade", (request, socket, head) => {
     try {
+      const authorityFailure = publicRequestAuthorityFailure({
+        host: request.headers.host,
+        forwardedHost: request.headers["x-forwarded-host"],
+        origin: request.headers.origin,
+      }, allowedHosts);
+      if (authorityFailure) {
+        rejectUpgradeAuthority(socket, authorityFailure);
+        return;
+      }
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (url.pathname !== "/v1/responses") {
         socket.destroy();

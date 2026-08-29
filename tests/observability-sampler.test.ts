@@ -5,6 +5,7 @@ import type { ObservabilityEvent } from "../src/observability/events";
 import { FleetSampler } from "../src/observability/sampler";
 import { projectId } from "../src/sandbox/types";
 import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
+import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 import { WebSocketTelemetry } from "../src/ws/telemetry";
 
 class MemoryLogger implements LoggerLike {
@@ -108,8 +109,8 @@ describe("FleetSampler", () => {
           projectId: projectId("00000000-0000-4000-8000-000000000001"),
           releaseRevision: "r3" as const,
           protocolRevision: "r2" as const,
-          buildHash: "a".repeat(64),
-          schemaHash: "b".repeat(64),
+          buildHash: V2_R3_RELEASE.buildHash,
+          schemaHash: V2_R3_RELEASE.schemaHash,
           incarnation: 3,
           state: "ready",
           capacity: 128,
@@ -320,8 +321,8 @@ describe("FleetSampler", () => {
       project_id: "00000000-0000-4000-8000-000000000001",
       release_revision: "r3",
       protocol_revision: "r2",
-      build_hash: "a".repeat(64),
-      schema_hash: "b".repeat(64),
+      build_hash: V2_R3_RELEASE.buildHash,
+      schema_hash: V2_R3_RELEASE.schemaHash,
       incarnation: 3,
       awareness_rtt_ms: 15,
       availability_reason: "available",
@@ -333,7 +334,6 @@ describe("FleetSampler", () => {
       completion_ewma_ms: 2_000,
       rate_limit_observations: [{
         model: "gpt-5.6-sol",
-        organization: "org-Example123",
         limit: 40_000_000,
         used: 40_000_000,
         requested: 609_930,
@@ -363,6 +363,7 @@ describe("FleetSampler", () => {
         },
       },
     });
+    expect(JSON.stringify(event)).not.toContain("org-Example123");
     expect(event.routable).toBe(1);
     expect(event.provisioning_circuit).toMatchObject({
       state: "open",
@@ -377,8 +378,8 @@ describe("FleetSampler", () => {
       selections: [{
         releaseRevision: "r3",
         protocolRevision: "r2",
-        buildHash: "a".repeat(64),
-        schemaHash: "b".repeat(64),
+        buildHash: V2_R3_RELEASE.buildHash,
+        schemaHash: V2_R3_RELEASE.schemaHash,
         runtimes: 1,
       }],
     });

@@ -185,7 +185,14 @@ function jsonCompatibilityError(name: string): AnthropicRequestError {
   return new AnthropicRequestError(400, `${name} must contain only JSON-compatible values`);
 }
 
-function jsonStringBytes(value: string): number {
+function invalidUnicode(name: string): AnthropicRequestError {
+  return new AnthropicRequestError(
+    400,
+    `${name} must contain only well-formed Unicode scalar values`,
+  );
+}
+
+function jsonStringBytes(value: string, name: string): number {
   let bytes = 2;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -200,10 +207,10 @@ function jsonStringBytes(value: string): number {
         bytes += 4;
         index += 1;
       } else {
-        bytes += 6;
+        throw invalidUnicode(name);
       }
     } else if (code >= 0xdc00 && code <= 0xdfff) {
-      bytes += 6;
+      throw invalidUnicode(name);
     } else if (code <= 0x7f) {
       bytes += 1;
     } else if (code <= 0x7ff) {
@@ -258,7 +265,7 @@ export function measureBoundedJson(
       continue;
     }
     if (typeof current === "string") {
-      addBytes(jsonStringBytes(current));
+      addBytes(jsonStringBytes(current, name));
       continue;
     }
     if (typeof current === "boolean") {
@@ -299,7 +306,7 @@ export function measureBoundedJson(
         addBytes(2 + Math.max(0, keys.length - 1));
         children = [];
         for (const key of keys) {
-          addBytes(jsonStringBytes(key) + 1);
+          addBytes(jsonStringBytes(key, name) + 1);
           children.push((current as Record<string, unknown>)[key]);
         }
       }

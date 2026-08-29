@@ -1,7 +1,7 @@
-import "dotenv/config";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
+import { DEFAULT_CANDIDATE_PORT } from "../src/core/ports";
 import { resolveObservabilityConfig } from "../src/observability/config";
 import type { ObservabilityEvent, ObservabilityPriority } from "../src/observability/events";
 import {
@@ -17,7 +17,7 @@ import type {
 } from "../src/v2/runtime";
 
 const MiB = 1024 * 1024;
-const PORT = Number(process.env.GP_DUAL_CHANNEL_TEST_PORT ?? 18888);
+const PORT = Number(process.env.GP_DUAL_CHANNEL_TEST_PORT ?? DEFAULT_CANDIDATE_PORT);
 const WAVE_COUNT = Number(process.env.GP_DUAL_CHANNEL_TEST_WAVES ?? 3);
 const TEST_ROOT = path.resolve(
   process.env.GP_DUAL_CHANNEL_TEST_ROOT ??
@@ -159,8 +159,10 @@ export async function main(): Promise<void> {
   if (process.env.GP_LIVE_DUAL_CHANNEL_TEST !== "1") {
     throw new Error("GP_LIVE_DUAL_CHANNEL_TEST=1 is required");
   }
-  if (!Number.isSafeInteger(PORT) || PORT !== 18888 || PORT === 18787) {
-    throw new Error("The dual-channel live proof is hard-fenced to test port 18888");
+  if (!Number.isSafeInteger(PORT) || PORT !== DEFAULT_CANDIDATE_PORT) {
+    throw new Error(
+      `The dual-channel live proof is hard-fenced to test port ${DEFAULT_CANDIDATE_PORT}`,
+    );
   }
   if (!Number.isSafeInteger(WAVE_COUNT) || WAVE_COUNT < 1 || WAVE_COUNT > 20) {
     throw new Error("GP_DUAL_CHANNEL_TEST_WAVES must be an integer from 1 through 20");

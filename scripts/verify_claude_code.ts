@@ -1,4 +1,8 @@
-import type { FetchLike } from "../src/core/ports";
+import {
+  DEFAULT_CANDIDATE_PORT,
+  PROTECTED_SERVICE_PORT,
+  type FetchLike,
+} from "../src/core/ports";
 import { ApiError } from "../src/http/errors";
 import { RelayError, type RunHandle } from "../src/relay/run-handle";
 import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../src/relay/host-upstream-policy";
@@ -28,7 +32,7 @@ import {
 export { closeVerifierServer, trackVerifierUpgrades };
 
 const DEFAULT_PORT = 18_788;
-const DEFAULT_UPSTREAM = "http://127.0.0.1:18787";
+const DEFAULT_UPSTREAM = `http://127.0.0.1:${DEFAULT_CANDIDATE_PORT}`;
 const PROTECTED_LISTENER_PORTS = new Set([18_787, 8_787]);
 const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024;
 const DEFAULT_MAX_EVENT_BYTES = 2 * 1024 * 1024;
@@ -145,6 +149,9 @@ function validateUpstream(value: string): { upstream: string; url: URL } {
   }
   if (!isLoopbackHostname(url.hostname)) {
     throw new TypeError("Verifier upstream must use a loopback host");
+  }
+  if (effectivePort(url) === PROTECTED_SERVICE_PORT) {
+    throw new TypeError(`Verifier upstream refuses protected service port ${PROTECTED_SERVICE_PORT}`);
   }
   if (url.username || url.password || hasRawUserInfo(value)) {
     throw new TypeError("Verifier upstream must not contain credentials");

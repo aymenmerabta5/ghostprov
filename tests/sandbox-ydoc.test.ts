@@ -188,6 +188,101 @@ describe("SandboxYDoc", () => {
     expect(await doc.tombstonePath("same/same")).toBe(true);
   });
 
+  it("atomically guards bootstrap path replacement without partial mutation", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    await doc.writePath(".ghostprov-v2/static.json", "old-static");
+    await doc.writePath(".ghostprov-v2/bootstrap.enc.json", "old-ciphertext");
+    await doc.writePath(".latexmkrc", "old-launcher");
+    await doc.writePath("main.tex", "old-main");
+
+    await expect(doc.compareAndMutatePaths({
+      guards: [{ path: ".ghostprov-v2/static.json", equals: "stale-static" }],
+      mutations: [
+        { kind: "tombstone", path: ".ghostprov-v2/bootstrap.enc.json" },
+        { kind: "write", path: ".latexmkrc", content: "new-launcher" },
+        { kind: "write", path: "main.tex", content: "new-main" },
+      ],
+    })).resolves.toBe(false);
+    expect(await doc.readPath(".ghostprov-v2/bootstrap.enc.json")).toBe("old-ciphertext");
+    expect(await doc.readPath(".latexmkrc")).toBe("old-launcher");
+    expect(await doc.readPath("main.tex")).toBe("old-main");
+
+    await expect(doc.compareAndMutatePaths({
+      guards: [{ path: ".ghostprov-v2/static.json", equals: "old-static" }],
+      mutations: [
+        { kind: "write", path: ".ghostprov-v2/static.json", content: "new-static" },
+        { kind: "tombstone", path: ".ghostprov-v2/bootstrap.enc.json" },
+        { kind: "write", path: ".latexmkrc", content: "new-launcher" },
+        { kind: "write", path: "main.tex", content: "new-main" },
+      ],
+    })).resolves.toBe(true);
+    expect(await doc.readPath(".ghostprov-v2/static.json")).toBe("new-static");
+    expect(await doc.readPath(".ghostprov-v2/bootstrap.enc.json")).toBeNull();
+    expect(await doc.readPath(".latexmkrc")).toBe("new-launcher");
+    expect(await doc.readPath("main.tex")).toBe("new-main");
+  });
+
+  it("preflights every guarded mutation before an earlier write becomes visible", async () => {
+    const { doc } = createDoc(A, new FakeProviderFactory(true, false));
+    await doc.connect();
+    await doc.writePath("authority.json", "current");
+    await doc.writePath("collision", "existing-file");
+
+    await expect(doc.compareAndMutatePaths({
+      guards: [{ path: "authority.json", equals: "current" }],
+      mutations: [
+        { kind: "write", path: "first.txt", content: "must-not-appear" },
+        { kind: "write", path: "collision/child.txt", content: "invalid" },
+      ],
+    })).rejects.toThrow("not a folder");
+
+    expect(await doc.readPath("first.txt")).toBeNull();
+    expect(await doc.readPath("collision")).toBe("existing-file");
+    expect(await doc.readPath("authority.json")).toBe("current");
+  });
+
+  it("atomically writes siblings beneath one newly planned folder", async () => {
+    const { doc } = createDoc(A, new FakeProviderFactory(true, false));
+    await doc.connect();
+    await doc.writePath("authority.json", "current");
+
+    await expect(doc.compareAndMutatePaths({
+      guards: [{ path: "authority.json", equals: "current" }],
+      mutations: [
+        { kind: "write", path: "a/x.txt", content: "x" },
+        { kind: "write", path: "a/y.txt", content: "y" },
+      ],
+    })).resolves.toBe(true);
+
+    expect(await doc.readPath("a/x.txt")).toBe("x");
+    expect(await doc.readPath("a/y.txt")).toBe("y");
+  });
+
+  it("preserves the integrated Y.Text identity and notifies its observer", async () => {
+    const factory = new FakeProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    await doc.writePath("authority.json", "current");
+    await doc.writePath(".latexmkrc", "old-launcher");
+    const entry = [...factory.docs[0].getMap<Y.Map<any>>("content").values()]
+      .find(value => value.get("filename") === ".latexmkrc")!;
+    const original = entry.get("content") as Y.Text;
+    let observerCalls = 0;
+    original.observe(() => { observerCalls++; });
+
+    await expect(doc.compareAndMutatePaths({
+      guards: [{ path: "authority.json", equals: "current" }],
+      mutations: [{ kind: "write", path: ".latexmkrc", content: "new-launcher" }],
+    })).resolves.toBe(true);
+
+    expect(entry.get("content")).toBe(original);
+    expect(observerCalls).toBe(1);
+    expect(original.toString()).toBe("new-launcher");
+    expect(await doc.readPath(".latexmkrc")).toBe("new-launcher");
+  });
+
   it("recursively tombstones an obsolete managed asset directory", async () => {
     const factory = new FakeProviderFactory(true, false);
     const { doc } = createDoc(A, factory);

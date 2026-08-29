@@ -459,6 +459,7 @@ function config(cookieFile: string, input: {
 }) {
   const explicit = input.explicit;
   return resolveMultiSandboxConfig({
+    GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
     PRISM_COOKIE_FILE: cookieFile,
     PRISM_PROJECT_IDS: explicit.join(","),
     GP_PRISM_SESSION: input.sessionMode ?? "authenticated",

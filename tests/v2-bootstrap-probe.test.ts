@@ -31,15 +31,15 @@ describe("V2 live bootstrap probe guards", () => {
     })).toThrow("PRISM_COOKIE_FILE");
   });
 
-  it("refuses protected ports 8787/18787 and accepts exactly one explicit project", () => {
+  it("is hard-fenced to candidate port 18888 and accepts exactly one explicit project", () => {
     expect(() => resolveV2BootstrapProbeOptions({
       ...VALID,
       PORT: "8787",
-    })).toThrow("protected port 8787");
+    })).toThrow("hard-fenced to candidate port 18888");
     expect(() => resolveV2BootstrapProbeOptions({
       ...VALID,
       PORT: "18787",
-    })).toThrow("protected port 18787");
+    })).toThrow("protected service port 18787");
     expect(() => resolveV2BootstrapProbeOptions({
       ...VALID,
       GP_LIVE_V2_PROJECT_ID: `${VALID.GP_LIVE_V2_PROJECT_ID},69288e8b-c183-45f3-9131-d64b05b98928`,
@@ -102,7 +102,8 @@ describe("V2 live bootstrap probe guards", () => {
     );
     expect(source).not.toContain("/zip");
     expect(source).not.toMatch(/deleteProject|projects\.delete|server\.close/);
-    expect(source).toContain("http://127.0.0.1:8787");
+    expect(source).not.toMatch(/127\.0\.0\.1:(?:8787|18787)/);
+    expect(source).toContain("protectedServiceTouched: false");
     expect(source).toContain('"ghostprovV2Data"');
     expect(source).toContain('"ghostprovV2Control"');
     expect(source).not.toMatch(/field:\s*["']ghostprovV2["']/);

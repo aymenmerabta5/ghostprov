@@ -40,6 +40,8 @@ import type { FleetSnapshot } from "../fleet/types";
 import {
   apiKeyAuthorized,
   isAuthenticatedTenantScope,
+  isProtectedApiPath,
+  publicRequestAuthorityFailure,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
 import { isAnthropicRequestPath } from "../http/request-policy";
@@ -48,6 +50,7 @@ import {
   anthropicErrorResponse,
   newAnthropicRequestId,
 } from "../anthropic/errors";
+import { safeObservabilityModel, sanitizeDiagnosticMessage } from "../observability/redaction";
 
 export interface RouterLike {
   startRelay(
@@ -99,6 +102,8 @@ export interface GhostProvAppOptions {
   anthropicContinuationIndex?: AnthropicContinuationIndex;
   /** Trusted server-derived tenant/provider-account scope; never request data. */
   authorizationScope?: AuthenticatedTenantScope;
+  /** Additional explicit hostnames accepted beside loopback authorities. */
+  allowedHosts?: readonly string[];
   keepAliveMs?: number;
 }
 
@@ -125,44 +130,211 @@ const RESPONSE_TERMINAL_EVENTS = new Set([
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_SYNCHRONOUS_STRUCTURAL_MEASURE_BYTES = 256 * 1024;
 const MAX_PUBLIC_UNAVAILABLE_PROJECTS = 256;
+const MAX_PUBLIC_RUNTIME_SNAPSHOTS = 256;
 const PUBLIC_PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-const RUNTIME_PRIVATE_KEYS = new Set([
-  "token", "cookie", "authorization", "sessionid", "sandboxsessionid",
-  "instanceid", "resourcetoken", "ysweettoken",
+const PUBLIC_RUNTIME_STATES = new Set([
+  "configured", "provisioning", "syncing_credentials", "syncing_workspace",
+  "deploying_daemon", "recovering", "ready", "auth_required", "draining",
+  "failed", "stopped",
 ]);
+const PUBLIC_AVAILABILITY_REASONS = new Set([
+  "available", "lifecycle_unavailable", "sidecar_suspect", "credential_refresh",
+  "awareness_reconnect", "transport_unavailable", "transport_recovery",
+  "transport_congested", "zero_remote_credits", "host_ceiling", "execution_window",
+  "transfer_budget", "quarantine",
+]);
+const PUBLIC_ATOM = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PUBLIC_PRIVATE_METRIC_KEY = /(?:token|secret|password|cookie|authorization|api.?key|prompt|content|output|body|url|client.?id|organization)/i;
 
-function sanitizeRuntimeValue(
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function publicNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.min(Number.MAX_SAFE_INTEGER, value)
+    : null;
+}
+
+function publicInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function publicAtom(value: unknown): string | null {
+  return typeof value === "string" && PUBLIC_ATOM.test(value) ? value : null;
+}
+
+function publicFailure(value: unknown): Record<string, unknown> | null {
+  const raw = record(value);
+  if (!raw) return null;
+  return {
+    name: publicAtom(raw.name) ?? "Error",
+    kind: raw.kind === null ? null : publicAtom(raw.kind),
+    status: publicInteger(raw.status),
+    operation: raw.operation === null ? null : publicAtom(raw.operation),
+    message: sanitizeDiagnosticMessage(raw.message),
+    sidecarErrorName: publicAtom(raw.sidecarErrorName),
+    sidecarErrorCode: publicAtom(raw.sidecarErrorCode),
+    sidecarCauseName: raw.sidecarCauseName === null ? null : publicAtom(raw.sidecarCauseName),
+    sidecarPhase: publicAtom(raw.sidecarPhase),
+    sidecarPermission: raw.sidecarPermission === null ? null : publicAtom(raw.sidecarPermission),
+  };
+}
+
+function publicMetricTree(
   value: unknown,
   depth = 0,
-  seen = new WeakSet<object>(),
+  state: { nodes: number } = { nodes: 0 },
 ): unknown {
-  if (depth > 16) return null;
-  if (Array.isArray(value)) return value.map(child => sanitizeRuntimeValue(child, depth + 1, seen));
-  if (!value || typeof value !== "object") return value;
-  if (seen.has(value)) return null;
-  seen.add(value);
-  try {
-    const output: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      const normalized = key.replaceAll("_", "").toLowerCase();
-      if (RUNTIME_PRIVATE_KEYS.has(normalized)) continue;
-      output[key] = sanitizeRuntimeValue(child, depth + 1, seen);
-    }
-    return output;
-  } finally {
-    seen.delete(value);
+  if (++state.nodes > 2_048 || depth > 8) return null;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return publicNumber(value);
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).map(child => publicMetricTree(child, depth + 1, state));
   }
+  const output: Record<string, unknown> = {};
+  let entries = 0;
+  for (const key in value as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (++entries > 256) break;
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) || PUBLIC_PRIVATE_METRIC_KEY.test(key)) {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    output[key] = publicMetricTree(
+      descriptor.value,
+      depth + 1,
+      state,
+    );
+  }
+  return output;
+}
+
+function publicRateLimitObservation(value: unknown): Record<string, unknown> | null {
+  const raw = record(value);
+  if (!raw) return null;
+  const hint = record(raw.hint);
+  const problem = record(raw.problem);
+  return {
+    requestedModel: safeObservabilityModel(raw.requestedModel),
+    observedAgoMs: publicNumber(raw.observedAgoMs),
+    hint: hint ? {
+      retryAfterMs: publicNumber(hint.retryAfterMs),
+      resetTokensMs: publicNumber(hint.resetTokensMs),
+      limitTokens: publicInteger(hint.limitTokens),
+      remainingTokens: publicInteger(hint.remainingTokens),
+      limitProjectTokens: publicInteger(hint.limitProjectTokens),
+      remainingProjectTokens: publicInteger(hint.remainingProjectTokens),
+      resetProjectTokensMs: publicNumber(hint.resetProjectTokensMs),
+    } : null,
+    problem: problem ? {
+      status: publicInteger(problem.status),
+      type: publicAtom(problem.type),
+      code: publicAtom(problem.code),
+      model: safeObservabilityModel(problem.model),
+      limitKind: publicAtom(problem.limitKind),
+      tokenLimit: publicInteger(problem.tokenLimit),
+      usedTokens: publicInteger(problem.usedTokens),
+      requestedTokens: publicInteger(problem.requestedTokens),
+      retryAfterMs: publicNumber(problem.retryAfterMs),
+    } : null,
+  };
 }
 
 function publicRuntimeSnapshot(value: unknown): Record<string, unknown> {
-  const raw = sanitizeRuntimeValue(value) as Record<string, unknown> ?? {};
+  const raw = record(value) ?? {};
   const release = safeV2ReleaseIdentity(raw);
-  raw.releaseRevision = release?.releaseRevision ?? null;
-  raw.protocolRevision = release?.protocolRevision ?? null;
-  raw.buildHash = release?.buildHash ?? null;
-  raw.schemaHash = release?.schemaHash ?? null;
-  return raw;
+  const recovery = record(raw.recovery);
+  const rateLimits = record(raw.upstreamRateLimits);
+  const publicRateLimits: Record<string, unknown> = Object.create(null);
+  if (rateLimits) {
+    let entries = 0;
+    for (const model in rateLimits) {
+      if (!Object.prototype.hasOwnProperty.call(rateLimits, model)) continue;
+      if (entries++ >= 16) break;
+      const descriptor = Object.getOwnPropertyDescriptor(rateLimits, model);
+      if (!descriptor || !("value" in descriptor)) continue;
+      const safeModel = safeObservabilityModel(model);
+      const safeObservation = publicRateLimitObservation(descriptor.value);
+      if (safeObservation) publicRateLimits[safeModel] = safeObservation;
+    }
+  }
+  return {
+    projectId: typeof raw.projectId === "string" && PUBLIC_PROJECT_ID.test(raw.projectId)
+      ? raw.projectId
+      : null,
+    releaseRevision: release?.releaseRevision ?? null,
+    protocolRevision: release?.protocolRevision ?? null,
+    transportProfile: raw.transportProfile === "standard" || raw.transportProfile === "bulk-v1"
+      ? raw.transportProfile
+      : null,
+    buildHash: release?.buildHash ?? null,
+    schemaHash: release?.schemaHash ?? null,
+    incarnation: publicInteger(raw.incarnation),
+    state: typeof raw.state === "string" && PUBLIC_RUNTIME_STATES.has(raw.state)
+      ? raw.state
+      : "unknown",
+    capacity: publicInteger(raw.capacity),
+    active: publicInteger(raw.active),
+    available: publicInteger(raw.available),
+    admissionCredits: publicInteger(raw.admissionCredits),
+    prefetchCredits: publicInteger(raw.prefetchCredits),
+    transferCredits: publicInteger(raw.transferCredits),
+    availabilityReason: typeof raw.availabilityReason === "string" &&
+        PUBLIC_AVAILABILITY_REASONS.has(raw.availabilityReason)
+      ? raw.availabilityReason
+      : null,
+    quarantined: publicInteger(raw.quarantined),
+    ambiguousQuarantined: publicInteger(raw.ambiguousQuarantined),
+    ambiguityLimit: publicInteger(raw.ambiguityLimit),
+    heartbeatAgeMs: publicNumber(raw.heartbeatAgeMs),
+    sidecarPeerAgeMs: publicNumber(raw.sidecarPeerAgeMs),
+    transportConnected: typeof raw.transportConnected === "boolean" ? raw.transportConnected : null,
+    credentialExpiresInMs: publicNumber(raw.credentialExpiresInMs),
+    ackEwmaMs: publicNumber(raw.ackEwmaMs),
+    completionEwmaMs: publicNumber(raw.completionEwmaMs),
+    recentFailureRate: publicNumber(raw.recentFailureRate),
+    queueDepth: publicInteger(raw.queueDepth),
+    memoryPressure: publicNumber(raw.memoryPressure),
+    failure: publicFailure(raw.failure),
+    diagnostics: publicMetricTree(raw.diagnostics),
+    recovery: recovery ? {
+      attempt: publicInteger(recovery.attempt),
+      consecutiveFailures: publicInteger(recovery.consecutiveFailures),
+      retryInMs: publicNumber(recovery.retryInMs),
+    } : null,
+    upstreamRateLimit: publicRateLimitObservation(raw.upstreamRateLimit),
+    upstreamRateLimits: publicRateLimits,
+  };
+}
+
+function publicResourceSnapshot(value: unknown): Record<string, unknown> {
+  const raw = record(value) ?? {};
+  return {
+    totalBytes: publicInteger(raw.totalBytes),
+    startupFreeBytes: publicInteger(raw.startupFreeBytes),
+    startupRssBytes: publicInteger(raw.startupRssBytes),
+    systemReserveBytes: publicInteger(raw.systemReserveBytes),
+    processCeilingBytes: publicInteger(raw.processCeilingBytes),
+    reservationCapacityBytes: publicInteger(raw.reservationCapacityBytes),
+    maximumReservationCapacityBytes: publicInteger(raw.maximumReservationCapacityBytes),
+    pauseFreeBytes: publicInteger(raw.pauseFreeBytes),
+    resumeFreeBytes: publicInteger(raw.resumeFreeBytes),
+    cpuTransformWorkers: publicInteger(raw.cpuTransformWorkers),
+    paused: raw.paused === true,
+    reservedBytes: publicInteger(raw.reservedBytes),
+    queued: publicInteger(raw.queued),
+    queuedReservationBytes: publicInteger(raw.queuedReservationBytes),
+    queueCapacity: publicInteger(raw.queueCapacity),
+    queueReservationCapacityBytes: publicInteger(raw.queueReservationCapacityBytes),
+    closed: raw.closed === true,
+  };
 }
 
 function publicFleetState(
@@ -184,14 +356,16 @@ function publicFleetState(
       unavailableProjectsTruncated: false,
     };
   }
-  const all = value.unavailableProjects
+  const all = value.unavailableProjects.slice(0, MAX_PUBLIC_UNAVAILABLE_PROJECTS + 1)
     .filter((id): id is typeof value.unavailableProjects[number] => PUBLIC_PROJECT_ID.test(id));
   return {
     desired: value.desired,
     ready: value.ready,
     unavailable: value.unavailable,
     unavailableProjects: all.slice(0, MAX_PUBLIC_UNAVAILABLE_PROJECTS),
-    unavailableProjectsTruncated: all.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS,
+    unavailableProjectsTruncated:
+      value.unavailableProjects.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS ||
+      all.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS,
   };
 }
 
@@ -830,6 +1004,8 @@ export function ghostProvAppAuthorizationScope(
 export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const app = new Hono();
   const keepAliveMs = options.keepAliveMs ?? 15_000;
+  const allowedHosts = Object.freeze([...(options.allowedHosts ?? [])]);
+  publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
   const routerScope = options.router.responseProvenanceAuthorizationScope?.() ?? null;
   if (routerScope !== null && !isAuthenticatedTenantScope(routerScope)) {
     throw new TypeError("router authorization scope must be an AuthenticatedTenantScope");
@@ -854,8 +1030,26 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     throw new RangeError(`keepAliveMs must be an integer from 1 through ${MAX_TIMER_MS}`);
   }
 
+  app.use("*", async (c, next) => {
+    const failure = publicRequestAuthorityFailure({
+      host: c.req.header("host") ?? new URL(c.req.url).host,
+      forwardedHost: c.req.header("x-forwarded-host"),
+      origin: c.req.header("origin"),
+    }, allowedHosts);
+    if (!failure) return next();
+    return apiErrorResponse(new ApiError(
+      failure === "host" ? 421 : 403,
+      failure === "host" ? "Request host is not allowed" : "Request origin is not allowed",
+      {
+        type: "permission_error",
+        code: failure === "host" ? "invalid_host" : "invalid_origin",
+      },
+    ));
+  });
+
   if (options.apiKey) {
-    app.use("/v1/*", async (c, next) => {
+    app.use("*", async (c, next) => {
+      if (!isProtectedApiPath(c.req.path) && c.req.path !== "/__sandboxes") return next();
       const anthropic = isAnthropicRequestPath(c.req.path);
       const authorized = apiKeyAuthorized({
         authorization: c.req.header("authorization"),
@@ -879,8 +1073,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
 
   app.get("/health", c => {
     const snapshot = options.router.snapshot();
-    const runtimes = snapshot.runtimes.map(publicRuntimeSnapshot);
-    const fleet = publicFleetState(options.fleetSnapshot?.(), runtimes.length);
+    const fleet = publicFleetState(options.fleetSnapshot?.(), snapshot.runtimes.length);
     const healthy = snapshot.capacity > 0;
     return c.json({
       ok: healthy,
@@ -888,25 +1081,29 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       active: snapshot.active,
       available: snapshot.available,
       queued: snapshot.queued,
-      runtimes: runtimes.length,
-      ...fleet,
-      release: summarizeV2Releases(runtimes),
+      runtimes: snapshot.runtimes.length,
+      desired: fleet.desired,
+      ready: fleet.ready,
+      unavailable: fleet.unavailable,
     }, healthy ? 200 : 503);
   });
 
   app.get("/__sandboxes", c => {
     const snapshot = options.router.snapshot();
-    const runtimes = snapshot.runtimes.map(publicRuntimeSnapshot);
-    const fleet = publicFleetState(options.fleetSnapshot?.(), runtimes.length);
+    const runtimes = snapshot.runtimes
+      .slice(0, MAX_PUBLIC_RUNTIME_SNAPSHOTS)
+      .map(publicRuntimeSnapshot);
+    const fleet = publicFleetState(options.fleetSnapshot?.(), snapshot.runtimes.length);
     return c.json({
       capacity: snapshot.capacity,
       active: snapshot.active,
       available: snapshot.available,
       queued: snapshot.queued,
       runtimes,
+      runtimesTruncated: snapshot.runtimes.length > runtimes.length,
       ...fleet,
       release: summarizeV2Releases(runtimes),
-      resources: snapshot.resources,
+      resources: publicResourceSnapshot(snapshot.resources),
     });
   });
 
@@ -1137,7 +1334,11 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           const retry = attempt === 0 && hit && continuationToken !== null &&
             continuationToken.match !== null && !relayAbort.signal.aborted && safeFailure &&
             definitivePreviousResponseNotFound(error);
-          if (retry && responsesContinuationIndex.compareDelete(continuationToken!)) {
+          if (retry) {
+            // Exact compare-delete protects a concurrently replaced generation,
+            // but every request with its own definitive pre-event rejection is
+            // independently safe to retry once with its immutable full history.
+            responsesContinuationIndex.compareDelete(continuationToken!);
             completeIncomingAdmission();
             attempt += 1;
             continue;
@@ -1150,7 +1351,10 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     } catch (error) {
       const normalized = normalizeApiError(error);
       if (normalized.status !== 499) {
-        console.error(`[responses] ${normalized.error.type}: ${normalized.error.message.slice(0, 240)}`);
+        console.error(
+          `[responses] ${normalized.status} ${publicAtom(normalized.error.type) ?? "error"} ` +
+          `${publicAtom(normalized.error.code) ?? "unknown"}`,
+        );
       }
       return apiErrorResponse(error);
     } finally {

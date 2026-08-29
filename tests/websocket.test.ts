@@ -31,6 +31,7 @@ import {
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../src/http/api-key";
+
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { RouterQueueFullError } from "../src/router/router";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
@@ -43,6 +44,7 @@ import {
   releaseAtomicBytePermit,
 } from "../src/v2/memory/permit-carrier";
 
+const TEST_API_KEY = "test-websocket-key-0123456789abcdef-0123456789";
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
 
@@ -130,6 +132,100 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("Responses WebSocket server", () => {
+  it("rejects hostile WebSocket Host and Origin before auth or process allocation", async () => {
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 2,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: 128 * 1024 * 1024,
+    });
+    let relayCalls = 0;
+    attachTestResponsesWebSocket(server, {
+      apiKey: TEST_API_KEY,
+      processBudget: budget,
+      startRelay: async () => {
+        relayCalls++;
+        return relayHandle(Promise.resolve(completed("unexpected")));
+      },
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const url = `ws://127.0.0.1:${address.port}/v1/responses`;
+
+    const rejectStatus = (headers: Record<string, string>) => new Promise<number>((resolve, reject) => {
+      const socket = new WebSocket(url, { headers });
+      socket.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      socket.once("open", () => reject(new Error("hostile WebSocket authority was accepted")));
+      socket.once("error", () => undefined);
+    });
+
+    expect(await rejectStatus({
+      host: "attacker.example",
+      authorization: "Bearer wrong",
+    })).toBe(421);
+    expect(await rejectStatus({
+      host: "attacker.test",
+      authorization: "Bearer wrong",
+    })).toBe(421);
+    expect(await rejectStatus({
+      origin: "https://attacker.example",
+      authorization: "Bearer wrong",
+    })).toBe(403);
+    expect(await rejectStatus({
+      origin: "https://attacker.test",
+      authorization: "Bearer wrong",
+    })).toBe(403);
+    expect(budget.snapshot()).toMatchObject({
+      sessions: 0,
+      queuedBytes: 0,
+      ingressReservedBytes: 0,
+    });
+    expect(relayCalls).toBe(0);
+  });
+
+  it("accepts an explicitly allowed WebSocket Host and Origin", async () => {
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const budget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 1024 * 1024,
+      maxIngressBytes: 128 * 1024 * 1024,
+    });
+    attachTestResponsesWebSocket(server, {
+      apiKey: TEST_API_KEY,
+      allowedHosts: ["ghostprov.example"],
+      processBudget: budget,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/v1/responses`,
+      {
+        headers: {
+          host: "ghostprov.example",
+          origin: "https://ghostprov.example",
+          authorization: `Bearer ${TEST_API_KEY}`,
+        },
+      },
+    );
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+
+    expect(budget.snapshot().sessions).toBe(1);
+    socket.close();
+    await waitFor(() => budget.snapshot().sessions === 0);
+  });
+
   it("requires the configured bearer key before allocating an upgrade", async () => {
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
     const budget = new WebSocketProcessBudget({
@@ -138,7 +234,7 @@ describe("Responses WebSocket server", () => {
       maxIngressBytes: 64 * 1024 * 1024,
     });
     attachTestResponsesWebSocket(server, {
-      apiKey: "GHOST_IS_KING",
+      apiKey: TEST_API_KEY,
       processBudget: budget,
       startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
     });
@@ -162,7 +258,7 @@ describe("Responses WebSocket server", () => {
     }
 
     const accepted = new WebSocket(url, {
-      headers: { authorization: "Bearer GHOST_IS_KING" },
+      headers: { authorization: `Bearer ${TEST_API_KEY}` },
     });
     sockets.push(accepted);
     await new Promise<void>((resolve, reject) => {
@@ -1073,7 +1169,7 @@ describe("Responses WebSocket server", () => {
     socket.close();
   });
 
-  it("releases warmup materialization when relay startup ignores disconnect", async () => {
+  it("keeps cancelled warmup handoff memory charged until late relay cleanup settles", async () => {
     const shared = new SharedByteBudget(16 * 1024 * 1024);
     const graph = new ResponseGraph({ maxBytes: 8 * 1024 * 1024, sharedBudget: shared });
     const authorizationScope = createAuthenticatedTenantScope();
@@ -1084,11 +1180,23 @@ describe("Responses WebSocket server", () => {
       input: [{ type: "message", content: "x".repeat(1024 * 1024) }],
     }, { authorizationScope });
     const storedBytes = shared.used;
+    const processBudget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 8 * 1024 * 1024,
+      maxIngressBytes: 128 * 1024 * 1024,
+    });
+    const handoff = deferred<RunHandle>();
+    let retainedBody: Record<string, unknown> | null = null;
     let started = false;
-    const socket = await startServer(async () => {
+    const socket = await startServer(async body => {
       started = true;
-      return new Promise<RunHandle>(() => undefined);
-    }, { authorizationScope, graphFactory: () => graph });
+      retainedBody = body;
+      return handoff.promise;
+    }, {
+      authorizationScope,
+      graphFactory: () => graph,
+      processBudget,
+    });
 
     socket.send(JSON.stringify({
       type: "response.create",
@@ -1097,8 +1205,55 @@ describe("Responses WebSocket server", () => {
     }));
     await waitFor(() => started && shared.used > storedBytes);
     socket.close();
-    await waitFor(() => shared.used === 0);
+    await waitFor(() => socket.readyState === WebSocket.CLOSED);
+
+    expect((retainedBody!.input as unknown[])[0]).toMatchObject({ type: "message" });
+    expect(shared.used).toBeGreaterThan(storedBytes);
     expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+    expect(processBudget.snapshot()).toMatchObject({
+      sessions: 1,
+      queuedBytes: expect.any(Number),
+    });
+    expect(processBudget.snapshot().queuedBytes).toBeGreaterThan(0);
+    expect(() => createTestSession(new FakeSocket() as unknown as WebSocket, {
+      authorizationScope,
+      processBudget,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unexpected"))),
+    })).toThrow("session capacity");
+
+    const lateFinal = deferred<any>();
+    let lateCleanupStarted = false;
+    handoff.resolve({
+      async *events() {
+        lateCleanupStarted = true;
+      },
+      final: lateFinal.promise,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    });
+    await waitFor(() => lateCleanupStarted);
+    expect(shared.used).toBeGreaterThan(storedBytes);
+    expect(processBudget.snapshot().sessions).toBe(1);
+
+    const latePermits = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    lateFinal.resolve(attachAtomicBytePermit(
+      completed("resp_late_cleanup"),
+      await latePermits.acquire(8_192),
+    ));
+    await waitFor(() => (
+      shared.used === 0 &&
+      processBudget.snapshot().sessions === 0 &&
+      latePermits.snapshot().activePermits === 0
+    ));
+    latePermits.close();
+    expect(processBudget.snapshot().queuedBytes).toBe(0);
+    const replacement = createTestSession(new FakeSocket() as unknown as WebSocket, {
+      authorizationScope,
+      processBudget,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+    expect(processBudget.snapshot().sessions).toBe(1);
+    replacement.close();
+    expect(processBudget.snapshot().sessions).toBe(0);
   });
 
   it("aborts relay work after malformed local frame processing", async () => {

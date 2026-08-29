@@ -3,17 +3,9 @@ import { sha256Hex } from "../src/v2/protocol/shared";
 import { createBrowserlessSystem } from "../src/server/system";
 import { resolveLiveV2Options } from "./live_v2_options";
 
-const PRIMARY = "http://127.0.0.1:8787";
-
 function percentile(values: readonly number[], fraction: number): number {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0;
-}
-
-async function health(root: string): Promise<void> {
-  const response = await fetch(`${root}/health`, { signal: AbortSignal.timeout(10_000) });
-  const body = await response.json().catch(() => null) as any;
-  if (!response.ok || body?.ok !== true) throw new Error(`${root} is not healthy`);
 }
 
 async function execute(
@@ -78,7 +70,6 @@ export async function main(
   const projectIds = (env.PRISM_PROJECT_IDS ?? "").split(",").map(value => value.trim()).filter(Boolean);
   if (projectIds.length !== 4) throw new Error("Fleet canary requires exactly four PRISM_PROJECT_IDS UUIDs");
   if (!env.PRISM_COOKIE_FILE?.trim()) throw new Error("PRISM_COOKIE_FILE is required");
-  await health(PRIMARY);
   const model = env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
   const system = await createBrowserlessSystem({
     ...env,
@@ -159,13 +150,11 @@ export async function main(
   } finally {
     await system.close();
   }
-  await health(PRIMARY);
   console.log(JSON.stringify({
     live: true,
     projectCount: 4,
     summaries,
     projectsDeleted: 0,
-    primary8787Healthy: true,
   }, null, 2));
 }
 

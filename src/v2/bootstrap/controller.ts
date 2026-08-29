@@ -1,7 +1,7 @@
 import type { Clock, RandomSource } from "../../core/ports";
 import { SYSTEM_CLOCK, SYSTEM_RANDOM } from "../../core/ports";
 import type { YSweetEnvelope } from "../../prism/protocol";
-import type { RenderSyncState } from "../../sandbox/ydoc";
+import type { GuardedYDocMutation, RenderSyncState } from "../../sandbox/ydoc";
 import type { ProjectId } from "../../sandbox/types";
 import type { AwarenessChannel } from "../awareness/channel";
 import {
@@ -28,14 +28,7 @@ import {
   assertV2SidecarAssets,
   protocolRevisionForV2SidecarRevision,
   resolveV2SidecarRevision,
-  V2_R1_RELEASE,
-  V2_R2_RELEASE,
-  V2_R3_RELEASE,
-  V2_R4_RELEASE,
-  V2_R5_RELEASE,
-  V2_R6_RELEASE,
-  V2_R7_RELEASE,
-  V2_R8_RELEASE,
+  V2_RETIREMENT_RELEASE_IDENTITIES,
   type V2SidecarAssets,
   type V2SidecarReleaseIdentity,
   type V2SidecarRevision,
@@ -52,8 +45,59 @@ const MAIN_PATH = "main.tex";
 const HELLO_PREFIX = "GPV2_BOOTSTRAP ";
 const OWNER_REUSED_PREFIX = "GPV2_OWNER_REUSED ";
 const SIDECAR_HEX_PREFIX = "GPV2_SIDECAR_HEX ";
+const RETIRED_PREFIX = "GPV2_RETIRED ";
+const RETIRE_FAILED_PREFIX = "GPV2_RETIRE_FAILED ";
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BOOTSTRAP_ATTEMPT_CLAIM_LIMIT = 256;
+const MAX_TRACKED_LAUNCH_NONCES = 64;
+const MAX_PROJECT_BOOTSTRAP_MUTATION_SCOPES = 4_096;
+const MAX_PROJECT_BOOTSTRAP_MUTATION_WAITERS = 16;
+
+interface ProjectBootstrapMutationOwner {
+  superseded: boolean;
+  terminal: boolean;
+}
+
+interface ProjectBootstrapMutationScope {
+  owner: ProjectBootstrapMutationOwner | null;
+  tail: Promise<void>;
+  queued: number;
+}
+
+const PROJECT_BOOTSTRAP_MUTATIONS = new Map<ProjectId, ProjectBootstrapMutationScope>();
+
+async function withProjectBootstrapMutation<T>(
+  projectId: ProjectId,
+  operation: (scope: ProjectBootstrapMutationScope) => Promise<T> | T,
+): Promise<T> {
+  let scope = PROJECT_BOOTSTRAP_MUTATIONS.get(projectId);
+  if (!scope) {
+    if (PROJECT_BOOTSTRAP_MUTATIONS.size >= MAX_PROJECT_BOOTSTRAP_MUTATION_SCOPES) {
+      throw new Error("V2 project bootstrap mutation scope capacity is exhausted");
+    }
+    scope = { owner: null, tail: Promise.resolve(), queued: 0 };
+    PROJECT_BOOTSTRAP_MUTATIONS.set(projectId, scope);
+  }
+  if (scope.queued >= MAX_PROJECT_BOOTSTRAP_MUTATION_WAITERS) {
+    throw new Error("V2 project bootstrap mutation waiter capacity is exhausted");
+  }
+  const previous = scope.tail;
+  let release!: () => void;
+  const turn = new Promise<void>(resolve => { release = resolve; });
+  scope.queued++;
+  scope.tail = previous.catch(() => undefined).then(() => turn);
+  await previous.catch(() => undefined);
+  try {
+    return await operation(scope);
+  } finally {
+    scope.queued--;
+    release();
+    if (
+      scope.queued === 0 && scope.owner === null &&
+      PROJECT_BOOTSTRAP_MUTATIONS.get(projectId) === scope
+    ) PROJECT_BOOTSTRAP_MUTATIONS.delete(projectId);
+  }
+}
 
 function perlSingleQuoted(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -72,16 +116,7 @@ function perlRegexAlternation(values: readonly string[]): string {
   return values.map(perlRegexLiteral).join("|");
 }
 
-const PRIOR_SIDECAR_RELEASES = Object.freeze([
-  V2_R1_RELEASE,
-  V2_R2_RELEASE,
-  V2_R3_RELEASE,
-  V2_R4_RELEASE,
-  V2_R5_RELEASE,
-  V2_R6_RELEASE,
-  V2_R7_RELEASE,
-  V2_R8_RELEASE,
-]);
+const PRIOR_SIDECAR_RELEASES = V2_RETIREMENT_RELEASE_IDENTITIES;
 const REGISTERED_SIDECAR_ENTRYPOINTS = perlRegexAlternation(
   PRIOR_SIDECAR_RELEASES.map(frozenSidecarEntrypoint),
 );
@@ -275,44 +310,129 @@ const INERT_LAUNCHER = [
   "",
 ].join("\n");
 
-function terminationLauncher(entrypointPath: string, launchNonce: string): string {
+function terminationLauncher(
+  entrypointPath: string,
+  launchNonces: readonly string[],
+  retirementNonce: string,
+  expectedStatic: string,
+  outputPath: string,
+  requireOwner: boolean,
+): string {
+  if (
+    launchNonces.length < 1 || launchNonces.length > MAX_TRACKED_LAUNCH_NONCES ||
+    launchNonces.some(nonce => !SAFE_ID.test(nonce)) ||
+    !SAFE_ID.test(retirementNonce)
+  ) throw new TypeError("V2 retirement nonce set is invalid");
   const expected = perlSingleQuoted(`/workspace/${entrypointPath}`);
-  const nonce = perlSingleQuoted(launchNonce);
+  const nonceList = [...new Set(launchNonces)]
+    .map(nonce => `'${perlSingleQuoted(nonce)}'`)
+    .join(", ");
+  const proofNonce = perlSingleQuoted(retirementNonce);
+  const staticAuthority = perlSingleQuoted(expectedStatic);
+  const proofOutput = perlSingleQuoted(`/workspace/${outputPath}`);
   return [
     "# GhostProv V2 sidecar termination launcher",
     "$pdf_mode = 1;",
     ...processInterlockHelpers(),
+    "my $gp_dir = '/tmp/ghostprov-v2';",
     "my $gp_pid_file = '/tmp/ghostprov-v2/sidecar.pid';",
     "my $gp_owner_file = '/tmp/ghostprov-v2/sidecar.owner.lock';",
+    "my $gp_static_path = '/workspace/.ghostprov-v2/static.json';",
     `my $gp_expected = '${expected}';`,
-    `my $gp_expected_nonce = '${nonce}';`,
+    `my %gp_expected_nonces = map { $_ => 1 } (${nonceList});`,
+    `my $gp_retirement_nonce = '${proofNonce}';`,
+    `my $gp_expected_static = '${staticAuthority}';`,
+    `my $gp_tex = '${proofOutput}';`,
+    `my $gp_require_owner = ${requireOwner ? 1 : 0};`,
+    `my $gp_attempt_claim_limit = ${BOOTSTRAP_ATTEMPT_CLAIM_LIMIT};`,
+    "mkdir $gp_dir, 0700 unless -e $gp_dir;",
+    "my $gp_dir_safe = -d $gp_dir && !-l $gp_dir;",
+    "my %gp_target_groups = ();",
+    "my %gp_settled_nonces = ();",
     "my $gp_stopped = 0;",
     "my $gp_pid_record_stopped = 0;",
     "my ($gp_stopped_pid, $gp_stopped_nonce, $gp_stopped_start);",
-    "my $gp_owner_record = gp_owner_record_if_locked($gp_owner_file);",
-    "if (defined $gp_owner_record && $gp_owner_record =~ /\"pid\"\\s*:\\s*([0-9]+)/) {",
-    "  my $gp_pid = $1;",
-    "  my $gp_cmd = gp_read_file(\"/proc/$gp_pid/cmdline\", 16384) // '';",
-    "  my @gp_args = grep { length $_ } split /\\0/, $gp_cmd;",
-    "  my @gp_nonces = map { /^--ghostprov-launch-nonce=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/ ? $1 : () } @gp_args;",
-    "  my $gp_start = gp_process_start($gp_pid);",
-    "  if (@gp_nonces == 1 && $gp_nonces[0] eq $gp_expected_nonce && $gp_start && gp_owner_record_is_locked($gp_owner_file, $gp_owner_record)) {",
-    "    $gp_stopped = gp_stop_if_current($gp_owner_file, $gp_owner_record, 1, $gp_pid, $gp_nonces[0], $gp_start, $gp_expected);",
-    "    ($gp_stopped_pid, $gp_stopped_nonce, $gp_stopped_start) = ($gp_pid, $gp_nonces[0], $gp_start) if $gp_stopped;",
+    // Atomically fence every target that never reached a launcher. If another
+    // launcher already owns the permanent claim, require its explicit settled
+    // marker; absence is ambiguous and can never produce a success proof.
+    "my $gp_attempt_claim_count = 0;",
+    "if ($gp_dir_safe && opendir my $gp_attempt_dir, $gp_dir) {",
+    "  while (my $gp_attempt_name = readdir $gp_attempt_dir) {",
+    "    next unless $gp_attempt_name =~ /^bootstrap-attempt\\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;",
+    "    my $gp_attempt_candidate = \"$gp_dir/$gp_attempt_name\";",
+    "    next if -l $gp_attempt_candidate;",
+    "    $gp_attempt_claim_count++ if -d $gp_attempt_candidate;",
+    "    last if $gp_attempt_claim_count >= $gp_attempt_claim_limit;",
+    "  }",
+    "  closedir $gp_attempt_dir;",
+    "}",
+    "for my $gp_nonce (keys %gp_expected_nonces) {",
+    "  my $gp_attempt_path = \"$gp_dir/bootstrap-attempt.$gp_nonce\";",
+    "  my $gp_settled_path = \"$gp_dir/bootstrap-settled.$gp_nonce\";",
+    "  if ($gp_dir_safe && !-d $gp_attempt_path && $gp_attempt_claim_count < $gp_attempt_claim_limit && gp_static_authority_is_current($gp_static_path, $gp_expected_static) && mkdir $gp_attempt_path, 0700) {",
+    "    $gp_attempt_claim_count++;",
+    "    unlink $gp_settled_path if -e $gp_settled_path || -l $gp_settled_path;",
+    "    if (open my $gp_settled_fh, '>', $gp_settled_path) { print $gp_settled_fh \"retired\\n\"; close $gp_settled_fh; chmod 0600, $gp_settled_path; }",
     "  }",
     "}",
+    "my $gp_owner_record = gp_owner_record_if_locked($gp_owner_file);",
     "my $gp_pid_record = gp_read_file($gp_pid_file, 4096);",
-    "if (defined $gp_pid_record) {",
-    "  my ($gp_pid, $gp_nonce, $gp_start) = $gp_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n?$/;",
-    "  if ($gp_stopped && defined($gp_start) && $gp_pid eq $gp_stopped_pid && $gp_nonce eq $gp_stopped_nonce && $gp_start eq $gp_stopped_start) {",
+    "my ($gp_record_pid, $gp_record_nonce, $gp_record_start) = defined($gp_pid_record) ? $gp_pid_record =~ /^([0-9]+) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) ([0-9]+)\\n$/ : ();",
+    "if (defined $gp_owner_record) {",
+    "  my ($gp_owner_instance, $gp_owner_nonce, $gp_owner_pid, $gp_owner_time) = $gp_owner_record =~ /^\\{\"version\":1,\"instanceId\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"nonce\":\"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\",\"pid\":([0-9]+),\"acquiredAtMs\":([0-9]+)\\}$/;",
+    "  if (defined($gp_owner_pid) && defined($gp_record_start) && $gp_owner_pid eq $gp_record_pid && $gp_expected_nonces{$gp_record_nonce}) {",
+    "    $gp_target_groups{$gp_record_pid} = 1;",
+    "    if (gp_process_matches($gp_record_pid, $gp_record_nonce, $gp_record_start, $gp_expected)) {",
+    "      $gp_stopped = gp_stop_if_current($gp_owner_file, $gp_owner_record, 1, $gp_record_pid, $gp_record_nonce, $gp_record_start, $gp_expected, $gp_static_path, $gp_expected_static);",
+    "      ($gp_stopped_pid, $gp_stopped_nonce, $gp_stopped_start) = ($gp_record_pid, $gp_record_nonce, $gp_record_start) if $gp_stopped;",
+    "    }",
+    "  }",
+    "}",
+    "if (defined($gp_record_start) && $gp_expected_nonces{$gp_record_nonce}) {",
+    "  $gp_target_groups{$gp_record_pid} = 1;",
+    "  if ($gp_stopped && $gp_record_pid eq $gp_stopped_pid && $gp_record_nonce eq $gp_stopped_nonce && $gp_record_start eq $gp_stopped_start) {",
     "    $gp_pid_record_stopped = 1;",
-    "  } elsif (!$gp_stopped && defined $gp_start && $gp_nonce eq $gp_expected_nonce) {",
-    "    $gp_stopped = gp_stop_if_current($gp_pid_file, $gp_pid_record, 0, $gp_pid, $gp_nonce, $gp_start, $gp_expected);",
+    "  } elsif (!$gp_require_owner && !$gp_stopped) {",
+    "    $gp_stopped = gp_stop_if_current($gp_pid_file, $gp_pid_record, 0, $gp_record_pid, $gp_record_nonce, $gp_record_start, $gp_expected, $gp_static_path, $gp_expected_static);",
     "    $gp_pid_record_stopped = $gp_stopped;",
     "  }",
     "}",
     "if ($gp_pid_record_stopped && defined $gp_pid_record) {",
     "  gp_unlink_pid_if_unowned_and_same($gp_owner_file, $gp_pid_file, $gp_pid_record);",
+    "}",
+    // Let a launcher that already won mkdir finish promotion or publish its
+    // settled marker. The wait is bounded inside the existing render budget.
+    "for (my $gp_try = 0; $gp_try < 100; $gp_try++) {",
+    "  my $gp_all_settled = 1;",
+    "  for my $gp_nonce (keys %gp_expected_nonces) {",
+    "    my $gp_settled_path = \"$gp_dir/bootstrap-settled.$gp_nonce\";",
+    "    my $gp_settled = !-l $gp_settled_path && -f $gp_settled_path ? gp_read_file($gp_settled_path, 32) : undef;",
+    "    if (defined($gp_settled) && ($gp_settled eq \"settled\\n\" || $gp_settled eq \"retired\\n\")) { $gp_settled_nonces{$gp_nonce} = 1; }",
+    "    else { $gp_all_settled = 0; }",
+    "  }",
+    "  last if $gp_all_settled;",
+    "  select undef, undef, undef, 0.05;",
+    "}",
+    "my $gp_matching_live = 0;",
+    "for my $gp_stat_path (glob('/proc/[0-9]*/stat')) {",
+    "  my ($gp_pid) = $gp_stat_path =~ m{/proc/([0-9]+)/stat$};",
+    "  next unless defined($gp_pid) && $gp_pid > 1;",
+    "  my @gp_args = gp_sidecar_args($gp_pid);",
+    "  next unless @gp_args && $gp_args[8] eq $gp_expected;",
+    "  my ($gp_nonce) = $gp_args[9] =~ /^--ghostprov-launch-nonce=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/;",
+    "  my ($gp_start) = $gp_args[10] =~ /^--ghostprov-process-start=([0-9]+)$/;",
+    "  next unless defined($gp_nonce) && $gp_expected_nonces{$gp_nonce} && defined($gp_start);",
+    "  $gp_target_groups{$gp_pid} = 1;",
+    "  $gp_matching_live = 1 if gp_process_is_same_live($gp_pid, $gp_start) && gp_process_matches($gp_pid, $gp_nonce, $gp_start, $gp_expected);",
+    "}",
+    "for my $gp_group (keys %gp_target_groups) { $gp_matching_live = 1 if gp_group_alive($gp_group); }",
+    "my $gp_all_settled = scalar(keys %gp_settled_nonces) == scalar(keys %gp_expected_nonces);",
+    "my $gp_authoritative = gp_static_authority_is_current($gp_static_path, $gp_expected_static);",
+    "my $gp_marker = $gp_authoritative && $gp_all_settled && !$gp_matching_live ? \"GPV2_RETIRED $gp_retirement_nonce\" : \"GPV2_RETIRE_FAILED $gp_retirement_nonce\";",
+    "if ($gp_authoritative) {",
+    "  open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 retirement output';",
+    "  print $gp_tex_fh \"\\\\typeout{$gp_marker}\\n\";",
+    "  close $gp_tex_fh;",
     "}",
     "$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';",
     "",
@@ -336,6 +456,11 @@ function bootstrapArtifactPaths(launchNonce: string): {
   };
 }
 
+function retirementArtifactPath(retirementNonce: string): string {
+  if (!SAFE_ID.test(retirementNonce)) throw new TypeError("retirementNonce is invalid");
+  return `.ghostprov-v2/retirement-output.${retirementNonce}.tex`;
+}
+
 function bootstrapMainSource(outputPath: string): string {
   return [
     "\\documentclass{article}",
@@ -351,6 +476,7 @@ export interface V2BootstrapYDoc {
   readPath(path: string): Promise<string | null>;
   writePath(path: string, content: string): Promise<void>;
   tombstonePath(path: string): Promise<boolean>;
+  compareAndMutatePaths(input: GuardedYDocMutation): Promise<boolean>;
   renderSyncState(): Promise<RenderSyncState>;
 }
 
@@ -448,6 +574,14 @@ interface BootstrapHello {
   publicJwk: JsonWebKey;
 }
 
+interface BootstrapAttemptAuthority {
+  readonly binding: BootstrapBinding;
+  readonly staticConfig: string;
+  readonly launcher: string;
+  readonly mainSource: string;
+  readonly outputPath: string;
+}
+
 function exactKeys(
   value: Record<string, unknown>,
   expected: readonly string[],
@@ -506,6 +640,7 @@ function temporaryLauncher(
     "my $gp_marker = '';",
     "my $gp_secondary_marker = '';",
     "my $gp_attempt_path = \"$gp_dir/bootstrap-attempt.$gp_launch_nonce\";",
+    "my $gp_settled_path = \"$gp_dir/bootstrap-settled.$gp_launch_nonce\";",
     "mkdir $gp_dir, 0700 unless -d $gp_dir;",
     // A delayed render must not retire the owner chosen by a newer binding.
     // The canonical static config contains the project/session/generation,
@@ -622,6 +757,7 @@ function temporaryLauncher(
     "    $gp_launch_error = 'bootstrap attempt claim capacity is exhausted';",
     "  } elsif (!$gp_launch_error && gp_static_authority_is_current($gp_static_path, $gp_expected_static) && mkdir $gp_attempt_path, 0700) {",
     "    $gp_attempt_claimed = 1;",
+    "    unlink $gp_settled_path if -e $gp_settled_path;",
     "  } elsif (!$gp_launch_error && !gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
     "    $gp_authoritative = 0;",
     "    $gp_launch_error = 'bootstrap launcher binding is no longer current';",
@@ -736,6 +872,12 @@ function temporaryLauncher(
     "  if ($gp_child_pid) { my $gp_sidecar_diag = gp_read_tail($gp_log, 4096); $gp_diag = $gp_sidecar_diag if defined($gp_sidecar_diag) && length($gp_sidecar_diag); }",
     "  $gp_diag = substr($gp_diag // '', 0, 4096);",
     "  $gp_marker = gp_hex_diag($gp_diag);",
+    "}",
+    // A permanent attempt claim prevents a second fork; this companion marker
+    // proves the winning launcher has crossed every fork/promotion branch. A
+    // retirement renderer may create its own claim+marker before any launch.
+    "if ($gp_attempt_claimed) {",
+    "  if (open my $gp_settled_fh, '>', $gp_settled_path) { print $gp_settled_fh \"settled\\n\"; close $gp_settled_fh; chmod 0600, $gp_settled_path; }",
     "}",
     "if ($gp_authoritative && length($gp_marker) && gp_static_authority_is_current($gp_static_path, $gp_expected_static)) {",
     "  open my $gp_tex_fh, '>', $gp_tex or die 'GhostProv V2 bootstrap output';",
@@ -1111,9 +1253,15 @@ export class V2BootstrapController {
   #retiring: Promise<void> | null = null;
   #forceRetiring: Promise<void> | null = null;
   readonly #lifecycleAbort = new AbortController();
+  readonly #projectMutationOwner: ProjectBootstrapMutationOwner = {
+    superseded: false,
+    terminal: false,
+  };
   #closed = false;
-  #launchAttempted = false;
-  #lastLaunchNonce: string | null = null;
+  readonly #attemptAuthorities = new Map<string, BootstrapAttemptAuthority>();
+  readonly #possiblyLaunched = new Map<string, BootstrapAttemptAuthority>();
+  readonly #ownedStaticConfigs = new Set<string>();
+  readonly #retirementStaticConfigs = new Set<string>();
   #reusableHello: BootstrapHello | null = null;
   #reusableRotationKey: string | null = null;
   readonly #transientArtifactPaths = new Set<string>();
@@ -1230,6 +1378,50 @@ export class V2BootstrapController {
     this.#batching = batching;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#random = options.random ?? SYSTEM_RANDOM;
+  }
+
+  #projectAuthorityFailure(): V2BootstrapError {
+    return new V2BootstrapError(
+      "V2 bootstrap workspace authority was replaced by another generation",
+      "deploy",
+      1,
+    );
+  }
+
+  async #claimProjectMutationOwnership(): Promise<void> {
+    await withProjectBootstrapMutation(this.#projectId, scope => {
+      if (
+        this.#projectMutationOwner.superseded ||
+        this.#projectMutationOwner.terminal
+      ) throw this.#projectAuthorityFailure();
+      if (scope.owner && scope.owner !== this.#projectMutationOwner) {
+        scope.owner.superseded = true;
+      }
+      scope.owner = this.#projectMutationOwner;
+    });
+  }
+
+  async #withOwnedProjectMutation<T>(
+    required: boolean,
+    operation: () => Promise<T> | T,
+  ): Promise<T | null> {
+    return withProjectBootstrapMutation(this.#projectId, async scope => {
+      if (
+        this.#projectMutationOwner.superseded ||
+        scope.owner !== this.#projectMutationOwner
+      ) {
+        if (required) throw this.#projectAuthorityFailure();
+        return null;
+      }
+      return operation();
+    });
+  }
+
+  async #releaseProjectMutationOwnership(): Promise<void> {
+    await withProjectBootstrapMutation(this.#projectId, scope => {
+      if (scope.owner === this.#projectMutationOwner) scope.owner = null;
+      this.#projectMutationOwner.terminal = true;
+    });
   }
 
   ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor> {
@@ -1351,15 +1543,15 @@ export class V2BootstrapController {
    */
   forceStop(reason: string, signal?: AbortSignal): Promise<void> {
     if (!this.#closed) return abortable(this.#beginRetirement(true, reason), signal);
-    if (!this.#forceRetiring) {
-      const forced = this.#forceRetireAfterClose(reason);
-      this.#forceRetiring = forced;
-    }
-    return abortable(this.#forceRetiring, signal);
+    return abortable(
+      this.#forceRetiring ?? this.#retiring ?? Promise.resolve(),
+      signal,
+    );
   }
 
   async #ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor> {
     try {
+      await this.#claimProjectMutationOwnership();
       await this.#deployAssets();
       await this.#awareness.connect(signal);
     } catch (cause) {
@@ -1386,7 +1578,6 @@ export class V2BootstrapController {
             schemaVersion: GP_V2_R2_SCHEMA_VERSION,
           }
         : baseBinding;
-      this.#lastLaunchNonce = binding.nonce;
       this.#rotationKey = null;
       try {
         const descriptor = await this.#attempt(binding, attempt, signal);
@@ -1409,6 +1600,10 @@ export class V2BootstrapController {
   }
 
   async #deployAssets(): Promise<void> {
+    await this.#withOwnedProjectMutation(true, () => this.#deployAssetsOwned());
+  }
+
+  async #deployAssetsOwned(): Promise<void> {
     await assertV2SidecarAssets(this.#assets, this.#selectedRevision);
     for (const obsoletePath of this.#assets.obsoletePaths) {
       await this.#ydoc.tombstonePath(obsoletePath);
@@ -1503,24 +1698,63 @@ export class V2BootstrapController {
       staticConfig,
     );
     const mainSource = bootstrapMainSource(artifacts.outputPath);
-    try {
-      await this.#ydoc.writePath(STATIC_PATH, staticConfig);
-      await this.#ydoc.writePath(LAUNCHER_PATH, launcher);
-      await this.#ydoc.writePath(MAIN_PATH, mainSource);
-      await this.#gateway.syncWorkspace(signal);
-    } catch (cause) {
-      throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
+    const authority: BootstrapAttemptAuthority = Object.freeze({
+      binding,
+      staticConfig,
+      launcher,
+      mainSource,
+      outputPath: artifacts.outputPath,
+    });
+    const existingAuthority = this.#attemptAuthorities.get(binding.nonce);
+    if (
+      existingAuthority &&
+      (
+        existingAuthority.staticConfig !== staticConfig ||
+        existingAuthority.launcher !== launcher ||
+        existingAuthority.mainSource !== mainSource
+      )
+    ) throw new V2BootstrapError("V2 bootstrap nonce authority changed", "deploy", attempt);
+    if (
+      !existingAuthority &&
+      this.#possiblyLaunched.size >= MAX_TRACKED_LAUNCH_NONCES
+    ) {
+      throw new V2BootstrapError(
+        "V2 bootstrap launch identity capacity is exhausted",
+        "readiness",
+        attempt,
+      );
     }
+    this.#attemptAuthorities.set(binding.nonce, authority);
+    this.#ownedStaticConfigs.add(staticConfig);
+    // Conservatively retain the nonce before staging. A concurrent shutdown
+    // must fence it even if this attempt later fails before render submission.
+    this.#possiblyLaunched.set(binding.nonce, authority);
+    await this.#withOwnedProjectMutation(true, async () => {
+      try {
+        const currentStatic = await this.#ydoc.readPath(STATIC_PATH);
+        const applied = await this.#ydoc.compareAndMutatePaths({
+          guards: [{ path: STATIC_PATH, equals: currentStatic }],
+          mutations: [
+            { kind: "write", path: STATIC_PATH, content: staticConfig },
+            { kind: "write", path: LAUNCHER_PATH, content: launcher },
+            { kind: "write", path: MAIN_PATH, content: mainSource },
+          ],
+        });
+        if (!applied) throw this.#projectAuthorityFailure();
+        await this.#gateway.syncWorkspace(signal);
+      } catch (cause) {
+        throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
+      }
 
-    try {
-      this.#launchAttempted = true;
-      await this.#gateway.triggerRender({
-        mainDocument: MAIN_PATH,
-        ...await this.#ydoc.renderSyncState(),
-      }, signal);
-    } catch (cause) {
-      throw new V2BootstrapError("Unable to trigger V2 sidecar render", "render", attempt, { cause });
-    }
+      try {
+        await this.#gateway.triggerRender({
+          mainDocument: MAIN_PATH,
+          ...await this.#ydoc.renderSyncState(),
+        }, signal);
+      } catch (cause) {
+        throw new V2BootstrapError("Unable to trigger V2 sidecar render", "render", attempt, { cause });
+      }
+    });
 
     const hello = await this.#waitForHello(
       binding,
@@ -1553,8 +1787,22 @@ export class V2BootstrapController {
     const readiness: AwarenessEnvelope<SidecarFrame>[] = [];
     const unsubscribe = this.#awareness.subscribe(update => readiness.push(update.envelope));
     try {
-      await this.#ydoc.writePath(CIPHERTEXT_PATH, canonicalJson(sealed));
-      await this.#gateway.syncWorkspace(signal);
+      await this.#withOwnedProjectMutation(true, async () => {
+        const applied = await this.#ydoc.compareAndMutatePaths({
+          guards: [
+            { path: STATIC_PATH, equals: staticConfig },
+            { path: LAUNCHER_PATH, equals: launcher },
+            { path: MAIN_PATH, equals: mainSource },
+          ],
+          mutations: [{
+            kind: "write",
+            path: CIPHERTEXT_PATH,
+            content: canonicalJson(sealed),
+          }],
+        });
+        if (!applied) throw this.#projectAuthorityFailure();
+        await this.#gateway.syncWorkspace(signal);
+      });
       const descriptor = await this.#waitForReadiness(
         binding,
         hello.instanceId,
@@ -1810,7 +2058,7 @@ export class V2BootstrapController {
       safeReason(reason),
       descriptor,
       binding,
-      this.#launchAttempted,
+      [...this.#possiblyLaunched.values()],
     );
     this.#retiring = retiring;
     if (force) this.#forceRetiring = retiring;
@@ -1822,37 +2070,20 @@ export class V2BootstrapController {
     return retiring;
   }
 
-  #forceRetireAfterClose(reason: string): Promise<void> {
-    return this.#retire(
-      true,
-      safeReason(reason),
-      null,
-      null,
-      this.#launchAttempted,
-    );
-  }
-
   async #retire(
     force: boolean,
     reason: string,
     descriptor: V2ReadyDescriptor | null,
     binding: BootstrapBinding | null,
-    mayHaveLaunched: boolean,
+    launches: readonly BootstrapAttemptAuthority[],
   ): Promise<void> {
     let unsubscribe: (() => void) | null = null;
     let failure: unknown = null;
     try {
-      if (force && mayHaveLaunched) {
-        const launchNonce = binding?.nonce ?? this.#lastLaunchNonce;
-        if (!launchNonce) {
-          throw new V2BootstrapError(
-            "Unable to identify the V2 sidecar launch for termination",
-            "readiness",
-            1,
-          );
-        }
-        await this.#forceTerminateSidecar(launchNonce);
+      if (force && launches.length > 0) {
+        await this.#forceTerminateSidecars(launches);
       } else if (descriptor && binding) {
+        await this.#fenceDelayedLaunches(launches);
         const frame = this.#controlFrame({ kind: "drain", reason });
         const seen: AwarenessEnvelope<SidecarFrame>[] = [];
         unsubscribe = this.#awareness.subscribe(update => seen.push(update.envelope));
@@ -1877,33 +2108,162 @@ export class V2BootstrapController {
     } catch (error) {
       failure = error;
     } finally {
+      if (!force && launches.length > 0) {
+        try {
+          // A clean drain proves request settlement, not that every previously
+          // accepted renderer lost its once-per-nonce fork race. Install and
+          // verify the same permanent nonce fences used by forced retirement.
+          await this.#forceTerminateSidecars(launches);
+        } catch (retirementError) {
+          failure = failure === null
+            ? retirementError
+            : new AggregateError(
+                [failure, retirementError],
+                "V2 sidecar drain and physical retirement failed",
+              );
+        }
+      }
       unsubscribe?.();
       this.#awareness.clear();
       try {
-        await this.#cleanupTransient(true);
+        await this.#cleanupTransient(true, undefined, "any");
       } catch (cleanupError) {
         failure = failure === null
           ? cleanupError
           : new AggregateError([failure, cleanupError], "V2 sidecar retirement failed");
       }
+      try {
+        await this.#releaseProjectMutationOwnership();
+      } catch (releaseError) {
+        failure = failure === null
+          ? releaseError
+          : new AggregateError(
+              [failure, releaseError],
+              "V2 sidecar retirement ownership release failed",
+            );
+      }
     }
     if (failure !== null) throw failure;
   }
 
-  async #forceTerminateSidecar(launchNonce: string): Promise<void> {
-    try {
-      await this.#ydoc.writePath(
-        LAUNCHER_PATH,
-        terminationLauncher(this.#assets.entrypointPath, launchNonce),
-      );
+  #nextRetirementNonce(launchNonces: ReadonlySet<string>): string {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const nonce = this.#random.uuid();
+      if (SAFE_ID.test(nonce) && !launchNonces.has(nonce)) return nonce;
+    }
+    throw new V2BootstrapError("Unable to allocate a fresh V2 retirement nonce", "readiness", 1);
+  }
+
+  #retirementStaticConfig(
+    retirementNonce: string,
+    launchNonces: readonly string[],
+  ): string {
+    return canonicalJson({
+      version: 1,
+      state: "retired",
+      projectId: this.#projectId,
+      sandboxSessionId: this.#sandboxSessionId,
+      leaderGeneration: this.#leaderGeneration,
+      releaseRevision: this.#selectedRevision,
+      protocolRevision: this.#protocolRevision,
+      buildHash: this.#assets.buildHash,
+      schemaHash: this.#assets.schemaHash,
+      retirementNonce,
+      launchNonces: [...launchNonces].sort(),
+    });
+  }
+
+  #requireOwnedStatic(current: string | null): void {
+    if (current === null || !this.#ownedStaticConfigs.has(current)) {
+      throw this.#projectAuthorityFailure();
+    }
+  }
+
+  async #fenceDelayedLaunches(
+    launches: readonly BootstrapAttemptAuthority[],
+  ): Promise<void> {
+    if (launches.length === 0) return;
+    const launchNonces = [...new Set(launches.map(launch => launch.binding.nonce))];
+    const retirementNonce = this.#nextRetirementNonce(new Set(launchNonces));
+    const retiredStatic = this.#retirementStaticConfig(retirementNonce, launchNonces);
+    this.#ownedStaticConfigs.add(retiredStatic);
+    this.#retirementStaticConfigs.add(retiredStatic);
+    await this.#withOwnedProjectMutation(true, async () => {
+      const currentStatic = await this.#ydoc.readPath(STATIC_PATH);
+      this.#requireOwnedStatic(currentStatic);
+      const applied = await this.#ydoc.compareAndMutatePaths({
+        guards: [{ path: STATIC_PATH, equals: currentStatic }],
+        mutations: [{ kind: "write", path: STATIC_PATH, content: retiredStatic }],
+      });
+      if (!applied) throw this.#projectAuthorityFailure();
       await this.#gateway.syncWorkspace();
-      await this.#gateway.triggerRender({
-        mainDocument: MAIN_PATH,
-        ...await this.#ydoc.renderSyncState(),
+    });
+  }
+
+  async #forceTerminateSidecars(
+    launches: readonly BootstrapAttemptAuthority[],
+  ): Promise<void> {
+    const launchNonces = [...new Set(launches.map(launch => launch.binding.nonce))];
+    if (launchNonces.length < 1 || launchNonces.length > MAX_TRACKED_LAUNCH_NONCES) {
+      throw new V2BootstrapError(
+        "Unable to identify the bounded V2 sidecar launches for termination",
+        "readiness",
+        1,
+      );
+    }
+    const retirementNonce = this.#nextRetirementNonce(new Set(launchNonces));
+    const retiredStatic = this.#retirementStaticConfig(retirementNonce, launchNonces);
+    const outputPath = retirementArtifactPath(retirementNonce);
+    const launcher = terminationLauncher(
+      this.#assets.entrypointPath,
+      launchNonces,
+      retirementNonce,
+      retiredStatic,
+      outputPath,
+      this.#protocolRevision === "r2",
+    );
+    const mainSource = bootstrapMainSource(outputPath);
+    this.#ownedStaticConfigs.add(retiredStatic);
+    this.#retirementStaticConfigs.add(retiredStatic);
+    this.#transientArtifactPaths.add(outputPath);
+    let triggerFailure: unknown = null;
+    try {
+      await this.#withOwnedProjectMutation(true, async () => {
+        const currentStatic = await this.#ydoc.readPath(STATIC_PATH);
+        this.#requireOwnedStatic(currentStatic);
+        const applied = await this.#ydoc.compareAndMutatePaths({
+          guards: [{ path: STATIC_PATH, equals: currentStatic }],
+          mutations: [
+            { kind: "tombstone", path: outputPath },
+            { kind: "write", path: STATIC_PATH, content: retiredStatic },
+            { kind: "write", path: LAUNCHER_PATH, content: launcher },
+            { kind: "write", path: MAIN_PATH, content: mainSource },
+          ],
+        });
+        if (!applied) throw this.#projectAuthorityFailure();
+        await this.#gateway.syncWorkspace();
+        try {
+          await this.#gateway.triggerRender({
+            mainDocument: MAIN_PATH,
+            ...await this.#ydoc.renderSyncState(),
+          });
+        } catch (cause) {
+          // An async render may have been accepted before its response failed.
+          // Only the fresh remote proof below can settle retirement.
+          triggerFailure = cause;
+        }
+      });
+      await this.#waitForRetirementProof({
+        retirementNonce,
+        retiredStatic,
+        launcher,
+        mainSource,
+        triggerFailure,
       });
     } catch (cause) {
+      if (cause instanceof V2BootstrapError) throw cause;
       throw new V2BootstrapError(
-        "Unable to terminate the V2 sidecar process",
+        "Unable to prove termination of the V2 sidecar process",
         "render",
         1,
         { cause },
@@ -1911,16 +2271,105 @@ export class V2BootstrapController {
     }
   }
 
-  async #cleanupTransient(required: boolean, signal?: AbortSignal): Promise<void> {
-    try {
-      await this.#ydoc.tombstonePath(CIPHERTEXT_PATH);
-      for (const path of this.#transientArtifactPaths) {
-        await this.#ydoc.tombstonePath(path);
+  async #waitForRetirementProof(input: {
+    retirementNonce: string;
+    retiredStatic: string;
+    launcher: string;
+    mainSource: string;
+    triggerFailure: unknown;
+  }): Promise<void> {
+    const deadline = this.#clock.now() + this.#timeoutMs;
+    let lastFailure = input.triggerFailure;
+    for (;;) {
+      let response: Awaited<ReturnType<V2BootstrapGateway["fetchText"]>>;
+      try {
+        response = await this.#gateway.fetchText("logs", { method: "GET" });
+      } catch (cause) {
+        lastFailure = cause;
+        response = { status: 0, text: "", headers: new Headers() };
       }
-      await this.#ydoc.writePath(LAUNCHER_PATH, INERT_LAUNCHER);
-      await this.#gateway.syncWorkspace(signal);
+      if (response.status >= 200 && response.status < 300) {
+        const log = renderLogText(response.text);
+        const failed = extractWrappedMarker(log, RETIRE_FAILED_PREFIX, /^[A-Za-z0-9._:-]+/, 128);
+        if (failed === input.retirementNonce) {
+          throw new V2BootstrapError("V2 sidecar retirement reported incomplete proof", "readiness", 1);
+        }
+        const retired = extractWrappedMarker(log, RETIRED_PREFIX, /^[A-Za-z0-9._:-]+/, 128);
+        if (retired === input.retirementNonce) {
+          await this.#assertRetirementAuthority(input);
+          return;
+        }
+      }
+      await this.#assertRetirementAuthority(input);
+      if (this.#clock.now() >= deadline) {
+        throw new V2BootstrapError(
+          "Timed out waiting for V2 sidecar retirement proof",
+          "timeout",
+          1,
+          lastFailure === null ? undefined : { cause: lastFailure },
+        );
+      }
+      await this.#clock.sleep(Math.min(this.#pollMs, deadline - this.#clock.now()));
+    }
+  }
+
+  async #assertRetirementAuthority(input: {
+    retiredStatic: string;
+    launcher: string;
+    mainSource: string;
+  }): Promise<void> {
+    await this.#withOwnedProjectMutation(true, async () => {
+      const [currentStatic, currentLauncher, currentMain] = await Promise.all([
+        this.#ydoc.readPath(STATIC_PATH),
+        this.#ydoc.readPath(LAUNCHER_PATH),
+        this.#ydoc.readPath(MAIN_PATH),
+      ]);
+      if (
+        currentStatic !== input.retiredStatic ||
+        currentLauncher !== input.launcher ||
+        currentMain !== input.mainSource
+      ) throw this.#projectAuthorityFailure();
+    });
+  }
+
+  async #cleanupTransient(
+    required: boolean,
+    signal?: AbortSignal,
+    authority: "attempt" | "any" = "attempt",
+  ): Promise<void> {
+    if (this.#ownedStaticConfigs.size === 0) return;
+    try {
+      await this.#withOwnedProjectMutation(required, async () => {
+        const currentStatic = await this.#ydoc.readPath(STATIC_PATH);
+        const ownsStatic = currentStatic !== null && this.#ownedStaticConfigs.has(currentStatic);
+        const allowedStatic = ownsStatic && (
+          authority === "any" || !this.#retirementStaticConfigs.has(currentStatic)
+        );
+        if (!allowedStatic) {
+          if (required) throw this.#projectAuthorityFailure();
+          return;
+        }
+        const applied = await this.#ydoc.compareAndMutatePaths({
+          guards: [{ path: STATIC_PATH, equals: currentStatic }],
+          mutations: [
+            { kind: "tombstone", path: CIPHERTEXT_PATH },
+            ...[...this.#transientArtifactPaths].map(path => ({
+              kind: "tombstone" as const,
+              path,
+            })),
+            { kind: "write", path: LAUNCHER_PATH, content: INERT_LAUNCHER },
+            { kind: "write", path: MAIN_PATH, content: MAIN_SOURCE },
+          ],
+        });
+        if (!applied) {
+          if (required) throw this.#projectAuthorityFailure();
+          return;
+        }
+        await this.#gateway.syncWorkspace(signal);
+      });
     } catch (cause) {
       if (required) {
+        if (cause instanceof V2BootstrapError) throw cause;
         throw new V2BootstrapError("Unable to restore the inert V2 launcher", "deploy", 1, { cause });
       }
     }

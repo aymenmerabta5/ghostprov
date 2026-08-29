@@ -12,6 +12,7 @@ const PNG = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   0x00, 0x00, 0x00, 0x0d,
 ]);
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
 
 function imageFinal(result: string) {
   return {
@@ -96,6 +97,50 @@ describe("Images compatibility HTTP routes", () => {
       model: "gpt-image-2",
       action: "edit",
     });
+  });
+
+  it("accepts the repeated image[] fields emitted by the OpenAI SDK", async () => {
+    let body: Record<string, unknown> | undefined;
+    const app = testApp(async value => {
+      body = value;
+      return handle(Promise.resolve(imageFinal("EDITED")));
+    });
+    const form = new FormData();
+    form.append("prompt", "combine references");
+    form.append("image[]", new File([PNG], "one.png", { type: "image/png" }));
+    form.append("image[]", new File([JPEG], "two.jpg", { type: "image/jpeg" }));
+
+    const response = await app.request("/v1/images/edits", { method: "POST", body: form });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ data: [{ b64_json: "EDITED" }] });
+    const content = ((body!.input as any[])[0].content as Array<Record<string, unknown>>);
+    expect(content.slice(1).map(part => part.image_url)).toEqual([
+      `data:image/png;base64,${Buffer.from(PNG).toString("base64")}`,
+      `data:image/jpeg;base64,${Buffer.from(JPEG).toString("base64")}`,
+    ]);
+  });
+
+  it("rejects mixed image and image[] fields before relay dispatch", async () => {
+    let calls = 0;
+    const app = testApp(async () => {
+      calls++;
+      return handle(Promise.resolve(imageFinal("never")));
+    });
+    const form = new FormData();
+    form.append("prompt", "ambiguous references");
+    form.append("image", new File([PNG], "direct.png", { type: "image/png" }));
+    form.append("image[]", new File([JPEG], "array.jpg", { type: "image/jpeg" }));
+
+    const response = await app.request("/v1/images/edits", { method: "POST", body: form });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: {
+      type: "invalid_request_error",
+      param: "image",
+      code: "invalid_value",
+    }});
+    expect(calls).toBe(0);
   });
 
   it("returns OpenAI-shaped validation errors without starting the relay", async () => {

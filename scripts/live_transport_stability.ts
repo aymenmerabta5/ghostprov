@@ -1,10 +1,10 @@
 
-import "dotenv/config";
 import WebSocket from "ws";
 import { writeFile, rename } from "node:fs/promises";
 import path from "node:path";
+import { DEFAULT_CANDIDATE_PORT } from "../src/core/ports";
 
-const ROOT = "http://127.0.0.1:18888";
+const ROOT = `http://127.0.0.1:${DEFAULT_CANDIDATE_PORT}`;
 const CONCURRENCY = Number(process.env.GP_TEST_CONCURRENCY ?? 8);
 const WAVES = Number(process.env.GP_TEST_WAVES ?? 5);
 const TARGET_BYTES = Number(process.env.GP_TEST_REQUEST_BYTES ?? Math.floor(2.9 * 1024 * 1024));
@@ -114,7 +114,7 @@ async function runOne(wave: number, request: number) {
   const encoded = JSON.stringify(body);
   if (Buffer.byteLength(encoded) !== requestSizes[request]) throw new Error("request size drifted");
   const started = performance.now();
-  const socket = new WebSocket("ws://127.0.0.1:18888/v1/responses", {
+  const socket = new WebSocket(`ws://127.0.0.1:${DEFAULT_CANDIDATE_PORT}/v1/responses`, {
     headers: { authorization: "Bearer " + apiKey },
   });
   return await new Promise<any>((resolve, reject) => {
@@ -139,7 +139,9 @@ async function runOne(wave: number, request: number) {
       maxGapMs = Math.max(maxGapMs, now - lastAt);
       lastAt = now;
       messages++;
-      responseBytes += raw.length;
+      responseBytes += Array.isArray(raw)
+        ? raw.reduce((total, part) => total + part.byteLength, 0)
+        : raw.byteLength;
       let event: any;
       try { event = JSON.parse(raw.toString()); } catch { return; }
       if (["error", "response.failed", "response.incomplete", "response.completed"].includes(event.type)) {

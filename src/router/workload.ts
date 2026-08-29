@@ -70,11 +70,28 @@ function jsonStringUnitBytes(value: string, index: number): { bytes: number; wid
 }
 
 function jsonStringBytes(value: string): number {
-  let bytes = 2;
-  for (let index = 0; index < value.length;) {
-    const encoded = jsonStringUnitBytes(value, index);
-    bytes += encoded.bytes;
-    index += encoded.width;
+  // Native UTF-8 sizing covers the overwhelmingly common prompt/base64 path
+  // without a JavaScript loop. Adjust only JSON escapes and lone surrogates;
+  // paired surrogates already have their exact four-byte UTF-8 width.
+  let bytes = Buffer.byteLength(value, "utf8") + 2;
+  const special = /["\\\u0000-\u001f\uD800-\uDFFF]/g;
+  for (let match = special.exec(value); match; match = special.exec(value)) {
+    const index = match.index;
+    const unit = value.charCodeAt(index);
+    if (unit === 0x22 || unit === 0x5c || unit === 0x08 || unit === 0x09 ||
+      unit === 0x0a || unit === 0x0c || unit === 0x0d) {
+      bytes += 1;
+      continue;
+    }
+    if (unit <= 0x1f) {
+      bytes += 5;
+      continue;
+    }
+    const pairedHigh = unit >= 0xd800 && unit <= 0xdbff &&
+      value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff;
+    const pairedLow = unit >= 0xdc00 && unit <= 0xdfff &&
+      value.charCodeAt(index - 1) >= 0xd800 && value.charCodeAt(index - 1) <= 0xdbff;
+    if (!pairedHigh && !pairedLow) bytes += 3;
   }
   return bytes;
 }

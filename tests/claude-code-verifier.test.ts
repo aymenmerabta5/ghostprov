@@ -127,11 +127,12 @@ describe("Claude Code forwarding verifier", () => {
     for (const port of [18787, 8787]) {
       expect(() => validateVerifierOptions({
         port,
-        upstream: "http://127.0.0.1:18787",
+        upstream: "http://127.0.0.1:18888",
       })).toThrow("protected");
     }
     for (const upstream of [
       "https://example.com",
+      "http://127.0.0.1:18787",
       "http://user:password@127.0.0.1:18787",
       "http://@127.0.0.1:18787",
       "http://127.0.0.1:18787/v1",
@@ -147,7 +148,7 @@ describe("Claude Code forwarding verifier", () => {
     for (const port of [0, -1, 1.5, 65_536, Number.NaN]) {
       expect(() => validateVerifierOptions({
         port,
-        upstream: "http://127.0.0.1:18787",
+        upstream: "http://127.0.0.1:18888",
       })).toThrow("port");
     }
     expect(() => validateVerifierOptions({
@@ -156,12 +157,12 @@ describe("Claude Code forwarding verifier", () => {
     })).toThrow("listener");
     expect(validateVerifierOptions({
       port: 18788,
-      upstream: "http://127.0.0.1:18787/",
-    })).toEqual({ port: 18788, upstream: "http://127.0.0.1:18787" });
+      upstream: "http://127.0.0.1:18888/",
+    })).toEqual({ port: 18788, upstream: "http://127.0.0.1:18888" });
     expect(validateVerifierOptions({
       port: 18_889,
-      upstream: "http://[::1]:18787",
-    })).toEqual({ port: 18_889, upstream: "http://[::1]:18787" });
+      upstream: "http://[::1]:18888",
+    })).toEqual({ port: 18_889, upstream: "http://[::1]:18888" });
   });
 
   it("admits only eight forwards and removes an aborted ninth waiter", async () => {
@@ -500,7 +501,7 @@ describe("Claude Code forwarding verifier", () => {
   it("posts a forced Responses stream and preserves frames plus authoritative final", async () => {
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
     const router = createForwardingRouter("http://127.0.0.1:19001", {
-      apiKey: "GHOST_IS_KING",
+      apiKey: "test-ghostprov-key-0123456789abcdef",
       fetch: async (input, init) => {
         requests.push({ url: String(input), init });
         return sseResponse(completedFrames(), 7);
@@ -523,7 +524,7 @@ describe("Claude Code forwarding verifier", () => {
     expect(new Headers(requests[0]?.init?.headers).get("accept")).toBe("text/event-stream");
     expect(new Headers(requests[0]?.init?.headers).get("content-type")).toBe("application/json");
     expect(new Headers(requests[0]?.init?.headers).get("authorization"))
-      .toBe("Bearer GHOST_IS_KING");
+      .toBe("Bearer test-ghostprov-key-0123456789abcdef");
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       ...body,
       stream: true,

@@ -143,6 +143,47 @@ export const V2_R8_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
   bundleSha256: "0ef602190dcbd4befbb0cf158dbc9825112193992dd486a2a32d416b37b1835f",
 });
 
+/**
+ * The first R2 artifact was declared frozen before the later selectable R2
+ * replacement was published. It is retained only so bootstrap can safely
+ * recognize and retire a process that still executes that exact artifact.
+ * It must never be selectable or deployed by this process.
+ */
+export const V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY:
+  V2SidecarReleaseIdentity = Object.freeze({
+    revision: V2_R2,
+    protocolRevision: "r2",
+    transportProfile: "standard",
+    buildHash: "21457e48716e99e82d48521ca43c60335ffd9933f4e1e258e252709c9525da6a",
+    schemaHash: "6c5d2c5cf60e0338d9d907f20636a0b3a6c40abca3bbc806fb59d0518a0af5bd",
+    bundleSha256: "fd76939a0e53638737aa60e4ea13ba27a870f8938ff20bf74354bd8efe87ef73",
+  });
+
+/** Exact releases that may be selected and reported by the current host. */
+export const V2_SELECTABLE_RELEASE_IDENTITIES = Object.freeze([
+  V2_R1_RELEASE,
+  V2_R2_RELEASE,
+  V2_R3_RELEASE,
+  V2_R4_RELEASE,
+  V2_R5_RELEASE,
+  V2_R6_RELEASE,
+  V2_R7_RELEASE,
+  V2_R8_RELEASE,
+] as const);
+
+/** Exact immutable entrypoints bootstrap is authorized to retire. */
+export const V2_RETIREMENT_RELEASE_IDENTITIES = Object.freeze([
+  V2_R1_RELEASE,
+  V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY,
+  V2_R2_RELEASE,
+  V2_R3_RELEASE,
+  V2_R4_RELEASE,
+  V2_R5_RELEASE,
+  V2_R6_RELEASE,
+  V2_R7_RELEASE,
+  V2_R8_RELEASE,
+] as const);
+
 export interface V2SidecarAsset {
   /** Immutable workspace-relative deployment path. */
   readonly path: string;

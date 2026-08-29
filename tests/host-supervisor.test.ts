@@ -12,6 +12,7 @@ import {
 
 const supervisors: GhostProvHostSupervisor[] = [];
 const temporaryDirectories: string[] = [];
+const API_KEY = "test-supervisor-key-0123456789abcdef-0123456789";
 
 afterEach(async () => {
   await Promise.allSettled(supervisors.splice(0).map(value => value.close()));
@@ -34,6 +35,7 @@ describe("GhostProv host supervisor", () => {
     const statusFile = path.join(directory, "supervisor.json");
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       readyTimeoutMs: 10_000,
@@ -54,7 +56,9 @@ describe("GhostProv host supervisor", () => {
     const root = `http://127.0.0.1:${port}`;
     expect(await (await fetch(`${root}/generation`)).json()).toMatchObject({ generation: 1 });
 
-    const firstSocket = new WebSocket(`ws://127.0.0.1:${port}/v1/responses`);
+    const firstSocket = new WebSocket(`ws://127.0.0.1:${port}/v1/responses`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
     const firstSocketMessage = new Promise<any>((resolve, reject) => {
       firstSocket.once("message", data => resolve(JSON.parse(data.toString())));
       firstSocket.once("error", reject);
@@ -67,13 +71,17 @@ describe("GhostProv host supervisor", () => {
     const slow = fetch(`${root}/slow?ms=100`).then(response => response.json());
     await Bun.sleep(20);
     const restart = supervisor.requestRestart("test-upgrade");
-    const queued = fetch(`${root}/generation`).then(response => response.json());
+    const queued = fetch(`${root}/v1/models`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    }).then(response => response.json());
     await expect(slow).resolves.toMatchObject({ generation: 1, delayed: true });
     expect(await firstSocketClosed).toBe(1012);
     await expect(queued).resolves.toMatchObject({ generation: 2 });
     await restart;
 
-    const secondSocket = new WebSocket(`ws://127.0.0.1:${port}/v1/responses`);
+    const secondSocket = new WebSocket(`ws://127.0.0.1:${port}/v1/responses`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
     await expect(new Promise<any>((resolve, reject) => {
       secondSocket.once("message", data => resolve(JSON.parse(data.toString())));
       secondSocket.once("error", reject);
@@ -95,7 +103,9 @@ describe("GhostProv host supervisor", () => {
     }
     expect(recovered).toMatchObject({ generation: 3 });
 
-    const diagnostic = await (await fetch(`${root}/__supervisor`)).json() as any;
+    const diagnostic = await (await fetch(`${root}/__supervisor`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    })).json() as any;
     expect(diagnostic).toMatchObject({
       schema: 1,
       state: "ready",
@@ -121,6 +131,7 @@ describe("GhostProv host supervisor", () => {
     const instanceNonce = randomUUID();
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       readyTimeoutMs: 10_000,
@@ -189,6 +200,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       workerEnv: { GP_TEST_SUPERVISOR_RESTART_READY_DELAY_MS: "1500" },
@@ -211,15 +223,19 @@ describe("GhostProv host supervisor", () => {
     const root = `http://127.0.0.1:${supervisor.snapshot().externalPort}`;
     const statusWritesBefore = supervisor.snapshot().statusWritesTotal;
     const restarting = supervisor.requestRestart("bounded-queue-test");
-    const oversized = await fetch(`${root}/generation`, {
+    const oversized = await fetch(`${root}/v1/models`, {
       method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
       body: "x".repeat(8_192),
     });
     expect(oversized.status).toBe(503);
     expect(await oversized.text()).toContain("host_queue_full");
     expect(supervisor.snapshot()).toMatchObject({ queuedRequests: 0, queuedBytes: 0 });
-    const accepted = Array.from({ length: 4 }, () => fetch(`${root}/generation`, {
-      headers: { "x-queue-padding": "x".repeat(128) },
+    const accepted = Array.from({ length: 4 }, () => fetch(`${root}/v1/models`, {
+      headers: {
+        authorization: `Bearer ${API_KEY}`,
+        "x-queue-padding": "x".repeat(128),
+      },
     }));
     for (let attempt = 0; attempt < 100 && supervisor.snapshot().queuedRequests < 4; attempt++) {
       await Bun.sleep(10);
@@ -229,8 +245,11 @@ describe("GhostProv host supervisor", () => {
     expect(supervisor.snapshot().queuedBytes).toBeLessThanOrEqual(4_096);
 
     const overflow = await Promise.all(Array.from({ length: 40 }, async () => {
-      const response = await fetch(`${root}/generation`, {
-        headers: { authorization: "Bearer must-not-leak" },
+      const response = await fetch(`${root}/v1/models`, {
+        headers: {
+          authorization: `Bearer ${API_KEY}`,
+          "x-private-canary": "must-not-leak",
+        },
       });
       return { status: response.status, body: await response.text() };
     }));
@@ -239,7 +258,10 @@ describe("GhostProv host supervisor", () => {
     expect(overflow.every(value => !value.body.includes("must-not-leak"))).toBe(true);
 
     const websocket503 = await new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const websocket = new WebSocket(`ws://127.0.0.1:${supervisor.snapshot().externalPort}/v1/responses`);
+      const websocket = new WebSocket(
+        `ws://127.0.0.1:${supervisor.snapshot().externalPort}/v1/responses`,
+        { headers: { authorization: `Bearer ${API_KEY}` } },
+      );
       websocket.once("unexpected-response", (_request, response) => {
         let body = "";
         response.setEncoding("utf8");
@@ -291,6 +313,7 @@ describe("GhostProv host supervisor", () => {
       if (!address || typeof address === "string") throw new Error("Foreign test listener has no port");
       const supervisor = new GhostProvHostSupervisor({
         externalPort: 0,
+        apiKey: API_KEY,
         cwd: process.cwd(),
         workerEntry: path.resolve("tests/support/fake-supervised-silent-worker.ts"),
         allocatePort: async () => address.port,
@@ -322,7 +345,10 @@ describe("GhostProv host supervisor", () => {
         const secretBody = "queued-body-must-never-reach-foreign-listener";
         const response = await fetch(`http://127.0.0.1:${publicPort}/v1/responses`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${API_KEY}`,
+          },
           body: secretBody,
         });
         expect(response.status).toBe(503);
@@ -349,6 +375,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-condemned-worker.ts"),
       readyTimeoutMs: 100,
@@ -369,7 +396,8 @@ describe("GhostProv host supervisor", () => {
       await Bun.sleep(5);
     }
     const response = await fetch(
-      `http://127.0.0.1:${supervisor.snapshot().externalPort}/generation`,
+      `http://127.0.0.1:${supervisor.snapshot().externalPort}/v1/models`,
+      { headers: { authorization: `Bearer ${API_KEY}` } },
     );
     expect(response.status).toBe(503);
     expect(await response.text()).toContain("host_restarting");
@@ -387,6 +415,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-condemned-worker.ts"),
       readyTimeoutMs: 2_000,
@@ -408,7 +437,8 @@ describe("GhostProv host supervisor", () => {
     }
     const restarting = supervisor.requestRestart("condemn-before-ready");
     const response = await fetch(
-      `http://127.0.0.1:${supervisor.snapshot().externalPort}/generation`,
+      `http://127.0.0.1:${supervisor.snapshot().externalPort}/v1/models`,
+      { headers: { authorization: `Bearer ${API_KEY}` } },
     );
     await Promise.all([starting, restarting]);
     expect(await response.json()).toMatchObject({ generation: 2, condemned: true });
@@ -424,6 +454,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: process.cwd(),
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       readyTimeoutMs: 10_000,
@@ -453,6 +484,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: directory,
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       readyTimeoutMs: 1_000,
@@ -477,6 +509,7 @@ describe("GhostProv host supervisor", () => {
     temporaryDirectories.push(directory);
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_KEY,
       cwd: directory,
       workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
       allocatePort: async () => { throw new Error("allocator failed"); },

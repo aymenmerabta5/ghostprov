@@ -224,4 +224,28 @@ describe("Anthropic response tool conversion", () => {
     expect(error.message).not.toContain(rawArguments);
   });
 
+  it("maps nested invalid Unicode in provider tool arguments to an upstream api_error", () => {
+    for (const argumentsValue of [
+      '{"value":"\\ud800"}',
+      '{"\\udc00":"value"}',
+    ]) {
+      const error = captureAnthropicError(() => responseToAnthropic({
+        id: "resp_bad_nested_unicode",
+        status: "completed",
+        output: [{
+          type: "function_call",
+          id: "fc_bad_nested_unicode",
+          status: "completed",
+          call_id: "call_bad_nested_unicode",
+          name: "Read",
+          arguments: argumentsValue,
+        }],
+      }, CONTEXT));
+
+      expect(error.status).toBe(500);
+      expect(error.errorType).toBe("api_error");
+      expect(error.message).toBe("Responses relay returned invalid function call arguments.");
+    }
+  });
+
 });

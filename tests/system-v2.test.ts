@@ -11,6 +11,7 @@ import { ResourceGovernor } from "../src/router/resource-governor";
 import type {
   RoutableSandboxRuntime,
   RoutableSandboxSnapshot,
+  SandboxRunOptions,
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { SupervisedSandboxRuntime } from "../src/sandbox/supervised-runtime";
@@ -132,7 +133,11 @@ class DeferredRuntime implements RoutableSandboxRuntime {
     this.emit();
   }
   async stop(): Promise<void> { this.state = "stopped"; this.emit(); }
-  async run(): Promise<RunHandle> { throw new Error("not used"); }
+  async run(
+    _body: Record<string, unknown>,
+    _signal?: AbortSignal,
+    _options?: SandboxRunOptions,
+  ): Promise<RunHandle> { throw new Error("not used"); }
   snapshot(): RoutableSandboxSnapshot {
     return {
       projectId: this.projectId,
@@ -156,6 +161,51 @@ class DeferredRuntime implements RoutableSandboxRuntime {
     return () => this.listeners.delete(listener);
   }
   emit(): void { for (const listener of this.listeners) listener(); }
+}
+
+class CapturingRuntime extends DeferredRuntime {
+  readonly bodies: Record<string, unknown>[] = [];
+
+  override async run(
+    body: Record<string, unknown>,
+    _signal?: AbortSignal,
+    _options?: SandboxRunOptions,
+  ): Promise<RunHandle> {
+    this.bodies.push(structuredClone(body));
+    const final = {
+      id: "resp_system_anthropic_model",
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: body.model,
+      error: null,
+      incomplete_details: null,
+      output: [{
+        id: "msg_system_anthropic_model",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{
+          type: "output_text",
+          text: "ok",
+          annotations: [],
+          logprobs: [],
+        }],
+      }],
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 2,
+      },
+    };
+    return {
+      async *events() {},
+      final: Promise.resolve(final),
+      stats: { bytes: 0, firstByteMs: 0, frames: 0 },
+    };
+  }
 }
 
 class FailingRuntime extends DeferredRuntime {
@@ -225,6 +275,7 @@ async function harness(): Promise<{
   };
   return {
     env: {
+      GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
       PRISM_COOKIE_FILE: cookieFile,
       PRISM_PROJECT_IDS: IDS.join(","),
       GP_PRISM_SESSION: "authenticated",
@@ -232,7 +283,7 @@ async function harness(): Promise<{
       GP_PROVISION_CONCURRENCY: "4",
       GP_CANDIDATE: "1",
       GP_LOG_LEVEL: "off",
-      PORT: "18787",
+      PORT: "18888",
     },
     dependencies: {
       machineProbe,
@@ -268,6 +319,102 @@ async function harness(): Promise<{
 }
 
 describe("V2 browserless system composition", () => {
+  it("rejects invalid public host allowlists before acquiring system ownership", async () => {
+    let machineSamples = 0;
+    let releasePreloads = 0;
+    let accountResolves = 0;
+    await expect(createBrowserlessSystem({
+      GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
+      PRISM_COOKIE_FILE: "D:/unused.json",
+      PRISM_PROJECT_IDS: IDS[0],
+      GP_CANDIDATE: "1",
+    }, {
+      allowedHosts: ["host/path"],
+      machineProbe: {
+        sample: () => {
+          machineSamples++;
+          throw new Error("machine ownership must not be acquired");
+        },
+      },
+      revisionSelector: {
+        preload: async () => { releasePreloads++; },
+        loadedForProject: () => { throw new Error("not used"); },
+      },
+      sessionManager: {
+        resolve: async () => {
+          accountResolves++;
+          throw new Error("account ownership must not be acquired");
+        },
+        close: async () => {},
+      },
+    })).rejects.toThrow("Allowed public host is invalid");
+    expect({ machineSamples, releasePreloads, accountResolves }).toEqual({
+      machineSamples: 0,
+      releasePreloads: 0,
+      accountResolves: 0,
+    });
+  });
+
+  it("threads an external startup abort through immutable release preload", async () => {
+    const value = await harness();
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    let accountResolves = 0;
+    value.dependencies.revisionSelector = {
+      preload: async signal => {
+        observedSignal = signal;
+        if (!signal) throw new Error("missing release preload startup signal");
+        await new Promise<never>(() => undefined);
+      },
+      loadedForProject: () => { throw new Error("release preload did not finish"); },
+    };
+    value.dependencies.sessionManager = {
+      resolve: async () => {
+        accountResolves++;
+        throw new Error("account resolution must not run after preload abort");
+      },
+      close: async () => {},
+    };
+
+    const creating = createBrowserlessSystem(
+      value.env,
+      value.dependencies,
+      controller.signal,
+    );
+    for (let attempt = 0; attempt < 100 && !observedSignal; attempt++) await Bun.sleep(0);
+    controller.abort(new DOMException("cancel system construction", "AbortError"));
+
+    await expect(creating).rejects.toMatchObject({ name: "AbortError" });
+    expect(observedSignal).toBe(controller.signal);
+    expect(accountResolves).toBe(0);
+  });
+
+  it("passes the external startup signal into account resolution and closes on abort", async () => {
+    const value = await harness();
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    value.dependencies.sessionManager = {
+      resolve: async signal => {
+        observedSignal = signal;
+        if (!signal) throw new Error("missing account startup signal");
+        return await new Promise<never>(() => undefined);
+      },
+      close: async () => { value.order.push("account-close"); },
+    };
+
+    const creating = createBrowserlessSystem(
+      value.env,
+      value.dependencies,
+      controller.signal,
+    );
+    for (let attempt = 0; attempt < 100 && !observedSignal; attempt++) await Bun.sleep(0);
+    controller.abort(new DOMException("cancel account resolution", "AbortError"));
+
+    await expect(creating).rejects.toMatchObject({ name: "AbortError" });
+    expect(observedSignal).toBe(controller.signal);
+    expect(value.order).toContain("account-close");
+  });
+
   it("fails closed on a selected release before account or server side effects", async () => {
     const value = await harness();
     let accountResolves = 0;
@@ -402,6 +549,82 @@ describe("V2 browserless system composition", () => {
     });
   }, 30_000);
 
+  it("uses Anthropic model overrides from the supplied system environment", async () => {
+    const value = await harness();
+    const runtime = new CapturingRuntime(IDS[0]!, false, value.order);
+    value.dependencies.runtimeFactory = { create: () => runtime };
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: IDS[0],
+      GP_ANTHROPIC_OPUS_MODEL: "system-explicit-opus",
+    }, value.dependencies);
+    await system.start();
+    try {
+      const response = await system.app.request("/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": value.env.GHOSTPROV_API_KEY,
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4-1",
+          max_tokens: 8,
+          messages: [{ role: "user", content: "use explicit system model" }],
+        }),
+      });
+      expect(response.status).toBe(200);
+      await response.json();
+      expect(runtime.bodies).toHaveLength(1);
+      expect(runtime.bodies[0]).toMatchObject({
+        model: "system-explicit-opus",
+        stream: true,
+        store: true,
+      });
+    } finally {
+      await system.close();
+    }
+  });
+
+  it("shares explicit public host allowlists with the system-composed app", async () => {
+    const value = await harness();
+    value.dependencies.allowedHosts = ["ghostprov.example"];
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    try {
+      expect((await system.app.request("http://ghostprov.example/health")).status).toBe(503);
+      expect((await system.app.request("http://attacker.example/health")).status).toBe(421);
+    } finally {
+      await system.close();
+    }
+  });
+
+  it("propagates an external abort into fleet reconciliation", async () => {
+    const value = await harness();
+    const controller = new AbortController();
+    let reconciliationSignal: AbortSignal | undefined;
+    value.dependencies.projects = {
+      get: async (_id, signal) => {
+        reconciliationSignal = signal;
+        if (!signal) throw new Error("missing reconciliation startup signal");
+        return await new Promise<never>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    };
+    const system = await createBrowserlessSystem(
+      value.env,
+      value.dependencies,
+      controller.signal,
+    );
+    const starting = system.start();
+    for (let attempt = 0; attempt < 100 && !reconciliationSignal; attempt++) await Bun.sleep(0);
+    controller.abort(new DOMException("cancel fleet reconciliation", "AbortError"));
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+    expect(reconciliationSignal?.aborted).toBe(true);
+    await system.close();
+  });
+
   it("binds with one exact healthy project when another explicit project metadata read fails", async () => {
     const value = await harness();
     value.factory.releaseAll();
@@ -434,7 +657,6 @@ describe("V2 browserless system composition", () => {
       desired: 2,
       ready: 1,
       unavailable: 1,
-      unavailableProjects: [IDS[0]],
     });
     await system.close();
   }, 30_000);
@@ -486,12 +708,12 @@ describe("V2 browserless system composition", () => {
     expect(value.dependencies.governor.snapshot().closed).toBe(true);
   });
 
-  it("never accepts protected port 8787 for a candidate", async () => {
+  it("never accepts protected port 18787 for a candidate", async () => {
     const value = await harness();
     await expect(createBrowserlessSystem({
       ...value.env,
-      PORT: "8787",
-    }, value.dependencies)).rejects.toThrow("port 8787");
+      PORT: "18787",
+    }, value.dependencies)).rejects.toThrow("port 18787");
   });
 
   it("waits for same-project sandbox recovery without creating a Prism project", async () => {

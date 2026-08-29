@@ -10,6 +10,12 @@ import {
   runMonitor,
 } from "../scripts/monitor_v2";
 
+const API_KEY = "test-monitor-key-0123456789abcdef-0123456789";
+
+function monitorOptions(overrides: Record<string, string | undefined> = {}) {
+  return resolveMonitorOptions({ GHOSTPROV_API_KEY: API_KEY, ...overrides });
+}
+
 class MemoryLogger implements LoggerLike {
   readonly events: ObservabilityEvent[] = [];
   onEmit?: (event: ObservabilityEvent) => void;
@@ -114,29 +120,43 @@ function successfulFetch(onRequest?: (path: string, init?: RequestInit) => void)
 
 describe("V2 external monitor", () => {
   it("accepts only a loopback root and rejects paths that could target mutating endpoints", () => {
-    expect(resolveMonitorOptions({})).toEqual({
+    expect(monitorOptions()).toEqual({
       root: "http://127.0.0.1:18787",
+      apiKey: API_KEY,
       intervalMs: 2_000,
       requestTimeoutMs: 5_000,
     });
-    expect(() => resolveMonitorOptions({
+    expect(() => monitorOptions({
       GP_MONITOR_ROOT: "https://example.com",
     })).toThrow("loopback");
-    expect(() => resolveMonitorOptions({
+    expect(() => monitorOptions({
       GP_MONITOR_ROOT: "http://127.0.0.1:18787/v1/responses",
     })).toThrow("origin only");
+    expect(() => resolveMonitorOptions({})).toThrow("GHOSTPROV_API_KEY is required");
   });
 
   it("polls only the two read-only endpoints with GET and emits sanitized metrics", async () => {
-    const requests: Array<{ path: string; method: string | undefined }> = [];
+    const requests: Array<{
+      path: string;
+      method: string | undefined;
+      authorization: string | null;
+    }> = [];
     const event = await pollMonitorSample(
-      resolveMonitorOptions({}),
-      successfulFetch((path, init) => requests.push({ path, method: init?.method })),
+      monitorOptions(),
+      successfulFetch((path, init) => requests.push({
+        path,
+        method: init?.method,
+        authorization: new Headers(init?.headers).get("authorization"),
+      })),
     );
 
     expect(requests).toEqual([
-      { path: "/health", method: "GET" },
-      { path: "/__sandboxes", method: "GET" },
+      { path: "/health", method: "GET", authorization: null },
+      {
+        path: "/__sandboxes",
+        method: "GET",
+        authorization: `Bearer ${API_KEY}`,
+      },
     ]);
     expect(event).toMatchObject({
       event: "monitor.sample",
@@ -161,7 +181,6 @@ describe("V2 external monitor", () => {
       ambiguity_limit: 4,
       rate_limit_observations: [{
         model: "gpt-5.6-sol",
-        organization: "org-Example123",
         limit: 40_000_000,
         used: 40_000_000,
         requested: 609_930,
@@ -171,7 +190,7 @@ describe("V2 external monitor", () => {
       }],
     });
     expect(event).not.toHaveProperty("rate_limit");
-    expect(JSON.stringify(event)).not.toMatch(/prompt|output|forbiddenToken|sk-secret/i);
+    expect(JSON.stringify(event)).not.toMatch(/prompt|output|organization|org-Example|forbiddenToken|sk-secret/i);
     expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
   });
 
@@ -183,8 +202,20 @@ describe("V2 external monitor", () => {
         : json({ capacity: 0, runtimes: [] });
     }) as typeof fetch;
 
-    await expect(pollMonitorSample(resolveMonitorOptions({}), fetchImpl))
+    await expect(pollMonitorSample(monitorOptions(), fetchImpl))
       .rejects.toThrow("GET /health returned HTTP 503");
+  });
+
+  it("rejects an oversized successful monitoring body before parsing it", async () => {
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/health") return json({ ok: true });
+      return new Response("{}", {
+        headers: { "content-length": String(2 * 1024 * 1024 + 1) },
+      });
+    }) as typeof fetch;
+    await expect(pollMonitorSample(monitorOptions(), fetchImpl))
+      .rejects.toThrow("bounded response limit");
   });
 
   it("cancels the sibling read when either endpoint fails", async () => {
@@ -200,7 +231,7 @@ describe("V2 external monitor", () => {
       });
     }) as unknown as typeof fetch;
 
-    await expect(pollMonitorSample(resolveMonitorOptions({}), fetchImpl))
+    await expect(pollMonitorSample(monitorOptions(), fetchImpl))
       .rejects.toThrow("GET /health returned HTTP 503");
     await Bun.sleep(0);
     expect(siblingAborted).toBe(true);
@@ -223,7 +254,7 @@ describe("V2 external monitor", () => {
       throw new Error("Authorization: Bearer sk-secret-value-that-must-not-appear");
     }) as unknown as typeof fetch;
 
-    await runMonitor(resolveMonitorOptions({}), {
+    await runMonitor(monitorOptions(), {
       logger,
       fetchImpl,
       signal: controller.signal,
@@ -244,13 +275,15 @@ describe("V2 external monitor", () => {
 
   it("is import-safe and returns from a successful loop on abort", async () => {
     expect(typeof main).toBe("function");
+    expect(await Bun.file(new URL("../scripts/monitor_v2.ts", import.meta.url)).text())
+      .not.toContain('import "dotenv/config"');
     const logger = new MemoryLogger();
     const controller = new AbortController();
     logger.onEmit = event => {
       if (event.event === "monitor.sample") controller.abort();
     };
 
-    await runMonitor(resolveMonitorOptions({}), {
+    await runMonitor(monitorOptions(), {
       logger,
       fetchImpl: successfulFetch(),
       signal: controller.signal,

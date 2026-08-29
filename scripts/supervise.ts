@@ -1,7 +1,12 @@
-import "dotenv/config";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { GhostProvHostSupervisor } from "../src/host/supervisor";
+import {
+  assertCandidatePort,
+  DEFAULT_CANDIDATE_PORT,
+  PROTECTED_SERVICE_PORT,
+} from "../src/core/ports";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 import {
   SUPERVISOR_CONTROL_DESCRIPTOR_SCHEMA,
   writeSupervisorControlDescriptor,
@@ -32,11 +37,20 @@ function port(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function binaryFlag(value: string | undefined, name: string): boolean {
+  if (value === undefined || value.trim() === "" || value === "0") return false;
+  if (value === "1") return true;
+  throw new TypeError(`${name} must be 0 or 1`);
+}
+
 export function supervisorOptions(env: NodeJS.ProcessEnv = process.env) {
-  const externalPort = port(env.PORT, 18787);
-  if (env.GP_CANDIDATE === "1" && externalPort === 8787) {
-    throw new RangeError("Supervised candidate cannot bind protected external port 8787");
-  }
+  const candidate = binaryFlag(env.GP_CANDIDATE, "GP_CANDIDATE");
+  const externalPort = port(
+    env.PORT,
+    candidate ? DEFAULT_CANDIDATE_PORT : PROTECTED_SERVICE_PORT,
+  );
+  if (candidate) assertCandidatePort(externalPort, "Supervised candidate");
+  const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   return {
     externalPort,
     host: "127.0.0.1",
@@ -47,7 +61,7 @@ export function supervisorOptions(env: NodeJS.ProcessEnv = process.env) {
     // .env revision selector has been reloaded.  The service-level
     // `config-restart` action starts a new supervisor (and therefore a new
     // startup snapshot) when configuration needs to change.
-    workerEnv: { ...env },
+    workerEnv: { ...env, GHOSTPROV_API_KEY: apiKey } as NodeJS.ProcessEnv,
     readyTimeoutMs: integer(
       env.GP_SUPERVISOR_READY_TIMEOUT_MS,
       120_000,
@@ -140,5 +154,4 @@ export async function runSupervisor(env: NodeJS.ProcessEnv = process.env): Promi
   }
 }
 
-const isMain = process.argv[1]?.endsWith("supervise.ts") || process.argv[1]?.endsWith("supervise.js");
-if (isMain) await runSupervisor();
+if (import.meta.main) await runSupervisor();

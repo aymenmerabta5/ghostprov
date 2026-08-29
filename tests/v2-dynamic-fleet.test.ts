@@ -146,6 +146,7 @@ describe("dynamic V2 fleet scale", () => {
       const cookieFile = path.join(root, "cookies.json");
       const configuredIds = Array.from({ length: size }, (_, index) => id(index + 1));
       const config = resolveMultiSandboxConfig({
+        GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
         PRISM_COOKIE_FILE: cookieFile,
         PRISM_PROJECT_IDS: configuredIds.join(","),
         GP_PRISM_SESSION: "authenticated",

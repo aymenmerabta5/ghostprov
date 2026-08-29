@@ -8,6 +8,12 @@ const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
 const gitignore = fs.readFileSync(path.join(root, ".gitignore"), "utf8");
 const agentsGuide = fs.readFileSync(path.join(root, "AGENTS.md"), "utf8");
 const claudeGuide = fs.readFileSync(path.join(root, "CLAUDE.md"), "utf8");
+const protectedPortGuard = fs.readFileSync(path.join(
+  root,
+  ".claude",
+  "guard-port-18787.ps1",
+), "utf8");
+const scriptsTsconfig = fs.readFileSync(path.join(root, "tsconfig.scripts.json"), "utf8");
 const historicalContinuationDocs = ["plans", "specs"].flatMap(section => (
   fs.readdirSync(path.join(root, "docs", "superpowers", section))
     .filter(name => name.endsWith(".md"))
@@ -52,8 +58,11 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912`");
     expect(readme).toContain("| WebSocket active responses | `16`");
     expect(readme).toContain("| WebSocket named lanes | `32`");
-    expect(readme).toContain("| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040`");
-    expect(readme).toContain("| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192`");
+    expect(readme).toContain("| Image edit aggregate raw input | `41943040`");
+    expect(readme).toContain("| Image edit HTTP request body | `67108864`");
+    expect(readme).toContain("not an environment setting");
+    expect(readme).not.toContain("GP_IMAGE_EDIT_MAX_INPUT_BYTES");
+    expect(readme).not.toContain("GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES");
     expect(readme).toContain("ghostprovV2Data");
     expect(readme).toContain("ghostprovV2Control");
     expect(readme).toContain("128 KiB");
@@ -68,7 +77,11 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r8");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
-    expect(envExample).toContain("GHOSTPROV_API_KEY=GHOST_IS_KING");
+    expect(envExample).toContain("PORT=18888");
+    expect(envExample.split(/\r?\n/)).toContain("GHOSTPROV_API_KEY=");
+    expect(envExample).not.toContain("GHOST_IS_KING");
+    expect(readme).toContain("RandomNumberGenerator]::Create()");
+    expect(readme).toContain("$rng.GetBytes($keyBytes)");
   });
 
   it("documents the Images compatibility surface and honest capability boundaries", () => {
@@ -87,7 +100,7 @@ describe("project documentation", () => {
       "POST /v1/messages?beta=true",
       "POST /v1/messages/count_tokens?beta=true",
       "ANTHROPIC_BASE_URL=http://127.0.0.1:18787",
-      "ANTHROPIC_API_KEY=GHOST_IS_KING",
+      "ANTHROPIC_API_KEY=<GHOSTPROV_API_KEY>",
       "GHOSTPROV_API_KEY",
       "must not end in `/v1`",
       "Opus → `gpt-5.6-sol`",
@@ -103,9 +116,9 @@ describe("project documentation", () => {
       "bun run verify:claude-code",
       "127.0.0.1:18788",
     ]) expect(readme).toContain(value);
-    expect(envExample).toContain("GHOSTPROV_API_KEY=GHOST_IS_KING");
+    expect(envExample.split(/\r?\n/)).toContain("GHOSTPROV_API_KEY=");
     expect(envExample).toContain("GP_CLAUDE_VERIFY_PORT=18788");
-    expect(envExample).toContain("GP_CLAUDE_VERIFY_UPSTREAM=http://127.0.0.1:18787");
+    expect(envExample).toContain("GP_CLAUDE_VERIFY_UPSTREAM=http://127.0.0.1:18888");
     expect(pkg.scripts["verify:claude-code"]).toBe("bun scripts/verify_claude_code.ts");
   });
 
@@ -117,7 +130,7 @@ describe("project documentation", () => {
       secondTerminal,
     );
     const verifierKey = readme.indexOf(
-      '$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"',
+      '$env:ANTHROPIC_API_KEY = Read-Host "Enter the same explicit GHOSTPROV_API_KEY"',
       verifierBase,
     );
     const verifierClaude = readme.indexOf("claude", verifierKey);
@@ -174,18 +187,20 @@ describe("project documentation", () => {
   });
 
   it("provides stable verification scripts", () => {
-    const unitScript = String(pkg.scripts["test:unit"]);
-    const integrationScript = String(pkg.scripts["test:integration"]);
+    const unitScript = String(pkg.scripts["test:focused:unit"]);
+    const integrationScript = String(pkg.scripts["test:focused:integration"]);
     expect(pkg.packageManager).toBe("bun@1.4.0");
     expect(pkg.engines.bun).toBe("^1.4.0");
     expect(pkg.devDependencies.typescript).toBe("7.0.2");
     expect(pkg.devDependencies["@types/bun"]).toBe("1.4.0");
     expect(pkg.devDependencies).not.toHaveProperty("vitest");
     expect(pkg.scripts).toMatchObject({
-      test: "bun test --isolate",
-      typecheck: "tsc --noEmit",
-      "test:unit": expect.any(String),
-      "test:integration": expect.any(String),
+      test: "bun --no-env-file test --isolate",
+      typecheck: "bun --no-env-file x --no-install tsc --noEmit",
+      "test:unit": "bun --no-env-file test --isolate",
+      "test:integration": "bun --no-env-file test --isolate",
+      "test:focused:unit": expect.any(String),
+      "test:focused:integration": expect.any(String),
       "verify:live": expect.any(String),
       "verify:browserless": expect.any(String),
       "verify:multi-sandbox": expect.any(String),
@@ -197,9 +212,10 @@ describe("project documentation", () => {
       "monitor:v2": "bun scripts/monitor_v2.ts",
       "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
       "build:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts --write",
-      "check:v2-sidecar-release": "bun scripts/build_v2_sidecar_release.ts",
-      "check:v2-sidecar-deno": "bunx deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r8/sidecar.bundle.js",
-      "test:v2-deno-fs": "bunx deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
+      "check:v2-sidecar-release": "bun --no-env-file scripts/build_v2_sidecar_release.ts",
+      "check:v2-sidecar-deno": "bun --no-env-file x --no-install deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r8/sidecar.bundle.js",
+      "test:v2-deno-fs": "bun --no-env-file x --no-install deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
+      "check:v2-sidecar": "bun run check:v2-sidecar-release && bun run check:v2-sidecar-deno && bun run test:v2-deno-upstream && bun run test:v2-deno-fs",
     });
     expect(pkg.scripts).not.toHaveProperty("test:daemon");
     expect(pkg.dependencies).not.toHaveProperty("playwright");
@@ -227,6 +243,67 @@ describe("project documentation", () => {
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_single.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_fleet.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "smoke_v2_candidate.ts"))).toBe(true);
+    expect(JSON.parse(scriptsTsconfig)).toMatchObject({
+      extends: "./tsconfig.json",
+      compilerOptions: { noEmit: true },
+      include: ["scripts/**/*.ts"],
+    });
+    expect(readme).toContain(
+      "bun --no-env-file node_modules/typescript/bin/tsc --project tsconfig.scripts.json",
+    );
+  });
+
+  it("keeps repository-local safety policy portable and fail-closed", () => {
+    const ignored = gitignore.split(/\r?\n/);
+    expect(ignored).toContain(".claude/settings.local.json");
+    expect(ignored).toContain(".claude/worktrees/");
+    expect(protectedPortGuard).not.toContain("20952");
+    expect(protectedPortGuard).not.toMatch(/codex-live|Stop-Process|taskkill/i);
+    expect(protectedPortGuard).not.toContain("18888/(?:health|__sandboxes)");
+    expect(protectedPortGuard).toContain("check:v2-sidecar");
+    expect(protectedPortGuard).toContain("tsconfig\\.scripts\\.json");
+
+    for (const obsolete of [
+      "dump_doc_files.ts",
+      "probe_deep.ts",
+      "probe_deep2.ts",
+      "probe_doc_structure.ts",
+      "probe_ws.ts",
+      "probe_ws_provider.ts",
+      "probe_ws_sync.ts",
+      "probe_ydoc.ts",
+      "render_probe.ts",
+      "setup_rendered.ts",
+      "touch_main.ts",
+    ]) {
+      expect(fs.existsSync(path.join(root, "scripts", obsolete)), obsolete).toBe(false);
+    }
+  });
+
+  it("documents explicit authentication and isolated candidate ports", () => {
+    expect(readme).toContain("there is no shared development-key fallback");
+    expect(readme).toContain(
+      "`GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential",
+    );
+    expect(readme).toContain("bearer-authenticated `GET /__supervisor`");
+    expect(readme).toContain("| `PORT` in candidate mode | `18888`");
+    expect(readme).toContain("refuses protected port `18787`");
+    expect(readme).not.toContain("port 8787 health");
+    expect(readme).not.toContain("service on 8787");
+    expect(readme).not.toContain("GHOST_IS_KING");
+    expect(envExample).toContain("GP_V2_DIAGNOSTIC_ROOT=http://127.0.0.1:18888");
+  });
+
+  it("documents anonymous-session flags with their actual scope", () => {
+    expect(readme).toContain("Explicit guest mode uses `GP_PRISM_SESSION=anonymous`");
+    expect(readme).toContain(
+      "`GP_ALLOW_ANONYMOUS=1` only permits `GP_PRISM_SESSION=auto`",
+    );
+    expect(envExample).toContain("GP_PRISM_SESSION=authenticated");
+    expect(envExample).toContain("GP_ALLOW_ANONYMOUS=0");
+    expect(envExample).toContain("GP_GUEST_MAX_PROJECTS=1");
+    expect(envExample).toContain("GP_AUTO_CREATE_PROJECTS=0");
+    expect(envExample).toContain("GP_PROJECT_REUSE=explicit");
   });
 
   it("documents privacy-safe performance tracing and its diagnosis order", () => {

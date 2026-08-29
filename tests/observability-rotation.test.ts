@@ -21,6 +21,7 @@ describe("RotatingJsonlSink", () => {
       rotateBytes: 180,
       retainFiles: 2,
       pid: 123,
+      isProcessAlive: () => false,
       now: (() => {
         let value = Date.UTC(2026, 7, 22);
         return () => value += 1_000;
@@ -34,12 +35,30 @@ describe("RotatingJsonlSink", () => {
 
     const names = await readdir(directory);
     const rotated = names.filter(name => /^ghostprov-v2\.\d{8}T\d{9}Z\.123\.\d+\.jsonl$/.test(name));
-    expect(rotated).toHaveLength(2);
+    expect(rotated).toHaveLength(1);
     expect(names).toContain("unrelated.jsonl");
     expect(names).toContain("ghostprov-v2.current.123.jsonl");
+    expect(names.filter(name => name.startsWith("ghostprov-v2")).length).toBe(2);
     for (const name of [...rotated, "ghostprov-v2.current.123.jsonl"]) {
       const text = await readFile(path.join(directory, name), "utf8");
       for (const line of text.trim().split("\n").filter(Boolean)) expect(() => JSON.parse(line)).not.toThrow();
     }
+  });
+
+  it("rejects a single record larger than the configured file ceiling", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-log-record-limit-"));
+    directories.push(directory);
+    const sink = new RotatingJsonlSink({
+      directory,
+      prefix: "ghostprov-v2",
+      rotateBytes: 64,
+      retainFiles: 1,
+      pid: 123,
+      isProcessAlive: () => false,
+    });
+    await expect(sink.writeBatch([`${"x".repeat(65)}\n`])).rejects.toThrow(
+      "record exceeds the rotation byte limit",
+    );
+    await sink.close();
   });
 });

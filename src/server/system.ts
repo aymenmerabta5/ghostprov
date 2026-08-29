@@ -48,9 +48,11 @@ import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session"
 import { createGhostProvApp } from "./app";
 import { ResponsesHttpContinuationIndex } from "../http/responses-continuation";
 import { AnthropicContinuationIndex } from "../anthropic/continuation";
+import { anthropicModelsFromEnv } from "../anthropic/model";
 import {
   createAuthenticatedTenantScope,
   isAuthenticatedTenantScope,
+  publicRequestAuthorityFailure,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
 import { createGhostProvServer } from "./runtime";
@@ -123,7 +125,7 @@ export interface BrowserlessFleetSampler {
 }
 
 export interface BrowserlessV2RevisionSelector {
-  preload(): Promise<void>;
+  preload(signal?: AbortSignal): Promise<void>;
   loadedForProject(projectId: ProjectId): {
     revision: string;
     assets: V2SidecarAssets;
@@ -268,6 +270,8 @@ export interface BrowserlessSystemDependencies {
   router?: MultiSandboxRouter;
   /** One opaque authority shared by every public continuation surface. */
   authorizationScope?: AuthenticatedTenantScope;
+  /** Additional explicit Host/Origin authorities shared by HTTP and WebSocket. */
+  allowedHosts?: readonly string[];
   /** Test seam for the app-scoped native Responses full-history index. */
   responsesContinuationIndex?: ResponsesHttpContinuationIndex;
   /** Test seam for the one app-scoped, bounded Claude continuation index. */
@@ -615,6 +619,26 @@ function closeServer(server: BrowserlessSystemServer): Promise<void> {
   });
 }
 
+function abortableStartup<T>(source: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return source;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => finish(() => reject(signal.reason));
+    signal.addEventListener("abort", onAbort, { once: true });
+    source.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+  });
+}
+
 async function settleServerClose(
   server: BrowserlessSystemServer,
   closing: Promise<void>,
@@ -659,7 +683,11 @@ async function settleServerClose(
 export async function createBrowserlessSystem(
   env: Record<string, string | undefined> = process.env,
   dependencies: BrowserlessSystemDependencies = {},
+  startupSignal?: AbortSignal,
 ): Promise<BrowserlessSystem> {
+  const allowedHosts = Object.freeze([...(dependencies.allowedHosts ?? [])]);
+  publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
+  startupSignal?.throwIfAborted();
   const machineProbe = dependencies.machineProbe ?? new SystemMachineProbe();
   const config = resolveMultiSandboxConfig(env, machineProbe.sample());
   const existingRouterScope = dependencies.router?.responseProvenanceAuthorizationScope();
@@ -686,7 +714,8 @@ export async function createBrowserlessSystem(
       }));
   // A selected release must be present and authentic before account/session,
   // server, fleet, or sandbox state is created. Never fall back to R1 here.
-  await revisionSelector.preload();
+  await abortableStartup(revisionSelector.preload(startupSignal), startupSignal);
+  startupSignal?.throwIfAborted();
   const observabilityConfig = resolveObservabilityConfig(env);
   const logger = dependencies.logger ?? createObservabilityLogger(observabilityConfig);
   const sessionManager = dependencies.sessionManager ?? await PrismSessionManager.create({
@@ -698,7 +727,9 @@ export async function createBrowserlessSystem(
   });
   let identity: ResolvedPrismIdentity;
   try {
-    identity = await sessionManager.resolve();
+    startupSignal?.throwIfAborted();
+    identity = await abortableStartup(sessionManager.resolve(startupSignal), startupSignal);
+    startupSignal?.throwIfAborted();
   } catch (error) {
     await sessionManager.close().catch(() => undefined);
     await logger.close().catch(() => undefined);
@@ -825,8 +856,10 @@ export async function createBrowserlessSystem(
     apiKey: config.apiKey,
     fleetSnapshot: () => fleet.snapshot(),
     authorizationScope,
+    allowedHosts,
     responsesContinuationIndex,
     anthropicContinuationIndex,
+    anthropicModels: anthropicModelsFromEnv(env),
   });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -837,12 +870,25 @@ export async function createBrowserlessSystem(
     webSocketTelemetry,
     webSocketProcessBudget: webSocketIngressMemory.budget,
     authorizationScope,
+    allowedHosts,
   }) as BrowserlessSystemServer;
   let reconciliation: Promise<unknown> | null = null;
   let starting: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
   let listenOperation: Promise<void> | null = null;
   const startupController = new AbortController();
+  const abortFromExternalStartup = () => startupController.abort(startupSignal?.reason);
+  let externalStartupLinked = false;
+  if (startupSignal?.aborted) abortFromExternalStartup();
+  else if (startupSignal) {
+    startupSignal.addEventListener("abort", abortFromExternalStartup, { once: true });
+    externalStartupLinked = true;
+  }
+  const unlinkExternalStartup = () => {
+    if (!externalStartupLinked || !startupSignal) return;
+    externalStartupLinked = false;
+    startupSignal.removeEventListener("abort", abortFromExternalStartup);
+  };
 
   const listen = (): Promise<void> => {
     if (server.listening) return Promise.resolve();
@@ -949,6 +995,7 @@ export async function createBrowserlessSystem(
             pid: process.pid,
             release: summarizeV2Releases(snapshot.runtimes) as unknown as JsonValue,
           }), "terminal");
+          unlinkExternalStartup();
         } catch (error) {
           if (!closing) await system.close().catch(() => undefined);
           throw error;
@@ -959,6 +1006,7 @@ export async function createBrowserlessSystem(
     close() {
       if (closing) return closing;
       closing = (async () => {
+        unlinkExternalStartup();
         startupController.abort();
         const shutdownDeadlineMs = Date.now() + config.shutdownDrainMs;
         const before = router.snapshot();

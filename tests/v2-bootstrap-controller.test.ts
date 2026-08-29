@@ -52,6 +52,10 @@ const RELEASE_ASSETS = Object.freeze([
 ]);
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
+const INITIAL_R2_RETIREMENT_IDENTITY = Object.freeze({
+  buildHash: "21457e48716e99e82d48521ca43c60335ffd9933f4e1e258e252709c9525da6a",
+  schemaHash: "6c5d2c5cf60e0338d9d907f20636a0b3a6c40abca3bbc806fb59d0518a0af5bd",
+});
 const TOKEN = `ysweet-plaintext-canary-${"x".repeat(48)}`;
 
 type Fault =
@@ -111,6 +115,24 @@ class FakeYDoc implements V2BootstrapYDoc {
     const existed = this.files.has(path);
     this.files.delete(path);
     return existed;
+  }
+  async compareAndMutatePaths(input: Parameters<V2BootstrapYDoc["compareAndMutatePaths"]>[0]) {
+    if (input.guards.some(guard => (this.files.get(guard.path) ?? null) !== guard.equals)) {
+      return false;
+    }
+    const callbacks: Array<{ path: string; content: string }> = [];
+    for (const mutation of input.mutations) {
+      if (mutation.kind === "write") {
+        this.files.set(mutation.path, mutation.content);
+        this.writes.push({ path: mutation.path, content: mutation.content });
+        callbacks.push({ path: mutation.path, content: mutation.content });
+      } else {
+        this.deleted.push(mutation.path);
+        this.files.delete(mutation.path);
+      }
+    }
+    for (const mutation of callbacks) await this.onWrite?.(mutation.path, mutation.content);
+    return true;
   }
   async renderSyncState() {
     return {
@@ -174,6 +196,15 @@ class FakeGateway implements V2BootstrapGateway {
     this.renders++;
     this.mainDocuments.push(request?.mainDocument ?? "");
     this.launchers.push(this.ydoc.files.get(".latexmkrc") ?? "");
+    const retirementLauncher = this.launchers.at(-1)!;
+    if (retirementLauncher.includes("GhostProv V2 sidecar termination launcher")) {
+      const retirementNonce = /my \$gp_retirement_nonce = '([^']+)'/.exec(
+        retirementLauncher,
+      )?.[1];
+      if (!retirementNonce) throw new Error("termination launcher omitted its proof nonce");
+      this.logs = `render starting\nGPV2_RETIRED ${retirementNonce}\n) render continues\n`;
+      return;
+    }
     if (this.fault === "replaced-binding") {
       this.ydoc.files.set(".ghostprov-v2/static.json", "foreign-generation");
       this.logs = "render accepted without a bootstrap marker";
@@ -468,6 +499,10 @@ describe("V2BootstrapController", () => {
     const r9Entrypoint = `/workspace/.ghostprov-v2/revisions/r9/${R8_ASSETS.schemaHash}/${R8_ASSETS.buildHash}/sidecar.bundle.js`;
     expect(allReleases.regex.test(r9Entrypoint)).toBe(false);
     expect(r2Releases.regex.test(r9Entrypoint)).toBe(false);
+
+    const initialR2Entrypoint = `/workspace/.ghostprov-v2/revisions/r2/${INITIAL_R2_RETIREMENT_IDENTITY.schemaHash}/${INITIAL_R2_RETIREMENT_IDENTITY.buildHash}/sidecar.bundle.js`;
+    expect(allReleases.regex.test(initialR2Entrypoint)).toBe(true);
+    expect(r2Releases.regex.test(initialR2Entrypoint)).toBe(true);
   });
 
   it("rejects an unregistered sidecar revision before generating a launcher", () => {
@@ -607,8 +642,11 @@ describe("V2BootstrapController", () => {
     expect(harness.ydoc.writes.some(write => write.path === ".latexmkrc")).toBe(true);
     expect(harness.ydoc.writes.some(write => write.path.endsWith("/.latexmkrc"))).toBe(false);
     expect(harness.ydoc.files.get("main.tex")).not.toBe("legacy V1 document\n");
-    expect(harness.ydoc.files.get("main.tex"))
-      .toContain(`\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`);
+    expect(harness.ydoc.writes.some(write => (
+      write.path === "main.tex" &&
+      write.content.includes(`\\InputIfFileExists{.ghostprov-v2/bootstrap-output.${nonce}.tex}{}{}`)
+    ))).toBe(true);
+    expect(harness.ydoc.files.get("main.tex")).toContain("launcher inactive");
   });
 
   it("publishes the bootstrap hello and bounded child diagnostics through the TeX log", async () => {
@@ -1038,6 +1076,8 @@ describe("V2BootstrapController", () => {
     expect(harness.awareness.published.some(envelope => (
       envelope.frames.some(frame => frame.kind === "drain" && frame.reason === "test shutdown")
     ))).toBe(true);
+    expect(harness.gateway.launchers.at(-1)).toContain("sidecar termination launcher");
+    expect(harness.gateway.logs).toContain("GPV2_RETIRED");
     expect(harness.awareness.clears).toBe(1);
   });
 
@@ -1054,14 +1094,18 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.launchers[1]).toContain("sidecar termination launcher");
     expect(harness.gateway.launchers[1]).toContain("/tmp/ghostprov-v2/sidecar.pid");
     expect(harness.gateway.launchers[1]).toContain(
-      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000001'",
+      "'00000000-0000-4000-8000-000000000001'",
     );
+    expect(harness.gateway.launchers[1]).toContain("%gp_expected_nonces");
+    expect(harness.gateway.launchers[1]).toContain("gp_stop_if_current($gp_owner_file");
     expect(harness.gateway.launchers[1]).toContain(
-      "$gp_nonces[0] eq $gp_expected_nonce",
+      "$gp_expected, $gp_static_path, $gp_expected_static",
     );
-    expect(harness.gateway.launchers[1]).toContain(
-      "gp_owner_record_is_locked($gp_owner_file, $gp_owner_record)",
-    );
+    expect(harness.gateway.launchers[1]).toContain("GPV2_RETIRED");
+    expect(harness.gateway.launchers[1]).toContain("$gp_expected_static");
+    expect(harness.gateway.launchers[1]).toContain("bootstrap-settled.$gp_nonce");
+    expect(harness.gateway.launchers[1]).toContain("gp_group_alive($gp_group)");
+    expect(harness.gateway.logs).toContain("GPV2_RETIRED");
     expect(harness.gateway.launchers[1]).toContain(
       "flock($gp_owner_fh, LOCK_EX | LOCK_NB)",
     );
@@ -1070,6 +1114,226 @@ describe("V2BootstrapController", () => {
       .toContain("GhostProv V2 launcher inactive");
     expect(harness.awareness.clears).toBe(1);
     await expect(harness.controller.ensureReady()).rejects.toThrow("retired");
+  });
+
+  it("does not report forced retirement from async render acceptance without fresh death proof", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    const startedAt = harness.clock.now();
+    harness.gateway.triggerRender = async request => {
+      harness.gateway.calls.push("render");
+      harness.gateway.renders++;
+      harness.gateway.mainDocuments.push(request?.mainDocument ?? "");
+      harness.gateway.launchers.push(harness.ydoc.files.get(".latexmkrc") ?? "");
+      // A conforming async render request may be accepted and then never run.
+    };
+
+    await expect(harness.controller.forceStop("lost async render"))
+      .rejects.toThrow(/retirement proof|terminate/i);
+    expect(harness.clock.now() - startedAt).toBeGreaterThanOrEqual(20);
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+  });
+
+  it("rejects a stale retirement marker instead of treating marker presence as proof", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    harness.gateway.triggerRender = async request => {
+      harness.gateway.calls.push("render");
+      harness.gateway.renders++;
+      harness.gateway.mainDocuments.push(request?.mainDocument ?? "");
+      harness.gateway.launchers.push(harness.ydoc.files.get(".latexmkrc") ?? "");
+      harness.gateway.logs = "render starting\nGPV2_RETIRED stale-retirement-token\n)\n";
+    };
+
+    await expect(harness.controller.forceStop("stale marker"))
+      .rejects.toThrow("retirement proof");
+  });
+
+  it("does not let detached retirement cleanup overwrite a newer bootstrap generation", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    let releaseTermination!: () => void;
+    const terminationGate = new Promise<void>(resolve => { releaseTermination = resolve; });
+    let retirementStarted!: () => void;
+    const started = new Promise<void>(resolve => { retirementStarted = resolve; });
+    harness.gateway.triggerRender = async () => {
+      retirementStarted();
+      await terminationGate;
+      throw new Error("late retirement render failed");
+    };
+    const reason = new DOMException("shutdown deadline expired", "TimeoutError");
+    const retiring = harness.controller.forceStop(
+      "expired shutdown",
+      AbortSignal.abort(reason),
+    );
+    await expect(retiring).rejects.toBe(reason);
+    await started;
+
+    harness.ydoc.files.set(".ghostprov-v2/static.json", "NEW_GENERATION_STATIC");
+    harness.ydoc.files.set(".ghostprov-v2/bootstrap.enc.json", "NEW_GENERATION_CIPHERTEXT");
+    harness.ydoc.files.set(".latexmkrc", "NEW_GENERATION_LAUNCHER");
+    releaseTermination();
+    await Bun.sleep(10);
+
+    expect(harness.ydoc.files.get(".ghostprov-v2/static.json"))
+      .toBe("NEW_GENERATION_STATIC");
+    expect(harness.ydoc.files.get(".ghostprov-v2/bootstrap.enc.json"))
+      .toBe("NEW_GENERATION_CIPHERTEXT");
+    expect(harness.ydoc.files.get(".latexmkrc")).toBe("NEW_GENERATION_LAUNCHER");
+  });
+
+  it("serializes two controllers and makes superseded cleanup leave the new owner intact", async () => {
+    const old = bootstrapHarness();
+    await old.controller.ensureReady();
+    old.gateway.triggerRender = async request => {
+      old.gateway.calls.push("render");
+      old.gateway.renders++;
+      old.gateway.mainDocuments.push(request?.mainDocument ?? "");
+      old.gateway.launchers.push(old.ydoc.files.get(".latexmkrc") ?? "");
+    };
+    let releaseOldPoll!: () => void;
+    const oldPollGate = new Promise<void>(resolve => { releaseOldPoll = resolve; });
+    let oldPollStarted!: () => void;
+    const oldPolling = new Promise<void>(resolve => { oldPollStarted = resolve; });
+    old.gateway.fetchText = async () => {
+      oldPollStarted();
+      await oldPollGate;
+      return { status: 200, text: "", headers: new Headers() };
+    };
+    const reason = new DOMException("old deadline", "TimeoutError");
+    await expect(old.controller.forceStop("old generation", AbortSignal.abort(reason)))
+      .rejects.toBe(reason);
+    await oldPolling;
+
+    const nextAwareness = new FakeAwareness();
+    const nextGateway = new FakeGateway(old.ydoc, "timeout");
+    let releaseNextRender!: () => void;
+    const nextRenderGate = new Promise<void>(resolve => { releaseNextRender = resolve; });
+    let nextRenderStarted!: () => void;
+    const nextRendering = new Promise<void>(resolve => { nextRenderStarted = resolve; });
+    nextGateway.triggerRender = async request => {
+      nextGateway.calls.push("render");
+      nextGateway.renders++;
+      nextGateway.mainDocuments.push(request?.mainDocument ?? "");
+      nextGateway.launchers.push(old.ydoc.files.get(".latexmkrc") ?? "");
+      nextRenderStarted();
+      await nextRenderGate;
+    };
+    let releaseNextFetch!: () => void;
+    const nextFetchGate = new Promise<void>(resolve => { releaseNextFetch = resolve; });
+    let nextFetchStarted!: () => void;
+    const nextFetching = new Promise<void>(resolve => { nextFetchStarted = resolve; });
+    let firstNextFetch = true;
+    nextGateway.fetchText = async () => {
+      if (firstNextFetch) {
+        firstNextFetch = false;
+        nextFetchStarted();
+        await nextFetchGate;
+      }
+      return { status: 200, text: "", headers: new Headers() };
+    };
+    old.ydoc.onWrite = undefined;
+    const next = new V2BootstrapController({
+      projectId: PROJECT,
+      workerIndex: 7,
+      sandboxSessionId: "sandbox-session-2",
+      leaderGeneration: 5,
+      ySweet: old.ySweet,
+      ydoc: old.ydoc,
+      gateway: nextGateway,
+      awareness: nextAwareness,
+      assets: ASSETS,
+      attempts: 1,
+      timeoutMs: 20,
+      pollMs: 5,
+      clock: new FakeClock(),
+      random: new FakeRandom(),
+      initialActivePerSandbox: 4,
+      maxActivePerSandbox: 8,
+    });
+    const nextEnsuring = next.ensureReady();
+    await nextRendering;
+    const nextStatic = old.ydoc.files.get(".ghostprov-v2/static.json");
+    const nextLauncher = old.ydoc.files.get(".latexmkrc");
+    old.ydoc.files.set(".ghostprov-v2/bootstrap.enc.json", "NEXT_CIPHERTEXT");
+
+    releaseOldPoll();
+    releaseNextRender();
+    await nextFetching;
+    for (let turn = 0; turn < 50 && old.awareness.clears < 1; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(old.awareness.clears).toBe(1);
+    expect(old.ydoc.files.get(".ghostprov-v2/static.json")).toBe(nextStatic);
+    expect(old.ydoc.files.get(".latexmkrc")).toBe(nextLauncher);
+    expect(old.ydoc.files.get(".ghostprov-v2/bootstrap.enc.json")).toBe("NEXT_CIPHERTEXT");
+
+    releaseNextFetch();
+    await expect(nextEnsuring).rejects.toBeInstanceOf(V2BootstrapError);
+  });
+
+  it("does not let a released old controller reclaim authority from its replacement", async () => {
+    const old = bootstrapHarness();
+    await old.controller.ensureReady();
+    const oldCurrent = old.gateway.current!;
+    old.awareness.onPublish = envelope => {
+      const drain = envelope.frames.find(frame => frame.kind === "drain");
+      if (!drain) return;
+      old.awareness.sidecar({
+        ...readyEnvelope(oldCurrent.binding, oldCurrent.instanceId, "none"),
+        revision: 2,
+        ack: { epoch: envelope.epoch, sequence: drain.sequence },
+        credits: 0,
+        draining: true,
+        frames: [{
+          kind: "drained",
+          active: 0,
+          queued: 0,
+          epoch: 1,
+          sequence: 0,
+        }],
+      });
+    };
+    await old.controller.drainAndStop("old generation retired");
+
+    const nextAwareness = new FakeAwareness();
+    const nextGateway = new FakeGateway(old.ydoc, "none");
+    old.ydoc.onWrite = async (path, content) => {
+      if (path === ".latexmkrc" && content.includes("temporary bootstrap launcher")) {
+        nextGateway.awaitingReadiness = false;
+        return;
+      }
+      if (path !== ".ghostprov-v2/bootstrap.enc.json") return;
+      const current = nextGateway.current!;
+      nextAwareness.sidecar(readyEnvelope(current.binding, current.instanceId, "none"));
+    };
+    const next = new V2BootstrapController({
+      projectId: PROJECT,
+      workerIndex: 7,
+      sandboxSessionId: "sandbox-session-2",
+      leaderGeneration: 5,
+      ySweet: old.ySweet,
+      ydoc: old.ydoc,
+      gateway: nextGateway,
+      awareness: nextAwareness,
+      assets: ASSETS,
+      attempts: 1,
+      timeoutMs: 20,
+      pollMs: 5,
+      clock: new FakeClock(),
+      random: new FakeRandom(),
+      initialActivePerSandbox: 4,
+      maxActivePerSandbox: 8,
+    });
+    await next.ensureReady();
+    const nextStatic = old.ydoc.files.get(".ghostprov-v2/static.json");
+
+    await expect(old.controller.forceStop("stale old force")).resolves.toBeUndefined();
+    expect(old.ydoc.files.get(".ghostprov-v2/static.json")).toBe(nextStatic);
+    await expect(next.forceStop("new owner retirement")).resolves.toBeUndefined();
+    expect(nextGateway.logs).toContain("GPV2_RETIRED");
   });
 
   it("observes physical retirement after its caller deadline already expired", async () => {
@@ -1093,7 +1357,7 @@ describe("V2BootstrapController", () => {
     expect(harness.awareness.clears).toBe(1);
   });
 
-  it("binds forced termination to the successful retry rather than a stale attempt", async () => {
+  it("retains every possibly launched retry nonce for forced termination", async () => {
     const harness = bootstrapHarness("first-wrong-nonce");
     await harness.controller.ensureReady();
 
@@ -1105,11 +1369,57 @@ describe("V2BootstrapController", () => {
       "00000000-0000-4000-8000-000000000002",
     ]);
     expect(termination).toContain(
-      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000002'",
+      "'00000000-0000-4000-8000-000000000002'",
     );
-    expect(termination).not.toContain(
-      "my $gp_expected_nonce = '00000000-0000-4000-8000-000000000001'",
+    expect(termination).toContain(
+      "'00000000-0000-4000-8000-000000000001'",
     );
+  });
+
+  it("retains an earlier launch when a later attempt fails before render", async () => {
+    const harness = bootstrapHarness(
+      "first-wrong-nonce",
+      undefined,
+      8,
+      ASSETS,
+      { attempts: 2 },
+    );
+    const originalWrite = harness.ydoc.onWrite;
+    let stagedLaunchers = 0;
+    harness.ydoc.onWrite = async (path, content) => {
+      if (path === ".latexmkrc" && content.includes("temporary bootstrap launcher")) {
+        stagedLaunchers++;
+        if (stagedLaunchers === 2) throw new Error("second attempt failed before render");
+      }
+      await originalWrite?.(path, content);
+    };
+
+    await expect(harness.controller.ensureReady()).rejects.toThrow("stage V2 bootstrap");
+    expect(harness.gateway.nonces).toEqual([
+      "00000000-0000-4000-8000-000000000001",
+    ]);
+
+    await expect(harness.controller.forceStop("retire every attempt")).resolves.toBeUndefined();
+    const termination = harness.gateway.launchers.at(-1)!;
+    expect(termination).toContain("'00000000-0000-4000-8000-000000000001'");
+    expect(termination).toContain("'00000000-0000-4000-8000-000000000002'");
+  });
+
+  it("bounds and retires launch identities across repeated ensure calls", async () => {
+    const harness = bootstrapHarness("timeout", undefined, 8, ASSETS, { attempts: 1 });
+    for (let call = 0; call < 4; call++) {
+      await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
+    }
+
+    await expect(harness.controller.forceStop("repeated ensure cleanup"))
+      .resolves.toBeUndefined();
+    const termination = harness.gateway.launchers.at(-1)!;
+    for (let nonce = 1; nonce <= 4; nonce++) {
+      expect(termination).toContain(
+        `'00000000-0000-4000-8000-${String(nonce).padStart(12, "0")}'`,
+      );
+    }
+    expect(termination).toContain("$gp_attempt_claim_count < $gp_attempt_claim_limit");
   });
 
   it("retires before launch without triggering a render", async () => {
@@ -1118,8 +1428,7 @@ describe("V2BootstrapController", () => {
     await expect(harness.controller.forceStop("never launched")).resolves.toBeUndefined();
 
     expect(harness.gateway.renders).toBe(0);
-    expect(harness.ydoc.files.get(".latexmkrc"))
-      .toContain("GhostProv V2 launcher inactive");
+    expect(harness.ydoc.files.get(".latexmkrc")).toBeUndefined();
     expect(harness.awareness.clears).toBe(1);
   });
 

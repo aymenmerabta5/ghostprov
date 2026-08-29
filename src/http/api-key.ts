@@ -44,12 +44,21 @@ export function authenticatedTenantScopeHmac(
 }
 
 export type ApiKeySurface = "openai" | "anthropic";
-export const DEFAULT_GHOSTPROV_API_KEY = "GHOST_IS_KING";
+const MIN_GHOSTPROV_API_KEY_CHARACTERS = 32;
 
 export interface ApiKeyHeaders {
   authorization?: string | readonly string[] | null;
   xApiKey?: string | readonly string[] | null;
 }
+
+export interface PublicRequestAuthorityHeaders {
+  host?: string | readonly string[] | null;
+  forwardedHost?: string | readonly string[] | null;
+  origin?: string | readonly string[] | null;
+}
+
+export type PublicRequestAuthorityFailure = "host" | "origin";
+const EMPTY_ALLOWED_HOSTNAMES: ReadonlySet<string> = new Set();
 
 function singleHeader(value: string | readonly string[] | null | undefined): string | null {
   if (Array.isArray(value)) return value.length === 1 ? value[0] ?? null : null;
@@ -73,10 +82,18 @@ function digest(value: string): Buffer {
 }
 
 export function resolveGhostProvApiKey(value: string | undefined): string {
-  const apiKey = (value ?? DEFAULT_GHOSTPROV_API_KEY).trim();
-  if (!apiKey || apiKey.length > 4_096 || /[\u0000-\u001f\u007f]/.test(apiKey)) {
+  const apiKey = value?.trim() ?? "";
+  if (!apiKey) {
+    throw new TypeError("GHOSTPROV_API_KEY is required");
+  }
+  if (apiKey.length < MIN_GHOSTPROV_API_KEY_CHARACTERS) {
     throw new TypeError(
-      "GHOSTPROV_API_KEY must be a nonempty single-line value of at most 4096 characters",
+      `GHOSTPROV_API_KEY must contain at least ${MIN_GHOSTPROV_API_KEY_CHARACTERS} characters`,
+    );
+  }
+  if (apiKey.length > 4_096 || /[\s,\u0000-\u001f\u007f]/.test(apiKey)) {
+    throw new TypeError(
+      "GHOSTPROV_API_KEY must be a single-token value of at most 4096 characters",
     );
   }
   return apiKey;
@@ -102,4 +119,83 @@ export function apiKeyAuthorized(
 
 export function isProtectedApiPath(path: string): boolean {
   return path === "/v1" || path.startsWith("/v1/");
+}
+
+function normalizedHostname(value: string): string {
+  return value.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function loopbackHostname(value: string): boolean {
+  const hostname = normalizedHostname(value);
+  if (
+    hostname === "localhost" || hostname.endsWith(".localhost") ||
+    hostname === "::1"
+  ) {
+    return true;
+  }
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  return !!ipv4 && Number(ipv4[1]) === 127 &&
+    ipv4.slice(1).every(component => Number(component) <= 255);
+}
+
+function authorityHostname(value: string | readonly string[] | null | undefined): string | null {
+  const authority = singleHeader(value)?.trim();
+  if (!authority || /[/?#@]/.test(authority)) return null;
+  try {
+    const parsed = new URL(`http://${authority}`);
+    return parsed.username || parsed.password || parsed.pathname !== "/" ||
+        parsed.search || parsed.hash
+      ? null
+      : normalizedHostname(parsed.hostname);
+  } catch {
+    return null;
+  }
+}
+
+function allowedHostnames(values: readonly string[]): ReadonlySet<string> {
+  if (values.length === 0) return EMPTY_ALLOWED_HOSTNAMES;
+  const allowed = new Set<string>();
+  for (const value of values) {
+    const hostname = authorityHostname(value);
+    if (!hostname) throw new TypeError("Allowed public host is invalid");
+    allowed.add(hostname);
+  }
+  return allowed;
+}
+
+function hostnameAllowed(hostname: string | null, allowed: ReadonlySet<string>): boolean {
+  return hostname !== null && (loopbackHostname(hostname) || allowed.has(hostname));
+}
+
+/**
+ * Validates the HTTP authority before authentication or body admission. Missing
+ * Origin is expected for CLI clients; a browser Origin, when present, must be
+ * loopback or explicitly allowlisted just like Host.
+ */
+export function publicRequestAuthorityFailure(
+  headers: PublicRequestAuthorityHeaders,
+  additionalAllowedHosts: readonly string[] = [],
+): PublicRequestAuthorityFailure | null {
+  const allowed = allowedHostnames(additionalAllowedHosts);
+  if (!hostnameAllowed(authorityHostname(headers.host), allowed)) return "host";
+  if (
+    headers.forwardedHost !== undefined && headers.forwardedHost !== null &&
+    !hostnameAllowed(authorityHostname(headers.forwardedHost), allowed)
+  ) return "host";
+
+  if (headers.origin === undefined || headers.origin === null) return null;
+  const origin = singleHeader(headers.origin)?.trim();
+  if (!origin || origin === "null") return "origin";
+  try {
+    const parsed = new URL(origin);
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username || parsed.password || parsed.pathname !== "/" ||
+      parsed.search || parsed.hash ||
+      !hostnameAllowed(normalizedHostname(parsed.hostname), allowed)
+    ) return "origin";
+  } catch {
+    return "origin";
+  }
+  return null;
 }

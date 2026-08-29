@@ -8,7 +8,7 @@ import {
 import { createGhostProvApp, type RouterLike } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 
-const API_KEY = "GHOST_IS_KING";
+const API_KEY = "test-api-key-0123456789abcdef-0123456789";
 
 function router(): RouterLike {
   const authorizationScope = createAuthenticatedTenantScope();
@@ -28,7 +28,9 @@ function router(): RouterLike {
 
 describe("GhostProv inbound API-key authentication", () => {
   it("uses constant-size comparison and exact standard header forms", () => {
-    expect(resolveGhostProvApiKey(undefined)).toBe(API_KEY);
+    expect(() => resolveGhostProvApiKey(undefined)).toThrow("required");
+    expect(() => resolveGhostProvApiKey("short-key")).toThrow("at least 32");
+    expect(resolveGhostProvApiKey(API_KEY)).toBe(API_KEY);
     expect(apiKeyMatches(API_KEY, API_KEY)).toBe(true);
     expect(apiKeyMatches("wrong", API_KEY)).toBe(false);
     expect(apiKeyMatches(null, API_KEY)).toBe(false);
@@ -47,7 +49,10 @@ describe("GhostProv inbound API-key authentication", () => {
   it("protects every v1 route while leaving health telemetry available", async () => {
     const app = createGhostProvApp({ router: router(), apiKey: API_KEY });
     expect((await app.request("/health")).status).toBe(200);
-    expect((await app.request("/__sandboxes")).status).toBe(200);
+    expect((await app.request("/__sandboxes")).status).toBe(401);
+    expect((await app.request("/__sandboxes", {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    })).status).toBe(200);
 
     const openAiAttempts: Array<Record<string, string> | undefined> = [
       undefined,

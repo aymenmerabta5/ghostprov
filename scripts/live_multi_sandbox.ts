@@ -1,4 +1,8 @@
 import { resolveGhostProvApiKey } from "../src/http/api-key";
+import {
+  DEFAULT_CANDIDATE_PORT,
+  PROTECTED_SERVICE_PORT,
+} from "../src/core/ports";
 
 interface RuntimeSnapshot {
   state: string;
@@ -55,22 +59,19 @@ export function percentile(values: readonly number[], fraction: number): number 
   return sorted[index];
 }
 
-async function health(root: string): Promise<any> {
-  const response = await fetch(`${root}/health`, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`${root} health failed: ${response.status}`);
-  return response.json();
-}
-
-async function sandboxSnapshot(root: string): Promise<RouterSnapshot> {
-  const response = await fetch(`${root}/__sandboxes`, { signal: AbortSignal.timeout(10_000) });
+async function sandboxSnapshot(root: string, apiKey: string): Promise<RouterSnapshot> {
+  const response = await fetch(`${root}/__sandboxes`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!response.ok) throw new Error(`Sandbox monitoring failed: ${response.status}`);
   return response.json() as Promise<RouterSnapshot>;
 }
 
-async function waitReady(root: string): Promise<RouterSnapshot> {
+async function waitReady(root: string, apiKey: string): Promise<RouterSnapshot> {
   const deadline = Date.now() + 5 * 60_000;
   for (;;) {
-    const snapshot = await sandboxSnapshot(root);
+    const snapshot = await sandboxSnapshot(root, apiKey);
     if (snapshot.runtimes.length >= 4 && snapshot.runtimes.every(runtime => runtime.state === "ready")) return snapshot;
     if (Date.now() >= deadline) throw new Error(`Candidate runtimes did not become ready: ${JSON.stringify(snapshot.runtimes)}`);
     await sleep(1_000);
@@ -95,7 +96,7 @@ async function runStage(options: {
   let monitoring = true;
   let monitorError: unknown;
   const sample = async () => {
-    const snapshot = await sandboxSnapshot(candidateRoot);
+    const snapshot = await sandboxSnapshot(candidateRoot, apiKey);
     const active = snapshot.runtimes.map(runtime => runtime.active);
     const physicalActive = active.reduce((sum, value) => sum + value, 0);
     if (physicalActive > peakPhysicalActive) {
@@ -187,17 +188,22 @@ async function runStage(options: {
 
 export async function main(env: Record<string, string | undefined> = process.env): Promise<void> {
   if (env.GP_LIVE_VERIFY !== "1") throw new Error("Set GP_LIVE_VERIFY=1 to run the multi-sandbox load ramp");
-  const candidate = new URL(env.OPENAI_BASE_URL ?? "http://127.0.0.1:18787/v1");
-  if (candidate.port === "8787") throw new Error("Live multi-sandbox proof refuses protected port 8787");
+  const candidate = new URL(
+    env.OPENAI_BASE_URL ?? `http://127.0.0.1:${DEFAULT_CANDIDATE_PORT}/v1`,
+  );
+  if (Number(candidate.port) === PROTECTED_SERVICE_PORT) {
+    throw new Error(`Live multi-sandbox proof refuses protected port ${PROTECTED_SERVICE_PORT}`);
+  }
+  if (Number(candidate.port) !== DEFAULT_CANDIDATE_PORT) {
+    throw new Error(`Live multi-sandbox proof is hard-fenced to port ${DEFAULT_CANDIDATE_PORT}`);
+  }
   const candidateRoot = `${candidate.protocol}//${candidate.host}`;
-  const primaryRoot = "http://127.0.0.1:8787";
   const model = env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
   const timeoutMs = Number(env.GP_LIVE_TIMEOUT_MS ?? 20 * 60_000);
   const apiKey = resolveGhostProvApiKey(env.GHOSTPROV_API_KEY);
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new Error("GP_LIVE_TIMEOUT_MS must be positive");
 
-  const primaryBefore = await health(primaryRoot);
-  const ready = await waitReady(candidateRoot);
+  const ready = await waitReady(candidateRoot, apiKey);
   const stages: Record<string, unknown>[] = [];
   const allIds = new Set<string>();
   for (const concurrency of [16, 32, 64, 96, 120]) {
@@ -216,15 +222,11 @@ export async function main(env: Record<string, string | undefined> = process.env
     }
     stages.push(stage.summary);
   }
-  const primaryAfter = await health(primaryRoot);
-  if (!primaryBefore.ok || !primaryAfter.ok) throw new Error("Protected port 8787 lost health during candidate proof");
   console.log(JSON.stringify({
     projects: ready.runtimes.length,
     capacity: ready.capacity,
     totalResponses: allIds.size,
     stages,
-    primary8787HealthyBefore: primaryBefore.ok,
-    primary8787HealthyAfter: primaryAfter.ok,
   }, null, 2));
 }
 

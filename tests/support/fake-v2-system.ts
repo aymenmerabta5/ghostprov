@@ -116,16 +116,33 @@ export class FakeScaleUpstream {
             arguments: JSON.stringify({ value: "V2_TOOL_OK" }),
           }]
           : [{
+            id: `msg_${this.runtimeIndex}_${call}`,
             type: "message",
             role: "assistant",
             status: "completed",
-            content: [{ type: "output_text", text: String(body.input ?? "") }],
+            content: [{
+              type: "output_text",
+              text: String(body.input ?? ""),
+              annotations: [],
+              logprobs: [],
+            }],
           }];
       const final = {
         ...this.finalExtensions,
         id: responseId,
         object: "response",
+        created_at: 1,
         status: "completed",
+        model: body.model,
+        error: null,
+        incomplete_details: null,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+          output_tokens_details: { reasoning_tokens: 0 },
+          total_tokens: 2,
+        },
         output,
       };
       const events: SseFrame[] = [

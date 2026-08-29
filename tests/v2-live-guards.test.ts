@@ -4,8 +4,9 @@ import { main as singleMain } from "../scripts/live_v2_single";
 import { main as fleetMain } from "../scripts/live_v2_fleet";
 import {
   main as smokeMain,
-  resolveSmokeProtectedRoot,
 } from "../scripts/smoke_v2_candidate";
+
+const API_KEY = "test-ghostprov-key-0123456789abcdef";
 
 describe("V2 live canary guards", () => {
   it("keeps every new canary import-safe", () => {
@@ -14,46 +15,56 @@ describe("V2 live canary guards", () => {
     expect(typeof smokeMain).toBe("function");
   });
 
-  it("allows smoke protection of an explicit loopback router only", () => {
-    expect(resolveSmokeProtectedRoot({})).toBe("http://127.0.0.1:8787");
-    expect(resolveSmokeProtectedRoot({
-      GP_SMOKE_PROTECTED_ROOT: "http://127.0.0.1:18787",
-    })).toBe("http://127.0.0.1:18787");
-    expect(() => resolveSmokeProtectedRoot({
-      GP_SMOKE_PROTECTED_ROOT: "https://example.com",
-    })).toThrow("loopback");
-    expect(() => resolveSmokeProtectedRoot({
-      GP_SMOKE_PROTECTED_ROOT: "http://127.0.0.1:18787/mutate",
-    })).toThrow("origin");
+  it("defaults live candidates to 18888 and refuses the protected service port", () => {
+    expect(resolveLiveV2Options({
+      GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
+    }).port).toBe(18_888);
+    expect(() => resolveLiveV2Options({
+      GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
+      PORT: "18787",
+    })).toThrow("protected service port 18787");
+    expect(() => resolveLiveV2Options({
+      GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
+      PORT: "8787",
+    })).toThrow("hard-fenced to candidate port 18888");
   });
 
   it("refuses live execution without every load opt-in", () => {
     expect(() => resolveLiveV2Options({})).toThrow("GP_LIVE_V2=1");
+    expect(() => resolveLiveV2Options({ GP_LIVE_V2: "1" }))
+      .toThrow("GHOSTPROV_API_KEY");
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
       GP_LIVE_PROJECT_COUNT: "5",
     })).toThrow("1 through 4");
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
-      PORT: "8787",
-    })).toThrow("protected port 8787");
+      GHOSTPROV_API_KEY: API_KEY,
+      PORT: "18787",
+    })).toThrow("protected service port 18787");
   });
 
   it("rejects automatic project creation and never enables project deletion", () => {
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
       GP_AUTO_CREATE_PROJECTS: "1",
     })).toThrow("unsupported");
     const options = resolveLiveV2Options({
       GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
       GP_LIVE_PROJECT_COUNT: "4",
-      PORT: "18787",
+      PORT: "18888",
       GP_ALLOW_PROJECT_DELETE: "1",
     });
 
     expect(options).toMatchObject({
       projectCount: 4,
-      port: 18787,
+      port: 18888,
       deleteProjects: false,
     });
   });
@@ -61,11 +72,13 @@ describe("V2 live canary guards", () => {
   it("requires a separate scale opt-in for more than one project", () => {
     expect(() => resolveLiveV2Options({
       GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
       GP_LIVE_PROJECT_COUNT: "4",
     }, { requireScale: true })).toThrow("GP_LIVE_SCALE=1");
 
     expect(resolveLiveV2Options({
       GP_LIVE_V2: "1",
+      GHOSTPROV_API_KEY: API_KEY,
       GP_LIVE_SCALE: "1",
       GP_LIVE_PROJECT_COUNT: "4",
     }, { requireScale: true }).scale).toBe(true);

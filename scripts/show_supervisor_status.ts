@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import {
   parseSupervisorReadyStatus,
@@ -90,9 +89,7 @@ export async function waitForFreshSupervisorReady(
   throw new Error("Fresh GhostProv supervisor did not publish matching ready status before timeout");
 }
 
-const isMain = process.argv[1]?.endsWith("show_supervisor_status.ts") ||
-  process.argv[1]?.endsWith("show_supervisor_status.js");
-if (isMain) {
+if (import.meta.main) {
   const mode = process.argv[2] ?? "status";
   if (mode === "status") {
     const status = await readSupervisorStatus();

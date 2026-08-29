@@ -3,6 +3,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import {
   CpuTransformPool,
   CpuTransformQueueFullError,
+  CpuTransformShutdownError,
   CpuTransformTimeoutError,
 } from "../src/router/cpu-transform-pool";
 
@@ -38,6 +39,12 @@ class FakeWorker extends EventTarget {
 
   fail(message: string): void {
     this.onerror?.(new ErrorEvent("error", { message }));
+  }
+}
+
+class NonClosingWorker extends FakeWorker {
+  override terminate(): void {
+    this.terminated = true;
   }
 }
 
@@ -105,6 +112,25 @@ describe("CpuTransformPool", () => {
     expect(await first).toBeInstanceOf(Error);
     expect(await second).toBeInstanceOf(Error);
     expect(workers[0].terminated).toBe(true);
+  });
+
+  it("bounds worker teardown without falsely reporting physical exit", async () => {
+    const worker = new NonClosingWorker(() => undefined);
+    const pool = new CpuTransformPool({
+      workers: 1,
+      workerCloseTimeoutMs: 10,
+      workerFactory: () => asWorker(worker),
+    });
+
+    await expect(pool.close()).rejects.toBeInstanceOf(CpuTransformShutdownError);
+    expect(worker.terminated).toBe(true);
+    expect(pool.snapshot()).toMatchObject({
+      closed: true,
+      readyWorkers: 0,
+      retiringWorkers: 1,
+      liveWorkers: 1,
+    });
+    await expect(pool.close()).rejects.toBeInstanceOf(CpuTransformShutdownError);
   });
 
   it("prioritizes queued latency work without leaving a healthy worker idle", async () => {

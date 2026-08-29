@@ -942,6 +942,23 @@ describe("Anthropic request current contracts", () => {
     }), "JSON-compatible");
   });
 
+  it("rejects lone-surrogate values and object keys before relay preparation", () => {
+    for (const input of [
+      { value: "\ud800" },
+      { ["\udc00"]: "value" },
+    ]) {
+      expectInvalid(request({
+        messages: [{
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_unicode", name: "Read", input }],
+        }, {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "call_unicode", content: "done" }],
+        }],
+      }), "Unicode");
+    }
+  });
+
   it("rejects an inbound request beyond an injected byte bound with HTTP 413", () => {
     expectInvalid(request({
       messages: [{ role: "user", content: "x".repeat(256) }],

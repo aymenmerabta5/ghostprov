@@ -844,6 +844,57 @@ describe("Anthropic lossless replay projection", () => {
     )).toBeNull();
   });
 
+  it("rejects lossy raw tool JSON while preserving harmless formatting", () => {
+    for (const [name, argumentsValue] of [
+      ["underflow", '{"value":1e-400}'],
+      ["negative underflow", '{"value":-1e-400}'],
+      ["changed decimal spelling", '{"value":1.0}'],
+      ["changed exponent spelling", '{"value":1e0}'],
+      ["duplicate keys", '{"value":1,"value":2}'],
+      ["escaped duplicate keys", '{"value":1,"\\u0076alue":2}'],
+      ["nested duplicate keys", '{"nested":{"value":1,"value":2}}'],
+    ] as const) {
+      const final = finalResponse(`resp_${name.replaceAll(" ", "_")}`, [
+        toolOutput("fc_lossy", "call_lossy", "Calculate", argumentsValue),
+      ]);
+      expect(
+        projectAnthropicReplay(final, responseToAnthropic(final, CONTEXT)),
+        name,
+      ).toBeNull();
+    }
+
+    const harmless = finalResponse("resp_harmless_formatting", [
+      toolOutput("fc_harmless", "call_harmless", "Calculate", '{ "b": 2, "a": 1 }'),
+    ]);
+    expect(projectAnthropicReplay(
+      harmless,
+      responseToAnthropic(harmless, CONTEXT),
+    )).toEqual([{
+      type: "function_call",
+      call_id: "call_harmless",
+      name: "Calculate",
+      arguments: '{"b":2,"a":1}',
+    }]);
+
+    const reorderedIntegerKeys = finalResponse("resp_harmless_key_order", [
+      toolOutput(
+        "fc_harmless_order",
+        "call_harmless_order",
+        "Calculate",
+        '{ "2": 2, "1": 1, "label": "1e-400" }',
+      ),
+    ]);
+    expect(projectAnthropicReplay(
+      reorderedIntegerKeys,
+      responseToAnthropic(reorderedIntegerKeys, CONTEXT),
+    )).toEqual([{
+      type: "function_call",
+      call_id: "call_harmless_order",
+      name: "Calculate",
+      arguments: '{"1":1,"2":2,"label":"1e-400"}',
+    }]);
+  });
+
   it("skips synchronous replay projection for very large tool arguments", () => {
     const large = finalResponse("resp_large_tool", [
       toolOutput(

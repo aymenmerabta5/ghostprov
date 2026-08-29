@@ -1,12 +1,20 @@
 import { WebSocket } from "ws";
 import { Buffer } from "node:buffer";
 import { resolveGhostProvApiKey } from "../src/http/api-key";
+import {
+  assertCandidatePort,
+  DEFAULT_CANDIDATE_PORT,
+} from "../src/core/ports";
 
 if (process.env.GP_LIVE_VERIFY !== "1") {
   throw new Error("Live verification mutates Prism state. Set GP_LIVE_VERIFY=1 explicitly.");
 }
 
-const base = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:8787/v1").replace(/\/$/, "");
+const baseUrl = new URL(
+  process.env.OPENAI_BASE_URL ?? `http://127.0.0.1:${DEFAULT_CANDIDATE_PORT}/v1`,
+);
+assertCandidatePort(Number(baseUrl.port || 80), "Live verification");
+const base = baseUrl.toString().replace(/\/$/, "");
 const model = process.env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
 const timeoutMs = Number(process.env.GP_LIVE_TIMEOUT_MS ?? 10 * 60_000);
 const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);

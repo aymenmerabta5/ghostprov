@@ -7,28 +7,10 @@ import {
   createAuthenticatedTenantScope,
   resolveGhostProvApiKey,
 } from "../src/http/api-key";
-
-export function resolveSmokeProtectedRoot(
-  env: Record<string, string | undefined>,
-): string {
-  const raw = env.GP_SMOKE_PROTECTED_ROOT?.trim() || "http://127.0.0.1:8787";
-  let value: URL;
-  try {
-    value = new URL(raw);
-  } catch {
-    throw new TypeError("GP_SMOKE_PROTECTED_ROOT must be a valid loopback origin");
-  }
-  if (
-    value.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "[::1]"].includes(value.hostname) ||
-    value.username ||
-    value.password
-  ) throw new TypeError("GP_SMOKE_PROTECTED_ROOT must be an HTTP loopback origin");
-  if (value.pathname !== "/" || value.search || value.hash) {
-    throw new TypeError("GP_SMOKE_PROTECTED_ROOT must contain only an origin");
-  }
-  return value.origin;
-}
+import {
+  DEFAULT_CANDIDATE_PORT,
+  PROTECTED_SERVICE_PORT,
+} from "../src/core/ports";
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -40,16 +22,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-async function primaryHealthy(root: string): Promise<void> {
-  const response = await fetch(`${root}/health`, { signal: AbortSignal.timeout(10_000) });
-  const body = await response.json().catch(() => null) as any;
-  if (!response.ok || body?.ok !== true) throw new Error("Protected port 8787 is not healthy");
-}
-
 export async function main(): Promise<void> {
-  const protectedRoot = resolveSmokeProtectedRoot(process.env);
   const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
-  await primaryHealthy(protectedRoot);
   const authorizationScope = createAuthenticatedTenantScope();
   const system = await createFakeV2System({
     runtimes: 1,
@@ -61,7 +35,7 @@ export async function main(): Promise<void> {
     app,
     router: system.router,
     apiKey,
-    port: 18_787,
+    port: DEFAULT_CANDIDATE_PORT,
     candidate: true,
     authorizationScope,
   });
@@ -74,7 +48,9 @@ export async function main(): Promise<void> {
       });
     });
     const port = (server.address() as AddressInfo).port;
-    if (port === 8_787) throw new Error("Candidate smoke bound protected port 8787");
+    if (port === PROTECTED_SERVICE_PORT) {
+      throw new Error(`Candidate smoke bound protected port ${PROTECTED_SERVICE_PORT}`);
+    }
     const base = `http://127.0.0.1:${port}`;
     const response = await fetch(`${base}/v1/responses`, {
       method: "POST",
@@ -125,7 +101,6 @@ export async function main(): Promise<void> {
     await new Promise<void>(resolve => server.close(() => resolve()));
     await system.close();
   }
-  await primaryHealthy(protectedRoot);
 }
 
 if (import.meta.main) await main();

@@ -3,9 +3,10 @@ import { createDiagnosticEvent, metricsFromSnapshot, resolveDiagnosticProbeOptio
 
 describe("V2 concurrency diagnostic probe guards",()=>{
  it("requires explicit opt-in and refuses protected/non-loopback roots",()=>{
-  expect(()=>resolveDiagnosticProbeOptions({})).toThrow("GP_LIVE_V2_DIAGNOSTICS=1");
-  expect(()=>resolveDiagnosticProbeOptions({GP_LIVE_V2_DIAGNOSTICS:"1",GP_V2_DIAGNOSTIC_ROOT:"http://127.0.0.1:8787"})).toThrow("8787");
-  expect(()=>resolveDiagnosticProbeOptions({GP_LIVE_V2_DIAGNOSTICS:"1",GP_V2_DIAGNOSTIC_ROOT:"https://example.com"})).toThrow("loopback");
+ expect(()=>resolveDiagnosticProbeOptions({})).toThrow("GP_LIVE_V2_DIAGNOSTICS=1");
+  expect(()=>resolveDiagnosticProbeOptions({GP_LIVE_V2_DIAGNOSTICS:"1",GHOSTPROV_API_KEY:"test-ghostprov-key-0123456789abcdef",GP_V2_DIAGNOSTIC_ROOT:"http://127.0.0.1:18787"})).toThrow("18787");
+  expect(()=>resolveDiagnosticProbeOptions({GP_LIVE_V2_DIAGNOSTICS:"1",GHOSTPROV_API_KEY:"test-ghostprov-key-0123456789abcdef",GP_V2_DIAGNOSTIC_ROOT:"https://example.com"})).toThrow("loopback");
+  expect(resolveDiagnosticProbeOptions({GP_LIVE_V2_DIAGNOSTICS:"1",GHOSTPROV_API_KEY:"test-ghostprov-key-0123456789abcdef"}).root).toBe("http://127.0.0.1:18888");
  });
  it("builds one immutable body with implicit websocket streaming",()=>{
   const left=createDiagnosticEvent();const right=createDiagnosticEvent();

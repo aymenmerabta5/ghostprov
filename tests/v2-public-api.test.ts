@@ -8,6 +8,9 @@ import { createGhostProvServer } from "../src/server/runtime";
 import { createAuthenticatedTenantScope } from "../src/http/api-key";
 import { createFakeV2System } from "./support/fake-v2-system";
 
+const API_KEY = "test-ghostprov-key-0123456789abcdef";
+const AUTHORIZATION = `Bearer ${API_KEY}`;
+
 async function harness(finalExtensions: Readonly<Record<string, unknown>> = {}) {
   const authorizationScope = createAuthenticatedTenantScope();
   const system = await createFakeV2System({
@@ -18,13 +21,15 @@ async function harness(finalExtensions: Readonly<Record<string, unknown>> = {}) 
   });
   const app = createGhostProvApp({
     router: system.router,
+    apiKey: API_KEY,
     keepAliveMs: 60_000,
     authorizationScope,
   });
   const server = createGhostProvServer({
     app,
     router: system.router,
-    port: 18_787,
+    apiKey: API_KEY,
+    port: 18_888,
     candidate: true,
     authorizationScope,
   });
@@ -50,7 +55,7 @@ async function harness(finalExtensions: Readonly<Record<string, unknown>> = {}) 
 async function openSocket(baseUrl: string) {
   const url = new URL("/v1/responses", baseUrl);
   url.protocol = "ws:";
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(url, { headers: { authorization: AUTHORIZATION } });
   const messages: any[] = [];
   const waiters = new Set<() => void>();
   socket.on("message", value => {
@@ -93,7 +98,7 @@ describe("V2 public API compatibility", () => {
       const body = { model: "gpt-5.6-sol", input: "extension-parity", store: false };
       const streamResponse = await fetch(`${streaming.baseUrl}/v1/responses`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: AUTHORIZATION },
         body: JSON.stringify({ ...body, stream: true }),
       });
       const completed = parseFrames(await streamResponse.text(), 0).frames
@@ -103,7 +108,7 @@ describe("V2 public API compatibility", () => {
 
       const response = await fetch(`${nonStreaming.baseUrl}/v1/responses`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: AUTHORIZATION },
         body: JSON.stringify({ ...body, stream: false }),
       });
       const nonStreamedFinal = await response.json();
@@ -122,7 +127,7 @@ describe("V2 public API compatibility", () => {
     try {
       const response = await fetch(`${value.baseUrl}/v1/responses`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: AUTHORIZATION },
         body: JSON.stringify({
           model: "gpt-5.6-sol",
           input: "hello-v2",
@@ -247,12 +252,47 @@ describe("V2 public API compatibility", () => {
     }
   });
 
+  it("routes an Anthropic message through the real app, router, and V2 transport", async () => {
+    const value = await harness();
+    try {
+      const response = await fetch(`${value.baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": API_KEY,
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "ANTHROPIC_V2_PUBLIC" }],
+        }),
+      });
+      const message = await response.json() as any;
+
+      expect(response.status).toBe(200);
+      expect(message).toMatchObject({
+        type: "message",
+        role: "assistant",
+        stop_reason: "end_turn",
+      });
+      expect(value.system.totalUpstreamCalls()).toBe(1);
+      expect(value.upstream.receivedBodies[0]).toMatchObject({
+        model: "gpt-5.6-terra",
+        stream: true,
+        store: true,
+      });
+    } finally {
+      await value.close();
+    }
+  });
+
   it("routes GPT Image generation and multipart editing through V2", async () => {
     const value = await harness();
     try {
       const generation = await fetch(`${value.baseUrl}/v1/images/generations`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: AUTHORIZATION },
         body: JSON.stringify({
           model: "gpt-image-2",
           prompt: "one pixel",
@@ -277,6 +317,7 @@ describe("V2 public API compatibility", () => {
       form.append("image", new File([png], "source.png", { type: "image/png" }));
       const edit = await fetch(`${value.baseUrl}/v1/images/edits`, {
         method: "POST",
+        headers: { authorization: AUTHORIZATION },
         body: form,
       });
       const edited = await edit.json() as any;

@@ -928,7 +928,7 @@ describe("Anthropic HTTP routes", () => {
     });
     const incoming = new AbortController();
     const pending = createGhostProvApp({ router }).fetch(new Request(
-      "http://local/v1/messages",
+      "http://localhost/v1/messages",
       {
         method: "POST",
         headers: ANTHROPIC_HEADERS,
@@ -1382,7 +1382,7 @@ describe("Anthropic HTTP routes", () => {
     const router = new FakeRouter(() => relayHandle(new Promise(() => undefined), () => iterator));
     const incoming = new AbortController();
     const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).fetch(new Request(
-      "http://local/v1/messages",
+      "http://localhost/v1/messages",
       {
         method: "POST",
         headers: ANTHROPIC_HEADERS,
@@ -1410,7 +1410,7 @@ describe("Anthropic HTTP routes", () => {
     const router = new FakeRouter(() => relayHandle(final));
     const incoming = new AbortController();
     const response = await createGhostProvApp({ router }).fetch(new Request(
-      "http://local/v1/messages",
+      "http://localhost/v1/messages",
       {
         method: "POST",
         headers: ANTHROPIC_HEADERS,
@@ -1506,7 +1506,7 @@ describe("Anthropic HTTP routes", () => {
     });
     const app = createGhostProvApp({ router, keepAliveMs: 60_000 });
     const incoming = new AbortController();
-    const response = await app.fetch(new Request("http://local/v1/messages", {
+    const response = await app.fetch(new Request("http://localhost/v1/messages", {
       method: "POST",
       headers: ANTHROPIC_HEADERS,
       body: JSON.stringify(messageRequest({ stream: true })),

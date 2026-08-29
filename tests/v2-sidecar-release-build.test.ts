@@ -101,11 +101,15 @@ describe("V2-R8 sidecar release build", () => {
       "utf8",
     ));
     expect(manifest.scripts["check:v2-sidecar-release"])
-      .toBe("bun scripts/build_v2_sidecar_release.ts");
+      .toBe("bun --no-env-file scripts/build_v2_sidecar_release.ts");
     expect(manifest.scripts["build:v2-sidecar-release"])
       .toContain("--write");
     expect(manifest.scripts["check:v2-sidecar-deno"])
-      .toContain("deno@2.9.5 check --no-config --no-remote --no-npm --no-lock");
+      .toContain("--no-install deno@2.9.5 check --no-config --no-remote --no-npm --no-lock");
+    expect(manifest.scripts["check:v2-sidecar"])
+      .toContain("test:v2-deno-upstream");
+    expect(manifest.scripts["check:v2-sidecar"])
+      .toContain("test:v2-deno-fs");
   });
 
   it(

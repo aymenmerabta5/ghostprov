@@ -1133,7 +1133,16 @@ export class V2TransportSession {
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #stallTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serializes envelope metadata/cursor admission, never per-request delivery. */
   #processing: Promise<void> = Promise.resolve();
+  /** At most one accepted reliable-window worth of bounded frame tasks. */
+  readonly #inboundFrameTasks = new Set<Promise<void>>();
+  /** Per-request tails preserve response order without coupling unrelated requests. */
+  readonly #inboundFrameTails = new Map<string, Promise<void>>();
+  /** Successfully processed sequences waiting behind an earlier unfinished frame. */
+  readonly #completedInboundSequences = new Set<number>();
+  /** Global protocol markers form a barrier across every earlier request tail. */
+  #inboundFrameBarrier: Promise<void> = Promise.resolve();
   #lifecycleEpoch = 0;
   #teardownPromise: Promise<void> | null = null;
   #dataRevision = 0;
@@ -1864,6 +1873,9 @@ export class V2TransportSession {
     const nextInboundEpoch = this.#inbound.ack().epoch + 1;
     this.#inbound.reset(nextInboundEpoch);
     this.#processedInboundAck = { epoch: nextInboundEpoch, sequence: -1 };
+    this.#completedInboundSequences.clear();
+    this.#inboundFrameTails.clear();
+    this.#inboundFrameBarrier = Promise.resolve();
     this.#dataDirty = false;
     this.#sidecarDiagnostics = null;
 
@@ -2276,6 +2288,9 @@ export class V2TransportSession {
       this.#flight.reset(nextEpoch);
       this.#resetFlightMeasurement();
       this.#dataDirty = false;
+      this.#completedInboundSequences.clear();
+      this.#inboundFrameTails.clear();
+      this.#inboundFrameBarrier = Promise.resolve();
       try {
         this.#channel.clear();
       } finally {
@@ -2590,9 +2605,101 @@ export class V2TransportSession {
   async #joinProcessingTail(): Promise<void> {
     for (;;) {
       const tail = this.#processing;
-      await tail.catch(() => undefined);
-      if (tail === this.#processing) return;
+      const frameTasks = [...this.#inboundFrameTasks];
+      await Promise.all([
+        tail.catch(() => undefined),
+        ...frameTasks.map(task => task.catch(() => undefined)),
+      ]);
+      if (tail === this.#processing && this.#inboundFrameTasks.size === 0) return;
     }
+  }
+
+  #inboundFrameStream(frame: ReliableFrame<SidecarFrame>): string {
+    if ("requestId" in frame) return `request:${frame.requestId}`;
+    if (frame.kind === "credential_ack") return `rotation:${frame.rotationId}`;
+    return `control:${frame.kind}`;
+  }
+
+  #inboundFrameIsBarrier(frame: ReliableFrame<SidecarFrame>): boolean {
+    return frame.kind === "recovery_complete" || frame.kind === "drained";
+  }
+
+  #scheduleInboundFrame(
+    frame: ReliableFrame<SidecarFrame>,
+    lifecycleEpoch: number,
+    orphanRecoveryEnvelope: boolean,
+  ): void {
+    if (this.#inboundFrameTasks.size >= this.#limits.windowMaxFrames) {
+      throw new Error("Accepted sidecar frame processing exceeds the reliable window bound");
+    }
+    const barrier = this.#inboundFrameIsBarrier(frame);
+    const stream = this.#inboundFrameStream(frame);
+    const predecessors = new Set<Promise<void>>([this.#inboundFrameBarrier]);
+    if (barrier) {
+      for (const tail of this.#inboundFrameTails.values()) predecessors.add(tail);
+    } else {
+      const streamTail = this.#inboundFrameTails.get(stream);
+      if (streamTail) predecessors.add(streamTail);
+    }
+
+    let task!: Promise<void>;
+    const processing = Promise.all([...predecessors])
+      .then(async () => {
+        if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+        await this.#processFrame(frame, lifecycleEpoch, orphanRecoveryEnvelope);
+        if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+        this.#completeInboundFrame(frame, lifecycleEpoch);
+      })
+      .catch(error => {
+        if (this.#ownsLifecycle(lifecycleEpoch)) this.#failProtocol(error);
+      });
+    task = processing.finally(() => {
+      this.#inboundFrameTasks.delete(task);
+      if (!barrier && this.#inboundFrameTails.get(stream) === task) {
+        this.#inboundFrameTails.delete(stream);
+      }
+    });
+    this.#inboundFrameTasks.add(task);
+    if (barrier) this.#inboundFrameBarrier = task;
+    else this.#inboundFrameTails.set(stream, task);
+  }
+
+  #completeInboundFrame(
+    frame: ReliableFrame<SidecarFrame>,
+    lifecycleEpoch: number,
+  ): void {
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    if (frame.epoch !== this.#processedInboundAck.epoch) {
+      throw new Error("Processed sidecar frame belongs to a stale reliable epoch");
+    }
+    if (
+      frame.sequence <= this.#processedInboundAck.sequence ||
+      this.#completedInboundSequences.has(frame.sequence)
+    ) {
+      throw new Error("Sidecar frame completion sequence was repeated");
+    }
+    const accepted = this.#inbound.ack();
+    if (accepted.epoch !== frame.epoch || frame.sequence > accepted.sequence) {
+      throw new Error("Sidecar frame completed beyond the accepted reliable cursor");
+    }
+    this.#completedInboundSequences.add(frame.sequence);
+    if (this.#completedInboundSequences.size > this.#limits.windowMaxFrames) {
+      throw new Error("Completed sidecar frames exceed the reliable window bound");
+    }
+
+    let nextSequence = this.#processedInboundAck.sequence + 1;
+    let advanced = false;
+    while (this.#completedInboundSequences.delete(nextSequence)) {
+      this.#processedInboundAck = { epoch: frame.epoch, sequence: nextSequence };
+      nextSequence++;
+      advanced = true;
+    }
+    this.#maybeCompleteSidecarRecovery();
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    this.#admitPending();
+    const urgency = this.#pump();
+    this.#requestPublication(advanced ? "urgent" : urgency);
+    this.#armStallWatchdog();
   }
 
   readonly #onAwarenessUpdate = (
@@ -2616,6 +2723,10 @@ export class V2TransportSession {
     envelope: AwarenessEnvelope<SidecarFrame>,
     lifecycleEpoch: number,
   ): Promise<void> {
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    // A recovery/drain marker is globally ordered. Later envelope metadata may
+    // pass ordinary request-local work, but never a still-running global fence.
+    await this.#inboundFrameBarrier;
     if (!this.#ownsLifecycle(lifecycleEpoch)) return;
     if (!validBinding(envelope, this.#binding)) {
       throw new Error("Sidecar Awareness binding is invalid");
@@ -2730,11 +2841,22 @@ export class V2TransportSession {
     if (lane === "data") {
       const currentEpoch = this.#inbound.ack().epoch;
       if (envelope.epoch > currentEpoch) {
+        if (
+          this.#processedInboundAck.epoch !== currentEpoch ||
+          this.#processedInboundAck.sequence !== this.#inbound.ack().sequence ||
+          this.#inboundFrameTasks.size > 0 ||
+          this.#completedInboundSequences.size > 0
+        ) {
+          throw new Error("Sidecar epoch changed while accepted frames were still processing");
+        }
         this.#clearOrphanRecoveryCandidates();
         this.#startupRecoveryOwnedRequestIds.clear();
         this.#startupRecoveryOpen = false;
         this.#inbound.reset(envelope.epoch);
         this.#processedInboundAck = { epoch: envelope.epoch, sequence: -1 };
+        this.#completedInboundSequences.clear();
+        this.#inboundFrameTails.clear();
+        this.#inboundFrameBarrier = Promise.resolve();
       }
       const envelopeHigh = envelope.frames.reduce(
         (high, frame) => frame.epoch === this.#processedInboundAck.epoch
@@ -2743,10 +2865,15 @@ export class V2TransportSession {
         -1,
       );
       delivered = this.#inbound.accept(envelope.frames);
+      if (
+        this.#inbound.ack().epoch !== this.#processedInboundAck.epoch ||
+        this.#inbound.ack().sequence - this.#processedInboundAck.sequence >
+          this.#limits.windowMaxFrames
+      ) {
+        throw new Error("Unprocessed sidecar frames exceed the reliable window bound");
+      }
       for (const frame of delivered) {
-        await this.#processFrame(frame, lifecycleEpoch, orphanRecoveryEnvelope);
-        if (!this.#ownsLifecycle(lifecycleEpoch)) return;
-        this.#processedInboundAck = { epoch: frame.epoch, sequence: frame.sequence };
+        this.#scheduleInboundFrame(frame, lifecycleEpoch, orphanRecoveryEnvelope);
       }
       if (
         delivered.length === 0 &&
@@ -2765,7 +2892,7 @@ export class V2TransportSession {
     const urgency = this.#pump();
     if (flightCompleted && urgency === null) this.#channel.clear("data");
     this.#requestPublication(
-      replaced || delivered.length > 0 || replayProcessedAck ? "urgent" : urgency,
+      replaced || replayProcessedAck ? "urgent" : urgency,
     );
     this.#armStallWatchdog();
   }
@@ -3701,18 +3828,30 @@ export class V2TransportSession {
       let wireBytes: number;
       try {
         // Batched response events are normally small. Hash their exact-size
-        // canonical buffer instead of TranscriptProof.append()'s 64 KiB
-        // general-purpose scratch allocation per logical event. Jumbo events
-        // retain the existing fixed-memory synchronous path; making delivery
-        // await timer-based transcript yields would change the serialized ACK
-        // boundary and can strand an unref-only test or shutdown lifecycle.
+        // canonical buffer instead of allocating the general-purpose scratch.
+        // Jumbo events use the existing fixed-memory cooperative path. Its
+        // referenced task yield keeps Bun alive, and this frame is not marked
+        // complete (therefore cannot advance the cumulative ACK) until every
+        // canonical byte has entered the proof.
         wireBytes = completed.wireBytes <= MAX_TRANSCRIPT_CHUNK_BYTES
           ? state.transcript.appendCanonical(completed.frame).byteLength
-          : state.transcript.append(completed.frame);
+          : await state.transcript.appendCanonicalStream(completed.frame, {
+              chunkBytes: MAX_TRANSCRIPT_CHUNK_BYTES,
+              yieldTask: async () => {
+                await yieldCanonicalWork();
+                if (!this.#ownsLifecycle(lifecycleEpoch)) {
+                  throw abortError("Host response proof was interrupted");
+                }
+              },
+            });
       } catch (cause) {
+        if (
+          !this.#ownsLifecycle(lifecycleEpoch) ||
+          this.#requests.get(state.requestId) !== state
+        ) return;
         // Keep the entry map-owned until failure cleanup releases its permit.
         // Transcript validation (notably terminal JSON parsing) may throw
-        // synchronously after the event has been fully materialized.
+        // after the event has been fully materialized.
         this.#failCommitted(state, new V2CommittedError(
           cause instanceof Error ? cause.message : "Response transcript validation failed",
           "response_transcript",

@@ -94,6 +94,7 @@ const GENERATION_FIELDS = new Set([
 const EDIT_FIELDS = new Set([
   "prompt",
   "image",
+  "image[]",
   "mask",
   "model",
   "n",
@@ -415,12 +416,28 @@ async function encodeUploadedImage(
   };
 }
 
-function formFiles(form: FormData, name: string): UploadedBlob[] {
+function formFiles(
+  form: FormData,
+  name: "image" | "image[]" | "mask",
+  param: "image" | "mask" = name === "image[]" ? "image" : name,
+): UploadedBlob[] {
   const values = form.getAll(name);
   if (values.some(value => typeof value === "string")) {
-    throw invalid(`'${name}' must contain uploaded files.`, name, "invalid_type");
+    throw invalid(`'${param}' must contain uploaded files.`, param, "invalid_type");
   }
   return values as UploadedBlob[];
+}
+
+function editImageFiles(form: FormData): UploadedBlob[] {
+  const images = formFiles(form, "image");
+  const sdkImages = formFiles(form, "image[]");
+  if (images.length > 0 && sdkImages.length > 0) {
+    throw invalid(
+      "Provide image files using either 'image' or 'image[]', not both.",
+      "image",
+    );
+  }
+  return images.length > 0 ? images : sdkImages;
 }
 
 function ensureEditBudget(
@@ -461,7 +478,7 @@ export async function parseEditRequest(
   rejectUnknownFormFields(form);
   validateFormNonStreaming(form);
 
-  const images = formFiles(form, "image");
+  const images = editImageFiles(form);
   const masks = formFiles(form, "mask");
   ensureEditBudget(images, masks, options.maxEditInputBytes);
 

@@ -42,13 +42,9 @@ if (
     Deny-ProtectedPortCommand $protectedReason
 }
 
-$offlineRun = '(?:typecheck|test:unit|test:integration|build:v2-sidecar-release|check:v2-sidecar-release|check:v2-sidecar-deno|test:v2-deno-fs|test:v2-deno-upstream|benchmark:v2-research)'
+$offlineRun = '(?:typecheck|test:unit|test:integration|build:v2-sidecar-release|check:v2-sidecar|check:v2-sidecar-release|check:v2-sidecar-deno|test:v2-deno-fs|test:v2-deno-upstream|benchmark:v2-research)'
 $allowed = @(
-    '^curl(?:\.exe)?\s+(?:--fail\s+)?(?:--silent\s+)?(?:--show-error\s+)?http://(?:127\.0\.0\.1|localhost):18888/(?:health|__sandboxes)$',
-    '^Get-CimInstance\s+Win32_Process\s+-Filter\s+"ProcessId\s+=\s+20952"$',
-    '^\(Get-CimInstance\s+Win32_Process\s+-Filter\s+"ProcessId\s+=\s+20952"\)\.CommandLine$',
-    '^Stop-Process\s+-Id\s+20952\s+-Confirm:\$false$',
-    '^taskkill(?:\.exe)?\s+/PID\s+20952\s+/T\s+/F$',
+    '^curl(?:\.exe)?\s+(?:--fail\s+)?(?:--silent\s+)?(?:--show-error\s+)?http://(?:127\.0\.0\.1|localhost):18888/health$',
     '^git(?:\.exe)?\s+status(?:\s+(?:--short|--porcelain(?:=v1)?|--branch))*$',
     '^git(?:\.exe)?\s+diff(?:\s+(?:--check|--stat|--name-only|--numstat|--cached|--staged))*$',
     '^git(?:\.exe)?\s+diff(?:\s+(?:--check|--stat|--name-only|--numstat|--cached|--staged))*\s+--\s+[A-Za-z0-9_./\\-]+(?:\s+[A-Za-z0-9_./\\-]+)*$',
@@ -56,11 +52,11 @@ $allowed = @(
     '^git(?:\.exe)?\s+rev-parse\s+(?:--show-toplevel|--show-prefix|--abbrev-ref\s+HEAD)$',
     '^git(?:\.exe)?\s+--no-pager\s+(?:log|show)(?:\s+--oneline)?$',
     '^bun(?:\.exe)?\s+--version$',
-    '^bun(?:\.exe)?\s+test\s+--isolate(?:\s+tests[/\\][A-Za-z0-9_.@/\\-]+\.test\.ts)*$',
+    '^bun(?:\.exe)?\s+--no-env-file\s+test\s+--isolate(?:\s+tests[/\\][A-Za-z0-9_.@/\\-]+\.test\.ts)*$',
     "^bun(?:\.exe)?\s+run\s+$offlineRun$",
+    '^bun(?:\.exe)?\s+--no-env-file\s+node_modules[/\\]typescript[/\\]bin[/\\]tsc\s+--project\s+tsconfig\.scripts\.json$',
     '^bun(?:\.exe)?\s+run\s+verify:persisted-continuation$',
     '^bun(?:\.exe)?\s+--env-file=\.ghostprov[/\\]continuation-live\.env\s+scripts[/\\]verify_persisted_continuation\.ts$',
-    '^bun(?:\.exe)?\s+--env-file=\.ghostprov[/\\]codex-live\.env\s+\.ghostprov[/\\]codex-live\.ts$',
     '^codex(?:\.exe)?\s+--help$',
     '^codex(?:\.exe)?\s+exec\s+--help$',
     '^codex(?:\.exe)?\s+exec\s+resume\s+--help$'

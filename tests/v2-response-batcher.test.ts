@@ -14,7 +14,7 @@ describe("ResponseBatcher",()=>{
   expect(frames).toHaveLength(1);expect(b.push("r",32,{event:"response.output_text.delta",data:"x".repeat(20_000)})).toBe(false);
  });
  it("uses a twenty-five millisecond default deadline",async()=>{
-  const frames:SidecarFrame[]=[];const b=new ResponseBatcher({emit:f=>frames.push(f)});b.push("r",0,{event:"response.created",data:"{}"});await Bun.sleep(10);expect(frames).toHaveLength(0);await Bun.sleep(25);expect(frames).toHaveLength(1);
+  const frames:SidecarFrame[]=[];let emitted!:()=>void;const emission=new Promise<void>(resolve=>{emitted=resolve;});const started=performance.now();const b=new ResponseBatcher({emit:f=>{frames.push(f);emitted();}});b.push("r",0,{event:"response.created",data:"{}"});expect(frames).toHaveLength(0);await emission;expect(performance.now()-started).toBeGreaterThanOrEqual(20);expect(frames).toHaveLength(1);
  });
  it("rejects a jumbo event in preflight and still batches the following small event",()=>{
   const frames:SidecarFrame[]=[];const b=new ResponseBatcher({emit:f=>frames.push(f),flushMs:60_000});

@@ -13,6 +13,15 @@ import { connect as connectTcp, createServer as createTcpServer } from "node:net
 import * as path from "node:path";
 import type { Duplex } from "node:stream";
 import {
+  apiKeyAuthorized,
+  isProtectedApiPath,
+  publicRequestAuthorityFailure,
+  resolveGhostProvApiKey,
+  type PublicRequestAuthorityFailure,
+} from "../http/api-key";
+import { isAnthropicRequestPath, requestPath } from "../http/request-policy";
+import { sanitizeDiagnosticMessage } from "../observability/redaction";
+import {
   parseSupervisorControlRequest,
   requestTargetsSupervisor,
   validSupervisorControlTarget,
@@ -60,7 +69,11 @@ export interface HostSupervisorSnapshot {
 
 export interface GhostProvHostSupervisorOptions {
   externalPort: number;
+  /** Explicit public API credential; otherwise taken from the frozen worker environment. */
+  apiKey?: string;
   host?: string;
+  /** Additional explicit public hostnames accepted beside loopback authorities. */
+  allowedHosts?: readonly string[];
   cwd?: string;
   workerEntry?: string;
   workerEnv?: NodeJS.ProcessEnv;
@@ -152,11 +165,7 @@ async function freeLoopbackPort(): Promise<number> {
 }
 
 function safeReason(value: unknown): string {
-  return String(value ?? "unknown")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
-    .trim()
-    .slice(0, 128) || "unknown";
+  return sanitizeDiagnosticMessage(value).slice(0, 128);
 }
 
 function queuedRequestFootprint(request: IncomingMessage, extraBytes = 0): number | null {
@@ -218,6 +227,102 @@ function rejectUpgradeUnavailable(
     "Retry-After: 1\r\n" +
     "Connection: close\r\n\r\n" +
     body,
+  );
+}
+
+function protectedSupervisorPath(pathname: string): boolean {
+  return isProtectedApiPath(pathname) ||
+    pathname === "/__sandboxes" || pathname === "/__supervisor";
+}
+
+function supervisorApiAuthorized(request: IncomingMessage, apiKey: string, pathname: string): boolean {
+  return apiKeyAuthorized({
+    authorization: request.headers.authorization,
+    xApiKey: request.headers["x-api-key"],
+  }, apiKey, isAnthropicRequestPath(pathname) ? "anthropic" : "openai");
+}
+
+function endJson(
+  response: ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): void {
+  if (response.headersSent || response.destroyed) return;
+  const encoded = JSON.stringify(body);
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(encoded),
+    connection: "close",
+    ...headers,
+  });
+  response.end(encoded);
+}
+
+function rejectSupervisorAuthority(
+  response: ServerResponse,
+  failure: PublicRequestAuthorityFailure,
+): void {
+  endJson(response, failure === "host" ? 421 : 403, { error: {
+    message: failure === "host" ? "Request host is not allowed" : "Request origin is not allowed",
+    type: "permission_error",
+    param: null,
+    code: failure === "host" ? "invalid_host" : "invalid_origin",
+  }});
+}
+
+function rejectSupervisorUnauthorized(response: ServerResponse, pathname: string): void {
+  if (isAnthropicRequestPath(pathname)) {
+    const requestId = `req_${randomUUID().replaceAll("-", "")}`;
+    endJson(response, 401, {
+      type: "error",
+      error: { type: "authentication_error", message: "Invalid API key" },
+      request_id: requestId,
+    }, { "request-id": requestId });
+    return;
+  }
+  endJson(response, 401, { error: {
+    message: "Invalid API key",
+    type: "authentication_error",
+    param: null,
+    code: "invalid_api_key",
+  }}, { "www-authenticate": 'Bearer realm="ghostprov"' });
+}
+
+function rejectSupervisorNotFound(response: ServerResponse): void {
+  endJson(response, 404, { error: {
+    message: "Not found",
+    type: "invalid_request_error",
+    param: null,
+    code: "not_found",
+  }});
+}
+
+function rejectUpgrade(
+  socket: Duplex,
+  status: 401 | 403 | 404 | 421,
+  code: string,
+): void {
+  if (socket.destroyed) return;
+  const reason = status === 401
+    ? "Unauthorized"
+    : status === 403
+      ? "Forbidden"
+      : status === 404
+        ? "Not Found"
+        : "Misdirected Request";
+  const body = JSON.stringify({ error: {
+    message: reason,
+    type: status === 401 ? "authentication_error" : "permission_error",
+    param: null,
+    code,
+  }});
+  socket.end(
+    `HTTP/1.1 ${status} ${reason}\r\n` +
+    "Content-Type: application/json\r\n" +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+    (status === 401 ? 'WWW-Authenticate: Bearer realm="ghostprov"\r\n' : "") +
+    "Connection: close\r\n\r\n" + body,
   );
 }
 
@@ -287,6 +392,9 @@ export class GhostProvHostSupervisor {
     if (options.host && !["127.0.0.1", "::1", "localhost"].includes(options.host.toLowerCase())) {
       throw new TypeError("GhostProv supervisor host must be loopback");
     }
+    const apiKey = resolveGhostProvApiKey(options.apiKey ?? options.workerEnv?.GHOSTPROV_API_KEY);
+    const allowedHosts = Object.freeze([...(options.allowedHosts ?? [])]);
+    publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
     const cwd = path.resolve(options.cwd ?? process.cwd());
     const startedAt = options.startedAt ?? new Date().toISOString();
     const instanceNonce = options.instanceNonce ?? randomUUID();
@@ -299,12 +407,18 @@ export class GhostProvHostSupervisor {
     }
     this.#options = {
       externalPort: options.externalPort,
+      apiKey,
       host: options.host ?? "127.0.0.1",
+      allowedHosts,
       cwd,
       workerEntry: path.resolve(cwd, options.workerEntry ?? "src/server.ts"),
       // Freeze the complete environment once. A rolling restart must not pick
       // up later process.env mutations or a newly edited .env file.
-      workerEnv: { ...process.env, ...options.workerEnv },
+      workerEnv: {
+        ...process.env,
+        ...options.workerEnv,
+        GHOSTPROV_API_KEY: apiKey,
+      },
       readyTimeoutMs: options.readyTimeoutMs ?? 120_000,
       gracefulShutdownMs: options.gracefulShutdownMs ?? 330_000,
       requestWaitMs: options.requestWaitMs ?? 480_000,
@@ -597,10 +711,9 @@ export class GhostProvHostSupervisor {
         PORT: String(port),
         GP_SUPERVISED_CHILD: "1",
         GP_SUPERVISOR_GENERATION: String(generation),
-        // src/server.ts explicitly imports dotenv/config. Point that import at
-        // the platform null device so an edited .env cannot leak into a rolling
-        // worker restart. A fresh supervisor has already loaded .env into the
-        // frozen environment above.
+        // Keep the null-device guard for any transitive dotenv import so an
+        // edited .env cannot leak into a rolling worker restart. A fresh
+        // supervisor has already frozen the intended startup environment.
         DOTENV_CONFIG_PATH: process.platform === "win32" ? "NUL" : "/dev/null",
         DOTENV_CONFIG_QUIET: "true",
       },
@@ -805,12 +918,31 @@ export class GhostProvHostSupervisor {
   }
 
   async #forwardHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (request.url === "/__supervisor") {
+    const pathname = requestPath(request.url);
+    const authorityFailure = publicRequestAuthorityFailure({
+      host: request.headers.host,
+      forwardedHost: request.headers["x-forwarded-host"],
+      origin: request.headers.origin,
+    }, this.#options.allowedHosts);
+    if (authorityFailure) {
+      request.resume();
+      rejectSupervisorAuthority(response, authorityFailure);
+      return;
+    }
+    if (
+      protectedSupervisorPath(pathname) &&
+      !supervisorApiAuthorized(request, this.#options.apiKey, pathname)
+    ) {
+      request.resume();
+      rejectSupervisorUnauthorized(response, pathname);
+      return;
+    }
+    if (pathname === "/__supervisor") {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       response.end(JSON.stringify({ schema: SUPERVISOR_SCHEMA, ...this.snapshot() }));
       return;
     }
-    if (!this.#target && request.url?.split("?", 1)[0] === "/health") {
+    if (!this.#target && pathname === "/health") {
       response.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
       response.end(JSON.stringify({ ok: false, supervisor: this.#state, retryable: true }));
       return;
@@ -818,6 +950,11 @@ export class GhostProvHostSupervisor {
     const queuedAt = performance.now();
     let target = this.#target;
     if (!target) {
+      if (!isProtectedApiPath(pathname) && pathname !== "/__sandboxes") {
+        request.resume();
+        rejectSupervisorNotFound(response);
+        return;
+      }
       const reservation = this.#reserveQueuedRequest(queuedRequestFootprint(request));
       if (reservation === null) {
         rejectHttpUnavailable(response, "host_queue_full");
@@ -848,7 +985,8 @@ export class GhostProvHostSupervisor {
     const waitMs = Math.max(0, performance.now() - queuedAt);
     const headers = { ...request.headers };
     headers.host = `127.0.0.1:${target.port}`;
-    if (request.headers.host) headers["x-forwarded-host"] = request.headers.host;
+    delete headers["x-forwarded-host"];
+    delete headers.origin;
     headers["x-forwarded-proto"] = "http";
     let finished = false;
     const finish = () => {
@@ -912,6 +1050,28 @@ export class GhostProvHostSupervisor {
   }
 
   async #forwardUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    const pathname = requestPath(request.url);
+    const authorityFailure = publicRequestAuthorityFailure({
+      host: request.headers.host,
+      forwardedHost: request.headers["x-forwarded-host"],
+      origin: request.headers.origin,
+    }, this.#options.allowedHosts);
+    if (authorityFailure) {
+      rejectUpgrade(
+        socket,
+        authorityFailure === "host" ? 421 : 403,
+        authorityFailure === "host" ? "invalid_host" : "invalid_origin",
+      );
+      return;
+    }
+    if (pathname !== "/v1/responses") {
+      rejectUpgrade(socket, 404, "not_found");
+      return;
+    }
+    if (!supervisorApiAuthorized(request, this.#options.apiKey, pathname)) {
+      rejectUpgrade(socket, 401, "invalid_api_key");
+      return;
+    }
     let target = this.#target;
     if (!target) {
       const reservation = this.#reserveQueuedRequest(
@@ -960,8 +1120,13 @@ export class GhostProvHostSupervisor {
     upstream.once("connect", () => {
       let header = `${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}\r\n`;
       for (let index = 0; index < request.rawHeaders.length; index += 2) {
-        header += `${request.rawHeaders[index]}: ${request.rawHeaders[index + 1]}\r\n`;
+        const name = request.rawHeaders[index]!;
+        if (["host", "origin", "x-forwarded-host", "x-forwarded-proto"].includes(
+          name.toLowerCase(),
+        )) continue;
+        header += `${name}: ${request.rawHeaders[index + 1]}\r\n`;
       }
+      header += `Host: 127.0.0.1:${target.port}\r\n`;
       upstream.write(`${header}\r\n`);
       if (head.byteLength) upstream.write(head);
       socket.pipe(upstream).pipe(socket);

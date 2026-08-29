@@ -17,14 +17,29 @@ import {
 import { GhostProvHostSupervisor } from "../src/host/supervisor";
 
 const workspace = path.resolve(import.meta.dir, "..");
+const API_ENV = Object.freeze({ GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef" });
 
 async function source(relativePath: string): Promise<string> {
   return readFile(path.join(workspace, relativePath), "utf8");
 }
 
 describe("host supervisor service controls", () => {
+  it("uses exact module entrypoint guards for every lifecycle script", async () => {
+    for (const file of [
+      "scripts/supervise.ts",
+      "scripts/request_upgrade.ts",
+      "scripts/request_shutdown.ts",
+      "scripts/show_supervisor_status.ts",
+    ]) {
+      const script = await source(file);
+      expect(script).toContain("import.meta.main");
+      expect(script).not.toContain("process.argv[1]?.endsWith");
+    }
+  });
+
   it("freezes the worker environment at supervisor startup", () => {
     const environment: NodeJS.ProcessEnv = {
+      ...API_ENV,
       GP_V2_SIDECAR_REVISION: "r1",
       GP_V2_SIDECAR_PROJECT_REVISIONS: "project-a=r2",
     };
@@ -36,15 +51,22 @@ describe("host supervisor service controls", () => {
     expect(options.workerEnv).not.toBe(environment);
     expect(options.workerEnv.GP_V2_SIDECAR_REVISION).toBe("r1");
     expect(options.workerEnv.GP_V2_SIDECAR_PROJECT_REVISIONS).toBe("project-a=r2");
+    expect(options.workerEnv.GHOSTPROV_API_KEY).toBe(API_ENV.GHOSTPROV_API_KEY);
     expect(options.maxQueuedRequests).toBe(256);
     expect(options.maxQueuedBytes).toBe(64 * 1024 * 1024);
-    expect(supervisorOptions({ PORT: "0" }).externalPort).toBe(0);
-    expect(() => supervisorOptions({ PORT: "8787", GP_CANDIDATE: "1" }))
-      .toThrow(/protected external port 8787/i);
+    expect(supervisorOptions({ ...API_ENV, PORT: "0" }).externalPort).toBe(0);
+    expect(supervisorOptions({ ...API_ENV, GP_CANDIDATE: "1" }).externalPort).toBe(18_888);
+    expect(() => supervisorOptions({ ...API_ENV, PORT: "18787", GP_CANDIDATE: "1" }))
+      .toThrow(/protected service port 18787/i);
+    for (const value of ["true", " true ", "false", "2"]) {
+      expect(() => supervisorOptions({ ...API_ENV, GP_CANDIDATE: value }))
+        .toThrow("GP_CANDIDATE must be 0 or 1");
+    }
     expect(() => supervisorOptions({
+      ...API_ENV,
       GP_SUPERVISOR_GRACE_MS: String(MAX_SUPERVISOR_LIFECYCLE_MS + 1),
     })).toThrow("no greater than");
-    expect(() => supervisorOptions({ GP_SUPERVISOR_QUEUE_MAX_REQUESTS: "0" }))
+    expect(() => supervisorOptions({ ...API_ENV, GP_SUPERVISOR_QUEUE_MAX_REQUESTS: "0" }))
       .toThrow("positive integer");
   });
 
@@ -53,6 +75,8 @@ describe("host supervisor service controls", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-supervisor-env-"));
     const supervisor = new GhostProvHostSupervisor({
       externalPort: 0,
+      apiKey: API_ENV.GHOSTPROV_API_KEY,
+      workerEnv: { ...API_ENV },
       cwd: directory,
       workerEntry: path.resolve(workspace, "tests/support/fake-supervised-worker.ts"),
       readyTimeoutMs: 10_000,
@@ -106,6 +130,7 @@ describe("host supervisor service controls", () => {
       cwd: directory,
       env: {
         ...process.env,
+        ...API_ENV,
         PORT: "0",
         GP_SUPERVISOR_WORKER_ENTRY: path.join(workspace, "tests/support/fake-supervised-worker.ts"),
         GP_TEST_SUPERVISOR_INITIAL_READY_DELAY_MS: "10000",
@@ -167,6 +192,7 @@ describe("host supervisor service controls", () => {
       cwd: directory,
       env: {
         ...process.env,
+        ...API_ENV,
         PORT: "0",
         GP_SUPERVISOR_WORKER_ENTRY: path.join(directory, "missing-worker.ts"),
         GP_SUPERVISOR_READY_TIMEOUT_MS: "100",

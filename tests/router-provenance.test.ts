@@ -388,7 +388,7 @@ describe("MultiSandboxRouter response provenance", () => {
   });
 
   it("does not index failed or incomplete authoritative finals", async () => {
-    const { router, first, second } = routerSystem([0, 0.999]);
+    const { router, first, second, authorizationScope } = routerSystem([0, 0.999]);
     first.responseIds.push("resp_failed_not_portable");
     first.responseStatuses.push("failed");
     second.responseIds.push("resp_incomplete_not_portable");
@@ -401,9 +401,9 @@ describe("MultiSandboxRouter response provenance", () => {
       second.completeNext();
       await incomplete.final;
 
-      expect(router.lookupResponseProvenance("resp_failed_not_portable"))
+      expect(router.lookupResponseProvenance("resp_failed_not_portable", authorizationScope))
         .toEqual({ kind: "unknown" });
-      expect(router.lookupResponseProvenance("resp_incomplete_not_portable"))
+      expect(router.lookupResponseProvenance("resp_incomplete_not_portable", authorizationScope))
         .toEqual({ kind: "unknown" });
     } finally {
       while (first.pending.length > 0) first.completeNext();
@@ -413,7 +413,7 @@ describe("MultiSandboxRouter response provenance", () => {
   });
 
   it("normalizes once, commits provenance before final/terminal exposure, and pins continuations", async () => {
-    const { router, first, second, logged } = routerSystem([0, 0.999]);
+    const { router, first, second, logged, authorizationScope } = routerSystem([0, 0.999]);
     const input = Object.freeze({
       model: "gpt-5.6-sol",
       input: "first",
@@ -431,7 +431,8 @@ describe("MultiSandboxRouter response provenance", () => {
         terminal.then(() => "settled" as const),
         Promise.resolve("pending" as const),
       ])).toBe("pending");
-      expect(router.lookupResponseProvenance("resp_first_1")).toEqual({ kind: "unknown" });
+      expect(router.lookupResponseProvenance("resp_first_1", authorizationScope))
+        .toEqual({ kind: "unknown" });
 
       const firstFinal = first.completeNext();
       await expect(handle.final).resolves.toBe(firstFinal);
@@ -439,10 +440,12 @@ describe("MultiSandboxRouter response provenance", () => {
         done: false,
         value: { event: "response.completed" },
       });
-      expect(router.lookupResponseProvenance(firstFinal.id)).toEqual({
+      expect(router.lookupResponseProvenance(firstFinal.id, authorizationScope)).toEqual({
         kind: "known",
         provenance: { projectId: first.projectId, incarnation: 1 },
       });
+      expect(router.lookupResponseProvenance(firstFinal.id))
+        .toEqual({ kind: "scope_mismatch" });
       expect(JSON.stringify(logged)).not.toContain(firstFinal.id);
 
       const continuation = await router.startRelay({
@@ -600,6 +603,87 @@ describe("MultiSandboxRouter response provenance", () => {
       expect(router.responseProvenanceAuthorizationScope()).toBe(authorizationScope);
       expect(first.executions + second.executions).toBe(0);
     } finally {
+      await router.close();
+    }
+  });
+
+  it("releases provenance and disposes a committed handle when final access throws", async () => {
+    const { router, first, second, authorizationScope } = routerSystem([0]);
+    let discarded = 0;
+    first.run = async (_body, _signal, options): Promise<RunHandle> => {
+      first.executions++;
+      options?.onAdmissionReflected?.();
+      options?.onExecutionRiskReflected?.();
+      return {
+        async *events() {},
+        discardUnconsumedEvents: () => { discarded++; },
+        get final(): Promise<unknown> {
+          throw new Error("synthetic final accessor failure");
+        },
+        stats: { bytes: 0, firstByteMs: null, frames: 0 },
+      };
+    };
+    try {
+      await expect(router.startRelay(
+        { model: "gpt-5.6-sol", input: "throwing committed handle" },
+        { authorizationScope },
+      )).rejects.toMatchObject({ committed: true, ambiguous: true });
+      await flush();
+      expect(discarded).toBe(1);
+      expect(router.snapshot().provenance).toMatchObject({
+        reservedRecords: 0,
+        reservedBytes: 0,
+      });
+      expect(second.executions).toBe(0);
+    } finally {
+      await router.close();
+    }
+  });
+
+  it("keeps cleanup ownership when committed metadata and prelude accessors throw", async () => {
+    const { router, first, authorizationScope } = routerSystem([0]);
+    const terminal = deferred<ReturnType<typeof response>>();
+    let discarded = 0;
+    first.run = async (_body, _signal, options): Promise<RunHandle> => {
+      first.executions++;
+      options?.onAdmissionReflected?.();
+      options?.onExecutionRiskReflected?.();
+      return {
+        async *events() {},
+        discardUnconsumedEvents: () => { discarded++; },
+        final: terminal.promise,
+        get upstreamPrelude(): Promise<never> {
+          throw new Error("synthetic upstream prelude accessor failure");
+        },
+        get stats(): RunHandle["stats"] {
+          throw new Error("synthetic stats accessor failure");
+        },
+      };
+    };
+    try {
+      const outcome = await Promise.race([
+        router.startRelay(
+          { model: "gpt-5.6-sol", input: "throwing committed metadata" },
+          { authorizationScope },
+        ).then(
+          () => ({ kind: "handle" as const }),
+          error => ({ kind: "error" as const, error }),
+        ),
+        Bun.sleep(100).then(() => ({ kind: "timeout" as const })),
+      ]);
+      expect(outcome).toMatchObject({
+        kind: "error",
+        error: { committed: true, ambiguous: true },
+      });
+      expect(discarded).toBe(1);
+      expect(router.snapshot().provenance).toMatchObject({
+        reservedRecords: 0,
+        reservedBytes: 0,
+      });
+      terminal.resolve(response("resp_discarded_metadata"));
+      await expect(router.awaitIdle(1_000)).resolves.toBeUndefined();
+    } finally {
+      terminal.resolve(response("resp_discarded_metadata"));
       await router.close();
     }
   });

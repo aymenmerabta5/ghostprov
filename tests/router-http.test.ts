@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
 import { Agent, request as httpRequest, type Server } from "node:http";
+import { createConnection } from "node:net";
 import type { RunHandle } from "../src/relay/run-handle";
 import { parseFrames, sseFrame, type SseFrame } from "../src/relay/sse";
 import {
@@ -28,6 +29,7 @@ import {
 } from "../src/http/api-key";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { v2EventPhysicalWorkingSetBytes } from "../src/v2/memory/event-memory-sizing";
+import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 
 const servers: Server[] = [];
 
@@ -222,7 +224,7 @@ describe("router HTTP composition", () => {
         authorizationScope: router.authorizationScope,
       });
 
-      const response = await app.fetch(new Request("http://ghostprov.test/v1/responses", {
+      const response = await app.fetch(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(root),
@@ -362,7 +364,7 @@ describe("router HTTP composition", () => {
       bodyBytes: Buffer.byteLength(publicJson),
       release() {},
     };
-    const response = await app.fetch(new Request("http://ghostprov.test/v1/responses", {
+    const response = await app.fetch(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: publicJson,
@@ -727,6 +729,90 @@ describe("router HTTP composition", () => {
     });
     expect(calls[2]).not.toHaveProperty("previous_response_id");
     expect(calls[2]!.input).toEqual([root, answer, next]);
+  });
+
+  it("lets every concurrent definitive stale inferred Responses hit retry its own immutable full history once", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 400,
+      value: { error: {
+        message: "Previous response was not found",
+        type: "invalid_request_error",
+        param: "previous_response_id",
+        code: "previous_response_not_found",
+      } },
+    });
+    const stale = new V2CommittedError(
+      providerError.error.message,
+      providerError.error.code!,
+      false,
+      undefined,
+      providerError,
+    );
+    const root = { type: "message", role: "user", content: "root" };
+    const answer = {
+      type: "message",
+      id: "msg_concurrent_stale_parent",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "answer", annotations: [], logprobs: [] }],
+    };
+    let staleArrivals = 0;
+    let releaseStale!: () => void;
+    const bothStale = new Promise<void>(resolve => { releaseStale = resolve; });
+    const calls: Record<string, unknown>[] = [];
+    const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
+      snapshot: () => ({
+        capacity: 2,
+        active: 0,
+        available: 2,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (body: Record<string, unknown>) => {
+        calls.push(structuredClone(body));
+        if (calls.length === 1) {
+          return handle(final("resp_concurrent_stale_parent", [answer]));
+        }
+        if (Object.hasOwn(body, "previous_response_id")) {
+          staleArrivals += 1;
+          if (staleArrivals === 2) releaseStale();
+          await bothStale;
+          throw stale;
+        }
+        return handle(final(`resp_concurrent_fallback_${calls.length}`));
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+    await (await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [root] }),
+    })).json();
+
+    const histories = ["next-a", "next-b"].map(text => [
+      root,
+      answer,
+      { type: "message", role: "user", content: text },
+    ]);
+    const responses = await Promise.all(histories.map(input => app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", stream: false, input }),
+    })));
+
+    expect(responses.map(response => response.status)).toEqual([200, 200]);
+    await Promise.all(responses.map(response => response.json()));
+    const inferred = calls.filter(body => Object.hasOwn(body, "previous_response_id"));
+    const fullFallbacks = calls.slice(1)
+      .filter(body => !Object.hasOwn(body, "previous_response_id"));
+    expect(inferred).toHaveLength(2);
+    expect(fullFallbacks).toHaveLength(2);
+    expect(fullFallbacks.map(body => body.input)).toEqual(expect.arrayContaining(histories));
+    expect(calls).toHaveLength(5);
   });
 
   it("never retries a stale inferred parent after any accepted relay event", async () => {
@@ -1146,7 +1232,7 @@ describe("router HTTP composition", () => {
     };
     const app = createGhostProvApp({ router });
     const controller = new AbortController();
-    const pending = app.fetch(new Request("http://ghostprov.test/v1/responses", {
+    const pending = app.fetch(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "gpt-5.6-sol", input: "cancel" }),
@@ -1245,7 +1331,7 @@ describe("router HTTP composition", () => {
       };
       const caller = new AbortController();
       const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).fetch(
-        new Request("http://ghostprov.test/v1/responses", {
+        new Request("http://localhost/v1/responses", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
@@ -1483,7 +1569,8 @@ describe("router HTTP composition", () => {
     const health = await (await app.request("/health")).json();
     const sandboxes = await (await app.request("/__sandboxes")).json();
     expect(health).toMatchObject({ ok: true, capacity: 120, active: 7, available: 113, queued: 2 });
-    expect((health as any).release).toEqual({
+    expect((health as any).release).toBeUndefined();
+    expect((sandboxes as any).release).toEqual({
       knownRuntimes: 0,
       unknownRuntimes: 0,
       selections: [],
@@ -1492,8 +1579,8 @@ describe("router HTTP composition", () => {
   });
 
   it("reports exact verified release identities and explicit unknown runtimes", async () => {
-    const buildHash = "a".repeat(64);
-    const schemaHash = "b".repeat(64);
+    const buildHash = V2_R3_RELEASE.buildHash;
+    const schemaHash = V2_R3_RELEASE.schemaHash;
     const router = healthRouter([
       { releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash },
       {
@@ -1506,12 +1593,12 @@ describe("router HTTP composition", () => {
       const app = createGhostProvApp({ router });
       const health = await (await app.request("/health")).json() as any;
       const sandboxes = await (await app.request("/__sandboxes")).json() as any;
-      expect(health.release).toEqual({
+      expect(health.release).toBeUndefined();
+      expect(sandboxes.release).toEqual({
         knownRuntimes: 1,
         unknownRuntimes: 1,
         selections: [{ releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash, runtimes: 1 }],
       });
-      expect(sandboxes.release).toEqual(health.release);
       expect(sandboxes.runtimes).toEqual(expect.arrayContaining([
         expect.objectContaining({ releaseRevision: "r3", protocolRevision: "r2", buildHash, schemaHash }),
         expect.objectContaining({ releaseRevision: null, protocolRevision: null, buildHash: null, schemaHash: null }),
@@ -1547,8 +1634,6 @@ describe("router HTTP composition", () => {
         desired: 2,
         ready: 1,
         unavailable: 1,
-        unavailableProjects: [unavailableProject],
-        unavailableProjectsTruncated: false,
       });
       expect(await (await app.request("/__sandboxes")).json()).toMatchObject({
         desired: 2,
@@ -1561,7 +1646,6 @@ describe("router HTTP composition", () => {
         desired: 2,
         ready: 2,
         unavailable: 0,
-        unavailableProjects: [],
       });
     } finally {
       await router.close();
@@ -1636,10 +1720,114 @@ describe("router HTTP composition", () => {
     expect(await response.json()).toMatchObject({ ok: false, capacity: 0 });
   });
 
-  it("refuses candidate mode on protected port 8787", () => {
+  it("refuses candidate mode on protected port 18787", () => {
     const router = new FakeRouter();
     const app = createGhostProvApp({ router });
-    expect(() => createGhostProvServer({ app, router, candidate: true, port: 8787 })).toThrow("protected");
+    expect(() => createGhostProvServer({ app, router, candidate: true, port: 18787 })).toThrow("protected");
+  });
+
+  it("rejects hostile or missing HTTP authorities before auth and body admission", async () => {
+    const apiKey = "test-ghostprov-key-0123456789abcdef";
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router, apiKey });
+    const server = createGhostProvServer({ app, router, apiKey, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+
+    const postStatus = (headers: Record<string, string>): Promise<number> => new Promise(
+      (resolve, reject) => {
+        const body = "{}";
+        const request = httpRequest({
+          host: "127.0.0.1",
+          port: address.port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(body),
+            ...headers,
+          },
+        }, response => {
+          response.resume();
+          response.once("end", () => resolve(response.statusCode ?? 0));
+        });
+        request.once("error", reject);
+        request.end(body);
+      },
+    );
+    const hostileStatus = await postStatus({ host: "attacker.example" });
+    const forwardedStatus = await postStatus({ "x-forwarded-host": "attacker.example" });
+    const originStatus = await postStatus({ origin: "https://attacker.example" });
+    const missingHost = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection({ host: "127.0.0.1", port: address.port });
+      let response = "";
+      socket.setEncoding("utf8");
+      socket.once("connect", () => socket.end(
+        "POST /v1/responses HTTP/1.0\r\nContent-Length: 2\r\n\r\n{}",
+      ));
+      socket.on("data", chunk => { response += chunk; });
+      socket.once("end", () => resolve(response));
+      socket.once("error", reject);
+    });
+
+    expect(hostileStatus).toBe(421);
+    expect(forwardedStatus).toBe(421);
+    expect(originStatus).toBe(403);
+    expect(missingHost).toMatch(/^HTTP\/1\.1 421 /);
+    expect(router.bodyReservations).toEqual([]);
+    expect(router.workloads).toEqual([]);
+  });
+
+  it("authenticates sandbox snapshots before body admission", async () => {
+    const apiKey = "test-ghostprov-key-0123456789abcdef";
+    const router = new FakeRouter();
+    const app = createGhostProvApp({ router, apiKey });
+    const server = createGhostProvServer({ app, router, apiKey, candidate: true, port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/__sandboxes`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(401);
+    expect(router.bodyReservations).toEqual([]);
+    expect(router.workloads).toEqual([]);
+  });
+
+  it("shares the explicit app host allowlist with WebSocket upgrades", async () => {
+    const router = new FakeRouter();
+    const allowedHosts = ["ghostprov.example"];
+    const app = createGhostProvApp({ router, allowedHosts });
+    const server = createGhostProvServer({
+      app,
+      router,
+      candidate: true,
+      port: 0,
+      allowedHosts,
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`, {
+      headers: {
+        host: "ghostprov.example",
+        origin: "https://ghostprov.example",
+      },
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    socket.close();
   });
 
   it("routes Codex WebSocket work through the same router", async () => {
@@ -1841,7 +2029,7 @@ describe("router HTTP composition", () => {
     });
     const incomingLease = await router.acquireIncomingBody(Buffer.byteLength(requestBody));
     let response: Response | null = null;
-    const responsePromise = app.fetch(new Request("http://ghostprov.test/v1/responses", {
+    const responsePromise = app.fetch(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: requestBody,

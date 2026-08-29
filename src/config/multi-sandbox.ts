@@ -1,5 +1,10 @@
 import * as path from "node:path";
-import type { MachineSample } from "../core/ports";
+import {
+  assertCandidatePort,
+  DEFAULT_CANDIDATE_PORT,
+  PROTECTED_SERVICE_PORT,
+  type MachineSample,
+} from "../core/ports";
 import { projectId, type ProjectId } from "../sandbox/types";
 import {
   DEFAULT_V2_SIDECAR_REVISION,
@@ -190,9 +195,13 @@ export function resolveMultiSandboxConfig(
     throw new TypeError("PRISM_COOKIE cannot seed an anonymous Prism session");
   }
 
-  const candidate = env.GP_CANDIDATE === "1";
-  const port = positiveInteger(env.PORT, candidate ? 18787 : 8787, "PORT");
-  if (candidate && port === 8787) throw new RangeError("Candidate mode must never bind protected port 8787");
+  const candidate = binaryFlag(env.GP_CANDIDATE, "GP_CANDIDATE");
+  const port = positiveInteger(
+    env.PORT,
+    candidate ? DEFAULT_CANDIDATE_PORT : PROTECTED_SERVICE_PORT,
+    "PORT",
+  );
+  if (candidate) assertCandidatePort(port, "Candidate mode");
 
   const heartbeatMs = positiveInteger(env.GP_HEARTBEAT_MS, 10_000, "GP_HEARTBEAT_MS");
   if (heartbeatMs !== 10_000) throw new RangeError("GP_HEARTBEAT_MS must remain exactly 10000");

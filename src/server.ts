@@ -1,18 +1,13 @@
-import "dotenv/config";
 import {
   createBrowserlessSystem,
   type BrowserlessSystem,
 } from "./server/system";
 import { sanitizeDiagnosticMessage } from "./observability/redaction";
+import { assertCandidatePort } from "./core/ports";
 
 export { createBrowserlessSystem } from "./server/system";
 export { createGhostProvApp } from "./server/app";
 export { createGhostProvServer } from "./server/runtime";
-
-const isMain = process.argv[1] && (
-  process.argv[1].endsWith("server.ts") ||
-  process.argv[1].endsWith("server.js")
-);
 
 export interface GhostProvWorkerProcess {
   readonly pid: number;
@@ -49,28 +44,48 @@ export async function runGhostProvMain(
 ): Promise<void> {
   const workerProcess = hooks.process ?? process as unknown as GhostProvWorkerProcess;
   const createSystem = hooks.createSystem ?? (
-    (input: Record<string, string | undefined>) => createBrowserlessSystem(input)
+    (input: Record<string, string | undefined>, signal: AbortSignal) => (
+      createBrowserlessSystem(input, {}, signal)
+    )
   );
   const startupController = new AbortController();
   let system: BrowserlessSystem | null = null;
   let systemCreation: Promise<BrowserlessSystem> | null = null;
   let closing: Promise<void> | null = null;
+  let systemClose: Promise<void> | null = null;
   let requestedExitCode = 0;
   let requestedReason = "shutdown";
   let intentionalDisconnect = false;
 
+  const closeSystem = (candidate: BrowserlessSystem): Promise<void> => {
+    systemClose ??= Promise.resolve().then(() => candidate.close());
+    return systemClose;
+  };
+  const reportShutdownFailure = (error: unknown) => {
+    requestedExitCode = mergeExitCode(requestedExitCode, 1);
+    workerProcess.exitCode = requestedExitCode;
+    console.error(`[ghostprov] shutdown failed: ${sanitizeDiagnosticMessage(
+      error instanceof Error ? `${error.name}: ${error.message}` : error,
+    )}`);
+  };
   const close = (): Promise<void> => {
     if (closing) return closing;
     startupController.abort(new DOMException("GhostProv worker startup aborted", "AbortError"));
+    const pendingCreation = system === null ? systemCreation : null;
+    if (pendingCreation) {
+      void pendingCreation.then(candidate => {
+        system ??= candidate;
+        void closeSystem(candidate).catch(reportShutdownFailure);
+      }, () => undefined);
+    }
     closing = (async () => {
+      // Keep one microtask for synchronous duplicate IPC/signal/fatal requests
+      // to merge their exit status, without waiting for system construction.
+      await Promise.resolve();
       try {
-        const candidate = system ?? await systemCreation?.catch(() => null) ?? null;
-        if (candidate) await candidate.close();
+        if (system) await closeSystem(system);
       } catch (error) {
-        requestedExitCode = mergeExitCode(requestedExitCode, 1);
-        console.error(`[ghostprov] shutdown failed: ${sanitizeDiagnosticMessage(
-          error instanceof Error ? `${error.name}: ${error.message}` : error,
-        )}`);
+        reportShutdownFailure(error);
       } finally {
         for (const [event, listener] of listeners) workerProcess.off(event, listener);
         try {
@@ -139,19 +154,25 @@ export async function runGhostProvMain(
   for (const [event, listener] of listeners) workerProcess.on(event, listener);
 
   try {
-    if (
-      env.GP_SUPERVISED_CHILD === "1" &&
-      env.GP_CANDIDATE === "1" &&
-      Number(env.PORT) === 8787
-    ) {
-      throw new RangeError("Supervised candidate child cannot bind protected port 8787");
+    if (env.GP_CANDIDATE === "1" && env.PORT !== undefined) {
+      assertCandidatePort(Number(env.PORT), "Candidate child");
     }
     if (startupController.signal.aborted) {
       await close();
       return;
     }
-    systemCreation = createSystem(env, startupController.signal);
-    system = await systemCreation;
+    systemCreation = Promise.resolve(createSystem(env, startupController.signal));
+    let abortCreation!: () => void;
+    const creationAborted = new Promise<never>((_resolve, reject) => {
+      abortCreation = () => reject(startupController.signal.reason);
+      if (startupController.signal.aborted) abortCreation();
+      else startupController.signal.addEventListener("abort", abortCreation, { once: true });
+    });
+    try {
+      system = await Promise.race([systemCreation, creationAborted]);
+    } finally {
+      startupController.signal.removeEventListener("abort", abortCreation);
+    }
     if (startupController.signal.aborted) {
       await close();
       return;
@@ -182,6 +203,6 @@ export async function runGhostProvMain(
   }
 }
 
-if (isMain) {
+if (import.meta.main) {
   await runGhostProvMain();
 }

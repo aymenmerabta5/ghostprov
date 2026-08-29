@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { writeBoundSupervisorControlRequest } from "./supervisor_control";
 
 export async function requestSupervisorShutdown(
@@ -8,6 +7,6 @@ export async function requestSupervisorShutdown(
   return (await writeBoundSupervisorControlRequest("shutdown", cwd)).path;
 }
 
-const isMain = process.argv[1]?.endsWith("request_shutdown.ts") ||
-  process.argv[1]?.endsWith("request_shutdown.js");
-if (isMain) console.log(`GhostProv shutdown requested through ${await requestSupervisorShutdown()}`);
+if (import.meta.main) {
+  console.log(`GhostProv shutdown requested through ${await requestSupervisorShutdown()}`);
+}

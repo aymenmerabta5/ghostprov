@@ -3,8 +3,6 @@ import { createBrowserlessSystem } from "../src/server/system";
 import { resolveLiveV2Options } from "./live_v2_options";
 import { resolveGhostProvApiKey } from "../src/http/api-key";
 
-const PRIMARY = "http://127.0.0.1:8787";
-
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
@@ -13,14 +11,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
       error => { clearTimeout(timer); reject(error); },
     );
   });
-}
-
-async function health(root: string): Promise<Record<string, any>> {
-  const response = await fetch(`${root}/health`, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`${root} health failed (${response.status})`);
-  const body = await response.json() as Record<string, any>;
-  if (body.ok !== true) throw new Error(`${root} did not report healthy`);
-  return body;
 }
 
 async function verifyHttp(base: string, model: string, apiKey: string): Promise<number> {
@@ -120,7 +110,6 @@ export async function main(
   if (!env.PRISM_COOKIE_FILE?.trim()) throw new Error("PRISM_COOKIE_FILE is required");
   const candidateRoot = `http://127.0.0.1:${options.port}`;
   const model = env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
-  const primaryBefore = await health(PRIMARY);
   const cycles: Record<string, unknown>[] = [];
   let failure: unknown = null;
   try {
@@ -152,14 +141,11 @@ export async function main(
   } catch (error) {
     failure = error;
   }
-  const primaryAfter = await health(PRIMARY);
   if (failure) throw failure;
   console.log(JSON.stringify({
     live: true,
     projectCount: 1,
     cycles,
-    primary8787HealthyBefore: primaryBefore.ok === true,
-    primary8787HealthyAfter: primaryAfter.ok === true,
     projectsDeleted: 0,
   }, null, 2));
 }

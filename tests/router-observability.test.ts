@@ -121,7 +121,7 @@ describe("router observability", () => {
     });
 
     const handle = await router.startRelay({
-      model: "gpt-5.6-sol",
+      model: "PRIVATE PROMPT IN MODEL",
       input: "must never appear in logs",
       stream: true,
     }, { source: "websocket", clientId: "private-client" });
@@ -140,7 +140,10 @@ describe("router observability", () => {
     ]);
     const serialized = JSON.stringify(logger.events);
     expect(serialized).not.toContain("must never appear");
+    expect(serialized).not.toContain("PRIVATE PROMPT IN MODEL");
     expect(serialized).not.toContain("private-client");
+    expect(logger.events.find(event => event.event === "request.accepted"))
+      .toMatchObject({ model: "unknown" });
     for (const event of logger.events) {
       expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
     }

@@ -1,8 +1,15 @@
 /** Concurrency test: fire N parallel requests at /v1/responses, report timings. */
 import { resolveGhostProvApiKey } from "../src/http/api-key";
 
+if (process.env.GP_LIVE_VERIFY !== "1") {
+  throw new Error("Set GP_LIVE_VERIFY=1 to run the paid candidate concurrency test");
+}
 const N = Number(process.argv[2] ?? "2");
-const SERVER = "http://localhost:8787";
+if (!Number.isSafeInteger(N) || N < 1 || N > 40) throw new RangeError("Concurrency must be 1 through 40");
+const SERVER = process.env.GP_BASE ?? "http://127.0.0.1:18888";
+if (!/^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(?:18888)(?:\/)?$/.test(SERVER)) {
+  throw new Error("GP_BASE must target the isolated loopback candidate on port 18888");
+}
 const API_KEY = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
 
 function body(i: number): string {

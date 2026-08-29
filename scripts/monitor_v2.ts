@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { resolveObservabilityConfig } from "../src/observability/config";
 import {
   observabilityEvent,
@@ -9,7 +8,11 @@ import {
   createObservabilityLogger,
   type LoggerLike,
 } from "../src/observability/logger";
-import { sanitizeDiagnosticMessage } from "../src/observability/redaction";
+import {
+  safeObservabilityModel,
+  sanitizeDiagnosticMessage,
+} from "../src/observability/redaction";
+import { resolveGhostProvApiKey } from "../src/http/api-key";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_STATES = new Set([
@@ -25,9 +28,12 @@ const RUNTIME_STATES = new Set([
   "failed",
   "stopped",
 ]);
+const MAX_MONITOR_RUNTIMES = 256;
+const MONITOR_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 
 export interface MonitorOptions {
   root: string;
+  apiKey: string;
   intervalMs: number;
   requestTimeoutMs: number;
 }
@@ -99,6 +105,7 @@ export function resolveMonitorOptions(
 ): MonitorOptions {
   return {
     root: monitorRoot(env.GP_MONITOR_ROOT),
+    apiKey: resolveGhostProvApiKey(env.GHOSTPROV_API_KEY),
     intervalMs: integer(
       env.GP_MONITOR_INTERVAL_MS,
       2_000,
@@ -147,21 +154,17 @@ function runtimeMetrics(value: unknown): JsonValue | null {
     if (!isRecord(raw)) return [];
     const problem = isRecord(raw.problem) ? raw.problem : null;
     const hint = isRecord(raw.hint) ? raw.hint : null;
+    const rawKind = typeof problem?.limitKind === "string" && problem.limitKind.length <= 64
+      ? problem.limitKind
+      : null;
     return [{
-      model: typeof problem?.model === "string"
-        ? problem.model.slice(0, 128)
-        : typeof raw.requestedModel === "string"
-          ? raw.requestedModel.slice(0, 128)
-          : fallbackModel.slice(0, 128),
-      organization: typeof problem?.organization === "string"
-        ? problem.organization.slice(0, 160)
-        : null,
-      kind: typeof problem?.limitKind === "string"
-        ? problem.limitKind.includes("token")
+      model: safeObservabilityModel(problem?.model ?? raw.requestedModel ?? fallbackModel),
+      kind: rawKind
+        ? rawKind.includes("token")
           ? "tpm"
-          : problem.limitKind.includes("request")
+          : rawKind.includes("request")
             ? "rpm"
-            : problem.limitKind.slice(0, 64)
+            : /^[a-z][a-z0-9_]{0,63}$/.test(rawKind) ? rawKind : null
         : null,
       limit: nullableMetric(problem?.tokenLimit ?? hint?.limitTokens),
       used: nullableMetric(problem?.usedTokens),
@@ -241,6 +244,7 @@ async function getJson(
   signal: AbortSignal,
   timedOut: () => boolean,
   fetchImpl: typeof fetch,
+  apiKey: string,
 ): Promise<{ status: number; value: unknown }> {
   let response: Response;
   try {
@@ -250,6 +254,9 @@ async function getJson(
       redirect: "error",
       credentials: "omit",
       cache: "no-store",
+      ...(path === "/__sandboxes"
+        ? { headers: { authorization: `Bearer ${apiKey}` } }
+        : {}),
     });
   } catch (error) {
     throw new MonitorPollError(
@@ -267,8 +274,48 @@ async function getJson(
     );
   }
   try {
-    return { status: response.status, value: await response.json() };
+    const declared = response.headers.get("content-length");
+    if (declared && /^\d+$/.test(declared) && Number(declared) > MONITOR_RESPONSE_MAX_BYTES) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new MonitorPollError(
+        "invalid_response",
+        `GET ${path} exceeded the bounded response limit`,
+        response.status,
+      );
+    }
+    const reader = response.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    if (reader) {
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          total += next.value.byteLength;
+          if (total > MONITOR_RESPONSE_MAX_BYTES) {
+            void reader.cancel().catch(() => undefined);
+            throw new MonitorPollError(
+              "invalid_response",
+              `GET ${path} exceeded the bounded response limit`,
+              response.status,
+            );
+          }
+          chunks.push(next.value.slice());
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+    }
+    const text = chunks.length === 0
+      ? ""
+      : Buffer.concat(chunks.map(chunk => Buffer.from(
+          chunk.buffer,
+          chunk.byteOffset,
+          chunk.byteLength,
+        )), total).toString("utf8");
+    return { status: response.status, value: JSON.parse(text) };
   } catch (error) {
+    if (error instanceof MonitorPollError) throw error;
     throw new MonitorPollError(
       "invalid_response",
       `GET ${path} returned invalid JSON`,
@@ -287,8 +334,8 @@ export async function pollMonitorSample(
   const scope = requestScope(options.requestTimeoutMs, parentSignal);
   try {
     const [health, sandboxes] = await Promise.all([
-      getJson(options.root, "/health", scope.signal, scope.timedOut, fetchImpl),
-      getJson(options.root, "/__sandboxes", scope.signal, scope.timedOut, fetchImpl),
+      getJson(options.root, "/health", scope.signal, scope.timedOut, fetchImpl, options.apiKey),
+      getJson(options.root, "/__sandboxes", scope.signal, scope.timedOut, fetchImpl, options.apiKey),
     ]);
     if (!isRecord(health.value) || !isRecord(sandboxes.value)) {
       throw new MonitorPollError(
@@ -297,7 +344,7 @@ export async function pollMonitorSample(
       );
     }
     const runtimes = Array.isArray(sandboxes.value.runtimes)
-      ? sandboxes.value.runtimes.slice(0, 4_096)
+      ? sandboxes.value.runtimes.slice(0, MAX_MONITOR_RUNTIMES)
         .map(runtimeMetrics)
         .filter((runtime): runtime is JsonValue => runtime !== null)
       : [];

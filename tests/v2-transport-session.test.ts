@@ -586,6 +586,149 @@ describe("V2TransportSession", () => {
     await Promise.allSettled([handle.final]);
   });
 
+  it("delivers an independent R2 response without acknowledging past a backpressured gap", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 2 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    const bodyA = {
+      model: "gpt-5.6-sol",
+      input: "response A",
+      previous_response_id: "resp_parent_a",
+      stream: false,
+      store: false,
+    };
+    const bodyB = {
+      model: "gpt-5.6-sol",
+      input: "response B",
+      previous_response_id: "resp_parent_b",
+      stream: false,
+      store: false,
+    };
+    const [digestA, digestB] = await Promise.all([bodyA, bodyB].map(body => sha256Hex(
+      utf8Bytes(canonicalJson({ ...body, stream: true, store: true })),
+    )));
+    await harness.start();
+    const pendingA = harness.session.run(bodyA);
+    const pendingB = harness.session.run(bodyB);
+    void pendingA.catch(() => undefined);
+    void pendingB.catch(() => undefined);
+
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].filter(frame => frame.kind === "request_commit").length === 2
+    ));
+    const commits = [...harness.hostFrames.values()].filter(
+      (frame): frame is ReliableFrame<R2RequestCommitFrame> => frame.kind === "request_commit",
+    );
+    const commitA = commits.find(frame => frame.requestDigest === digestA)!;
+    const commitB = commits.find(frame => frame.requestDigest === digestB)!;
+    expect(commitA).toBeDefined();
+    expect(commitB).toBeDefined();
+    const prepared = [commitA, commitB].map((frame): SidecarFrame => ({
+      kind: "request_prepared",
+      requestId: frame.requestId,
+      protocolRevision: "r2",
+      schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+      projectId: frame.projectId,
+      sessionId: frame.sessionId,
+      leaderGeneration: frame.leaderGeneration,
+      buildHash: frame.buildHash,
+      schemaHash: frame.schemaHash,
+      launchNonce: frame.launchNonce,
+      hostInstanceId: frame.hostInstanceId,
+      targetInstanceId: frame.targetInstanceId,
+      requestDigest: frame.requestDigest,
+      decodedBytes: frame.decodedBytes,
+      encodedBytes: frame.encodedBytes,
+      encoding: frame.encoding,
+      partCount: frame.partCount,
+    }));
+    harness.publish(prepared);
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].filter(frame => frame.kind === "request_start").length === 2
+    ));
+    harness.publish([commitA, commitB].flatMap((frame): SidecarFrame[] => [{
+      kind: "request_ack",
+      requestId: frame.requestId,
+      requestDigest: frame.requestDigest,
+      committed: true,
+    }, {
+      kind: "upstream_prelude",
+      requestId: frame.requestId,
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: null,
+    }]));
+    await harness.settle();
+    const [handleA, handleB] = await Promise.all([pendingA, pendingB]);
+    const finalA = handleA.final.catch(error => error);
+    const finalB = handleB.final.catch(error => error);
+    const responseStartSequence = harness.sidecarSequence;
+    const responsePart = (
+      requestId: string,
+      eventIndex: number,
+      data: string,
+    ): SidecarFrame => ({
+      kind: "response_event",
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes(data)),
+    });
+
+    harness.publish([
+      responsePart(commitA.requestId, 0, "a".repeat(100)),
+      responsePart(commitA.requestId, 1, "A".repeat(100)),
+      responsePart(commitB.requestId, 0, "B"),
+    ]);
+    await harness.settle();
+    const eventsB = handleB.events();
+    const nextB = eventsB.next();
+    await harness.settle();
+    expect(await promiseState(nextB)).toBe("settled");
+    await expect(nextB).resolves.toMatchObject({
+      done: false,
+      value: { event: "response.output_text.delta", data: "B" },
+    });
+    // B completed out of sequence, but the cumulative ACK must stop after A0
+    // until the full A buffer makes room for A1.
+    expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
+      .toBe(responseStartSequence);
+
+    const eventsA = handleA.events();
+    await expect(eventsA.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: "response.output_text.delta", data: "a".repeat(100) },
+    });
+    await harness.settleUntil(() => Math.max(
+      ...harness.hostEnvelopes.map(envelope => envelope.ack.sequence),
+    ) === harness.sidecarSequence - 1);
+    await expect(eventsA.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: "response.output_text.delta", data: "A".repeat(100) },
+    });
+    await eventsA.return(undefined);
+    await eventsB.return(undefined);
+    await harness.close();
+    await Promise.all([finalA, finalB]);
+    expect(pool.snapshot()).toMatchObject({
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      activePermits: 0,
+    });
+    pool.close();
+  });
+
   it("lets cancellation close a backpressured request without poisoning the transport", async () => {
     const harness = new TransportHarness({
       maxResponseBytes: 4_096,
@@ -2193,6 +2336,22 @@ describe("V2TransportSession", () => {
     transcript.append(completed);
     const terminal = await transcript.createTerminal();
 
+    const originalAppendCanonicalStream = TranscriptProof.prototype.appendCanonicalStream;
+    let cooperativeYields = 0;
+    const appendCanonicalStream = spyOn(
+      TranscriptProof.prototype,
+      "appendCanonicalStream",
+    ).mockImplementation(function (this: TranscriptProof<boolean>, frame, options = {}) {
+      const upstreamYield = options.yieldTask;
+      return originalAppendCanonicalStream.call(this, frame, {
+        ...options,
+        yieldTask: async () => {
+          cooperativeYields++;
+          await upstreamYield?.();
+        },
+      });
+    });
+
     const bytes = utf8Bytes(data);
     const partBytes = 8 * 1024;
     const partCount = Math.ceil(bytes.byteLength / partBytes);
@@ -2209,9 +2368,16 @@ describe("V2TransportSession", () => {
         dataBase64Url: base64UrlEncode(bytes.subarray(offset, offset + partBytes)),
       };
     });
-    for (let offset = 0; offset < parts.length; offset += 16) {
-      harness.publish(parts.slice(offset, offset + 16));
-      await harness.settle();
+    try {
+      for (let offset = 0; offset < parts.length; offset += 16) {
+        harness.publish(parts.slice(offset, offset + 16));
+        await harness.settle();
+      }
+
+      expect(appendCanonicalStream).toHaveBeenCalled();
+      expect(cooperativeYields).toBeGreaterThan(0);
+    } finally {
+      appendCanonicalStream.mockRestore();
     }
 
     expect(pool.snapshot()).toMatchObject({

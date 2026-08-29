@@ -949,6 +949,151 @@ function replaySafeJsonNumbers(
   return true;
 }
 
+/**
+ * Validates the raw provider argument text without constructing another value
+ * tree. Object member order and insignificant whitespace are intentionally
+ * ignored, while duplicate keys and number spellings that JavaScript would
+ * change on the Anthropic JSON round trip make the replay ineligible.
+ */
+function losslessToolArguments(value: string): boolean {
+  let cursor = 0;
+  let nodes = 0;
+  let keyCount = 0;
+
+  const skipWhitespace = (): void => {
+    while (cursor < value.length) {
+      const unit = value.charCodeAt(cursor);
+      if (unit !== 0x20 && unit !== 0x09 && unit !== 0x0a && unit !== 0x0d) break;
+      cursor++;
+    }
+  };
+
+  const stringToken = (): { start: number; end: number } | null => {
+    if (value.charCodeAt(cursor) !== 0x22) return null;
+    const start = cursor++;
+    while (cursor < value.length) {
+      const unit = value.charCodeAt(cursor++);
+      if (unit === 0x22) return { start, end: cursor };
+      if (unit < 0x20) return null;
+      if (unit !== 0x5c) continue;
+      if (cursor >= value.length) return null;
+      const escaped = value.charCodeAt(cursor++);
+      if (escaped === 0x75) {
+        if (cursor + 4 > value.length ||
+          !/^[0-9a-fA-F]{4}$/.test(value.slice(cursor, cursor + 4))) return null;
+        cursor += 4;
+      } else if (escaped !== 0x22 && escaped !== 0x5c && escaped !== 0x2f &&
+        escaped !== 0x62 && escaped !== 0x66 && escaped !== 0x6e &&
+        escaped !== 0x72 && escaped !== 0x74) {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const numberToken = (): boolean => {
+    const start = cursor;
+    if (value.charCodeAt(cursor) === 0x2d) cursor++;
+    if (value.charCodeAt(cursor) === 0x30) {
+      cursor++;
+    } else {
+      const first = value.charCodeAt(cursor);
+      if (first < 0x31 || first > 0x39) return false;
+      do cursor++;
+      while (value.charCodeAt(cursor) >= 0x30 && value.charCodeAt(cursor) <= 0x39);
+    }
+    if (value.charCodeAt(cursor) === 0x2e) {
+      cursor++;
+      const first = value.charCodeAt(cursor);
+      if (first < 0x30 || first > 0x39) return false;
+      do cursor++;
+      while (value.charCodeAt(cursor) >= 0x30 && value.charCodeAt(cursor) <= 0x39);
+    }
+    const exponent = value.charCodeAt(cursor);
+    if (exponent === 0x65 || exponent === 0x45) {
+      cursor++;
+      const sign = value.charCodeAt(cursor);
+      if (sign === 0x2b || sign === 0x2d) cursor++;
+      const first = value.charCodeAt(cursor);
+      if (first < 0x30 || first > 0x39) return false;
+      do cursor++;
+      while (value.charCodeAt(cursor) >= 0x30 && value.charCodeAt(cursor) <= 0x39);
+    }
+    const raw = value.slice(start, cursor);
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && JSON.stringify(parsed) === raw;
+  };
+
+  const parseValue = (depth: number): boolean => {
+    if (depth > MAX_RESPONSES_JSON_DEPTH || ++nodes > MAX_SYNCHRONOUS_REPLAY_NODES) {
+      return false;
+    }
+    skipWhitespace();
+    const unit = value.charCodeAt(cursor);
+    if (unit === 0x22) return stringToken() !== null;
+    if (unit === 0x7b) return parseObject(depth + 1);
+    if (unit === 0x5b) return parseArray(depth + 1);
+    for (const literal of ["true", "false", "null"] as const) {
+      if (value.startsWith(literal, cursor)) {
+        cursor += literal.length;
+        return true;
+      }
+    }
+    return numberToken();
+  };
+
+  const parseArray = (depth: number): boolean => {
+    cursor++;
+    skipWhitespace();
+    if (value.charCodeAt(cursor) === 0x5d) {
+      cursor++;
+      return true;
+    }
+    for (;;) {
+      if (!parseValue(depth)) return false;
+      skipWhitespace();
+      const unit = value.charCodeAt(cursor++);
+      if (unit === 0x5d) return true;
+      if (unit !== 0x2c) return false;
+    }
+  };
+
+  const parseObject = (depth: number): boolean => {
+    cursor++;
+    skipWhitespace();
+    if (value.charCodeAt(cursor) === 0x7d) {
+      cursor++;
+      return true;
+    }
+    const keys = new Set<string>();
+    for (;;) {
+      if (++keyCount > MAX_SYNCHRONOUS_REPLAY_NODES) return false;
+      const token = stringToken();
+      if (!token) return false;
+      let key: unknown;
+      try {
+        key = JSON.parse(value.slice(token.start, token.end));
+      } catch {
+        return false;
+      }
+      if (typeof key !== "string" || keys.has(key)) return false;
+      keys.add(key);
+      skipWhitespace();
+      if (value.charCodeAt(cursor++) !== 0x3a || !parseValue(depth)) return false;
+      skipWhitespace();
+      const unit = value.charCodeAt(cursor++);
+      if (unit === 0x7d) return true;
+      if (unit !== 0x2c) return false;
+      skipWhitespace();
+    }
+  };
+
+  skipWhitespace();
+  if (!parseValue(0)) return false;
+  skipWhitespace();
+  return cursor === value.length;
+}
+
 const MESSAGE_REPLAY_KEYS = new Set([
   "type", "id", "status", "role", "content", "phase",
 ]);
@@ -1045,6 +1190,7 @@ function expectedReplayItems(
           !hasOnlyReplayKeys(item.caller, DIRECT_CALLER_REPLAY_KEYS)))) {
       return null;
     }
+    if (!losslessToolArguments(item.arguments)) return null;
     let input: Record<string, unknown>;
     const projectedTool = projectedTools[projectedToolIndex++];
     if (validatedFunctionArguments?.(outputIndex, item) && projectedTool &&

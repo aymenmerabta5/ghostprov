@@ -1,5 +1,5 @@
 /**
- * Wire-level tool-call integrity test against localhost:8787/v1/responses.
+ * Wire-level tool-call integrity test against the isolated candidate.
  *
  * Turn 1: force a function call via tools[], capture RAW SSE frames and assert:
  *   - ordered Responses-API events arrive verbatim (created → deltas → done → completed)
@@ -11,7 +11,13 @@
  */
 import { resolveGhostProvApiKey } from "../src/http/api-key";
 
-const BASE = process.env.GP_BASE ?? "http://localhost:8787";
+if (process.env.GP_LIVE_VERIFY !== "1") {
+  throw new Error("Set GP_LIVE_VERIFY=1 to run the paid candidate tool-call test");
+}
+const BASE = process.env.GP_BASE ?? "http://127.0.0.1:18888";
+if (!/^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(?:18888)(?:\/)?$/.test(BASE)) {
+  throw new Error("GP_BASE must target the isolated loopback candidate on port 18888");
+}
 const MODEL = process.env.GP_MODEL ?? "gpt-5.6-luna";
 const API_KEY = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
 

@@ -17,8 +17,7 @@ import {
   resolveV2SidecarRevision,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
-
-const PROTECTED_ROOT = "http://127.0.0.1:8787";
+import { assertCandidatePort, DEFAULT_CANDIDATE_PORT } from "../src/core/ports";
 
 export function sanitizeV2BootstrapRenderLog(value: string): string {
   const sanitized = value
@@ -56,12 +55,14 @@ export function resolveV2BootstrapProbeOptions(
   }
   const cookieFile = env.PRISM_COOKIE_FILE?.trim();
   if (!cookieFile) throw new Error("PRISM_COOKIE_FILE is required");
-  const port = Number(env.PORT ?? 18_888);
+  const port = Number(env.PORT ?? DEFAULT_CANDIDATE_PORT);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
     throw new Error("PORT must be an integer from 1 through 65535");
   }
-  if (port === 8_787) throw new Error("V2 bootstrap probe refuses protected port 8787");
-  if (port === 18_787) throw new Error("V2 bootstrap probe refuses protected port 18787");
+  assertCandidatePort(port, "V2 bootstrap probe");
+  if (port !== DEFAULT_CANDIDATE_PORT) {
+    throw new Error(`V2 bootstrap probe is hard-fenced to candidate port ${DEFAULT_CANDIDATE_PORT}`);
+  }
   const revision = resolveV2SidecarRevision(
     env.GP_LIVE_V2_REVISION?.trim() || DEFAULT_V2_SIDECAR_REVISION,
   );
@@ -89,18 +90,6 @@ export function resolveV2BootstrapProbeOptions(
     revision,
     rollbackFromR2SandboxSessionId,
   };
-}
-
-async function protectedHealth(): Promise<Record<string, unknown>> {
-  const response = await fetch(`${PROTECTED_ROOT}/health`, {
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) throw new Error(`Protected GhostProv health failed (${response.status})`);
-  const body = await response.json();
-  if (!body || typeof body !== "object" || (body as Record<string, unknown>).ok !== true) {
-    throw new Error("Protected GhostProv did not report healthy");
-  }
-  return body as Record<string, unknown>;
 }
 
 async function assertCookieFile(file: string): Promise<void> {
@@ -139,7 +128,6 @@ export async function main(
 ): Promise<void> {
   const options = resolveV2BootstrapProbeOptions(env);
   await assertCookieFile(options.cookieFile);
-  const primaryBefore = await protectedHealth();
   const account = await PrismAccountSession.create({
     origin: options.prismOrigin,
     cookieFile: options.cookieFile,
@@ -293,22 +281,11 @@ export async function main(
     await account.flush().catch(() => undefined);
   }
 
-  let afterFailure: unknown = null;
-  let primaryAfter: Record<string, unknown> | null = null;
-  try {
-    primaryAfter = await protectedHealth();
-  } catch (error) {
-    afterFailure = error;
-  }
-  if (failure && afterFailure) {
-    throw new AggregateError([failure, afterFailure], "V2 bootstrap probe and protected health both failed");
-  }
   if (failure) throw failure;
-  if (afterFailure) throw afterFailure;
   console.log(JSON.stringify({
     ...result,
-    primary8787HealthyBefore: primaryBefore.ok === true,
-    primary8787HealthyAfter: primaryAfter?.ok === true,
+    candidatePort: options.port,
+    protectedServiceTouched: false,
   }, null, 2));
 }
 

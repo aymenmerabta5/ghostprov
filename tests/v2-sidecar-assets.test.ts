@@ -7,6 +7,7 @@ import {
   loadV2SidecarAssets,
   resolveV2SidecarRevision,
   V2_R1_RELEASE,
+  V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY,
   V2_R2_RELEASE,
   V2_R3_RELEASE,
   V2_R4_RELEASE,
@@ -14,6 +15,8 @@ import {
   V2_R6_RELEASE,
   V2_R7_RELEASE,
   V2_R8_RELEASE,
+  V2_RETIREMENT_RELEASE_IDENTITIES,
+  V2_SELECTABLE_RELEASE_IDENTITIES,
 } from "../src/v2/sidecar/assets";
 import { protocolSchemaHash } from "../src/v2/protocol/shared";
 
@@ -229,6 +232,23 @@ describe("V2 sidecar assets", () => {
       ...assets,
       revision: "r2",
     }, "r1")).rejects.toThrow(/revision mismatch/i);
+  });
+
+  it("keeps the original R2 identity retirement-only", async () => {
+    expect(V2_RETIREMENT_RELEASE_IDENTITIES).toContain(
+      V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY,
+    );
+    expect(V2_SELECTABLE_RELEASE_IDENTITIES).not.toContain(
+      V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY,
+    );
+    expect(V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY).toMatchObject({
+      revision: "r2",
+      protocolRevision: "r2",
+      buildHash: "21457e48716e99e82d48521ca43c60335ffd9933f4e1e258e252709c9525da6a",
+      bundleSha256: "fd76939a0e53638737aa60e4ea13ba27a870f8938ff20bf74354bd8efe87ef73",
+    });
+    await expect(loadV2SidecarAssets({ revision: "r2" }))
+      .resolves.toMatchObject({ buildHash: V2_R2_RELEASE.buildHash });
   });
 
   it("exposes the authorized R7 to R8 markers across exact frozen identities", async () => {

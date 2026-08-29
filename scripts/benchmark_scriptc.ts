@@ -12,3 +12,5 @@ const processResult = Bun.spawn([
 ], { stdout: "inherit", stderr: "inherit", stdin: "inherit" });
 const exitCode = await processResult.exited;
 if (exitCode !== 0) process.exit(exitCode);
+
+export {};

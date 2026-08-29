@@ -2,7 +2,7 @@
 
 GhostProv is a browserless OpenAI-compatible router over independent Prism sandbox projects. Per-project Deno Awareness sidecars distribute work while preserving terminal proof, provider-persisted continuation, GPT Image compatibility, and Claude/Codex streaming.
 
-The project is pinned to Bun 1.4.0, TypeScript 7.0.2, and `bun test --isolate`. Playwright and Chromium are not runtime dependencies.
+The project is pinned to Bun 1.4.0, TypeScript 7.0.2, and the hermetic `bun run test` gate. Playwright and Chromium are not runtime dependencies.
 
 ## Browserless configuration
 
@@ -12,6 +12,10 @@ Every sandbox uses a separate explicitly allowlisted Prism project under the sam
 $env:PRISM_PROJECT_IDS = "project-uuid-1,project-uuid-2,project-uuid-3,project-uuid-4"
 $env:PRISM_COOKIE_FILE = "D:\secrets\prism-cookies.json"
 $env:GP_PRISM_SESSION = "authenticated"
+$keyBytes = New-Object byte[] 32
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $rng.GetBytes($keyBytes) } finally { $rng.Dispose() }
+$env:GHOSTPROV_API_KEY = [Convert]::ToBase64String($keyBytes)
 $env:GP_CANDIDATE = "1"
 $env:PORT = "18888"
 bun run dev
@@ -21,7 +25,7 @@ bun run dev
 
 Port `18787` is the protected existing inference gateway and is never a candidate or test listener. Development and live verification use `18888` or an OS-assigned port; lifecycle commands must not target the protected service. Stable project UUIDs and worker indexes are persisted in `.ghostprov/fleet.json`; restarts reuse them and never create a new fleet blindly.
 
-V2-only mode requires an explicit allowlist of existing `PRISM_PROJECT_IDS`. GhostProv never creates or adopts an unlisted project. The signed-in session is the production default. Guest mode requires `GP_PRISM_SESSION=anonymous` and `GP_ALLOW_ANONYMOUS=1`, and remains capped separately by `GP_GUEST_MAX_PROJECTS`.
+V2-only mode requires an explicit allowlist of existing `PRISM_PROJECT_IDS`. GhostProv never creates or adopts an unlisted project. The signed-in session is the production default. Explicit guest mode uses `GP_PRISM_SESSION=anonymous` and remains capped separately by `GP_GUEST_MAX_PROJECTS`; `GP_ALLOW_ANONYMOUS=1` only permits `GP_PRISM_SESSION=auto` to create a guest when no authenticated session is available.
 
 ## Architecture
 
@@ -114,14 +118,14 @@ One sequential Codex task normally uses one lane. High utilization requires mult
 
 ```powershell
 $env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
-$env:OPENAI_API_KEY = "GHOST_IS_KING"
+$env:OPENAI_API_KEY = $env:GHOSTPROV_API_KEY
 curl.exe -X POST http://127.0.0.1:18787/v1/responses `
-  -H "Authorization: Bearer GHOST_IS_KING" `
+  -H "Authorization: Bearer $env:GHOSTPROV_API_KEY" `
   -H "content-type: application/json" `
   -d '{"model":"gpt-5.6-sol","store":true,"input":"Reply with hello"}'
 ```
 
-Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. Health and sandbox-monitor endpoints remain available without credentials. Use `stream:true` for incremental SSE; omitted or false client `stream` still produces a JSON final while the upstream body is normalized to `stream:true`. Client `store` hints are accepted for compatibility but the upstream body is always `store:true`. Every non-image upstream request is forced to `service_tier:"fast"`; image-tool requests continue to omit unsupported service tiers. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
+Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. `GHOSTPROV_API_KEY` is an explicit single-token value of at least 32 characters; there is no shared development-key fallback. `GET /health` remains unauthenticated, while `GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential. Use `stream:true` for incremental SSE; omitted or false client `stream` still produces a JSON final while the upstream body is normalized to `stream:true`. Client `store` hints are accepted for compatibility but the upstream body is always `store:true`. Every non-image upstream request is forced to `service_tier:"fast"`; image-tool requests continue to omit unsupported service tiers. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
 ## Anthropic Messages and Claude Code
 
@@ -129,11 +133,11 @@ The production Anthropic adapter is part of the same `createGhostProvApp` and us
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787"
-$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"
+$env:ANTHROPIC_API_KEY = $env:GHOSTPROV_API_KEY
 claude
 ```
 
-The equivalent values are `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and `ANTHROPIC_API_KEY=GHOST_IS_KING`. Anthropic routes require either an exact `x-api-key: <GHOSTPROV_API_KEY>` or `Authorization: Bearer <GHOSTPROV_API_KEY>`. The SDK adds the required `anthropic-version: 2023-06-01` header itself, so normal Claude Code setup does not configure that header separately.
+The equivalent values are `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and `ANTHROPIC_API_KEY=<GHOSTPROV_API_KEY>`. Anthropic routes require either an exact `x-api-key: <GHOSTPROV_API_KEY>` or `Authorization: Bearer <GHOSTPROV_API_KEY>`. The SDK adds the required `anthropic-version: 2023-06-01` header itself, so normal Claude Code setup does not configure that header separately.
 
 Supported Anthropic routes are:
 
@@ -160,11 +164,11 @@ Messages supports streaming and non-streaming text, client tool use/results (inc
 
 ### Separate-port forwarding verifier
 
-`bun run verify:claude-code` is a disposable branch verifier, not a production proxy. It defaults to `127.0.0.1:18788` and forwards translated Responses streams to the loopback root in `GP_CLAUDE_VERIFY_UPSTREAM` (default `http://127.0.0.1:18787`). Override the listener with `GP_CLAUDE_VERIFY_PORT` only when another non-protected loopback port is needed:
+`bun run verify:claude-code` is a disposable branch verifier, not a production proxy. It defaults to `127.0.0.1:18788` and forwards translated Responses streams to the isolated candidate root in `GP_CLAUDE_VERIFY_UPSTREAM` (default `http://127.0.0.1:18888`). It refuses the protected service port `18787`. Override the listener with `GP_CLAUDE_VERIFY_PORT` only when another non-protected loopback port is needed:
 
 ```powershell
 $env:GP_CLAUDE_VERIFY_PORT = "18788"
-$env:GP_CLAUDE_VERIFY_UPSTREAM = "http://127.0.0.1:18787"
+$env:GP_CLAUDE_VERIFY_UPSTREAM = "http://127.0.0.1:18888"
 bun run verify:claude-code
 ```
 
@@ -172,7 +176,7 @@ In a second terminal, point Claude Code at the verifier rather than the producti
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18788"
-$env:ANTHROPIC_API_KEY = "GHOST_IS_KING"
+$env:ANTHROPIC_API_KEY = Read-Host "Enter the same explicit GHOSTPROV_API_KEY"
 claude
 ```
 
@@ -216,7 +220,7 @@ Start the read-only external monitor against an already-running router without r
 bun run monitor:v2
 ```
 
-It polls only `GET /health` and `GET /__sandboxes`, retries failures with capped exponential jitter, and writes `monitor.sample` or sanitized `monitor.error` JSONL events. The default target is `http://127.0.0.1:18787`; non-loopback roots and roots containing paths, credentials, queries, or fragments are rejected. Ctrl+C stops only the monitor and flushes its log.
+It polls only `GET /health` and authenticated `GET /__sandboxes`, retries failures with capped exponential jitter, and writes `monitor.sample` or sanitized `monitor.error` JSONL events. The default target is `http://127.0.0.1:18787`; it reads `GHOSTPROV_API_KEY` for the sandbox snapshot, and non-loopback roots or roots containing paths, credentials, queries, or fragments are rejected. Ctrl+C stops only the monitor and flushes its log.
 
 Built-in tracing starts with the upgraded router after the operator's next manual restart. It records `request.accepted`, `admission.acquired`, `request.queued`, `route.selected`, `route.attempt_expired`, `transport.committed`, `response.first_event`, and exactly one `request.completed` or `request.failed`. Selected routes and expired attempts include a bounded capacity reason without request content. Commit events include decoded/encoded request bytes, compression ratio, part count, encoding, assembly, durable claim, prepare-to-start, fetch-start sync, scheduler, and transport-residual timing. A periodic `fleet.sample` adds separately measured host external/ArrayBuffer memory, CPU, event-loop delay, logger pressure, aggregate capacity, lifecycle-ready and actually-routable runtime counts, per-runtime availability reasons, interval requests/second and success rate, response bytes, retries, uniquely acknowledged goodput, retransmitted bytes, stall transitions, observation-only upstream rate-limit evidence, and bounded p50/p95/max distributions for queue wait, commit ACK, first byte, and total latency. When the sidecar runtime exposes them, the same sample includes process CPU deltas, ArrayBuffer bytes, and bounded rolling GC/event-loop observations; missing platform metrics stay `null` rather than being estimated. Full samples remain in JSONL while the console prints a fixed-size fleet rollup. The external monitor provides immediate fleet visibility, but only built-in tracing can attribute per-request queue, commit, first-event, and total latency.
 
@@ -249,11 +253,11 @@ For boundary-level V2 diagnostics, explicitly enable instrumentation, manually r
 ```powershell
 $env:GP_V2_DIAGNOSTICS = "1"
 $env:GP_LIVE_V2_DIAGNOSTICS = "1"
-$env:GP_V2_DIAGNOSTIC_ROOT = "http://127.0.0.1:18787"
+$env:GP_V2_DIAGNOSTIC_ROOT = "http://127.0.0.1:18888"
 bun run diagnose:v2-concurrency
 ```
 
-The probe uses identical 256 KiB request bodies, three waves per stage, waits for fleet idle, never touches port 8787, and writes only timing/counter summaries under `.ghostprov/diagnostics`. It incurs real API usage and never records request or response content.
+The probe uses identical 256 KiB request bodies, three waves per stage, waits for the candidate fleet to become idle, refuses protected port `18787`, and writes only timing/counter summaries under `.ghostprov/diagnostics`. It incurs real API usage and never records request or response content.
 
 ## Lifecycle and recovery
 
@@ -278,7 +282,7 @@ Heartbeat requests have a five-second deadline inside the exact ten-second caden
 
 `bun run start:supervised` runs a cross-platform supervisor that owns the public loopback port and proxies to one internal GhostProv worker. It restarts crashed workers with bounded backoff. A worker becomes selectable only after its own IPC channel proves the exact PID, allocated port, and supervisor generation; an unrelated local listener returning HTTP 200/503 can never satisfy readiness or receive queued API bodies. A planned `bun run upgrade` stops new worker dispatch, lets existing HTTP responses finish, closes persistent Responses WebSockets with restart code `1012`, gracefully stops the old worker, starts exactly one replacement, then releases requests queued at the stable public listener. The restart queue is bounded by both count and declared request bytes; overflowed HTTP and WebSocket handshakes receive an immediate credential-free `503 host_queue_full` instead of retaining bodies and timers for the full wait. Old and new workers never manage the same Prism projects concurrently. This rolling worker restart deliberately keeps the supervisor's immutable startup environment; it does **not** reload an edited `.env`.
 
-The supervisor exposes `GET /__supervisor`, writes its current state to `.ghostprov/supervisor.json`, and appends bounded structured history to `.ghostprov/logs/supervisor.jsonl`. Status persistence coalesces bursts to at most one in-flight write and one latest dirty snapshot instead of writing once per forwarded request. `host.supervisor.sample` records request rate, proxy errors, exact queued request/byte pressure, rejections, active requests, WebSockets, generations, crashes, restart backoff, and upgrade duration. The first migration from a directly bound `18787` process still requires the operator to stop that old process once; after the supervisor owns the port, upgrades do not require rebinding it.
+The supervisor exposes bearer-authenticated `GET /__supervisor`, writes its current state to `.ghostprov/supervisor.json`, and appends bounded structured history to `.ghostprov/logs/supervisor.jsonl`. Status persistence coalesces bursts to at most one in-flight write and one latest dirty snapshot instead of writing once per forwarded request. `host.supervisor.sample` records request rate, proxy errors, exact queued request/byte pressure, rejections, active requests, WebSockets, generations, crashes, restart backoff, and upgrade duration. The first migration from a directly bound `18787` process still requires the operator to stop that old process once; after the supervisor owns the port, upgrades do not require rebinding it.
 
 Each supervisor process also atomically publishes `.ghostprov/supervisor-control.json`, a non-secret discovery record written with mode `0600` where supported and containing its PID, start time, random instance nonce, configured control/status paths, and lifecycle timeouts. Every upgrade/shutdown request has an exact schema, random request ID, action, timestamp, and descriptor-derived PID/start/nonce target. The supervisor parses content identity rather than trusting filesystem timestamp ordering, so stale-generation writes, duplicate IDs, equal/coarse timestamps, and backward timestamps cannot control a fresh process. Helpers re-read the descriptor after their atomic request rename and retry against a replacement rather than claiming a stale write succeeded. Lifecycle waits are capped at 1,800 seconds; systemd retains a finite 1,860-second cgroup-owned last resort, so it never signals a bare PID from the descriptor and cannot wait forever on a hung supervisor.
 
@@ -345,8 +349,8 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
-| `PORT` in candidate mode | `18787` | Protected candidate listener; `8787` is rejected |
-| `GHOSTPROV_API_KEY` | `GHOST_IS_KING` | Shared inbound key required by every OpenAI/Anthropic `/v1/*` route and Responses WebSocket upgrade |
+| `PORT` in candidate mode | `18888` | Dedicated candidate listener; protected port `18787` is rejected |
+| `GHOSTPROV_API_KEY` | required | Explicit single-token key of at least 32 characters, shared by every protected HTTP route and Responses WebSocket upgrade |
 | `GP_SUPERVISOR_READY_TIMEOUT_MS` | `120000` | Maximum internal-worker startup time |
 | `GP_SHUTDOWN_DRAIN_MS` | `300000` | Maximum wait for active terminal proofs during graceful shutdown |
 | `GP_SUPERVISOR_GRACE_MS` | `330000` | Graceful drain before force-stopping only the owned worker |
@@ -367,14 +371,14 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 | `GP_V2_YSWEET_REFRESH_MS` | `2700000` | Encrypted reconnect-credential rotation horizon |
 | WebSocket active responses | `16` | Per-connection active response ceiling |
 | WebSocket named lanes | `32` | Per-connection named-lane ceiling |
-| `GP_IMAGE_EDIT_MAX_INPUT_BYTES` | `41943040` | Raw multipart edit-input budget |
-| `GP_IMAGE_EDIT_HTTP_MAX_BODY_BYTES` | `44040192` | Multipart envelope ceiling |
+| Image edit aggregate raw input | `41943040` | Fixed production limit across edit images and mask; not an environment setting |
+| Image edit HTTP request body | `67108864` | Fixed production envelope ceiling inherited from the shared HTTP body limit |
 | `GP_ANTHROPIC_OPUS_MODEL` | `gpt-5.6-sol` | Default target for Claude Opus names |
 | `GP_ANTHROPIC_SONNET_MODEL` | `gpt-5.6-terra` | Default target for Claude Sonnet names |
 | `GP_ANTHROPIC_HAIKU_MODEL` | `gpt-5.6-luna` | Default target for Claude Haiku names |
 | `GP_ANTHROPIC_DEFAULT_MODEL` | `gpt-5.6-sol` | Fallback for unknown model names |
 | `GP_CLAUDE_VERIFY_PORT` | `18788` | Separate loopback-only verifier listener |
-| `GP_CLAUDE_VERIFY_UPSTREAM` | `http://127.0.0.1:18787` | Loopback root used only by the verifier |
+| `GP_CLAUDE_VERIFY_UPSTREAM` | `http://127.0.0.1:18888` | Isolated candidate root used only by the verifier; protected `18787` is rejected |
 | `GP_LOG_LEVEL` | `info` | `off`, `error`, `info`, or `debug` bounded JSONL tracing |
 | `GP_LOG_DIR` | `.ghostprov/logs` | Absolute or working-directory-relative log directory |
 | `GP_LOG_ROTATE_BYTES` | `67108864` | Active-file rotation threshold (64 MiB) |
@@ -395,10 +399,11 @@ Only manifest records with `managed:true` can be deleted. Explicit user projects
 ## Tests
 
 ```powershell
-bun test --isolate
+bun run test
 bun run test:unit
 bun run test:integration
 bun run typecheck
+bun --no-env-file node_modules/typescript/bin/tsc --project tsconfig.scripts.json
 bun audit --production
 ```
 
@@ -489,6 +494,7 @@ The isolated suite includes:
 - `tests/sandbox-liveness.test.ts`
 - `tests/supervised-runtime.test.ts`
 - `tests/sandbox-ydoc.test.ts`
+- `tests/security-observability-boundaries.test.ts`
 - `tests/session-manager.test.ts`
 - `tests/server-main-lifecycle.test.ts`
 - `tests/sse.test.ts`
@@ -542,6 +548,7 @@ The isolated suite includes:
 - `tests/v2-publication-pacer.test.ts`
 - `tests/v2-response-batch.test.ts`
 - `tests/v2-response-batcher.test.ts`
+- `tests/v2-release-observability.test.ts`
 - `tests/v2-run-handle.test.ts`
 - `tests/v2-runtime-completion.test.ts`
 - `tests/v2-runtime.test.ts`
@@ -607,7 +614,7 @@ $env:OPENAI_BASE_URL = "http://127.0.0.1:18888/v1"
 bun run verify:multi-sandbox
 ```
 
-The load script verifies exact output markers, unique response IDs, peak physical occupancy, per-runtime occupancy, zero under-capacity queueing, zero quarantines, and port 8787 health before and after the candidate run.
+The load script verifies exact output markers, unique response IDs, peak physical occupancy, per-runtime occupancy, zero under-capacity queueing, and zero quarantines against the candidate only; it refuses and never probes protected port `18787`.
 
 Run Codex-compatible HTTP streaming, provider-persisted WebSocket tool continuation, and eight concurrent named lanes:
 
@@ -623,13 +630,13 @@ Native GPT Image generation and multipart editing are separately opt-in because 
 $env:GP_LIVE_VERIFY = "1"
 $env:GP_LIVE_IMAGE = "1"
 $env:GP_LIVE_IMAGE_EDIT = "1"
-$env:OPENAI_BASE_URL = "http://127.0.0.1:18787/v1"
+$env:OPENAI_BASE_URL = "http://127.0.0.1:18888/v1"
 bun run verify:live
 ```
 
 ## V2 verification
 
-The deterministic candidate smoke uses an OS-assigned port and verifies that the existing service on 8787 stays healthy:
+The deterministic candidate smoke uses an OS-assigned port and never contacts the protected service on `18787`:
 
 ```powershell
 bun run verify:v2-smoke

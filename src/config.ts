@@ -1,5 +1,3 @@
-import "dotenv/config";
-
 function integer(v: string | undefined, d: number): number {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : d;

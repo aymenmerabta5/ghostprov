@@ -1,6 +1,7 @@
 const DEFAULT_MAX_QUEUED = 1_024;
 const DEFAULT_MAX_QUEUED_BYTES = 512 * 1024 * 1024;
 const DEFAULT_JOB_TIMEOUT_MS = 120_000;
+const DEFAULT_WORKER_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_CONSECUTIVE_LATENCY_OVERTAKES = 8;
 
@@ -38,6 +39,8 @@ export interface CpuTransformPoolOptions {
   maxQueued?: number;
   maxQueuedBytes?: number;
   jobTimeoutMs?: number;
+  /** Maximum time to wait for every terminate() close acknowledgement. */
+  workerCloseTimeoutMs?: number;
   /** Test/embedding hook. Production callers should use the default worker. */
   workerFactory?: () => Worker;
 }
@@ -59,6 +62,17 @@ export class CpuTransformTimeoutError extends Error {
 
   constructor(timeoutMs: number) {
     super(`CPU transform timed out after ${timeoutMs}ms`);
+  }
+}
+
+export class CpuTransformShutdownError extends Error {
+  readonly name = "CpuTransformShutdownError";
+  readonly code = "cpu_transform_shutdown_timeout";
+
+  constructor(timeoutMs: number, liveWorkers: number) {
+    super(
+      `CPU transform pool still has ${liveWorkers} live worker(s) after ${timeoutMs}ms shutdown`,
+    );
   }
 }
 
@@ -129,6 +143,7 @@ export class CpuTransformPool {
   readonly #maxQueued: number;
   readonly #maxQueuedBytes: number;
   readonly #jobTimeoutMs: number;
+  readonly #workerCloseTimeoutMs: number;
   readonly #workerFactory: () => Worker;
   #nextId = 1;
   #queuedBytes = 0;
@@ -148,6 +163,10 @@ export class CpuTransformPool {
       options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES,
     );
     this.#jobTimeoutMs = timeout("jobTimeoutMs", options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS);
+    this.#workerCloseTimeoutMs = timeout(
+      "workerCloseTimeoutMs",
+      options.workerCloseTimeoutMs ?? DEFAULT_WORKER_CLOSE_TIMEOUT_MS,
+    );
     this.#workerFactory = options.workerFactory ?? (() => new Worker(
       new URL("./cpu-transform-worker.ts", import.meta.url).href,
       { type: "module" },
@@ -273,7 +292,26 @@ export class CpuTransformPool {
       }
       if (state.closePromise) closePromises.push(state.closePromise);
     }
-    this.#closePromise = Promise.all(closePromises).then(() => undefined);
+    if (closePromises.length === 0) {
+      this.#closePromise = Promise.resolve();
+    } else {
+      this.#closePromise = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const liveWorkers = this.#states.filter(state => state.worker !== null).length;
+          reject(new CpuTransformShutdownError(this.#workerCloseTimeoutMs, liveWorkers));
+        }, this.#workerCloseTimeoutMs);
+        void Promise.all(closePromises).then(
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          error => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+    }
     for (const state of this.#states) {
       if (state.worker) this.#retireWorker(state, state.worker, error);
     }

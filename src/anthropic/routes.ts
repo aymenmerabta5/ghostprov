@@ -677,7 +677,11 @@ export function registerAnthropicRoutes(
             preparedMatch !== null && !requestLink.controller.signal.aborted &&
             definitivePreviousResponseNotFound(error) &&
             (clientWantsStream ? safePreStreamFailure : safePreJsonFailure);
-          if (retry && continuationIndex.compareDelete(preparedMatch!)) {
+          if (retry) {
+            // Exact compare-delete protects a concurrently replaced generation,
+            // but every request with its own definitive pre-event rejection is
+            // independently safe to retry once with its immutable full history.
+            continuationIndex.compareDelete(preparedMatch!);
             completeIncomingAdmission();
             attempt += 1;
             continue;

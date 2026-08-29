@@ -15,6 +15,7 @@ import {
   summarizeV2Releases,
 } from "../v2/release-observability";
 import type { FleetSnapshot } from "../fleet/types";
+import { safeObservabilityModel } from "./redaction";
 
 const MAX_UNAVAILABLE_PROJECT_SAMPLES = 256;
 
@@ -147,14 +148,17 @@ function rateLimitObservationJson(
   model: string,
   value: NonNullable<MultiSandboxRouterSnapshot["runtimes"][number]["upstreamRateLimit"]>,
 ): JsonValue {
-  return {
-    model: value.problem?.model ?? value.requestedModel ?? model,
-    organization: value.problem?.organization ?? null,
-    kind: value.problem?.limitKind?.includes("token")
+  const rawKind = value.problem?.limitKind;
+  const kind = typeof rawKind === "string" && rawKind.length <= 64
+    ? rawKind.includes("token")
       ? "tpm"
-      : value.problem?.limitKind?.includes("request")
+      : rawKind.includes("request")
         ? "rpm"
-        : value.problem?.limitKind ?? null,
+        : /^[a-z][a-z0-9_]{0,63}$/.test(rawKind) ? rawKind : null
+    : null;
+  return {
+    model: safeObservabilityModel(value.problem?.model ?? value.requestedModel ?? model),
+    kind,
     limit: value.problem?.tokenLimit ?? value.hint.limitTokens ?? null,
     used: value.problem?.usedTokens ?? null,
     requested: value.problem?.requestedTokens ?? null,
