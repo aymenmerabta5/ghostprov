@@ -758,6 +758,22 @@ describe("Anthropic request current contracts", () => {
       type: "image",
       source: { type: "base64", media_type: "image/png", data: "AAA" },
     }],
+    ["malformed base64 padding", {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "A===" },
+    }],
+    ["embedded base64 padding", {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "AA=A" },
+    }],
+    ["noncanonical two-pad low bits", {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "AB==" },
+    }],
+    ["noncanonical one-pad low bits", {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "AAB=" },
+    }],
     ["non-PDF base64 document", {
       type: "document",
       source: { type: "base64", media_type: "text/plain", data: "AA==" },
@@ -802,6 +818,30 @@ describe("Anthropic request current contracts", () => {
         }],
       })).relayBody;
       expect(JSON.stringify(body.input)).toContain(`data:${mediaType};base64,AA==`);
+    }
+  });
+
+  it("accepts canonical base64 media at 8, 16, and near-32-MiB boundaries", () => {
+    const MiB = 1024 * 1024;
+    const lengths = [8 * MiB, 16 * MiB, 32 * MiB - 16 * 1024];
+    const reservoir = "A".repeat(lengths.at(-1)!);
+
+    for (const length of lengths) {
+      const data = reservoir.slice(0, length);
+      const translated = translate(request({
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data },
+          }],
+        }],
+      }));
+
+      expect(translated.inboundBytes).toBeGreaterThan(length);
+      expect(translated.inboundBytes).toBeLessThanOrEqual(32 * MiB);
+      expect(translated.relayBytes).toBeGreaterThan(length);
+      expect(translated.relayBytes).toBeLessThanOrEqual(64 * MiB);
     }
   });
 

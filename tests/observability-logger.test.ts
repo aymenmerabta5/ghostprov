@@ -45,7 +45,6 @@ describe("ObservabilityLogger", () => {
       resources: {
         memory_paused: false,
         governor_queued: 0,
-        cpu_queued: 0,
         transform_queued: 0,
       },
       logger: { queued_events: 1, queued_bytes: 100 },

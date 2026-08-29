@@ -29,8 +29,10 @@ import {
 } from "../src/v2/transport/run-handle";
 import {
   computeV2RetransmitDelayMs,
+  MAX_TERMINAL_OBJECT_KEYS,
   V2_R2_REQUEST_PART_BYTES,
   V2TransportSession,
+  validateHostTerminalFinalStructure,
   type V2GzipOptions,
 } from "../src/v2/transport/session";
 import {
@@ -43,6 +45,11 @@ import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import { createExactSizedV2Request } from "./support/v2-performance-harness";
 import { HostRequestDiagnosticsObserver } from "../src/v2/diagnostics/host-observer";
+import {
+  MAX_RESPONSES_JSON_DEPTH,
+  MAX_RESPONSES_JSON_ITEMS,
+  ResponsesInputStructureError,
+} from "../src/relay/responses-validation";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const BINDING: ProtocolBinding = {
@@ -409,6 +416,57 @@ class TransportHarness {
 }
 
 describe("V2TransportSession", () => {
+  it("bounds host terminal structure before canonical proof hashing", () => {
+    expect(() => validateHostTerminalFinalStructure({
+      id: "resp_valid",
+      status: "completed",
+      output: [],
+    })).not.toThrow();
+    const exact = {
+      id: "resp_exact_structure",
+      status: "completed",
+      output: new Array(MAX_RESPONSES_JSON_ITEMS - 4).fill(null),
+    };
+    expect(() => validateHostTerminalFinalStructure(exact)).not.toThrow();
+    expect(() => validateHostTerminalFinalStructure({
+      ...exact,
+      output: new Array(MAX_RESPONSES_JSON_ITEMS - 3).fill(null),
+    })).toThrow("too many JSON values");
+
+    const oversized = new Array(MAX_RESPONSES_JSON_ITEMS + 1);
+    Object.defineProperty(oversized, "0", {
+      get() { throw new Error("oversized terminal element was read"); },
+    });
+    expect(() => validateHostTerminalFinalStructure({ output: oversized }))
+      .toThrow("too many JSON values");
+    expect(() => validateHostTerminalFinalStructure({ output: new Array(2) }))
+      .toThrow("sparse array");
+    expect(() => validateHostTerminalFinalStructure({ ["k".repeat(4 * 1024 + 1)]: 1 }))
+      .toThrow("canonical keys");
+
+    const boundedObject = Object.fromEntries(Array.from(
+      { length: MAX_TERMINAL_OBJECT_KEYS },
+      (_, index) => [`key-${index.toString(36).padStart(3, "0")}`, null],
+    ));
+    expect(() => validateHostTerminalFinalStructure(boundedObject)).not.toThrow();
+    boundedObject["one-key-too-many"] = null;
+    expect(() => validateHostTerminalFinalStructure(boundedObject))
+      .toThrow("too many keys");
+
+    // Count already-discovered siblings before scheduling a nested container.
+    // The rejection must happen before any nested child is retained/read.
+    const outer = new Array(32_769).fill(null);
+    const nested = new Array(32_767).fill(null);
+    Object.defineProperty(nested, "0", {
+      configurable: true,
+      enumerable: true,
+      get() { throw new Error("over-limit nested terminal child was read"); },
+    });
+    outer[0] = nested;
+    expect(() => validateHostTerminalFinalStructure({ output: outer }))
+      .toThrow("too many JSON values");
+  });
+
   it("keeps standard rollback accounting conservative while R5 admits bounded medium concurrency", () => {
     expect(v2HostTransferBudget("standard")).toBe(5);
     expect(v2HostTransferBudget("bulk-v1")).toBe(6);
@@ -892,7 +950,11 @@ describe("V2TransportSession", () => {
     await harness.settle();
     expect(reflected).toBe(0);
     controller.abort();
-    await expect(pending).rejects.toBeInstanceOf(DOMException);
+    await expect(pending).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+      committed: false,
+    });
     expect(reflected).toBe(0);
     await harness.close();
   });
@@ -1144,7 +1206,11 @@ describe("V2TransportSession", () => {
       ))).toBe(true);
 
       smallController.abort();
-      await expect(small).rejects.toBeInstanceOf(DOMException);
+      await expect(small).rejects.toMatchObject({
+        name: "V2PreCommitError",
+        code: "cancelled_precommit",
+        committed: false,
+      });
       await harness.settleUntil(() => harness.session.snapshot().active === 1, 5_000);
       const beforeBulkResume = harness.hostEnvelopes.filter(
         envelope => envelope.lane === "data",
@@ -1271,6 +1337,8 @@ describe("V2TransportSession", () => {
     expect(harness.session.snapshot().admissionCredits).toBe(0);
     expect(harness.session.snapshot().diagnostics!.host.stallEventsTotal).toBe(1);
     expect(harness.stateChanges).toBeGreaterThan(0);
+    expect(harness.hostEnvelopes.filter(envelope => envelope.lane === "control").at(-1))
+      .toMatchObject({ credits: 1 });
 
     const before = harness.session.snapshot().retransmissions;
     harness.publish([], { lane: "control", ackSequence: -1 });
@@ -1281,6 +1349,220 @@ describe("V2TransportSession", () => {
 
     await harness.close();
     await expect(pending).rejects.toBeDefined();
+  });
+
+  it("rejects over-deep direct transport bodies before recursive canonicalization", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING });
+    await harness.start();
+    harness.hostFrames.clear();
+    let input: Record<string, unknown> = { leaf: true };
+    for (let depth = 0; depth <= MAX_RESPONSES_JSON_DEPTH + 10_000; depth++) {
+      input = { nested: input };
+    }
+
+    await expect(harness.session.run({ model: "gpt-5.6-sol", input }))
+      .rejects.toBeInstanceOf(ResponsesInputStructureError);
+    expect(harness.hostFrames.size).toBe(0);
+    expect(harness.session.snapshot()).toMatchObject({ connected: true, active: 0, queued: 0 });
+    await harness.close();
+  });
+
+  it("matches the shared depth boundary for top-level input items", async () => {
+    const nested = (containers: number): unknown => {
+      let value: unknown = "leaf";
+      for (let depth = 0; depth < containers; depth++) value = { nested: value };
+      return value;
+    };
+    const harness = new TransportHarness({ binding: R2_BINDING });
+    await harness.start();
+    harness.hostFrames.clear();
+
+    await expect(harness.session.run({
+      model: "gpt-5.6-sol",
+      input: [nested(MAX_RESPONSES_JSON_DEPTH + 2)],
+    })).rejects.toBeInstanceOf(ResponsesInputStructureError);
+    expect(harness.hostFrames.size).toBe(0);
+
+    const controller = new AbortController();
+    const accepted = harness.session.run({
+      model: "gpt-5.6-sol",
+      input: [nested(MAX_RESPONSES_JSON_DEPTH + 1)],
+    }, controller.signal);
+    void accepted.catch(() => undefined);
+    await harness.settleUntil(() => (
+      [...harness.hostFrames.values()].some(frame => frame.kind === "request_open")
+    ));
+    controller.abort();
+    await expect(accepted).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+    });
+    await harness.close();
+  });
+
+  it("yields during large direct serialization so a zero-delay abort wins before admission", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING });
+    await harness.start();
+    harness.hostFrames.clear();
+    const controller = new AbortController();
+    let timerFired = false;
+    const timer = setTimeout(() => {
+      timerFired = true;
+      controller.abort();
+    }, 0);
+
+    try {
+      await expect(harness.session.run({
+        model: "gpt-5.6-sol",
+        input: "x".repeat(8 * 1024 * 1024),
+      }, controller.signal)).rejects.toMatchObject({
+        name: "V2PreCommitError",
+        code: "cancelled_precommit",
+      });
+      expect(timerFired).toBe(true);
+      expect(harness.hostFrames.size).toBe(0);
+      expect(harness.session.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    } finally {
+      clearTimeout(timer);
+      await harness.close();
+    }
+  });
+
+  it("bounds concurrent direct request preparation before aggregate serialization grows", async () => {
+    let activePreparations = 0;
+    let peakPreparations = 0;
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      gzip: async (_bytes, options) => {
+        activePreparations++;
+        peakPreparations = Math.max(peakPreparations, activePreparations);
+        return new Promise<Uint8Array>((_resolve, reject) => {
+          const signal = options?.signal;
+          const onAbort = () => {
+            activePreparations--;
+            signal?.removeEventListener("abort", onAbort);
+            reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    });
+    await harness.start();
+    const controllers = Array.from({ length: 7 }, () => new AbortController());
+    const body = {
+      model: "gpt-5.6-sol",
+      input: "bounded-preparation-".padEnd(2 * 1024 * 1024, "x"),
+    };
+    const pending = controllers.map(controller => harness.session.run(body, controller.signal));
+    pending.forEach(value => void value.catch(() => undefined));
+
+    await harness.settleUntil(() => activePreparations === 4);
+    expect(peakPreparations).toBe(4);
+    for (const queued of pending.slice(4)) {
+      expect(await promiseState(queued)).toBe("pending");
+    }
+    for (const controller of controllers) controller.abort();
+    const settled = await Promise.allSettled(pending);
+    expect(settled.every(result => (
+      result.status === "rejected" && result.reason?.name === "V2PreCommitError" &&
+        result.reason?.code === "cancelled_precommit"
+    ))).toBe(true);
+    expect(harness.session.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    await harness.close();
+  });
+
+  it("times out a noncooperative active preparation without hanging its caller", async () => {
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      unadmittedTimeoutMs: 20,
+      gzip: async () => new Promise<Uint8Array>(() => undefined),
+    });
+    await harness.start();
+    const started = performance.now();
+    await expect(harness.session.run({
+      model: "gpt-5.6-sol",
+      input: "noncooperative-preparation-".padEnd(2 * 1024 * 1024, "x"),
+    })).rejects.toMatchObject({ committed: false, code: "capacity_changed" });
+    expect(performance.now() - started).toBeLessThan(100);
+    await harness.close();
+    expect(harness.session.snapshot().queued).toBe(0);
+  });
+
+  it("does not continue full compression after a timed-out sample returns", async () => {
+    let resolveSample!: (bytes: Uint8Array) => void;
+    let gzipCalls = 0;
+    const sample = new Promise<Uint8Array>(resolve => { resolveSample = resolve; });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      unadmittedTimeoutMs: 20,
+      gzip: async bytes => {
+        gzipCalls++;
+        if (gzipCalls === 1) return sample;
+        return bytes;
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run({
+      model: "gpt-5.6-sol",
+      input: "late-sample-".padEnd(2 * 1024 * 1024, "x"),
+    });
+    await expect(pending).rejects.toMatchObject({ code: "capacity_changed" });
+    resolveSample(new Uint8Array(1));
+    await Bun.sleep(20);
+    expect(gzipCalls).toBe(1);
+    await harness.close();
+  });
+
+  it("aborts active and queued preparation when the transport closes", async () => {
+    let preparationStarted!: () => void;
+    const started = new Promise<void>(resolve => { preparationStarted = resolve; });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      gzip: async (_bytes, options) => {
+        preparationStarted();
+        return new Promise<Uint8Array>((_resolve, reject) => {
+          const signal = options?.signal;
+          const onAbort = () => reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run({
+      model: "gpt-5.6-sol",
+      input: "close-preparation-".padEnd(2 * 1024 * 1024, "x"),
+    });
+    void pending.catch(() => undefined);
+    await started;
+
+    const closing = harness.session.close();
+    await expect(pending).rejects.toMatchObject({ committed: false, code: "draining" });
+    await closing;
+    expect(harness.session.snapshot()).toMatchObject({ connected: false, active: 0, queued: 0 });
+    await harness.sidecar.close();
+  });
+
+  it("rejects cyclic, non-finite, and unsupported direct canonical values", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING });
+    await harness.start();
+    harness.hostFrames.clear();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ model: "gpt-5.6-sol", input: cyclic }, "cycles"],
+      [{ model: "gpt-5.6-sol", input: Number.POSITIVE_INFINITY }, "finite"],
+      [{ model: "gpt-5.6-sol", input: undefined }, "undefined"],
+    ];
+
+    for (const [body, message] of cases) {
+      await expect(harness.session.run(body)).rejects.toThrow(message);
+    }
+    expect(harness.hostFrames.size).toBe(0);
+    expect(harness.session.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    await harness.close();
   });
 
   it("expands response batches into the exact logical SSE transcript", async () => {
@@ -1340,6 +1622,36 @@ describe("V2TransportSession", () => {
     });
     await harness.close();
   });
+
+  it("advertises bulk body prefetch only after exact medium admission", async () => {
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+    });
+    await harness.start();
+    expect(harness.session.snapshot()).toMatchObject({
+      admissionCredits: 4,
+      prefetchCredits: 4,
+    });
+
+    const controller = new AbortController();
+    const pending = harness.session.run(
+      createExactSizedV2Request(512 * 1024, 19, "incompressible"),
+      controller.signal,
+    );
+    try {
+      await harness.settleUntil(() => harness.session.snapshot().active === 1);
+      expect(harness.session.snapshot()).toMatchObject({
+        admissionCredits: 3,
+        prefetchCredits: 5,
+      });
+    } finally {
+      controller.abort();
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+  });
+
   it("admits at most four uncommitted requests per sandbox", async () => {
     const harness=new TransportHarness();await harness.start();
     const pending=Array.from({length:5},(_,i)=>harness.session.run({...BODY,input:`request-${i}`}));
@@ -1351,7 +1663,7 @@ describe("V2TransportSession", () => {
     const medium=createExactSizedV2Request(2*1024*1024,10,"incompressible");
     const controllers=Array.from({length:5},()=>new AbortController());
     const pending=controllers.map(controller=>harness.session.run(medium,controller.signal));
-    await harness.settle();
+    await harness.settleUntil(() => harness.session.snapshot().prefetched === 1);
     expect(harness.session.snapshot()).toMatchObject({
       admissionCredits: 0,
       active: 4,
@@ -1359,7 +1671,10 @@ describe("V2TransportSession", () => {
       queued: 1,
     });
     controllers[0]!.abort();
-    await expect(pending[0]!).rejects.toBeInstanceOf(DOMException);
+    await expect(pending[0]!).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+    });
     await harness.settle();
     expect(harness.session.snapshot()).toMatchObject({active:4,queued:0});
     await harness.close();await Promise.allSettled(pending);
@@ -1367,14 +1682,14 @@ describe("V2TransportSession", () => {
     const observedHarness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await observedHarness.start();
     const observed=createExactSizedV2Request(3*1024*1024,11,"incompressible");
     const observedPending=Array.from({length:4},()=>observedHarness.session.run(observed));
-    await observedHarness.settle();
+    await observedHarness.settleUntil(() => observedHarness.session.snapshot().active === 3);
     expect(observedHarness.session.snapshot()).toMatchObject({active:3,queued:1});
     await observedHarness.close();await Promise.allSettled(observedPending);
 
     const bulkHarness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});await bulkHarness.start();
     const bulk=createExactSizedV2Request(3*1024*1024+1,12,"incompressible");
     const bulkPending=[bulkHarness.session.run(bulk),bulkHarness.session.run(bulk)];
-    await bulkHarness.settle();
+    await bulkHarness.settleUntil(() => bulkHarness.session.snapshot().active === 1);
     expect(bulkHarness.session.snapshot()).toMatchObject({active:1,queued:1});
     await bulkHarness.close();await Promise.allSettled(bulkPending);
   });
@@ -1405,25 +1720,49 @@ describe("V2TransportSession", () => {
       await Promise.allSettled(pending);
     }
   });
+  it("does not admit a late tiny body through medium-only prefetch credits", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING, transportProfile: "bulk-v1" });
+    await harness.start();
+    const controllers = Array.from({ length: 5 }, () => new AbortController());
+    const medium = createExactSizedV2Request(512 * 1024, 70, "incompressible");
+    const pending = controllers.slice(0, 4).map(controller =>
+      harness.session.run(medium, controller.signal));
+    try {
+      await harness.settleUntil(() => harness.session.snapshot().active === 4);
+      pending.push(harness.session.run(
+        createExactSizedV2Request(128 * 1024, 71, "incompressible"),
+        controllers[4]!.signal,
+      ));
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({ active: 4, queued: 1 });
+      expect([...harness.hostFrames.values()].filter(frame => (
+        frame.kind === "request_open" && frame.decodedBytes === 128 * 1024
+      ))).toHaveLength(0);
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await harness.close();
+      await Promise.allSettled(pending);
+    }
+  });
   it("admits and frames a queued tiny R5 request ahead of medium prefetch", async () => {
     const harness=new TransportHarness({binding:R2_BINDING,transportProfile:"bulk-v1"});
     await harness.start();
     harness.credits=0;
     harness.publish([],{lane:"control"});
     await harness.settle();
-    const controllers=Array.from({length:5},()=>new AbortController());
+    const controllers=Array.from({length:7},()=>new AbortController());
     const pending=[
-      ...controllers.slice(0,4).map((controller,index)=>harness.session.run(
+      ...controllers.slice(0,6).map((controller,index)=>harness.session.run(
         createExactSizedV2Request(512*1024,40+index,"incompressible"),
         controller.signal,
       )),
       harness.session.run(
-        createExactSizedV2Request(128*1024,44,"incompressible"),
-        controllers[4]!.signal,
+        createExactSizedV2Request(128*1024,46,"incompressible"),
+        controllers[6]!.signal,
       ),
     ];
     try {
-      await harness.settleUntil(()=>harness.session.snapshot().queued===5);
+      await harness.settleUntil(()=>harness.session.snapshot().queued===7);
       harness.credits=128;
       harness.publish([],{lane:"control"});
       await harness.settleUntil(()=>(
@@ -1435,7 +1774,7 @@ describe("V2TransportSession", () => {
         ),
       );
       expect(firstOpen?.decodedBytes).toBe(128*1024);
-      expect(harness.session.snapshot()).toMatchObject({active:4,queued:1,prefetched:0});
+      expect(harness.session.snapshot()).toMatchObject({active:4,queued:3,prefetched:0});
     }finally{
       for(const controller of controllers)controller.abort();
       await harness.close();
@@ -1953,6 +2292,83 @@ describe("V2TransportSession", () => {
     pool.close();
   });
 
+  it("keeps a backpressured terminal charged through cancelled proof finalization", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      eventMemoryPool: pool,
+      maxBufferedResponseBytes: 160,
+    });
+    const controller = new AbortController();
+    await harness.start();
+    const handle = await harness.commit(harness.session.run(BODY, controller.signal));
+    const identity = harness.requestIdentity();
+    const final = {
+      id: "resp_cancelled_terminal_proof",
+      object: "response",
+      status: "completed",
+      output: [],
+    };
+    const events = [{
+      event: "response.created",
+      data: JSON.stringify({
+        type: "response.created",
+        sequence_number: 0,
+        response: { id: final.id },
+      }),
+    }, {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        sequence_number: 1,
+        response: final,
+      }),
+    }];
+    const transcript = new TranscriptProof(identity.requestId, identity.requestDigest);
+    for (const event of events) transcript.append(event);
+    const terminal = await transcript.createTerminal();
+    const eventFrame = (eventIndex: number): SidecarFrame => ({
+      kind: "response_event",
+      requestId: identity.requestId,
+      eventIndex,
+      event: events[eventIndex]!.event,
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes(events[eventIndex]!.data)),
+    });
+    const rejectedFinal = handle.final.catch(error => error);
+
+    try {
+      // Proof may arrive ahead of its reliable response frames.
+      harness.publish([terminal]);
+      await harness.settle();
+      harness.publish([eventFrame(0)]);
+      await harness.settleUntil(() => pool.snapshot().activePermits === 1);
+
+      // The second event cannot enter the full one-event handle buffer.
+      harness.publish([eventFrame(1)]);
+      await harness.settleUntil(() => pool.snapshot().activePermits === 2);
+      controller.abort(new DOMException("client disconnected", "AbortError"));
+      await harness.settleUntil(() => pool.snapshot().activePermits === 1);
+
+      // Cancelling releases the public frame/internal final references, while
+      // the session proof reference keeps the parsed transcript final charged.
+      expect(await rejectedFinal).toMatchObject({ committed: true, code: "cancelled" });
+      expect(pool.snapshot()).toMatchObject({ activePermits: 1 });
+
+      // A replayed proof wakes finalization after the blocked delivery unwinds.
+      harness.publish([terminal]);
+      await harness.settleUntil(() => pool.snapshot().activePermits === 0);
+      expect(harness.session.snapshot().committed).toBe(0);
+    } finally {
+      await harness.close();
+      pool.close();
+    }
+  });
+
   it("enforces the exact canonical SSE response limit including newline framing", async () => {
     const final = { id: "resp_exact", object: "response", status: "completed", output: [] };
     const events = [{
@@ -2114,7 +2530,12 @@ describe("V2TransportSession", () => {
       previous_response_id: "resp_parent_exact",
       stream: false,
       store: false,
-      vendor_extension: { preserved: true },
+      vendor_extension: {
+        preserved: true,
+        negative_zero: -0,
+        escaped: "quote=\" slash=\\ newline=\n",
+        surrogate_pair_across_chunk: `${"x".repeat(64 * 1024 - 1)}😀`,
+      },
     });
     const expectedBody = { ...body, stream: true, store: true };
     const expectedBytes = utf8Bytes(canonicalJson(expectedBody));
@@ -2157,11 +2578,14 @@ describe("V2TransportSession", () => {
       partCount: open.partCount,
     });
     expect(Buffer.compare(carried, Buffer.from(expectedBytes))).toBe(0);
-    expect(JSON.parse(carried.toString("utf8"))).toEqual(expectedBody);
+    expect(JSON.parse(carried.toString("utf8"))).toEqual(JSON.parse(canonicalJson(expectedBody)));
     expect(body).toMatchObject({ stream: false, store: false });
 
     controller.abort();
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await expect(pending).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+    });
     await harness.close();
   });
 
@@ -2331,10 +2755,16 @@ describe("V2TransportSession", () => {
     expect(open.encoding).toBe("gzip+base64");
     expect(open.encodedBytes).toBeLessThan(open.decodedBytes * 0.8);
     expect(gzipCalls).toBe(2);
-    expect(gzipOptions).toEqual([
-      { inputOwnership: "owned", priority: "bulk", signal: undefined },
-      { inputOwnership: "owned", priority: "bulk", signal: undefined },
+    expect(gzipOptions.map(options => ({
+      inputOwnership: options?.inputOwnership,
+      priority: options?.priority,
+    }))).toEqual([
+      { inputOwnership: "owned", priority: "bulk" },
+      { inputOwnership: "owned", priority: "bulk" },
     ]);
+    expect(gzipOptions[0]?.signal).toBe(gzipOptions[1]?.signal);
+    expect(gzipOptions[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(gzipOptions[0]?.signal?.aborted).toBe(false);
     for (let round = 0; round < 64; round++) {
       if ([...harness.hostFrames.values()].some(frame => (
         frame.kind === "request_commit" && frame.requestId === open.requestId
@@ -2583,7 +3013,10 @@ describe("V2TransportSession", () => {
     const abortQueued = new AbortController();
     const pending = queued.session.run(BODY, abortQueued.signal);
     abortQueued.abort();
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await expect(pending).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+    });
     expect(queued.session.snapshot().queued).toBe(0);
     await queued.close();
 

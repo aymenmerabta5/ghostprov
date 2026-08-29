@@ -50,8 +50,12 @@ export async function main(): Promise<void> {
   const protectedRoot = resolveSmokeProtectedRoot(process.env);
   const apiKey = resolveGhostProvApiKey(process.env.GHOSTPROV_API_KEY);
   await primaryHealthy(protectedRoot);
-  const system = await createFakeV2System({ runtimes: 1, physicalPerRuntime: 8 });
   const authorizationScope = createAuthenticatedTenantScope();
+  const system = await createFakeV2System({
+    runtimes: 1,
+    physicalPerRuntime: 8,
+    authorizationScope,
+  });
   const app = createGhostProvApp({ router: system.router, apiKey, authorizationScope });
   const server = createGhostProvServer({
     app,

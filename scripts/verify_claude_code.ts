@@ -1,7 +1,7 @@
 import type { FetchLike } from "../src/core/ports";
 import { ApiError } from "../src/http/errors";
 import { RelayError, type RunHandle } from "../src/relay/run-handle";
-import { normalizeUpstreamResponsesRequest } from "../src/relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../src/relay/host-upstream-policy";
 import type { SseFrame } from "../src/relay/sse";
 import { createGhostProvApp, type RouterLike } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
@@ -353,9 +353,11 @@ export function createForwardingRouter(
   );
   const activeControllers = new Set<AbortController>();
   const forwards = new ForwardSemaphore(forwardCapacity, maxForwardWaiters);
+  const authorizationScope = createAuthenticatedTenantScope();
   let closed = false;
 
   const router: ForwardingRouter = {
+    responseProvenanceAuthorizationScope: () => authorizationScope,
     acquireIncomingBody(bytes, signal) {
       return incomingBodies.acquire(bytes, signal);
     },
@@ -566,7 +568,7 @@ export async function main(
   const options = optionsFromEnvironment(environment);
   const apiKey = resolveGhostProvApiKey(environment.GHOSTPROV_API_KEY);
   const router = createForwardingRouter(options.upstream, { apiKey });
-  const authorizationScope = createAuthenticatedTenantScope();
+  const authorizationScope = router.responseProvenanceAuthorizationScope!()!;
   const app = createGhostProvApp({ router, apiKey, authorizationScope });
   const server = createGhostProvServer({
     app,

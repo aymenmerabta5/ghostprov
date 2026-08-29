@@ -1072,6 +1072,27 @@ describe("V2BootstrapController", () => {
     await expect(harness.controller.ensureReady()).rejects.toThrow("retired");
   });
 
+  it("observes physical retirement after its caller deadline already expired", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    harness.gateway.triggerRender = async () => {
+      throw new Error("late retirement failed");
+    };
+    const reason = new DOMException("shutdown deadline expired", "TimeoutError");
+
+    await expect(harness.controller.forceStop(
+      "expired shutdown",
+      AbortSignal.abort(reason),
+    )).rejects.toBe(reason);
+
+    // The caller is already released, but the source retirement still owns a
+    // rejection consumer and completes its local inert-launcher cleanup.
+    await Bun.sleep(10);
+    expect(harness.ydoc.files.get(".latexmkrc"))
+      .toContain("GhostProv V2 launcher inactive");
+    expect(harness.awareness.clears).toBe(1);
+  });
+
   it("binds forced termination to the successful retry rather than a stale attempt", async () => {
     const harness = bootstrapHarness("first-wrong-nonce");
     await harness.controller.ensureReady();

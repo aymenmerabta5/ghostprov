@@ -259,6 +259,7 @@ describe("project documentation", () => {
       "separate app-scoped, content-free prefix index",
       "one app-scoped, process-local continuation index",
       "at most 4,096 records",
+      "conservative approximately 6 MiB heap estimate",
       "60-minute absolute TTL",
       "reserves bounded concurrent commit capacity",
       "exact project/incarnation before public terminal exposure",

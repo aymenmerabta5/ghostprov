@@ -117,7 +117,6 @@ export function formatConsoleObservabilityLine(line: string): string {
       pressure: resources ? {
         memory_paused: resources.memory_paused,
         governor_queued: resources.governor_queued,
-        cpu_queued: resources.cpu_queued,
         transform_queued: resources.transform_queued,
       } : null,
       logger: event.logger,

@@ -519,7 +519,7 @@ function defaultRuntimeFactory(options: {
 
   const recoveryPermits = new RecoveryPermitPool(config.provisionConcurrency);
   const acquireSandboxForAuth = async (
-    projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"],
+    _projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"],
     _status: number,
     signal: AbortSignal,
   ) => {
@@ -663,16 +663,16 @@ export async function createBrowserlessSystem(
   const machineProbe = dependencies.machineProbe ?? new SystemMachineProbe();
   const config = resolveMultiSandboxConfig(env, machineProbe.sample());
   const existingRouterScope = dependencies.router?.responseProvenanceAuthorizationScope();
-  if (
-    dependencies.authorizationScope !== undefined &&
-    existingRouterScope !== null &&
-    existingRouterScope !== undefined &&
-    dependencies.authorizationScope !== existingRouterScope
-  ) {
+  if (dependencies.router && !isAuthenticatedTenantScope(existingRouterScope)) {
+    throw new TypeError("Injected router must expose its AuthenticatedTenantScope");
+  }
+  if (dependencies.authorizationScope !== undefined &&
+    dependencies.authorizationScope !== existingRouterScope && dependencies.router) {
     throw new TypeError("Injected router and system authorization scopes must match");
   }
-  const authorizationScope = dependencies.authorizationScope ?? existingRouterScope ??
-    createAuthenticatedTenantScope();
+  const authorizationScope = dependencies.router
+    ? existingRouterScope!
+    : dependencies.authorizationScope ?? createAuthenticatedTenantScope();
   if (!isAuthenticatedTenantScope(authorizationScope)) {
     throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
   }

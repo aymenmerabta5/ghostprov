@@ -40,6 +40,11 @@ export interface RoutableSandboxSnapshot {
   capacity: number;
   active: number;
   available: number;
+  /** General four-start execution admission advertised by V2. */
+  admissionCredits?: number;
+  /** Optional body-only prefetch capacity for eligible medium/bulk requests. */
+  prefetchCredits?: number;
+  transferCredits?: number;
   /** Sanitized reason this runtime can or cannot accept another request. */
   availabilityReason?: SandboxAvailabilityReason;
   quarantined: number;

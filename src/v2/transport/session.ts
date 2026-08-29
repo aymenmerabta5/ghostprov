@@ -1,8 +1,14 @@
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import type { RunHandle } from "../../relay/run-handle";
-import { normalizeUpstreamResponsesRequest } from "../../relay/upstream-policy";
+import {
+  MAX_RESPONSES_JSON_DEPTH,
+  MAX_RESPONSES_JSON_ITEMS,
+  ResponsesInputStructureError,
+} from "../../relay/responses-validation";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../../relay/host-upstream-policy";
 import type { SandboxAdmissionProgress } from "../../sandbox/registry";
-import { sseFrame, type SseFrame } from "../../relay/sse";
+import { jsonEncodedByteLength } from "../../router/workload";
+import type { SseFrame } from "../../relay/sse";
 import type {
   AwarenessChannel,
   AwarenessPeerUpdate,
@@ -14,7 +20,6 @@ import {
   awarenessEnvelopeEncodedBytes,
   base64UrlDecode,
   base64UrlEncode,
-  canonicalJson,
   protocolTransportLimits,
   sha256Hex,
   utf8Bytes,
@@ -40,6 +45,7 @@ import { ReliableDeliveryTiming } from "../protocol/delivery-timing";
 import {
   PublicationPacer,
   type PublicationReason,
+  type PublicationTimer,
 } from "../protocol/publication-pacer";
 import {
   HostRequestDiagnosticsObserver,
@@ -74,6 +80,7 @@ import {
   estimateAtomicEventPermitBytes,
 } from "../memory/atomic-byte-permits";
 import { v2RetainedEventPermitBytes } from "../memory/event-memory-sizing";
+import { releaseAtomicBytePermit } from "../memory/permit-carrier";
 
 export { computeV2RetransmitDelayMs } from "../protocol/retransmit";
 import {
@@ -88,12 +95,144 @@ const MIN_GZIP_SAVINGS_RATIO = 0.05;
 const LARGE_INLINE_BASE64_BYTES = 64 * 1024;
 const BULK_GZIP_MIN_BYTES = 2 * 1024 * 1024;
 const GZIP_SAMPLE_BYTES = 64 * 1024;
-const LATENCY_CRITICAL_REQUEST_BYTES = 256 * 1024;
+export const V2_LATENCY_CRITICAL_REQUEST_BYTES = 256 * 1024;
 const MAX_PRECOMMIT_EXECUTION_RESERVATIONS = 4;
 const MAX_BULK_BODY_PREFETCH_RESERVATIONS = 6;
 const ACCELERATION_RECOVERY_CLEAN_FLIGHTS = 2;
 const DEFAULT_TRANSPORT_STALL_MS = 2_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
+// Keep sub-MiB interactive requests on the original single-turn fast path;
+// larger canonicalization yields often enough to bound host event-loop stalls.
+const CANONICAL_CHUNK_CODE_UNITS = 1024 * 1024;
+const CANONICAL_ITEMS_PER_YIELD = 256;
+const MAX_CANONICAL_JSON_ITEMS = 1_000_000;
+const MAX_PREPARATION_WAITERS = 128;
+const MAX_FAST_PREPARED_PAYLOADS = 128;
+const MAX_FAST_ACTIVE_PREPARATIONS = 16;
+const PREPARATION_CANCELLATION_FENCE_MS = 25;
+const FAST_PREPARATION_MAX_ITEMS = 4_096;
+const FAST_PREPARATION_HEADROOM_BYTES = 64;
+export const MAX_TERMINAL_OBJECT_KEYS = 4_096;
+const MAX_TERMINAL_CANONICAL_KEY_UNITS = 256 * 1024;
+const MAX_TERMINAL_CANONICAL_KEY_LENGTH = 4 * 1024;
+const MAX_REQUEST_CANONICAL_KEY_UNITS = 256 * 1024;
+const MAX_REQUEST_CANONICAL_KEY_LENGTH = 4 * 1024;
+const TERMINAL_RESPONSE_EVENTS = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+]);
+
+type TerminalStructureFrame =
+  | {
+      readonly kind: "value";
+      readonly value: unknown;
+      readonly depth: number;
+    }
+  | {
+      readonly kind: "array";
+      readonly value: unknown[];
+      readonly depth: number;
+      readonly length: number;
+      index: number;
+    }
+  | {
+      readonly kind: "object";
+      readonly value: Record<string, unknown>;
+      readonly depth: number;
+      readonly keys: Iterator<string>;
+    };
+
+function* terminalOwnEnumerableKeys(value: Record<string, unknown>): Generator<string> {
+  for (const key in value) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) yield key;
+  }
+}
+
+/** @internal Host-only structural fence before frozen terminal proof hashing. */
+export function validateHostTerminalFinalStructure(root: Record<string, unknown>): void {
+  const stack: TerminalStructureFrame[] = [{ kind: "value", value: root, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let scheduledValues = 1;
+  let keyUnits = 0;
+
+  const scheduleChildren = (count: number): void => {
+    if (count > MAX_RESPONSES_JSON_ITEMS - scheduledValues) {
+      throw new Error("Terminal final contains too many JSON values");
+    }
+    scheduledValues += count;
+  };
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.kind === "array") {
+      if (frame.index >= frame.length) continue;
+      const index = frame.index++;
+      if (!Object.hasOwn(frame.value, index)) {
+        throw new Error("Terminal final contains a sparse array");
+      }
+      stack.push(frame, {
+        kind: "value",
+        value: frame.value[index],
+        depth: frame.depth + 1,
+      });
+      continue;
+    }
+    if (frame.kind === "object") {
+      const next = frame.keys.next();
+      if (next.done) continue;
+      stack.push(frame, {
+        kind: "value",
+        value: frame.value[next.value],
+        depth: frame.depth + 1,
+      });
+      continue;
+    }
+
+    const value = frame.value;
+    if (!value || typeof value !== "object") continue;
+    if (frame.depth > MAX_RESPONSES_JSON_DEPTH) {
+      throw new Error("Terminal final exceeds the maximum JSON nesting depth");
+    }
+    if (seen.has(value)) throw new Error("Terminal final contains a JSON cycle");
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      scheduleChildren(value.length);
+      stack.push({
+        kind: "array",
+        value,
+        depth: frame.depth,
+        length: value.length,
+        index: 0,
+      });
+      continue;
+    }
+
+    const object = value as Record<string, unknown>;
+    let keyCount = 0;
+    for (const key in object) {
+      if (!Object.prototype.hasOwnProperty.call(object, key)) continue;
+      if (++keyCount > MAX_TERMINAL_OBJECT_KEYS) {
+        throw new Error("Terminal final object contains too many keys");
+      }
+      keyUnits += key.length;
+      if (
+        key.length > MAX_TERMINAL_CANONICAL_KEY_LENGTH ||
+        keyUnits > MAX_TERMINAL_CANONICAL_KEY_UNITS
+      ) {
+        throw new Error("Terminal final canonical keys exceed the host work limit");
+      }
+    }
+    scheduleChildren(keyCount);
+    stack.push({
+      kind: "object",
+      value: object,
+      depth: frame.depth,
+      keys: terminalOwnEnumerableKeys(object),
+    });
+  }
+}
 
 function hostFrameCarriesRequest(frame: ReliableFrame<HostFrame>): boolean {
   // Route payloads by request-body goodput only. Tiny request_start/commit
@@ -102,25 +241,422 @@ function hostFrameCarriesRequest(frame: ReliableFrame<HostFrame>): boolean {
   return frame.kind === "request_data";
 }
 
-function containsLargeInlineBase64(value: unknown, seen = new Set<object>()): boolean {
-  if (typeof value === "string") {
-    return value.length >= LARGE_INLINE_BASE64_BYTES &&
-      /^data:[^;,]{1,127};base64,/i.test(value);
-  }
-  if (!value || typeof value !== "object" || seen.has(value)) return false;
-  seen.add(value);
+function snapshotFastPreparationBody(
+  body: Record<string, unknown>,
+): Readonly<Record<string, unknown>> | null {
   try {
-    if (Array.isArray(value)) return value.some(item => containsLargeInlineBase64(item, seen));
-    return Object.values(value).some(item => containsLargeInlineBase64(item, seen));
-  } finally {
-    seen.delete(value);
+    // Preserve the allocation-light hot path used by Codex's common flat
+    // 128 KiB body. Nested JSON falls through to the bounded deep snapshot.
+    const flat: Record<string, unknown> = Object.create(null);
+    let flatKeys = 0;
+    let flatUnits = 0;
+    let flatCandidate = true;
+    for (const key in body) {
+      if (!Object.prototype.hasOwnProperty.call(body, key) || ++flatKeys > 32) {
+        flatCandidate = false;
+        break;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(body, key);
+      if (!descriptor || !("value" in descriptor)) {
+        flatCandidate = false;
+        break;
+      }
+      const value = descriptor.value;
+      if (value !== null && typeof value === "object" ||
+        typeof value === "undefined" || typeof value === "function" ||
+        typeof value === "symbol" || typeof value === "bigint" ||
+        (typeof value === "number" && !Number.isFinite(value))) {
+        flatCandidate = false;
+        break;
+      }
+      flatUnits += key.length + (typeof value === "string" ? value.length : 0);
+      if (flatUnits > V2_LATENCY_CRITICAL_REQUEST_BYTES) {
+        flatCandidate = false;
+        break;
+      }
+      flat[key] = value;
+    }
+    if (flatCandidate &&
+      jsonEncodedByteLength(flat) + FAST_PREPARATION_HEADROOM_BYTES <=
+        V2_LATENCY_CRITICAL_REQUEST_BYTES) return Object.freeze(flat);
+
+    const stack: unknown[] = [body];
+    const seen = new WeakSet<object>();
+    let items = 0;
+    let stringUnits = 0;
+    while (stack.length > 0) {
+      const value = stack.pop();
+      if (++items > FAST_PREPARATION_MAX_ITEMS) return null;
+      if (typeof value === "string") {
+        stringUnits += value.length;
+        if (stringUnits > V2_LATENCY_CRITICAL_REQUEST_BYTES) return null;
+        continue;
+      }
+      if (value === null || typeof value === "boolean") continue;
+      if (typeof value === "number") {
+        if (!Number.isFinite(value)) return null;
+        continue;
+      }
+      if (!value || typeof value !== "object" || seen.has(value)) return null;
+      seen.add(value);
+      if (Array.isArray(value)) {
+        if (Object.getPrototypeOf(value) !== Array.prototype ||
+          stack.length + value.length > FAST_PREPARATION_MAX_ITEMS - items) return null;
+        for (let index = value.length - 1; index >= 0; index--) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+          if (!descriptor || !("value" in descriptor)) return null;
+          stack.push(descriptor.value);
+        }
+        continue;
+      }
+      const object = value as Record<string, unknown>;
+      const prototype = Object.getPrototypeOf(object);
+      if (prototype !== Object.prototype && prototype !== null) return null;
+      let ownKeys = 0;
+      for (const key in object) {
+        if (!Object.prototype.hasOwnProperty.call(object, key)) return null;
+        if (++ownKeys + stack.length > FAST_PREPARATION_MAX_ITEMS - items) return null;
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (!descriptor || !("value" in descriptor)) return null;
+        const child = descriptor.value;
+        if (typeof child === "undefined" || typeof child === "function" ||
+          typeof child === "symbol" || typeof child === "bigint") return null;
+        stringUnits += key.length;
+        if (stringUnits > V2_LATENCY_CRITICAL_REQUEST_BYTES) return null;
+        stack.push(child);
+      }
+    }
+    const encoded = JSON.stringify(body);
+    if (typeof encoded !== "string") return null;
+    const snapshot = JSON.parse(encoded) as Record<string, unknown>;
+    if (
+      jsonEncodedByteLength(snapshot) + FAST_PREPARATION_HEADROOM_BYTES >
+        V2_LATENCY_CRITICAL_REQUEST_BYTES
+    ) return null;
+    return Object.freeze(snapshot);
+  } catch {
+    return null;
   }
+}
+
+type CanonicalContainer =
+  | {
+      kind: "array";
+      value: unknown[];
+      depth: number;
+      index: number;
+      length: number;
+    }
+  | {
+      kind: "object";
+      value: Record<string, unknown>;
+      depth: number;
+      index: number;
+      keys: string[];
+    };
+
+/**
+ * Host-only stack-safe equivalent of protocol canonicalJson. The checked-in
+ * sidecar serializer is frozen; direct transport callers still need a bounded
+ * serialization path before their bytes enter the R8 request digest.
+ */
+function yieldCanonicalWork(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(abortError("V2 request aborted during canonical serialization"));
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearImmediate(immediate);
+      signal?.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => finish(() => reject(
+      abortError("V2 request aborted during canonical serialization"),
+    ));
+    const immediate = setImmediate(() => finish(resolve));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function canonicalHostRequestBytes(
+  value: unknown,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<{
+  bytes: Uint8Array;
+  containsLargeInlineBase64: boolean;
+}> {
+  const chunks: Uint8Array[] = [];
+  let buffered = "";
+  let byteCount = 0;
+  let workSinceYield = 0;
+  let itemsSinceYield = 0;
+  let canonicalKeyUnits = 0;
+  let containsLargeInlineBase64 = false;
+  const flush = (): void => {
+    if (!buffered) return;
+    const encoded = utf8Bytes(buffered);
+    buffered = "";
+    if (byteCount + encoded.byteLength > maxBytes) {
+      throw new V2PreCommitError("V2 request exceeds the 64 MiB limit", "request_too_large");
+    }
+    chunks.push(encoded);
+    byteCount += encoded.byteLength;
+  };
+  const append = (part: string): void => {
+    buffered += part;
+    workSinceYield += part.length;
+    if (buffered.length < CANONICAL_CHUNK_CODE_UNITS) return;
+    flush();
+  };
+  const checkpoint = (): Promise<void> | null => {
+    if (signal?.aborted) {
+      throw abortError("V2 request aborted during canonical serialization");
+    }
+    if (
+      workSinceYield < CANONICAL_CHUNK_CODE_UNITS &&
+      itemsSinceYield < CANONICAL_ITEMS_PER_YIELD
+    ) return null;
+    workSinceYield = 0;
+    itemsSinceYield = 0;
+    return yieldCanonicalWork(signal);
+  };
+  let canonicalItems = 0;
+  const countCanonicalItem = (): void => {
+    canonicalItems++;
+    itemsSinceYield++;
+    if (canonicalItems > MAX_CANONICAL_JSON_ITEMS) {
+      throw new ResponsesInputStructureError("body");
+    }
+  };
+  const chargeCanonicalKey = (key: string): void => {
+    canonicalKeyUnits += key.length;
+    if (key.length > MAX_REQUEST_CANONICAL_KEY_LENGTH ||
+      canonicalKeyUnits > MAX_REQUEST_CANONICAL_KEY_UNITS) {
+      throw new ResponsesInputStructureError("body", "items");
+    }
+  };
+  const sortedCanonicalKeysAsync = async (
+    input: Record<string, unknown>,
+  ): Promise<string[]> => {
+    const keys: string[] = [];
+    for (const key in input) {
+      workSinceYield += Math.max(1, key.length);
+      itemsSinceYield++;
+      const pendingYield = checkpoint();
+      if (pendingYield) await pendingYield;
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+      if (keys.length >= MAX_CANONICAL_JSON_ITEMS - canonicalItems) {
+        throw new ResponsesInputStructureError("body");
+      }
+      chargeCanonicalKey(key);
+      keys.push(key);
+    }
+    if (keys.length < 2) return keys;
+
+    // Native Array#sort is one uninterruptible O(n log n) turn. A bottom-up
+    // merge keeps the same UTF-16 lexical order while yielding cooperatively.
+    let source = keys;
+    let target = new Array<string>(keys.length);
+    for (let width = 1; width < keys.length; width *= 2) {
+      for (let start = 0; start < keys.length; start += width * 2) {
+        const middle = Math.min(start + width, keys.length);
+        const end = Math.min(start + width * 2, keys.length);
+        let left = start;
+        let right = middle;
+        for (let output = start; output < end; output++) {
+          if (
+            left < middle &&
+            (right >= end || source[left]! <= source[right]!)
+          ) target[output] = source[left++]!;
+          else target[output] = source[right++]!;
+          workSinceYield++;
+          itemsSinceYield++;
+          const pendingYield = checkpoint();
+          if (pendingYield) await pendingYield;
+        }
+      }
+      [source, target] = [target, source];
+    }
+    return source;
+  };
+  const sortedCanonicalKeys = (
+    input: Record<string, unknown>,
+  ): string[] | Promise<string[]> => {
+    const small: string[] = [];
+    let chargedUnits = 0;
+    for (const key in input) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+      chargeCanonicalKey(key);
+      chargedUnits += key.length;
+      small.push(key);
+      if (small.length > 256) {
+        canonicalKeyUnits -= chargedUnits;
+        return sortedCanonicalKeysAsync(input);
+      }
+    }
+    return small.sort();
+  };
+  const appendLargeJsonString = async (input: string): Promise<void> => {
+    append('"');
+    for (let offset = 0; offset < input.length;) {
+      let end = Math.min(input.length, offset + CANONICAL_CHUNK_CODE_UNITS);
+      if (
+        end < input.length &&
+        input.charCodeAt(end - 1) >= 0xd800 &&
+        input.charCodeAt(end - 1) <= 0xdbff &&
+        input.charCodeAt(end) >= 0xdc00 &&
+        input.charCodeAt(end) <= 0xdfff
+      ) end--;
+      const encoded = JSON.stringify(input.slice(offset, end));
+      append(encoded.slice(1, -1));
+      offset = end;
+      const pendingYield = checkpoint();
+      if (pendingYield) await pendingYield;
+    }
+    append('"');
+  };
+  const appendJsonString = (input: string): Promise<void> | null => {
+    if (input.length >= CANONICAL_CHUNK_CODE_UNITS) {
+      return appendLargeJsonString(input);
+    }
+    append(JSON.stringify(input));
+    return null;
+  };
+  const ancestors = new WeakSet<object>();
+  const containers: CanonicalContainer[] = [];
+  // The shared Responses validator defines each top-level field (and each
+  // element of the top-level input array) as depth zero. Keep the transport
+  // serializer on that same acceptance boundary while leaving the body shell
+  // and input collection themselves uncounted.
+  let pending: { value: unknown; depth: number } | null = { value, depth: -1 };
+
+  for (;;) {
+    if (pending) {
+      const current = pending;
+      pending = null;
+      const candidate = current.value;
+      countCanonicalItem();
+      if (candidate === null) {
+        append("null");
+      } else if (typeof candidate === "string") {
+        if (
+          !containsLargeInlineBase64 &&
+          candidate.length >= LARGE_INLINE_BASE64_BYTES &&
+          /^data:[^;,]{1,127};base64,/i.test(candidate)
+        ) containsLargeInlineBase64 = true;
+        const pendingString = appendJsonString(candidate);
+        if (pendingString) await pendingString;
+      } else if (typeof candidate === "boolean") {
+        append(JSON.stringify(candidate));
+      } else if (typeof candidate === "number") {
+        if (!Number.isFinite(candidate)) {
+          throw new TypeError("Canonical JSON numbers must be finite");
+        }
+        append(JSON.stringify(candidate));
+      } else {
+        if (typeof candidate !== "object") {
+          throw new TypeError(`Canonical JSON does not support ${typeof candidate}`);
+        }
+        if (current.depth > MAX_RESPONSES_JSON_DEPTH) {
+          throw new ResponsesInputStructureError("body");
+        }
+        if (ancestors.has(candidate)) {
+          throw new TypeError("Canonical JSON does not support cycles");
+        }
+        ancestors.add(candidate);
+        if (Array.isArray(candidate)) {
+          append("[");
+          containers.push({
+            kind: "array",
+            value: candidate,
+            depth: current.depth,
+            index: 0,
+            length: candidate.length,
+          });
+        } else {
+          const sortedKeys = sortedCanonicalKeys(candidate as Record<string, unknown>);
+          append("{");
+          containers.push({
+            kind: "object",
+            value: candidate as Record<string, unknown>,
+            depth: current.depth,
+            index: 0,
+            keys: sortedKeys instanceof Promise ? await sortedKeys : sortedKeys,
+          });
+        }
+      }
+      const pendingYield = checkpoint();
+      if (pendingYield) await pendingYield;
+      continue;
+    }
+
+    const container = containers.at(-1);
+    if (!container) break;
+    if (container.kind === "array") {
+      if (container.index >= container.length) {
+        append("]");
+        ancestors.delete(container.value);
+        containers.pop();
+        continue;
+      }
+      const index = container.index++;
+      if (index > 0) append(",");
+      const descriptor = Object.getOwnPropertyDescriptor(container.value, String(index));
+      if (!descriptor || !("value" in descriptor)) {
+        throw new TypeError("Canonical JSON arrays must be dense data values");
+      }
+      pending = { value: descriptor.value, depth: container.depth + 1 };
+      continue;
+    }
+
+    if (container.index >= container.keys.length) {
+      append("}");
+      ancestors.delete(container.value);
+      containers.pop();
+      continue;
+    }
+    const index = container.index++;
+    if (index > 0) append(",");
+    const key = container.keys[index]!;
+    const pendingKey = appendJsonString(key);
+    if (pendingKey) await pendingKey;
+    append(":");
+    const child = container.value[key];
+    pending = {
+      value: child,
+      depth: container.depth === -1 && key === "input" && Array.isArray(child)
+        ? -1
+        : container.depth + 1,
+    };
+    const pendingYield = checkpoint();
+    if (pendingYield) await pendingYield;
+  }
+
+  flush();
+  const output = new Uint8Array(byteCount);
+  let offset = 0;
+  workSinceYield = 0;
+  itemsSinceYield = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+    workSinceYield += chunk.byteLength;
+    const pendingYield = checkpoint();
+    if (pendingYield) await pendingYield;
+  }
+  return { bytes: output, containsLargeInlineBase64 };
 }
 
 export interface V2TransportSnapshot {
   connected: boolean;
   committed: number;
   active: number;
+  /** Active host request preparations. Always bounded by local preparation limits. */
+  preparing?: number;
   /** Body-only R2 reservations waiting behind the four-start safety gate. */
   prefetched?: number;
   queued: number;
@@ -131,6 +667,8 @@ export interface V2TransportSnapshot {
   admissionCredits?: number;
   /** Safe host run calls, including bounded body-only bulk-profile prefetch capacity. */
   prefetchCredits?: number;
+  /** Remaining weighted request-body transfer units after reflected reservations. */
+  transferCredits?: number;
   admissionBlockReason?: V2AdmissionBlockReason;
   retransmissions: number;
   awarenessRttMs: number | null;
@@ -202,6 +740,8 @@ export interface V2TransportSessionOptions {
   retransmitMs?: number;
   rotationTimeoutMs?: number;
   publicationIntervalMs?: number;
+  /** Primarily injectable for deterministic component tests. */
+  publicationTimer?: PublicationTimer;
   unadmittedTimeoutMs?: number;
   /** Sidecar instance proven by the bootstrap handshake. Required for liveness probes. */
   expectedSidecarInstanceId?: string;
@@ -278,6 +818,8 @@ interface RequestState {
   manifest: RequestManifest;
   /** Lazily consumed so large base64 frame arrays are never retained. */
   preparedRequest: PreparedRequestPlan | null;
+  preparationRetained: boolean;
+  preparationFast: boolean;
   handle: V2RunHandle;
   transcript: TranscriptProof<false>;
   resolveRun: (handle: RunHandle) => void;
@@ -298,7 +840,6 @@ interface RequestState {
   /** Irreversible R2 boundary after request_start enters the cumulative window. */
   startRisk: boolean;
   startQueued: boolean;
-  startStaged: boolean;
   startReserved: boolean;
   preparedStart: R2RequestStartFrame | null;
   committed: boolean;
@@ -309,6 +850,8 @@ interface RequestState {
   assemblies: Map<number, EventAssembly>;
   completedEvents: Map<number, CompletedEvent>;
   terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }> | null;
+  cancelledTerminalPermit: AtomicBytePermit | null;
+  terminalFinalizationAnchor: object | null;
   upstreamPrelude: UpstreamPrelude | null;
   diagnostics: HostRequestDiagnosticsObserver;
   firstResponseSeen: boolean;
@@ -325,6 +868,8 @@ export interface V2SidecarRecoveryToken {
 interface SidecarRecoveryState {
   token: V2SidecarRecoveryToken;
   markerSeen: boolean;
+  /** IDs imported from the retired host and therefore never orphan candidates. */
+  ownedRequestIds: ReadonlySet<string>;
   resolve(): void;
   reject(error: unknown): void;
   promise: Promise<void>;
@@ -335,6 +880,22 @@ interface TerminalReceipt {
   queued: boolean;
   replayed: boolean;
   cursor: { epoch: number; sequence: number } | null;
+}
+
+interface OrphanEventAssembly extends EventAssembly {
+  eventIndex: number;
+  nextPartIndex: number;
+  nextOffset: number;
+}
+
+interface OrphanRecoveryCandidate {
+  requestId: string;
+  requestDigest: string;
+  transcript: TranscriptProof<false> | null;
+  terminalProof: Extract<SidecarFrame, { kind: "response_terminal" }> | null;
+  responseBytes: number;
+  nextEventIndex: number;
+  assembly: OrphanEventAssembly | null;
 }
 
 interface SidecarRecoveryCapsulePayload {
@@ -349,6 +910,15 @@ const SIDECAR_RECOVERY_CAPSULES = new WeakMap<object, SidecarRecoveryCapsulePayl
 interface RotationWaiter {
   resolve: () => void;
   reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+interface PreparationWaiter {
+  readonly fast: boolean;
+  resolve(controller: AbortController): void;
+  reject(error: unknown): void;
   signal?: AbortSignal;
   onAbort?: () => void;
   timer?: ReturnType<typeof setTimeout>;
@@ -370,6 +940,13 @@ const MAX_TERMINAL_RECEIPTS = 4_096;
 
 function abortError(message: string): DOMException {
   return new DOMException(message, "AbortError");
+}
+
+function preCommitCancellationError(): V2PreCommitError {
+  return new V2PreCommitError(
+    "V2 request was cancelled before provider execution",
+    "cancelled_precommit",
+  );
 }
 
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
@@ -527,6 +1104,11 @@ export class V2TransportSession {
   readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #pacer: PublicationPacer;
   readonly #requests = new Map<string, RequestState>();
+  readonly #preparations = new Set<AbortController>();
+  readonly #fastPreparations = new Set<AbortController>();
+  readonly #preparationWaiters: PreparationWaiter[] = [];
+  #retainedPreparedPayloads = 0;
+  #retainedFastPreparedPayloads = 0;
   #committedRequestCount = 0;
   #admittedUncommittedRequestCount = 0;
   #unadmittedRequestCount = 0;
@@ -539,7 +1121,10 @@ export class V2TransportSession {
   readonly #retiredSidecarInstances = new Set<string>();
   readonly #terminalReceipts = new Map<string, TerminalReceipt>();
   readonly #ambiguityTombstones = new Map<string, string>();
+  readonly #orphanRecoveryCandidates = new Map<string, OrphanRecoveryCandidate>();
+  readonly #startupRecoveryOwnedRequestIds = new Set<string>();
   #sidecarRecovery: SidecarRecoveryState | null = null;
+  #startupRecoveryOpen = true;
   #connected = false;
   #closed = false;
   #draining = false;
@@ -708,6 +1293,7 @@ export class V2TransportSession {
     });
     this.#pacer = new PublicationPacer({
       intervalMs: options.publicationIntervalMs,
+      timer: options.publicationTimer,
       publish: reason => this.#publish(reason),
     });
   }
@@ -851,7 +1437,7 @@ export class V2TransportSession {
     signal?: AbortSignal,
     options?: V2TransportRunOptions,
   ): Promise<RunHandle> {
-    if (signal?.aborted) throw abortError("V2 request aborted before commitment");
+    if (signal?.aborted) throw preCommitCancellationError();
     if (!this.#connected || this.#closed) {
       throw new V2PreCommitError("V2 transport is not connected", "not_connected");
     }
@@ -864,91 +1450,223 @@ export class V2TransportSession {
     if (this.#draining) {
       throw new V2PreCommitError("V2 transport is draining", "draining");
     }
-    const requestId = `req-${crypto.randomUUID()}`;
+    const fastBody = snapshotFastPreparationBody(body);
+    const fastPreparation = fastBody !== null;
+    const preparationLease = this.#acquirePreparation(signal, fastPreparation);
+    // Preserve the original scheduling contract for the bounded fast wave: an
+    // immediately available slot must not add a microtask before
+    // canonicalization. The immutable size/item probe above caps its aggregate
+    // turn and memory cost; larger work remains on the four-slot lane.
+    const preparation = preparationLease instanceof AbortController
+      ? preparationLease
+      : await preparationLease;
+    const abortPreparation = () => preparation.abort(
+      signal?.reason ?? abortError("V2 request aborted during preparation"),
+    );
+    if (signal?.aborted) abortPreparation();
+    signal?.addEventListener("abort", abortPreparation, { once: true });
+    const preparationTimeoutError = new V2PreCommitError(
+      "V2 request preparation timed out before admission",
+      "capacity_changed",
+    );
+    let preparationWorkSettled = false;
+    let preparationCancellationFence: ReturnType<typeof setTimeout> | undefined;
+    const preparationTimer = setTimeout(() => {
+      preparation.abort(preparationTimeoutError);
+      preparationCancellationFence = setTimeout(() => {
+        preparationCancellationFence = undefined;
+        if (!preparationWorkSettled) {
+          this.#failProtocol(new Error(
+            "V2 request preparation ignored its cancellation deadline",
+          ));
+        }
+      }, PREPARATION_CANCELLATION_FENCE_MS);
+      preparationCancellationFence.unref?.();
+    }, this.#unadmittedTimeoutMs);
+    preparationTimer.unref?.();
+    let rejectPreparationAbort!: (error: unknown) => void;
+    const preparationAborted = new Promise<never>((_resolve, reject) => {
+      rejectPreparationAbort = reject;
+    });
+    void preparationAborted.catch(() => undefined);
+    const onPreparationAbort = () => {
+      const reason = preparation.signal.reason;
+      rejectPreparationAbort(
+        reason instanceof Error
+          ? reason
+          : abortError("V2 request aborted during preparation"),
+      );
+    };
+    preparation.signal.addEventListener("abort", onPreparationAbort, { once: true });
+    if (preparation.signal.aborted) onPreparationAbort();
+    let releasePreparationWhenSettled = false;
+    const preparationWork = this.#prepareRequest(
+      fastBody ?? body,
+      preparation.signal,
+    );
+    const onPreparationWorkSettled = () => {
+      preparationWorkSettled = true;
+      if (preparationCancellationFence) clearTimeout(preparationCancellationFence);
+      preparationCancellationFence = undefined;
+      if (releasePreparationWhenSettled) this.#releasePreparation(preparation);
+    };
+    void preparationWork.then(onPreparationWorkSettled, onPreparationWorkSettled);
+    let requestId!: string;
+    let retainStartupOwnership = false;
     const diagnostics = new HostRequestDiagnosticsObserver(
       () => this.#clock.now(),
       this.#hostDiagnosticsSource,
     );
-    const prepared = await this.#prepareRequest(body, signal);
-    diagnostics.prepared(prepared);
-    if (signal?.aborted) throw abortError("V2 request aborted before commitment");
-    if (this.#sidecarRecovery || !this.#connected) {
-      throw new V2PreCommitError(
-        "V2 sidecar recovery started during request preparation",
-        "sidecar_recovering",
-      );
-    }
-    if (this.#draining || this.#closed) {
-      throw new V2PreCommitError("V2 transport stopped during request preparation", "draining");
-    }
-    const handle = new V2RunHandle({
-      clock: this.#clock,
-      maxBufferedBytes: this.#maxBufferedResponseBytes,
-      expectUpstreamPrelude: this.#binding.protocolRevision === "r2",
-      requireTransferredEventMemory: this.#eventMemoryPool !== undefined,
-    });
-    handle.stats.diagnostics = diagnostics.value();
-    let resolveRun!: (handle: RunHandle) => void;
-    let rejectRun!: (error: unknown) => void;
-    const committed = new Promise<RunHandle>((resolve, reject) => {
-      resolveRun = resolve;
-      rejectRun = reject;
-    });
-    void committed.catch(() => undefined);
-    const state: RequestState = {
-      requestId,
-      requestDigest: prepared.requestDigest,
-      manifest: {
+    let state: RequestState | undefined;
+    let committed: Promise<RunHandle> | undefined;
+    try {
+      requestId = this.#allocateRequestId();
+      retainStartupOwnership = this.#binding.protocolRevision === "r2" &&
+        this.#startupRecoveryOpen;
+      if (
+        retainStartupOwnership &&
+        this.#startupRecoveryOwnedRequestIds.size >= MAX_TERMINAL_RECEIPTS
+      ) {
+        throw new V2PreCommitError(
+          "V2 startup recovery request identity capacity is exhausted",
+          "startup_recovery_capacity",
+        );
+      }
+      if (retainStartupOwnership) this.#startupRecoveryOwnedRequestIds.add(requestId);
+      const prepared = await Promise.race([preparationWork, preparationAborted]);
+      diagnostics.prepared(prepared);
+      if (signal?.aborted) throw preCommitCancellationError();
+      if (this.#sidecarRecovery || !this.#connected) {
+        throw new V2PreCommitError(
+          "V2 sidecar recovery started during request preparation",
+          "sidecar_recovering",
+        );
+      }
+      if (this.#draining || this.#closed) {
+        throw new V2PreCommitError("V2 transport stopped during request preparation", "draining");
+      }
+      const handle = new V2RunHandle({
+        clock: this.#clock,
+        maxBufferedBytes: this.#maxBufferedResponseBytes,
+        expectUpstreamPrelude: this.#binding.protocolRevision === "r2",
+        requireTransferredEventMemory: this.#eventMemoryPool !== undefined,
+      });
+      handle.stats.diagnostics = diagnostics.value();
+      let resolveRun!: (value: RunHandle) => void;
+      let rejectRun!: (error: unknown) => void;
+      committed = new Promise<RunHandle>((resolve, reject) => {
+        resolveRun = resolve;
+        rejectRun = reject;
+      });
+      void committed.catch(() => undefined);
+      const preparedIsFast = prepared.decodedBytes <= V2_LATENCY_CRITICAL_REQUEST_BYTES;
+      if (fastPreparation && !preparedIsFast) {
+        throw new V2PreCommitError(
+          "V2 fast preparation exceeded its immutable size reservation",
+          "preparation_capacity",
+        );
+      }
+      state = {
+        requestId,
         requestDigest: prepared.requestDigest,
-        decodedBytes: prepared.decodedBytes,
-        encodedBytes: prepared.encodedBytes,
-        encoding: prepared.encoding,
-        partCount: prepared.partCount,
-      },
-      preparedRequest: prepared,
-      handle,
-      transcript: new TranscriptProof(requestId, prepared.requestDigest, {
-        maxBytes: this.#maxResponseBytes,
-        retainBytes: false,
-        hasher: createNativeTranscriptHasher(),
-      }),
-      resolveRun,
-      rejectRun,
-      signal,
-      onAdmissionReflected: options?.onAdmissionReflected,
-      onAdmissionProgress: options?.onAdmissionProgress,
-      acknowledgedEncodedBytes: 0,
-      onExecutionRiskReflected: options?.onExecutionRiskReflected,
-      admitted: false,
-      transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
-      latencyCriticalPreCommitTracked: false,
-      latencyCriticalRequestTracked: false,
-      published: false,
-      commitStaged: false,
-      commitPublished: false,
-      startRisk: false,
-      startQueued: false,
-      startStaged: false,
-      startReserved: false,
-      preparedStart: null,
-      committed: false,
-      cancelled: false,
-      quarantineKind: null,
-      responseBytes: 0,
-      nextEventIndex: 0,
-      assemblies: new Map(),
-      completedEvents: new Map(),
-      terminal: null,
-      upstreamPrelude: null,
-      diagnostics,
-      firstResponseSeen: false,
-    };
-    if (state.onAdmissionProgress) this.#admissionProgressObservers++;
-    state.onAbort = () => this.#abortRequest(state);
-    signal?.addEventListener("abort", state.onAbort, { once: true });
-    this.#requests.set(requestId, state);
-    this.#pending.push(state);
-    this.#trackRequestState(state);
+        manifest: {
+          requestDigest: prepared.requestDigest,
+          decodedBytes: prepared.decodedBytes,
+          encodedBytes: prepared.encodedBytes,
+          encoding: prepared.encoding,
+          partCount: prepared.partCount,
+        },
+        preparedRequest: prepared,
+        preparationRetained: false,
+        preparationFast: fastPreparation,
+        handle,
+        transcript: new TranscriptProof(requestId, prepared.requestDigest, {
+          maxBytes: this.#maxResponseBytes,
+          retainBytes: false,
+          hasher: createNativeTranscriptHasher(),
+        }),
+        resolveRun,
+        rejectRun,
+        signal,
+        onAdmissionReflected: options?.onAdmissionReflected,
+        onAdmissionProgress: options?.onAdmissionProgress,
+        acknowledgedEncodedBytes: 0,
+        onExecutionRiskReflected: options?.onExecutionRiskReflected,
+        admitted: false,
+        transferCost: v2RequestTransferCost(prepared.encodedBytes, this.#transportProfile),
+        latencyCriticalPreCommitTracked: false,
+        latencyCriticalRequestTracked: false,
+        published: false,
+        commitStaged: false,
+        commitPublished: false,
+        startRisk: false,
+        startQueued: false,
+        startReserved: false,
+        preparedStart: null,
+        committed: false,
+        cancelled: false,
+        quarantineKind: null,
+        responseBytes: 0,
+        nextEventIndex: 0,
+        assemblies: new Map(),
+        completedEvents: new Map(),
+        terminal: null,
+        cancelledTerminalPermit: null,
+        terminalFinalizationAnchor: null,
+        upstreamPrelude: null,
+        diagnostics,
+        firstResponseSeen: false,
+      };
+      // Classification uses the immutable canonical result, never a mutable or
+      // accessor-backed caller object. This makes the 128-slot fast bound an
+      // actual <=32 MiB canonical-payload bound.
+      if (fastPreparation) this.#retainedFastPreparedPayloads++;
+      else this.#retainedPreparedPayloads++;
+      state.preparationRetained = true;
+      if (state.onAdmissionProgress) this.#admissionProgressObservers++;
+      state.onAbort = () => this.#abortRequest(state!);
+      this.#requests.set(requestId, state);
+      this.#pending.push(state);
+      this.#trackRequestState(state);
+      signal?.addEventListener("abort", state.onAbort, { once: true });
+      if (signal?.aborted) state.onAbort();
+    } catch (error) {
+      if (state) {
+        if (this.#requests.has(state.requestId)) {
+          this.#failPreCommit(
+            state,
+            error instanceof Error ? error : new Error("V2 request registration failed"),
+          );
+        } else {
+          this.#releasePreparedPayload(state);
+        }
+      }
+      if (retainStartupOwnership) this.#startupRecoveryOwnedRequestIds.delete(requestId);
+      if (
+        preparation.signal.aborted &&
+        !signal?.aborted &&
+        (this.#closed || this.#draining || !this.#connected)
+      ) {
+        throw new V2PreCommitError(
+          "V2 transport stopped during request preparation",
+          "draining",
+        );
+      }
+      if (signal?.aborted && !(error instanceof V2PreCommitError)) {
+        throw preCommitCancellationError();
+      }
+      throw error;
+    } finally {
+      clearTimeout(preparationTimer);
+      signal?.removeEventListener("abort", abortPreparation);
+      preparation.signal.removeEventListener("abort", onPreparationAbort);
+      releasePreparationWhenSettled = true;
+      if (preparationWorkSettled) this.#releasePreparation(preparation);
+    }
+    if (!state || !committed) {
+      throw new Error("V2 request preparation completed without registered state");
+    }
+    if (!this.#requests.has(state.requestId)) return committed;
     state.admissionTimer = setTimeout(() => {
       if (!this.#requests.has(state.requestId) || state.admitted) return;
       this.#unadmittedTimeouts++;
@@ -1012,6 +1730,15 @@ export class V2TransportSession {
     this.#draining = true;
     this.#remoteCredits = 0;
     this.#connected = false;
+    for (const preparation of this.#preparations) {
+      preparation.abort(abortError("V2 sidecar recovery interrupted request preparation"));
+    }
+    this.#preparations.clear();
+    this.#fastPreparations.clear();
+    this.#rejectPreparationWaiters(new V2PreCommitError(
+      "V2 sidecar recovery interrupted request preparation",
+      "sidecar_recovery",
+    ));
     this.#pacer.close();
     this.#unsubscribe?.();
     this.#unsubscribe = null;
@@ -1086,7 +1813,6 @@ export class V2TransportSession {
       state.preparedRequest = null;
       state.terminal = null;
       state.startQueued = false;
-      state.startStaged = false;
       state.startReserved = false;
       state.preparedStart = null;
       state.onAdmissionReflected = undefined;
@@ -1121,6 +1847,8 @@ export class V2TransportSession {
       payload.receipts.set(requestId, receipt);
     }
     this.#terminalReceipts.clear();
+    this.#clearOrphanRecoveryCandidates();
+    this.#startupRecoveryOwnedRequestIds.clear();
     this.#ambiguityTombstones.clear();
     this.#ambiguousQuarantined = 0;
     this.#quarantined = 0;
@@ -1187,13 +1915,21 @@ export class V2TransportSession {
       reject = rejectValue;
     });
     void promise.catch(() => undefined);
+    const ownedRequestIds = new Set<string>([
+      ...payload.states.map(state => state.requestId),
+      ...payload.receipts.keys(),
+      ...payload.ambiguityTombstones.keys(),
+    ]);
     this.#sidecarRecovery = {
       token,
       markerSeen: false,
+      ownedRequestIds,
       resolve,
       reject,
       promise,
     };
+    this.#startupRecoveryOpen = false;
+    this.#startupRecoveryOwnedRequestIds.clear();
     this.#remoteCredits = 0;
     for (const [requestId, requestDigest] of payload.ambiguityTombstones) {
       if (this.#ambiguityTombstones.has(requestId)) continue;
@@ -1248,6 +1984,10 @@ export class V2TransportSession {
   async drain(reason: string, signal?: AbortSignal): Promise<void> {
     if (this.#closed) return this.#teardownPromise ?? Promise.resolve();
     this.#draining = true;
+    this.#abortPreparations(new V2PreCommitError(
+      "V2 transport drained during request preparation",
+      "draining",
+    ));
     for (const state of [...this.#pending]) {
       if (state.admitted) continue;
       this.#failPreCommit(
@@ -1275,6 +2015,10 @@ export class V2TransportSession {
       return;
     }
     this.#draining = true;
+    this.#abortPreparations(new V2PreCommitError(
+      "V2 sandbox recovery interrupted request preparation",
+      "sandbox_recovery",
+    ));
     for (const state of [...this.#requests.values()]) {
       const requestId = state.requestId;
       const published = state.published;
@@ -1455,6 +2199,16 @@ export class V2TransportSession {
     this.#connected = false;
     this.#draining = true;
     this.#remoteCredits = 0;
+    this.#startupRecoveryOpen = false;
+    for (const preparation of this.#preparations) {
+      preparation.abort(abortError("V2 transport closed during request preparation"));
+    }
+    this.#preparations.clear();
+    this.#fastPreparations.clear();
+    this.#rejectPreparationWaiters(new V2PreCommitError(
+      "V2 transport closed before request preparation",
+      "draining",
+    ));
     this.#lifecycleEpoch++;
     if (this.#sidecarRecovery) {
       const recovery = this.#sidecarRecovery;
@@ -1510,6 +2264,8 @@ export class V2TransportSession {
       }
       this.#scheduler.removeStream("control");
       this.#terminalReceipts.clear();
+      this.#clearOrphanRecoveryCandidates();
+      this.#startupRecoveryOwnedRequestIds.clear();
       this.#creditReservations = 0;
       this.#transferReservations = 0;
       this.#startReservations = 0;
@@ -1543,14 +2299,17 @@ export class V2TransportSession {
       connected: this.#connected && !this.#closed && !this.#sidecarRecovery,
       committed: this.#committedRequestCount,
       active: this.#committedRequestCount + executionReservations,
+      preparing: this.#preparations.size,
       prefetched,
-      queued: this.#unadmittedRequestCount + prefetched,
+      queued: this.#unadmittedRequestCount + prefetched +
+        this.#preparations.size + this.#preparationWaiters.length,
       quarantined: this.#quarantined,
       ambiguousQuarantined: this.#ambiguousQuarantined,
       ambiguityLimit: Math.max(1, Math.min(4, this.#hostCeiling)),
       credits: Math.max(0, this.#remoteCredits - this.#creditReservations),
       admissionCredits: this.#availableCredits(),
       prefetchCredits: this.#availablePrefetchCredits(),
+      transferCredits: Math.max(0, this.#transferBudget - this.#transferReservations),
       admissionBlockReason: this.#admissionBlockReason(),
       retransmissions: this.#retransmissions,
       awarenessRttMs: this.#delivery.roundTripEwmaMs,
@@ -1568,6 +2327,170 @@ export class V2TransportSession {
     if (value === this.#hostCeiling) return;
     this.#hostCeiling = value;
     if (this.#connected && !this.#closed) this.#pacer.requestUrgent();
+  }
+
+  #preparationLimit(): number {
+    // bulk-v1 may retain the same six body-only prefetches that transport
+    // admission already bounds. CPU-heavy canonicalization/compression remains
+    // independently capped at four below, so this does not turn six retained
+    // payload slots into six concurrent preparation jobs.
+    return this.#transportProfile === "bulk-v1" &&
+        this.#binding.protocolRevision === "r2"
+      ? MAX_BULK_BODY_PREFETCH_RESERVATIONS
+      : MAX_PRECOMMIT_EXECUTION_RESERVATIONS;
+  }
+
+  #boundedPreparationCount(): number {
+    return this.#preparations.size - this.#fastPreparations.size;
+  }
+
+  #acquirePreparation(
+    signal: AbortSignal | undefined,
+    fast: boolean,
+  ): AbortController | Promise<AbortController> {
+    if (signal?.aborted) {
+      return Promise.reject(preCommitCancellationError());
+    }
+    if (this.#canAcquirePreparation(fast)) {
+      const controller = new AbortController();
+      this.#preparations.add(controller);
+      if (fast) this.#fastPreparations.add(controller);
+      this.#notifyStateChange();
+      return controller;
+    }
+    if (this.#preparationWaiters.length >= MAX_PREPARATION_WAITERS) {
+      return Promise.reject(new V2PreCommitError(
+        "V2 request preparation queue is full",
+        "preparation_capacity",
+      ));
+    }
+    return new Promise<AbortController>((resolve, reject) => {
+      const waiter: PreparationWaiter = { fast, resolve, reject, signal };
+      waiter.onAbort = () => {
+        const index = this.#preparationWaiters.indexOf(waiter);
+        if (index < 0) return;
+        this.#preparationWaiters.splice(index, 1);
+        signal?.removeEventListener("abort", waiter.onAbort!);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        this.#notifyStateChange();
+        reject(preCommitCancellationError());
+      };
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      waiter.timer = setTimeout(() => {
+        const index = this.#preparationWaiters.indexOf(waiter);
+        if (index < 0) return;
+        this.#preparationWaiters.splice(index, 1);
+        signal?.removeEventListener("abort", waiter.onAbort!);
+        this.#notifyStateChange();
+        reject(new V2PreCommitError(
+          "V2 request preparation capacity changed before admission",
+          "capacity_changed",
+        ));
+      }, this.#unadmittedTimeoutMs);
+      waiter.timer.unref?.();
+      this.#preparationWaiters.push(waiter);
+      this.#notifyStateChange();
+    });
+  }
+
+  #releasePreparation(controller: AbortController): void {
+    if (!this.#preparations.delete(controller)) return;
+    this.#fastPreparations.delete(controller);
+    this.#notifyStateChange();
+    this.#drainPreparationWaiters();
+  }
+
+  #releasePreparedPayload(state: RequestState): void {
+    if (!state.preparationRetained) return;
+    state.preparationRetained = false;
+    if (state.preparationFast) {
+      state.preparationFast = false;
+      this.#retainedFastPreparedPayloads = Math.max(
+        0,
+        this.#retainedFastPreparedPayloads - 1,
+      );
+    } else {
+      this.#retainedPreparedPayloads = Math.max(0, this.#retainedPreparedPayloads - 1);
+    }
+    this.#drainPreparationWaiters();
+  }
+
+  #drainPreparationWaiters(): void {
+    while (this.#preparationWaiters.length > 0) {
+      let index = this.#preparationWaiters.findIndex(waiter => (
+        waiter.fast && this.#canAcquirePreparation(true)
+      ));
+      if (index < 0) {
+        index = this.#preparationWaiters.findIndex(waiter => (
+          !waiter.fast && this.#canAcquirePreparation(false)
+        ));
+      }
+      if (index < 0) return;
+      const [waiter] = this.#preparationWaiters.splice(index, 1);
+      waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.signal?.aborted) {
+        waiter.reject(preCommitCancellationError());
+        continue;
+      }
+      if (this.#closed || this.#draining || this.#sidecarRecovery || !this.#connected) {
+        waiter.reject(new V2PreCommitError(
+          "V2 transport stopped before request preparation",
+          "draining",
+        ));
+        continue;
+      }
+      const next = new AbortController();
+      this.#preparations.add(next);
+      if (waiter.fast) this.#fastPreparations.add(next);
+      this.#notifyStateChange();
+      waiter.resolve(next);
+    }
+  }
+
+  #canAcquirePreparation(fast: boolean): boolean {
+    if (fast) {
+      return this.#fastPreparations.size < MAX_FAST_ACTIVE_PREPARATIONS &&
+        this.#fastPreparations.size + this.#retainedFastPreparedPayloads <
+          MAX_FAST_PREPARED_PAYLOADS;
+    }
+    if (this.#boundedPreparationCount() >= MAX_PRECOMMIT_EXECUTION_RESERVATIONS) return false;
+    return this.#boundedPreparationCount() + this.#retainedPreparedPayloads <
+      this.#preparationLimit();
+  }
+
+  #rejectPreparationWaiters(error: Error): void {
+    for (const waiter of this.#preparationWaiters.splice(0)) {
+      waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.#notifyStateChange();
+  }
+
+  #abortPreparations(error: Error): void {
+    for (const preparation of this.#preparations) preparation.abort(error);
+    this.#preparations.clear();
+    this.#fastPreparations.clear();
+    this.#rejectPreparationWaiters(error);
+  }
+
+  #allocateRequestId(): string {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const requestId = `req-${crypto.randomUUID()}`;
+      if (
+        !this.#requests.has(requestId) &&
+        !this.#terminalReceipts.has(requestId) &&
+        !this.#ambiguityTombstones.has(requestId) &&
+        !this.#orphanRecoveryCandidates.has(requestId) &&
+        !this.#startupRecoveryOwnedRequestIds.has(requestId) &&
+        !this.#sidecarRecovery?.ownedRequestIds.has(requestId)
+      ) return requestId;
+    }
+    throw new V2PreCommitError(
+      "V2 transport could not allocate a unique request identity",
+      "request_id_collision",
+    );
   }
 
   #notifyStateChange(): void {
@@ -1747,11 +2670,28 @@ export class V2TransportSession {
       this.#dataDirty = false;
       this.#sidecarRevision.data = -1;
       this.#sidecarRevision.control = -1;
+      this.#clearOrphanRecoveryCandidates();
+      this.#startupRecoveryOwnedRequestIds.clear();
+      this.#startupRecoveryOpen = false;
       replaced = true;
     }
     if (envelope.revision <= this.#sidecarRevision[lane]) return;
     this.#sidecarInstanceId = envelope.instanceId;
     this.#sidecarRevision[lane] = envelope.revision;
+    const orphanRecoveryEnvelope = this.#binding.protocolRevision === "r2" && (
+      this.#sidecarRecovery !== null || (
+        this.#startupRecoveryOpen && envelope.credits === 0 && !envelope.draining
+      )
+    );
+    if (
+      this.#binding.protocolRevision === "r2" &&
+      !this.#sidecarRecovery &&
+      envelope.credits > 0
+    ) {
+      this.#startupRecoveryOpen = false;
+      this.#startupRecoveryOwnedRequestIds.clear();
+      this.#clearOrphanRecoveryCandidates();
+    }
     let creditsChanged = false;
     if (lane === "control" || legacy) {
       this.#sidecarDiagnostics = envelope.diagnostics ?? null;
@@ -1790,6 +2730,9 @@ export class V2TransportSession {
     if (lane === "data") {
       const currentEpoch = this.#inbound.ack().epoch;
       if (envelope.epoch > currentEpoch) {
+        this.#clearOrphanRecoveryCandidates();
+        this.#startupRecoveryOwnedRequestIds.clear();
+        this.#startupRecoveryOpen = false;
         this.#inbound.reset(envelope.epoch);
         this.#processedInboundAck = { epoch: envelope.epoch, sequence: -1 };
       }
@@ -1801,7 +2744,7 @@ export class V2TransportSession {
       );
       delivered = this.#inbound.accept(envelope.frames);
       for (const frame of delivered) {
-        await this.#processFrame(frame, lifecycleEpoch);
+        await this.#processFrame(frame, lifecycleEpoch, orphanRecoveryEnvelope);
         if (!this.#ownsLifecycle(lifecycleEpoch)) return;
         this.#processedInboundAck = { epoch: frame.epoch, sequence: frame.sequence };
       }
@@ -1830,6 +2773,7 @@ export class V2TransportSession {
   async #processFrame(
     frame: ReliableFrame<SidecarFrame>,
     lifecycleEpoch: number,
+    orphanRecoveryEnvelope: boolean,
   ): Promise<void> {
     switch (frame.kind) {
       case "request_prepared": {
@@ -1907,7 +2851,10 @@ export class V2TransportSession {
       }
       case "request_ack": {
         const state = this.#requests.get(frame.requestId);
-        if (!state) return;
+        if (!state) {
+          this.#trackOrphanRecoveryCandidate(frame, orphanRecoveryEnvelope);
+          return;
+        }
         if (frame.requestDigest !== state.requestDigest) {
           if (this.#binding.protocolRevision === "r2") {
             state.startRisk = true;
@@ -1952,7 +2899,10 @@ export class V2TransportSession {
       }
       case "request_reject": {
         const state = this.#requests.get(frame.requestId);
-        if (!state) return;
+        if (!state) {
+          this.#deleteOrphanRecoveryCandidate(frame.requestId);
+          return;
+        }
         if (state.committed || (
           this.#binding.protocolRevision === "r2" && state.startRisk
         )) {
@@ -1968,7 +2918,13 @@ export class V2TransportSession {
       }
       case "response_event": {
         const state = this.#requests.get(frame.requestId);
-        if (!state) return;
+        if (!state) {
+          const candidate = this.#orphanRecoveryCandidates.get(frame.requestId);
+          if (candidate) {
+            await this.#acceptOrphanRecoveryEventPart(candidate, frame, lifecycleEpoch);
+          }
+          return;
+        }
         if (!state.committed) {
           const message = "Sidecar emitted response data before commitment";
           if (this.#hasExecutionRisk(state)) {
@@ -1993,7 +2949,21 @@ export class V2TransportSession {
       }
       case "response_batch": {
         const state = this.#requests.get(frame.requestId);
-        if (!state) return;
+        if (!state) {
+          const candidate = this.#orphanRecoveryCandidates.get(frame.requestId);
+          if (!candidate) return;
+          for (let offset = 0; offset < frame.items.length; offset++) {
+            const item = frame.items[offset]!;
+            if (!await this.#acceptOrphanRecoveryWholeEvent(
+              candidate,
+              frame.firstEventIndex + offset,
+              item.event,
+              item.dataBase64Url,
+              lifecycleEpoch,
+            )) return;
+          }
+          return;
+        }
         if (!state.committed) {
           const message = "Sidecar emitted response data before commitment";
           if (this.#hasExecutionRisk(state)) {
@@ -2037,20 +3007,32 @@ export class V2TransportSession {
         const state = this.#requests.get(frame.requestId);
         if (!state) {
           const receipt = this.#terminalReceipts.get(frame.requestId);
-          if (!receipt || !this.#sidecarRecovery) return;
-          if (!this.#terminalMatchesReceipt(frame, receipt.terminal)) {
-            this.failSidecarRecovery(
-              this.#sidecarRecovery.token,
-              new V2CommittedError(
+          if (receipt && (this.#sidecarRecovery || receipt.replayed)) {
+            if (!this.#terminalMatchesReceipt(frame, receipt.terminal)) {
+              this.#failRecoveryProtocol(
                 "Recovered terminal conflicts with its retained receipt",
                 "terminal_receipt_conflict",
-                true,
-              ),
+              );
+              return;
+            }
+            receipt.replayed = true;
+            this.#queueTerminalReceipt(frame.requestId, receipt);
+            return;
+          }
+          if (receipt) return;
+          if (
+            this.#sidecarRecovery?.ownedRequestIds.has(frame.requestId) ||
+            this.#startupRecoveryOwnedRequestIds.has(frame.requestId)
+          ) {
+            this.#failRecoveryProtocol(
+              "Recovered terminal conflicts with a locally owned definitive outcome",
+              "owned_terminal_conflict",
             );
             return;
           }
-          receipt.replayed = true;
-          this.#queueTerminalReceipt(frame.requestId, receipt);
+          const candidate = this.#orphanRecoveryCandidates.get(frame.requestId);
+          if (!candidate) return;
+          await this.#validateOrphanRecoveryTerminal(candidate, frame, lifecycleEpoch);
           return;
         }
         if (!state.committed) {
@@ -2084,7 +3066,10 @@ export class V2TransportSession {
       }
       case "response_error": {
         const state = this.#requests.get(frame.requestId);
-        if (!state) return;
+        if (!state) {
+          this.#deleteOrphanRecoveryCandidate(frame.requestId);
+          return;
+        }
         if (state.committed || (
           this.#binding.protocolRevision === "r2" && state.startRisk
         )) {
@@ -2102,7 +3087,11 @@ export class V2TransportSession {
       }
       case "request_cancelled": {
         const state = this.#requests.get(frame.requestId);
-        if (state && this.#sidecarRecovery && !state.cancelled) {
+        if (!state) {
+          this.#deleteOrphanRecoveryCandidate(frame.requestId);
+          return;
+        }
+        if (this.#sidecarRecovery && !state.cancelled) {
           this.#failCommitted(state, new V2CommittedError(
             "Recovered request was durably cancelled",
             "cancelled",
@@ -2111,7 +3100,7 @@ export class V2TransportSession {
           this.#maybeCompleteSidecarRecovery();
           return;
         }
-        if (!state?.cancelled) return;
+        if (!state.cancelled) return;
         const releaseQuarantine = state.quarantineKind === "cancellation";
         this.#removeState(state);
         if (releaseQuarantine) {
@@ -2121,6 +3110,17 @@ export class V2TransportSession {
         return;
       }
       case "recovery_complete":
+        if (this.#orphanRecoveryCandidates.size > 0) {
+          const candidate = this.#orphanRecoveryCandidates.values().next().value!;
+          this.#failOrphanRecoveryCandidate(
+            candidate,
+            "Recovered orphan replay ended without a complete terminal proof",
+            "orphan_terminal_truncated",
+          );
+          return;
+        }
+        this.#startupRecoveryOpen = false;
+        this.#startupRecoveryOwnedRequestIds.clear();
         if (this.#sidecarRecovery) {
           this.#sidecarRecovery.markerSeen = true;
           this.#maybeCompleteSidecarRecovery();
@@ -2320,7 +3320,8 @@ export class V2TransportSession {
         MAX_PRECOMMIT_EXECUTION_RESERVATIONS
     ) {
       const latencyIndex = this.#preparedStarts.findIndex(state => (
-        state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
+        this.#transportProfile === "bulk-v1" &&
+            state.manifest.decodedBytes <= V2_LATENCY_CRITICAL_REQUEST_BYTES
       ));
       const index = latencyIndex >= 0 ? latencyIndex : 0;
       const state = this.#preparedStarts.splice(index, 1)[0]!;
@@ -2338,7 +3339,7 @@ export class V2TransportSession {
         state.startQueued = false;
         state.startReserved = false;
         this.#startReservations = Math.max(0, this.#startReservations - 1);
-        this.#failPreCommit(state, new V2PreCommitError(
+        this.#failRequestStaging(state, new V2PreCommitError(
           cause instanceof Error ? cause.message : "R2 request start could not be staged",
           "start_stage",
         ));
@@ -2730,11 +3731,17 @@ export class V2TransportSession {
       if (state.cancelled) {
         state.completedEvents.delete(state.nextEventIndex);
         state.nextEventIndex++;
-        completed.permit?.release();
+        if (TERMINAL_RESPONSE_EVENTS.has(completed.frame.event)) {
+          state.cancelledTerminalPermit?.release();
+          state.cancelledTerminalPermit = completed.permit;
+        } else {
+          completed.permit?.release();
+        }
         completed.permit = null;
         continue;
       }
       let permit: AtomicBytePermit | undefined;
+      let terminalFinalizationAnchor: object | undefined;
       try {
         permit = completed.permit?.transfer("host-run-handle-event");
       } catch (cause) {
@@ -2750,13 +3757,27 @@ export class V2TransportSession {
       state.nextEventIndex++;
       const started = this.#clock.now();
       try {
+        if (
+          TERMINAL_RESPONSE_EVENTS.has(completed.frame.event) &&
+          !state.terminalFinalizationAnchor
+        ) {
+          terminalFinalizationAnchor = {};
+          // Store before acceptEvent can suspend on client backpressure. A
+          // concurrent abort/remove path can then release the proof reference.
+          state.terminalFinalizationAnchor = terminalFinalizationAnchor;
+        }
         // Backpressure the reliable data lane instead of converting a short
         // consumer pause into an ambiguous committed failure. While this
         // awaits, the inbound cumulative ACK intentionally does not advance,
         // so the sidecar's bounded reliable window and output backpressure
         // stop upstream consumption. Control-lane liveness is observed before
         // this serialized data path and therefore remains responsive.
-        await state.handle.acceptEvent(completed.frame, wireBytes, permit);
+        await state.handle.acceptEvent(
+          completed.frame,
+          wireBytes,
+          permit,
+          terminalFinalizationAnchor,
+        );
         permit = undefined;
       } catch (error) {
         // V2RunHandle releases a transferred permit on rejection. A client
@@ -2829,8 +3850,14 @@ export class V2TransportSession {
     if (eventCount < terminal.eventCount) return;
     if (state.assemblies.size > 0 || state.completedEvents.size > 0) return;
     const snapshot = state.transcript.snapshot();
+    const cancelledPermit = state.cancelledTerminalPermit;
+    const finalizationAnchor = state.terminalFinalizationAnchor;
+    state.cancelledTerminalPermit = null;
+    state.terminalFinalizationAnchor = null;
     let final: Record<string, unknown>;
     try {
+      if (!snapshot.final) throw new Error("Terminal proof has no final response");
+      validateHostTerminalFinalStructure(snapshot.final);
       final = await validateTerminalProof(terminal, snapshot);
     } catch (cause) {
       if (
@@ -2843,6 +3870,9 @@ export class V2TransportSession {
         true,
       ));
       return;
+    } finally {
+      cancelledPermit?.release();
+      releaseAtomicBytePermit(finalizationAnchor);
     }
     if (
       !this.#ownsLifecycle(lifecycleEpoch) ||
@@ -2890,6 +3920,471 @@ export class V2TransportSession {
       terminalDigest: receipt.terminal.transcriptSha256,
     });
     receipt.queued = true;
+  }
+
+  #releaseOrphanRecoveryCandidate(candidate: OrphanRecoveryCandidate): void {
+    const assembly = candidate.assembly;
+    if (assembly) {
+      for (const part of assembly.parts.values()) part.bytes.fill(0);
+      assembly.parts.clear();
+      assembly.permit?.release();
+      assembly.permit = null;
+      candidate.assembly = null;
+    }
+  }
+
+  #deleteOrphanRecoveryCandidate(requestId: string): void {
+    const candidate = this.#orphanRecoveryCandidates.get(requestId);
+    if (!candidate) return;
+    this.#orphanRecoveryCandidates.delete(requestId);
+    this.#releaseOrphanRecoveryCandidate(candidate);
+  }
+
+  #clearOrphanRecoveryCandidates(): void {
+    for (const candidate of this.#orphanRecoveryCandidates.values()) {
+      this.#releaseOrphanRecoveryCandidate(candidate);
+    }
+    this.#orphanRecoveryCandidates.clear();
+  }
+
+  #failOrphanRecoveryCandidate(
+    candidate: OrphanRecoveryCandidate,
+    message: string,
+    code: string,
+  ): void {
+    if (this.#orphanRecoveryCandidates.get(candidate.requestId) === candidate) {
+      this.#orphanRecoveryCandidates.delete(candidate.requestId);
+    }
+    this.#releaseOrphanRecoveryCandidate(candidate);
+    this.#failRecoveryProtocol(message, code);
+  }
+
+  async #appendOrphanRecoveryEvent(
+    candidate: OrphanRecoveryCandidate,
+    eventIndex: number,
+    frame: SseFrame,
+    wireBytes: number,
+    permit: AtomicBytePermit | null | undefined,
+    lifecycleEpoch: number,
+  ): Promise<boolean> {
+    if (
+      eventIndex !== candidate.nextEventIndex ||
+      candidate.responseBytes + wireBytes > this.#maxResponseBytes
+    ) {
+      permit?.release();
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        eventIndex !== candidate.nextEventIndex
+          ? "Recovered orphan response event order is invalid"
+          : "Recovered orphan response exceeds the configured byte limit",
+        eventIndex !== candidate.nextEventIndex ? "orphan_event_order" : "response_too_large",
+      );
+      return false;
+    }
+    try {
+      let transcript = candidate.transcript;
+      if (!transcript || candidate.terminalProof) {
+        throw new Error("Recovered orphan emitted output after its terminal event");
+      }
+      const appended = await transcript.appendCanonicalStream(frame, {
+        chunkBytes: MAX_TRANSCRIPT_CHUNK_BYTES,
+        yieldTask: async () => {
+          await yieldCanonicalWork();
+          if (!this.#ownsLifecycle(lifecycleEpoch)) {
+            throw abortError("Recovered orphan verification was interrupted");
+          }
+        },
+      });
+      if (appended !== wireBytes) {
+        throw new Error("Canonical orphan response byte accounting diverged");
+      }
+      if (
+        frame.event === "response.completed" ||
+        frame.event === "response.failed" ||
+        frame.event === "response.incomplete"
+      ) {
+        candidate.terminalProof = await transcript.createTerminal();
+        // Retain only bounded proof metadata between the terminal SSE event and
+        // response_terminal; the parsed final object is no longer reachable.
+        candidate.transcript = null;
+        transcript = null;
+      }
+    } catch (cause) {
+      permit?.release();
+      if (!this.#ownsLifecycle(lifecycleEpoch)) return false;
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        cause instanceof Error ? cause.message : "Recovered orphan transcript is invalid",
+        "orphan_transcript",
+      );
+      return false;
+    }
+    permit?.release();
+    if (
+      !this.#ownsLifecycle(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+    ) return false;
+    candidate.responseBytes += wireBytes;
+    candidate.nextEventIndex++;
+    return true;
+  }
+
+  async #acceptOrphanRecoveryWholeEvent(
+    candidate: OrphanRecoveryCandidate,
+    eventIndex: number,
+    event: string,
+    encoded: string,
+    lifecycleEpoch: number,
+  ): Promise<boolean> {
+    if (candidate.assembly || eventIndex !== candidate.nextEventIndex) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response batch order conflicts",
+        "orphan_event_order",
+      );
+      return false;
+    }
+    const decodedLength = base64UrlDecodedBytes(encoded);
+    if (decodedLength === null) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response batch encoding is invalid",
+        "response_encoding",
+      );
+      return false;
+    }
+    const wireBytes = partialEventLogicalBytes(event, decodedLength);
+    if (candidate.responseBytes + wireBytes > this.#maxResponseBytes) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response exceeds the configured byte limit",
+        "response_too_large",
+      );
+      return false;
+    }
+    const permit = this.#tryAcquireEventPermit(
+      wireBytes,
+      `host-orphan-recovery:${candidate.requestId}`,
+    );
+    if (permit === null) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Host event memory is unavailable for orphan recovery",
+        "event_memory_capacity",
+      );
+      return false;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = decodeCanonicalBase64Url(encoded, decodedLength);
+    } catch {
+      permit?.release();
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response batch encoding is invalid",
+        "response_encoding",
+      );
+      return false;
+    }
+    if (!this.#tryResizeEventPermit(permit ?? null, wireBytes)) {
+      bytes.fill(0);
+      permit?.release();
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Host event memory cannot verify the recovered orphan event",
+        "event_memory_capacity",
+      );
+      return false;
+    }
+    let data: string;
+    try {
+      data = utf8Text(bytes);
+    } catch {
+      bytes.fill(0);
+      permit?.release();
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response event is not valid UTF-8",
+        "response_encoding",
+      );
+      return false;
+    }
+    bytes.fill(0);
+    return this.#appendOrphanRecoveryEvent(
+      candidate,
+      eventIndex,
+      { event, data },
+      wireBytes,
+      permit,
+      lifecycleEpoch,
+    );
+  }
+
+  async #acceptOrphanRecoveryEventPart(
+    candidate: OrphanRecoveryCandidate,
+    frame: Extract<ReliableFrame<SidecarFrame>, { kind: "response_event" }>,
+    lifecycleEpoch: number,
+  ): Promise<void> {
+    let assembly = candidate.assembly;
+    if (!assembly) {
+      if (
+        frame.eventIndex !== candidate.nextEventIndex ||
+        frame.partIndex !== 0 ||
+        frame.offset !== 0
+      ) {
+        this.#failOrphanRecoveryCandidate(
+          candidate,
+          "Recovered orphan response begins with a gap",
+          "orphan_event_order",
+        );
+        return;
+      }
+      const decodedLength = base64UrlDecodedBytes(frame.dataBase64Url);
+      if (decodedLength === null) {
+        this.#failOrphanRecoveryCandidate(
+          candidate,
+          "Recovered orphan response part is not valid base64url",
+          "response_encoding",
+        );
+        return;
+      }
+      const partialBytes = partialEventLogicalBytes(frame.event, decodedLength);
+      if (candidate.responseBytes + partialBytes > this.#maxResponseBytes) {
+        this.#failOrphanRecoveryCandidate(
+          candidate,
+          "Recovered orphan response exceeds the configured byte limit",
+          "response_too_large",
+        );
+        return;
+      }
+      const permit = this.#tryAcquireEventPermit(
+        partialBytes,
+        `host-orphan-recovery:${candidate.requestId}`,
+      );
+      if (permit === null) {
+        this.#failOrphanRecoveryCandidate(
+          candidate,
+          "Host event memory is unavailable for orphan recovery",
+          "event_memory_capacity",
+        );
+        return;
+      }
+      assembly = {
+        eventIndex: frame.eventIndex,
+        event: frame.event,
+        partCount: frame.partCount,
+        parts: new Map(),
+        rawBytes: 0,
+        permit: permit ?? null,
+        nextPartIndex: 0,
+        nextOffset: 0,
+      };
+      candidate.assembly = assembly;
+    }
+    if (
+      assembly.eventIndex !== frame.eventIndex ||
+      assembly.event !== frame.event ||
+      assembly.partCount !== frame.partCount ||
+      assembly.nextPartIndex !== frame.partIndex ||
+      assembly.nextOffset !== frame.offset
+    ) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response parts conflict",
+        "orphan_event_order",
+      );
+      return;
+    }
+    const decodedLength = base64UrlDecodedBytes(frame.dataBase64Url);
+    const partialBytes = decodedLength === null
+      ? null
+      : partialEventLogicalBytes(assembly.event, assembly.rawBytes + decodedLength);
+    if (
+      decodedLength === null ||
+      partialBytes === null ||
+      candidate.responseBytes + partialBytes > this.#maxResponseBytes ||
+      !this.#tryResizeEventPermit(assembly.permit, partialBytes)
+    ) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        decodedLength === null
+          ? "Recovered orphan response part is not valid base64url"
+          : partialBytes !== null && candidate.responseBytes + partialBytes > this.#maxResponseBytes
+            ? "Recovered orphan response exceeds the configured byte limit"
+          : "Host event memory cannot grow the recovered orphan event",
+        decodedLength === null
+          ? "response_encoding"
+          : partialBytes !== null && candidate.responseBytes + partialBytes > this.#maxResponseBytes
+            ? "response_too_large"
+            : "event_memory_capacity",
+      );
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = decodeCanonicalBase64Url(frame.dataBase64Url, decodedLength);
+    } catch {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response part is not valid base64url",
+        "response_encoding",
+      );
+      return;
+    }
+    assembly.parts.set(frame.partIndex, { offset: frame.offset, bytes });
+    assembly.rawBytes += bytes.byteLength;
+    assembly.nextPartIndex++;
+    assembly.nextOffset += bytes.byteLength;
+    if (assembly.nextPartIndex !== assembly.partCount) return;
+
+    const parts = [...assembly.parts.values()].map(part => part.bytes);
+    const wireBytes = canonicalEventWireBytes(assembly.event, parts);
+    if (
+      candidate.responseBytes + wireBytes > this.#maxResponseBytes ||
+      !this.#tryResizeEventPermit(assembly.permit, wireBytes)
+    ) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        candidate.responseBytes + wireBytes > this.#maxResponseBytes
+          ? "Recovered orphan response exceeds the configured byte limit"
+          : "Host event memory cannot verify the recovered orphan event",
+        candidate.responseBytes + wireBytes > this.#maxResponseBytes
+          ? "response_too_large"
+          : "event_memory_capacity",
+      );
+      return;
+    }
+    let data: string;
+    try {
+      data = utf8Text(concat(parts, assembly.rawBytes));
+    } catch {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan response event is not valid UTF-8",
+        "response_encoding",
+      );
+      return;
+    }
+    for (const part of parts) part.fill(0);
+    assembly.parts.clear();
+    const permit = assembly.permit;
+    assembly.permit = null;
+    candidate.assembly = null;
+    await this.#appendOrphanRecoveryEvent(
+      candidate,
+      frame.eventIndex,
+      { event: frame.event, data },
+      wireBytes,
+      permit,
+      lifecycleEpoch,
+    );
+  }
+
+  async #validateOrphanRecoveryTerminal(
+    candidate: OrphanRecoveryCandidate,
+    terminal: Extract<ReliableFrame<SidecarFrame>, { kind: "response_terminal" }>,
+    lifecycleEpoch: number,
+  ): Promise<void> {
+    if (candidate.assembly) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Recovered orphan terminal arrived before its event completed",
+        "orphan_terminal_truncated",
+      );
+      return;
+    }
+    if (!this.#ownsLifecycle(lifecycleEpoch)) return;
+    const derived = candidate.terminalProof;
+    if (!derived || !this.#terminalMatchesReceipt(terminal, derived)) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        derived
+          ? "Recovered orphan terminal does not match its fully verified replay"
+          : "Recovered orphan terminal arrived without a verified terminal event",
+        "orphan_terminal_proof",
+      );
+      return;
+    }
+    if (
+      !this.#ownsLifecycle(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+    ) return;
+    if (this.#terminalReceipts.size >= MAX_TERMINAL_RECEIPTS) {
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Host terminal receipt capacity is exhausted during recovery",
+        "terminal_receipt_capacity",
+      );
+      return;
+    }
+    this.#orphanRecoveryCandidates.delete(candidate.requestId);
+    const receipt: TerminalReceipt = {
+      terminal: { ...terminal },
+      queued: false,
+      replayed: true,
+      cursor: null,
+    };
+    this.#terminalReceipts.set(candidate.requestId, receipt);
+    this.#queueTerminalReceipt(candidate.requestId, receipt);
+  }
+
+  #trackOrphanRecoveryCandidate(
+    frame: Extract<ReliableFrame<SidecarFrame>, { kind: "request_ack" }>,
+    recoveryEnvelope: boolean,
+  ): void {
+    if (!recoveryEnvelope || this.#binding.protocolRevision !== "r2") return;
+    const recovery = this.#sidecarRecovery;
+    // Startup candidates are accepted only inside the initial zero-credit
+    // recovery window. Locally allocated/imported IDs remain owned even after
+    // an earlier frame in the same flight removes their live RequestState.
+    if ((!recovery && !this.#startupRecoveryOpen) || recovery?.ownedRequestIds.has(frame.requestId)) {
+      return;
+    }
+    if (
+      this.#terminalReceipts.has(frame.requestId) ||
+      this.#ambiguityTombstones.has(frame.requestId) ||
+      this.#startupRecoveryOwnedRequestIds.has(frame.requestId)
+    ) return;
+    const existing = this.#orphanRecoveryCandidates.get(frame.requestId);
+    if (existing) {
+      if (existing.requestDigest !== frame.requestDigest) {
+        this.#failRecoveryProtocol(
+          "Recovered orphan commitment changed its request digest",
+          "orphan_commit_conflict",
+        );
+      }
+      return;
+    }
+    if (this.#orphanRecoveryCandidates.size >= MAX_TERMINAL_RECEIPTS) {
+      this.#failRecoveryProtocol(
+        "Host orphan recovery candidate capacity is exhausted",
+        "terminal_receipt_capacity",
+      );
+      return;
+    }
+    this.#orphanRecoveryCandidates.set(frame.requestId, {
+      requestId: frame.requestId,
+      requestDigest: frame.requestDigest,
+      transcript: new TranscriptProof(frame.requestId, frame.requestDigest, {
+        maxBytes: this.#maxResponseBytes,
+        retainBytes: false,
+        hasher: createNativeTranscriptHasher(),
+      }),
+      terminalProof: null,
+      responseBytes: 0,
+      nextEventIndex: 0,
+      assembly: null,
+    });
+  }
+
+  #failRecoveryProtocol(message: string, code: string): void {
+    const error = new V2CommittedError(message, code, true);
+    const recovery = this.#sidecarRecovery;
+    if (recovery) {
+      this.failSidecarRecovery(recovery.token, error);
+      return;
+    }
+    throw error;
   }
 
   #terminalMatchesReceipt(
@@ -2959,18 +4454,24 @@ export class V2TransportSession {
     // digest, compression, frames, and the immutable R8 fetch body all describe
     // exactly the same bytes. Outer HTTP streaming remains a separate contract.
     const upstreamBody = normalizeUpstreamResponsesRequest(body);
-    const decoded = utf8Bytes(canonicalJson(upstreamBody));
-    if (decoded.byteLength < 1 || decoded.byteLength > this.#limits.requestMaxBytes) {
+    const canonical = await canonicalHostRequestBytes(
+      upstreamBody,
+      this.#limits.requestMaxBytes,
+      signal,
+    );
+    const decoded = canonical.bytes;
+    if (decoded.byteLength < 1) {
       throw new V2PreCommitError("V2 request exceeds the 64 MiB limit", "request_too_large");
     }
     const requestDigest = await sha256Hex(decoded);
+    if (signal?.aborted) throw signal.reason ?? abortError("V2 request aborted after hashing");
     const partBytes = this.#binding.protocolRevision === "r2"
       ? V2_R2_REQUEST_PART_BYTES
       : R1_REQUEST_PART_BYTES;
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
     const gzipPriority = decoded.byteLength >= BULK_GZIP_MIN_BYTES ? "bulk" : "latency";
-    const inlineBase64 = containsLargeInlineBase64(upstreamBody);
+    const inlineBase64 = canonical.containsLargeInlineBase64;
     if (
       this.#gzip &&
       decoded.byteLength > partBytes &&
@@ -2989,6 +4490,9 @@ export class V2TransportSession {
         inputOwnership: "owned",
         priority: gzipPriority,
       });
+      if (signal?.aborted) {
+        throw signal.reason ?? abortError("V2 request aborted after compression sampling");
+      }
       const sampleSavings = sampleLength - sampleCompressed.byteLength;
       const sampleWorthwhile = sampleCompressed.byteLength > 0 &&
         sampleSavings >= Math.ceil(sampleLength * MIN_GZIP_SAVINGS_RATIO);
@@ -3003,6 +4507,9 @@ export class V2TransportSession {
               inputOwnership: "owned",
               priority: gzipPriority,
             });
+      if (signal?.aborted) {
+        throw signal.reason ?? abortError("V2 request aborted after compression");
+      }
       const identityParts = Math.ceil(decoded.byteLength / partBytes);
       const compressedParts = compressed && compressed.byteLength > 0
         ? Math.ceil(compressed.byteLength / partBytes)
@@ -3102,22 +4609,55 @@ export class V2TransportSession {
   #stageNextRequestFrame(state: RequestState): void {
     const plan = state.preparedRequest;
     if (!plan) return;
-    const frame = this.#takePreparedFrame(state.requestId, plan);
+    let frame: HostFrame | null;
+    try {
+      frame = this.#takePreparedFrame(state.requestId, plan);
+    } catch (cause) {
+      this.#failRequestStaging(state, new V2PreCommitError(
+        cause instanceof Error ? cause.message : "Prepared V2 request frame is invalid",
+        "request_stage",
+      ));
+      return;
+    }
     if (!frame) {
       state.preparedRequest = null;
+      this.#releasePreparedPayload(state);
       return;
     }
     // One frame per request is enough for weighted fairness; #pump replenishes
     // it only after the scheduler transfers ownership of the previous frame.
-    this.#scheduler.enqueue(
-      this.#transportProfile === "bulk-v1" &&
-          state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
-        ? "commit"
-        : "data",
-      state.requestId,
-      frame,
-    );
+    try {
+      // Request-body scheduling is profile-neutral. Only the R2 request_start
+      // fence uses commit priority; promoting tiny bulk bodies would change
+      // otherwise identical standard/bulk flight membership.
+      this.#scheduler.enqueue("data", state.requestId, frame);
+    } catch (cause) {
+      // Frame extraction mutates the lazy cursor, so enqueue failure cannot be
+      // retried transactionally. Fail and release the entire pre-execution
+      // state rather than leaking a reservation or sending a body with a hole.
+      this.#failRequestStaging(state, new V2PreCommitError(
+        cause instanceof Error ? cause.message : "Prepared V2 request could not be staged",
+        "request_stage",
+      ));
+      return;
+    }
+    if (plan.encodedPayload === null) this.#releasePreparedPayload(state);
     if (plan.stage === "done") state.preparedRequest = null;
+  }
+
+  #failRequestStaging(state: RequestState, error: V2PreCommitError): void {
+    const published = state.published;
+    this.#failPreCommit(state, error);
+    if (!published || this.#closed) return;
+    try {
+      this.#scheduler.enqueue("control", state.requestId, {
+        kind: "request_cancel",
+        requestId: state.requestId,
+        reason: "host request staging failed",
+      });
+    } catch (cause) {
+      this.#failProtocol(cause);
+    }
   }
 
   #admitPending(): void {
@@ -3129,17 +4669,23 @@ export class V2TransportSession {
       // A queued interactive request always claims the next body slot before
       // medium prefetch. Once one is admitted the bulk-profile precommit depth returns to
       // the established four-request contract.
-      const state = this.#pending.find(candidate => (
+      const latencyCandidate = this.#availableCredits() > 0
+        ? this.#pending.find(candidate => (
+            eligible(candidate) &&
+            candidate.manifest.decodedBytes <= V2_LATENCY_CRITICAL_REQUEST_BYTES
+          ))
+        : undefined;
+      const state = latencyCandidate ?? this.#pending.find(candidate => (
         eligible(candidate) &&
-        candidate.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES
-      )) ?? this.#pending.find(eligible);
+        candidate.manifest.decodedBytes > V2_LATENCY_CRITICAL_REQUEST_BYTES
+      ));
       if (!state) return;
       this.#markRequestAdmitted(state);
       if (state.admissionTimer) clearTimeout(state.admissionTimer);
       state.admissionTimer = undefined;
       this.#creditReservations++;
       this.#transferReservations += state.transferCost;
-      if (state.manifest.encodedBytes <= LATENCY_CRITICAL_REQUEST_BYTES) {
+      if (state.manifest.decodedBytes <= V2_LATENCY_CRITICAL_REQUEST_BYTES) {
         state.latencyCriticalPreCommitTracked = true;
         this.#latencyCriticalPreCommitTransfers++;
         state.latencyCriticalRequestTracked = true;
@@ -3174,9 +4720,7 @@ export class V2TransportSession {
       this.#sidecarRecovery || !this.#connected || this.#closed || this.#draining ||
       this.#congestion.congested
     ) return 0;
-    const limit = this.#transportProfile === "bulk-v1" &&
-        this.#binding.protocolRevision === "r2" &&
-        this.#latencyCriticalRequests === 0
+    const limit = this.#bulkBodyPrefetchEnabled()
       ? MAX_BULK_BODY_PREFETCH_RESERVATIONS
       : MAX_PRECOMMIT_EXECUTION_RESERVATIONS;
     return Math.max(0, Math.min(
@@ -3198,9 +4742,7 @@ export class V2TransportSession {
     if (
       this.#hostCeiling - this.#creditReservations - this.#ambiguousQuarantined <= 0
     ) return "host_ceiling";
-    const prefetchLimit = this.#transportProfile === "bulk-v1" &&
-        this.#binding.protocolRevision === "r2" &&
-        this.#latencyCriticalRequests === 0
+    const prefetchLimit = this.#bulkBodyPrefetchEnabled()
       ? MAX_BULK_BODY_PREFETCH_RESERVATIONS
       : MAX_PRECOMMIT_EXECUTION_RESERVATIONS;
     if (
@@ -3210,6 +4752,18 @@ export class V2TransportSession {
       return "transfer_budget";
     }
     return "available";
+  }
+
+  #bulkBodyPrefetchEnabled(): boolean {
+    // An idle transport has not classified the next body yet, so advertise the
+    // common four-request admission window to the router. Once exact canonical
+    // sizing proves at least one live request is non-latency-critical, bulk R2
+    // may use its two additional body-only prefetch slots. A live tiny request
+    // keeps the shared four-request contract until its terminal cleanup.
+    return this.#transportProfile === "bulk-v1" &&
+      this.#binding.protocolRevision === "r2" &&
+      this.#latencyCriticalRequests === 0 &&
+      (this.#creditReservations > 0 || this.#committedRequestCount > 0);
   }
 
   #hostFlightLimits(): Pick<
@@ -3244,9 +4798,24 @@ export class V2TransportSession {
         this.#limits.windowMaxBytes - snapshot.encodedBytes,
       );
       if (frameBudget < 1 || byteBudget < 512) break;
-      const next = this.#scheduler.take(1, Math.max(1, byteBudget - 256));
+      let next: HostFrame[];
+      try {
+        next = this.#scheduler.take(1, Math.max(1, byteBudget - 256));
+      } catch (cause) {
+        this.#failProtocol(cause);
+        return urgency;
+      }
       if (next.length === 0) break;
-      const reliable = this.#outbound.push(next[0]!);
+      let reliable: ReliableFrame<HostFrame>;
+      try {
+        reliable = this.#outbound.push(next[0]!);
+      } catch (cause) {
+        // take() already transferred this frame out of the scheduler. A window
+        // invariant failure is therefore transport-wide and cannot be repaired
+        // by retrying one request without risking an execution-order hole.
+        this.#failProtocol(cause);
+        return urgency;
+      }
       if (reliable.kind === "response_ack") {
         const receipt = this.#terminalReceipts.get(reliable.requestId);
         if (receipt && receipt.terminal.transcriptSha256 === reliable.terminalDigest) {
@@ -3260,7 +4829,6 @@ export class V2TransportSession {
         if (state) state.published = true;
         if (state && reliable.kind === "request_commit") state.commitStaged = true;
         if (state && reliable.kind === "request_start") {
-          state.startStaged = true;
           state.startRisk = true;
           this.#reflectExecutionRisk(state);
         }
@@ -3341,6 +4909,12 @@ export class V2TransportSession {
         if (this.#hasExecutionRisk(state)) recoveryActive++;
       }
     }
+    const requiredOwned = Math.min(
+      128,
+      this.#committedRequestCount +
+        this.#creditReservations +
+        this.#ambiguousQuarantined,
+    );
     const common = {
       protocol: "gp-awareness-v2",
       schemaHash: this.#binding.schemaHash,
@@ -3353,11 +4927,20 @@ export class V2TransportSession {
       epoch: outbound.epoch,
       revision: lane === "data" ? this.#dataRevision++ : this.#controlRevision++,
       ack: this.#processedInboundAck,
-      credits: this.#sidecarRecovery || this.#congestion.congested ? 0 : this.#hostCeiling,
+      // Congestion closes new local admission, but requests already owned by
+      // this host must retain exactly enough sidecar admission. Publishing zero
+      // can overtake their data-lane commit and deadlock its ACK; advertising
+      // the full ceiling would instead erase congestion backpressure.
+      credits: this.#sidecarRecovery
+        ? 0
+        : this.#congestion.congested
+          ? requiredOwned
+          : Math.max(this.#hostCeiling, requiredOwned),
       active: this.#sidecarRecovery
         ? Math.max(1, recoveryActive)
         : this.#committedRequestCount,
-      queued: this.#unadmittedRequestCount,
+      queued: this.#unadmittedRequestCount +
+        this.#preparations.size + this.#preparationWaiters.length,
       draining: this.#draining,
       frames,
       lane,
@@ -3623,17 +5206,6 @@ export class V2TransportSession {
     }, delay);
   }
 
-  #requireSidecarRecovery(token: V2SidecarRecoveryToken): SidecarRecoveryState {
-    const recovery = this.#sidecarRecovery;
-    if (!recovery || recovery.token !== token) {
-      throw new V2TransportLivenessError(
-        "V2 sidecar recovery token is stale or invalid",
-        "instance_changed",
-      );
-    }
-    return recovery;
-  }
-
   #releasePartialResponseState(state: RequestState): void {
     for (const assembly of state.assemblies.values()) assembly.permit?.release();
     state.assemblies.clear();
@@ -3670,6 +5242,11 @@ export class V2TransportSession {
 
   #detachStateForRecovery(state: RequestState): void {
     state.diagnostics.freezePeak();
+    state.cancelledTerminalPermit?.release();
+    state.cancelledTerminalPermit = null;
+    releaseAtomicBytePermit(state.terminalFinalizationAnchor);
+    state.terminalFinalizationAnchor = null;
+    this.#releasePreparedPayload(state);
     this.#discardPreparedStart(state);
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);
@@ -3736,25 +5313,32 @@ export class V2TransportSession {
       );
       if (!acknowledged) state.rejectRun(error);
       state.handle.cancel(error);
-      this.#scheduler.enqueue("control", state.requestId, {
-        kind: "request_cancel",
-        requestId: state.requestId,
-        reason: "client aborted",
-      });
+      this.#enqueueCancellation(state.requestId, "client aborted");
     } else {
       const published = state.published;
+      const error = preCommitCancellationError();
       this.#removeState(state);
-      state.rejectRun(abortError("V2 request aborted before commitment"));
-      state.handle.cancel(abortError("V2 request aborted before commitment"));
+      state.rejectRun(error);
+      state.handle.cancel(error);
       if (published) {
-        this.#scheduler.enqueue("control", state.requestId, {
-          kind: "request_cancel",
-          requestId: state.requestId,
-          reason: "client aborted",
-        });
+        this.#enqueueCancellation(state.requestId, "client aborted");
       }
     }
     this.#requestPublication(this.#pump());
+  }
+
+  #enqueueCancellation(requestId: string, reason: string): void {
+    try {
+      this.#scheduler.enqueue("control", requestId, {
+        kind: "request_cancel",
+        requestId,
+        reason,
+      });
+    } catch (cause) {
+      // A partial request without its cancellation would retain sidecar
+      // assembly state while this session falsely remained healthy.
+      this.#failProtocol(cause);
+    }
   }
 
   #failPreCommit(state: RequestState, error: Error): void {
@@ -3804,6 +5388,11 @@ export class V2TransportSession {
 
   #removeState(state: RequestState): void {
     state.diagnostics.freezePeak();
+    state.cancelledTerminalPermit?.release();
+    state.cancelledTerminalPermit = null;
+    releaseAtomicBytePermit(state.terminalFinalizationAnchor);
+    state.terminalFinalizationAnchor = null;
+    this.#releasePreparedPayload(state);
     this.#discardPreparedStart(state);
     this.#releaseStartReservation(state);
     this.#stopTrackingLatencyCriticalPreCommit(state);

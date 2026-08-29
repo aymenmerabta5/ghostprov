@@ -15,6 +15,7 @@ import {
   SharedByteBudget,
   SYNTHETIC_WARMUP_ID_PREFIX,
 } from "../src/ws/response-graph";
+import { createAuthenticatedTenantScope } from "../src/http/api-key";
 import { deriveV2HostEventMemorySizing } from "../src/v2/memory/event-memory-sizing";
 import { WebSocketProcessBudget } from "../src/ws/session";
 
@@ -38,7 +39,7 @@ function resolved(graph: ResponseGraph, input: string) {
     type: "response.create",
     store: false,
     input,
-  });
+  }, { authorizationScope: createAuthenticatedTenantScope() });
 }
 
 describe("ResponseGraph fixed governor memory", () => {
@@ -99,7 +100,7 @@ describe("ResponseGraph fixed governor memory", () => {
       generate: false,
       store: false,
       input: "one",
-    });
+    }, { authorizationScope: createAuthenticatedTenantScope() });
     expect(budget.used).toBeGreaterThan(0);
     expect(() => memory.close()).toThrow("retained bytes");
     expect(value.snapshot().reservedBytes).toBe(budget.limit);
@@ -125,7 +126,7 @@ describe("ResponseGraph fixed governor memory", () => {
         status: "completed",
         output: [{ type: "message", content: `cached-${index}` }],
       }, await permits.acquire(64 * 1024));
-      graph.record(resolved(graph, String(index)), final);
+      resolved(graph, String(index));
       releaseAtomicBytePermit(final);
       expect(permits.snapshot().ordinaryUsedBytes).toBe(0);
     }

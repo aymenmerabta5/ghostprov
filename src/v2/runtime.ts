@@ -223,6 +223,7 @@ interface V2SidecarRelaunchContext {
   bootstrap: V2RuntimeBootstrap | null;
   transport: V2RuntimeTransport | null;
   cleanup: Promise<void> | null;
+  cleanupDeadline: number | null;
 }
 
 export interface V2SandboxRuntimeOptions {
@@ -353,6 +354,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #shutdownPromise: Promise<void> | null = null;
   #shutdownKind: "drain" | "stop" | null = null;
   #escalateShutdown: (() => void) | null = null;
+  #runtimeCleanup: Promise<void> | null = null;
+  #runtimeCleanupDeadline: number | null = null;
 
   constructor(options: V2SandboxRuntimeOptions) {
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
@@ -538,6 +541,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#emit();
     return {
       events: () => handle.events(),
+      discardUnconsumedEvents: () => handle.discardUnconsumedEvents?.(),
       final,
       get rateLimit() { return handle.rateLimit; },
       get upstreamPrelude() { return handle.upstreamPrelude; },
@@ -565,13 +569,22 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         !this.#credentialRefreshPending && !this.#ySweetReconnectPending
       ? Math.max(0, Math.min(descriptorCapacity, creditCapacity))
       : 0;
-    const available = this.#state === "ready" && !this.#sidecarSuspect &&
-        !this.#credentialRefreshPending && !this.#ySweetReconnectPending && transport
+    const routable = this.#state === "ready" && !this.#sidecarSuspect &&
+      !this.#credentialRefreshPending && !this.#ySweetReconnectPending && transport;
+    const remaining = Math.max(0, capacity - active - prefetched - quarantined);
+    const admissionCredits = routable
       ? Math.max(0, Math.min(
-          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
-          capacity - active - prefetched - quarantined,
+          transport.admissionCredits ?? transport.credits,
+          remaining,
         ))
       : 0;
+    const prefetchCredits = routable
+      ? Math.max(0, Math.min(
+          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+          remaining,
+        ))
+      : 0;
+    const available = Math.max(admissionCredits, prefetchCredits);
     const availabilityReason: SandboxAvailabilityReason = available > 0
       ? "available"
       : this.#state !== "ready"
@@ -605,6 +618,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       capacity,
       active,
       available,
+      admissionCredits,
+      prefetchCredits,
+      transferCredits: transport?.transferCredits ?? 0,
       availabilityReason,
       quarantined,
       ambiguousQuarantined: transport?.ambiguousQuarantined ?? 0,
@@ -778,6 +794,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
 
       const sessionId = credentials.sandbox.sessionId ??
         (await this.#gateway.heartbeat(controller.signal)).sessionId;
+      if (generation !== this.#generation) return;
       if (!sessionId) throw new Error("V2 sandbox session ID is unavailable");
       const binding: ProtocolBinding = {
         projectId: this.projectId,
@@ -883,17 +900,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#setState("failed");
       const transport = this.#transport;
       const bootstrap = this.#bootstrap;
-      if (transport) {
-        await this.#runBounded(signal => transport.forceStop
-          ? transport.forceStop("startup-failed", signal)
-          : transport.drain("startup-failed", signal));
-      }
-      if (bootstrap) {
-        await this.#runBounded(signal => bootstrap.forceStop
-          ? bootstrap.forceStop("startup-failed", signal)
-          : bootstrap.drainAndStop("startup-failed", signal));
-      }
-      await this.#runBounded(() => this.#dispose(true));
+      const deadline = this.#stopDeadline();
+      const cleanup = this.#forceStopAndDispose(
+        transport,
+        bootstrap,
+        "startup-failed",
+        deadline,
+      );
+      await this.#runBounded(
+        signal => this.#abortable(cleanup, signal),
+        deadline,
+      );
       throw error;
     }
   }
@@ -1082,6 +1099,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       bootstrap: null,
       transport: null,
       cleanup: null,
+      cleanupDeadline: null,
     };
     this.#sidecarRelaunchContext = context;
     try {
@@ -1241,36 +1259,67 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #cleanupSidecarRelaunch(
     context: V2SidecarRelaunchContext,
     reason: string,
+    deadline = this.#stopDeadline(),
   ): Promise<void> {
-    if (context.cleanup) return context.cleanup;
-    this.#failSidecarRelaunchCapsule(
-      context,
-      new V2RuntimeLifecycleFailure("sidecar_unreachable"),
-    );
-    const cleanup = this.#runBounded(async signal => {
-      const operations: Promise<unknown>[] = [];
-      if (context.transport) {
-        operations.push(Promise.resolve().then(() => context.transport!.forceStop
-          ? context.transport!.forceStop(reason, signal)
-          : context.transport!.close()));
-      }
-      if (context.bootstrap) {
-        operations.push(Promise.resolve().then(() => context.bootstrap!.forceStop
-          ? context.bootstrap!.forceStop(reason, signal)
-          : context.bootstrap!.drainAndStop(reason, signal)));
-      }
-      if (context.awareness) {
-        operations.push(this.#abortable(
-          Promise.resolve().then(() => context.awareness!.close()),
-          signal,
+    if (!context.cleanup) {
+      context.cleanupDeadline = deadline;
+      this.#failSidecarRelaunchCapsule(
+        context,
+        new V2RuntimeLifecycleFailure("sidecar_unreachable"),
+      );
+      const cleanupController = new AbortController();
+      const timeoutController = new AbortController();
+      void this.#clock.waitUntil(deadline, timeoutController.signal).then(() => {
+        cleanupController.abort(new DOMException(
+          "V2 runtime shutdown deadline expired",
+          "TimeoutError",
         ));
-      }
-      await Promise.allSettled(operations);
-    }).then(() => undefined).finally(() => {
-      if (this.#sidecarRelaunchContext === context) this.#sidecarRelaunchContext = null;
-    });
-    context.cleanup = cleanup;
-    return cleanup;
+      }, () => undefined);
+      const actualCleanup = (async () => {
+        const transport = context.transport;
+        const bootstrap = context.bootstrap;
+        const awareness = context.awareness;
+        context.transport = null;
+        context.bootstrap = null;
+        context.awareness = null;
+        const remoteOperations: Promise<unknown>[] = [];
+        if (transport) remoteOperations.push(Promise.resolve().then(() => (
+          transport.forceStop
+            ? transport.forceStop(reason, cleanupController.signal)
+            : transport.close()
+        )));
+        if (bootstrap) remoteOperations.push(Promise.resolve().then(() => (
+          bootstrap.forceStop
+            ? bootstrap.forceStop(reason, cleanupController.signal)
+            : bootstrap.drainAndStop(reason, cleanupController.signal)
+        )));
+        if (awareness) remoteOperations.push(Promise.resolve().then(() => awareness.close()));
+        const remoteSettlement = Promise.allSettled(remoteOperations).then(() => undefined);
+        await this.#runBounded(
+          signal => this.#abortable(remoteSettlement, signal),
+          deadline,
+        );
+        if (transport?.forceStop) {
+          const closing = Promise.resolve().then(() => transport.close()).catch(() => undefined);
+          await this.#runBounded(
+            signal => this.#abortable(closing, signal),
+            deadline,
+          );
+        }
+      })().finally(() => {
+        timeoutController.abort();
+        if (this.#sidecarRelaunchContext === context) this.#sidecarRelaunchContext = null;
+      });
+      // Retain the physical cleanup, not merely a bounded waiter. A caller may
+      // time out, but a later shutdown must still join this exact cleanup owner
+      // instead of launching overlapping retirement against the same candidate.
+      context.cleanup = actualCleanup;
+    }
+    const effectiveDeadline = Math.min(deadline, context.cleanupDeadline ?? deadline);
+    return this.#runBounded(
+      signal => this.#abortable(context.cleanup!, signal),
+      effectiveDeadline,
+    ).then(() => undefined);
   }
 
   async #refreshResources(generation: number, signal: AbortSignal): Promise<void> {
@@ -1556,60 +1605,166 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     reason: string,
     escalation: Promise<void>,
   ): Promise<void> {
+    // Startup failure and public shutdown can converge on the same resources.
+    // Once either path owns cleanup, the other must not extend its deadline.
+    const deadline = this.#runtimeCleanupDeadline ?? this.#stopDeadline();
     const starting = this.#starting;
     const relaunching = this.#sidecarRelaunching;
     const relaunchContext = this.#sidecarRelaunchContext;
     const relaunchCleanup = relaunchContext
-      ? this.#cleanupSidecarRelaunch(relaunchContext, "runtime-shutdown")
+      ? this.#cleanupSidecarRelaunch(relaunchContext, "runtime-shutdown", deadline)
       : null;
+    const relaunchActualCleanup = relaunchContext?.cleanup ?? null;
+    let relaunchSettled: Promise<void> | undefined;
     if (relaunching || relaunchCleanup) {
+      relaunchSettled = Promise.allSettled([
+        relaunching ?? Promise.resolve(),
+        relaunchActualCleanup ?? Promise.resolve(),
+      ]).then(() => undefined);
       await this.#runBounded(async signal => {
-        await Promise.allSettled([
-          relaunching ? this.#abortable(relaunching, signal) : Promise.resolve(),
-          relaunchCleanup ? this.#abortable(relaunchCleanup, signal) : Promise.resolve(),
-        ]);
-      });
+        await this.#abortable(relaunchSettled!, signal);
+      }, deadline);
     }
     const transport = this.#transport;
     const bootstrap = this.#bootstrap;
     let clean = false;
+    let drainSettled: Promise<void> | undefined;
     if (initialKind === "drain") {
       clean = await this.#runBounded(
-        signal => transport
-          ? transport.drain(reason, signal)
-          : bootstrap?.drainAndStop(reason, signal) ?? Promise.resolve(),
+        signal => {
+          const draining = transport
+            ? transport.drain(reason, signal)
+            : bootstrap?.drainAndStop(reason, signal) ?? Promise.resolve();
+          drainSettled = draining.then(() => undefined, () => undefined);
+          return draining;
+        },
+        deadline,
         escalation,
       );
     }
     if (!clean || this.#shutdownKind === "stop") {
-      if (transport) {
-        await this.#runBounded(signal => transport.forceStop
-          ? transport.forceStop(reason, signal)
-          : transport.drain(reason, signal));
-      }
-      if (bootstrap) {
-        await this.#runBounded(signal => bootstrap.forceStop
-          ? bootstrap.forceStop(reason, signal)
-          : bootstrap.drainAndStop(reason, signal));
-      }
+      const predecessors = [relaunchSettled, drainSettled]
+        .filter((value): value is Promise<void> => value !== undefined);
+      const predecessor = predecessors.length > 0
+        ? Promise.allSettled(predecessors).then(() => undefined)
+        : undefined;
+      const cleanup = this.#forceStopAndDispose(
+        transport,
+        bootstrap,
+        reason,
+        deadline,
+        predecessor,
+      );
+      await this.#runBounded(
+        signal => this.#abortable(cleanup, signal),
+        deadline,
+      );
+    } else {
+      await this.#runBounded(() => this.#disposeOnce(true, deadline), deadline);
     }
-    await this.#runBounded(() => this.#dispose(true));
     if (starting) {
-      await this.#runBounded(signal => this.#abortable(starting, signal));
-      await this.#runBounded(() => this.#dispose(true));
+      await this.#runBounded(async signal => {
+        await this.#abortable(starting.then(() => undefined, () => undefined), signal);
+        if (signal.aborted || this.#clock.now() >= deadline) return;
+        await this.#disposeOnce(true, deadline);
+      }, deadline);
     }
+  }
+
+  #stopDeadline(): number {
+    return Math.min(Number.MAX_SAFE_INTEGER, this.#clock.now() + this.#stopTimeoutMs);
+  }
+
+  #forceStopAndDispose(
+    transport: V2RuntimeTransport | null,
+    bootstrap: V2RuntimeBootstrap | null,
+    reason: string,
+    deadline: number,
+    predecessor?: Promise<void>,
+  ): Promise<void> {
+    const existing = this.#runtimeCleanup;
+    if (existing) return existing;
+    const cleanupController = new AbortController();
+    const timeoutController = new AbortController();
+    void this.#clock.waitUntil(deadline, timeoutController.signal).then(() => {
+      cleanupController.abort(new DOMException(
+        "V2 runtime shutdown deadline expired",
+        "TimeoutError",
+      ));
+    }, () => undefined);
+    const cleanup = (async () => {
+      if (predecessor) {
+        await this.#runBounded(
+          signal => this.#abortable(predecessor, signal),
+          deadline,
+        );
+      }
+      // Transport and bootstrap are independent resources. Start both remote
+      // retirement requests together so one non-cooperative implementation
+      // cannot prevent the other from being fenced before the shared deadline.
+      const remoteRetirements: Promise<unknown>[] = [];
+      if (transport) remoteRetirements.push(Promise.resolve().then(() => (
+        transport.forceStop
+          ? transport.forceStop(reason, cleanupController.signal)
+          : transport.drain(reason, cleanupController.signal)
+      )));
+      if (bootstrap) remoteRetirements.push(Promise.resolve().then(() => (
+        bootstrap.forceStop
+          ? bootstrap.forceStop(reason, cleanupController.signal)
+          : bootstrap.drainAndStop(reason, cleanupController.signal)
+      )));
+      const remoteSettlement = Promise.allSettled(remoteRetirements).then(() => undefined);
+      await this.#runBounded(
+        signal => this.#abortable(remoteSettlement, signal),
+        deadline,
+      );
+      // Begin every independent local fence even when one close implementation
+      // ignores its promise contract. #dispose clears runtime references before
+      // awaiting its resource operations, so replacement cannot adopt this
+      // generation while transport.close or a peripheral stop remains pending.
+      const localFences = [
+        transport
+          ? Promise.resolve().then(() => transport.close()).catch(() => undefined)
+          : Promise.resolve(),
+        this.#dispose(false),
+      ];
+      await this.#runBounded(
+        signal => this.#abortable(
+          Promise.allSettled(localFences).then(() => undefined),
+          signal,
+        ),
+        deadline,
+      );
+    })().finally(() => timeoutController.abort());
+    this.#runtimeCleanup = cleanup;
+    this.#runtimeCleanupDeadline = deadline;
+    return cleanup;
+  }
+
+  #disposeOnce(closeTransport: boolean, deadline: number): Promise<void> {
+    if (this.#runtimeCleanup) return this.#runtimeCleanup;
+    const cleanup = Promise.resolve().then(() => this.#dispose(closeTransport));
+    this.#runtimeCleanup = cleanup;
+    this.#runtimeCleanupDeadline = deadline;
+    return cleanup;
   }
 
   async #runBounded(
     operation: (signal: AbortSignal) => Promise<void>,
+    deadline: number,
     escalation?: Promise<void>,
   ): Promise<boolean> {
+    if (this.#clock.now() >= deadline) return false;
     const operationController = new AbortController();
     const timeoutController = new AbortController();
-    const completed = Promise.resolve()
-      .then(() => operation(operationController.signal))
-      .then(() => true, () => false);
-    const timeout = this.#clock.sleep(this.#stopTimeoutMs, timeoutController.signal)
+    let source: Promise<void>;
+    try {
+      source = operation(operationController.signal);
+    } catch (error) {
+      source = Promise.reject(error);
+    }
+    const completed = source.then(() => true, () => false);
+    const timeout = this.#clock.waitUntil(deadline, timeoutController.signal)
       .then(() => false, () => false);
     const candidates: Promise<boolean>[] = [completed, timeout];
     if (escalation) candidates.push(escalation.then(() => false));

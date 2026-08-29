@@ -24,6 +24,10 @@ import {
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 import type { Clock } from "../src/core/ports";
+import {
+  createAuthenticatedTenantScope,
+  type AuthenticatedTenantScope,
+} from "../src/http/api-key";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -43,6 +47,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   state: "ready" | "draining" | "stopped" = "ready";
   failStarts = 0;
   failError: Error = new V2PreCommitError("pre-publication failure", "test_precommit");
+  mutateBeforeFailure?: (body: Record<string, unknown>) => void;
   failDelayMs = 0;
   waitForAdmissionAbort = false;
   admissionAbortError: Error | null = null;
@@ -51,7 +56,13 @@ class FakeRuntime implements RoutableSandboxRuntime {
   postAdmissionDelayMs = 0;
   waitForPostAdmissionAbort = false;
   reflectExecutionRisk = true;
+  failAfterExecutionRiskError: Error | null = null;
+  returnPendingHandleOnAbortAfterExecutionRisk = false;
+  lateHandleDiscardCalls = 0;
   admissionWindow: number | null = null;
+  admissionLimit: number | null = null;
+  prefetchLimit: number | null = null;
+  transferCredits: number | undefined;
   ackEwmaMs = 1_000;
   heartbeatAgeMs: number | null = 1_000;
   sidecarPeerAgeMs: number | null = null;
@@ -86,6 +97,24 @@ class FakeRuntime implements RoutableSandboxRuntime {
   }
   snapshot() {
     this.snapshotCalls++;
+    const defaultAvailable = Math.max(0, Math.min(
+      this.admissionWindow === null
+        ? this.capacity
+        : this.admissionWindow - this.uncommitted,
+      this.capacity - this.active,
+    ));
+    const admissionCredits = this.admissionLimit === null
+      ? undefined
+      : Math.max(0, Math.min(
+          this.admissionLimit - this.uncommitted,
+          this.capacity - this.active,
+        ));
+    const prefetchCredits = this.prefetchLimit === null
+      ? undefined
+      : Math.max(0, Math.min(
+          this.prefetchLimit - this.uncommitted,
+          this.capacity - this.active,
+        ));
     return {
       projectId: this.projectId,
       transportProfile: this.transportProfile,
@@ -93,12 +122,14 @@ class FakeRuntime implements RoutableSandboxRuntime {
       state: this.state,
       capacity: this.capacity,
       active: this.active,
-      available: Math.max(0, Math.min(
-        this.admissionWindow === null
-          ? this.capacity
-          : this.admissionWindow - this.uncommitted,
-        this.capacity - this.active,
-      )),
+      available: Math.max(
+        defaultAvailable,
+        admissionCredits ?? 0,
+        prefetchCredits ?? 0,
+      ),
+      ...(admissionCredits === undefined ? {} : { admissionCredits }),
+      ...(prefetchCredits === undefined ? {} : { prefetchCredits }),
+      ...(this.transferCredits === undefined ? {} : { transferCredits: this.transferCredits }),
       quarantined: 0,
       heartbeatAgeMs: this.heartbeatAgeMs,
       sidecarPeerAgeMs: this.sidecarPeerAgeMs,
@@ -124,6 +155,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
     this.bodies.push(body);
     if (this.failStarts > 0) {
       this.failStarts--;
+      this.mutateBeforeFailure?.(body);
       if (this.failDelayMs > 0) await Bun.sleep(this.failDelayMs);
       if (this.pulseAdmissionOnFailure) {
         const previousWindow = this.admissionWindow;
@@ -137,11 +169,17 @@ class FakeRuntime implements RoutableSandboxRuntime {
     if (this.waitForAdmissionAbort) {
       await new Promise<never>((_resolve, reject) => {
         if (signal?.aborted) {
-          reject(signal.reason);
+          reject(this.admissionAbortError ?? new V2PreCommitError(
+            "fake runtime proved no execution began before admission",
+            "test_precommit_abort",
+          ));
           return;
         }
         signal?.addEventListener("abort", () => {
-          const fail = () => reject(this.admissionAbortError ?? signal.reason);
+          const fail = () => reject(this.admissionAbortError ?? new V2PreCommitError(
+            "fake runtime proved no execution began before admission",
+            "test_precommit_abort",
+          ));
           if (this.admissionAbortDelayMs > 0) setTimeout(fail, this.admissionAbortDelayMs);
           else fail();
         }, { once: true });
@@ -162,14 +200,43 @@ class FakeRuntime implements RoutableSandboxRuntime {
       if (this.reflectExecutionRisk) options.onExecutionRiskReflected();
       else this.executionRiskCallbacks.push(options.onExecutionRiskReflected);
     }
+    if (this.failAfterExecutionRiskError) {
+      this.active--;
+      this.uncommitted--;
+      throw this.failAfterExecutionRiskError;
+    }
+    if (this.returnPendingHandleOnAbortAfterExecutionRisk) {
+      await new Promise<void>(resolve => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      this.uncommitted--;
+      const gate = deferred<any>();
+      this.finals.push(gate);
+      return {
+        async *events() {},
+        discardUnconsumedEvents: () => { this.lateHandleDiscardCalls++; },
+        final: gate.promise.finally(() => {
+          this.active--;
+          this.notify();
+        }),
+        stats: { bytes: 0, firstByteMs: 1, frames: 0 },
+      };
+    }
     if (this.waitForPostAdmissionAbort) {
       try {
         await new Promise<never>((_resolve, reject) => {
           if (signal?.aborted) {
-            reject(signal.reason);
+            reject(new V2PreCommitError(
+              "fake runtime proved admitted work never started",
+              "test_precommit_abort",
+            ));
             return;
           }
-          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          signal?.addEventListener("abort", () => reject(new V2PreCommitError(
+            "fake runtime proved admitted work never started",
+            "test_precommit_abort",
+          )), { once: true });
         });
       } finally {
         this.active--;
@@ -223,6 +290,7 @@ function createSystem(
   queueByteCapacity?: number,
   clock?: Clock,
   routeAttemptTimeoutMs?: number,
+  authorizationScope?: AuthenticatedTenantScope,
 ) {
   const runtimes = Array.from({ length: projects }, (_, index) => new FakeRuntime(
     projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
@@ -251,6 +319,7 @@ function createSystem(
     queueByteCapacity,
     clock,
     routeAttemptTimeoutMs,
+    authorizationScope,
   });
   return { runtimes, registry, governor, router };
 }
@@ -260,6 +329,85 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("uses four regular credits for tiny work and six prefetch credits for medium work", async () => {
+    const tiny = createSystem(1, 6, 1_000);
+    tiny.runtimes[0]!.transportProfile = "bulk-v1";
+    tiny.runtimes[0]!.admissionLimit = 4;
+    tiny.runtimes[0]!.prefetchLimit = 6;
+    tiny.runtimes[0]!.postAdmissionDelayMs = 50;
+    tiny.runtimes[0]!.notify();
+    const tinyRuns = Array.from({ length: 6 }, (_, index) => tiny.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: `tiny-${index}`,
+      stream: true,
+    }, { clientId: `tiny-credit-${index}`, source: "websocket" }));
+    await flush(100);
+    expect(tiny.runtimes[0]!.executions).toBe(4);
+    expect(tiny.router.snapshot().queued).toBe(2);
+    await Bun.sleep(60);
+    await flush(100);
+    expect(tiny.runtimes[0]!.executions).toBe(6);
+    for (let index = 0; index < 6; index++) tiny.runtimes[0]!.completeOne();
+    const tinyHandles = await Promise.all(tinyRuns);
+    await Promise.all(tinyHandles.map(handle => handle.final));
+    await tiny.router.close();
+
+    const medium = createSystem(1, 6, 1_000);
+    medium.runtimes[0]!.transportProfile = "bulk-v1";
+    medium.runtimes[0]!.admissionLimit = 4;
+    medium.runtimes[0]!.prefetchLimit = 6;
+    medium.runtimes[0]!.notify();
+    const mediumInput = "x".repeat(512 * 1024);
+    const mediumStructuralBytes = Buffer.byteLength(JSON.stringify({
+      model: "gpt-5.6-sol",
+      input: mediumInput,
+      stream: true,
+    }));
+    const mediumRuns = Array.from({ length: 6 }, (_, index) => medium.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: mediumInput,
+      tag: `medium-${index}`,
+      stream: true,
+    }, {
+      clientId: `medium-credit-${index}`,
+      source: "websocket",
+      structuralBodyBytes: mediumStructuralBytes,
+    }));
+    await flush(100);
+    expect(medium.runtimes[0]!.executions).toBe(6);
+    for (let index = 0; index < 6; index++) medium.runtimes[0]!.completeOne();
+    const mediumHandles = await Promise.all(mediumRuns);
+    await Promise.all(mediumHandles.map(handle => handle.final));
+    await medium.router.close();
+  });
+
+  it("does not treat reflected transfer units as whole-request credits", async () => {
+    const system = createSystem(1, 6, 1_000);
+    const runtime = system.runtimes[0]!;
+    runtime.transportProfile = "bulk-v1";
+    runtime.admissionLimit = 6;
+    runtime.prefetchLimit = 6;
+    runtime.transferCredits = 2;
+    runtime.notify();
+    const input = "x".repeat(3 * 1024 ** 2 + 1);
+    const body = { model: "gpt-5.6-sol", input, stream: true };
+    const pending = system.router.startRelay(body, {
+      source: "websocket",
+      structuralBodyBytes: Buffer.byteLength(JSON.stringify(body)),
+    });
+    await flush(100);
+    expect(runtime.executions).toBe(0);
+    expect(system.router.snapshot().queued).toBe(1);
+
+    runtime.transferCredits = 6;
+    runtime.notify();
+    const handle = await pending;
+    expect(runtime.executions).toBe(1);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
   it("caps R5 fleet bursts at four weighted units while tiny work bypasses the gate", async () => {
     const system = createSystem(8, 8, 10_000, undefined, undefined, undefined, 5_000);
     for (const runtime of system.runtimes) {
@@ -276,6 +424,7 @@ describe("MultiSandboxRouter", () => {
         source: "websocket",
         signal: controllers[index]!.signal,
         encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(2.9 * 1024 ** 2),
       },
     ));
     await flush(100);
@@ -295,6 +444,7 @@ describe("MultiSandboxRouter", () => {
         source: "websocket",
         signal: controllers[8]!.signal,
         encodedBodyBytes: 128 * 1024,
+        structuralBodyBytes: 128 * 1024,
       },
     );
     await flush(100);
@@ -327,7 +477,7 @@ describe("MultiSandboxRouter", () => {
     });
     await flush(100);
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
-    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 3 });
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 4 });
 
     otherHolding.emitAdmissionProgress({
       stage: "request_data",
@@ -335,8 +485,8 @@ describe("MultiSandboxRouter", () => {
       totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
     });
     await flush(100);
-    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
-    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 4 });
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 4 });
 
     holding.emitAdmissionProgress({
       stage: "request_prepared",
@@ -344,21 +494,77 @@ describe("MultiSandboxRouter", () => {
       totalEncodedBytes: Math.floor(2.9 * 1024 ** 2),
     });
     await flush(100);
-    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
-    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 3 });
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+    expect(system.router.snapshot()).toMatchObject({ queued: 6, fleetTransferReserved: 3 });
 
-    // A later execution-risk handoff is idempotent for the released control
-    // unit and cannot accidentally admit another large body.
+    // Prepared proof releases only the data share. The remaining control unit
+    // is released at execution risk, at which point one new body may enter.
     holding.emitExecutionRisk(0);
     await flush(100);
     expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(4);
-    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 3 });
+    expect(system.router.snapshot()).toMatchObject({ queued: 5, fleetTransferReserved: 4 });
 
     for (const controller of controllers) controller.abort();
     await Promise.allSettled([...large, tiny]);
     await system.router.close();
     expect(system.router.snapshot().fleetTransferReserved).toBe(0);
   });
+
+  for (const scenario of [
+    { name: "medium", bytes: 1024 ** 2, initialCost: 1 },
+    { name: "observed", bytes: Math.floor(2.9 * 1024 ** 2), initialCost: 2 },
+    { name: "true bulk", bytes: Math.floor(3.35 * 1024 ** 2), initialCost: 4 },
+    { name: "payload-scaled", bytes: 9 * 1024 ** 2, initialCost: 4 },
+  ]) {
+    it(`retains control capacity after exact request_prepared for ${scenario.name} bodies`, async () => {
+      const system = createSystem(2, 8, 100_000, undefined, undefined, undefined, 50_000);
+      for (const runtime of system.runtimes) {
+        runtime.transportProfile = "bulk-v1";
+        runtime.reflectExecutionRisk = false;
+        runtime.waitForPostAdmissionAbort = true;
+        runtime.notify();
+      }
+      const controller = new AbortController();
+      const pending = system.router.startRelay(
+        { model: "gpt-5.6-sol", input: scenario.name, stream: true },
+        {
+          clientId: `prepared-${scenario.name}`,
+          source: "websocket",
+          signal: controller.signal,
+          encodedBodyBytes: scenario.bytes,
+          structuralBodyBytes: scenario.bytes,
+        },
+      );
+      await flush(100);
+      const selected = system.runtimes.find(runtime => runtime.executions === 1)!;
+      expect(selected.admissionProgressCallbacks).toHaveLength(1);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(scenario.initialCost);
+
+      selected.emitAdmissionProgress({
+        stage: "request_data",
+        acknowledgedEncodedBytes: scenario.bytes,
+        totalEncodedBytes: scenario.bytes,
+      });
+      await flush(20);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(scenario.initialCost);
+
+      selected.emitAdmissionProgress({
+        stage: "request_prepared",
+        acknowledgedEncodedBytes: scenario.bytes,
+        totalEncodedBytes: scenario.bytes,
+      });
+      await flush(20);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(1);
+
+      selected.emitExecutionRisk();
+      await flush(20);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+
+      controller.abort();
+      await Promise.allSettled([pending]);
+      await system.router.close();
+    });
+  }
 
   it("paces a synchronized R5 medium burst while preserving single-start and tiny-request fast paths", async () => {
     let now = performance.timeOrigin + performance.now();
@@ -382,6 +588,7 @@ describe("MultiSandboxRouter", () => {
         source: "websocket",
         signal: controllers[index]!.signal,
         encodedBodyBytes: 1024 ** 2,
+        structuralBodyBytes: 1024 ** 2,
       },
     ));
     await flush(100);
@@ -396,6 +603,7 @@ describe("MultiSandboxRouter", () => {
         source: "websocket",
         signal: controllers[4]!.signal,
         encodedBodyBytes: 128 * 1024,
+        structuralBodyBytes: 128 * 1024,
       },
     );
     await flush(100);
@@ -456,6 +664,7 @@ describe("MultiSandboxRouter", () => {
           source: "websocket",
           signal: controllers[index]!.signal,
           encodedBodyBytes: scenario.bytes,
+          structuralBodyBytes: scenario.bytes,
         },
       ));
       await flush(100);
@@ -488,6 +697,7 @@ describe("MultiSandboxRouter", () => {
         clientId: `profile-cost-${index}`,
         source: "websocket",
         encodedBodyBytes: 2 * 1024 ** 2,
+        structuralBodyBytes: 2 * 1024 ** 2,
       }),
     );
 
@@ -526,6 +736,7 @@ describe("MultiSandboxRouter", () => {
         clientId: `observed-cost-${index}`,
         source: "websocket",
         encodedBodyBytes: 3 * 1024 ** 2,
+        structuralBodyBytes: 3 * 1024 ** 2,
       }));
     await flush();
     expect(observed.runtimes[0]!.executions).toBe(3);
@@ -697,6 +908,136 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("releases replacement permits when ingress release wins the async handoff", async () => {
+    const system = createSystem(1, 1);
+    const growing = await system.router.acquireIncomingBody(0, undefined, {
+      maxBytes: 64 * 1024 ** 2,
+    });
+    const growth = growing.ensureBytes!(13 * 1024 ** 2);
+    growing.release();
+    await expect(growth).rejects.toThrow("released during growth");
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+
+    const replacing = await system.router.acquireIncomingBody(1024);
+    const replacement = replacing.replace!({
+      class: "text-small",
+      requestBytes: 1024,
+      reservedBytes: 4 * 1024 ** 2,
+      stream: true,
+    });
+    replacing.release();
+    await expect(replacement).rejects.toThrow("released during replacement");
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+
+    const retained = await system.router.acquireIncomingBody(0, undefined, {
+      maxBytes: 64 * 1024 ** 2,
+    });
+    const retainedGrowth = retained.ensureBytes!(13 * 1024 ** 2);
+    retained.completeAdmission?.();
+    await retainedGrowth;
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+    retained.release();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("allows a retained completed ingress lease to hand off during fallback", async () => {
+    const system = createSystem(1, 1);
+    const incoming = await system.router.acquireIncomingBody(1024);
+    incoming.completeAdmission?.();
+    const replacement = await incoming.replace!({
+      class: "text-large",
+      requestBytes: 2 * 1024 ** 2,
+      reservedBytes: 16 * 1024 ** 2,
+      stream: true,
+    });
+
+    expect(replacement.reservedBytes).toBe(16 * 1024 ** 2);
+    replacement.release();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("does not return a granted incoming lease after its abort wins the resume race", async () => {
+    const system = createSystem(1, 1);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    const controller = new AbortController();
+    const pending = system.router.acquireIncomingBody(0, controller.signal);
+    await Promise.resolve();
+    blocker.release();
+    const reason = new DOMException("client disconnected", "AbortError");
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("observes aborts between immutable snapshot completion and queue listener setup", async () => {
+    const system = createSystem(0, 1, 100);
+    const controller = new AbortController();
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "abort during immutable handoff",
+      stream: true,
+    }, { signal: controller.signal });
+    queueMicrotask(() => controller.abort(new DOMException("client disconnected", "AbortError")));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(system.router.snapshot()).toMatchObject({ queued: 0, active: 0 });
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("retains admitted memory through the declared graph lifetime after queue failure", async () => {
+    const system = createSystem(0, 1, 20);
+    const retained = deferred<void>();
+    await expect(system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "retained source graph",
+      stream: true,
+    }, {
+      source: "image",
+      retainMemoryUntil: retained.promise,
+    })).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+    const idle = system.router.awaitIdle(200);
+    expect(await Promise.race([
+      idle.then(() => "idle" as const),
+      Bun.sleep(10).then(() => "retained" as const),
+    ])).toBe("retained");
+
+    retained.resolve();
+    await flush();
+    await expect(idle).resolves.toBeUndefined();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("keeps cooperative snapshot work visible to shutdown until it is aborted", async () => {
+    const system = createSystem(0, 1, 1_000);
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: Array.from({ length: 20_000 }, (_, index) => ({
+        type: "input_text",
+        text: `snapshot-${index}`,
+      })),
+      stream: true,
+    });
+    for (let turn = 0;
+      turn < 100 && system.governor.snapshot().reservedBytes === 0;
+      turn++) await Promise.resolve();
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+
+    system.router.beginShutdown();
+    await expect(pending).rejects.toMatchObject({ code: "router_shutting_down" });
+    await expect(system.router.awaitIdle(1_000)).resolves.toBeUndefined();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("does not retry host-local CPU overload through another sandbox", async () => {
     const system = createSystem(2, 1);
     for (const runtime of system.runtimes) {
@@ -835,6 +1176,116 @@ describe("MultiSandboxRouter", () => {
     expect(system.governor.snapshot().reservedBytes).toBe(0);
   });
 
+  it("keeps a bounded queue permit for a safely retryable pre-commit request", async () => {
+    const system = createSystem(1, 1, 500, 1);
+    const runtime = system.runtimes[0]!;
+    runtime.failStarts = 1;
+    runtime.failDelayMs = 40;
+    const retrying = system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "must retain retry capacity", stream: true },
+      { clientId: "retry-capacity", source: "websocket" },
+    );
+    while (runtime.executions === 0) await Promise.resolve();
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "cannot steal retry capacity", stream: true },
+      { clientId: "competing", source: "websocket" },
+    )).rejects.toMatchObject({ code: "router_queue_full" });
+
+    const handle = await retrying;
+    expect(runtime.executions).toBe(2);
+    runtime.completeOne();
+    await handle.final;
+    await system.router.close();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+  });
+
+  it("releases lightweight incoming leases on success and pre-admission failure", async () => {
+    const system = createSystem(1, 1);
+    let successfulReleases = 0;
+    const handle = await system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "lightweight lease", stream: true },
+      {
+        incomingLease: {
+          reservedBytes: 1,
+          release: () => { successfulReleases++; },
+        },
+      },
+    );
+    expect(successfulReleases).toBe(1);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+
+    let rejectedReleases = 0;
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "invalid sizing", stream: true },
+      {
+        encodedBodyBytes: -1,
+        incomingLease: {
+          reservedBytes: 1,
+          release: () => { rejectedReleases++; },
+        },
+      },
+    )).rejects.toBeInstanceOf(RangeError);
+    expect(rejectedReleases).toBe(1);
+
+    const cyclic: Record<string, unknown> = {
+      model: "gpt-5.6-sol",
+      input: "cyclic structural sizing",
+      stream: true,
+    };
+    cyclic.self = cyclic;
+    let structuralFailureReleases = 0;
+    await expect(system.router.startRelay(cyclic, {
+      incomingLease: {
+        reservedBytes: 1,
+        release: () => { structuralFailureReleases++; },
+      },
+    })).rejects.toBeInstanceOf(TypeError);
+    expect(structuralFailureReleases).toBe(1);
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "throwing lease release", stream: true },
+      {
+        incomingLease: {
+          reservedBytes: 1,
+          release: () => { throw new Error("synthetic incoming release failure"); },
+        },
+      },
+    )).rejects.toThrow("synthetic incoming release failure");
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+
+    await system.router.close();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+
+    let closedRouterReleases = 0;
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "closed router", stream: true },
+      {
+        incomingLease: {
+          reservedBytes: 1,
+          release: () => { closedRouterReleases++; },
+        },
+      },
+    )).rejects.toMatchObject({ code: "router_shutting_down" });
+    expect(closedRouterReleases).toBe(1);
+
+    const closed = createSystem(1, 1);
+    closed.governor.close();
+    let admissionFailureReleases = 0;
+    await expect(closed.router.startRelay(
+      { model: "gpt-5.6-sol", input: "closed governor", stream: true },
+      {
+        incomingLease: {
+          reservedBytes: 1,
+          release: () => { admissionFailureReleases++; },
+        },
+      },
+    )).rejects.toMatchObject({ code: "resource_governor_closed" });
+    expect(admissionFailureReleases).toBe(1);
+    await closed.router.close();
+  });
+
   it("bounds queued request bytes atomically", async () => {
     const system = createSystem(0, 1, 1_000, 10, 1);
     await expect(system.router.startRelay(
@@ -885,6 +1336,183 @@ describe("MultiSandboxRouter", () => {
     expect(runtime.executions).toBe(2);
     runtime.completeOne();
     await handle.final;
+    await system.router.close();
+  });
+
+  it("keeps the relay body immutable across a safe runtime retry", async () => {
+    const system = createSystem(2, 1, 500);
+    const first = system.runtimes[1]!;
+    first.failStarts = 1;
+    first.mutateBeforeFailure = body => {
+      const input = body.input as Array<Record<string, unknown>>;
+      expect(Object.isFrozen(body)).toBe(true);
+      expect(Object.isFrozen(input)).toBe(true);
+      expect(Object.isFrozen(input[0])).toBe(true);
+      try {
+        input[0]!.text = "mutated by failed runtime";
+      } catch {
+        // Strict-mode mutation rejection is the expected immutable boundary.
+      }
+    };
+    const original = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "input_text", text: "original retry body" }],
+      stream: true,
+    };
+
+    const handle = await system.router.startRelay(original, {
+      clientId: "immutable-retry",
+      source: "websocket",
+    });
+    const successful = system.runtimes.find(runtime => runtime.finals.length > 0)!;
+    expect(successful.bodies.at(-1)?.input).toEqual([
+      { type: "input_text", text: "original retry body" },
+    ]);
+    expect(original.input[0]!.text).toBe("original retry body");
+    successful.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("re-sizes the frozen body when caller mutation wins the admission wait", async () => {
+    const system = createSystem(1, 1, 1_000);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    system.runtimes[0]!.postAdmissionDelayMs = 50;
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "input_text", text: "x" }],
+      stream: true,
+    };
+    const pending = system.router.startRelay(body, {
+      clientId: "mutation-resize",
+      source: "internal",
+    });
+    await Promise.resolve();
+    body.input[0]!.text = "x".repeat(2 * 1024 ** 2);
+    blocker.release();
+    for (let turn = 0; turn < 100 && system.runtimes[0]!.executions === 0; turn++) {
+      await Bun.sleep(1);
+    }
+
+    expect((system.runtimes[0]!.bodies[0]!.input as any[])[0].text.length)
+      .toBe(2 * 1024 ** 2);
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThanOrEqual(16 * 1024 ** 2);
+    const handle = await pending;
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("re-normalizes store and stream on the exact frozen admission snapshot", async () => {
+    const system = createSystem(1, 1, 1_000);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    const body: Record<string, unknown> = {
+      model: "gpt-5.6-sol",
+      input: "policy before admission",
+      service_tier: "fast",
+      store: true,
+      stream: true,
+    };
+    const pending = system.router.startRelay(body);
+    while (system.governor.snapshot().queued === 0) await Promise.resolve();
+    body.store = false;
+    body.stream = false;
+    body.input = "mutation captured by frozen snapshot";
+    blocker.release();
+
+    const handle = await pending;
+    expect(system.runtimes[0]!.bodies).toHaveLength(1);
+    expect(system.runtimes[0]!.bodies[0]).toMatchObject({
+      input: "mutation captured by frozen snapshot",
+      store: true,
+      stream: true,
+    });
+    expect(Object.isFrozen(system.runtimes[0]!.bodies[0])).toBe(true);
+    system.runtimes[0]!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("binds a mutated continuation only from the frozen scoped snapshot", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const system = createSystem(
+      2,
+      1,
+      1_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      authorizationScope,
+    );
+    const seed = await system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "seed lineage",
+      service_tier: "fast",
+      store: true,
+      stream: true,
+    });
+    const bound = system.runtimes.find(runtime => runtime.executions === 1)!;
+    const other = system.runtimes.find(runtime => runtime !== bound)!;
+    bound.completeOne({ id: "resp_mutation_seed", status: "completed" });
+    await seed.final;
+    await flush();
+    bound.ackEwmaMs = 10_000;
+    other.ackEwmaMs = 1;
+    bound.notify();
+    other.notify();
+
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    const body: Record<string, unknown> = {
+      model: "gpt-5.6-sol",
+      input: "continue after wait",
+      service_tier: "fast",
+      store: true,
+      stream: true,
+    };
+    const pending = system.router.startRelay(body, { authorizationScope });
+    while (system.governor.snapshot().queued === 0) await Promise.resolve();
+    body.previous_response_id = "resp_mutation_seed";
+    blocker.release();
+
+    const continuation = await pending;
+    expect(bound.executions).toBe(2);
+    expect(other.executions).toBe(0);
+    expect(bound.bodies.at(-1)?.previous_response_id).toBe("resp_mutation_seed");
+    bound.completeOne();
+    await continuation.final;
+    await system.router.close();
+  });
+
+  it("fails closed when an unscoped frozen snapshot gains a continuation", async () => {
+    const system = createSystem(1, 1, 1_000);
+    const blocker = system.governor.reserveFixedBytes(
+      system.governor.snapshot().reservationCapacityBytes,
+    );
+    const body: Record<string, unknown> = {
+      model: "gpt-5.6-sol",
+      input: "initially standalone",
+      service_tier: "fast",
+      store: true,
+      stream: true,
+    };
+    const pending = system.router.startRelay(body);
+    while (system.governor.snapshot().queued === 0) await Promise.resolve();
+    body.previous_response_id = "resp_added_during_admission";
+    blocker.release();
+
+    await expect(pending).rejects.toMatchObject({
+      code: "response_provenance_scope_mismatch",
+      committed: false,
+    });
+    expect(system.runtimes[0]!.executions).toBe(0);
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
     await system.router.close();
   });
 
@@ -962,6 +1590,62 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("classifies a generic runtime rejection after caller abort as ambiguous", async () => {
+    const system = createSystem(1, 1, 500);
+    const runtime = system.runtimes[0]!;
+    runtime.waitForAdmissionAbort = true;
+    runtime.admissionAbortError = new Error("generic cancellation race");
+    const controller = new AbortController();
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "generic abort rejection",
+      stream: true,
+    }, {
+      source: "websocket",
+      signal: controller.signal,
+    });
+    await flush();
+    expect(runtime.executions).toBe(1);
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+
+    await expect(pending).rejects.toMatchObject({
+      code: "caller_cancellation_unproven",
+      committed: true,
+      ambiguous: true,
+    });
+    expect(runtime.executions).toBe(1);
+    await system.router.close();
+  });
+
+  it("keeps a cancellation-unproven runtime charged until its late cleanup settles", async () => {
+    const system = createSystem(1, 1, 500);
+    const runtime = system.runtimes[0]!;
+    runtime.ignoreAdmissionAbortMs = 100;
+    const controller = new AbortController();
+    const pending = system.router.startRelay({
+      model: "gpt-5.6-sol",
+      input: "late cancellation cleanup",
+      stream: true,
+    }, { source: "websocket", signal: controller.signal });
+    await flush();
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+
+    await expect(pending).rejects.toMatchObject({
+      code: "caller_cancellation_unproven",
+      committed: true,
+    });
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+    await expect(system.router.awaitIdle(30)).rejects.toMatchObject({
+      code: "router_shutting_down",
+    });
+
+    await Bun.sleep(90);
+    await flush();
+    await expect(system.router.awaitIdle(100)).resolves.toBeUndefined();
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
   it("fails over a safely unadmitted route before the global deadline", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
     system.runtimes[1]!.waitForAdmissionAbort = true;
@@ -1031,6 +1715,7 @@ describe("MultiSandboxRouter", () => {
         clientId: "large-no-progress",
         source: "websocket",
         encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(2.9 * 1024 ** 2),
       },
     );
     const elapsed = performance.now() - started;
@@ -1067,6 +1752,7 @@ describe("MultiSandboxRouter", () => {
         clientId: "large-progressing",
         source: "websocket",
         encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(2.9 * 1024 ** 2),
       },
     );
     await flush();
@@ -1119,6 +1805,7 @@ describe("MultiSandboxRouter", () => {
         clientId: "near-complete-live-shape",
         source: "websocket",
         encodedBodyBytes: totalEncodedBytes,
+        structuralBodyBytes: totalEncodedBytes,
         signal: controller.signal,
       },
     );
@@ -1168,6 +1855,7 @@ describe("MultiSandboxRouter", () => {
         clientId: "body-acked-prepared-stalled",
         source: "websocket",
         encodedBodyBytes: totalEncodedBytes,
+        structuralBodyBytes: totalEncodedBytes,
       },
     );
     await flush();
@@ -1203,6 +1891,7 @@ describe("MultiSandboxRouter", () => {
         clientId: "large-standard",
         source: "websocket",
         encodedBodyBytes: Math.floor(2.9 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(2.9 * 1024 ** 2),
       },
     );
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
@@ -1243,17 +1932,20 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("does not await non-cooperative cleanup after the admission handoff deadline", async () => {
+  it("waits for explicit pre-commit cleanup proof before failover", async () => {
     const system = createSystem(2, 1, 200, undefined, undefined, undefined, 20);
     system.runtimes[1]!.ignoreAdmissionAbortMs = 120;
     const started = performance.now();
 
-    const handle = await system.router.startRelay(
+    const pending = system.router.startRelay(
       { model: "gpt-5.6-sol", input: "detach-safe-cleanup", stream: true },
       { clientId: "detach-safe-cleanup", source: "websocket" },
     );
-
-    expect(performance.now() - started).toBeLessThan(80);
+    await Bun.sleep(60);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    const handle = await pending;
+    expect(performance.now() - started).toBeGreaterThanOrEqual(110);
+    expect(performance.now() - started).toBeLessThan(190);
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
     system.runtimes[0]!.completeOne();
     await handle.final;
@@ -1269,7 +1961,11 @@ describe("MultiSandboxRouter", () => {
     await expect(system.router.startRelay(
       { model: "gpt-5.6-sol", input: "hard-deadline", stream: true },
       { clientId: "hard-deadline", source: "websocket" },
-    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    )).rejects.toMatchObject({
+      code: "route_timeout_cancellation_unproven",
+      committed: true,
+      ambiguous: true,
+    });
 
     expect(performance.now() - started).toBeLessThan(110);
     await Bun.sleep(220);
@@ -1290,6 +1986,79 @@ describe("MultiSandboxRouter", () => {
       { clientId: "never-duplicate", source: "websocket" },
     )).rejects.toMatchObject({ committed: true, ambiguous: true, code: "start_risk" });
 
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    await system.router.close();
+  });
+
+  it("bounds a runtime that reports execution risk but never returns its handle", async () => {
+    const system = createSystem(1, 1, 60, undefined, undefined, undefined, 20);
+    const runtime = system.runtimes[0]!;
+    runtime.postAdmissionDelayMs = 200;
+    const started = performance.now();
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "risk-without-handle", stream: true },
+      { clientId: "risk-without-handle", source: "websocket" },
+    )).rejects.toMatchObject({
+      code: "execution_risk_handle_unproven",
+      committed: true,
+      ambiguous: true,
+    });
+    expect(performance.now() - started).toBeLessThan(120);
+    expect(runtime.executions).toBe(1);
+    await Bun.sleep(210);
+    runtime.completeOne();
+    await system.router.close();
+  });
+
+  it("keeps same-turn late handles cleanup-only after execution-risk proof expires", async () => {
+    const system = createSystem(1, 1, 40, undefined, undefined, undefined, 20);
+    const runtime = system.runtimes[0]!;
+    runtime.returnPendingHandleOnAbortAfterExecutionRisk = true;
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "same-turn-late-handle", stream: true },
+      { clientId: "same-turn-late-handle", source: "websocket" },
+    )).rejects.toMatchObject({
+      code: "execution_risk_handle_unproven",
+      committed: true,
+      ambiguous: true,
+    });
+    await flush();
+    expect(runtime.executions).toBe(1);
+    expect(runtime.lateHandleDiscardCalls).toBe(1);
+    expect(runtime.active).toBe(1);
+    expect(runtime.finals).toHaveLength(1);
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+    await expect(system.router.awaitIdle(10)).rejects.toMatchObject({
+      code: "router_shutting_down",
+    });
+
+    runtime.completeOne();
+    await expect(system.router.awaitIdle(100)).resolves.toBeUndefined();
+    expect(runtime.lateHandleDiscardCalls).toBe(1);
+    expect(runtime.active).toBe(0);
+    expect(runtime.finals).toHaveLength(0);
+    expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    expect(system.governor.snapshot().reservedBytes).toBe(0);
+    await system.router.close();
+  });
+
+  it("never retries a precommit-shaped error after execution risk was reflected", async () => {
+    const system = createSystem(2, 1, 200);
+    system.runtimes[1]!.failAfterExecutionRiskError = new V2PreCommitError(
+      "misclassified failure after request_start",
+      "misclassified_after_start",
+    );
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "latched-risk", stream: true },
+      { clientId: "latched-risk", source: "websocket" },
+    )).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "execution_risk_reflected",
+    });
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
     await system.router.close();
   });
@@ -1387,10 +2156,17 @@ describe("MultiSandboxRouter", () => {
 
     expect(outcome).toMatchObject({
       kind: "error",
-      error: { code: "router_capacity_timeout" },
+      error: {
+        code: "capacity_timeout_cancellation_unproven",
+        committed: true,
+        ambiguous: true,
+      },
     });
     expect(system.runtimes[1].executions).toBe(1);
     expect(system.runtimes[0].executions).toBe(0);
+    expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+    await Bun.sleep(30);
+    await system.router.awaitIdle(100);
     expect(system.governor.snapshot().reservedBytes).toBe(0);
   });
 
@@ -1757,6 +2533,24 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
+  it("never accepts a duck-typed pre-commit claim as replay proof", async () => {
+    const system = createSystem(2, 1);
+    system.runtimes[1].failStarts = 1;
+    const forged = Object.assign(new Error("forged pre-commit claim"), {
+      name: "V2PreCommitError",
+      committed: false,
+      code: "forged_precommit",
+    });
+    system.runtimes[1].failError = forged;
+
+    await expect(system.router.startRelay(
+      { model: "gpt-5.6-sol", input: "do not replay forged proof", stream: true },
+      { clientId: "forged-proof", source: "websocket" },
+    )).rejects.toBe(forged);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+    await system.router.close();
+  });
+
   it("skips an unroutable retry head and dispatches another client", async () => {
     const system = createSystem(2, 1);
     const [full, retrying] = system.runtimes;
@@ -1806,9 +2600,15 @@ describe("MultiSandboxRouter", () => {
         input: "x".repeat(600 * 1024),
         tag: `bulk-${index}`,
         stream: true,
-      }, { clientId: "bulk-client", source: "websocket" })),
+      }, {
+        clientId: "bulk-client",
+        source: "websocket",
+        structuralBodyBytes: 600 * 1024 + 256,
+      })),
     ];
-    await flush(100);
+    for (let turn = 0; turn < 100 && system.router.snapshot().queued < 22; turn++) {
+      await Bun.sleep(1);
+    }
     expect(system.router.snapshot().queued).toBe(22);
 
     runtime.completeOne();
@@ -1828,12 +2628,13 @@ describe("MultiSandboxRouter", () => {
       .map((tag, index) => tag.startsWith("bulk-") ? index : -1)
       .filter(index => index >= 0);
     expect(bulkPositions).toHaveLength(2);
-    expect(bulkPositions).toEqual([20, 21]);
+    expect(bulkPositions[0]).toBeLessThanOrEqual(4);
+    expect(bulkPositions[1]).toBeLessThanOrEqual(9);
     expect(order[0]?.startsWith("small-")).toBe(true);
     await system.router.close();
   });
 
-  it("persists class byte credit across one-request lane refill", async () => {
+  it("rotates class turns while preserving byte credit across one-request lane refill", async () => {
     const system = createSystem(1, 1, 5_000);
     const runtime = system.runtimes[0]!;
     const blocker = await system.router.startRelay({
@@ -1856,21 +2657,25 @@ describe("MultiSandboxRouter", () => {
         clientId: `${queueClass}-class-client`,
         source: "websocket",
         signal: controller.signal,
+        ...(queueClass === "bulk"
+          ? { structuralBodyBytes: 1024 * 1024 + 256 }
+          : {}),
       }).then(handle => ({ queueClass, handle }));
     };
     const waiting: Record<"latency" | "bulk", ReturnType<typeof launch>> = {
       latency: launch("latency"),
       bulk: launch("bulk"),
     };
+    await Bun.sleep(20);
 
     runtime.completeOne();
     await blocker.final;
     const order: Array<"latency" | "bulk"> = [];
-    for (let turn = 0; turn < 540; turn++) {
+    for (let turn = 0; turn < 40; turn++) {
       const selected = await Promise.race([waiting.latency, waiting.bulk]);
       order.push(selected.queueClass);
       waiting[selected.queueClass] = launch(selected.queueClass);
-      await flush(1);
+      await Bun.sleep(0);
       runtime.completeOne();
       await selected.handle.final;
     }
@@ -1878,9 +2683,13 @@ describe("MultiSandboxRouter", () => {
     const bulkPositions = order
       .map((queueClass, index) => queueClass === "bulk" ? index : -1)
       .filter(index => index >= 0);
-    expect(bulkPositions).toHaveLength(1);
-    expect(bulkPositions[0]).toBeGreaterThanOrEqual(500);
-    expect(bulkPositions[0]).toBeLessThanOrEqual(520);
+    expect(order[0]).toBe("latency");
+    expect(bulkPositions.length).toBeGreaterThanOrEqual(6);
+    expect(bulkPositions[0]).toBeLessThanOrEqual(4);
+    const bulkGaps = bulkPositions.slice(1).map((position, index) => (
+      position - bulkPositions[index]!
+    ));
+    expect(Math.max(...bulkGaps)).toBeLessThanOrEqual(6);
 
     for (const controller of controllers) controller.abort();
     await flush();

@@ -17,9 +17,9 @@ import {
   releaseAtomicBytePermit,
   transferAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
+import { jsonEncodedByteLengthAsync } from "../router/workload";
 
 import {
-  createAuthenticatedTenantScope,
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
@@ -180,6 +180,7 @@ export type WebSocketRelayStarter = (
     clientId: string;
     authorizationScope: AuthenticatedTenantScope;
     encodedBodyBytes?: number;
+    structuralBodyBytes?: number;
   },
 ) => Promise<RunHandle>;
 
@@ -200,7 +201,7 @@ export interface ResponsesWebSocketSessionOptions {
   /** Maximum queue/backpressure/send-callback lifetime for one outgoing message. */
   sendTimeoutMs?: number;
   /** Stable trusted tenant scope supplied by the server integration. */
-  authorizationScope?: AuthenticatedTenantScope;
+  authorizationScope: AuthenticatedTenantScope;
   /** Stable routing identity reused by every response on this connection. */
   clientId?: string;
   /** Shared process-level session and retained-byte fence. */
@@ -360,6 +361,72 @@ function abortError(): DOMException {
   return new DOMException("WebSocket request aborted", "AbortError");
 }
 
+function abortable<T>(
+  source: Promise<T>,
+  signal: AbortSignal,
+  onLateValue?: (value: T) => void,
+): Promise<T> {
+  if (signal.aborted) {
+    void source.then(value => onLateValue?.(value), () => undefined);
+    return Promise.reject(abortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    source.then(
+      value => {
+        if (settled) {
+          onLateValue?.(value);
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function disposeLateHandle(handle: RunHandle): void {
+  try {
+    const discard = handle.discardUnconsumedEvents;
+    if (typeof discard === "function") {
+      // V2 must remain able to accept and definitively settle committed events.
+      // Claiming then closing its iterator would instead turn later delivery
+      // into an ambiguous committed failure.
+      discard.call(handle);
+    } else {
+      const iterator = handle.events();
+      // Async generators which have never started do not execute their `finally`
+      // block when return() is called first. Claim exactly one buffered frame so
+      // its permit can be released, then close the generic iterator.
+      void Promise.resolve()
+        .then(() => iterator.next())
+        .then(async result => {
+          if (!result.done) releaseAtomicBytePermit(result.value);
+          await iterator.return(undefined);
+        })
+        .catch(() => undefined);
+    }
+  } catch {}
+  try { void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined); }
+  catch {}
+  try { if (handle.upstreamPrelude) void handle.upstreamPrelude.catch(() => undefined); }
+  catch {}
+}
+
 function positiveInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new RangeError(`${label} must be a positive safe integer`);
@@ -427,6 +494,21 @@ function terminalEventType(final: unknown):
     return `response.${status}`;
   }
   throw new TypeError("WebSocket relay returned an invalid final response status");
+}
+
+function terminalFrameMatchesFinal(
+  terminal: Record<string, unknown>,
+  final: unknown,
+): boolean {
+  if (!final || typeof final !== "object" || Array.isArray(final)) return false;
+  const expectedType = terminalEventType(final);
+  if (terminal.type !== expectedType) return false;
+  const response = terminal.response;
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  const expected = final as Record<string, unknown>;
+  const actual = response as Record<string, unknown>;
+  return typeof expected.id === "string" && expected.id.length > 0 &&
+    actual.id === expected.id && actual.status === expected.status;
 }
 
 export class ResponsesWebSocketSession {
@@ -497,8 +579,7 @@ export class ResponsesWebSocketSession {
       options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
       "sendTimeoutMs",
     );
-    this.#authorizationScope = options.authorizationScope ??
-      createAuthenticatedTenantScope();
+    this.#authorizationScope = options.authorizationScope;
     if (!isAuthenticatedTenantScope(this.#authorizationScope)) {
       throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
     }
@@ -649,6 +730,8 @@ export class ResponsesWebSocketSession {
   ): Promise<void> {
     let release: (() => void) | undefined;
     let handle: RunHandle | undefined;
+    let eventIterator: AsyncGenerator<import("../relay/sse").SseFrame, void> | undefined;
+    let eventIteratorFinished = false;
     let resolved: ResolvedRelayRequest | undefined;
     let pendingTerminal: Record<string, unknown> | undefined;
     let finalObserved = false;
@@ -667,45 +750,66 @@ export class ResponsesWebSocketSession {
         return;
       }
       const streamId = event.stream_id;
-      resolved = this.#graph.resolve(event, {
+      const resolution = this.#graph.resolve(event, {
         authorizationScope: this.#authorizationScope,
         inputOwnership: "owned",
       });
-      const relayBody = resolved.relayBody;
-      // resolve() owns independent graph and relay representations now; avoid
-      // retaining the original payload for the complete streamed response.
+      resolved = resolution;
+      let relayBody: Record<string, unknown> = resolution.relayBody;
+      // The relay body now owns the parsed input reference; avoid retaining a
+      // second path through the client event for the streamed response.
       delete event.input;
       try {
-        handle = await this.#startRelay(relayBody, {
+        const structuralBodyBytes = await jsonEncodedByteLengthAsync(relayBody, {
+          signal: controller.signal,
+        });
+        const starting = Promise.resolve().then(() => this.#startRelay(relayBody, {
           signal: controller.signal,
           clientId: this.#clientId,
-          authorizationScope: resolved.authorizationScope,
+          authorizationScope: resolution.authorizationScope,
           // Public type/stream metadata normally covers the two enforced policy
           // fields; retain a small conservative allowance for minimal envelopes.
-          encodedBodyBytes: resolved.materializedLocally
+          encodedBodyBytes: resolution.materializedLocally
             ? undefined
             : Math.min(
                 Number.MAX_SAFE_INTEGER,
                 requestBytes + UPSTREAM_POLICY_HEADROOM_BYTES,
               ),
-        });
+          structuralBodyBytes,
+        }));
+        handle = await abortable(starting, controller.signal, disposeLateHandle);
       } finally {
         // Router/transport preparation has taken ownership of its encoded
         // request by this boundary; the large reconstructed lineage can drop.
-        releaseResponseGraphPayload(resolved);
-        if (!resolved.cacheLocally) resolved.inputDelta = [];
-        // Retain only the tiny field needed by graph.record; the reconstructed
-        // lineage is now owned by router/transport preparation, not the session.
-        resolved.relayBody = typeof relayBody.model === "string"
-          ? { model: relayBody.model }
-          : {};
+        releaseResponseGraphPayload(resolution);
+        resolution.relayBody = {};
+        relayBody = {};
       }
       let sawTerminal = false;
-      for await (const frame of handle.events()) {
-        const outbound = this.#graph.sanitizeOutbound(
-          parseEventData(frame.data),
-          resolved,
+      eventIterator = handle.events();
+      for (;;) {
+        const next = await abortable(
+          Promise.resolve().then(() => eventIterator!.next()),
+          controller.signal,
+          late => {
+            if (!late.done) releaseAtomicBytePermit(late.value);
+          },
         );
+        if (next.done) {
+          eventIteratorFinished = true;
+          break;
+        }
+        const frame = next.value;
+        let outbound: Record<string, unknown>;
+        try {
+          outbound = this.#graph.sanitizeOutbound(
+            parseEventData(frame.data),
+            resolution,
+          );
+        } catch (error) {
+          releaseAtomicBytePermit(frame);
+          throw error;
+        }
         if (streamId) outbound.stream_id = streamId;
         const type = outbound.type;
         if (
@@ -717,18 +821,37 @@ export class ResponsesWebSocketSession {
           releaseAtomicBytePermit(pendingTerminal);
           transferAtomicBytePermit(frame, outbound, "websocket-terminal-pending");
           pendingTerminal = outbound;
-          continue;
+          // A Responses terminal is the final logical stream event. Do not
+          // request another iterator item before awaiting authoritative final;
+          // a generic wrapper may otherwise stall forever after its terminal.
+          break;
         }
         transferAtomicBytePermit(frame, outbound, "websocket-outbound");
         await this.#send(outbound);
       }
-      const final = await handle.final;
+      const final = await abortable(Promise.resolve(handle.final), controller.signal);
       finalObserved = true;
       try {
         if (this.#closed || controller.signal.aborted) return;
-        this.#graph.record(resolved, final);
         if (pendingTerminal) {
-          const outbound = pendingTerminal;
+          if (!terminalFrameMatchesFinal(pendingTerminal, final)) {
+            throw new WebSocketRequestOutputError(
+              "WebSocket terminal event conflicts with its authoritative final response",
+              "websocket_terminal_mismatch",
+              500,
+              "internal_error",
+            );
+          }
+          const outbound = {
+            ...pendingTerminal,
+            type: terminalEventType(final),
+            response: this.#graph.sanitizeOutbound(final, resolution),
+          };
+          transferAtomicBytePermit(
+            pendingTerminal,
+            outbound,
+            "websocket-authoritative-terminal",
+          );
           pendingTerminal = undefined;
           await this.#send(outbound);
         } else if (!sawTerminal) {
@@ -736,7 +859,7 @@ export class ResponsesWebSocketSession {
             type: terminalEventType(final),
             response: final,
             ...(streamId ? { stream_id: streamId } : {}),
-          }, resolved);
+          }, resolution);
           transferAtomicBytePermit(final, outbound, "websocket-final-outbound");
           await this.#send(outbound);
         }
@@ -754,7 +877,7 @@ export class ResponsesWebSocketSession {
       if (error instanceof ResponseGraphCapacityError) {
         this.#telemetry?.responseGraphRejected();
       }
-      if (error instanceof WebSocketRequestOutputError) controller.abort();
+      if (!controller.signal.aborted) controller.abort(error);
       // Release the request/body reservation before queuing its terminal error,
       // otherwise a full process byte budget could deadlock error delivery.
       releaseRequest();
@@ -795,6 +918,10 @@ export class ResponsesWebSocketSession {
         // handle.final. Release a definitive late terminal carrier even when
         // the relay wins the cancellation race and settles successfully.
         void handle.final.then(releaseAtomicBytePermit, () => undefined);
+      }
+      if (eventIterator && !eventIteratorFinished) {
+        try { void Promise.resolve(eventIterator.return(undefined)).catch(() => undefined); }
+        catch {}
       }
       releaseAtomicBytePermit(pendingTerminal);
       if (resolved) releaseResponseGraphResolution(resolved);

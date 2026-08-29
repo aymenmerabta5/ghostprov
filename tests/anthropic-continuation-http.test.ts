@@ -11,6 +11,7 @@ import type { RunHandle } from "../src/relay/run-handle";
 import type { SseFrame } from "../src/relay/sse";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { V2CommittedError } from "../src/v2/transport/run-handle";
+import { classifyWorkload } from "../src/router/workload";
 import {
   finalResponse,
   messageOutput,
@@ -51,11 +52,16 @@ function relayHandle(
   events: () => AsyncGenerator<SseFrame> = async function* () {},
   upstreamPrelude?: Promise<unknown>,
 ): RunHandle {
+  const stats: RunHandle["stats"] = { bytes: 0, firstByteMs: null, frames: 0 };
+  const settledFinal = Promise.resolve(final).then(value => {
+    stats.bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+    return value as Record<string, unknown>;
+  });
   return {
     events,
-    final: Promise.resolve(final),
+    final: settledFinal,
     ...(upstreamPrelude ? { upstreamPrelude: upstreamPrelude as Promise<any> } : {}),
-    stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    stats,
   };
 }
 
@@ -63,7 +69,10 @@ const SCOPE = createAuthenticatedTenantScope();
 
 function testApp(
   factory: RelayFactory,
-  options: { scope?: AuthenticatedTenantScope | null } = { scope: SCOPE },
+  options: {
+    scope?: AuthenticatedTenantScope | null;
+    continuationIndex?: AnthropicContinuationIndex;
+  } = { scope: SCOPE },
 ): {
   app: Hono;
   calls: Record<string, unknown>[];
@@ -79,7 +88,8 @@ function testApp(
   registerAnthropicRoutes(app, {
     keepAliveMs: 60_000,
     models: MODELS,
-    continuationScope: options.scope ?? undefined,
+    continuationScope: options.scope === null ? undefined : options.scope ?? SCOPE,
+    continuationIndex: options.continuationIndex,
     startRelay: async (body, signal, _clientId, incomingLease, admission) => {
       calls.push(structuredClone(body));
       admissions.push(admission);
@@ -192,7 +202,7 @@ describe("Anthropic persisted continuation HTTP integration", () => {
         content: [{ type: "input_text", text: "second" }],
       }],
     });
-    expect(admissions[0]).toBeUndefined();
+    expect(admissions[0]?.fairnessBytes).toBeUndefined();
     expect(admissions[1]?.fairnessBytes).toBeGreaterThan(
       Buffer.byteLength(JSON.stringify(calls[1]!.input), "utf8"),
     );
@@ -431,7 +441,7 @@ describe("Anthropic persisted continuation HTTP integration", () => {
       previous_response_id: "resp_app_scope_1",
       input: [{ type: "message", role: "user" }],
     });
-    expect(continuationIndex.snapshot().entries).toBe(2);
+    expect(continuationIndex.snapshot().records).toBe(2);
   });
 
   it("commits a reconciled stream before message_stop without changing terminal order", async () => {
@@ -490,6 +500,60 @@ describe("Anthropic persisted continuation HTTP integration", () => {
         content: [{ type: "input_text", text: "after stream" }],
       }],
     });
+  });
+
+  it("withholds every public terminal chunk while the cooperative stream commit is pending", async () => {
+    const continuationIndex = new AnthropicContinuationIndex();
+    const originalCommit = continuationIndex.commitAsync.bind(continuationIndex);
+    let releaseCommit!: () => void;
+    let markCommitStarted!: () => void;
+    const commitGate = new Promise<void>(resolve => { releaseCommit = resolve; });
+    const commitStarted = new Promise<void>(resolve => { markCommitStarted = resolve; });
+    continuationIndex.commitAsync = async (...args) => {
+      if (args[2] === "resp_barrier_stream") {
+        markCommitStarted();
+        await commitGate;
+      }
+      return originalCommit(...args);
+    };
+    const parent = completed("resp_barrier_parent", "parent answer");
+    const streamed = completed("resp_barrier_stream", "streamed answer");
+    const { app } = testApp((_body, call) => {
+      if (call === 1) return relayHandle(parent);
+      return relayHandle(streamed, async function* () {
+        yield streamFrame("response.completed", { response: streamed });
+      }, Promise.resolve({ status: 200 }));
+    }, { continuationIndex });
+
+    await post(app, request([{ role: "user", content: "root" }]));
+    const response = await post(app, request([
+      { role: "user", content: "root" },
+      { role: "assistant", content: assistantContent("parent answer") },
+      { role: "user", content: "next" },
+    ], { stream: true }));
+    const reader = response.body!.getReader();
+    expect(responseEvents(new TextDecoder().decode((await reader.read()).value))[0]?.type)
+      .toBe("message_start");
+
+    let readSettled = false;
+    const blockedRead = reader.read().then(value => {
+      readSettled = true;
+      return value;
+    });
+    await commitStarted;
+    await Bun.sleep(0);
+    expect(readSettled).toBe(false);
+
+    releaseCommit();
+    const decoder = new TextDecoder();
+    const types: unknown[] = [];
+    let chunk = await blockedRead;
+    while (!chunk.done) {
+      types.push(...responseEvents(decoder.decode(chunk.value)).map(event => event.type));
+      chunk = await reader.read();
+    }
+    expect(types.at(-1)).toBe("message_stop");
+    expect(continuationIndex.snapshot().records).toBe(2);
   });
 
   it("does not reuse state without a trusted server-derived scope", async () => {
@@ -601,6 +665,37 @@ describe("Anthropic persisted continuation HTTP integration", () => {
     expect(calls[1]).not.toHaveProperty("previous_response_id");
   });
 
+  it("retains a streaming miss graph until the handler clears its prelude", async () => {
+    let releasePrelude!: () => void;
+    const prelude = new Promise<void>(resolve => { releasePrelude = resolve; });
+    const terminal = completed("resp_streaming_miss", "answer");
+    const { app, admissions } = testApp(() => relayHandle(
+      terminal,
+      async function* () {
+        yield streamFrame("response.completed", { response: terminal });
+      },
+      prelude,
+    ));
+
+    const pending = post(app, request([{ role: "user", content: "root" }], {
+      stream: true,
+    }));
+    await waitFor(() => admissions.length === 1);
+    const lifetime = admissions[0]?.retainMemoryUntil;
+    expect(lifetime).toBeDefined();
+    let settled = false;
+    void lifetime!.then(() => { settled = true; });
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+
+    releasePrelude();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await lifetime;
+    expect(settled).toBe(true);
+    await response.body?.cancel();
+  });
+
   it("retries one definitive HTTP previous_response_not_found with full stored input", async () => {
     const missing = await previousResponseNotFound();
     const { app, calls, signals } = testApp((_body, call) => {
@@ -634,6 +729,51 @@ describe("Anthropic persisted continuation HTTP integration", () => {
       { role: "user", content: "different fork" },
     ]));
     expect(calls[3]).not.toHaveProperty("previous_response_id");
+  });
+
+  it("sizes a tiny stored suffix separately from its multi-megabyte fallback", async () => {
+    const MiB = 1_024 * 1_024;
+    const largePrefix = `prefix-${"x".repeat(2 * MiB)}`;
+    const missing = await previousResponseNotFound();
+    const { app, calls, admissions } = testApp((_body, call) => {
+      if (call === 1) return relayHandle(completed("resp_large_parent", "parent"));
+      if (call === 2) throw missing;
+      return relayHandle(completed("resp_large_fallback", "fallback"));
+    });
+
+    const first = await post(app, request([{ role: "user", content: largePrefix }]));
+    expect(first.status).toBe(200);
+    const fullRequest = request([
+      { role: "user", content: largePrefix },
+      { role: "assistant", content: assistantContent("parent") },
+      { role: "user", content: "tiny suffix" },
+    ]);
+    const continued = await post(app, fullRequest);
+
+    expect(continued.status).toBe(200);
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toMatchObject({
+      previous_response_id: "resp_large_parent",
+      input: [{ type: "message", role: "user" }],
+    });
+    expect(calls[2]).not.toHaveProperty("previous_response_id");
+    const suffixBytes = Buffer.byteLength(JSON.stringify(calls[1]), "utf8");
+    const fallbackBytes = Buffer.byteLength(JSON.stringify(calls[2]), "utf8");
+    const inboundBytes = Buffer.byteLength(JSON.stringify(fullRequest), "utf8");
+    expect(admissions[1]?.structuralBodyBytes).toBe(suffixBytes);
+    expect(admissions[2]?.structuralBodyBytes).toBe(fallbackBytes);
+    expect(suffixBytes).toBeLessThan(16 * 1_024);
+    expect(fallbackBytes).toBeGreaterThan(2 * MiB);
+    expect(classifyWorkload(calls[1]!, {
+      structuralBytes: admissions[1]?.structuralBodyBytes,
+    }).class).toBe("text-small");
+    expect(classifyWorkload(calls[2]!, {
+      structuralBytes: admissions[2]?.structuralBodyBytes,
+    }).class).toBe("text-large");
+    expect(admissions[1]?.fairnessBytes).toBeGreaterThanOrEqual(fallbackBytes);
+    expect(admissions[1]?.fairnessBytes).toBeGreaterThanOrEqual(inboundBytes);
+    expect(admissions[2]?.fairnessBytes).toBeGreaterThanOrEqual(fallbackBytes);
+    expect(admissions[2]?.fairnessBytes).toBeGreaterThanOrEqual(inboundBytes);
   });
 
   it("does not replay an ambiguous committed rejection that retains its HTTP envelope", async () => {
@@ -725,6 +865,26 @@ describe("Anthropic persisted continuation HTTP integration", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("does not retry while nonstream event absence remains unproven", async () => {
+    const missing = await previousResponseNotFound();
+    const { app, calls } = testApp((_body, call) => {
+      if (call === 1) return relayHandle(completed("resp_parent", "parent"));
+      return relayHandle(Promise.reject(missing), async function* () {
+        await Bun.sleep(100);
+        yield streamFrame("response.created", { response: { id: "late" } });
+      });
+    });
+    await post(app, request([{ role: "user", content: "root" }]));
+    const response = await post(app, request([
+      { role: "user", content: "root" },
+      { role: "assistant", content: assistantContent("parent") },
+      { role: "user", content: "next" },
+    ]));
+
+    expect(response.status).toBe(400);
+    expect(calls).toHaveLength(2);
+  });
+
   it("does not retry a definitive error after the outer SSE response commits", async () => {
     const missing = await previousResponseNotFound();
     const { app, calls } = testApp((_body, call) => {
@@ -748,7 +908,7 @@ describe("Anthropic persisted continuation HTTP integration", () => {
   it("retries a definitive stream prelude failure before committing SSE", async () => {
     const missing = await previousResponseNotFound();
     const fallback = completed("resp_fallback", "fallback");
-    const { app, calls } = testApp((_body, call) => {
+    const { app, calls, admissions } = testApp((_body, call) => {
       if (call === 1) return relayHandle(completed("resp_parent", "parent"));
       if (call === 2) {
         return relayHandle(Promise.reject(missing), async function* () {}, Promise.reject(missing));
@@ -770,5 +930,6 @@ describe("Anthropic persisted continuation HTTP integration", () => {
     expect(calls[1]).toHaveProperty("previous_response_id", "resp_parent");
     expect(calls[2]).not.toHaveProperty("previous_response_id");
     expect(calls[2].input).toHaveLength(3);
+    expect(admissions[2]?.retainMemoryUntil).toBeDefined();
   });
 });

@@ -18,8 +18,6 @@ export interface ResourceGovernorSnapshot extends ResourceSizing {
   paused: boolean;
   reservedBytes: number;
   queued: number;
-  cpuActive: number;
-  cpuQueued: number;
 }
 
 export interface ResourceGovernorDetailedSnapshot extends ResourceGovernorSnapshot {
@@ -28,5 +26,4 @@ export interface ResourceGovernorDetailedSnapshot extends ResourceGovernorSnapsh
   queuedReservationBytes?: number;
   queueCapacity?: number;
   queueReservationCapacityBytes?: number;
-  cpuQueueCapacity?: number;
 }

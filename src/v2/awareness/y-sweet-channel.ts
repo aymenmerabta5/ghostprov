@@ -37,7 +37,7 @@ export class AwarenessChannelError extends Error {
   }
 }
 
-export interface YSweetAwarenessChannelOptions<TLocal, TRemote> {
+export interface YSweetAwarenessChannelOptions<TRemote> {
   envelope: YSweetEnvelope;
   localPeerId: string;
   field: "ghostprovV2" | "ghostprovV2Data" | "ghostprovV2Control";
@@ -97,7 +97,7 @@ implements AwarenessChannel<TLocal, TRemote> {
   #lastConnectionError: AwarenessChannelError | null = null;
   #credential: YSweetEnvelope;
 
-  constructor(options: YSweetAwarenessChannelOptions<TLocal, TRemote>) {
+  constructor(options: YSweetAwarenessChannelOptions<TRemote>) {
     if (!options.localPeerId || options.localPeerId.length > 128) {
       throw new AwarenessChannelError("localPeerId is invalid", "state");
     }

@@ -214,16 +214,6 @@ export class ResponseProvenanceRegistry {
     if (state) this.#releaseState(state);
   }
 
-  /** Test/helper convenience; production routing reserves before execution. */
-  record(
-    responseId: unknown,
-    scope: AuthenticatedTenantScope,
-    provenance: ResponseProvenance,
-  ): boolean {
-    const reservation = this.reserve();
-    return reservation ? this.commit(reservation, responseId, scope, provenance) : false;
-  }
-
   snapshot(): ResponseProvenanceSnapshot {
     this.#pruneExpired(this.#now());
     return Object.freeze({
@@ -351,14 +341,14 @@ export class ResponseProvenanceScopeError extends Error {
   }
 }
 
-export class ResponseProvenanceCapacityError extends Error {
-  readonly name = "ResponseProvenanceCapacityError";
-  readonly code = "response_provenance_capacity";
-  readonly status = 503;
+export class ResponseProvenanceObsoleteError extends Error {
+  readonly name = "ResponseProvenanceObsoleteError";
+  readonly code = "response_provenance_obsolete";
+  readonly status = 409;
   readonly committed = false;
 
   constructor() {
-    super("Response provenance capacity is exhausted");
+    super("Response continuation is bound to an obsolete sandbox incarnation");
   }
 }
 

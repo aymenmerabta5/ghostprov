@@ -11,7 +11,6 @@ import {
 import type { ResponseGraph } from "./response-graph";
 import {
   apiKeyAuthorized,
-  createAuthenticatedTenantScope,
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
@@ -82,7 +81,7 @@ export interface AttachResponsesWebSocketOptions extends Omit<
 > {
   startRelay: WebSocketRelayStarter;
   /** Trusted tenant/provider-account scope shared by this attached listener. */
-  authorizationScope?: AuthenticatedTenantScope;
+  authorizationScope: AuthenticatedTenantScope;
   /** Shared OpenAI-compatible bearer credential for the upgrade request. */
   apiKey?: string;
   /** Application limit; Bun's node:http shim may assemble up to 16 MiB before this check. */
@@ -166,8 +165,7 @@ export function attachResponsesWebSocket(
     options.idleTimeoutMs ?? DEFAULT_WS_IDLE_TIMEOUT_MS,
     "idleTimeoutMs",
   );
-  const authorizationScope = options.authorizationScope ??
-    createAuthenticatedTenantScope();
+  const authorizationScope = options.authorizationScope;
   if (!isAuthenticatedTenantScope(authorizationScope)) {
     throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
   }

@@ -4,6 +4,7 @@ export type RuntimeHealthOutcome = "healthy" | "neutral" | "unhealthy";
 
 const NEUTRAL_CODES = new Set([
   "cancelled",
+  "cancelled_precommit",
   "capacity",
   "capacity_changed",
   "draining",

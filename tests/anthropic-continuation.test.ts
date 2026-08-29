@@ -1,11 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
-  ANTHROPIC_CONTINUATION_ENTRY_METADATA_BYTES,
-  ANTHROPIC_CONTINUATION_MAX_ENTRIES,
+  ANTHROPIC_CONTINUATION_MAX_RECORDS,
   ANTHROPIC_CONTINUATION_METADATA_BYTES,
+  ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES,
   ANTHROPIC_CONTINUATION_TTL_MS,
   AnthropicContinuationIndex,
-  projectAnthropicReplay,
+  projectAnthropicReplay as projectAnthropicReplayWithBounds,
 } from "../src/anthropic/continuation";
 import type {
   ResponsesInputItem,
@@ -26,6 +26,17 @@ import { createAuthenticatedTenantScope } from "../src/http/api-key";
 
 const KEY = new Uint8Array(32).fill(0x5a);
 const SCOPE = createAuthenticatedTenantScope();
+
+function projectAnthropicReplay(
+  finalValue: Parameters<typeof projectAnthropicReplayWithBounds>[0],
+  projected: Parameters<typeof projectAnthropicReplayWithBounds>[1],
+  options: Parameters<typeof projectAnthropicReplayWithBounds>[2] = {},
+) {
+  return projectAnthropicReplayWithBounds(finalValue, projected, {
+    ...options,
+    terminalBytes: Buffer.byteLength(JSON.stringify(finalValue), "utf8"),
+  });
+}
 
 function user(text: string): ResponsesInputItem {
   return {
@@ -63,6 +74,44 @@ describe("Anthropic persisted continuation index", () => {
     expect(first.digestInput(input).digest).not.toBe(second.digestInput(input).digest);
     expect(first.fingerprintSettings(requestBody(input)))
       .not.toBe(second.fingerprintSettings(requestBody(input)));
+  });
+
+  it("keeps cooperative canonicalization limits hard and lower-only", async () => {
+    expect(() => new AnthropicContinuationIndex({
+      maxCanonicalBytes: 64 * 1024 * 1024 + 1,
+    })).toThrow(RangeError);
+    expect(() => new AnthropicContinuationIndex({
+      maxCanonicalNodes: 1_000_001,
+    })).toThrow(RangeError);
+    const byteBounded = new AnthropicContinuationIndex({
+      key: KEY,
+      maxCanonicalBytes: 128,
+    });
+    await expect(byteBounded.prepareAsync(
+      requestBody([user("x".repeat(256))]),
+      SCOPE,
+    )).rejects.toThrow("canonical bytes");
+    const nodeBounded = new AnthropicContinuationIndex({
+      key: KEY,
+      maxCanonicalNodes: 8,
+    });
+    await expect(nodeBounded.prepareAsync(
+      requestBody([user("node-bound")]),
+      SCOPE,
+    )).rejects.toThrow("canonical nodes");
+
+    const oversizedArray = new Array<ResponsesInputItem>(64);
+    Object.defineProperty(oversizedArray, "0", {
+      get() { throw new Error("oversized array element was read"); },
+    });
+    const allocationBounded = new AnthropicContinuationIndex({
+      key: KEY,
+      maxCanonicalNodes: 32,
+    });
+    await expect(allocationBounded.prepareAsync(
+      requestBody(oversizedArray),
+      SCOPE,
+    )).rejects.toThrow("canonical nodes");
   });
 
   it("uses canonical, ordered, item-boundary rolling HMAC digests", () => {
@@ -160,26 +209,25 @@ describe("Anthropic persisted continuation index", () => {
     expect(index.fingerprintSettings(reordered)).toBe(fingerprint);
   });
 
-  it("falls back to full history when the index mutates during cooperative hashing", async () => {
+  it("falls back when a previously observed relevant bucket becomes ambiguous", async () => {
     const index = new AnthropicContinuationIndex({ key: KEY });
     const input = Array.from({ length: 600 }, (_, value) => user(`item-${value}`));
     const short = index.prepare(requestBody(input.slice(0, 1)), SCOPE);
     index.commit(short, SCOPE, "resp_short", [input[1]!]);
-    const longPrefix = index.prepare(requestBody(input.slice(0, 399)), SCOPE);
-
     const pending = index.prepareAsync(requestBody(input), SCOPE);
-    index.commit(longPrefix, SCOPE, "resp_long_left", [input[399]!]);
-    index.commit(longPrefix, SCOPE, "resp_long_right", [input[399]!]);
+    setTimeout(() => {
+      index.commit(short, SCOPE, "resp_short_concurrent", [input[1]!]);
+    }, 0);
     const prepared = await pending;
 
     expect(index.snapshot().ambiguousBuckets).toBe(1);
-    expect(prepared.decision).toBe("miss");
+    expect(prepared.decision).toBe("ambiguous");
     expect(prepared.match).toBeNull();
     expect(prepared.relayBody.input).toEqual(input);
     expect(prepared.relayBody).not.toHaveProperty("previous_response_id");
   });
 
-  it("keeps a valid hit when unrelated unique metadata changes during hashing", async () => {
+  it("keeps a valid hit when an unrelated bucket becomes ambiguous during hashing", async () => {
     const index = new AnthropicContinuationIndex({ key: KEY });
     const input = Array.from({ length: 600 }, (_, value) => user(`stable-${value}`));
     const short = index.prepare(requestBody(input.slice(0, 1)), SCOPE);
@@ -187,12 +235,35 @@ describe("Anthropic persisted continuation index", () => {
     const unrelated = index.prepare(requestBody([user("unrelated")]), SCOPE);
 
     const pending = index.prepareAsync(requestBody(input), SCOPE);
-    index.commit(unrelated, SCOPE, "resp_unrelated", [assistant("answer")]);
+    setTimeout(() => {
+      index.commit(unrelated, SCOPE, "resp_unrelated_left", [assistant("answer")]);
+      index.commit(unrelated, SCOPE, "resp_unrelated_right", [assistant("answer")]);
+    }, 0);
     const prepared = await pending;
 
+    expect(index.snapshot().ambiguousBuckets).toBe(1);
     expect(prepared.decision).toBe("hit");
     expect(prepared.match?.providerResponseId).toBe("resp_stable_short");
     expect(prepared.match?.prefixItemCount).toBe(2);
+  });
+
+  it("re-scans once when a longer relevant prefix commits during hashing", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const input = Array.from({ length: 600 }, (_, value) => user(`longer-${value}`));
+    const longToken = index.prepare(requestBody(input.slice(0, 2)), SCOPE);
+    const shortToken = index.prepare(requestBody(input.slice(0, 1)), SCOPE);
+    index.commit(shortToken, SCOPE, "resp_short_parent", [input[1]!]);
+
+    const pending = index.prepareAsync(requestBody(input), SCOPE);
+    setTimeout(() => {
+      index.commit(longToken, SCOPE, "resp_long_parent", [input[2]!]);
+    }, 0);
+    const prepared = await pending;
+
+    expect(prepared.decision).toBe("hit");
+    expect(prepared.match?.providerResponseId).toBe("resp_long_parent");
+    expect(prepared.match?.prefixItemCount).toBe(3);
+    expect(prepared.relayBody.input).toEqual(input.slice(3));
   });
 
   it("aborts cooperative hashing at a yield boundary", async () => {
@@ -203,6 +274,122 @@ describe("Anthropic persisted continuation index", () => {
     controller.abort(new DOMException("stop hashing", "AbortError"));
 
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("yields within large settings and single input strings without changing digests", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const body = requestBody([user("input-" + "x".repeat(512 * 1024))], {
+      instructions: "settings-" + "y".repeat(512 * 1024),
+    });
+    const order: string[] = [];
+    setTimeout(() => { order.push("timer"); }, 0);
+    const prepared = await index.prepareAsync(body, SCOPE);
+    order.push("prepared");
+
+    expect(order[0]).toBe("timer");
+    expect(prepared.inputDigest).toEqual(index.digestInput(body.input));
+    expect(prepared.settingsDigest).toBe(index.fingerprintSettings(body));
+  });
+
+  it("snapshots a request that mutates across cooperative canonicalization", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const body = requestBody([user("x".repeat(512 * 1024))]);
+    const content = (body.input[0] as { content: Array<{ text: string }> }).content;
+    const pending = index.prepareAsync(body, SCOPE);
+    setTimeout(() => { content[0]!.text = "y".repeat(512 * 1024); }, 0);
+
+    const prepared = await pending;
+    expect(prepared.fullRelayBody).not.toBe(body);
+    expect(prepared.inputDigest).toEqual(index.digestInput(prepared.fullRelayBody.input));
+    expect(index.digestInput(body.input).digest).not.toBe(prepared.inputDigest.digest);
+    expect(index.snapshot().records).toBe(0);
+  });
+
+  it("preserves an own __proto__ key in the immutable request snapshot", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const setting = JSON.parse('{"__proto__":{"polluted":true},"ok":1}');
+    const body = requestBody([user("prototype-safe")], { future_setting: setting });
+    const prepared = await index.prepareAsync(body, SCOPE);
+    const snapshot = prepared.fullRelayBody.future_setting as Record<string, unknown>;
+
+    expect(Object.hasOwn(snapshot, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(snapshot)).toBeNull();
+    expect(prepared.settingsDigest).toBe(index.fingerprintSettings(prepared.fullRelayBody));
+  });
+
+  it("yields by structural node count inside one large setting", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const body = requestBody([user("small")], {
+      future_setting: Array.from({ length: 2_048 }, (_, value) => ({ value })),
+    });
+    const order: string[] = [];
+    setTimeout(() => { order.push("timer"); }, 0);
+    const prepared = await index.prepareAsync(body, SCOPE);
+    order.push("prepared");
+
+    expect(order[0]).toBe("timer");
+    expect(prepared.settingsDigest).toBe(index.fingerprintSettings(body));
+  });
+
+  it("checks abort inside one large canonical string and does not commit partial state", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const controller = new AbortController();
+    const pending = index.prepareAsync(
+      requestBody([user("x".repeat(2 * 1024 * 1024))]),
+      SCOPE,
+      controller.signal,
+    );
+    setTimeout(() => controller.abort(new DOMException("stop string", "AbortError")), 0);
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(index.snapshot().records).toBe(0);
+  });
+
+  it("yields and aborts cooperative terminal commits before publishing metadata", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const prepared = index.prepare(requestBody([user("root")]), SCOPE);
+    const order: string[] = [];
+    setTimeout(() => { order.push("timer"); }, 0);
+    expect(await index.commitAsync(
+      prepared,
+      SCOPE,
+      "resp_async",
+      [assistant("x".repeat(512 * 1024))],
+    )).toBe(true);
+    order.push("committed");
+    expect(order[0]).toBe("timer");
+
+    const abortedIndex = new AnthropicContinuationIndex({ key: KEY });
+    const abortedPrepared = abortedIndex.prepare(requestBody([user("abort")]), SCOPE);
+    const controller = new AbortController();
+    const aborted = abortedIndex.commitAsync(
+      abortedPrepared,
+      SCOPE,
+      "resp_aborted",
+      [assistant("z".repeat(2 * 1024 * 1024))],
+      controller.signal,
+    );
+    setTimeout(() => controller.abort(new DOMException("stop commit", "AbortError")), 0);
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+    expect(abortedIndex.snapshot().records).toBe(0);
+  });
+
+  it("rejects a cooperative commit that crosses the shutdown barrier", async () => {
+    const index = new AnthropicContinuationIndex({ key: KEY });
+    const prepared = index.prepare(requestBody([user("shutdown-root")]), SCOPE);
+    let hookCalls = 0;
+    index.onShutdown(() => { hookCalls += 1; });
+    const pending = index.commitAsync(
+      prepared,
+      SCOPE,
+      "resp_shutdown_race",
+      [assistant("x".repeat(2 * 1024 * 1024))],
+    );
+    setTimeout(() => index.beginShutdown(), 0);
+
+    expect(await pending).toBe(false);
+    expect(hookCalls).toBe(1);
+    expect(index.snapshot().records).toBe(0);
   });
 
   it("sends only the exact nonempty suffix with the stored parent and current settings", () => {
@@ -219,7 +406,6 @@ describe("Anthropic persisted continuation index", () => {
     ], {
       stream: true,
       store: false,
-      previous_response_id: "caller-supplied-must-not-win",
     });
     const continuation = index.prepare(current, SCOPE);
     expect(continuation.decision).toBe("hit");
@@ -233,6 +419,18 @@ describe("Anthropic persisted continuation index", () => {
       input: [user("two")],
       previous_response_id: "resp_parent",
     });
+
+    const explicit = requestBody(current.input, {
+      previous_response_id: "caller-supplied-must-win",
+    });
+    const bypassed = index.prepare(explicit, SCOPE);
+    expect(bypassed).toMatchObject({
+      decision: "explicit",
+      match: null,
+      relayBody: { previous_response_id: "caller-supplied-must-win" },
+    });
+    expect(bypassed.relayBody).toBe(explicit);
+    expect(index.commit(bypassed, SCOPE, "resp_ignored", [assistant("ignored")])).toBe(false);
 
     const changedSettings = index.prepare(requestBody([
       user("one"),
@@ -305,7 +503,7 @@ describe("Anthropic persisted continuation index", () => {
     const preparedA = index.prepare(requestBody([user("same")]), scopeA);
     const preparedB = index.prepare(requestBody([user("same")]), scopeB);
     expect(index.commit(preparedA, scopeB, "wrong-scope", [assistant("left")]))
-      .toBeNull();
+      .toBe(false);
     index.commit(preparedA, scopeA, "resp_left", [assistant("left")]);
     index.commit(preparedB, scopeB, "resp_right", [assistant("left")]);
 
@@ -340,11 +538,11 @@ describe("Anthropic persisted continuation index", () => {
     const prepared = index.prepare(requestBody([user("shutdown")]), SCOPE);
 
     index.beginShutdown();
-    expect(index.commit(prepared, SCOPE, "resp_late", [assistant("late")])).toBeNull();
-    expect(index.snapshot().entries).toBe(0);
+    expect(index.commit(prepared, SCOPE, "resp_late", [assistant("late")])).toBe(false);
+    expect(index.snapshot().records).toBe(0);
     index.clear();
     index.clear();
-    expect(index.snapshot().entries).toBe(0);
+    expect(index.snapshot().records).toBe(0);
   });
 
   it("uses a 60-minute absolute TTL even when an entry is touched", () => {
@@ -358,7 +556,7 @@ describe("Anthropic persisted continuation index", () => {
     expect(index.prepare(query, SCOPE).decision).toBe("hit");
     now += 1;
     expect(index.prepare(query, SCOPE).decision).toBe("miss");
-    expect(index.snapshot().entries).toBe(0);
+    expect(index.snapshot().records).toBe(0);
   });
 
   it("keeps ambiguity sticky through LRU pressure until its absolute TTL", () => {
@@ -374,12 +572,12 @@ describe("Anthropic persisted continuation index", () => {
     ]);
     expect(index.prepare(query, SCOPE).decision).toBe("ambiguous");
 
-    for (let value = 0; value < ANTHROPIC_CONTINUATION_MAX_ENTRIES; value += 1) {
+    for (let value = 0; value < ANTHROPIC_CONTINUATION_MAX_RECORDS; value += 1) {
       const prepared = index.prepare(requestBody([user(`pressure-${value}`)]), SCOPE);
       index.commit(prepared, SCOPE, `resp_pressure_${value}`, [assistant(`answer-${value}`)]);
     }
     expect(index.snapshot()).toMatchObject({
-      entries: ANTHROPIC_CONTINUATION_MAX_ENTRIES,
+      records: ANTHROPIC_CONTINUATION_MAX_RECORDS,
       ambiguousBuckets: 1,
     });
     expect(index.prepare(query, SCOPE).decision).toBe("ambiguous");
@@ -391,26 +589,26 @@ describe("Anthropic persisted continuation index", () => {
     expect(index.snapshot().ambiguousBuckets).toBe(0);
   });
 
-  it("enforces 4096-entry LRU and the fixed approximately 2 MiB metadata budget", () => {
+  it("enforces 4096 records and a conservative approximately 6 MiB metadata budget", () => {
     let now = 10_000;
     const index = new AnthropicContinuationIndex({ key: KEY, now: () => now++ });
     const base = requestBody([user("root")]);
     const prepared = index.prepare(base, SCOPE);
-    for (let value = 0; value < ANTHROPIC_CONTINUATION_MAX_ENTRIES; value += 1) {
+    for (let value = 0; value < ANTHROPIC_CONTINUATION_MAX_RECORDS; value += 1) {
       index.commit(prepared, SCOPE, `resp_${value}`, [assistant(`answer-${value}`)]);
     }
     expect(index.snapshot()).toMatchObject({
-      entries: ANTHROPIC_CONTINUATION_MAX_ENTRIES,
+      records: ANTHROPIC_CONTINUATION_MAX_RECORDS,
       logicalMetadataBytes: ANTHROPIC_CONTINUATION_METADATA_BYTES,
       metadataBudgetBytes: ANTHROPIC_CONTINUATION_METADATA_BYTES,
     });
-    expect(ANTHROPIC_CONTINUATION_ENTRY_METADATA_BYTES).toBe(512);
+    expect(ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES).toBe(1_536);
 
     const first = requestBody([user("root"), assistant("answer-0"), user("next")]);
     const second = requestBody([user("root"), assistant("answer-1"), user("next")]);
     expect(index.prepare(first, SCOPE).decision).toBe("hit"); // refresh generation 1
     index.commit(prepared, SCOPE, "resp_overflow", [assistant("overflow")]);
-    expect(index.snapshot().entries).toBe(ANTHROPIC_CONTINUATION_MAX_ENTRIES);
+    expect(index.snapshot().records).toBe(ANTHROPIC_CONTINUATION_MAX_RECORDS);
     expect(index.prepare(first, SCOPE).match?.providerResponseId).toBe("resp_0");
     expect(index.prepare(second, SCOPE).decision).toBe("miss");
   });
@@ -480,6 +678,29 @@ describe("Anthropic persisted continuation index", () => {
 });
 
 describe("Anthropic lossless replay projection", () => {
+  it("fails closed before inspecting a terminal without trusted byte metadata", () => {
+    const ordinary = finalResponse("resp_unmeasured", [
+      messageOutput("msg_unmeasured", [textPart("answer")]),
+    ]);
+    let inspected = false;
+    const unmeasured = new Proxy(ordinary, {
+      get(target, key, receiver) {
+        inspected = true;
+        return Reflect.get(target, key, receiver);
+      },
+      ownKeys(target) {
+        inspected = true;
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    expect(projectAnthropicReplayWithBounds(
+      unmeasured,
+      responseToAnthropic(ordinary, CONTEXT),
+    )).toBeNull();
+    expect(inspected).toBe(false);
+  });
+
   it("projects omitted reasoning summaries through their authoritative encrypted item", () => {
     const final = finalResponse("resp_omitted_summary", [
       {
@@ -621,6 +842,30 @@ describe("Anthropic lossless replay projection", () => {
       unsafeInteger,
       responseToAnthropic(unsafeInteger, CONTEXT),
     )).toBeNull();
+  });
+
+  it("skips synchronous replay projection for very large tool arguments", () => {
+    const large = finalResponse("resp_large_tool", [
+      toolOutput(
+        "fc_large_tool",
+        "call_large_tool",
+        "Read",
+        JSON.stringify({ value: "x".repeat(2 * 1024 * 1024) }),
+      ),
+    ]);
+    expect(projectAnthropicReplay(large, responseToAnthropic(large, CONTEXT))).toBeNull();
+  });
+
+  it("counts nested tool input against the synchronous replay node fence", () => {
+    const wide = finalResponse("resp_wide_tool", [
+      toolOutput(
+        "fc_wide_tool",
+        "call_wide_tool",
+        "Read",
+        JSON.stringify({ values: Array.from({ length: 9_000 }, () => 0) }),
+      ),
+    ]);
+    expect(projectAnthropicReplay(wide, responseToAnthropic(wide, CONTEXT))).toBeNull();
   });
 
   it("skips refusal, filtering, incompleteness, missing ciphertext, and empty output", () => {

@@ -11,6 +11,7 @@ import { executeImageBatch, type ImageRelayStarter } from "./service";
 import type { IncomingResourceLease } from "../router/router";
 import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
 import { permittedJsonResponse } from "../http/permitted-json";
+import { jsonEncodedByteLengthAsync } from "../router/workload";
 
 export interface ImageRouteDependencies {
   options: ImageCompatOptions;
@@ -19,6 +20,8 @@ export interface ImageRouteDependencies {
     signal: AbortSignal | undefined,
     clientId: string,
     incomingLease?: IncomingResourceLease,
+    retainMemoryUntil?: Promise<unknown>,
+    structuralBodyBytes?: number,
   ) => ReturnType<ImageRelayStarter>;
 }
 
@@ -26,16 +29,34 @@ function relayStarterForRequest(
   dependencies: ImageRouteDependencies,
   env: unknown,
   explicitClientId?: string,
+  retainMemoryUntil?: Promise<unknown>,
+  initialIncomingLease?: IncomingResourceLease,
 ): ImageRelayStarter {
-  let incomingLease = takeIncomingBodyLease(env);
+  let incomingLease = initialIncomingLease ?? takeIncomingBodyLease(env);
+  let structuralBodyBytes: Promise<number> | null = null;
   const clientId = resolveHttpClientId(env, explicitClientId);
-  return (body, signal) => {
+  return async (body, signal) => {
     // Promise.all invokes each mapper synchronously up to this call. Clearing
     // before dispatch makes exactly one fan-out job the handoff owner even
     // when all relay promises are pending concurrently.
     const handoff = incomingLease;
     incomingLease = undefined;
-    return dependencies.startRelay(body, signal, clientId, handoff);
+    structuralBodyBytes ??= jsonEncodedByteLengthAsync(body, { signal });
+    let measuredBytes: number;
+    try {
+      measuredBytes = await structuralBodyBytes;
+    } catch (error) {
+      handoff?.release();
+      throw error;
+    }
+    return dependencies.startRelay(
+      body,
+      signal,
+      clientId,
+      handoff,
+      handoff ? retainMemoryUntil : undefined,
+      measuredBytes,
+    );
   };
 }
 
@@ -65,23 +86,32 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
       }
       const parsed = parseGenerationRequest(value, dependencies.options);
       const bodies = buildGenerationBodies(parsed);
-      const response = await executeImageBatch(
-        bodies,
-        relayStarterForRequest(
-          dependencies,
-          c.env,
-          c.req.header("x-ghostprov-client-id"),
-        ),
-        c.req.raw.signal,
-      );
-      return permittedJsonResponse(response, { owners: response.data });
+      let finishBatch!: () => void;
+      const batchLifetime = new Promise<void>(resolve => { finishBatch = resolve; });
+      try {
+        const response = await executeImageBatch(
+          bodies,
+          relayStarterForRequest(
+            dependencies,
+            c.env,
+            c.req.header("x-ghostprov-client-id"),
+            batchLifetime,
+          ),
+          c.req.raw.signal,
+        );
+        return permittedJsonResponse(response, { owners: response.data });
+      } finally {
+        finishBatch();
+      }
     } catch (error) {
       return apiErrorResponse(error);
     }
   });
 
   app.post("/v1/images/edits", async c => {
+    const incomingLease = takeIncomingBodyLease(c.env);
     try {
+      if (c.req.raw.signal.aborted) throw c.req.raw.signal.reason;
       let form: FormData;
       try {
         form = await c.req.formData();
@@ -89,19 +119,30 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
         throw invalidBody("Request body is not valid multipart form data.", "invalid_multipart_form");
       }
       const parsed = await parseEditRequest(form, dependencies.options);
+      if (c.req.raw.signal.aborted) throw c.req.raw.signal.reason;
       const bodies = buildEditBodies(parsed);
-      const response = await executeImageBatch(
-        bodies,
-        relayStarterForRequest(
-          dependencies,
-          c.env,
-          c.req.header("x-ghostprov-client-id"),
-        ),
-        c.req.raw.signal,
-      );
-      return permittedJsonResponse(response, { owners: response.data });
+      let finishBatch!: () => void;
+      const batchLifetime = new Promise<void>(resolve => { finishBatch = resolve; });
+      try {
+        const response = await executeImageBatch(
+          bodies,
+          relayStarterForRequest(
+            dependencies,
+            c.env,
+            c.req.header("x-ghostprov-client-id"),
+            batchLifetime,
+            incomingLease,
+          ),
+          c.req.raw.signal,
+        );
+        return permittedJsonResponse(response, { owners: response.data });
+      } finally {
+        finishBatch();
+      }
     } catch (error) {
       return apiErrorResponse(error);
+    } finally {
+      incomingLease?.release();
     }
   });
 

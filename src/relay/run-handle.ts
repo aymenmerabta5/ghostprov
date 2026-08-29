@@ -16,6 +16,8 @@ export interface RunDiagnostics {
 
 export interface RunHandle {
   events(): AsyncGenerator<SseFrame>;
+  /** Release buffered events when a committed handle loses a bounded caller race. */
+  discardUnconsumedEvents?(): void;
   final: Promise<any>;
   /** Latest upstream rate-limit headers, kept out of the public Responses body. */
   rateLimit?: RateLimitHint;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeUpstreamResponsesRequest } from "../src/relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../src/relay/host-upstream-policy";
 import { applyUpstreamServiceTierPolicy } from "../src/relay/service-tier-policy";
 
 describe("normalizeUpstreamResponsesRequest", () => {
@@ -92,6 +92,49 @@ describe("normalizeUpstreamResponsesRequest", () => {
     });
     expect(Object.hasOwn(body, "stream")).toBe(false);
     expect(Object.hasOwn(body, "store")).toBe(false);
+  });
+
+  it("materializes non-enumerable policy fields so they are present on the wire", () => {
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [],
+      previous_response_id: "resp_parent_exact",
+    } as Record<string, unknown>;
+    Object.defineProperties(body, {
+      stream: { value: true, enumerable: false },
+      store: { value: true, enumerable: false },
+    });
+
+    const normalized = normalizeUpstreamResponsesRequest(body);
+
+    expect(normalized).not.toBe(body);
+    expect(Object.prototype.propertyIsEnumerable.call(normalized, "stream")).toBe(true);
+    expect(Object.prototype.propertyIsEnumerable.call(normalized, "store")).toBe(true);
+    expect(JSON.parse(JSON.stringify(normalized))).toMatchObject({
+      stream: true,
+      store: true,
+      previous_response_id: "resp_parent_exact",
+    });
+  });
+
+  it("copies enumerable accessors so later reads cannot change wire policy", () => {
+    let reads = 0;
+    const body = { model: "gpt-5.6-sol", input: [] } as Record<string, unknown>;
+    Object.defineProperties(body, {
+      stream: {
+        enumerable: true,
+        get: () => ++reads === 1,
+      },
+      store: {
+        enumerable: true,
+        get: () => true,
+      },
+    });
+
+    const normalized = normalizeUpstreamResponsesRequest(body);
+
+    expect(normalized).not.toBe(body);
+    expect(JSON.parse(JSON.stringify(normalized))).toMatchObject({ stream: true, store: true });
   });
 });
 

@@ -11,6 +11,7 @@ import { projectId } from "../src/sandbox/types";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { assertSafeObservabilityEvent } from "../src/observability/redaction";
+import { V2PreCommitError } from "../src/v2/transport/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -77,8 +78,12 @@ class Runtime implements RoutableSandboxRuntime {
     }
     if (this.waitForAdmissionAbort) {
       await new Promise<never>((_resolve, reject) => {
-        if (signal?.aborted) return reject(signal.reason);
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        const safe = () => reject(new V2PreCommitError(
+          "observability fake proved no provider execution",
+          "test_precommit_abort",
+        ));
+        if (signal?.aborted) return safe();
+        signal?.addEventListener("abort", safe, { once: true });
       });
     }
     return {
@@ -268,6 +273,7 @@ describe("router observability", () => {
       }, {
         source: "http",
         encodedBodyBytes: Math.floor(2.9 * 1024 * 1024),
+        structuralBodyBytes: Math.floor(2.9 * 1024 * 1024),
       });
       const expired = logger.events.filter(event => event.event === "route.attempt_expired");
       expect(expired).toHaveLength(1);

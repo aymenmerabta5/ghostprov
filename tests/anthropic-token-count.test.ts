@@ -73,24 +73,56 @@ describe("Anthropic deterministic input token estimation", () => {
   });
 
   it("caps each decoded base64 media contribution without allocating decoded media", () => {
-    const data = "A".repeat(8 * 1024 * 1024);
+    const MiB = 1024 * 1024;
+    const lengths = [8 * MiB, 16 * MiB, 32 * MiB - 16 * 1024];
+    const reservoir = "A".repeat(lengths.at(-1)!);
+    for (const length of lengths) {
+      const media = {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: reservoir.slice(0, length),
+        },
+      };
+      const one = estimateAnthropicInputTokens({
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: [media] }],
+      });
+      expect(one).toBeGreaterThan(999_900);
+      expect(one).toBeLessThan(1_000_200);
+    }
+
     const media = {
       type: "image",
-      source: { type: "base64", media_type: "image/png", data },
+      source: {
+        type: "base64",
+        media_type: "image/png",
+        data: reservoir.slice(0, 8 * MiB),
+      },
     };
-    const one = estimateAnthropicInputTokens({
-      model: "claude-sonnet-4-6",
-      messages: [{ role: "user", content: [media] }],
-    });
     const two = estimateAnthropicInputTokens({
       model: "claude-sonnet-4-6",
-      messages: [{ role: "user", content: [media, structuredClone(media)] }],
+      messages: [{ role: "user", content: [media, media] }],
     });
 
-    expect(one).toBeGreaterThan(999_900);
-    expect(one).toBeLessThan(1_000_200);
     expect(two).toBeGreaterThan(1_999_800);
     expect(two).toBeLessThan(2_000_300);
+  });
+
+  it("rejects malformed base64 alphabet and padding", () => {
+    for (const data of ["A$==", "A===", "AA=A", "AAAA=", "AB==", "AAB="]) {
+      expect(() => estimateAnthropicInputTokens({
+        model: "claude-sonnet-4-6",
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data },
+          }],
+        }],
+      })).toThrow(/canonical base64/i);
+    }
   });
 
   it("rejects cyclic, over-depth, non-JSON, and over-32-MiB inputs", () => {

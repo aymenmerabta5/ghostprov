@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import { BoundedPreparationScheduler } from "../relay/preparation-scheduler";
 import type { RunHandle } from "../relay/run-handle";
-import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
 import type { AuthenticatedTenantScope } from "../http/api-key";
 import {
   AnthropicContinuationIndex,
@@ -18,7 +18,10 @@ import type { AnthropicModelOptions } from "./model";
 import { createAnthropicPullStream } from "./pull-stream";
 import { translateAnthropicRequest } from "./request";
 import { responseToAnthropic, type AnthropicResponseContext } from "./response";
-import { AnthropicStreamTranslator } from "./stream";
+import {
+  AnthropicStreamTranslator,
+  type AnthropicTerminalReplayProof,
+} from "./stream";
 import {
   estimateAnthropicInputTokens,
   validateAnthropicCountTokenRequest,
@@ -37,6 +40,7 @@ import {
   releaseAtomicBytePermit,
   transferAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
+import { jsonEncodedByteLengthAsync } from "../router/workload";
 
 export type AnthropicRelayStarter = (
   body: Record<string, unknown>,
@@ -68,8 +72,12 @@ const CONTINUATION_PREPARE_MAX_QUEUED = 64;
 const CONTINUATION_PREPARE_MAX_QUEUED_BYTES = 256 * 1024 * 1024;
 
 export type AnthropicRelayAdmission = Readonly<{
+  /** Exact JSON bytes for the normalized body used by this relay attempt. */
+  structuralBodyBytes?: number;
   /** Full preprocessing bytes charged only to fair scheduling. */
   fairnessBytes?: number;
+  retainIncomingLeaseBytes?: boolean;
+  retainMemoryUntil?: Promise<unknown>;
 }>;
 
 async function jsonBody(request: { json(): Promise<unknown> }): Promise<unknown> {
@@ -216,7 +224,7 @@ async function nonStreamingFinal(
   handle: RunHandle,
   controller: AbortController,
   onFailure: (
-    source: "final" | "events" | "cancelled",
+    source: "final" | "events" | "cancelled" | "unknown",
     sawRelayEvent: boolean,
   ) => void = () => undefined,
 ): Promise<unknown> {
@@ -280,11 +288,28 @@ async function nonStreamingFinal(
     throw winner.error;
   }
   if (!winner.completed) {
+    let failureSource: "final" | "events" | "unknown" = winner.source;
+    if (failureSource === "final") {
+      let observationTimer: ReturnType<typeof setTimeout> | undefined;
+      const observation = await Promise.race([
+        drainOutcome.then(result => ({ settled: true as const, result })),
+        new Promise<{ settled: false }>(resolve => {
+          observationTimer = setTimeout(
+            () => resolve({ settled: false }),
+            NONSTREAM_CLEANUP_MS,
+          );
+          observationTimer.unref?.();
+        }),
+      ]);
+      if (observationTimer !== undefined) clearTimeout(observationTimer);
+      if (!observation.settled) failureSource = "unknown";
+      else if (!observation.result.ok) failureSource = "events";
+    }
     releaseFinalOutcome();
     if (!controller.signal.aborted) controller.abort(winner.error);
     returnIterator();
     await boundedCleanup([finalOutcome, drainOutcome]);
-    onFailure(winner.source, sawRelayEvent);
+    onFailure(failureSource, sawRelayEvent);
     throw winner.error;
   }
   return winner.value;
@@ -313,11 +338,21 @@ export function continuationPreparationCostBytes(
       throw new RangeError(`${name} must be a non-negative safe integer`);
     }
   }
-  const retainedBytes = inboundBytes + relayBytes;
+  // Cooperative continuation preparation owns an immutable container snapshot
+  // in addition to the inbound and translated bodies. Strings are shared, but
+  // charging one full relay-sized copy conservatively bounds wide object graphs.
+  const retainedBytes = inboundBytes + relayBytes + relayBytes;
   if (!Number.isSafeInteger(retainedBytes)) {
     throw new RangeError("continuation preparation bytes exceed the safe integer range");
   }
-  return Math.max(1, retainedBytes - Math.min(retainedBytes, reservedBytes));
+  return Math.max(
+    1,
+    // Reservation coverage reduces memory pressure, not cooperative CPU work.
+    // Keep structural relay bytes visible so the scheduler can prioritize a
+    // small continuation ahead of a large covered job.
+    relayBytes,
+    retainedBytes - Math.min(retainedBytes, reservedBytes),
+  );
 }
 
 function continuationPreparationBytes(
@@ -346,6 +381,9 @@ async function prepareContinuation(
   if (scope === null || translated.maxTokensZero || translated.stopSequences.length > 0) {
     return null;
   }
+  // This generic guard protects future translated/native callers even though
+  // today's Anthropic request surface never synthesizes an explicit lineage.
+  if (Object.hasOwn(translated.relayBody, "previous_response_id")) return null;
   return scheduler.prepare(async () => {
     try {
       return await index.prepareAsync(translated.relayBody, scope, signal);
@@ -359,22 +397,30 @@ async function prepareContinuation(
 
 type AnthropicContinuationCommitToken = Pick<
   PreparedAnthropicContinuation,
-  "decision" | "inputDigest" | "settingsDigest" | "scopeDigest"
+  "decision" | "inputDigest" | "settingsDigest" |
+    "settingsCanonicalBytes" | "settingsCanonicalNodes" | "scopeDigest"
 >;
 
-function commitContinuation(
+async function commitContinuation(
   index: AnthropicContinuationIndex,
   prepared: AnthropicContinuationCommitToken | null,
   scope: AuthenticatedTenantScope | null,
   finalValue: unknown,
   projected: ReturnType<typeof responseToAnthropic>,
-): void {
-  if (!prepared || scope === null || prepared.decision === "empty_suffix") return;
+  signal: AbortSignal,
+  terminalBytes: number,
+  replayProof?: AnthropicTerminalReplayProof,
+): Promise<void> {
+  if (!prepared || scope === null || prepared.decision === "empty_suffix" ||
+    prepared.decision === "explicit") return;
   try {
-    const replay = projectAnthropicReplay(finalValue, projected);
+    const replay = projectAnthropicReplay(finalValue, projected, {
+      ...replayProof,
+      terminalBytes,
+    });
     const responseId = terminalProviderResponseId(finalValue);
     if (!replay || !responseId) return;
-    index.commit(prepared, scope, responseId, replay);
+    await index.commitAsync(prepared, scope, responseId, replay, signal);
   } catch {
     // A failed metadata commit cannot replace an otherwise valid response.
   }
@@ -386,6 +432,7 @@ function releaseFailedPreludeHandle(
   error: unknown,
 ): void {
   if (!controller.signal.aborted) controller.abort(error);
+  handle.discardUnconsumedEvents?.();
   try {
     void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined);
   } catch {
@@ -402,6 +449,7 @@ export function registerAnthropicRoutes(
     maxQueued: CONTINUATION_PREPARE_MAX_QUEUED,
     maxQueuedBytes: CONTINUATION_PREPARE_MAX_QUEUED_BYTES,
   });
+  continuationIndex.onShutdown(() => continuationScheduler.close());
   app.post("/v1/messages/count_tokens", async c => {
     const requestId = newAnthropicRequestId();
     try {
@@ -429,6 +477,8 @@ export function registerAnthropicRoutes(
     let unlinkIncomingSignal: () => void = () => undefined;
     let completeIncomingAdmission: () => void = () => undefined;
     let retainedIncomingLease: IncomingResourceLease | undefined;
+    let finishRequestLifetime!: () => void;
+    const requestLifetime = new Promise<void>(resolve => { finishRequestLifetime = resolve; });
     try {
       validateProtocolHeaders(c.req);
       const body = await jsonBody(c.req);
@@ -462,6 +512,12 @@ export function registerAnthropicRoutes(
         requestLink.controller.signal,
         continuationPreparationBytes(translated, incomingLease),
       );
+      if (prepared) {
+        // The immutable snapshot now owns both initial and fallback execution.
+        // Drop the translated container graph; large strings remain shared.
+        (translated as { relayBody: Record<string, unknown> }).relayBody =
+          prepared.fullRelayBody;
+      }
       const preparedDecision = prepared?.decision ?? null;
       const preparedMatch = prepared?.match ?? null;
       const commitToken: AnthropicContinuationCommitToken | null = prepared
@@ -469,6 +525,8 @@ export function registerAnthropicRoutes(
             decision: prepared.decision,
             inputDigest: prepared.inputDigest,
             settingsDigest: prepared.settingsDigest,
+            settingsCanonicalBytes: prepared.settingsCanonicalBytes,
+            settingsCanonicalNodes: prepared.settingsCanonicalNodes,
             scopeDigest: prepared.scopeDigest,
           }
         : null;
@@ -477,7 +535,8 @@ export function registerAnthropicRoutes(
         ? incomingLeaseTimingView(retainedIncomingLease)
         : undefined;
       const initialRelayBody = prepared?.relayBody ?? translated.relayBody;
-      let fallbackRelayBody: Record<string, unknown> | null = translated.relayBody;
+      let fallbackRelayBody: Record<string, unknown> | null =
+        prepared?.fullRelayBody ?? translated.relayBody;
       const clientWantsStream = translated.stream;
       let attempt = 0;
 
@@ -491,23 +550,36 @@ export function registerAnthropicRoutes(
         let streamOwnsAttempt = false;
         let stage: "start" | "nonstream" | "projection" | "prelude" | "sse-commit" = "start";
         const nonstreamFailure: {
-          source: "final" | "events" | "cancelled" | null;
+          source: "final" | "events" | "cancelled" | "unknown" | null;
           sawRelayEvent: boolean;
         } = { source: null, sawRelayEvent: false };
         try {
+          const structuralBodyBytes = await jsonEncodedByteLengthAsync(relayBody, {
+            signal: attemptLink.controller.signal,
+          });
+          const attemptIncomingLease = attempt === 0
+            ? preparedDecision === "hit" ? continuationLease : incomingLease
+            : retainedIncomingLease;
           handle = await dependencies.startRelay(
             relayBody,
             attemptLink.controller.signal,
             clientId,
-            attempt === 0 && !retainedIncomingLease ? incomingLease : continuationLease,
-            attempt === 0 && preparedDecision === "hit"
-              ? {
+            attemptIncomingLease,
+            {
+              structuralBodyBytes,
+              ...(preparedDecision === "hit" ? {
                   fairnessBytes: Math.max(
                     incomingLease?.bodyBytes ?? 0,
+                    translated.inboundBytes,
+                    translated.relayBytes,
                     commitToken!.inputDigest.canonicalBytes,
                   ),
-                }
-              : undefined,
+                  retainIncomingLeaseBytes: attempt > 0,
+                } : {}),
+              ...(preparedDecision !== "hit" || attempt > 0
+                ? { retainMemoryUntil: requestLifetime }
+                : {}),
+            },
           );
           completeIncomingAdmission();
 
@@ -534,7 +606,15 @@ export function registerAnthropicRoutes(
             let response: ReturnType<typeof responseToAnthropic> | null = null;
             try {
               response = responseToAnthropic(final, context);
-              commitContinuation(continuationIndex, commitToken, scope, final, response);
+              await commitContinuation(
+                continuationIndex,
+                commitToken,
+                scope,
+                final,
+                response,
+                attemptLink.controller.signal,
+                handle.stats.bytes,
+              );
               transferAtomicBytePermit(final, response, "anthropic-json-output");
               return permittedJsonResponse(response, {
                 headers: { "request-id": requestId },
@@ -555,8 +635,17 @@ export function registerAnthropicRoutes(
           stream = createAnthropicPullStream({
             handle,
             translator: new AnthropicStreamTranslator(context, {
-              beforeMessageStop: (final, response) => {
-                commitContinuation(continuationIndex, commitToken, scope, final, response);
+              beforeMessageStopAsync: async (final, response, replayProof) => {
+                await commitContinuation(
+                  continuationIndex,
+                  commitToken,
+                  scope,
+                  final,
+                  response,
+                  attemptLink.controller.signal,
+                  handle!.stats.bytes,
+                  replayProof,
+                );
               },
             }),
             keepAliveMs: dependencies.keepAliveMs,
@@ -585,7 +674,8 @@ export function registerAnthropicRoutes(
           const safePreStreamFailure = stage === "start" || stage === "prelude";
           const safePreJsonFailure = stage === "start" || safeNonstreamFailure;
           const retry = attempt === 0 && preparedDecision === "hit" &&
-            preparedMatch !== null && definitivePreviousResponseNotFound(error) &&
+            preparedMatch !== null && !requestLink.controller.signal.aborted &&
+            definitivePreviousResponseNotFound(error) &&
             (clientWantsStream ? safePreStreamFailure : safePreJsonFailure);
           if (retry && continuationIndex.compareDelete(preparedMatch!)) {
             completeIncomingAdmission();
@@ -605,9 +695,10 @@ export function registerAnthropicRoutes(
       retainedIncomingLease?.release();
       retainedIncomingLease = undefined;
       if (!streamOwnsLink) requestLink.unlink();
+      setImmediate(finishRequestLifetime);
     }
   });
 
-  app.all("/v1/messages/count_tokens", c => methodNotAllowed(newAnthropicRequestId()));
-  app.all("/v1/messages", c => methodNotAllowed(newAnthropicRequestId()));
+  app.all("/v1/messages/count_tokens", _c => methodNotAllowed(newAnthropicRequestId()));
+  app.all("/v1/messages", _c => methodNotAllowed(newAnthropicRequestId()));
 }

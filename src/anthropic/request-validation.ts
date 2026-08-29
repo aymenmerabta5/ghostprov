@@ -18,7 +18,7 @@ export const DEFAULT_ANTHROPIC_REQUEST_LIMITS: Readonly<AnthropicRequestLimits> 
   mediaBytes: 32 * 1024 * 1024,
   maxJsonDepth: 64,
   maxArrayItems: 100_000,
-  maxTotalJsonItems: 1_000_000,
+  maxTotalJsonItems: 65_536,
 });
 
 export function resolveAnthropicRequestLimits(
@@ -128,18 +128,48 @@ export class RequestMediaBudget {
   }
 }
 
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+function base64Value(code: number): number {
+  if (code >= 0x41 && code <= 0x5a) return code - 0x41;
+  if (code >= 0x61 && code <= 0x7a) return code - 0x61 + 26;
+  if (code >= 0x30 && code <= 0x39) return code - 0x30 + 52;
+  if (code === 0x2b) return 62;
+  if (code === 0x2f) return 63;
+  return -1;
+}
+
+/** Returns the decoded byte length for canonical padded base64, or null if invalid. */
+export function decodedCanonicalBase64Bytes(data: string): number | null {
+  if (!data.length || data.length % 4 !== 0) return null;
+
+  const finalCode = data.charCodeAt(data.length - 1);
+  const padding = finalCode === 0x3d
+    ? data.charCodeAt(data.length - 2) === 0x3d ? 2 : 1
+    : 0;
+  const contentEnd = data.length - padding;
+  for (let index = 0; index < contentEnd; index += 1) {
+    if (base64Value(data.charCodeAt(index)) < 0) return null;
+  }
+  // Canonical padding requires every unused low sextet bit to be zero.
+  if (padding === 2 && (base64Value(data.charCodeAt(contentEnd - 1)) & 0x0f) !== 0) {
+    return null;
+  }
+  if (padding === 1 && (base64Value(data.charCodeAt(contentEnd - 1)) & 0x03) !== 0) {
+    return null;
+  }
+
+  return (data.length / 4) * 3 - padding;
+}
 
 export function validateBase64(
   data: string,
   name: string,
   budget: RequestMediaBudget,
 ): void {
-  if (!data || data.length % 4 !== 0 || !BASE64.test(data)) {
+  const decodedBytes = decodedCanonicalBase64Bytes(data);
+  if (decodedBytes === null) {
     throw new AnthropicRequestError(400, `${name} must be canonical base64`);
   }
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-  budget.add((data.length / 4) * 3 - padding, name);
+  budget.add(decodedBytes, name);
 }
 
 type VisitFrame = {

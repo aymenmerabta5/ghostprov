@@ -1,9 +1,46 @@
 import { describe, expect, it } from "bun:test";
-import { classifyWorkload } from "../src/router/workload";
+import {
+  MAX_WORKLOAD_JSON_ITEMS,
+  WorkloadTraversalLimitError,
+  classifyWorkload,
+  jsonEncodedByteLength,
+  jsonEncodedByteLengthAsync,
+} from "../src/router/workload";
 
 const MiB = 1024 ** 2;
 
 describe("workload classification", () => {
+  it("matches cooperative and synchronous JSON sizing across escaping boundaries", async () => {
+    const value = {
+      input: [
+        "plain\0\b\t\n\f\r\"\\",
+        "é漢😀",
+        "lone-\ud800-low-\udc00",
+        { finite: 1e20, nonfinite: Number.POSITIVE_INFINITY, omitted: undefined },
+      ],
+    };
+    expect(await jsonEncodedByteLengthAsync(value)).toBe(jsonEncodedByteLength(value));
+    expect(await jsonEncodedByteLengthAsync(value)).toBe(
+      Buffer.byteLength(JSON.stringify(value), "utf8"),
+    );
+  });
+
+  it("yields inside one large escaped string and preserves exact abort reason", async () => {
+    const value = { input: "\0".repeat(1024 * 1024) };
+    let yields = 0;
+    expect(await jsonEncodedByteLengthAsync(value, {
+      yieldTask: async () => { yields++; },
+    })).toBe(Buffer.byteLength(JSON.stringify(value), "utf8"));
+    expect(yields).toBeGreaterThan(1);
+
+    const controller = new AbortController();
+    const reason = new DOMException("stop sizing", "AbortError");
+    await expect(jsonEncodedByteLengthAsync(value, {
+      signal: controller.signal,
+      yieldTask: async () => { controller.abort(reason); },
+    })).rejects.toBe(reason);
+  });
+
   it("classifies small and large streamed text with bounded reservations", () => {
     const small = classifyWorkload({ model: "gpt-5.6-sol", input: "hello", stream: true });
     const large = classifyWorkload({ model: "gpt-5.6-sol", input: "x".repeat(MiB), stream: true });
@@ -11,7 +48,6 @@ describe("workload classification", () => {
     expect(small.reservedBytes).toBeGreaterThanOrEqual(8 * MiB);
     expect(large.class).toBe("text-large");
     expect(large.reservedBytes).toBeGreaterThan(small.reservedBytes);
-    expect(large.cpuPermits).toBe(1);
   });
 
   it("distinguishes image generation from reference-image editing", () => {
@@ -33,7 +69,6 @@ describe("workload classification", () => {
     expect(edit.class).toBe("image-edit");
     expect(edit.model).toBe("gpt-image-2");
     expect(edit.reservedBytes).toBeGreaterThan(generation.reservedBytes);
-    expect(edit.cpuPermits).toBe(1);
   });
 
   it("honors precomputed encoded byte sizes without retaining a serialized copy", () => {
@@ -69,5 +104,77 @@ describe("workload classification", () => {
     const workload = classifyWorkload(body);
     expect(workload.requestBytes).toBe(Buffer.byteLength(JSON.stringify(body), "utf8"));
     expect(workload).not.toHaveProperty("serializedBody");
+  });
+
+  it("rejects over-deep sizing with a stable typed request error", () => {
+    let value: unknown = { leaf: true };
+    for (let depth = 0; depth < 257; depth++) value = [value];
+
+    const failure = (() => {
+      try {
+        jsonEncodedByteLength({ metadata: value });
+        return null;
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(failure).toBeInstanceOf(WorkloadTraversalLimitError);
+    expect(failure).toMatchObject({
+      status: 400,
+      code: "invalid_json_structure",
+      param: "body",
+      reason: "depth",
+    });
+  });
+
+  it("bounds iterative input-image scanning even with precomputed structural bytes", () => {
+    let input: unknown = { type: "input_text", text: "leaf" };
+    for (let depth = 0; depth < 258; depth++) input = [input];
+
+    expect(() => classifyWorkload({
+      input,
+      tools: [{ type: "image_generation" }],
+    }, { structuralBytes: 1 })).toThrow(WorkloadTraversalLimitError);
+  });
+
+  it("matches validation depth at top-level fields and input-item roots", () => {
+    let metadata: unknown = { leaf: true };
+    let inputItem: unknown = { type: "input_text", text: "leaf" };
+    for (let depth = 0; depth < 256; depth++) {
+      metadata = [metadata];
+      inputItem = [inputItem];
+    }
+
+    expect(() => classifyWorkload({ metadata, input: "text" })).not.toThrow();
+    expect(() => classifyWorkload({
+      input: [inputItem],
+      tools: [{ type: "image_generation", action: "edit" }],
+    }, { structuralBytes: 1 })).not.toThrow();
+  });
+
+  it("caps iterative input-image scanning by visited value count", () => {
+    const input = Array.from({ length: MAX_WORKLOAD_JSON_ITEMS + 1 }, () => null);
+    let failure: unknown = null;
+    try {
+      classifyWorkload({
+        input,
+        tools: [{ type: "image_generation" }],
+      }, { structuralBytes: 1 });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(WorkloadTraversalLimitError);
+    expect(failure).toMatchObject({ reason: "items" });
+  });
+
+  it("preserves circular JSON sizing failures without recursive overflow", () => {
+    const body: Record<string, unknown> = {};
+    body.self = body;
+    expect(() => jsonEncodedByteLength(body)).toThrow("Converting circular structure to JSON");
+
+    expect(() => classifyWorkload({
+      input: body,
+      tools: [{ type: "image_generation" }],
+    }, { structuralBytes: 1 })).toThrow("Converting circular structure to JSON");
   });
 });

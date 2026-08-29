@@ -17,6 +17,12 @@ import {
   CpuTransformQueueFullError,
   CpuTransformTimeoutError,
 } from "../src/router/cpu-transform-pool";
+import { WorkloadTraversalLimitError } from "../src/router/workload";
+import {
+  ResponseProvenanceCommitError,
+  ResponseProvenanceObsoleteError,
+  ResponseProvenanceScopeError,
+} from "../src/router/provenance";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { V2PreCommitError } from "../src/v2/transport/run-handle";
 
@@ -134,6 +140,45 @@ describe("OpenAI-compatible HTTP errors", () => {
         type: "service_unavailable_error",
         param: null,
         code: "cpu_transform_timeout",
+      },
+    });
+  });
+
+  it("maps bounded workload traversal failures to a typed client error", () => {
+    expect(normalizeApiError(new WorkloadTraversalLimitError("items"))).toEqual({
+      status: 400,
+      error: {
+        message: "Request body contains more than 65536 JSON values",
+        type: "invalid_request_error",
+        param: "body",
+        code: "invalid_json_structure",
+      },
+    });
+  });
+
+  it("maps response provenance failures without exposing routing bindings", () => {
+    expect(normalizeApiError(new ResponseProvenanceScopeError())).toMatchObject({
+      status: 403,
+      error: {
+        type: "permission_error",
+        param: "previous_response_id",
+        code: "response_provenance_scope_mismatch",
+      },
+    });
+    expect(normalizeApiError(new ResponseProvenanceObsoleteError())).toMatchObject({
+      status: 409,
+      error: {
+        type: "invalid_request_error",
+        param: "previous_response_id",
+        code: "response_provenance_obsolete",
+      },
+    });
+    expect(normalizeApiError(new ResponseProvenanceCommitError())).toMatchObject({
+      status: 502,
+      error: {
+        type: "server_error",
+        param: null,
+        code: "response_provenance_commit_failed",
       },
     });
   });

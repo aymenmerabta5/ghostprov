@@ -2,17 +2,18 @@ import { describe, expect, it } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
 import { sseFrame } from "../src/relay/sse";
 import {
+  type IncomingResourceLease,
   MultiSandboxRouter,
-  RouterCapacityTimeoutError,
 } from "../src/router/router";
 import {
   RESPONSE_PROVENANCE_LIMITS,
   ResponseProvenanceCommitError,
+  ResponseProvenanceObsoleteError,
   ResponseProvenanceRegistry,
   ResponseProvenanceScopeError,
 } from "../src/router/provenance";
 import { createAuthenticatedTenantScope } from "../src/http/api-key";
-import { ResourceGovernor } from "../src/router/resource-governor";
+import { ResourceGovernor, type ResourceLease } from "../src/router/resource-governor";
 import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
@@ -35,6 +36,37 @@ function response(id: string, status: "completed" | "failed" | "incomplete" = "c
   return { id, object: "response", status, output: [] };
 }
 
+function recordProvenance(
+  registry: ResponseProvenanceRegistry,
+  responseId: unknown,
+  scope: ReturnType<typeof createAuthenticatedTenantScope>,
+  provenance: { readonly projectId: ProjectId; readonly incarnation: number },
+): boolean {
+  const reservation = registry.reserve();
+  return reservation !== null && registry.commit(reservation, responseId, scope, provenance);
+}
+
+function detachedIncomingLease(): IncomingResourceLease {
+  return {
+    release: () => undefined,
+    replace: async workload => {
+      let reservedBytes = workload.reservedBytes;
+      let active = true;
+      let lease!: ResourceLease;
+      lease = {
+        get reservedBytes() { return active ? reservedBytes : 0; },
+        replace: async replacement => {
+          if (!active) throw new Error("detached lease is released");
+          reservedBytes = replacement.reservedBytes;
+          return lease;
+        },
+        release: () => { active = false; },
+      };
+      return lease;
+    },
+  };
+}
+
 class ProvenanceRuntime implements RoutableSandboxRuntime {
   incarnation = 1;
   active = 0;
@@ -52,6 +84,7 @@ class ProvenanceRuntime implements RoutableSandboxRuntime {
   constructor(
     readonly projectId: ProjectId,
     readonly label: string,
+    readonly capacity = 4,
   ) {}
 
   async start(): Promise<void> {}
@@ -77,9 +110,9 @@ class ProvenanceRuntime implements RoutableSandboxRuntime {
       projectId: this.projectId,
       incarnation: this.incarnation,
       state: "ready",
-      capacity: 4,
+      capacity: this.capacity,
       active: this.active,
-      available: 4 - this.active,
+      available: this.capacity - this.active,
       quarantined: 0,
       heartbeatAgeMs: 0,
       credentialExpiresInMs: 60_000,
@@ -153,7 +186,10 @@ function governor(): ResourceGovernor {
   });
 }
 
-function routerSystem(randomValues: number[] = [0], queueTimeoutMs = 1_000) {
+function routerSystem(
+  randomValues: number[] = [0],
+  queueTimeoutMs = 1_000,
+) {
   const first = new ProvenanceRuntime(
     projectId("00000000-0000-4000-8000-000000000001"),
     "first",
@@ -204,23 +240,23 @@ describe("ResponseProvenanceRegistry", () => {
     const first = projectId("00000000-0000-4000-8000-000000000001");
     const other = projectId("00000000-0000-4000-8000-000000000002");
 
-    expect(registry.record("resp_bound", firstScope, {
+    expect(recordProvenance(registry, "resp_bound", firstScope, {
       projectId: first,
       incarnation: 7,
     })).toBe(true);
-    expect(registry.record("resp_bound", firstScope, {
+    expect(recordProvenance(registry, "resp_bound", firstScope, {
       projectId: first,
       incarnation: 7,
     })).toBe(true);
-    expect(registry.record("resp_bound", firstScope, {
+    expect(recordProvenance(registry, "resp_bound", firstScope, {
       projectId: other,
       incarnation: 7,
     })).toBe(false);
-    expect(registry.record("resp_bound", firstScope, {
+    expect(recordProvenance(registry, "resp_bound", firstScope, {
       projectId: first,
       incarnation: 8,
     })).toBe(false);
-    expect(registry.record("resp_bound", otherScope, {
+    expect(recordProvenance(registry, "resp_bound", otherScope, {
       projectId: first,
       incarnation: 7,
     })).toBe(false);
@@ -233,11 +269,11 @@ describe("ResponseProvenanceRegistry", () => {
     });
 
     const raced = await Promise.all([
-      Promise.resolve().then(() => registry.record("resp_race", firstScope, {
+      Promise.resolve().then(() => recordProvenance(registry, "resp_race", firstScope, {
         projectId: first,
         incarnation: 1,
       })),
-      Promise.resolve().then(() => registry.record("resp_race", otherScope, {
+      Promise.resolve().then(() => recordProvenance(registry, "resp_race", otherScope, {
         projectId: other,
         incarnation: 2,
       })),
@@ -264,7 +300,7 @@ describe("ResponseProvenanceRegistry", () => {
       incarnation: 1,
     };
 
-    expect(registry.record(
+    expect(recordProvenance(registry,
       "x".repeat(RESPONSE_PROVENANCE_LIMITS.maxResponseIdBytes + 1),
       scope,
       location,
@@ -287,9 +323,9 @@ describe("ResponseProvenanceRegistry", () => {
     expect(registry.snapshot()).toMatchObject({ reservedRecords: 0, reservedBytes: 0 });
 
     for (let index = 0; index < RESPONSE_PROVENANCE_LIMITS.maxRecords; index++) {
-      expect(registry.record(`r${index}`, scope, location)).toBe(true);
+      expect(recordProvenance(registry, `r${index}`, scope, location)).toBe(true);
     }
-    expect(registry.record("record-overflow", scope, location)).toBe(true);
+    expect(recordProvenance(registry, "record-overflow", scope, location)).toBe(true);
     expect(registry.lookup("r0", scope).kind).toBe("unknown");
     expect(registry.lookup("r1", scope).kind).toBe("known");
     expect(registry.lookup("record-overflow", scope).kind).toBe("known");
@@ -302,7 +338,7 @@ describe("ResponseProvenanceRegistry", () => {
 
     registry.clear();
     for (let index = 0; index < 2_000; index++) {
-      if (!registry.record(
+      if (!recordProvenance(registry,
         `${String(index).padStart(5, "0")}-${"z".repeat(500)}`,
         scope,
         location,
@@ -311,15 +347,15 @@ describe("ResponseProvenanceRegistry", () => {
     const byteBounded = registry.snapshot();
     expect(byteBounded.bytes).toBeLessThanOrEqual(RESPONSE_PROVENANCE_LIMITS.maxBytes);
     expect(byteBounded.records).toBeLessThan(2_000);
-    expect(registry.record("byte-overflow", scope, location)).toBe(true);
+    expect(recordProvenance(registry, "byte-overflow", scope, location)).toBe(true);
     expect(registry.lookup(`00000-${"z".repeat(500)}`, scope).kind).toBe("unknown");
     expect(registry.lookup("byte-overflow", scope).kind).toBe("known");
 
     registry.clear();
     now = 0;
-    expect(registry.record("resp_ttl_old", scope, location)).toBe(true);
+    expect(recordProvenance(registry, "resp_ttl_old", scope, location)).toBe(true);
     now = 1;
-    expect(registry.record("resp_ttl_new", scope, location)).toBe(true);
+    expect(recordProvenance(registry, "resp_ttl_new", scope, location)).toBe(true);
     now = RESPONSE_PROVENANCE_LIMITS.ttlMs - 1;
     expect(registry.lookup("resp_ttl_old", scope).kind).toBe("known");
     now = RESPONSE_PROVENANCE_LIMITS.ttlMs;
@@ -425,7 +461,65 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
-  it("never fails a known continuation over to another project or incarnation", async () => {
+  it("queues at metadata pressure without spinning or capping the 4,096-job ingress queue", async () => {
+    const reservationCapacity = Math.min(
+      RESPONSE_PROVENANCE_LIMITS.maxRecords,
+      Math.floor(
+        RESPONSE_PROVENANCE_LIMITS.maxBytes /
+          RESPONSE_PROVENANCE_LIMITS.maxRecordBytes,
+      ),
+    );
+    const runtime = new ProvenanceRuntime(
+      projectId("00000000-0000-4000-8000-000000000001"),
+      "pressure",
+      reservationCapacity + 1,
+    );
+    const authorizationScope = createAuthenticatedTenantScope();
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      governor: governor(),
+      authorizationScope,
+      queueTimeoutMs: 2_000,
+      random: { next: () => 0, uuid: () => "trace-pressure" },
+    });
+    try {
+      const starts = Array.from({ length: reservationCapacity + 1 }, (_, index) => (
+        router.startRelay(
+          { model: "gpt-5.6-sol", input: `pressure-${index}` },
+          { incomingLease: detachedIncomingLease() },
+        )
+      ));
+      const admitted = await Promise.all(starts.slice(0, reservationCapacity));
+      await flush(50);
+
+      expect(runtime.executions).toBe(reservationCapacity);
+      expect(router.snapshot()).toMatchObject({
+        queued: 1,
+        provenance: { reservedRecords: reservationCapacity },
+      });
+      // Repeated microtask turns cannot rescan/spin or execute without a fresh
+      // reservation. The terminal below is the sole capacity wake.
+      await flush(100);
+      expect(runtime.executions).toBe(reservationCapacity);
+
+      runtime.completeNext();
+      await admitted[0]!.final;
+      const last = await starts.at(-1)!;
+      expect(runtime.executions).toBe(reservationCapacity + 1);
+      expect(router.snapshot().queued).toBe(0);
+
+      while (runtime.pending.length > 0) runtime.completeNext();
+      await Promise.all([
+        ...admitted.slice(1).map(handle => handle.final),
+        last.final,
+      ]);
+    } finally {
+      while (runtime.pending.length > 0) runtime.completeNext();
+      await router.close();
+    }
+  });
+
+  it("never fails a known continuation over and rejects an obsolete incarnation immediately", async () => {
     const { router, first, second } = routerSystem([0, 0.999, 0.999], 300);
     try {
       const original = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
@@ -447,11 +541,13 @@ describe("MultiSandboxRouter response provenance", () => {
       await retryHandle.final;
 
       first.replaceIncarnation();
+      const obsoleteStartedAt = performance.now();
       await expect(router.startRelay({
         model: "gpt-5.6-sol",
         input: "old incarnation",
         previous_response_id: originalFinal.id,
-      })).rejects.toBeInstanceOf(RouterCapacityTimeoutError);
+      })).rejects.toBeInstanceOf(ResponseProvenanceObsoleteError);
+      expect(performance.now() - obsoleteStartedAt).toBeLessThan(50);
       expect(second.executions).toBe(0);
     } finally {
       while (first.pending.length > 0) first.completeNext();
@@ -460,16 +556,85 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
+  it("rejects a queued continuation as soon as its pinned incarnation is replaced", async () => {
+    const { router, first, second } = routerSystem([0], 1_000);
+    try {
+      const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+      const seedFinal = first.completeNext();
+      await seed.final;
+
+      first.active = first.capacity;
+      first.notify();
+      const pending = router.startRelay({
+        model: "gpt-5.6-sol",
+        input: "queued old incarnation",
+        previous_response_id: seedFinal.id,
+      });
+      await flush();
+      expect(router.snapshot().queued).toBe(1);
+
+      const replacedAt = performance.now();
+      first.replaceIncarnation();
+      await expect(pending).rejects.toBeInstanceOf(ResponseProvenanceObsoleteError);
+      expect(performance.now() - replacedAt).toBeLessThan(50);
+      expect(router.snapshot().queued).toBe(0);
+      expect(second.executions).toBe(0);
+    } finally {
+      first.active = 0;
+      while (first.pending.length > 0) first.completeNext();
+      while (second.pending.length > 0) second.completeNext();
+      await router.close();
+    }
+  });
+
+  it("accepts only the exact configured authorization-scope object", async () => {
+    const { router, first, second, authorizationScope } = routerSystem();
+    const otherScope = createAuthenticatedTenantScope();
+    try {
+      await expect(router.startRelay(
+        { model: "gpt-5.6-sol", input: "foreign scope" },
+        { authorizationScope: otherScope },
+      )).rejects.toBeInstanceOf(ResponseProvenanceScopeError);
+      expect(router.lookupResponseProvenance("resp_unknown", otherScope))
+        .toEqual({ kind: "scope_mismatch" });
+      expect(router.responseProvenanceAuthorizationScope()).toBe(authorizationScope);
+      expect(first.executions + second.executions).toBe(0);
+    } finally {
+      await router.close();
+    }
+  });
+
+  it("does not let a router without composition authority adopt request scopes", async () => {
+    const runtime = new ProvenanceRuntime(
+      projectId("00000000-0000-4000-8000-000000000001"),
+      "unscoped",
+    );
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      governor: governor(),
+    });
+    const scope = createAuthenticatedTenantScope();
+    try {
+      await expect(router.startRelay(
+        { model: "gpt-5.6-sol", input: "cannot adopt scope" },
+        { authorizationScope: scope },
+      )).rejects.toBeInstanceOf(ResponseProvenanceScopeError);
+      expect(router.lookupResponseProvenance("resp_unknown", scope))
+        .toEqual({ kind: "scope_mismatch" });
+      expect(runtime.executions).toBe(0);
+    } finally {
+      await router.close();
+    }
+  });
+
   it("fails closed on response-ID scope/binding conflicts without poisoning the first record", async () => {
-    const { router, first, second } = routerSystem([0, 0.999]);
-    const firstScope = createAuthenticatedTenantScope();
+    const { router, first, second, authorizationScope } = routerSystem([0, 0.999]);
     const secondScope = createAuthenticatedTenantScope();
     first.responseIds.push("resp_collision");
     second.responseIds.push("resp_collision");
     try {
       const firstHandle = await router.startRelay(
         { model: "gpt-5.6-sol", input: "first" },
-        { authorizationScope: firstScope },
       );
       first.completeNext();
       await firstHandle.final;
@@ -486,13 +651,12 @@ describe("MultiSandboxRouter response provenance", () => {
 
       const conflicting = await router.startRelay(
         { model: "gpt-5.6-sol", input: "second" },
-        { authorizationScope: secondScope },
       );
       second.completeNext();
       await expect(conflicting.final).rejects.toBeInstanceOf(ResponseProvenanceCommitError);
       expect(router.lookupResponseProvenance(
         "resp_collision",
-        firstScope,
+        authorizationScope,
       )).toEqual({
         kind: "known",
         provenance: { projectId: first.projectId, incarnation: 1 },

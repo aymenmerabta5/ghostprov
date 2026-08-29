@@ -56,8 +56,6 @@ function successfulFetch(onRequest?: (path: string, init?: RequestInit) => void)
           reservationCapacityBytes: 65_536,
           paused: false,
           queued: 0,
-          cpuActive: 2,
-          cpuQueued: 1,
           forbiddenToken: "sk-secret-value-that-must-not-appear",
         },
         runtimes: [{
@@ -154,8 +152,6 @@ describe("V2 external monitor", () => {
       reservation_capacity_bytes: 65_536,
       memory_paused: false,
       governor_queued: 0,
-      cpu_active: 2,
-      cpu_queued: 1,
     });
     expect((event.runtimes as any[])[0]).toMatchObject({
       project_id: "00000000-0000-4000-8000-000000000001",

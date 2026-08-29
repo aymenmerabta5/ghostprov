@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { WebSocket } from "ws";
 import { Agent, request as httpRequest, type Server } from "node:http";
 import type { RunHandle } from "../src/relay/run-handle";
-import { parseFrames, sseFrame } from "../src/relay/sse";
+import { parseFrames, sseFrame, type SseFrame } from "../src/relay/sse";
 import {
   MultiSandboxRouter,
   type IncomingResourceLease,
@@ -21,6 +21,7 @@ import { closeResponsesWebSockets } from "../src/ws/server";
 import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { resolveHttpClientId } from "../src/http/request-lease";
+import { ResponsesHttpContinuationIndex } from "../src/http/responses-continuation";
 import {
   createAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
@@ -76,6 +77,7 @@ function healthRouter(overrides: Array<Partial<RoutableSandboxSnapshot>>): Multi
   });
   return new MultiSandboxRouter({
     registry: new SandboxRegistry(runtimes),
+    authorizationScope: createAuthenticatedTenantScope(),
     governor: new ResourceGovernor({
       probe: {
         sample: () => ({
@@ -92,6 +94,7 @@ function healthRouter(overrides: Array<Partial<RoutableSandboxSnapshot>>): Multi
 }
 
 class FakeRouter {
+  authorizationScope = createAuthenticatedTenantScope();
   workloads: Array<{
     body: Record<string, unknown>;
     source?: string;
@@ -105,6 +108,9 @@ class FakeRouter {
   bodyLeases: IncomingResourceLease[] = [];
   bodyReservationActive = 0;
   bodyReservationReleases = 0;
+  responseProvenanceAuthorizationScope() {
+    return this.authorizationScope;
+  }
   async acquireIncomingBody(bytes: number) {
     this.bodyReservations.push(bytes);
     this.bodyReservationActive++;
@@ -184,11 +190,161 @@ describe("router HTTP composition", () => {
       router,
       authorizationScope: {} as AuthenticatedTenantScope,
     })).toThrow(TypeError);
+    const foreignScope = createAuthenticatedTenantScope();
+    expect(() => createGhostProvApp({
+      router,
+      authorizationScope: foreignScope,
+    })).toThrow("router's exact AuthenticatedTenantScope");
+    const app = createGhostProvApp({ router });
+    expect(() => createGhostProvServer({
+      app,
+      router,
+      authorizationScope: foreignScope,
+      candidate: true,
+      port: 0,
+    })).toThrow("router's exact AuthenticatedTenantScope");
+    const otherRouter = new FakeRouter();
+    expect(() => createGhostProvServer({
+      app,
+      router: otherRouter,
+      authorizationScope: otherRouter.authorizationScope,
+      candidate: true,
+      port: 0,
+    })).toThrow("app, HTTP router, and WebSocket router");
   });
+
+  it.each([[null], [[]], ["text"], [42], [true]])(
+    "rejects non-object Responses JSON roots locally: %p",
+    async root => {
+      const router = new FakeRouter();
+      const app = createGhostProvApp({
+        router,
+        authorizationScope: router.authorizationScope,
+      });
+
+      const response = await app.fetch(new Request("http://ghostprov.test/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(root),
+      }));
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        error: {
+          type: "invalid_request_error",
+          param: "body",
+          code: "invalid_type",
+        },
+      });
+      expect(router.workloads).toHaveLength(0);
+    },
+  );
+
+  for (const regression of [
+    {
+      name: "malformed nested function arguments",
+      invalidOutput: {
+        type: "function_call",
+        id: "fc_invalid_prefix",
+        status: "completed",
+        call_id: "call_invalid_prefix",
+        name: "read",
+        arguments: "{\"path\":",
+      },
+      expectedCode: "invalid_function_call_arguments",
+      expectedParam: "input[1].arguments",
+    },
+    {
+      name: "a lone Unicode surrogate",
+      invalidOutput: {
+        type: "message",
+        id: "msg_invalid_prefix",
+        status: "completed",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: "\ud800",
+          annotations: [],
+          logprobs: [],
+        }],
+      },
+      expectedCode: "invalid_unicode",
+      expectedParam: "input[1]",
+    },
+  ]) {
+    it(`validates native full history before prefix inference can strip ${regression.name}`, async () => {
+      const authorizationScope = createAuthenticatedTenantScope();
+      const continuationIndex = new ResponsesHttpContinuationIndex({
+        key: new Uint8Array(32).fill(0x43),
+      });
+      const calls: Record<string, unknown>[] = [];
+      const root = {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "root" }],
+      };
+      const next = {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "next" }],
+      };
+      const router = {
+        responseProvenanceAuthorizationScope: () => authorizationScope,
+        snapshot: () => ({
+          capacity: 1,
+          active: 0,
+          available: 1,
+          queued: 0,
+          runtimes: [],
+          resources: {},
+        }),
+        startRelay: async (body: Record<string, unknown>) => {
+          calls.push(structuredClone(body));
+          return handle(final("resp_invalid_prefix", calls.length === 1
+            ? [regression.invalidOutput]
+            : []));
+        },
+      };
+      const app = createGhostProvApp({
+        router,
+        authorizationScope,
+        responsesContinuationIndex: continuationIndex,
+      });
+
+      const seeded = await app.request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: [root] }),
+      });
+      expect(seeded.status).toBe(200);
+      await seeded.json();
+      expect(continuationIndex.snapshot().records).toBe(1);
+
+      const rejected = await app.request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          input: [root, regression.invalidOutput, next],
+        }),
+      });
+
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({
+        error: {
+          type: "invalid_request_error",
+          param: regression.expectedParam,
+          code: regression.expectedCode,
+        },
+      });
+      expect(calls).toHaveLength(1);
+    });
+  }
 
   it("forces upstream persistence and streaming without changing the public nonstream contract", async () => {
     const router = new FakeRouter();
     const authorizationScope = createAuthenticatedTenantScope();
+    router.authorizationScope = authorizationScope;
     const app = createGhostProvApp({
       router,
       authorizationScope,
@@ -258,6 +414,7 @@ describe("router HTTP composition", () => {
       content: [{ type: "input_text", text: "next" }],
     };
     const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
       snapshot: () => ({
         capacity: 1,
         active: 0,
@@ -318,6 +475,18 @@ describe("router HTTP composition", () => {
 
   it("commits a native Responses prefix before exposing an SSE terminal", async () => {
     const authorizationScope = createAuthenticatedTenantScope();
+    const continuationIndex = new ResponsesHttpContinuationIndex({
+      key: new Uint8Array(32).fill(0x41),
+    });
+    const commit = continuationIndex.commit.bind(continuationIndex);
+    let releaseCommit!: () => void;
+    let commitStarted = false;
+    const commitGate = new Promise<void>(resolve => { releaseCommit = resolve; });
+    continuationIndex.commit = async (...args) => {
+      commitStarted = true;
+      await commitGate;
+      return commit(...args);
+    };
     const calls: Record<string, unknown>[] = [];
     const root = {
       type: "message",
@@ -342,6 +511,7 @@ describe("router HTTP composition", () => {
       resolveParent = resolve;
     });
     const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
       snapshot: () => ({
         capacity: 1,
         active: 0,
@@ -361,7 +531,11 @@ describe("router HTTP composition", () => {
         return handle(final("resp_sse_child"));
       },
     };
-    const app = createGhostProvApp({ router, authorizationScope });
+    const app = createGhostProvApp({
+      router,
+      authorizationScope,
+      responsesContinuationIndex: continuationIndex,
+    });
     const streamed = await app.request("/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -377,6 +551,11 @@ describe("router HTTP composition", () => {
     expect(terminalVisible).toBe(false);
 
     resolveParent(parent);
+    for (let turn = 0; turn < 50 && !commitStarted; turn++) await Bun.sleep(1);
+    expect(commitStarted).toBe(true);
+    await Bun.sleep(10);
+    expect(terminalVisible).toBe(false);
+    releaseCommit();
     expect(new TextDecoder().decode((await terminal).value)).toContain("response.completed");
     await reader.cancel();
 
@@ -400,6 +579,65 @@ describe("router HTTP composition", () => {
       previous_response_id: "resp_sse_parent",
       input: [next],
     });
+  });
+
+  it("commits native Responses metadata before exposing a JSON final", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const continuationIndex = new ResponsesHttpContinuationIndex({
+      key: new Uint8Array(32).fill(0x42),
+    });
+    const commit = continuationIndex.commit.bind(continuationIndex);
+    let releaseCommit!: () => void;
+    let commitStarted = false;
+    const commitGate = new Promise<void>(resolve => { releaseCommit = resolve; });
+    continuationIndex.commit = async (...args) => {
+      commitStarted = true;
+      await commitGate;
+      return commit(...args);
+    };
+    const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async () => handle(final("resp_json_commit", [{
+        type: "message",
+        id: "msg_json_commit",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done", annotations: [], logprobs: [] }],
+      }])),
+    };
+    const app = createGhostProvApp({
+      router,
+      authorizationScope,
+      responsesContinuationIndex: continuationIndex,
+    });
+
+    let responseSettled = false;
+    const response = Promise.resolve(app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "wait for commit" }],
+      }] }),
+    })).then((value: Response) => {
+      responseSettled = true;
+      return value;
+    });
+
+    for (let turn = 0; turn < 50 && !commitStarted; turn++) await Bun.sleep(1);
+    expect(commitStarted).toBe(true);
+    expect(responseSettled).toBe(false);
+    releaseCommit();
+    expect((await response).status).toBe(200);
   });
 
   it("retries one definitive stale auto-inferred Responses parent with full history", async () => {
@@ -447,6 +685,7 @@ describe("router HTTP composition", () => {
     };
     const calls: Record<string, unknown>[] = [];
     const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
       snapshot: () => ({
         capacity: 1,
         active: 0,
@@ -488,6 +727,73 @@ describe("router HTTP composition", () => {
     });
     expect(calls[2]).not.toHaveProperty("previous_response_id");
     expect(calls[2]!.input).toEqual([root, answer, next]);
+  });
+
+  it("never retries a stale inferred parent after any accepted relay event", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const providerError = await createProviderErrorEnvelope({
+      origin: "http",
+      status: 400,
+      value: { error: {
+        message: "Previous response was not found",
+        type: "invalid_request_error",
+        param: "previous_response_id",
+        code: "previous_response_not_found",
+      } },
+    });
+    const stale = new V2CommittedError(
+      providerError.error.message,
+      providerError.error.code!,
+      false,
+      undefined,
+      providerError,
+    );
+    const root = { type: "message", role: "user", content: "root" };
+    const answer = {
+      type: "message",
+      id: "msg_no_replay",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "answer", annotations: [], logprobs: [] }],
+    };
+    const next = { type: "message", role: "user", content: "next" };
+    const calls: Record<string, unknown>[] = [];
+    const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (body: Record<string, unknown>) => {
+        calls.push(structuredClone(body));
+        if (calls.length === 1) return handle(final("resp_no_replay_parent", [answer]));
+        return handle(Promise.reject(stale), [{
+          event: "response.created",
+          data: JSON.stringify({ type: "response.created" }),
+        }]);
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+    await (await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [root] }),
+    })).json();
+
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [root, answer, next] }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: "previous_response_not_found" },
+    });
+    expect(calls).toHaveLength(2);
   });
 
   it("drains bounded relay events for non-streaming responses", async () => {
@@ -813,6 +1119,51 @@ describe("router HTTP composition", () => {
     expect(returnCalled).toBe(true);
   });
 
+  it("settles native non-stream cancellation when final and events ignore abort", async () => {
+    let returnCalled = false;
+    const waitingIterator = {
+      next: () => new Promise<IteratorResult<SseFrame, void>>(() => undefined),
+      return: async () => {
+        returnCalled = true;
+        return { done: true as const, value: undefined };
+      },
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame, void>;
+    const router = {
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (): Promise<RunHandle> => ({
+        events: () => waitingIterator,
+        final: new Promise(() => undefined),
+        stats: { bytes: 0, firstByteMs: null, frames: 0 },
+      }),
+    };
+    const app = createGhostProvApp({ router });
+    const controller = new AbortController();
+    const pending = app.fetch(new Request("http://ghostprov.test/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "cancel" }),
+      signal: controller.signal,
+    }));
+
+    await Bun.sleep(0);
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    const response = await Promise.race([
+      pending,
+      Bun.sleep(250).then(() => null),
+    ]);
+    expect(response).not.toBeNull();
+    expect(response?.status).toBe(499);
+    expect(returnCalled).toBe(true);
+  });
+
   it("bounds SSE pull-ahead and aborts the relay when the response body is cancelled", async () => {
     let produced = 0;
     let iteratorClosed = false;
@@ -863,6 +1214,56 @@ describe("router HTTP composition", () => {
     // its body/finally correctly never runs; cancellation still aborts relay.
     expect(iteratorClosed).toBe(false);
   });
+
+  for (const wait of ["iterator", "final"] as const) {
+    it(`wakes a pending native SSE ${wait} wait when the request aborts`, async () => {
+      let returnCalled = false;
+      const iterator = {
+        next: () => wait === "iterator"
+          ? new Promise<IteratorResult<SseFrame, void>>(() => undefined)
+          : Promise.resolve({ done: true as const, value: undefined }),
+        return() {
+          returnCalled = true;
+          return new Promise<IteratorResult<SseFrame, void>>(() => undefined);
+        },
+        [Symbol.asyncIterator]() { return this; },
+      } as unknown as AsyncGenerator<SseFrame, void>;
+      const router = {
+        snapshot: () => ({
+          capacity: 1,
+          active: 0,
+          available: 1,
+          queued: 0,
+          runtimes: [],
+          resources: {},
+        }),
+        startRelay: async (): Promise<RunHandle> => ({
+          events: () => iterator,
+          final: new Promise(() => undefined),
+          stats: { bytes: 0, firstByteMs: null, frames: 0 },
+        }),
+      };
+      const caller = new AbortController();
+      const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).fetch(
+        new Request("http://ghostprov.test/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+          signal: caller.signal,
+        }),
+      );
+      const reader = response.body!.getReader();
+      const pending = reader.read();
+      await Bun.sleep(0);
+      caller.abort(new DOMException("client disconnected", "AbortError"));
+      const result = await Promise.race([
+        pending,
+        Bun.sleep(100).then(() => { throw new Error(`${wait} wait did not wake`); }),
+      ]);
+      expect(result.done).toBe(true);
+      expect(returnCalled).toBe(true);
+    });
+  }
 
   it("aborts and returns the SSE iterator when streaming fails", async () => {
     let relaySignal: AbortSignal | undefined;
@@ -1045,6 +1446,36 @@ describe("router HTTP composition", () => {
       });
     },
   );
+
+  it("advances synthesized terminal sequence after an oversized event", async () => {
+    const responseFinal = final("resp_missing_after_large_event");
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async () => handle(responseFinal, [{
+        event: "response.output_text.delta",
+        data: JSON.stringify({
+          type: "response.output_text.delta",
+          sequence_number: 0,
+          delta: "small",
+        }),
+      }, {
+        event: "response.output_text.delta",
+        data: JSON.stringify({
+          type: "response.output_text.delta",
+          sequence_number: 1,
+          delta: "x".repeat(70 * 1024),
+        }),
+      }]),
+    };
+    const appResponse = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "x", stream: true }),
+    });
+    const frames = parseFrames(await appResponse.text(), 0).frames;
+
+    expect(frames.map(frame => JSON.parse(frame.data).sequence_number)).toEqual([0, 1, 2]);
+  });
 
   it("reports aggregate capacity and sanitized runtime snapshots", async () => {
     const router = new FakeRouter();
@@ -1264,7 +1695,6 @@ describe("router HTTP composition", () => {
       class: "text-large",
       requestBytes: 0,
       reservedBytes: reservationCapacity - 8 * MiB,
-      cpuPermits: 0,
       stream: false,
     });
     const id = projectId("00000000-0000-4000-8000-000000000099");
@@ -1293,6 +1723,7 @@ describe("router HTTP composition", () => {
     };
     const router = new MultiSandboxRouter({
       registry: new SandboxRegistry([runtime]),
+      authorizationScope: createAuthenticatedTenantScope(),
       governor,
     });
     const app = createGhostProvApp({ router });
@@ -1325,6 +1756,141 @@ describe("router HTTP composition", () => {
     } finally {
       await router.close();
       blocker.release();
+      governor.close();
+    }
+  });
+
+  it("retains a streaming request graph while upstream headers are pending", async () => {
+    const MiB = 1024 ** 2;
+    const governor = new ResourceGovernor({
+      probe: {
+        sample: () => ({
+          totalBytes: 16 * 1024 ** 3,
+          freeBytes: 12 * 1024 ** 3,
+          rssBytes: 256 * MiB,
+          heapBytes: 64 * MiB,
+          externalBytes: 8 * MiB,
+          logicalProcessors: 8,
+        }),
+      },
+    });
+    const id = projectId("00000000-0000-4000-8000-000000000098");
+    const responseFinal = final("resp_stream_request_lifetime");
+    let active = 0;
+    let markPreludeAccessed!: () => void;
+    const preludeAccessed = new Promise<void>(resolve => { markPreludeAccessed = resolve; });
+    let resolvePrelude!: (value: {
+      status: number;
+      contentType: string;
+      upstreamRequestId: null;
+    }) => void;
+    const upstreamPrelude = new Promise<{
+      status: number;
+      contentType: string;
+      upstreamRequestId: null;
+    }>(resolve => { resolvePrelude = resolve; });
+    let resolveFinal!: (value: typeof responseFinal) => void;
+    const terminal = new Promise<typeof responseFinal>(resolve => { resolveFinal = resolve; });
+    const runtime: RoutableSandboxRuntime = {
+      projectId: id,
+      async start() {},
+      async drain() {},
+      async stop() {},
+      snapshot: () => ({
+        projectId: id,
+        state: "ready",
+        capacity: 1,
+        active,
+        available: Math.max(0, 1 - active),
+        quarantined: 0,
+        heartbeatAgeMs: 0,
+        credentialExpiresInMs: 60_000,
+        ackEwmaMs: 1,
+        completionEwmaMs: 1,
+        recentFailureRate: 0,
+        queueDepth: 0,
+        memoryPressure: 0,
+        failure: null,
+      }),
+      async run(_body, _signal, options) {
+        active = 1;
+        options?.onAdmissionReflected?.();
+        options?.onExecutionRiskReflected?.();
+        return {
+          async *events() {},
+          get upstreamPrelude() {
+            markPreludeAccessed();
+            return upstreamPrelude;
+          },
+          final: terminal.finally(() => { active = 0; }),
+          stats: { bytes: 0, firstByteMs: null, frames: 0 },
+        };
+      },
+    };
+    const authorizationScope = createAuthenticatedTenantScope();
+    const router = new MultiSandboxRouter({
+      registry: new SandboxRegistry([runtime]),
+      authorizationScope,
+      governor,
+    });
+    const app = createGhostProvApp({ router, authorizationScope });
+    const requestBody = JSON.stringify({
+      model: "gpt-5.6-sol",
+      input: "x".repeat(768 * 1024),
+      stream: true,
+    });
+    const incomingLease = await router.acquireIncomingBody(Buffer.byteLength(requestBody));
+    let response: Response | null = null;
+    const responsePromise = app.fetch(new Request("http://ghostprov.test/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    }), { incomingBodyLease: incomingLease });
+
+    try {
+      let preludeTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          preludeAccessed,
+          new Promise<never>((_, reject) => {
+            preludeTimer = setTimeout(
+              () => reject(new Error("HTTP handler did not await upstream headers")),
+              2_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (preludeTimer !== undefined) clearTimeout(preludeTimer);
+      }
+      // Once transport commitment returns the handle, the router normally
+      // shrinks its request reservation to 4 MiB. The HTTP frame still owns the
+      // parsed request while awaiting headers, so its graph lifetime must keep
+      // the full reservation instead.
+      expect(governor.snapshot().reservedBytes).toBeGreaterThan(4 * MiB);
+
+      resolvePrelude({
+        status: 200,
+        contentType: "text/event-stream",
+        upstreamRequestId: null,
+      });
+      response = await responsePromise;
+      expect(response.status).toBe(200);
+      resolveFinal(responseFinal);
+      for (let turn = 0; turn < 100 && governor.snapshot().reservedBytes > 0; turn++) {
+        await Bun.sleep(1);
+      }
+      expect(governor.snapshot().reservedBytes).toBe(0);
+      await response.body?.cancel();
+    } finally {
+      resolvePrelude({
+        status: 200,
+        contentType: "text/event-stream",
+        upstreamRequestId: null,
+      });
+      resolveFinal(responseFinal);
+      response ??= await Promise.resolve(responsePromise).catch(() => null);
+      await response?.body?.cancel().catch(() => undefined);
+      await router.close();
       governor.close();
     }
   });
@@ -1668,7 +2234,9 @@ describe("router HTTP composition", () => {
     let markAborted!: () => void;
     const started = new Promise<void>(resolve => { markStarted = resolve; });
     const aborted = new Promise<void>(resolve => { markAborted = resolve; });
+    const authorizationScope = createAuthenticatedTenantScope();
     const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
       snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
       startRelay: (_body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) => {
         markStarted();
@@ -1682,8 +2250,14 @@ describe("router HTTP composition", () => {
         });
       },
     };
-    const app = createGhostProvApp({ router });
-    const server = createGhostProvServer({ app, router, candidate: true, port: 0 });
+    const app = createGhostProvApp({ router, authorizationScope });
+    const server = createGhostProvServer({
+      app,
+      router,
+      authorizationScope,
+      candidate: true,
+      port: 0,
+    });
     servers.push(server);
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();

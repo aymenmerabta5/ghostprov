@@ -66,6 +66,25 @@ type ReasoningSummaryStreamState = {
   completedDigest: string | null;
 };
 
+type CompletedToolArguments = Readonly<{
+  digest: string;
+  units: number;
+  bytes: number;
+}>;
+
+type PreparedStreamCompletion = Readonly<{
+  events: AnthropicSseEvent[];
+  finalValue: unknown;
+  projected: AnthropicAdapterMessage;
+}>;
+
+export type AnthropicTerminalReplayProof = Readonly<{
+  validatedFunctionArguments(
+    outputIndex: number,
+    item: Readonly<Record<string, unknown>>,
+  ): boolean;
+}>;
+
 function malformedEvent(): never {
   throw invalidUpstream(MALFORMED_EVENT_MESSAGE);
 }
@@ -104,7 +123,14 @@ export type AnthropicStreamTranslatorOptions = {
   beforeMessageStop?(
     finalValue: unknown,
     projected: AnthropicAdapterMessage,
+    replayProof: AnthropicTerminalReplayProof,
   ): void;
+  /** Async terminal barrier; callers must use pushAsync/finishAsync. */
+  beforeMessageStopAsync?(
+    finalValue: unknown,
+    projected: AnthropicAdapterMessage,
+    replayProof: AnthropicTerminalReplayProof,
+  ): void | Promise<void>;
 };
 
 /**
@@ -119,6 +145,7 @@ export type AnthropicStreamTranslatorOptions = {
 export class AnthropicStreamTranslator {
   readonly #context: AnthropicResponseContext;
   readonly #beforeMessageStop: AnthropicStreamTranslatorOptions["beforeMessageStop"];
+  readonly #beforeMessageStopAsync: AnthropicStreamTranslatorOptions["beforeMessageStopAsync"];
   readonly #limits: AnthropicRequestLimits;
   readonly #streamLimits: AnthropicStreamLimits;
   readonly #stopSequences: string[];
@@ -131,6 +158,7 @@ export class AnthropicStreamTranslator {
   readonly #budget: AnthropicStreamBudget;
   readonly #blocksByIdentity = new Map<string, StreamBlock>();
   readonly #blocksByPosition = new Map<string, StreamBlock>();
+  readonly #completedToolArguments = new Map<StreamBlock, CompletedToolArguments>();
   #blocks: StreamBlock[] = [];
   #matchedStop: string | null = null;
   #started = false;
@@ -154,6 +182,7 @@ export class AnthropicStreamTranslator {
     this.#budget = new AnthropicStreamBudget(this.#streamLimits);
     this.#context = { ...context, stopSequences: this.#stopSequences };
     this.#beforeMessageStop = options.beforeMessageStop;
+    this.#beforeMessageStopAsync = options.beforeMessageStopAsync;
     this.#textFilter = new UnicodeStopFilter(this.#stopSequences);
   }
 
@@ -185,26 +214,21 @@ export class AnthropicStreamTranslator {
     if (this.#terminal) return [];
     const events = this.#started ? [] : this.start();
     try {
-      if (!frame || typeof frame.event !== "string" || typeof frame.data !== "string") {
-        malformedEvent();
-      }
-      this.#budget.countWire(frame.data);
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(frame.data);
-      } catch {
-        malformedEvent();
-      }
-      const event = record(parsed);
-      if (!event || typeof event.type !== "string" || event.type !== frame.event) {
-        malformedEvent();
-      }
-      const acceptedSuffix = this.#protocol.accept(event);
-      this.#countStreamedPayload(event.type, event);
-      if (acceptedSuffix !== null && acceptedSuffix.value.length > 0) {
-        this.#budget.countPayload(acceptedSuffix.category, acceptedSuffix.value);
-      }
+      const event = this.#acceptFrame(frame);
       events.push(...this.#translate(event.type, event));
+      return events;
+    } catch (error) {
+      events.push(...this.#emitError(error));
+      return events;
+    }
+  }
+
+  async pushAsync(frame: SseFrame): Promise<AnthropicSseEvent[]> {
+    if (this.#terminal) return [];
+    const events = this.#started ? [] : this.start();
+    try {
+      const event = this.#acceptFrame(frame);
+      events.push(...await this.#translateAsync(event.type, event));
       return events;
     } catch (error) {
       events.push(...this.#emitError(error));
@@ -217,6 +241,18 @@ export class AnthropicStreamTranslator {
     const events = this.#started ? [] : this.start();
     try {
       events.push(...this.#complete(finalValue));
+      return events;
+    } catch (error) {
+      events.push(...this.#emitError(error));
+      return events;
+    }
+  }
+
+  async finishAsync(finalValue: unknown): Promise<AnthropicSseEvent[]> {
+    if (this.#terminal) return [];
+    const events = this.#started ? [] : this.start();
+    try {
+      events.push(...await this.#completeAsync(finalValue));
       return events;
     } catch (error) {
       events.push(...this.#emitError(error));
@@ -245,6 +281,29 @@ export class AnthropicStreamTranslator {
           .reduce((summaryTotal, summary) =>
             summaryTotal + summary.scalar.retainedCodePoints(), 0), 0),
     };
+  }
+
+  #acceptFrame(frame: SseFrame): Record<string, unknown> & { type: string } {
+    if (!frame || typeof frame.event !== "string" || typeof frame.data !== "string") {
+      malformedEvent();
+    }
+    this.#budget.countWire(frame.data);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(frame.data);
+    } catch {
+      malformedEvent();
+    }
+    const event = record(parsed);
+    if (!event || typeof event.type !== "string" || event.type !== frame.event) {
+      malformedEvent();
+    }
+    const acceptedSuffix = this.#protocol.accept(event);
+    this.#countStreamedPayload(event.type, event);
+    if (acceptedSuffix !== null && acceptedSuffix.value.length > 0) {
+      this.#budget.countPayload(acceptedSuffix.category, acceptedSuffix.value);
+    }
+    return event as Record<string, unknown> & { type: string };
   }
 
   #countStreamedPayload(type: string, event: Record<string, unknown>): void {
@@ -294,6 +353,17 @@ export class AnthropicStreamTranslator {
     return events;
   }
 
+  async #translateAsync(
+    type: string,
+    event: Record<string, unknown>,
+  ): Promise<AnthropicSseEvent[]> {
+    if (type === "response.completed" || type === "response.incomplete") {
+      if (!("response" in event)) malformedEvent();
+      return this.#completeAsync(event.response);
+    }
+    return this.#translate(type, event);
+  }
+
   #onOutputItemAdded(
     event: Record<string, unknown>,
     events: AnthropicSseEvent[],
@@ -319,7 +389,7 @@ export class AnthropicStreamTranslator {
 
   #onContentPartAdded(
     event: Record<string, unknown>,
-    events: AnthropicSseEvent[],
+    _events: AnthropicSseEvent[],
   ): void {
     const outputIndex = indexField(event, "output_index");
     const contentIndex = indexField(event, "content_index");
@@ -536,6 +606,57 @@ export class AnthropicStreamTranslator {
   }
 
   #complete(finalValue: unknown): AnthropicSseEvent[] {
+    const completion = this.#prepareCompletion(finalValue);
+    if (this.#beforeMessageStopAsync) {
+      throw invalidUpstream("Asynchronous terminal work requires the async translator API.");
+    }
+    let hookResult: unknown;
+    if (this.#beforeMessageStop) {
+      try {
+        hookResult = this.#beforeMessageStop(
+          completion.finalValue,
+          completion.projected,
+          this.#terminalReplayProof(),
+        );
+      } catch {
+        // Continuation metadata is advisory and must never alter public SSE.
+      }
+    }
+    if (hookResult && typeof (hookResult as Promise<void>).then === "function") {
+      void Promise.resolve(hookResult).catch(() => undefined);
+      throw invalidUpstream("Asynchronous terminal work requires the async translator API.");
+    }
+    return this.#sealCompletion(completion.events);
+  }
+
+  async #completeAsync(finalValue: unknown): Promise<AnthropicSseEvent[]> {
+    const completion = this.#prepareCompletion(finalValue);
+    if (this.#beforeMessageStop) {
+      try {
+        await this.#beforeMessageStop(
+          completion.finalValue,
+          completion.projected,
+          this.#terminalReplayProof(),
+        );
+      } catch {
+        // Continuation metadata is advisory and must never alter public SSE.
+      }
+    }
+    if (this.#beforeMessageStopAsync) {
+      try {
+        await this.#beforeMessageStopAsync(
+          completion.finalValue,
+          completion.projected,
+          this.#terminalReplayProof(),
+        );
+      } catch {
+        // Continuation metadata is advisory and must never alter public SSE.
+      }
+    }
+    return this.#sealCompletion(completion.events);
+  }
+
+  #prepareCompletion(finalValue: unknown): PreparedStreamCompletion {
     this.#protocol.validateFinal(finalValue);
     const projectionFinal = this.#projectionFinal(finalValue);
     const converted = responseToAnthropic(projectionFinal, this.#context);
@@ -615,6 +736,12 @@ export class AnthropicStreamTranslator {
         if (!block.stopped) {
           const args = descriptor.arguments ?? "{}";
           assertUnicodeWellFormed(args);
+          // responseToAnthropic just parsed and bounded this exact terminal
+          // argument. Retain only its fixed-size proof so replay projection does
+          // not parse the same potentially large JSON a second time.
+          if (!this.#completedToolArguments.has(block)) {
+            this.#completedToolArguments.set(block, this.#toolArgumentValidation(args));
+          }
           this.#reconcileArguments(block, args);
           this.#assertStreamedPrefix(block, args);
           const remaining = args.slice(block.emittedUnits);
@@ -673,13 +800,10 @@ export class AnthropicStreamTranslator {
       },
       usage: converted.usage,
     });
-    if (this.#beforeMessageStop) {
-      try {
-        this.#beforeMessageStop(projectionFinal, converted);
-      } catch {
-        // Continuation metadata is advisory and must never alter public SSE.
-      }
-    }
+    return { events, finalValue: projectionFinal, projected: converted };
+  }
+
+  #sealCompletion(events: AnthropicSseEvent[]): AnthropicSseEvent[] {
     events.push({ type: "message_stop" });
     this.#protocol.markTerminal();
     this.#terminal = true;
@@ -756,6 +880,7 @@ export class AnthropicStreamTranslator {
     this.#blocksByPosition.clear();
     this.#textFilter.clear();
     this.#reasoningSummaries.clear();
+    this.#completedToolArguments.clear();
     this.#budget.clearRetained();
     this.#matchedStop = null;
     this.#drainCursor = 0;
@@ -830,14 +955,56 @@ export class AnthropicStreamTranslator {
 
   #validateToolArguments(block: StreamBlock, itemId: string | null, args: string): void {
     if (block.toolId === null || block.toolName === null) return;
+    const normalized = args.trim().length > 0 ? args : "{}";
+    const validation = this.#toolArgumentValidation(normalized);
+    const completed = this.#completedToolArguments.get(block);
+    if (completed) {
+      if (completed.units !== validation.units || completed.bytes !== validation.bytes ||
+        completed.digest !== validation.digest) {
+        throw invalidUpstream(
+          "Responses stream could not be reconciled with its final response.",
+        );
+      }
+      return;
+    }
     responseToAnthropic(terminalForStreamItem({
       type: "function_call",
       ...(itemId === null ? {} : { id: itemId }),
       status: "completed",
       call_id: block.toolId,
       name: block.toolName,
-      arguments: args,
+      arguments: normalized,
     }), this.#context);
+    this.#completedToolArguments.set(block, validation);
+  }
+
+  #toolArgumentValidation(value: string): CompletedToolArguments {
+    assertUnicodeWellFormed(value);
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes > this.#limits.outputBytes) {
+      throw invalidUpstream("Responses relay returned invalid function call arguments.");
+    }
+    return {
+      digest: createHash("sha256").update(value, "utf8").digest("base64url"),
+      units: value.length,
+      bytes,
+    };
+  }
+
+  #terminalReplayProof(): AnthropicTerminalReplayProof {
+    return Object.freeze({
+      validatedFunctionArguments: (outputIndex, item) => {
+        const block = this.#blocksByPosition.get(`tool_use:${outputIndex}:-`);
+        const completed = block && this.#completedToolArguments.get(block);
+        if (!block || !completed || item.type !== "function_call" ||
+          item.call_id !== block.toolId || item.name !== block.toolName ||
+          typeof item.arguments !== "string") return false;
+        const normalized = item.arguments.trim().length > 0 ? item.arguments : "{}";
+        const terminal = this.#toolArgumentValidation(normalized);
+        return terminal.units === completed.units && terminal.bytes === completed.bytes &&
+          terminal.digest === completed.digest;
+      },
+    });
   }
 
   #reconcileArguments(block: StreamBlock, value: string, countSuffix = true): void {

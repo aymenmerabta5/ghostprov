@@ -5,7 +5,6 @@ import { createGhostProvApp, type RouterLike } from "../src/server/app";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import {
   attachAtomicBytePermit,
-  releaseAtomicBytePermit,
 } from "../src/v2/memory/permit-carrier";
 import type { SseFrame } from "../src/relay/sse";
 import {

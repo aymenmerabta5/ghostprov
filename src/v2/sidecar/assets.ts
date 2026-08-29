@@ -554,11 +554,3 @@ export async function loadV2SidecarAssets(
   await assertV2SidecarAssets(assets, revision);
   return assets;
 }
-
-export function sidecarSourcePath(asset: V2SidecarAsset): string {
-  const prefix = `${ASSET_PREFIX}/`;
-  if (!asset.path.startsWith(prefix)) {
-    throw new Error(`V2 sidecar asset is outside ${ASSET_PREFIX}: ${asset.path}`);
-  }
-  return asset.path.slice(prefix.length);
-}

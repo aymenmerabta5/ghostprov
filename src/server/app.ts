@@ -1,8 +1,12 @@
-import { ResponsesHttpContinuationIndex } from "../http/responses-continuation";
+import {
+  ResponsesHttpContinuationIndex,
+  responsesContinuationPreparationCostBytes,
+} from "../http/responses-continuation";
 import { Hono } from "hono";
 import type { RunHandle } from "../relay/run-handle";
 import { definitivePreviousResponseNotFound } from "../relay/continuation-error";
-import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { validateResponsesInputJson } from "../relay/responses-validation";
 import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
@@ -14,7 +18,9 @@ import {
   type AnthropicModelOptions,
 } from "../anthropic/model";
 import type { ResponseProvenanceLookup } from "../router/provenance";
-import { jsonEncodedByteLength } from "../router/workload";
+import {
+  jsonEncodedByteLengthAsync,
+} from "../router/workload";
 import type { IncomingResourceLease } from "../router/router";
 import {
   incomingLeaseTimingView,
@@ -56,12 +62,14 @@ export interface RouterLike {
       encodedBodyBytes?: number;
       structuralBodyBytes?: number;
       fairnessRequestBytes?: number;
+      retainIncomingLeaseBytes?: boolean;
+      retainMemoryUntil?: Promise<unknown>;
     },
   ): Promise<RunHandle>;
   acquireIncomingBody?(
     bytes: number,
     signal?: AbortSignal,
-    options?: { maxBytes?: number },
+    options?: { maxBytes?: number; reservationMultiplier?: number },
   ): Promise<IncomingResourceLease>;
   responseProvenanceAuthorizationScope?(): AuthenticatedTenantScope | null;
   lookupResponseProvenance?(
@@ -115,6 +123,7 @@ const RESPONSE_TERMINAL_EVENTS = new Set([
   "response.failed",
 ]);
 const MAX_TIMER_MS = 2_147_483_647;
+const MAX_SYNCHRONOUS_STRUCTURAL_MEASURE_BYTES = 256 * 1024;
 const MAX_PUBLIC_UNAVAILABLE_PROJECTS = 256;
 const PUBLIC_PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -198,6 +207,14 @@ function terminalEventForFinal(final: unknown): string {
 }
 
 function nextResponseSequence(data: string, current: number | null): number | null {
+  // Never parse a multi-MiB delta a second time solely to decorate a rare
+  // final-only fallback. Provider Responses events are a contiguous sequence,
+  // so advance the already-validated stream cursor without retaining/parsing
+  // the large payload. This also prevents a synthesized terminal from reusing
+  // the large event's sequence number.
+  if (data.length > 64 * 1024) {
+    return current === null ? 1 : current < Number.MAX_SAFE_INTEGER ? current + 1 : null;
+  }
   let value: unknown;
   try {
     value = JSON.parse(data);
@@ -228,9 +245,20 @@ function linkedAbortController(signal: AbortSignal): {
   };
 }
 
+const NONSTREAM_CLEANUP_MS = 25;
+
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+  return promise.then(
+    value => ({ ok: true as const, value }),
+    error => ({ ok: false as const, error }),
+  );
+}
+
 async function nonStreamingFinal(
   handle: RunHandle,
-  cancelRelay: (reason?: unknown) => void,
+  controller: AbortController,
   onFailure: (
     source: "final" | "events" | "unknown",
     sawRelayEvent: boolean,
@@ -238,42 +266,122 @@ async function nonStreamingFinal(
 ): Promise<any> {
   const iterator = handle.events();
   let sawRelayEvent = false;
-  let finalRejected = false;
-  let eventsRejected = false;
-  let settledFinal: any = null;
-  const final = handle.final.then(value => {
-    settledFinal = value;
-    return value;
-  }, error => {
-    finalRejected = true;
-    throw error;
-  });
+  let drainSettled = false;
   const drain = (async () => {
     try {
-      while (!(await iterator.next()).done) {
-        sawRelayEvent = true;
-        // Non-streaming callers still have to consume the bounded transport
-        // queue. The authoritative response is provided by handle.final.
-      }
-    } catch (error) {
-      eventsRejected = true;
-      throw error;
+      while (!(await iterator.next()).done) sawRelayEvent = true;
+    } finally {
+      drainSettled = true;
     }
   })();
-  try {
-    const [value] = await Promise.all([final, drain]);
-    return value;
-  } catch (error) {
-    if (settledFinal) releaseAtomicBytePermit(settledFinal);
-    else void final.then(releaseAtomicBytePermit, () => undefined);
-    cancelRelay(error);
-    void iterator.return(undefined).catch(() => undefined);
-    onFailure(
-      finalRejected ? "final" : eventsRejected ? "events" : "unknown",
-      sawRelayEvent,
-    );
-    throw error;
+  let finalPromise: Promise<any>;
+  try { finalPromise = Promise.resolve(handle.final); }
+  catch (error) { finalPromise = Promise.reject(error); }
+  const finalOutcome = settle(finalPromise);
+  const drainOutcome = settle(drain);
+  let returnCalled = false;
+  const returnIterator = (): void => {
+    if (returnCalled) return;
+    returnCalled = true;
+    try { void Promise.resolve(iterator.return(undefined)).catch(() => undefined); }
+    catch {}
+  };
+  const releaseLateFinal = (): void => {
+    void finalOutcome.then(outcome => {
+      if (outcome.ok) releaseAtomicBytePermit(outcome.value);
+    });
+  };
+  const waitForCancellation = (): {
+    promise: Promise<{ cancelled: true; error: unknown }>;
+    dispose(): void;
+  } => {
+    let listener: (() => void) | null = null;
+    const promise = new Promise<{ cancelled: true; error: unknown }>(resolve => {
+      const finish = () => resolve({
+        cancelled: true,
+        error: controller.signal.reason ?? new DOMException("Request was cancelled", "AbortError"),
+      });
+      if (controller.signal.aborted) finish();
+      else {
+        listener = finish;
+        controller.signal.addEventListener("abort", finish, { once: true });
+      }
+    });
+    return {
+      promise,
+      dispose() {
+        if (listener) controller.signal.removeEventListener("abort", listener);
+        listener = null;
+      },
+    };
+  };
+  const cancellation = waitForCancellation();
+  const first = await Promise.race([
+    finalOutcome.then(result => ({ source: "final" as const, result })),
+    drainOutcome.then(result => ({ source: "events" as const, result })),
+    cancellation.promise,
+  ]);
+  cancellation.dispose();
+  if ("cancelled" in first) {
+    releaseLateFinal();
+    returnIterator();
+    onFailure("unknown", sawRelayEvent);
+    throw first.error;
   }
+
+  let failure: { source: "final" | "events" | "unknown"; error: unknown } | null = null;
+  let value: any = null;
+  if (!first.result.ok) {
+    failure = { source: first.source, error: first.result.error };
+  } else {
+    const second = first.source === "final" ? drainOutcome : finalOutcome;
+    const secondCancellation = waitForCancellation();
+    const secondResult = await Promise.race([second, secondCancellation.promise]);
+    secondCancellation.dispose();
+    if ("cancelled" in secondResult) {
+      releaseLateFinal();
+      returnIterator();
+      onFailure("unknown", sawRelayEvent);
+      throw secondResult.error;
+    }
+    if (!secondResult.ok) {
+      failure = {
+        source: first.source === "final" ? "events" : "final",
+        error: secondResult.error,
+      };
+    } else {
+      value = first.source === "final" ? first.result.value : secondResult.value;
+    }
+  }
+  if (!failure) return value;
+
+  if (failure.source === "final" && !drainSettled) {
+    // Let an already-accepted event become observable before cancellation. If
+    // the read remains pending, absence is unproven and replay stays disabled.
+    const observation = await Promise.race([
+      drainOutcome.then(result => ({ settled: true as const, result })),
+      new Promise<{ settled: false }>(resolve => setTimeout(
+        () => resolve({ settled: false }),
+        0,
+      )),
+    ]);
+    if (!observation.settled) failure.source = "unknown";
+    else if (!observation.result.ok) failure.source = "events";
+  }
+  releaseLateFinal();
+  if (!controller.signal.aborted) controller.abort(failure.error);
+  returnIterator();
+  let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.all([finalOutcome, drainOutcome]).then(() => undefined),
+    new Promise<void>(resolve => {
+      cleanupTimer = setTimeout(resolve, NONSTREAM_CLEANUP_MS);
+      cleanupTimer.unref?.();
+    }),
+  ]);
+  if (cleanupTimer !== undefined) clearTimeout(cleanupTimer);
+  onFailure(failure.source, sawRelayEvent);
+  throw failure.error;
 }
 
 function releaseFailedPreludeHandle(
@@ -282,6 +390,7 @@ function releaseFailedPreludeHandle(
   error: unknown,
 ): void {
   if (!controller.signal.aborted) controller.abort(error);
+  handle.discardUnconsumedEvents?.();
   try {
     void Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined);
   } catch {
@@ -347,10 +456,12 @@ function responseEventStream(
   options: {
     cancelRelay(reason?: unknown): void;
     close(): void;
+    signal: AbortSignal;
   },
 ): ReadableStream<Uint8Array> {
   type NextOutcome = { kind: "next"; result: IteratorResult<SseFrame, void> };
   type CancelledOutcome = { kind: "cancelled" };
+  type AbortedOutcome = { kind: "aborted"; reason: unknown };
   const encoder = new TextEncoder();
   const iterator = handle.events();
   let deliveredChunk: Uint8Array | null = null;
@@ -363,6 +474,24 @@ function responseEventStream(
   let wakeCancellation: (() => void) | null = null;
   let finalForCleanup: Record<string, unknown> | null = null;
   let closeAfterDeliveredChunk = false;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let resolveAborted!: (value: AbortedOutcome) => void;
+  const aborted = new Promise<AbortedOutcome>(resolve => { resolveAborted = resolve; });
+  const onAbort = () => {
+    resolveAborted({ kind: "aborted", reason: options.signal.reason });
+    const controller = streamController;
+    if (!controller || finished || cancelled) return;
+    // A Fetch consumer is allowed to never pull the returned body. Abort must
+    // still release the final/event permits and iterator immediately rather
+    // than waiting for a pull or explicit body.cancel() that may never happen.
+    discardAndReturnIterator();
+    finish(controller);
+  };
+
+  const discardAndReturnIterator = (): void => {
+    handle.discardUnconsumedEvents?.();
+    void iterator.return(undefined).catch(() => undefined);
+  };
 
   void handle.final.then(final => {
     if (finished || cancelled) releaseAtomicBytePermit(final);
@@ -398,6 +527,7 @@ function responseEventStream(
     dequeuedFrame = null;
     releaseAtomicBytePermit(finalForCleanup);
     finalForCleanup = null;
+    options.signal.removeEventListener("abort", onAbort);
     options.close();
     if (!cancelled) controller.close();
   };
@@ -407,12 +537,15 @@ function responseEventStream(
     error: unknown,
   ): void => {
     if (finished || cancelled) return;
-    options.cancelRelay(error);
-    void iterator.return(undefined).catch(() => undefined);
     try {
       controller.enqueue(encoder.encode(sseFrame("error", apiErrorEvent(error))));
     } finally {
+      discardAndReturnIterator();
       finish(controller);
+      // finish() removes the request-abort listener first. Aborting relay work
+      // before the public error is queued would synchronously close this stream
+      // and silently drop the committed HTTP-200 terminal error frame.
+      options.cancelRelay(error);
     }
   };
 
@@ -420,6 +553,7 @@ function responseEventStream(
     | NextOutcome
     | { kind: "keepalive" }
     | CancelledOutcome
+    | AbortedOutcome
   > => {
     const next = pendingNext ??= iterator.next().then(result => {
       if (!result.done) {
@@ -445,6 +579,7 @@ function responseEventStream(
         next,
         keepAlive,
         cancellation.promise,
+        aborted,
       ]);
       if (result.kind === "next" && pendingNext === next) pendingNext = null;
       return result;
@@ -454,7 +589,10 @@ function responseEventStream(
     }
   };
 
-  return new ReadableStream<Uint8Array>({
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
     async pull(controller) {
       if (finished || cancelled) return;
       // highWaterMark=0 means a new pull proves the previous chunk left the
@@ -468,6 +606,11 @@ function responseEventStream(
       try {
         const outcome = await nextOrKeepAlive();
         if (cancelled || outcome.kind === "cancelled") return;
+        if (outcome.kind === "aborted") {
+          discardAndReturnIterator();
+          finish(controller);
+          return;
+        }
         if (outcome.kind === "keepalive") {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
           return;
@@ -483,8 +626,14 @@ function responseEventStream(
             const finalOutcome = await Promise.race([
               handle.final.then(() => ({ kind: "final" as const })),
               cancellation.promise,
+              aborted,
             ]).finally(cancellation.dispose);
             if (cancelled || finalOutcome.kind === "cancelled") return;
+            if (finalOutcome.kind === "aborted") {
+              discardAndReturnIterator();
+              finish(controller);
+              return;
+            }
             sawTerminal = true;
           }
           nextSequence = nextResponseSequence(frame.data, nextSequence);
@@ -509,8 +658,14 @@ function responseEventStream(
           const finalOutcome = await Promise.race([
             handle.final.then(value => ({ kind: "final" as const, value })),
             cancellation.promise,
+            aborted,
           ]).finally(cancellation.dispose);
           if (cancelled || finalOutcome.kind === "cancelled") return;
+          if (finalOutcome.kind === "aborted") {
+            discardAndReturnIterator();
+            finish(controller);
+            return;
+          }
           const event = terminalEventForFinal(finalOutcome.value);
           let encoded: Uint8Array | null = null;
           try {
@@ -549,13 +704,17 @@ function responseEventStream(
       dequeuedFrame = null;
       releaseAtomicBytePermit(finalForCleanup);
       finalForCleanup = null;
+      options.signal.removeEventListener("abort", onAbort);
       wakeCancellation?.();
       wakeCancellation = null;
       options.cancelRelay(reason);
       options.close();
-      void iterator.return(undefined).catch(() => undefined);
+      discardAndReturnIterator();
     },
   }, { highWaterMark: 0 });
+  options.signal.addEventListener("abort", onAbort, { once: true });
+  if (options.signal.aborted) onAbort();
+  return stream;
 }
 
 function codexModel(input: {
@@ -657,16 +816,36 @@ const CODEX_MODELS = Object.freeze([
   }),
 ]);
 
+const GHOSTPROV_APP_AUTHORIZATION_SCOPES = new WeakMap<
+  object,
+  AuthenticatedTenantScope | null
+>();
+
+export function ghostProvAppAuthorizationScope(
+  app: object,
+): AuthenticatedTenantScope | null | undefined {
+  return GHOSTPROV_APP_AUTHORIZATION_SCOPES.get(app);
+}
+
 export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   const app = new Hono();
   const keepAliveMs = options.keepAliveMs ?? 15_000;
-  const scopeValue = options.authorizationScope ??
-    options.router.responseProvenanceAuthorizationScope?.() ??
-    null;
+  const routerScope = options.router.responseProvenanceAuthorizationScope?.() ?? null;
+  if (routerScope !== null && !isAuthenticatedTenantScope(routerScope)) {
+    throw new TypeError("router authorization scope must be an AuthenticatedTenantScope");
+  }
+  if (
+    options.authorizationScope !== undefined &&
+    options.authorizationScope !== routerScope
+  ) {
+    throw new TypeError("authorizationScope must be the router's exact AuthenticatedTenantScope");
+  }
+  const scopeValue = options.authorizationScope ?? routerScope;
   if (scopeValue !== null && !isAuthenticatedTenantScope(scopeValue)) {
     throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
   }
   const authorizationScope = scopeValue;
+  GHOSTPROV_APP_AUTHORIZATION_SCOPES.set(app, authorizationScope);
   const responsesContinuationIndex = options.responsesContinuationIndex ??
     new ResponsesHttpContinuationIndex();
   const anthropicContinuationIndex = options.anthropicContinuationIndex ??
@@ -746,18 +925,21 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
 
 
   app.post("/v1/responses", async c => {
-    let body: Record<string, unknown>;
+    let parsedBody: unknown;
     try {
-      body = await c.req.json();
+      parsedBody = await c.req.json();
     } catch {
       return c.json({ error: { message: "invalid JSON body" } }, 400);
     }
+    if (parsedBody === null || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+      return apiErrorResponse(new ApiError(400, "Request body must be a JSON object.", {
+        type: "invalid_request_error",
+        param: "body",
+        code: "invalid_type",
+      }));
+    }
+    let body = parsedBody as Record<string, unknown>;
     const clientWantsStream = body.stream === true;
-    const rawStructuralBytes = jsonEncodedByteLength(body);
-    let upstreamBody: Record<string, unknown> = normalizeUpstreamResponsesRequest(body);
-    const upstreamStructuralBytes = upstreamBody === body
-      ? rawStructuralBytes
-      : jsonEncodedByteLength(upstreamBody);
     const incomingLease = takeIncomingBodyLease(c.env);
     const requestSignal = c.req.raw.signal;
     const relayAbort = new AbortController();
@@ -765,6 +947,33 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     if (requestSignal.aborted) abortRelay();
     else requestSignal.addEventListener("abort", abortRelay, { once: true });
     const unlinkIncomingSignal = linkIncomingLeaseAbort(relayAbort, incomingLease);
+    let rawStructuralBytes: number;
+    let upstreamBody: Record<string, unknown>;
+    let upstreamStructuralBytes: number;
+    try {
+      const leasedBodyBytes = Number.isSafeInteger(incomingLease?.bodyBytes) &&
+          Number(incomingLease?.bodyBytes) >= 0
+        ? Number(incomingLease!.bodyBytes)
+        : null;
+      upstreamBody = normalizeUpstreamResponsesRequest(body);
+      upstreamStructuralBytes = await jsonEncodedByteLengthAsync(upstreamBody, {
+        signal: relayAbort.signal,
+      });
+      // Validate the complete client history before advisory prefix inference
+      // can strip it. The router will validate the selected suffix again.
+      validateResponsesInputJson(upstreamBody);
+      rawStructuralBytes = upstreamBody === body
+        ? upstreamStructuralBytes
+        : leasedBodyBytes === null ||
+            leasedBodyBytes <= MAX_SYNCHRONOUS_STRUCTURAL_MEASURE_BYTES
+          ? await jsonEncodedByteLengthAsync(body, { signal: relayAbort.signal })
+          : upstreamStructuralBytes;
+    } catch (error) {
+      unlinkIncomingSignal();
+      requestSignal.removeEventListener("abort", abortRelay);
+      incomingLease?.release();
+      return apiErrorResponse(error);
+    }
     let incomingAdmissionCompleted = false;
     const completeIncomingAdmission = () => {
       if (incomingAdmissionCompleted) return;
@@ -779,6 +988,8 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       incomingLease?.release();
     };
     let streamOwnsCleanup = false;
+    let finishRequestLifetime!: () => void;
+    const requestLifetime = new Promise<void>(resolve => { finishRequestLifetime = resolve; });
     const cleanupSignal = () => requestSignal.removeEventListener("abort", abortRelay);
     try {
       const preparation = authorizationScope === null
@@ -787,9 +998,17 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
             upstreamBody,
             authorizationScope,
             relayAbort.signal,
-            incomingLease?.bodyBytes ?? incomingLease?.reservedBytes ?? upstreamStructuralBytes,
+            responsesContinuationPreparationCostBytes(
+              incomingLease?.bodyBytes ?? upstreamStructuralBytes,
+              incomingLease?.reservedBytes ?? 0,
+              upstreamStructuralBytes,
+            ),
           );
       const continuationToken = preparation?.token ?? null;
+      if (preparation) {
+        upstreamBody = preparation.fullRelayBody;
+        body = {};
+      }
       const initialRelayBody = preparation?.relayBody ?? upstreamBody;
       const hit = continuationToken?.decision === "hit";
       const continuationLease = hit ? incomingLeaseTimingView(incomingLease) : undefined;
@@ -802,7 +1021,9 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
         let relayBody = attempt === 0 ? initialRelayBody : upstreamBody;
         const relayStructuralBytes = relayBody === upstreamBody
           ? upstreamStructuralBytes
-          : jsonEncodedByteLength(relayBody);
+          : await jsonEncodedByteLengthAsync(relayBody, {
+              signal: attemptLink.controller.signal,
+            });
         const encodedBodyBytes = typeof incomingLease?.bodyBytes === "number"
           ? Math.min(
               Number.MAX_SAFE_INTEGER,
@@ -816,17 +1037,23 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
         let sawRelayEvent = false;
         let nonstreamFailureSource: "final" | "events" | "unknown" | null = null;
         try {
+          const attemptIncomingLease = attempt === 0
+            ? hit ? continuationLease : incomingLease
+            : hit ? incomingLease : undefined;
+          if (attempt > 0 && hit) incomingLeaseOwned = false;
           rawHandle = await options.router.startRelay(relayBody, {
             source: "http",
             clientId,
             signal: attemptLink.controller.signal,
-            incomingLease: hit
-              ? continuationLease
-              : attempt === 0 ? incomingLease : undefined,
+            incomingLease: attemptIncomingLease,
+            retainIncomingLeaseBytes: attempt > 0 && hit,
             encodedBodyBytes,
             structuralBodyBytes: relayStructuralBytes,
             fairnessRequestBytes: attempt === 0 && hit
               ? Math.max(incomingLease?.bodyBytes ?? 0, upstreamStructuralBytes)
+              : undefined,
+            retainMemoryUntil: !hit || attempt > 0
+              ? requestLifetime
               : undefined,
             authorizationScope: authorizationScope ?? undefined,
           });
@@ -839,12 +1066,18 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           }
           const handle: RunHandle = {
             events: () => rawHandle!.events(),
+            discardUnconsumedEvents: () => rawHandle!.discardUnconsumedEvents?.(),
             get rateLimit() { return rawHandle!.rateLimit; },
             get upstreamPrelude() { return rawHandle!.upstreamPrelude; },
             stats: rawHandle.stats,
-            final: rawHandle.final.then(final => {
+            final: rawHandle.final.then(async final => {
               if (authorizationScope !== null) {
-                responsesContinuationIndex.commit(continuationToken, authorizationScope, final);
+                await responsesContinuationIndex.commit(
+                  continuationToken,
+                  authorizationScope,
+                  final,
+                  attemptLink.controller.signal,
+                );
               }
               return final;
             }),
@@ -853,7 +1086,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
             stage = "nonstream";
             const final = await nonStreamingFinal(
               handle,
-              reason => attemptLink.controller.abort(reason),
+              attemptLink.controller,
               (source, sawEvent) => {
                 nonstreamFailureSource = source;
                 sawRelayEvent = sawEvent;
@@ -877,6 +1110,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           stage = "sse-commit";
           stream = responseEventStream(handle, keepAliveMs, {
             cancelRelay: reason => attemptLink.controller.abort(reason),
+            signal: attemptLink.controller.signal,
             close: () => {
               attemptLink.unlink();
               cleanupSignal();
@@ -901,7 +1135,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           const safeFailure = stage === "start" || stage === "prelude" ||
             (stage === "nonstream" && nonstreamFailureSource === "final" && !sawRelayEvent);
           const retry = attempt === 0 && hit && continuationToken !== null &&
-            continuationToken.match !== null && safeFailure &&
+            continuationToken.match !== null && !relayAbort.signal.aborted && safeFailure &&
             definitivePreviousResponseNotFound(error);
           if (retry && responsesContinuationIndex.compareDelete(continuationToken!)) {
             completeIncomingAdmission();
@@ -923,6 +1157,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       completeIncomingAdmission();
       releaseIncomingLease();
       if (!streamOwnsCleanup) cleanupSignal();
+      setImmediate(finishRequestLifetime);
     }
   });
 
@@ -931,12 +1166,22 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       responsesModel: "gpt-5.6-sol",
       maxEditInputBytes: 40 * 1024 ** 2,
     },
-    startRelay: (body, signal, clientId, incomingLease) => options.router.startRelay(body, {
+    startRelay: (
+      body,
+      signal,
+      clientId,
+      incomingLease,
+      retainMemoryUntil,
+      structuralBodyBytes,
+    ) =>
+      options.router.startRelay(body, {
       source: "image",
       clientId,
       signal,
       incomingLease,
+      structuralBodyBytes,
       authorizationScope: authorizationScope ?? undefined,
+      retainMemoryUntil,
     }),
   });
 
@@ -951,7 +1196,10 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       signal,
       incomingLease,
       authorizationScope: authorizationScope ?? undefined,
+      structuralBodyBytes: admission?.structuralBodyBytes,
       fairnessRequestBytes: admission?.fairnessBytes,
+      retainIncomingLeaseBytes: admission?.retainIncomingLeaseBytes,
+      retainMemoryUntil: admission?.retainMemoryUntil,
     }),
   });
 

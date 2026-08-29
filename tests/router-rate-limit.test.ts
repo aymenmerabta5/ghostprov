@@ -176,7 +176,9 @@ describe("V2 upstream rate-limit observation", () => {
     const value = router(runtime);
     const first = await value.startRelay({ model: "gpt-5.6-sol", input: "first" });
     const secondPending = value.startRelay({ model: "gpt-5.6-sol", input: "second" });
-    await Promise.resolve();
+    for (let turn = 0; turn < 20 && value.snapshot().queued === 0; turn++) {
+      await Promise.resolve();
+    }
     expect(runtime.calls).toBe(1);
     expect(value.snapshot().queued).toBe(1);
 

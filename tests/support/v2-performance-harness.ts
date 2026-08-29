@@ -37,7 +37,6 @@ import {
   type HostFrame,
   type ProtocolBinding,
   type ProtocolRevision,
-  type ReliableFrame,
   type RequestEncoding,
   type SidecarFrame,
   type V2TransportProfile,
@@ -51,6 +50,10 @@ import type {
   UpstreamTerminal,
 } from "../../src/v2/sidecar/upstream";
 import { TranscriptProof } from "../../src/v2/protocol/transcript";
+import type {
+  PublicationTimer,
+  PublicationTimerHandle,
+} from "../../src/v2/protocol/publication-pacer";
 import { parseAwarenessEnvelope } from "../../src/v2/protocol/validate";
 import { V2TransportSession } from "../../src/v2/transport/session";
 import {
@@ -226,6 +229,8 @@ export interface V2PerformanceHarnessReport {
   preparation: {
     gzipCalls: number;
     gzipWallMs: number;
+    unresolvedSessionRuns: number;
+    peakUnresolvedSessionRuns: number;
   };
   upstream: {
     calls: number;
@@ -316,13 +321,30 @@ interface HubEndpointMetadata {
   label: string;
 }
 
-interface QueuedUpdate {
+interface QueuedWorkBase {
   id: number;
   dueAtMs: number;
+}
+
+interface QueuedUpdate extends QueuedWorkBase {
+  kind: "delivery";
   target: HarnessAwarenessProvider | null;
   update: Uint8Array;
   bytes: number;
 }
+
+interface HarnessPublicationTimerHandle {
+  readonly id: number;
+  cancelled: boolean;
+}
+
+interface QueuedPublication extends QueuedWorkBase {
+  kind: "publication";
+  callback: () => void;
+  handle: HarnessPublicationTimerHandle | null;
+}
+
+type QueuedWork = QueuedUpdate | QueuedPublication;
 
 class HarnessAwarenessProvider
 implements AwarenessProviderLike, DenoAwarenessProviderLike {
@@ -392,7 +414,7 @@ class FaultyAwarenessHub {
   readonly #faults: readonly V2HarnessFaultRule[];
   readonly #disconnects: readonly V2HarnessTransientDisconnect[];
   readonly #providers = new Set<HarnessAwarenessProvider>();
-  readonly #queue: QueuedUpdate[] = [];
+  readonly #queue: QueuedWork[] = [];
   readonly #heldReorders = new Map<string, QueuedUpdate[]>();
   readonly #ordinals = new Map<string, number>();
   readonly #requestTraces = new Map<string, WireRequestTrace>();
@@ -401,7 +423,10 @@ class FaultyAwarenessHub {
   readonly #linkAvailableAt = new Map<string, number>();
   readonly #bandwidthBytesPerSecond: number;
   readonly #serializationBytesPerSecond: number;
-  #nextUpdateId = 1;
+  #hostPreparing: (() => number) | null = null;
+  #preparationPauseObserved = false;
+  #stablePreparationTurns = 0;
+  #nextWorkId = 1;
   #pump: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
   #attemptedPublications = 0;
@@ -437,6 +462,48 @@ class FaultyAwarenessHub {
       lane,
       label: `${role}-${lane}`,
     });
+  }
+
+  publicationTimer(
+    owner: "host" | "sidecar",
+    preparing?: () => number,
+  ): PublicationTimer {
+    if (owner === "host" && preparing) this.#hostPreparing = preparing;
+    return {
+      now: () => this.#clock.now(),
+      set: (callback, delayMs) => {
+        const handle: HarnessPublicationTimerHandle = {
+          id: this.#nextWorkId++,
+          cancelled: this.#closed,
+        };
+        if (!handle.cancelled) {
+          this.#queue.push({
+            kind: "publication",
+            id: handle.id,
+            dueAtMs: this.#clock.now() + Math.max(0, delayMs),
+            callback,
+            handle,
+          });
+          this.#schedulePump();
+        }
+        return handle;
+      },
+      clear: (opaque: PublicationTimerHandle) => {
+        if (!opaque || typeof opaque !== "object") return;
+        (opaque as HarnessPublicationTimerHandle).cancelled = true;
+      },
+      defer: callback => {
+        if (this.#closed) return;
+        this.#queue.push({
+          kind: "publication",
+          id: this.#nextWorkId++,
+          dueAtMs: this.#clock.now(),
+          callback,
+          handle: null,
+        });
+        this.#schedulePump();
+      },
+    };
   }
 
   onActivity(listener: () => void): () => void {
@@ -577,7 +644,8 @@ class FaultyAwarenessHub {
     }
 
     const queued: QueuedUpdate = {
-      id: this.#nextUpdateId++,
+      kind: "delivery",
+      id: this.#nextWorkId++,
       dueAtMs,
       target,
       update: update.slice(),
@@ -587,7 +655,7 @@ class FaultyAwarenessHub {
     if (actions.has("duplicate")) this.#duplicateDeliveries++;
     const deliveries = Array.from({ length: copies }, (_, index) => ({
       ...queued,
-      id: index === 0 ? queued.id : this.#nextUpdateId++,
+      id: index === 0 ? queued.id : this.#nextWorkId++,
       update: queued.update.slice(),
     }));
 
@@ -622,7 +690,8 @@ class FaultyAwarenessHub {
 
   #scheduleClockOnly(dueAtMs: number): void {
     this.#queue.push({
-      id: this.#nextUpdateId++,
+      kind: "delivery",
+      id: this.#nextWorkId++,
       dueAtMs,
       target: null,
       update: new Uint8Array(),
@@ -641,14 +710,38 @@ class FaultyAwarenessHub {
 
   #flushNext(): void {
     if (this.#closed || this.#queue.length === 0) return;
+    for (let index = this.#queue.length - 1; index >= 0; index--) {
+      const item = this.#queue[index]!;
+      if (item.kind === "publication" && item.handle?.cancelled) {
+        this.#queue.splice(index, 1);
+      }
+    }
     this.#queue.sort((left, right) =>
       left.dueAtMs - right.dueAtMs || left.id - right.id);
-    const dueAtMs = this.#queue[0]!.dueAtMs;
-    this.#clock.advanceTo(dueAtMs);
-    const ready: QueuedUpdate[] = [];
-    while (this.#queue[0]?.dueAtMs === dueAtMs) ready.push(this.#queue.shift()!);
-    for (const item of ready) {
-      if (item.bytes === 0 || !item.target?.connected) continue;
+    const preparing = Math.max(0, Math.min(128, this.#hostPreparing?.() ?? 0));
+    if (preparing > 0) {
+      // Host CPU preparation is measured separately from the virtual model.
+      // Do not let wall-time hash completion decide how far the modeled link
+      // advances before the next prepared request becomes publishable.
+      this.#preparationPauseObserved = true;
+      this.#stablePreparationTurns = 0;
+      this.#schedulePump();
+      return;
+    }
+    if (this.#preparationPauseObserved && this.#stablePreparationTurns === 0) {
+      this.#stablePreparationTurns = 1;
+      this.#schedulePump();
+      return;
+    }
+    this.#preparationPauseObserved = false;
+    this.#stablePreparationTurns = 0;
+    const next = this.#queue[0];
+    if (!next) return;
+    const item = this.#queue.shift()!;
+    this.#clock.advanceTo(Math.max(this.#clock.now(), item.dueAtMs));
+    if (item.kind === "publication") {
+      if (!item.handle?.cancelled) item.callback();
+    } else if (item.bytes > 0 && item.target?.connected) {
       applyAwarenessUpdate(item.target.awareness, item.update, this);
       this.#deliveredUpdates++;
       this.#deliveredBytes += item.bytes;
@@ -870,6 +963,8 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   readonly #preparationWall: PreparationWallMetrics;
   readonly #physical: number;
   readonly #listeners = new Set<() => void>();
+  #unresolvedSessionRuns = 0;
+  #peakUnresolvedSessionRuns = 0;
   #state = "configured";
   #lastRoutingSignal = "";
   #credentialRotations = 0;
@@ -967,7 +1062,12 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       data: hostLane("data", "ghostprovV2Data"),
       control: hostLane("control", "ghostprovV2Control"),
     });
-    const session = new V2TransportSession({
+    let session!: V2TransportSession;
+    const hostPublicationTimer = hub.publicationTimer(
+      "host",
+      () => session.snapshot().preparing ?? 0,
+    );
+    session = new V2TransportSession({
       binding,
       transportProfile,
       channel,
@@ -977,6 +1077,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       hostCeiling: options.concurrency,
       retransmitMs,
       publicationIntervalMs: 1,
+      publicationTimer: hostPublicationTimer,
       unadmittedTimeoutMs: options.timeoutMs ?? 20_000,
       gzip: async bytes => {
         const startedAt = performance.now();
@@ -1125,7 +1226,19 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     signal?: AbortSignal,
     options?: SandboxRunOptions,
   ): Promise<RunHandle> {
-    return this.#session.run(body, signal, options);
+    this.#unresolvedSessionRuns++;
+    this.#peakUnresolvedSessionRuns = Math.max(
+      this.#peakUnresolvedSessionRuns,
+      this.#unresolvedSessionRuns,
+    );
+    try {
+      return this.#session.run(body, signal, options).finally(() => {
+        this.#unresolvedSessionRuns = Math.max(0, this.#unresolvedSessionRuns - 1);
+      });
+    } catch (error) {
+      this.#unresolvedSessionRuns = Math.max(0, this.#unresolvedSessionRuns - 1);
+      throw error;
+    }
   }
 
   subscribe(listener: () => void): () => void {
@@ -1179,22 +1292,46 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     return { ...this.#preparationWall };
   }
 
+  sessionRunMetrics(): {
+    unresolvedSessionRuns: number;
+    peakUnresolvedSessionRuns: number;
+  } {
+    return {
+      unresolvedSessionRuns: this.#unresolvedSessionRuns,
+      peakUnresolvedSessionRuns: this.#peakUnresolvedSessionRuns,
+    };
+  }
+
   #notifyIfRoutingChanged(): void {
     const transport = this.#session.snapshot();
     const capacity = this.#state === "ready" ? this.#physical : 0;
     const prefetched = transport.prefetched ?? 0;
-    const available = this.#state === "ready"
+    const remaining = Math.max(
+      0,
+      capacity - transport.active - prefetched - transport.quarantined,
+    );
+    const admissionCredits = this.#state === "ready"
       ? Math.max(0, Math.min(
-        transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
-        capacity - transport.active - prefetched - transport.quarantined,
+        transport.admissionCredits ?? transport.credits,
+        remaining,
       ))
       : 0;
+    const prefetchCredits = this.#state === "ready"
+      ? Math.max(0, Math.min(
+        transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+        remaining,
+      ))
+      : 0;
+    const available = Math.max(admissionCredits, prefetchCredits);
     const signal = [
       this.#state,
       capacity,
       transport.active,
       prefetched,
       available,
+      admissionCredits,
+      prefetchCredits,
+      transport.transferCredits,
       transport.queued,
       transport.quarantined,
     ].join(":");
@@ -1208,18 +1345,32 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
     this.sample();
     const capacity = this.#state === "ready" ? this.#physical : 0;
     const prefetched = transport.prefetched ?? 0;
+    const remaining = Math.max(
+      0,
+      capacity - transport.active - prefetched - transport.quarantined,
+    );
+    const admissionCredits = this.#state === "ready"
+      ? Math.max(0, Math.min(
+        transport.admissionCredits ?? transport.credits,
+        remaining,
+      ))
+      : 0;
+    const prefetchCredits = this.#state === "ready"
+      ? Math.max(0, Math.min(
+        transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+        remaining,
+      ))
+      : 0;
     return {
       projectId: this.projectId,
       transportProfile: this.#transportProfile,
       state: this.#state,
       capacity,
       active: transport.active,
-      available: this.#state === "ready"
-        ? Math.max(0, Math.min(
-          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
-          capacity - transport.active - prefetched - transport.quarantined,
-        ))
-        : 0,
+      available: Math.max(admissionCredits, prefetchCredits),
+      admissionCredits,
+      prefetchCredits,
+      transferCredits: transport.transferCredits,
       quarantined: transport.quarantined,
       ambiguousQuarantined: transport.ambiguousQuarantined,
       ambiguityLimit: transport.ambiguityLimit,
@@ -1707,6 +1858,7 @@ export async function runV2PerformanceHarness(
       },
       preparation: {
         ...runtime.preparationWallMetrics(),
+        ...runtime.sessionRunMetrics(),
       },
       upstream: {
         calls: runtime.upstream.calls,

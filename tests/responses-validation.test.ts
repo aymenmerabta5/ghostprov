@@ -1,11 +1,35 @@
 import { describe, expect, it } from "bun:test";
 import {
+  MAX_RESPONSES_JSON_DEPTH,
+  MAX_RESPONSES_JSON_ITEMS,
   ResponsesInputJsonError,
+  ResponsesInputStructureError,
   validateResponsesInputJson,
 } from "../src/relay/responses-validation";
 import { normalizeApiError } from "../src/http/errors";
 
 describe("Responses nested JSON validation", () => {
+  it("rejects an oversized flat input before visiting its elements", () => {
+    const input = new Array<unknown>(MAX_RESPONSES_JSON_ITEMS + 1);
+    Object.defineProperty(input, "0", {
+      get() { throw new Error("oversized input element was read"); },
+    });
+    expect(() => validateResponsesInputJson({ input })).toThrow(
+      ResponsesInputStructureError,
+    );
+  });
+
+  it("rejects excessive depth before recursive canonicalization", () => {
+    let nested: unknown = "leaf";
+    for (let depth = 0; depth <= MAX_RESPONSES_JSON_DEPTH; depth++) {
+      nested = { child: nested };
+    }
+
+    expect(() => validateResponsesInputJson({
+      input: [{ type: "message", role: "user", content: nested }],
+    })).toThrow(ResponsesInputStructureError);
+  });
+
   it("accepts ordinary input without recursively parsing message text", () => {
     expect(() => validateResponsesInputJson({
       input: [{

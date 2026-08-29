@@ -16,6 +16,21 @@ type FinalRead =
   | { kind: "error"; error: unknown };
 
 type ClosedRead = { kind: "closed" };
+type AbortedRead = { kind: "aborted"; reason: unknown };
+
+const AUTHORITATIVE_FINAL_EVENTS = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+]);
+
+function finalTerminalEvent(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const status = (value as Record<string, unknown>).status;
+  return status === "completed" || status === "failed" || status === "incomplete"
+    ? `response.${status}`
+    : null;
+}
 
 interface PendingOutput {
   data: string;
@@ -50,14 +65,21 @@ export function createAnthropicPullStream(
   let pendingRead: Promise<PendingRead> | null = null;
   let pendingFinal: Promise<FinalRead> | null = null;
   let iteratorDone = false;
+  let observedTerminalEvent: string | null = null;
   let upstreamDone = false;
   let closed = false;
   let iteratorReturned = false;
   let activeTimer: ReturnType<typeof setTimeout> | undefined;
   let deliveredOwner: object | null = null;
+  let dequeuedFrame: SseFrame | null = null;
   let finalReleaseWatched = false;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let internalFailureAbort = false;
   let resolveClosed!: (value: ClosedRead) => void;
   const closedRead = new Promise<ClosedRead>(resolve => { resolveClosed = resolve; });
+  let resolveAborted!: (value: AbortedRead) => void;
+  const abortedRead = new Promise<AbortedRead>(resolve => { resolveAborted = resolve; });
+  let onAbort!: () => void;
 
   const clearKeepAlive = (): void => {
     if (activeTimer !== undefined) clearTimeout(activeTimer);
@@ -67,6 +89,8 @@ export function createAnthropicPullStream(
   const releaseOutputOwners = (): void => {
     releaseAtomicBytePermit(deliveredOwner);
     deliveredOwner = null;
+    releaseAtomicBytePermit(dequeuedFrame);
+    dequeuedFrame = null;
     for (const item of output) releaseAtomicBytePermit(item.owner);
     output.length = 0;
   };
@@ -90,6 +114,7 @@ export function createAnthropicPullStream(
     closed = true;
     clearKeepAlive();
     releaseOutputOwners();
+    options.abortController.signal.removeEventListener("abort", onAbort);
     resolveClosed({ kind: "closed" });
     options.onClose();
   };
@@ -97,6 +122,7 @@ export function createAnthropicPullStream(
   const returnIterator = (): void => {
     if (iteratorReturned) return;
     iteratorReturned = true;
+    options.handle.discardUnconsumedEvents?.();
     try {
       const returned = iterator.return?.(undefined);
       void returned?.catch(() => undefined);
@@ -132,7 +158,13 @@ export function createAnthropicPullStream(
     if (!pendingRead) {
       try {
         pendingRead = Promise.resolve(iterator.next()).then(
-          result => ({ kind: "next" as const, result }),
+          result => {
+            if (!result.done) {
+              if (closed) releaseAtomicBytePermit(result.value);
+              else dequeuedFrame = result.value;
+            }
+            return { kind: "next" as const, result };
+          },
           error => ({ kind: "error" as const, error }),
         );
       } catch (error) {
@@ -167,16 +199,42 @@ export function createAnthropicPullStream(
     return pendingFinal;
   };
 
+  const abortInternally = (reason?: unknown): void => {
+    if (options.abortController.signal.aborted) return;
+    internalFailureAbort = true;
+    try { options.abortController.abort(reason); } finally { internalFailureAbort = false; }
+  };
+
   const fail = (error: unknown): void => {
     append(options.translator.fail(error));
     upstreamDone = true;
     releaseFinalWhenSettled(Boolean(iteratorDone || pendingFinal));
     clearKeepAlive();
-    if (!options.abortController.signal.aborted) options.abortController.abort();
+    abortInternally();
     returnIterator();
   };
 
+  onAbort = () => {
+    resolveAborted({
+      kind: "aborted",
+      reason: options.abortController.signal.reason,
+    });
+    if (internalFailureAbort || closed) return;
+    releaseFinalWhenSettled(Boolean(iteratorDone || pendingFinal));
+    returnIterator();
+    cleanup();
+    try { streamController?.close(); } catch {
+      // A simultaneous downstream cancel may already have closed the stream.
+    }
+  };
+  options.abortController.signal.addEventListener("abort", onAbort, { once: true });
+  if (options.abortController.signal.aborted) onAbort();
+
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      if (closed) controller.close();
+    },
     async pull(controller) {
       if (closed) return;
       // A new pull proves the prior translated chunk left the stream queue.
@@ -203,9 +261,21 @@ export function createAnthropicPullStream(
         }
 
         if (iteratorDone) {
-          const final = await Promise.race([startFinal(), keepAlive(), closedRead]);
+          const final = await Promise.race([
+            startFinal(),
+            keepAlive(),
+            closedRead,
+            abortedRead,
+          ]);
           clearKeepAlive();
           if (final.kind === "closed" || closed) return;
+          if (final.kind === "aborted") {
+            releaseFinalWhenSettled(true);
+            returnIterator();
+            cleanup();
+            controller.close();
+            return;
+          }
           if (final.kind === "keepalive") {
             controller.enqueue(encoder.encode(": keepalive\n\n"));
             return;
@@ -213,8 +283,26 @@ export function createAnthropicPullStream(
           pendingFinal = null;
           if (final.kind === "error") fail(final.error);
           else {
+            if (
+              observedTerminalEvent !== null &&
+              finalTerminalEvent(final.value) !== observedTerminalEvent
+            ) {
+              releaseAtomicBytePermit(final.value);
+              fail(new Error("Relay terminal disagrees with its authoritative final"));
+              continue;
+            }
             try {
-              append(options.translator.finish(final.value), final.value);
+              const translated = await options.translator.finishAsync(final.value);
+              if (closed || options.abortController.signal.aborted) {
+                releaseAtomicBytePermit(final.value);
+                returnIterator();
+                if (!closed) {
+                  cleanup();
+                  controller.close();
+                }
+                return;
+              }
+              append(translated, final.value);
               upstreamDone = true;
             } catch (error) {
               releaseAtomicBytePermit(final.value);
@@ -224,9 +312,21 @@ export function createAnthropicPullStream(
           continue;
         }
 
-        const winner = await Promise.race([startRead(), keepAlive(), closedRead]);
+        const winner = await Promise.race([
+          startRead(),
+          keepAlive(),
+          closedRead,
+          abortedRead,
+        ]);
         clearKeepAlive();
         if (winner.kind === "closed" || closed) return;
+        if (winner.kind === "aborted") {
+          releaseFinalWhenSettled(Boolean(iteratorDone || pendingFinal));
+          returnIterator();
+          cleanup();
+          controller.close();
+          return;
+        }
         if (winner.kind === "keepalive") {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
           return;
@@ -241,14 +341,39 @@ export function createAnthropicPullStream(
           iteratorDone = true;
           continue;
         }
+        if (AUTHORITATIVE_FINAL_EVENTS.has(winner.result.value.event)) {
+          // The transport transcript can expose its terminal event just before
+          // router provenance/prefix commits make handle.final authoritative.
+          // Discard this duplicate representation and rebuild the Anthropic
+          // terminal solely from the exact correlated final value below.
+          releaseAtomicBytePermit(winner.result.value);
+          if (dequeuedFrame === winner.result.value) dequeuedFrame = null;
+          observedTerminalEvent = winner.result.value.event;
+          iteratorDone = true;
+          returnIterator();
+          continue;
+        }
         let terminal: "error" | "message_stop" | null;
         try {
+          const translated = await options.translator.pushAsync(winner.result.value);
+          if (closed || options.abortController.signal.aborted) {
+            releaseAtomicBytePermit(winner.result.value);
+            if (dequeuedFrame === winner.result.value) dequeuedFrame = null;
+            returnIterator();
+            if (!closed) {
+              cleanup();
+              controller.close();
+            }
+            return;
+          }
           terminal = append(
-            options.translator.push(winner.result.value),
+            translated,
             winner.result.value,
           );
+          if (dequeuedFrame === winner.result.value) dequeuedFrame = null;
         } catch (error) {
           releaseAtomicBytePermit(winner.result.value);
+          if (dequeuedFrame === winner.result.value) dequeuedFrame = null;
           fail(error);
           continue;
         }
@@ -256,7 +381,7 @@ export function createAnthropicPullStream(
           upstreamDone = true;
           releaseFinalWhenSettled(true);
           if (terminal === "error" && !options.abortController.signal.aborted) {
-            options.abortController.abort();
+            abortInternally();
           }
           returnIterator();
         }
@@ -268,5 +393,5 @@ export function createAnthropicPullStream(
       if (!options.abortController.signal.aborted) options.abortController.abort(reason);
       returnIterator();
     },
-  });
+  }, { highWaterMark: 0 });
 }

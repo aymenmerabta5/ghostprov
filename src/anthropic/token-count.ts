@@ -1,5 +1,6 @@
 import { AnthropicRequestError } from "./errors";
 import {
+  decodedCanonicalBase64Bytes,
   DEFAULT_ANTHROPIC_REQUEST_LIMITS,
   measureBoundedJson,
 } from "./request-validation";
@@ -12,13 +13,6 @@ const SYSTEM_OVERHEAD_TOKENS = 4;
 const TOOL_OVERHEAD_TOKENS = 12;
 const MEDIA_OVERHEAD_TOKENS = 85;
 const MAX_MEDIA_TOKENS = 1_000_000;
-
-function base64Value(code: number): boolean {
-  return (code >= 0x41 && code <= 0x5a) ||
-    (code >= 0x61 && code <= 0x7a) ||
-    (code >= 0x30 && code <= 0x39) ||
-    code === 0x2b || code === 0x2f;
-}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -60,25 +54,6 @@ function contextualBase64Media(value: unknown): string[] {
   return media;
 }
 
-function decodedBase64Bytes(value: string): number {
-  if (!value.length || value.length % 4 !== 0) {
-    throw new AnthropicRequestError(400, "base64 media data must be canonical base64");
-  }
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  const contentEnd = value.length - padding;
-  for (let index = 0; index < contentEnd; index += 1) {
-    if (!base64Value(value.charCodeAt(index))) {
-      throw new AnthropicRequestError(400, "base64 media data must be canonical base64");
-    }
-  }
-  for (let index = contentEnd; index < value.length; index += 1) {
-    if (value.charCodeAt(index) !== 0x3d) {
-      throw new AnthropicRequestError(400, "base64 media data must be canonical base64");
-    }
-  }
-  return (value.length / 4) * 3 - padding;
-}
-
 function fixedOverhead(value: unknown): number {
   if (!value || typeof value !== "object" || Array.isArray(value)) return 0;
   const request = value as Record<string, unknown>;
@@ -113,7 +88,10 @@ export function estimateAnthropicInputTokens(value: unknown): number {
   let jsonBytes = measureBoundedJson(value, "inbound request", limits.inboundBytes, limits);
   let mediaTokens = 0;
   for (const data of contextualBase64Media(value)) {
-    const decodedBytes = decodedBase64Bytes(data);
+    const decodedBytes = decodedCanonicalBase64Bytes(data);
+    if (decodedBytes === null) {
+      throw new AnthropicRequestError(400, "base64 media data must be canonical base64");
+    }
     jsonBytes -= data.length + 2;
     mediaTokens += Math.min(
       MAX_MEDIA_TOKENS,

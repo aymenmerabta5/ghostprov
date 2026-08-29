@@ -20,6 +20,8 @@ import type {
   ReliableFrame,
   SidecarFrame,
 } from "../src/v2/protocol/shared";
+import { utf8Bytes } from "../src/v2/protocol/shared";
+import { TranscriptProof } from "../src/v2/protocol/transcript";
 import { parseAwarenessEnvelope } from "../src/v2/protocol/validate";
 import { V2TransportSession } from "../src/v2/transport/session";
 import { AdmissionController } from "../src/v2/sidecar/admission";
@@ -247,6 +249,266 @@ describe("V2 split-flight production components", () => {
       await peer.close();
     }
   });
+
+  it("keeps an already-reserved commit admissible while its host flight is congested", async () => {
+    const hub = new AwarenessHub();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-congested-commit",
+    };
+    const ySweet = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret",
+      authorization: "full",
+    });
+    let holdHostData = true;
+    hub.dropBroadcast = source => holdHostData && source.label === "host-stalled-data";
+    const hostLane = (
+      lane: "data" | "control",
+      field: "ghostprovV2Data" | "ghostprovV2Control",
+    ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: ySweet,
+      localPeerId: `host-stalled:${lane}`,
+      field,
+      parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+      providerFactory: doc => hub.create(doc, `host-stalled-${lane}`),
+      syncTimeoutMs: 100,
+    });
+    const session = new V2TransportSession({
+      binding,
+      channel: new SplitAwarenessChannel({
+        data: hostLane("data", "ghostprovV2Data"),
+        control: hostLane("control", "ghostprovV2Control"),
+      }),
+      expectedSidecarInstanceId: "sidecar-congested-commit",
+      hostInstanceId: "host-congested-commit",
+      maxResponseBytes: 2 * 1024 * 1024,
+      publicationIntervalMs: 1,
+      retransmitMs: 25,
+      transportStallMs: 30,
+    });
+    let sidecarCeiling = 1;
+    const sidecarCeilings: number[] = [];
+    let commits = 0;
+    let cancellations = 0;
+    let preemptions = 0;
+    const engine = {
+      snapshot: () => ({
+        ready: true,
+        credits: sidecarCeiling > 0 ? 1 : 0,
+        active: 0,
+        queued: 0,
+        draining: false,
+      }),
+      setHostCeiling: (value: number) => {
+        sidecarCeiling = value;
+        sidecarCeilings.push(value);
+      },
+      accept: async (frame: ReliableFrame<HostFrame>) => {
+        if (frame.kind === "request_commit") {
+          commits++;
+          while (sidecarCeiling === 0) await Bun.sleep(2);
+        } else if (frame.kind === "request_cancel") {
+          cancellations++;
+        }
+      },
+      preemptRequest: () => { preemptions++; },
+    };
+    const peer = new DenoAwarenessPeer({
+      credential: {
+        url: ySweet.url,
+        baseUrl: ySweet.baseUrl,
+        docId: ySweet.docId,
+        token: ySweet.token.reveal(),
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-congested-commit",
+      engine: engine as any,
+      providerFactory: (doc, _credential, lane) => hub.create(doc, `sidecar-stalled-${lane}`),
+      publicationIntervalMs: 1,
+      retransmitMs: 25,
+      transportStallMs: 30,
+      connectTimeoutMs: 100,
+      initialActivePerSandbox: 1,
+      maxActivePerSandbox: 1,
+    });
+    const controller = new AbortController();
+    let pending: Promise<unknown> | null = null;
+
+    try {
+      await peer.connect();
+      await session.connect();
+      await waitFor(() => session.snapshot().credits > 0);
+      pending = session.run({
+        model: "gpt-5.6-sol",
+        input: "congested commit",
+      }, controller.signal);
+      void pending.catch(() => undefined);
+      await waitFor(() => {
+        const provider = [...hub.providers].find(value => value.label === "host-stalled-data");
+        return (provider?.awareness.getLocalState()?.ghostprovV2Data?.frames ?? [])
+          .some((frame: HostFrame) => frame.kind === "request_commit");
+      });
+      await waitFor(() => (
+        session.snapshot().diagnostics?.host.stallEventsTotal === 1
+      ));
+
+      expect(session.snapshot().admissionBlockReason).toBe("transport_congested");
+      const ceilingsBeforeReduction = sidecarCeilings.length;
+      session.setHostCeiling(0);
+      await waitFor(() => sidecarCeilings.length > ceilingsBeforeReduction);
+      // Local admission is closed, but the already-owned sidecar credit remains
+      // available even when the requested future-work ceiling drops to zero.
+      expect(sidecarCeilings.at(-1)).toBe(1);
+
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({
+        name: "V2PreCommitError",
+        code: "cancelled_precommit",
+        committed: false,
+      });
+      holdHostData = false;
+      await waitFor(() => cancellations === 1);
+      expect(commits).toBe(1);
+      expect(preemptions).toBe(1);
+    } finally {
+      holdHostData = false;
+      controller.abort();
+      await Promise.allSettled(pending ? [pending] : []);
+      await session.close().catch(() => undefined);
+      await peer.close().catch(() => undefined);
+    }
+  }, 10_000);
+
+  it("lets a fresh host retire an orphan recovery terminal and restore credits", async () => {
+    const hub = new AwarenessHub();
+    const binding: ProtocolBinding = {
+      ...BINDING,
+      protocolRevision: "r2",
+      launchNonce: "launch-fresh-orphan-recovery",
+      sessionId: "fresh-orphan-recovery-session",
+      leaderGeneration: 12,
+    };
+    const ySweet = parseYSweetEnvelope({
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret",
+      authorization: "full",
+    });
+    const requestId = "req-fresh-host-orphan";
+    const requestDigest = "e".repeat(64);
+    const event = {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_fresh_host_orphan", status: "completed", output: [] },
+      }),
+    };
+    const transcript = new TranscriptProof(requestId, requestDigest);
+    transcript.append(event);
+    const terminal = await transcript.createTerminal();
+    const terminalBytes = utf8Bytes(`event: ${event.event}\ndata: ${event.data}\n\n`);
+    const storage = new FakeSidecarStorage([]);
+    const seed = new ClaimJournal({ storage, flushIntervalMs: 0, maxBatch: 8 });
+    await seed.claim({ requestId, requestDigest, leaderGeneration: binding.leaderGeneration });
+    await seed.markFetchStarting(requestId);
+    await seed.markTerminal(
+      requestId,
+      terminal.responseId,
+      terminal.transcriptSha256,
+      terminalBytes,
+      { status: 200, contentType: "text/event-stream", upstreamRequestId: "upstream-orphan" },
+    );
+    await seed.close();
+
+    const hostLane = (
+      lane: "data" | "control",
+      field: "ghostprovV2Data" | "ghostprovV2Control",
+    ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: ySweet,
+      localPeerId: `fresh-host:${lane}`,
+      field,
+      parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+      providerFactory: doc => hub.create(doc, `fresh-host-${lane}`),
+      syncTimeoutMs: 100,
+    });
+    const session = new V2TransportSession({
+      binding,
+      channel: new SplitAwarenessChannel({
+        data: hostLane("data", "ghostprovV2Data"),
+        control: hostLane("control", "ghostprovV2Control"),
+      }),
+      expectedSidecarInstanceId: "sidecar-fresh-orphan-recovery",
+      hostInstanceId: "host-fresh-orphan-recovery",
+      maxResponseBytes: 2 * 1024 * 1024,
+      publicationIntervalMs: 1,
+      retransmitMs: 25,
+    });
+    const journal = new ClaimJournal({ storage, flushIntervalMs: 0, maxBatch: 8 });
+    const admission = new AdmissionController({
+      physicalMax: 1,
+      acceptedMax: 2,
+      hostCeiling: 1,
+      memoryBudgetBytes: 16 * 1024 * 1024,
+    });
+    let upstreamCalls = 0;
+    let peer!: DenoAwarenessPeer;
+    const engine = new SidecarEngine({
+      binding,
+      assembler: new RequestAssembler({ maxReservedBytes: 16 * 1024 * 1024 }),
+      journal,
+      admission,
+      upstream: {
+        execute: async () => {
+          upstreamCalls++;
+          throw new Error("recovery must not execute upstream");
+        },
+      },
+      assertExecutionFence: frame => peer.assertExecutionFence(frame),
+      emit: (frame, priority, streamId) => peer.enqueue(frame, priority, streamId),
+    });
+    peer = new DenoAwarenessPeer({
+      credential: {
+        url: ySweet.url,
+        baseUrl: ySweet.baseUrl,
+        docId: ySweet.docId,
+        token: ySweet.token.reveal(),
+        authorization: "full",
+        rotationKey: createCredentialRotationKey(),
+      },
+      binding,
+      instanceId: "sidecar-fresh-orphan-recovery",
+      engine,
+      providerFactory: (doc, _credential, lane) => hub.create(doc, `fresh-sidecar-${lane}`),
+      publicationIntervalMs: 1,
+      retransmitMs: 25,
+      connectTimeoutMs: 100,
+      initialActivePerSandbox: 1,
+      maxActivePerSandbox: 1,
+    });
+
+    try {
+      await engine.start();
+      await peer.connect();
+      await session.connect();
+      await waitFor(() => journal.status(requestId) === "acked");
+      await waitFor(() => session.snapshot().credits > 0);
+      expect(storage.terminals.has(requestId)).toBe(false);
+      expect(upstreamCalls).toBe(0);
+      expect(session.snapshot()).toMatchObject({ connected: true, credits: 1 });
+    } finally {
+      await session.close().catch(() => undefined);
+      await peer.close().catch(() => undefined);
+      admission.close();
+      await journal.close().catch(() => undefined);
+    }
+  }, 10_000);
 
   it("recovers a persisted terminal across two real R2 launches without another fetch", async () => {
     const hub = new AwarenessHub();

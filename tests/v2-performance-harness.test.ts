@@ -687,9 +687,21 @@ describe("V2 deterministic performance harness", () => {
       expect(bulk.wire.uniqueRequestDataBytes).toBe(standard.wire.uniqueRequestDataBytes);
       expect(bulk.requests.map(request => request.ackRoundsAtCommit).sort((a, b) => a - b))
         .toEqual(standard.requests.map(request => request.ackRoundsAtCommit).sort((a, b) => a - b));
+      const expectedPeakSessionRuns = Math.min(concurrency, 4);
+      expect(standard.preparation.unresolvedSessionRuns).toBe(0);
+      expect(bulk.preparation.unresolvedSessionRuns).toBe(0);
+      expect(standard.preparation.peakUnresolvedSessionRuns).toBe(expectedPeakSessionRuns);
+      expect(bulk.preparation.peakUnresolvedSessionRuns).toBe(expectedPeakSessionRuns);
       expect(Math.abs(
         bulk.timings.modeledLink.commitMs.p95 - standard.timings.modeledLink.commitMs.p95,
       )).toBeLessThanOrEqual(0.01);
+      // The virtual model deliberately removes host CPU/task phase. Keep an
+      // independent wall fence so that determinism cannot hide preparation or
+      // admission stalls in the real production code exercised by the harness.
+      expect(standard.timings.measuredWall.hostPreparationMs.p95).toBeLessThan(3_000);
+      expect(bulk.timings.measuredWall.hostPreparationMs.p95).toBeLessThan(3_000);
+      expect(standard.timings.measuredWall.commitMs.p95).toBeLessThan(5_000);
+      expect(bulk.timings.measuredWall.commitMs.p95).toBeLessThan(5_000);
     }
   }, 60_000);
 

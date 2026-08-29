@@ -1,5 +1,6 @@
 import type { SseFrame } from "../../src/relay/sse";
 import type { RunHandle } from "../../src/relay/run-handle";
+import type { AuthenticatedTenantScope } from "../../src/http/api-key";
 import { ResourceGovernor } from "../../src/router/resource-governor";
 import { MultiSandboxRouter } from "../../src/router/router";
 import {
@@ -440,17 +441,31 @@ export class FakeV2ScaleRuntime implements RoutableSandboxRuntime {
     const transport = this.#session.snapshot();
     const capacity = this.#state === "ready" ? this.#physical : 0;
     const prefetched = transport.prefetched ?? 0;
+    const remaining = Math.max(
+      0,
+      capacity - transport.active - prefetched - transport.quarantined,
+    );
+    const admissionCredits = this.#state === "ready"
+      ? Math.max(0, Math.min(
+          transport.admissionCredits ?? transport.credits,
+          remaining,
+        ))
+      : 0;
+    const prefetchCredits = this.#state === "ready"
+      ? Math.max(0, Math.min(
+          transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
+          remaining,
+        ))
+      : 0;
     return {
       projectId: this.projectId,
       state: this.#state,
       capacity,
       active: transport.active,
-      available: this.#state === "ready"
-        ? Math.max(0, Math.min(
-            transport.prefetchCredits ?? transport.admissionCredits ?? transport.credits,
-            capacity - transport.active - prefetched - transport.quarantined,
-          ))
-        : 0,
+      available: Math.max(admissionCredits, prefetchCredits),
+      admissionCredits,
+      prefetchCredits,
+      transferCredits: transport.transferCredits,
       quarantined: transport.quarantined,
       heartbeatAgeMs: 0,
       credentialExpiresInMs: 60_000,
@@ -503,6 +518,7 @@ export async function createFakeV2System(options: {
   holdUpstream?: boolean;
   faults?: FaultOptions;
   finalExtensions?: Readonly<Record<string, unknown>>;
+  authorizationScope?: AuthenticatedTenantScope;
 }): Promise<FakeV2System> {
   const gates = Array.from({ length: options.runtimes }, () => new Gate());
   if (!options.holdUpstream) gates.forEach(gate => gate.release());
@@ -528,6 +544,7 @@ export async function createFakeV2System(options: {
   const router = new MultiSandboxRouter({
     registry,
     governor: new ResourceGovernor({ probe }),
+    authorizationScope: options.authorizationScope,
   });
   return {
     router,

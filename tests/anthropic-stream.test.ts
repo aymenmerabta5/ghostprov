@@ -7,6 +7,7 @@ import {
 } from "../src/anthropic/stream";
 import { ApiError } from "../src/http/errors";
 import { decodeReasoningItem } from "../src/anthropic/reasoning";
+import { projectAnthropicReplay } from "../src/anthropic/continuation";
 import type { AnthropicAdapterMessage } from "../src/anthropic/types";
 import {
   CONTEXT,
@@ -25,6 +26,34 @@ import {
 } from "./support/anthropic-stream";
 
 describe("Responses to Anthropic stream translation", () => {
+  it("awaits asynchronous terminal metadata before returning message_stop", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const hookStarted = new Promise<void>(resolve => { started = resolve; });
+    const final = finalResponse("resp_async_terminal", [
+      message("msg_async_terminal", [textPart("answer")]),
+    ]);
+    const translator = new AnthropicStreamTranslator(CONTEXT, {
+      async beforeMessageStopAsync() {
+        started();
+        await gate;
+      },
+    });
+    let settled = false;
+    const pending = translator.finishAsync(final).then(events => {
+      settled = true;
+      return events;
+    });
+    await hookStarted;
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+    release();
+
+    const events = await pending;
+    expect(events.at(-1)?.type).toBe("message_stop");
+  });
+
   it("keeps response.output_item.done reasoning authoritative when terminal encryption rotates", () => {
     const completedReasoning = reasoning("rs_rotated", "careful plan", "done-ciphertext");
     const terminal = finalResponse("resp_rotated", [
@@ -420,6 +449,64 @@ describe("Responses to Anthropic stream translation", () => {
       "{\"path\":",
       "\"a\"}",
     ]);
+  });
+
+  it("does not repeatedly parse a large completed tool argument across SSE stages", () => {
+    const argumentsJson = JSON.stringify({ payload: "x".repeat(512 * 1024) });
+    const completed = tool("fc_parse_once", "call_parse_once", "Read", argumentsJson);
+    const final = finalResponse("resp_parse_once", [completed]);
+    const originalParse = JSON.parse;
+    let argumentParses = 0;
+    JSON.parse = ((text: string, reviver?: (this: unknown, key: string, value: unknown) => unknown) => {
+      if (text === argumentsJson) argumentParses += 1;
+      return originalParse(text, reviver);
+    }) as typeof JSON.parse;
+    try {
+        let replay: unknown = null;
+        const translator = new AnthropicStreamTranslator(CONTEXT, {
+          beforeMessageStop(finalValue, projected, proof) {
+            replay = projectAnthropicReplay(finalValue, projected, {
+              ...proof,
+              terminalBytes: Buffer.byteLength(JSON.stringify(finalValue), "utf8"),
+            });
+          },
+      });
+      const events = collect(translator, [
+        frame("response.output_item.added", {
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc_parse_once",
+            status: "in_progress",
+            call_id: "call_parse_once",
+            name: "Read",
+            arguments: "",
+          },
+        }),
+        frame("response.function_call_arguments.done", {
+          item_id: "fc_parse_once",
+          output_index: 0,
+          call_id: "call_parse_once",
+          name: "Read",
+          arguments: argumentsJson,
+        }),
+        frame("response.output_item.done", { output_index: 0, item: completed }),
+        frame("response.completed", { response: final }),
+      ]);
+
+      expect(events.at(-1)?.type).toBe("message_stop");
+      expect(replay).toEqual([{
+        type: "function_call",
+        call_id: "call_parse_once",
+        name: "Read",
+        arguments: argumentsJson,
+      }]);
+      // Once for pre-exposure safety and once to materialize the final Anthropic
+      // tool input. The repeated done item and replay commit reuse exact proofs.
+      expect(argumentParses).toBe(2);
+    } finally {
+      JSON.parse = originalParse;
+    }
   });
 
   it("appends only the missing terminal suffix after partial function JSON", () => {

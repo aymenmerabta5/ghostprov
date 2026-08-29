@@ -146,6 +146,40 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
   if (
+    structured?.name === "ResponsesInputStructureError" &&
+    structured.status === 400 &&
+    structured.code === "invalid_json_structure"
+  ) {
+    return {
+      status: 400,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "Responses input exceeds the maximum JSON nesting depth",
+        type: "invalid_request_error",
+        param: typeof structured.param === "string" ? structured.param : "input",
+        code: "invalid_json_structure",
+      },
+    };
+  }
+  if (
+    structured?.name === "WorkloadTraversalLimitError" &&
+    structured.status === 400 &&
+    structured.code === "invalid_json_structure"
+  ) {
+    return {
+      status: 400,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "Request body exceeds the supported JSON structure limits",
+        type: "invalid_request_error",
+        param: typeof structured.param === "string" ? structured.param : "body",
+        code: "invalid_json_structure",
+      },
+    };
+  }
+  if (
     structured?.name === "V2PreCommitError" &&
     structured.code === "request_too_large"
   ) {
@@ -167,6 +201,29 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
         type: "invalid_request_error",
         param: "body",
         code: "request_too_large",
+      },
+    };
+  }
+  if (
+    structured?.name === "ResponseProvenanceScopeError" ||
+    structured?.name === "ResponseProvenanceObsoleteError" ||
+    structured?.name === "ResponseProvenanceCommitError"
+  ) {
+    const scope = structured.name === "ResponseProvenanceScopeError";
+    const obsolete = structured.name === "ResponseProvenanceObsoleteError";
+    return {
+      status: scope ? 403 : obsolete ? 409 : 502,
+      error: {
+        message: scope
+          ? "Response continuation is not authorized for this tenant"
+          : obsolete
+            ? "Previous response is bound to an unavailable sandbox incarnation"
+            : "Completed response routing metadata could not be committed",
+        type: scope
+          ? "permission_error"
+          : obsolete ? "invalid_request_error" : "server_error",
+        param: scope || obsolete ? "previous_response_id" : null,
+        code: typeof structured.code === "string" ? structured.code : null,
       },
     };
   }

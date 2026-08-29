@@ -204,8 +204,6 @@ function resourceMetrics(value: unknown): JsonValue {
     reservation_capacity_bytes: metric(resources.reservationCapacityBytes),
     memory_paused: resources.paused === true,
     governor_queued: metric(resources.queued),
-    cpu_active: metric(resources.cpuActive),
-    cpu_queued: metric(resources.cpuQueued),
   };
 }
 

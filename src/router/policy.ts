@@ -20,6 +20,10 @@ export interface RouteCandidate {
    * V2 and may fall independently while a transport is congested.
    */
   available?: number;
+  admissionCredits?: number;
+  prefetchCredits?: number;
+  /** Runtime-reflected weighted body-transfer units still available. */
+  transferCredits?: number;
   availabilityReason?: SandboxAvailabilityReason;
   /** Host reservations not yet reflected in runtime admission credits. */
   reserved: number;

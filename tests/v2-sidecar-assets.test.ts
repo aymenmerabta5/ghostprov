@@ -230,4 +230,24 @@ describe("V2 sidecar assets", () => {
       revision: "r2",
     }, "r1")).rejects.toThrow(/revision mismatch/i);
   });
+
+  it("exposes the authorized R7 to R8 markers across exact frozen identities", async () => {
+    const [r7, r8] = await Promise.all([
+      loadV2SidecarAssets({ revision: "r7" }),
+      loadV2SidecarAssets({ revision: "r8" }),
+    ]);
+    const r7Bundle = r7.files[0]!.content;
+    const r8Bundle = r8.files[0]!.content;
+
+    // loadV2SidecarAssets has already enforced each complete immutable bundle
+    // hash. These assertions name the reviewed behavioral markers; they are not
+    // a substitute for the exact full-artifact identity check above.
+    expect(r7Bundle).toContain('failure.code==="invalid_json"');
+    expect(r7Bundle).toContain("validatedImmutableJsonText(input.body)");
+    expect(r8Bundle).not.toContain('failure.code==="invalid_json"');
+    expect(r8Bundle).not.toContain("validatedImmutableJsonText(input.body)");
+    expect(r7Bundle).not.toContain("function normalizeUpstreamResponsesRequest");
+    expect(r8Bundle).toContain("function normalizeUpstreamResponsesRequest");
+    expect(r8Bundle).toContain("metadata?.stream===!0&&metadata.store===!0");
+  });
 });

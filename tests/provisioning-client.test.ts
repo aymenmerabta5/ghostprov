@@ -134,7 +134,7 @@ describe("PrismProvisioningClient", () => {
   it("exposes the sandbox immediately so heartbeat can start during credential sync", async () => {
     let acquired = false;
     const responses = successResponses();
-    responses[1] = call => {
+    responses[1] = _call => {
       expect(acquired).toBe(true);
       return json(200, { access_token: "resource-token", expires_at: 2_000_000_000, resources_base_url: "https://prism.test/s/sandbox-resources/" });
     };

@@ -115,6 +115,7 @@ export function traceRunHandle(
         yield frame;
       }
     },
+    discardUnconsumedEvents: () => handle.discardUnconsumedEvents?.(),
     final,
     get rateLimit() { return handle.rateLimit; },
     get upstreamPrelude() { return handle.upstreamPrelude; },

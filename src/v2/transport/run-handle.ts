@@ -169,8 +169,10 @@ export class V2RunHandle implements RunHandle {
     frame: SseFrame,
     knownWireBytes?: number,
     transferredMemoryPermit?: AtomicBytePermit,
+    terminalFinalizationAnchor?: object,
   ): Promise<void> {
     let createdFinalAnchor = false;
+    let permitAttachedBeforeWait = false;
     try {
       if (!frame || typeof frame.event !== "string" || !frame.event || typeof frame.data !== "string") {
         throw new TypeError("SSE frame is invalid");
@@ -184,6 +186,29 @@ export class V2RunHandle implements RunHandle {
       const bytes = knownWireBytes ??
         utf8Bytes(sseFrame(frame.event, frame.data)).byteLength;
       this.#assertPermitCoverage(bytes, transferredMemoryPermit);
+      if (
+        transferredMemoryPermit &&
+        terminalFinalizationAnchor &&
+        RESPONSE_TERMINAL_EVENTS.has(frame.event)
+      ) {
+        // The session has already parsed the terminal final into its transcript.
+        // Establish its independent proof-lifetime reference before a full
+        // consumer buffer can suspend below. Cancellation may release the frame
+        // and this handle's final anchor, but must not leave that parsed final
+        // uncharged while terminal proof hashing continues.
+        attachAtomicBytePermit(frame, transferredMemoryPermit);
+        transferredMemoryPermit = undefined;
+        const anchor = {};
+        shareAtomicBytePermit(frame, anchor, "host-run-handle-final");
+        this.#finalPermitAnchor = anchor;
+        createdFinalAnchor = true;
+        shareAtomicBytePermit(
+          frame,
+          terminalFinalizationAnchor,
+          "host-terminal-finalization",
+        );
+        permitAttachedBeforeWait = true;
+      }
       if (this.#discardEvents) {
         this.#recordAccepted(bytes);
         if (
@@ -196,6 +221,7 @@ export class V2RunHandle implements RunHandle {
           this.#finalPermitAnchor = anchor;
           transferredMemoryPermit = undefined;
         }
+        if (permitAttachedBeforeWait) releaseAtomicBytePermit(frame);
         transferredMemoryPermit?.release();
         return;
       }

@@ -10,7 +10,6 @@ import type {
 const MiB = 1024 ** 2;
 const GiB = 1024 ** 3;
 const DEFAULT_MAX_BYTE_WAITERS = 256;
-const DEFAULT_MAX_CPU_WAITERS = 256;
 const DEFAULT_MAX_QUEUED_RESERVATION_BYTES = 512 * MiB;
 const DEFAULT_WAITER_TIMEOUT_MS = 30_000;
 const DEFAULT_PRESSURE_POLL_MS = 250;
@@ -133,16 +132,8 @@ export function deriveResourceSizing(
 interface ByteWaiter {
   reservedBytes: number;
   bypasses: number;
+  protectedHeadroomBytes?: number;
   resolve: (lease: ResourceLease) => void;
-  reject: (error: unknown) => void;
-  deadlineMs: number;
-  timer?: ReturnType<typeof setTimeout>;
-  signal?: AbortSignal;
-  onAbort?: () => void;
-}
-
-interface CpuWaiter {
-  resolve: (lease: ReleasableLease) => void;
   reject: (error: unknown) => void;
   deadlineMs: number;
   timer?: ReturnType<typeof setTimeout>;
@@ -241,19 +232,16 @@ export class ResourceGovernor {
   readonly #sizing: DerivedResourceSizing;
   readonly #maximumReservationCapacityBytes: number;
   readonly #maxByteWaiters: number;
-  readonly #maxCpuWaiters: number;
   readonly #maxQueuedReservationBytes: number;
   readonly #waiterTimeoutMs: number;
   readonly #pressurePollMs: number;
   readonly #now: () => number;
   readonly #byteWaiters: ByteWaiter[] = [];
-  readonly #cpuWaiters: CpuWaiter[] = [];
   #unreservedRssBaselineBytes: number;
   #resetRssBaselineOnNextSample = false;
   #activeByteLeases = 0;
   #reservedBytes = 0;
   #queuedReservationBytes = 0;
-  #cpuActive = 0;
   #paused = false;
   #closed = false;
   #pressureTimer?: ReturnType<typeof setTimeout>;
@@ -262,7 +250,6 @@ export class ResourceGovernor {
   constructor(options: {
     probe: MachineProbe;
     maxByteWaiters?: number;
-    maxCpuWaiters?: number;
     maxQueuedReservationBytes?: number;
     waiterTimeoutMs?: number;
     pressurePollMs?: number;
@@ -276,10 +263,6 @@ export class ResourceGovernor {
     this.#maxByteWaiters = positiveSafeInteger(
       options.maxByteWaiters ?? DEFAULT_MAX_BYTE_WAITERS,
       "maxByteWaiters",
-    );
-    this.#maxCpuWaiters = positiveSafeInteger(
-      options.maxCpuWaiters ?? DEFAULT_MAX_CPU_WAITERS,
-      "maxCpuWaiters",
     );
     this.#maxQueuedReservationBytes = nonNegativeSafeInteger(
       options.maxQueuedReservationBytes ?? DEFAULT_MAX_QUEUED_RESERVATION_BYTES,
@@ -463,57 +446,6 @@ export class ResourceGovernor {
     );
   }
 
-  tryAcquireCpu(): ReleasableLease | null {
-    if (this.#closed || this.#cpuWaiters.length > 0) return null;
-    return this.#tryGrantCpu();
-  }
-
-  #tryGrantCpu(): ReleasableLease | null {
-    if (this.#cpuActive >= this.#sizing.cpuTransformWorkers) return null;
-    this.#cpuActive++;
-    let released = false;
-    return {
-      release: () => {
-        if (released) return;
-        released = true;
-        this.#cpuActive--;
-        this.#drainCpu();
-      },
-    };
-  }
-
-  acquireCpu(
-    signal?: AbortSignal,
-    options: ResourceAcquireOptions = {},
-  ): Promise<ReleasableLease> {
-    if (this.#closed) return Promise.reject(new ResourceGovernorClosedError());
-    if (signal?.aborted) return Promise.reject(abortError());
-    let deadlineMs: number;
-    try {
-      deadlineMs = this.#deadline(options);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    if (deadlineMs <= this.#now()) return Promise.reject(new ResourceGovernorTimeoutError());
-    this.#rejectStaleCpuWaiters();
-    const immediate = this.#cpuWaiters.length === 0 ? this.#tryGrantCpu() : null;
-    if (immediate) return Promise.resolve(immediate);
-    if (this.#cpuWaiters.length >= this.#maxCpuWaiters) {
-      return Promise.reject(new ResourceGovernorQueueFullError());
-    }
-    return new Promise((resolve, reject) => {
-      const waiter: CpuWaiter = { resolve, reject, signal, deadlineMs };
-      waiter.onAbort = () => {
-        if (!this.#removeCpuWaiter(waiter)) return;
-        reject(abortError());
-        this.#drainCpu();
-      };
-      signal?.addEventListener("abort", waiter.onAbort, { once: true });
-      this.#cpuWaiters.push(waiter);
-      this.#armCpuWaiter(waiter);
-    });
-  }
-
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
@@ -525,10 +457,6 @@ export class ResourceGovernor {
       waiter.reject(error);
     }
     this.#queuedReservationBytes = 0;
-    for (const waiter of this.#cpuWaiters.splice(0)) {
-      this.#cleanupCpuWaiter(waiter);
-      waiter.reject(error);
-    }
   }
 
   snapshot(): ResourceGovernorDetailedSnapshot {
@@ -541,9 +469,6 @@ export class ResourceGovernor {
       queuedReservationBytes: this.#queuedReservationBytes,
       queueCapacity: this.#maxByteWaiters,
       queueReservationCapacityBytes: this.#maxQueuedReservationBytes,
-      cpuActive: this.#cpuActive,
-      cpuQueued: this.#cpuWaiters.length,
-      cpuQueueCapacity: this.#maxCpuWaiters,
     };
   }
 
@@ -610,19 +535,40 @@ export class ResourceGovernor {
           this.#sizing.reservationCapacityBytes - this.#reservedBytes,
         );
         let index = -1;
+        let protectedHeadroomBytes = 0;
         for (let candidate = 0; candidate < this.#byteWaiters.length; candidate++) {
           const waiter = this.#byteWaiters[candidate];
-          if (waiter.reservedBytes <= available) {
+          if (waiter.reservedBytes <= available - protectedHeadroomBytes) {
             index = candidate;
             break;
           }
-          // A large request may be bypassed briefly to keep the queue useful,
-          // but after a bounded number of skips it reserves the next headroom.
-          if (waiter.bypasses >= MAX_WAITER_BYPASSES) return;
+          // An aged request monotonically protects the headroom it has already
+          // accumulated. The bypass count and acquisition deadline bound both
+          // sides of the tradeoff; only the oldest protected waiter contributes
+          // a floor in one pass.
+          if (
+            protectedHeadroomBytes === 0 &&
+            waiter.bypasses >= MAX_WAITER_BYPASSES
+          ) {
+            waiter.protectedHeadroomBytes = Math.max(
+              waiter.protectedHeadroomBytes ?? 0,
+              Math.min(waiter.reservedBytes, available),
+            );
+            protectedHeadroomBytes = waiter.protectedHeadroomBytes;
+          }
         }
         if (index < 0) return;
         for (let skipped = 0; skipped < index; skipped++) {
-          this.#byteWaiters[skipped].bypasses++;
+          const waiter = this.#byteWaiters[skipped];
+          waiter.bypasses = Math.min(MAX_WAITER_BYPASSES, waiter.bypasses + 1);
+          if (
+            waiter.bypasses === MAX_WAITER_BYPASSES &&
+            waiter.protectedHeadroomBytes === undefined
+          ) {
+            // This final permitted bypass may temporarily consume the floor;
+            // once its lease releases, that headroom belongs to the aged job.
+            waiter.protectedHeadroomBytes = Math.min(waiter.reservedBytes, available);
+          }
         }
         const waiter = this.#removeByteWaiterAt(index);
         const lease = this.#tryGrant(waiter.reservedBytes);
@@ -633,16 +579,6 @@ export class ResourceGovernor {
       this.#drainingBytes = false;
       if (this.#byteWaiters.length > 0) this.#schedulePressurePoll();
       else this.#clearPressurePoll();
-    }
-  }
-
-  #drainCpu(): void {
-    if (this.#closed) return;
-    this.#rejectStaleCpuWaiters();
-    while (this.#cpuActive < this.#sizing.cpuTransformWorkers) {
-      const waiter = this.#removeCpuWaiterAt(0);
-      if (!waiter) return;
-      waiter.resolve(this.#tryGrantCpu()!);
     }
   }
 
@@ -726,21 +662,6 @@ export class ResourceGovernor {
     waiter.timer.unref?.();
   }
 
-  #armCpuWaiter(waiter: CpuWaiter): void {
-    const remaining = Math.max(0, waiter.deadlineMs - this.#now());
-    waiter.timer = setTimeout(() => {
-      waiter.timer = undefined;
-      if (this.#now() < waiter.deadlineMs) {
-        this.#armCpuWaiter(waiter);
-        return;
-      }
-      if (!this.#removeCpuWaiter(waiter)) return;
-      waiter.reject(new ResourceGovernorTimeoutError());
-      this.#drainCpu();
-    }, Math.min(remaining, 2_147_483_647));
-    waiter.timer.unref?.();
-  }
-
   #removeByteWaiter(waiter: ByteWaiter): boolean {
     const index = this.#byteWaiters.indexOf(waiter);
     if (index < 0) return false;
@@ -764,26 +685,6 @@ export class ResourceGovernor {
     waiter.signal?.removeEventListener("abort", waiter.onAbort!);
   }
 
-  #removeCpuWaiter(waiter: CpuWaiter): boolean {
-    const index = this.#cpuWaiters.indexOf(waiter);
-    if (index < 0) return false;
-    this.#removeCpuWaiterAt(index);
-    return true;
-  }
-
-  #removeCpuWaiterAt(index: number): CpuWaiter | undefined {
-    if (index < 0 || index >= this.#cpuWaiters.length) return undefined;
-    const [waiter] = this.#cpuWaiters.splice(index, 1);
-    this.#cleanupCpuWaiter(waiter);
-    return waiter;
-  }
-
-  #cleanupCpuWaiter(waiter: CpuWaiter): void {
-    if (waiter.timer) clearTimeout(waiter.timer);
-    waiter.timer = undefined;
-    waiter.signal?.removeEventListener("abort", waiter.onAbort!);
-  }
-
   #rejectStaleByteWaiters(): void {
     const now = this.#now();
     for (let index = this.#byteWaiters.length - 1; index >= 0; index--) {
@@ -795,20 +696,6 @@ export class ResourceGovernor {
           : null;
       if (!error) continue;
       this.#removeByteWaiterAt(index).reject(error);
-    }
-  }
-
-  #rejectStaleCpuWaiters(): void {
-    const now = this.#now();
-    for (let index = this.#cpuWaiters.length - 1; index >= 0; index--) {
-      const waiter = this.#cpuWaiters[index];
-      const error = waiter.signal?.aborted
-        ? abortError()
-        : now >= waiter.deadlineMs
-          ? new ResourceGovernorTimeoutError()
-          : null;
-      if (!error) continue;
-      this.#removeCpuWaiterAt(index)?.reject(error);
     }
   }
 

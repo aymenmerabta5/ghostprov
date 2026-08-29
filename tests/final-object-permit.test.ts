@@ -6,9 +6,13 @@ import { sseFrame } from "../src/relay/sse";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { v2RetainedEventPermitBytes } from "../src/v2/memory/event-memory-sizing";
 import { V2RunHandle } from "../src/v2/transport/run-handle";
-import { attachAtomicBytePermit } from "../src/v2/memory/permit-carrier";
+import {
+  atomicBytePermitOf,
+  attachAtomicBytePermit,
+} from "../src/v2/memory/permit-carrier";
 import { ResponseGraph } from "../src/ws/response-graph";
 import { ResponsesWebSocketSession } from "../src/ws/session";
+import { createAuthenticatedTenantScope } from "../src/http/api-key";
 
 function terminalHarness(
   payloadBytes = 1024 * 1024,
@@ -133,6 +137,7 @@ describe("terminal final-object permit ownership", () => {
     const firstSocket = new SlowSocket();
     const firstGraph = new ResponseGraph();
     const firstSession = new ResponsesWebSocketSession(firstSocket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
       graph: firstGraph,
       sendTimeoutMs: 10_000,
       startRelay: async () => first.handle,
@@ -158,6 +163,7 @@ describe("terminal final-object permit ownership", () => {
     const secondSocket = new SlowSocket();
     const secondGraph = new ResponseGraph();
     const secondSession = new ResponsesWebSocketSession(secondSocket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
       graph: secondGraph,
       sendTimeoutMs: 10_000,
       startRelay: async () => second.handle,
@@ -230,6 +236,7 @@ describe("terminal final-object permit ownership", () => {
     const socket = new SlowSocket();
     let started = false;
     const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
       startRelay: async () => {
         started = true;
         return handle;
@@ -247,6 +254,133 @@ describe("terminal final-object permit ownership", () => {
       { id: "resp_late", status: "completed", output: [] },
       await pool.acquire(8_192),
     ));
+    await waitFor(() => pool.snapshot().ordinaryUsedBytes === 0);
+    pool.close();
+  });
+
+  it("discards a late V2 handle without closing its committed event producer", async () => {
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 64 * 1024, jumboBytes: 1 });
+    const v2Handle = new V2RunHandle({
+      expectUpstreamPrelude: true,
+      requireTransferredEventMemory: true,
+    });
+    let discardCalls = 0;
+    let eventsCalls = 0;
+    const lateHandle: RunHandle = {
+      events: () => {
+        eventsCalls++;
+        return v2Handle.events();
+      },
+      discardUnconsumedEvents: () => {
+        discardCalls++;
+        v2Handle.discardUnconsumedEvents();
+      },
+      final: v2Handle.final,
+      upstreamPrelude: v2Handle.upstreamPrelude,
+      stats: v2Handle.stats,
+    };
+    let started = false;
+    let resolveStart!: (handle: RunHandle) => void;
+    const delayedStart = new Promise<RunHandle>(resolve => { resolveStart = resolve; });
+    const socket = new SlowSocket();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
+      startRelay: async () => {
+        started = true;
+        return delayedStart;
+      },
+    });
+    session.receive(JSON.stringify({ type: "response.create", input: "late handle" }));
+    await waitFor(() => started);
+    session.close();
+    resolveStart(lateHandle);
+    await waitFor(() => discardCalls === 1);
+
+    const accept = async (event: string, data: string): Promise<void> => {
+      const frame = { event, data };
+      const wireBytes = new TextEncoder().encode(sseFrame(event, data)).byteLength;
+      const retainedBytes = v2RetainedEventPermitBytes(wireBytes);
+      await v2Handle.acceptEvent(frame, wireBytes, await pool.acquire(retainedBytes));
+    };
+    const final = { id: "resp_late_v2", status: "completed", output: [] };
+    let producerError: unknown;
+    try {
+      await accept("response.created", JSON.stringify({
+        type: "response.created",
+        response: { id: final.id, status: "in_progress", output: [] },
+      }));
+      await accept("response.completed", JSON.stringify({
+        type: "response.completed",
+        response: final,
+      }));
+      v2Handle.settle(final);
+    } catch (error) {
+      producerError = error;
+      v2Handle.cancel(error instanceof Error ? error : new Error("late producer failed"));
+    }
+
+    await waitFor(() => pool.snapshot().activePermits === 0);
+    expect(producerError).toBeUndefined();
+    expect(discardCalls).toBe(1);
+    expect(eventsCalls).toBe(0);
+    expect(v2Handle.stats.frames).toBe(2);
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    expect(socket.sent).toEqual([]);
+    pool.close();
+  });
+
+  it("releases a buffered terminal when the next event read ignores cancellation", async () => {
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    const response = { id: "resp_pending_read", status: "completed", output: [] };
+    const frame = attachAtomicBytePermit({
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response }),
+    }, await pool.acquire(4_096));
+    const handle: RunHandle = {
+      async *events() {
+        yield frame;
+        await new Promise<void>(() => undefined);
+      },
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 1 },
+    };
+    const socket = new SlowSocket();
+    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
+      startRelay: async () => handle,
+    });
+    session.receive(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      input: "cancel pending read",
+    }));
+    await waitFor(() => atomicBytePermitOf(frame) === null);
+    session.close();
+    await waitFor(() => pool.snapshot().ordinaryUsedBytes === 0);
+    pool.close();
+  });
+
+  it("releases a buffered terminal when the authoritative final never settles", async () => {
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    const response = { id: "resp_pending_final", status: "completed", output: [] };
+    const frame = attachAtomicBytePermit({
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response }),
+    }, await pool.acquire(4_096));
+    const handle: RunHandle = {
+      async *events() {
+        yield frame;
+      },
+      final: new Promise(() => undefined),
+      stats: { bytes: 0, firstByteMs: null, frames: 1 },
+    };
+    const session = new ResponsesWebSocketSession(new SlowSocket() as unknown as WebSocket, {
+      authorizationScope: createAuthenticatedTenantScope(),
+      startRelay: async () => handle,
+    });
+    session.receive(JSON.stringify({ type: "response.create", input: "cancel final" }));
+    await waitFor(() => atomicBytePermitOf(frame) === null);
+    session.close();
     await waitFor(() => pool.snapshot().ordinaryUsedBytes === 0);
     pool.close();
   });

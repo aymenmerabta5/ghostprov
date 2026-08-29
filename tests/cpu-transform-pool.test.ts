@@ -107,7 +107,7 @@ describe("CpuTransformPool", () => {
     expect(workers[0].terminated).toBe(true);
   });
 
-  it("reserves one worker for latency while bulk compression remains backlogged", async () => {
+  it("prioritizes queued latency work without leaving a healthy worker idle", async () => {
     const workers: FakeWorker[] = [];
     const assignments: Array<{ worker: FakeWorker; id: number; value: number }> = [];
     const pool = new CpuTransformPool({
@@ -123,27 +123,132 @@ describe("CpuTransformPool", () => {
 
     const bulkOne = pool.gzip(new Uint8Array([1]), { priority: "bulk" });
     const bulkTwo = pool.gzip(new Uint8Array([2]), { priority: "bulk" });
-    expect(pool.snapshot()).toMatchObject({ active: 1, queued: 1 });
-    expect(assignments.map(value => value.value)).toEqual([1]);
+    expect(pool.snapshot()).toMatchObject({ active: 2, queued: 0 });
+    expect(assignments.map(value => value.value)).toEqual([1, 2]);
 
+    const bulkThree = pool.gzip(new Uint8Array([4]), { priority: "bulk" });
     const latency = pool.gzip(new Uint8Array([3]), { priority: "latency" });
-    expect(pool.snapshot()).toMatchObject({ active: 2, queued: 1 });
-    expect(assignments.map(value => value.value)).toEqual([1, 3]);
-    const latencyAssignment = assignments.find(value => value.value === 3)!;
+    expect(pool.snapshot()).toMatchObject({ active: 2, queued: 2 });
+
+    const secondBulk = assignments.find(value => value.value === 2)!;
+    secondBulk.worker.result(secondBulk.id, new Uint8Array([20]));
+    expect(await bulkTwo).toEqual(new Uint8Array([20]));
+    await Promise.resolve();
+    expect(assignments.map(value => value.value)).toEqual([1, 2, 3]);
+    const latencyAssignment = assignments.at(-1)!;
     latencyAssignment.worker.result(latencyAssignment.id, new Uint8Array([30]));
     expect(await latency).toEqual(new Uint8Array([30]));
     await Promise.resolve();
-    expect(pool.snapshot()).toMatchObject({ active: 1, queued: 1 });
+    expect(assignments.map(value => value.value)).toEqual([1, 2, 3, 4]);
+    const thirdBulk = assignments.at(-1)!;
+    thirdBulk.worker.result(thirdBulk.id, new Uint8Array([40]));
+    expect(await bulkThree).toEqual(new Uint8Array([40]));
 
     const firstBulk = assignments.find(value => value.value === 1)!;
     firstBulk.worker.result(firstBulk.id, new Uint8Array([10]));
     expect(await bulkOne).toEqual(new Uint8Array([10]));
-    await Promise.resolve();
-    expect(assignments.map(value => value.value)).toEqual([1, 3, 2]);
-    const secondBulk = assignments.find(value => value.value === 2)!;
-    secondBulk.worker.result(secondBulk.id, new Uint8Array([20]));
-    expect(await bulkTwo).toEqual(new Uint8Array([20]));
     await pool.close();
+  });
+
+  it("moves the latency reservation when the previously reserved worker is busy", async () => {
+    const workers: FakeWorker[] = [];
+    const assignments: Array<{ worker: FakeWorker; id: number; value: number }> = [];
+    const pool = new CpuTransformPool({
+      workers: 2,
+      workerFactory: () => {
+        const worker = new FakeWorker((owner, message) => {
+          assignments.push({ worker: owner, id: message.id, value: message.data[0]! });
+        });
+        workers.push(worker);
+        return asWorker(worker);
+      },
+    });
+
+    const first = pool.gzip(new Uint8Array([1]), { priority: "bulk" });
+    const second = pool.gzip(new Uint8Array([2]), { priority: "bulk" });
+    const queuedBulk = pool.gzip(new Uint8Array([3]), { priority: "bulk" });
+    const latency = pool.gzip(new Uint8Array([4]), { priority: "latency" });
+
+    const firstAssignment = assignments.find(value => value.value === 1)!;
+    firstAssignment.worker.result(firstAssignment.id, new Uint8Array([10]));
+    await first;
+    await Promise.resolve();
+    expect(assignments.at(-1)?.value).toBe(4);
+    expect(assignments.at(-1)?.worker).toBe(firstAssignment.worker);
+
+    for (const assignment of assignments.slice(1)) {
+      if (assignment.value === 2) assignment.worker.result(assignment.id, new Uint8Array([20]));
+      if (assignment.value === 4) assignment.worker.result(assignment.id, new Uint8Array([40]));
+    }
+    await Promise.all([second, latency]);
+    await Promise.resolve();
+    const bulkAssignment = assignments.find(value => value.value === 3)!;
+    bulkAssignment.worker.result(bulkAssignment.id, new Uint8Array([30]));
+    await queuedBulk;
+    await pool.close();
+  });
+
+  it("lets bulk work use the reserved slot when it is the only healthy worker", async () => {
+    const workers: FakeWorker[] = [];
+    const assignments: Array<{ worker: FakeWorker; id: number; value: number }> = [];
+    const pool = new CpuTransformPool({
+      workers: 2,
+      workerFactory: () => {
+        const worker = new FakeWorker((owner, message) => {
+          assignments.push({ worker: owner, id: message.id, value: message.data[0]! });
+        });
+        workers.push(worker);
+        return asWorker(worker);
+      },
+    });
+
+    const failed = pool.gzip(new Uint8Array([1]), { priority: "bulk" }).catch(error => error);
+    const active = pool.gzip(new Uint8Array([2]), { priority: "bulk" });
+    const queued = pool.gzip(new Uint8Array([3]), { priority: "bulk" });
+    expect(assignments.map(value => value.value)).toEqual([1, 2]);
+
+    workers[0]!.fail("first worker failed");
+    assignments[1]!.worker.result(assignments[1]!.id, new Uint8Array([20]));
+    expect(await active).toEqual(new Uint8Array([20]));
+    expect(assignments.map(value => value.value)).toEqual([1, 2, 3]);
+    expect(assignments[2]!.worker).toBe(workers[1]);
+    assignments[2]!.worker.result(assignments[2]!.id, new Uint8Array([30]));
+
+    expect(await failed).toBeInstanceOf(Error);
+    expect(await queued).toEqual(new Uint8Array([30]));
+    await pool.close();
+  });
+
+  it("bounds latency overtakes when only one worker is healthy", async () => {
+    const assignments: Array<{ worker: FakeWorker; id: number; value: number }> = [];
+    const pool = new CpuTransformPool({
+      workers: 1,
+      workerFactory: () => asWorker(new FakeWorker((worker, message) => {
+        assignments.push({ worker, id: message.id, value: message.data[0]! });
+      })),
+    });
+
+    const active = pool.gzip(new Uint8Array([0]), { priority: "bulk" });
+    const bulk = pool.gzip(new Uint8Array([1]), { priority: "bulk" });
+    const latency = Array.from({ length: 12 }, (_, index) => (
+      pool.gzip(new Uint8Array([index + 2]), { priority: "latency" })
+    ));
+
+    assignments[0]!.worker.result(assignments[0]!.id, new Uint8Array([0]));
+    await active;
+    while (!assignments.some(value => value.value === 1)) {
+      const assignment = assignments.at(-1)!;
+      assignment.worker.result(assignment.id, new Uint8Array([assignment.value]));
+      await Promise.resolve();
+    }
+
+    expect(assignments.findIndex(value => value.value === 1)).toBeLessThanOrEqual(9);
+    const bulkAssignment = assignments.find(value => value.value === 1)!;
+    bulkAssignment.worker.result(bulkAssignment.id, new Uint8Array([1]));
+    await bulk;
+
+    await pool.close();
+    await Promise.allSettled(latency);
   });
 
   it("removes an aborted queued transform without disturbing active work", async () => {

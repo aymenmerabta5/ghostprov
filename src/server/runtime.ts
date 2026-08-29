@@ -18,14 +18,16 @@ import {
   newAnthropicRequestId,
 } from "../anthropic/errors";
 import { attachResponsesWebSocket } from "../ws/server";
-import type { RouterLike } from "./app";
+import {
+  ghostProvAppAuthorizationScope,
+  type RouterLike,
+} from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
 import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
 import {
   apiKeyAuthorized,
-  createAuthenticatedTenantScope,
   isAuthenticatedTenantScope,
   isProtectedApiPath,
   type AuthenticatedTenantScope,
@@ -64,13 +66,27 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
   if (options.candidate && options.port === 8787) {
     throw new RangeError("Candidate server cannot bind protected port 8787");
   }
-  const scopeValue = options.authorizationScope ??
-    options.router.responseProvenanceAuthorizationScope?.() ??
-    createAuthenticatedTenantScope();
+  const routerScope = options.router.responseProvenanceAuthorizationScope?.() ?? null;
+  if (routerScope !== null && !isAuthenticatedTenantScope(routerScope)) {
+    throw new TypeError("router authorization scope must be an AuthenticatedTenantScope");
+  }
+  if (
+    options.authorizationScope !== undefined &&
+    options.authorizationScope !== routerScope
+  ) {
+    throw new TypeError("authorizationScope must be the router's exact AuthenticatedTenantScope");
+  }
+  const scopeValue = routerScope;
   if (!isAuthenticatedTenantScope(scopeValue)) {
     throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
   }
   const authorizationScope = scopeValue;
+  const appScope = ghostProvAppAuthorizationScope(options.app);
+  if (appScope === undefined || appScope !== authorizationScope) {
+    throw new TypeError(
+      "app, HTTP router, and WebSocket router must share the exact AuthenticatedTenantScope",
+    );
+  }
   const connectionIds = new WeakMap<object, string>();
   let nextConnectionId = 0;
   const server = createHttpServer((request, response) => {
@@ -144,7 +160,12 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
             bodyLease = await options.router.acquireIncomingBody?.(
               reservationBytes,
               relayAbort.signal,
-              { maxBytes: maxBodyBytes },
+              {
+                maxBytes: maxBodyBytes,
+                // Multipart image parsing temporarily owns raw, File,
+                // ArrayBuffer/Buffer, and base64 representations together.
+                reservationMultiplier: path === "/v1/images/edits" ? 5 : 2,
+              },
             ) ?? null;
             const collected = await collectRequestBody(request, maxBodyBytes, {
               signal: bodyLease?.signal ?? relayAbort.signal,
@@ -196,6 +217,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
       signal: relayOptions.signal,
       authorizationScope: relayOptions.authorizationScope,
       encodedBodyBytes: relayOptions.encodedBodyBytes,
+      structuralBodyBytes: relayOptions.structuralBodyBytes,
     }),
   });
   return server;

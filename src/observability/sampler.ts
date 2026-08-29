@@ -252,8 +252,6 @@ export class FleetSampler {
         reservation_capacity_bytes: router.resources.reservationCapacityBytes,
         memory_paused: router.resources.paused,
         governor_queued: router.resources.queued,
-        cpu_active: router.resources.cpuActive,
-        cpu_queued: router.resources.cpuQueued,
         transform_workers: transforms?.workers ?? router.resources.cpuTransformWorkers,
         transform_active: transforms?.active ?? 0,
         transform_queued: transforms?.queued ?? 0,

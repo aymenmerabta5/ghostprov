@@ -1,6 +1,28 @@
 import { ApiError } from "../http/errors";
-import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
-import type { ImageGenerationTool, InputImage } from "../relay/types";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+
+type InputImage = {
+  type: "input_image";
+  image_url?: string;
+  file_id?: string;
+  detail?: "low" | "high" | "auto" | "original";
+  [key: string]: unknown;
+};
+
+type ImageGenerationTool = {
+  type: "image_generation";
+  model?: string;
+  action?: "generate" | "edit" | string;
+  quality?: ImageQuality;
+  size?: string;
+  output_format?: ImageOutputFormat;
+  output_compression?: number;
+  background?: ImageBackground | "transparent";
+  moderation?: string;
+  input_fidelity?: "low" | "high" | string;
+  input_image_mask?: { file_id?: string; image_url?: string; [key: string]: unknown };
+  [key: string]: unknown;
+};
 
 export interface ImageCompatOptions {
   responsesModel: string;

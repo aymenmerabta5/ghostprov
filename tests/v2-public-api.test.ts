@@ -5,20 +5,28 @@ import WebSocket from "ws";
 import { parseFrames } from "../src/relay/sse";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
+import { createAuthenticatedTenantScope } from "../src/http/api-key";
 import { createFakeV2System } from "./support/fake-v2-system";
 
 async function harness(finalExtensions: Readonly<Record<string, unknown>> = {}) {
+  const authorizationScope = createAuthenticatedTenantScope();
   const system = await createFakeV2System({
     runtimes: 1,
     physicalPerRuntime: 16,
     finalExtensions,
+    authorizationScope,
   });
-  const app = createGhostProvApp({ router: system.router, keepAliveMs: 60_000 });
+  const app = createGhostProvApp({
+    router: system.router,
+    keepAliveMs: 60_000,
+    authorizationScope,
+  });
   const server = createGhostProvServer({
     app,
     router: system.router,
     port: 18_787,
     candidate: true,
+    authorizationScope,
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

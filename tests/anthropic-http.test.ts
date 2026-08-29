@@ -20,6 +20,9 @@ import {
 } from "../src/server/runtime";
 import type { IncomingResourceLease } from "../src/router/router";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
+import { createAuthenticatedTenantScope } from "../src/http/api-key";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import { attachAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 import {
   finalResponse,
   messageOutput,
@@ -69,7 +72,12 @@ function relayHandle(
 }
 
 class FakeRouter implements RouterLike {
+  readonly authorizationScope = createAuthenticatedTenantScope();
   readonly calls: RelayCall[] = [];
+
+  responseProvenanceAuthorizationScope() {
+    return this.authorizationScope;
+  }
 
   constructor(
     private readonly makeHandle: (
@@ -136,9 +144,12 @@ async function expectAnthropicError(response: Response, status: number, message:
 }
 
 async function listen(app: ReturnType<typeof createGhostProvApp>, router: RouterLike) {
+  const authorizationScope = router.responseProvenanceAuthorizationScope?.() ??
+    createAuthenticatedTenantScope();
   const server = createGhostProvServer({
     app,
     router,
+    authorizationScope,
     candidate: true,
     port: 0,
     maxBodyBytes: 64 * MiB,
@@ -864,7 +875,7 @@ describe("Anthropic HTTP routes", () => {
     let returnCalls = 0;
     let drainSettled = false;
     let settleNext!: (result: IteratorResult<SseFrame>) => void;
-    const router = new FakeRouter((_body, options) => {
+    const router = new FakeRouter((_body, _options) => {
       const iterator = {
         next: () => new Promise<IteratorResult<SseFrame>>(resolve => { settleNext = resolve; }),
         return: () => {
@@ -1293,6 +1304,133 @@ describe("Anthropic HTTP routes", () => {
     expect(returnCalls).toBe(1);
   });
 
+  it("withholds a relay terminal until the authoritative final settles", async () => {
+    let resolveFinal!: (value: unknown) => void;
+    const final = new Promise<unknown>(resolve => { resolveFinal = resolve; });
+    const terminal = completed("resp_terminal_gate", "authoritative");
+    const router = new FakeRouter(() => relayHandle(final, async function* () {
+      yield streamFrame("response.completed", { response: terminal });
+    }));
+    const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).request(
+      "/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest({ stream: true })),
+      },
+    );
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value))
+      .toContain("event: message_start");
+    const pendingTerminal = reader.read();
+    expect(await Promise.race([
+      pendingTerminal.then(() => "settled"),
+      Bun.sleep(25).then(() => "pending"),
+    ])).toBe("pending");
+
+    resolveFinal(terminal);
+    let remainder = "";
+    const firstTerminal = await pendingTerminal;
+    if (!firstTerminal.done) remainder += new TextDecoder().decode(firstTerminal.value);
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      remainder += new TextDecoder().decode(chunk.value);
+    }
+    expect(remainder).toContain("event: message_stop\n");
+  });
+
+  it("never exposes message_stop when authority rejects after a relay terminal", async () => {
+    let rejectFinal!: (error: unknown) => void;
+    const final = new Promise<unknown>((_resolve, reject) => { rejectFinal = reject; });
+    const terminal = completed("resp_rejected_authority");
+    const router = new FakeRouter(() => relayHandle(final, async function* () {
+      yield streamFrame("response.completed", { response: terminal });
+    }));
+    const response = await createGhostProvApp({ router }).request("/v1/messages", {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({ stream: true })),
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+    const pending = reader.read();
+    rejectFinal(new Error("provenance commit failed"));
+    let remainder = "";
+    const first = await pending;
+    if (!first.done) remainder += new TextDecoder().decode(first.value);
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      remainder += new TextDecoder().decode(chunk.value);
+    }
+    expect(remainder).toContain("event: error\n");
+    expect(remainder).not.toContain("event: message_stop\n");
+  });
+
+  it("wakes a pending upstream read when the incoming request aborts", async () => {
+    let returnCalls = 0;
+    const iterator = {
+      next: () => new Promise<IteratorResult<SseFrame>>(() => undefined),
+      return() {
+        returnCalls += 1;
+        return new Promise<IteratorResult<SseFrame>>(() => undefined);
+      },
+      throw: (error?: unknown) => Promise.reject(error),
+      [Symbol.asyncIterator]() { return this; },
+    } as unknown as AsyncGenerator<SseFrame>;
+    const router = new FakeRouter(() => relayHandle(new Promise(() => undefined), () => iterator));
+    const incoming = new AbortController();
+    const response = await createGhostProvApp({ router, keepAliveMs: 60_000 }).fetch(new Request(
+      "http://local/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest({ stream: true })),
+        signal: incoming.signal,
+      },
+    ));
+    const reader = response.body!.getReader();
+    await reader.read();
+    const pending = reader.read();
+    incoming.abort(new DOMException("client disconnected", "AbortError"));
+    const result = await Promise.race([
+      pending,
+      Bun.sleep(100).then(() => { throw new Error("request abort did not wake the stream"); }),
+    ]);
+    expect(result.done).toBe(true);
+    expect(returnCalls).toBe(1);
+  });
+
+  it("drops queued terminal output and its permit immediately on request abort", async () => {
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 8_192, jumboBytes: 1 });
+    const permit = pool.tryAcquire(8_192, { region: "ordinary" });
+    if (!permit) throw new Error("missing test permit");
+    const final = attachAtomicBytePermit(completed("resp_abort_output"), permit);
+    const router = new FakeRouter(() => relayHandle(final));
+    const incoming = new AbortController();
+    const response = await createGhostProvApp({ router }).fetch(new Request(
+      "http://local/v1/messages",
+      {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(messageRequest({ stream: true })),
+        signal: incoming.signal,
+      },
+    ));
+    const reader = response.body!.getReader();
+    await reader.read(); // message_start
+    const firstTerminalChunk = await reader.read();
+    expect(new TextDecoder().decode(firstTerminalChunk.value))
+      .not.toContain("event: message_stop\n");
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(8_192);
+
+    incoming.abort(new DOMException("client disconnected", "AbortError"));
+    await Bun.sleep(0);
+    expect((await reader.read()).done).toBe(true);
+    expect(pool.snapshot().ordinaryUsedBytes).toBe(0);
+  });
+
   it("converts synchronous iterator.next failures into a safe terminal error", async () => {
     let returnCalls = 0;
     let relaySignal: AbortSignal | undefined;
@@ -1353,7 +1491,7 @@ describe("Anthropic HTTP routes", () => {
     expect(returnCalls).toBe(1);
   });
 
-  it("links the incoming request signal and sanitizes midstream failures", async () => {
+  it("links the incoming request signal and ignores late midstream failures", async () => {
     let relaySignal: AbortSignal | undefined;
     let failNext!: (error: unknown) => void;
     const iterator = {
@@ -1378,16 +1516,20 @@ describe("Anthropic HTTP routes", () => {
     const first = await reader.read();
     expect(new TextDecoder().decode(first.value)).toContain("event: message_start");
 
+    const pending = reader.read();
+    await waitFor(() => typeof failNext === "function", "upstream read did not start");
     incoming.abort();
     expect(relaySignal?.aborted).toBe(true);
     failNext(new Error("secret upstream payload must not leak"));
     let rest = "";
+    const pendingChunk = await pending;
+    if (!pendingChunk.done) rest += new TextDecoder().decode(pendingChunk.value);
     for (;;) {
       const chunk = await reader.read();
       if (chunk.done) break;
       rest += new TextDecoder().decode(chunk.value);
     }
-    expect(rest).toContain("event: error\n");
+    expect(rest).not.toContain("event: error\n");
     expect(rest).not.toContain("secret upstream payload");
   });
 
@@ -1502,6 +1644,7 @@ describe("Anthropic runtime body limits", () => {
       release() { releases++; },
     };
     const router: RouterLike = {
+      responseProvenanceAuthorizationScope: () => base.authorizationScope,
       snapshot: () => base.snapshot(),
       startRelay: (body, options) => base.startRelay(body, options),
       acquireIncomingBody: async () => lease,
@@ -1527,6 +1670,7 @@ describe("Anthropic runtime body limits", () => {
     const base = new FakeRouter();
     let releases = 0;
     const router: RouterLike = {
+      responseProvenanceAuthorizationScope: () => base.authorizationScope,
       snapshot: () => base.snapshot(),
       startRelay: (body, options) => base.startRelay(body, options),
       acquireIncomingBody: async () => ({
@@ -1553,6 +1697,7 @@ describe("Anthropic runtime body limits", () => {
     const base = new FakeRouter();
     const router: RouterLike = {
       ...base,
+      responseProvenanceAuthorizationScope: () => base.authorizationScope,
       snapshot: () => base.snapshot(),
       startRelay: (body, options) => base.startRelay(body, options),
       acquireIncomingBody: (_bytes, signal) => {
@@ -1590,6 +1735,7 @@ describe("Anthropic runtime body limits", () => {
   it("sanitizes an internal body-admission 413 instead of trusting its message", async () => {
     const base = new FakeRouter();
     const router: RouterLike = {
+      responseProvenanceAuthorizationScope: () => base.authorizationScope,
       snapshot: () => base.snapshot(),
       startRelay: (body, options) => base.startRelay(body, options),
       acquireIncomingBody: () => Promise.reject(new ApiError(

@@ -14,5 +14,3 @@ export const config = {
   wsActiveResponses: integer(process.env.GP_WS_ACTIVE_RESPONSES, CONFIG_DEFAULTS.wsActiveResponses),
   wsNamedStreams: integer(process.env.GP_WS_NAMED_STREAMS, CONFIG_DEFAULTS.wsNamedStreams),
 } as const;
-
-export type Config = typeof config;

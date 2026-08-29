@@ -2,6 +2,7 @@ const DEFAULT_MAX_QUEUED = 1_024;
 const DEFAULT_MAX_QUEUED_BYTES = 512 * 1024 * 1024;
 const DEFAULT_JOB_TIMEOUT_MS = 120_000;
 const MAX_TIMER_MS = 2_147_483_647;
+const MAX_CONSECUTIVE_LATENCY_OVERTAKES = 8;
 
 export interface CpuTransformPoolSnapshot {
   workers: number;
@@ -137,6 +138,7 @@ export class CpuTransformPool {
   #closePromise: Promise<void> | null = null;
   #dispatching = false;
   #dispatchRequested = false;
+  #consecutiveLatencyOvertakes = 0;
 
   constructor(options: CpuTransformPoolOptions) {
     positiveInteger("workers", options.workers);
@@ -187,7 +189,7 @@ export class CpuTransformPool {
     if (priority !== "latency" && priority !== "bulk") {
       return Promise.reject(new RangeError("CPU transform priority is invalid"));
     }
-    const willQueue = !this.#hasImmediateWorker(priority);
+    const willQueue = !this.#hasImmediateWorker();
     if (willQueue && (
       this.#queue.length >= this.#maxQueued ||
       this.#queuedBytes + data.byteLength > this.#maxQueuedBytes
@@ -369,28 +371,54 @@ export class CpuTransformPool {
     }, delayMs);
   }
 
-  #hasImmediateWorker(priority: "latency" | "bulk"): boolean {
-    const last = this.#states.length - 1;
-    return this.#states.some((state, index) => (
-      state.worker !== null && !state.retiring && state.job === null &&
-      (priority === "latency" || this.#states.length === 1 || index < last)
+  #hasImmediateWorker(): boolean {
+    return this.#states.some(state => (
+      state.worker !== null && !state.retiring && state.job === null
     ));
   }
 
-  #takeNextJob(workerIndex: number): Job | undefined {
+  #reservedWorkerIndex(): number {
+    let readyWorkers = 0;
+    let idleWorker = -1;
+    for (let index = 0; index < this.#states.length; index++) {
+      const state = this.#states[index]!;
+      if (!state.worker || state.retiring) continue;
+      readyWorkers++;
+      if (state.job === null) idleWorker = index;
+    }
+    return readyWorkers > 1 ? idleWorker : -1;
+  }
+
+  #takeNextJob(workerIndex: number, reservedWorker: number): Job | undefined {
     if (this.#queue.length === 0) return undefined;
     const latency = this.#queue.findIndex(job => job.priority === "latency");
     const bulk = this.#queue.findIndex(job => job.priority === "bulk");
     let selected = -1;
-    if (this.#states.length === 1) {
+    if (workerIndex === reservedWorker) {
+      // Prefer interactive work, but never strand healthy CPU while every
+      // non-reserved worker is occupied and only bulk work is waiting.
       selected = latency >= 0 ? latency : bulk;
-    } else if (workerIndex === this.#states.length - 1) {
-      // Keep one physical worker immediately available to interactive work.
-      selected = latency;
+    } else if (reservedWorker < 0) {
+      // With one healthy worker there is no spare capacity to reserve. Give
+      // latency work a bounded head start, then force one waiting bulk job so
+      // a sustained interactive stream cannot starve request preparation.
+      if (
+        latency >= 0 &&
+        (bulk < 0 || this.#consecutiveLatencyOvertakes < MAX_CONSECUTIVE_LATENCY_OVERTAKES)
+      ) {
+        selected = latency;
+        this.#consecutiveLatencyOvertakes = bulk >= 0
+          ? this.#consecutiveLatencyOvertakes + 1
+          : 0;
+      } else {
+        selected = bulk;
+        this.#consecutiveLatencyOvertakes = 0;
+      }
     } else {
       // Bulk owns the non-reserved workers while backlogged; otherwise latency
       // may use the entire pool rather than paying for an artificial partition.
       selected = bulk >= 0 ? bulk : latency;
+      this.#consecutiveLatencyOvertakes = 0;
     }
     if (selected < 0) return undefined;
     return this.#queue.splice(selected, 1)[0];
@@ -406,11 +434,13 @@ export class CpuTransformPool {
     try {
       do {
         this.#dispatchRequested = false;
+        const reservedWorker = this.#reservedWorkerIndex();
+        if (reservedWorker >= 0) this.#consecutiveLatencyOvertakes = 0;
         for (let workerIndex = 0; workerIndex < this.#states.length; workerIndex++) {
           const state = this.#states[workerIndex]!;
           const worker = state.worker;
           if (!worker || state.retiring || state.job) continue;
-          const job = this.#takeNextJob(workerIndex);
+          const job = this.#takeNextJob(workerIndex, reservedWorker);
           if (!job) continue;
           this.#queuedBytes -= job.data.byteLength;
           state.job = job;

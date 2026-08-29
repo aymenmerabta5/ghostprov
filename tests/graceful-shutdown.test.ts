@@ -138,7 +138,6 @@ describe("graceful router shutdown", () => {
       class: "text-large",
       requestBytes: 1,
       reservedBytes: governor.snapshot().reservationCapacityBytes,
-      cpuPermits: 0,
       stream: false,
     });
     const router = new MultiSandboxRouter({

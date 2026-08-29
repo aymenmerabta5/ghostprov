@@ -17,6 +17,7 @@ import type { RunHandle } from "../src/relay/run-handle";
 import {
   ResponsesWebSocketSession,
   WebSocketProcessBudget,
+  type ResponsesWebSocketSessionOptions,
 } from "../src/ws/session";
 import { WebSocketTelemetry } from "../src/ws/telemetry";
 import {
@@ -69,13 +70,35 @@ function completed(id: string, output: unknown[] = []) {
   return { id, object: "response", model: "gpt-5.6-sol", status: "completed", output };
 }
 
+type TestAttachOptions = Omit<AttachResponsesWebSocketOptions, "authorizationScope"> & {
+  authorizationScope?: AuthenticatedTenantScope;
+};
+
+function attachTestResponsesWebSocket(server: Server, options: TestAttachOptions) {
+  return attachResponsesWebSocket(server, {
+    ...options,
+    authorizationScope: options.authorizationScope ?? createAuthenticatedTenantScope(),
+  });
+}
+
+type TestSessionOptions = Omit<ResponsesWebSocketSessionOptions, "authorizationScope"> & {
+  authorizationScope?: AuthenticatedTenantScope;
+};
+
+function createTestSession(socket: WebSocket, options: TestSessionOptions) {
+  return new ResponsesWebSocketSession(socket, {
+    ...options,
+    authorizationScope: options.authorizationScope ?? createAuthenticatedTenantScope(),
+  });
+}
+
 async function startServer(
   startRelay: WebSocketRelayStarter,
-  options: Omit<AttachResponsesWebSocketOptions, "startRelay"> = {},
+  options: Omit<TestAttachOptions, "startRelay"> = {},
   clientHeaders?: Record<string, string>,
 ) {
   const server = createServer((_req, res) => { res.writeHead(404).end(); });
-  attachResponsesWebSocket(server, { startRelay, ...options });
+  attachTestResponsesWebSocket(server, { startRelay, ...options });
   servers.push(server);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -114,7 +137,7 @@ describe("Responses WebSocket server", () => {
       maxQueuedBytes: 1024 * 1024,
       maxIngressBytes: 64 * 1024 * 1024,
     });
-    attachResponsesWebSocket(server, {
+    attachTestResponsesWebSocket(server, {
       apiKey: "GHOST_IS_KING",
       processBudget: budget,
       startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
@@ -200,24 +223,32 @@ describe("Responses WebSocket server", () => {
     const startRelay = async () => relayHandle(Promise.resolve(completed("unused")));
     for (const maxPayloadBytes of [0, Number.NaN, MAX_WS_PAYLOAD_BYTES + 1]) {
       const server = createServer();
-      expect(() => attachResponsesWebSocket(server, {
+      expect(() => attachTestResponsesWebSocket(server, {
         maxPayloadBytes,
         startRelay,
       })).toThrow(RangeError);
     }
     for (const fastPathPayloadBytes of [0, DEFAULT_WS_MAX_PAYLOAD_BYTES + 1]) {
       const server = createServer();
-      expect(() => attachResponsesWebSocket(server, {
+      expect(() => attachTestResponsesWebSocket(server, {
         maxPayloadBytes: DEFAULT_WS_MAX_PAYLOAD_BYTES,
         fastPathPayloadBytes,
         startRelay,
       })).toThrow(RangeError);
     }
     const server = createServer();
-    expect(() => attachResponsesWebSocket(server, {
+    expect(() => attachTestResponsesWebSocket(server, {
       authorizationScope: {} as AuthenticatedTenantScope,
       startRelay,
     })).toThrow(TypeError);
+    const missingScopeServer = createServer();
+    expect(() => attachResponsesWebSocket(missingScopeServer, {
+      startRelay,
+    } as unknown as AttachResponsesWebSocketOptions)).toThrow(TypeError);
+    expect(() => new ResponsesWebSocketSession(
+      new FakeSocket() as unknown as WebSocket,
+      { startRelay } as unknown as ResponsesWebSocketSessionOptions,
+    )).toThrow(TypeError);
   });
 
   it("reserves enough raw parser memory when a custom fast path is smaller", async () => {
@@ -400,7 +431,7 @@ describe("Responses WebSocket server", () => {
     const telemetry = new WebSocketTelemetry();
     let calls = 0;
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
-    attachResponsesWebSocket(server, {
+    attachTestResponsesWebSocket(server, {
       processBudget: budget,
       telemetry,
       startRelay: async () => {
@@ -456,7 +487,7 @@ describe("Responses WebSocket server", () => {
     });
     const telemetry = new WebSocketTelemetry();
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
-    attachResponsesWebSocket(server, {
+    attachTestResponsesWebSocket(server, {
       processBudget: budget,
       telemetry,
       startRelay: async () => relayHandle(new Promise(() => {})),
@@ -509,7 +540,7 @@ describe("Responses WebSocket server", () => {
       maxIngressBytes: normalBytes * 27 + DEFAULT_WS_PROMOTION_HEADROOM_BYTES,
     });
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
-    attachResponsesWebSocket(server, {
+    attachTestResponsesWebSocket(server, {
       processBudget: budget,
       heartbeatIntervalMs: 50,
       pongTimeoutMs: 100,
@@ -554,7 +585,7 @@ describe("Responses WebSocket server", () => {
       maxIngressBytes: normalBytes,
     });
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
-    attachResponsesWebSocket(server, {
+    attachTestResponsesWebSocket(server, {
       processBudget: budget,
       heartbeatIntervalMs: 10,
       pongTimeoutMs: 30,
@@ -668,7 +699,7 @@ describe("Responses WebSocket server", () => {
     await waitFor(() => messages.some(message => message.type === "response.completed"));
     expect(messages.some(message => message.type === "error")).toBe(false);
     expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({ stream: true, input: [{ role: "user" }] });
+    expect(bodies[0]).toMatchObject({ stream: true, store: true, input: "hello from Codex" });
 
     socket.send(JSON.stringify({
       type: "response.create",
@@ -697,7 +728,7 @@ describe("Responses WebSocket server", () => {
     let active = 0;
     let maxActive = 0;
     const startRelay: WebSocketRelayStarter = async body => {
-      const label = (body.input as any[]).at(-1).content[0].text as string;
+      const label = String(body.input);
       started.push(label);
       active++;
       maxActive = Math.max(maxActive, active);
@@ -871,7 +902,7 @@ describe("Responses WebSocket server", () => {
     await waitFor(() => messages.some(message => message.response?.id === "resp_provider_next"));
     expect(relays[1]!.body).toMatchObject({
       previous_response_id: "resp_generated_after_warmup",
-      input: [normalizedUser("provider continuation")],
+      input: "provider continuation",
       store: true,
       stream: true,
     });
@@ -891,7 +922,7 @@ describe("Responses WebSocket server", () => {
           data: JSON.stringify({ type: "response.completed", response: parent }),
         }]);
       }
-      const text = (body.input as any[])[0]?.content?.[0]?.text as string;
+      const text = String(body.input);
       return relayHandle(Promise.resolve({
         ...completed(`resp_fork_${text}`),
         previous_response_id: body.previous_response_id,
@@ -937,11 +968,7 @@ describe("Responses WebSocket server", () => {
     for (const fork of ["left", "right"]) {
       expect(bodies).toContainEqual(expect.objectContaining({
         previous_response_id: parent.id,
-        input: [{
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: fork }],
-        }],
+        input: fork,
         store: true,
         stream: true,
       }));
@@ -1046,6 +1073,116 @@ describe("Responses WebSocket server", () => {
     socket.close();
   });
 
+  it("releases warmup materialization when relay startup ignores disconnect", async () => {
+    const shared = new SharedByteBudget(16 * 1024 * 1024);
+    const graph = new ResponseGraph({ maxBytes: 8 * 1024 * 1024, sharedBudget: shared });
+    const authorizationScope = createAuthenticatedTenantScope();
+    const warmupId = `${SYNTHETIC_WARMUP_ID_PREFIX}aborted_handoff`;
+    graph.recordWarmup(warmupId, {
+      type: "response.create",
+      generate: false,
+      input: [{ type: "message", content: "x".repeat(1024 * 1024) }],
+    }, { authorizationScope });
+    const storedBytes = shared.used;
+    let started = false;
+    const socket = await startServer(async () => {
+      started = true;
+      return new Promise<RunHandle>(() => undefined);
+    }, { authorizationScope, graphFactory: () => graph });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      previous_response_id: warmupId,
+      input: "next",
+    }));
+    await waitFor(() => started && shared.used > storedBytes);
+    socket.close();
+    await waitFor(() => shared.used === 0);
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
+  it("aborts relay work after malformed local frame processing", async () => {
+    let relaySignal: AbortSignal | undefined;
+    const socket = await startServer(async (_body, options) => {
+      relaySignal = options.signal;
+      return relayHandle(new Promise(() => undefined), [{
+        event: "response.output_text.delta",
+        data: "{",
+      }]);
+    });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: "x" }));
+
+    await waitFor(() => messages.some(message => message.type === "error"));
+    expect(relaySignal?.aborted).toBe(true);
+  });
+
+  it("rejects a buffered terminal that conflicts with the authoritative final", async () => {
+    let relaySignal: AbortSignal | undefined;
+    const completedFinal = completed("resp_terminal_conflict");
+    const failedFinal = { ...completedFinal, status: "failed" };
+    const socket = await startServer(async (_body, options) => {
+      relaySignal = options.signal;
+      return relayHandle(Promise.resolve(failedFinal), [{
+        event: "response.completed",
+        data: JSON.stringify({ type: "response.completed", response: completedFinal }),
+      }]);
+    });
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: "x" }));
+
+    await waitFor(() => messages.some(message => message.type === "error"));
+    expect(messages.some(message => message.type === "response.completed")).toBe(false);
+    expect(relaySignal?.aborted).toBe(true);
+  });
+
+  it("publishes authoritative final content instead of buffered terminal content", async () => {
+    const final = {
+      ...completed("resp_authoritative_terminal"),
+      previous_response_id: "resp_exact_parent",
+      output: [{ type: "message", content: "authoritative" }],
+    };
+    const buffered = {
+      ...final,
+      previous_response_id: "resp_wrong_parent",
+      output: [{ type: "message", content: "wrong" }],
+    };
+    const socket = await startServer(async () => relayHandle(Promise.resolve(final), [{
+      event: "response.completed",
+      data: JSON.stringify({ type: "response.completed", response: buffered }),
+    }]));
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "response.create", input: "x" }));
+
+    await waitFor(() => messages.some(message => message.type === "response.completed"));
+    const terminal = messages.find(message => message.type === "response.completed");
+    expect(terminal.response.previous_response_id).toBe("resp_exact_parent");
+    expect(terminal.response.output).toEqual(final.output);
+    expect(JSON.stringify(terminal)).not.toContain("wrong");
+  });
+
+  it("does not read past a terminal before awaiting an already-ready final", async () => {
+    const final = completed("resp_terminal_then_stall");
+    const handle: RunHandle = {
+      async *events() {
+        yield {
+          event: "response.completed",
+          data: JSON.stringify({ type: "response.completed", response: final }),
+        };
+        await new Promise<void>(() => undefined);
+      },
+      final: Promise.resolve(final),
+      stats: { bytes: 0, firstByteMs: null, frames: 1 },
+    };
+    const socket = await startServer(async () => handle);
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "response.create", input: "x" }));
+
+    await waitFor(() => messages.some(message => message.type === "response.completed"));
+    expect(messages.find(message => message.type === "response.completed").response.id)
+      .toBe("resp_terminal_then_stall");
+  });
+
   it("caps active responses per connection and drains queued lanes", async () => {
     const gates: Array<ReturnType<typeof deferred<any>>> = [];
     let active = 0;
@@ -1091,7 +1228,7 @@ describe("Responses WebSocket server", () => {
 
   it("synthesizes the terminal event type from a final-only response", async () => {
     const socket = await startServer(async body => {
-      const label = (body.input as any[])[0]?.content?.[0]?.text as string;
+      const label = String(body.input);
       const status = label === "failed" ? "failed" : "incomplete";
       return relayHandle(Promise.resolve({
         ...completed(`resp_${status}`),
@@ -1127,7 +1264,7 @@ describe("Responses WebSocket server", () => {
   it("returns direct validation errors without closing other lanes", async () => {
     const gates = new Map<string, ReturnType<typeof deferred<any>>>();
     const startRelay: WebSocketRelayStarter = async body => {
-      const label = (body.input as any[]).at(-1)?.content?.[0]?.text ?? "unknown";
+      const label = typeof body.input === "string" ? body.input : "unknown";
       const gate = deferred<any>();
       gates.set(label, gate);
       return relayHandle(gate.promise);
@@ -1502,7 +1639,7 @@ describe("Responses WebSocket bounded delivery", () => {
     const bodies: Record<string, unknown>[] = [];
     const authorizationScope = createAuthenticatedTenantScope();
     const scopes: AuthenticatedTenantScope[] = [];
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       authorizationScope,
       graph,
       startRelay: async (body, options) => {
@@ -1546,7 +1683,7 @@ describe("Responses WebSocket bounded delivery", () => {
       input: "keep me",
     }, { authorizationScope, inputOwnership: "owned" });
     const retained = graph.stats();
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       authorizationScope,
       graph,
       maxSendQueueBytes: 64,
@@ -1570,7 +1707,7 @@ describe("Responses WebSocket bounded delivery", () => {
   it("never retries an unknown provider ID by dropping the continuation", async () => {
     const socket = new FakeSocket();
     const bodies: Record<string, unknown>[] = [];
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       authorizationScope: createAuthenticatedTenantScope(),
       startRelay: async body => {
         bodies.push(structuredClone(body));
@@ -1613,7 +1750,7 @@ describe("Responses WebSocket bounded delivery", () => {
       event: "response.created",
       data: JSON.stringify({ type: "response.created", response: { id: "resp_owned" } }),
     }, (await permits.acquire(4_096)).transfer("websocket-test"));
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       sendTimeoutMs: 10_000,
       startRelay: async () => relayHandle(new Promise(() => {}), [frame]),
     });
@@ -1643,8 +1780,8 @@ describe("Responses WebSocket bounded delivery", () => {
       type: "response.create",
       store: false,
       input: "remember",
-    });
-    graph.record(resolved, final);
+    }, { authorizationScope: createAuthenticatedTenantScope() });
+    expect(resolved.relayBody.input).toBe("remember");
     expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
     expect(permits.snapshot().ordinaryUsedBytes).toBe(8_192);
     graph.clear();
@@ -1662,7 +1799,7 @@ describe("Responses WebSocket bounded delivery", () => {
       maxSessions: 1,
       maxQueuedBytes: 1024 * 1024,
     });
-    const first = new ResponsesWebSocketSession(
+    const first = createTestSession(
       new FakeSocket() as unknown as WebSocket,
       {
         processBudget: budget,
@@ -1670,7 +1807,7 @@ describe("Responses WebSocket bounded delivery", () => {
       },
     );
     expect(budget.snapshot().sessions).toBe(1);
-    expect(() => new ResponsesWebSocketSession(
+    expect(() => createTestSession(
       new FakeSocket() as unknown as WebSocket,
       {
         processBudget: budget,
@@ -1680,7 +1817,7 @@ describe("Responses WebSocket bounded delivery", () => {
 
     first.close();
     expect(budget.snapshot()).toMatchObject({ sessions: 0, queuedBytes: 0 });
-    const replacement = new ResponsesWebSocketSession(
+    const replacement = createTestSession(
       new FakeSocket() as unknown as WebSocket,
       {
         processBudget: budget,
@@ -1700,11 +1837,11 @@ describe("Responses WebSocket bounded delivery", () => {
     const secondSocket = new FakeSocket();
     const firstGate = deferred<any>();
     let secondCalls = 0;
-    const first = new ResponsesWebSocketSession(firstSocket as unknown as WebSocket, {
+    const first = createTestSession(firstSocket as unknown as WebSocket, {
       processBudget: budget,
       startRelay: async () => relayHandle(firstGate.promise),
     });
-    const second = new ResponsesWebSocketSession(secondSocket as unknown as WebSocket, {
+    const second = createTestSession(secondSocket as unknown as WebSocket, {
       processBudget: budget,
       startRelay: async () => {
         secondCalls++;
@@ -1752,7 +1889,7 @@ describe("Responses WebSocket bounded delivery", () => {
     const graph = new ResponseGraph();
     const final = deferred<any>();
     let started = false;
-    const session = new ResponsesWebSocketSession(
+    const session = createTestSession(
       new FakeSocket() as unknown as WebSocket,
       {
         graph,
@@ -1786,7 +1923,7 @@ describe("Responses WebSocket bounded delivery", () => {
     const socket = new FakeSocket();
     const signals: AbortSignal[] = [];
     let calls = 0;
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       maxActive: 2,
       maxSendQueueBytes: 512,
       startRelay: async (_body, options) => {
@@ -1844,7 +1981,7 @@ describe("Responses WebSocket bounded delivery", () => {
     const socket = new FakeSocket();
     socket.bufferedAmount = 1_024;
     const telemetry = new WebSocketTelemetry();
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       telemetry,
       maxBufferedBytes: 128,
       sendTimeoutMs: 1_000,
@@ -1876,7 +2013,7 @@ describe("Responses WebSocket bounded delivery", () => {
     socket.holdCallbacks = true;
     const signals: AbortSignal[] = [];
     const telemetry = new WebSocketTelemetry();
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       telemetry,
       maxActive: 3,
       maxSendQueueItems: 2,
@@ -1932,7 +2069,7 @@ describe("Responses WebSocket bounded delivery", () => {
     socket.sendError = new Error("socket write failed");
     let signal: AbortSignal | undefined;
     const telemetry = new WebSocketTelemetry();
-    const session = new ResponsesWebSocketSession(socket as unknown as WebSocket, {
+    const session = createTestSession(socket as unknown as WebSocket, {
       telemetry,
       startRelay: async (_body, options) => {
         signal = options.signal;

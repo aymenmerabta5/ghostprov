@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import type { JournalRecord } from "../src/v2/sidecar/journal";
 import type {
   DirectResponsesExecution,
   UpstreamTerminal,

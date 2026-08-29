@@ -14,6 +14,7 @@ import {
 } from "../src/v2/protocol/shared";
 import { TranscriptProof } from "../src/v2/protocol/transcript";
 import { V2TransportSession } from "../src/v2/transport/session";
+import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 
@@ -43,6 +44,7 @@ class RecoveryLink {
   readonly session: V2TransportSession;
   readonly hostFrames: ReliableFrame<HostFrame>[] = [];
   hostUpdates = 0;
+  credits = 1;
   #sidecarSequence = 0;
   #sidecarRevision = 0;
   #hostEpoch = 1;
@@ -52,6 +54,7 @@ class RecoveryLink {
     readonly binding: ProtocolBinding,
     readonly sidecarInstanceId: string,
     readonly hostInstanceId: string,
+    eventMemoryPool?: AtomicBytePermitPool,
   ) {
     this.host = this.network.connectHost(hostInstanceId, PROJECT);
     this.sidecar = this.network.connectSidecar(sidecarInstanceId, PROJECT);
@@ -78,6 +81,7 @@ class RecoveryLink {
       maxResponseBytes: 2 * 1024 * 1024,
       publicationIntervalMs: 1,
       retransmitMs: 60_000,
+      eventMemoryPool,
     });
   }
 
@@ -117,7 +121,7 @@ class RecoveryLink {
       epoch: 1,
       revision: this.#sidecarRevision++,
       ack: { epoch: this.#hostEpoch, sequence: hostAck },
-      credits: 1,
+      credits: this.credits,
       active: 0,
       queued: 0,
       draining: false,
@@ -178,6 +182,229 @@ async function committedRequest(link: RecoveryLink, signal?: AbortSignal): Promi
 }
 
 describe("R2 same-sandbox sidecar recovery", () => {
+  it("semantically ACKs a recovered terminal orphaned by a fresh host", async () => {
+    const eventMemoryPool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+      maxWaiters: 4,
+    });
+    const link = new RecoveryLink(
+      binding("fresh-orphan-nonce"),
+      "fresh-orphan-sidecar",
+      "fresh-orphan-host",
+      eventMemoryPool,
+    );
+    link.credits = 0;
+    await link.connect();
+    const controller = new AbortController();
+    const queued = link.session.run({
+      model: "gpt-5.6-sol",
+      input: "queued before recovered replay",
+    }, controller.signal);
+    void queued.catch(() => undefined);
+    await link.settle(2);
+    expect(link.session.snapshot().queued).toBe(1);
+    const requestId = "req-fresh-recovery-orphan";
+    const requestDigest = "c".repeat(64);
+    const completed = {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_fresh_orphan", status: "completed", output: [] },
+      }),
+    };
+    const transcript = new TranscriptProof(requestId, requestDigest);
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+
+    link.publish([{
+      kind: "request_ack",
+      requestId,
+      requestDigest,
+      committed: true,
+    }, {
+      kind: "response_batch",
+      requestId,
+      firstEventIndex: 0,
+      items: [{
+        event: completed.event,
+        dataBase64Url: base64UrlEncode(utf8Bytes(completed.data)),
+      }],
+    }]);
+    await link.settle();
+    expect(link.hostFrames.some(frame => frame.kind === "response_ack")).toBe(false);
+    // Full proof metadata is derived immediately; no parsed final content is
+    // retained while waiting for the separate response_terminal frame.
+    expect(eventMemoryPool.snapshot().activePermits).toBe(0);
+
+    link.publish([{ ...terminal, requestId, requestDigest }]);
+    const receipt = await within(link.hostFrame("response_ack"), "fresh orphan response ACK");
+    expect(receipt).toMatchObject({
+      requestId,
+      terminalDigest: terminal.transcriptSha256,
+    });
+
+    controller.abort();
+    await expect(queued).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+      committed: false,
+    });
+    expect(eventMemoryPool.snapshot().activePermits).toBe(0);
+    link.publish([], "control");
+    await link.settle();
+    await link.session.close();
+    eventMemoryPool.close();
+  });
+
+  it("never ACKs a truncated orphan recovery terminal", async () => {
+    const link = new RecoveryLink(
+      binding("truncated-orphan-nonce"),
+      "truncated-orphan-sidecar",
+      "truncated-orphan-host",
+    );
+    link.credits = 0;
+    await link.connect();
+    const requestId = "req-truncated-recovery-orphan";
+    const requestDigest = "d".repeat(64);
+    const completed = {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_truncated_orphan", status: "completed", output: [] },
+      }),
+    };
+    const transcript = new TranscriptProof(requestId, requestDigest);
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+
+    link.publish([{
+      kind: "request_ack",
+      requestId,
+      requestDigest,
+      committed: true,
+    }, { ...terminal, requestId, requestDigest }]);
+    await link.settle();
+
+    expect(link.hostFrames.some(frame => frame.kind === "response_ack")).toBe(false);
+    expect(link.session.snapshot().connected).toBe(false);
+    await link.session.close();
+  });
+
+  it("never ACKs a tampered orphan recovery transcript", async () => {
+    const eventMemoryPool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 4 * 1024 * 1024,
+      maxWaiters: 4,
+    });
+    const link = new RecoveryLink(
+      binding("tampered-orphan-nonce"),
+      "tampered-orphan-sidecar",
+      "tampered-orphan-host",
+      eventMemoryPool,
+    );
+    link.credits = 0;
+    await link.connect();
+    const requestId = "req-tampered-recovery-orphan";
+    const requestDigest = "e".repeat(64);
+    const completed = {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_tampered_orphan", status: "completed", output: [] },
+      }),
+    };
+    const transcript = new TranscriptProof(requestId, requestDigest);
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+
+    link.publish([{
+      kind: "request_ack",
+      requestId,
+      requestDigest,
+      committed: true,
+    }, {
+      kind: "response_batch",
+      requestId,
+      firstEventIndex: 0,
+      items: [{
+        event: completed.event,
+        dataBase64Url: base64UrlEncode(utf8Bytes(completed.data)),
+      }],
+    }]);
+    await link.settle();
+    expect(eventMemoryPool.snapshot().activePermits).toBe(0);
+
+    link.publish([{
+      ...terminal,
+      requestId,
+      requestDigest,
+      transcriptSha256: "f".repeat(64),
+    }]);
+    await link.settle();
+
+    expect(link.hostFrames.some(frame => frame.kind === "response_ack")).toBe(false);
+    expect(link.session.snapshot().connected).toBe(false);
+    expect(eventMemoryPool.snapshot().activePermits).toBe(0);
+    await link.session.close();
+    eventMemoryPool.close();
+  });
+
+  it("never mistakes a locally owned recovery conflict for an orphan terminal", async () => {
+    const source = new RecoveryLink(
+      binding("owned-conflict-old"),
+      "owned-conflict-sidecar-old",
+      "owned-conflict-host-old",
+    );
+    await source.connect();
+    const request = await committedRequest(source);
+    const capsule = await source.session.suspendSidecarRecovery("owned conflict");
+    const target = new RecoveryLink(
+      binding("owned-conflict-new"),
+      "owned-conflict-sidecar-new",
+      "owned-conflict-host-new",
+    );
+    const barrier = target.session.adoptRecoveredSidecar(capsule);
+    await target.connect();
+    const completed = {
+      event: "response.completed",
+      data: JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_owned_conflict", status: "completed", output: [] },
+      }),
+    };
+    const transcript = new TranscriptProof(request.requestId, request.requestDigest);
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+
+    target.publish([{
+      kind: "response_error",
+      requestId: request.requestId,
+      code: "definitive_recovery_error",
+      message: "The retained request already settled definitively",
+      ambiguous: false,
+    }, {
+      kind: "request_ack",
+      requestId: request.requestId,
+      requestDigest: request.requestDigest,
+      committed: true,
+    }, { ...terminal, requestId: request.requestId, requestDigest: request.requestDigest }, {
+      kind: "recovery_complete",
+    }]);
+    await target.settle();
+
+    await expect(request.handle.final).rejects.toMatchObject({
+      code: "definitive_recovery_error",
+      ambiguous: false,
+    });
+    expect(target.hostFrames.some(frame => frame.kind === "response_ack")).toBe(false);
+    await expect(within(barrier, "owned conflict recovery barrier")).rejects.toMatchObject({
+      code: "owned_terminal_conflict",
+      ambiguous: true,
+    });
+    await target.session.close();
+  });
+
   it("preserves the original handle, suppresses replayed prefix, and never restarts fetch", async () => {
     const oldBinding: ProtocolBinding = {
       protocolRevision: "r2",

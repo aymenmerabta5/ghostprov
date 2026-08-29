@@ -103,8 +103,6 @@ describe("FleetSampler", () => {
           paused: false,
           reservedBytes: 256 * 1024 ** 2,
           queued: 0,
-          cpuActive: 1,
-          cpuQueued: 0,
         },
         runtimes: [{
           projectId: projectId("00000000-0000-4000-8000-000000000001"),
@@ -295,6 +293,8 @@ describe("FleetSampler", () => {
       array_buffer_bytes: 100,
     });
     expect((event.resources as any).transform_workers).toBe(6);
+    expect(event.resources).not.toHaveProperty("cpu_active");
+    expect(event.resources).not.toHaveProperty("cpu_queued");
     expect((event.resources as any).fleet_transfer_reserved).toBe(4);
     expect((event.resources as any).fleet_transfer_budget).toBe(4);
     expect((event.resources as any).event_memory).toMatchObject({

@@ -1,6 +1,5 @@
-import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
 import {
-  createAuthenticatedTenantScope,
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
@@ -22,48 +21,33 @@ export interface ResolvedRelayRequest {
   relayBody: Record<string, unknown>;
   /** Opaque server-derived scope; never serialized into a provider request. */
   authorizationScope: AuthenticatedTenantScope;
-  /** Present only when a synthetic warmup alias was expanded locally. */
-  parentId?: string;
   /** Public alias restored on outbound response objects after local expansion. */
   clientPreviousResponseId?: string;
-  inputDelta: unknown[];
-  /** Generated responses are always provider-backed and are never cached locally. */
-  cacheLocally: boolean;
   exposeEncryptedReasoning: boolean;
   /** True when relayBody.input includes locally accumulated warmup deltas. */
   materializedLocally: boolean;
 }
 
 interface MaterializationReservation {
-  releasePayload(): void;
-  releasePin(): void;
   release(): void;
 }
 
-const MATERIALIZATION_RESERVATIONS = new WeakMap<object, MaterializationReservation>();
 const RESOLUTION_RESERVATIONS = new WeakMap<ResolvedRelayRequest, MaterializationReservation>();
-
-export function releaseResponseGraphMaterialization(value: unknown): void {
-  if (!value || typeof value !== "object") return;
-  const reservation = MATERIALIZATION_RESERVATIONS.get(value);
-  if (!reservation) return;
-  MATERIALIZATION_RESERVATIONS.delete(value);
-  reservation.release();
-}
 
 /** Releases handoff scratch and lineage pins once router/transport owns the request. */
 export function releaseResponseGraphPayload(resolved: ResolvedRelayRequest): void {
   const reservation = RESOLUTION_RESERVATIONS.get(resolved);
-  reservation?.releasePayload();
-  reservation?.releasePin();
+  if (!reservation) return;
+  // Delete before releasing so a settled router handoff cannot keep the
+  // materialized warmup lineage reachable for the provider response lifetime.
+  RESOLUTION_RESERVATIONS.delete(resolved);
+  reservation.release();
+  resolved.relayBody = {};
 }
 
 /** Releases every remaining materialization charge and lineage pin. */
 export function releaseResponseGraphResolution(resolved: ResolvedRelayRequest): void {
-  const reservation = RESOLUTION_RESERVATIONS.get(resolved);
-  if (!reservation) return;
-  RESOLUTION_RESERVATIONS.delete(resolved);
-  reservation.release();
+  releaseResponseGraphPayload(resolved);
 }
 
 interface WarmupAliasNode {
@@ -97,7 +81,6 @@ export class PreviousResponseNotFoundError extends Error {
 export class ResponseGraphCapacityError extends Error {
   readonly name = "ResponseGraphCapacityError";
   readonly code = "response_graph_capacity";
-  readonly status = 503;
 
   constructor(message = "WebSocket continuation materialization capacity is exhausted") {
     super(message);
@@ -139,7 +122,7 @@ export interface ResponseGraphOptions {
 
 export interface ResponseGraphResolveOptions {
   /** Trusted server-side scope; never sourced from a client event. */
-  authorizationScope?: AuthenticatedTenantScope;
+  authorizationScope: AuthenticatedTenantScope;
   /** Caller transfers an isolated JSON.parse-owned input graph. */
   inputOwnership?: "borrowed" | "owned";
 }
@@ -181,7 +164,7 @@ function cloneFrozen<T>(value: T): T {
   return freezeJson(structuredClone(value));
 }
 
-function normalizeInput(input: unknown, owned: boolean): unknown[] {
+function normalizeRetainedInput(input: unknown, owned: boolean): unknown[] {
   if (input == null) return freezeJson([] as unknown[]);
   if (Array.isArray(input)) return owned ? freezeJson(input) : cloneFrozen(input);
   if (typeof input === "string") {
@@ -192,6 +175,20 @@ function normalizeInput(input: unknown, owned: boolean): unknown[] {
     }]);
   }
   return freezeJson([owned ? freezeJson(input) : cloneFrozen(input)]);
+}
+
+/** Shape-only normalization for a generated child of a retained warmup alias. */
+function normalizeMaterializedInput(input: unknown): readonly unknown[] {
+  if (input == null) return [];
+  if (Array.isArray(input)) return input;
+  if (typeof input === "string") {
+    return [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: input }],
+    }];
+  }
+  return [input];
 }
 
 const RETAINED_ARRAY_HEADER_BYTES = 64;
@@ -348,35 +345,98 @@ function warmupAliasByteSize(
   return bytes;
 }
 
+const MAX_REDACTION_VALUES = 1_000_000;
+const MAX_REDACTION_DEPTH = 65_536;
+
+interface RedactionFrame {
+  readonly source: unknown[] | Record<string, unknown>;
+  /** Object keys only; arrays are walked by numeric index without allocating a key list. */
+  readonly keys?: readonly string[];
+  readonly depth: number;
+  readonly parent?: RedactionFrame;
+  readonly parentKey?: string | number;
+  index: number;
+  output: unknown[] | Record<string, unknown> | null;
+}
+
+/** Copy-on-write, iterative redaction for potentially deep provider JSON. */
 function stripEncryptedContent(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    let output: unknown[] | null = null;
-    for (let index = 0; index < value.length; index++) {
-      const original = value[index];
-      const sanitized = stripEncryptedContent(original);
-      if (!output && sanitized !== original) output = value.slice(0, index);
-      output?.push(sanitized);
-    }
-    return output ?? value;
-  }
   if (!value || typeof value !== "object") return value;
-  const source = value as Record<string, unknown>;
-  let output: Record<string, unknown> | null = null;
-  for (const key in source) {
-    if (!Object.hasOwn(source, key)) continue;
-    if (key === "encrypted_content") {
-      output ??= { ...source };
-      delete output[key];
+
+  const root = value as unknown[] | Record<string, unknown>;
+  const frameFor = (
+    source: unknown[] | Record<string, unknown>,
+    depth: number,
+    parent?: RedactionFrame,
+    parentKey?: string | number,
+  ): RedactionFrame => ({
+    source,
+    keys: Array.isArray(source) ? undefined : Object.keys(source),
+    depth,
+    parent,
+    parentKey,
+    index: 0,
+    output: null,
+  });
+  const copy = (frame: RedactionFrame): unknown[] | Record<string, unknown> => {
+    frame.output ??= Array.isArray(frame.source)
+      ? frame.source.slice()
+      : { ...frame.source };
+    return frame.output;
+  };
+
+  const ancestors = new Set<object>([root]);
+  const stack: RedactionFrame[] = [frameFor(root, 0)];
+  let visited = 1;
+  while (stack.length > 0) {
+    const frame = stack.at(-1)!;
+    const entryCount = Array.isArray(frame.source)
+      ? frame.source.length
+      : frame.keys!.length;
+    if (frame.index >= entryCount) {
+      stack.pop();
+      ancestors.delete(frame.source);
+      const result = frame.output ?? frame.source;
+      if (!frame.parent) return result;
+      if (result !== frame.source) {
+        (copy(frame.parent) as any)[frame.parentKey!] = result;
+      }
       continue;
     }
-    const original = source[key];
-    const sanitized = stripEncryptedContent(original);
-    if (sanitized !== original) {
-      output ??= { ...source };
-      output[key] = sanitized;
+
+    const key = Array.isArray(frame.source)
+      ? frame.index++
+      : frame.keys![frame.index++]!;
+    visited++;
+    if (visited > MAX_REDACTION_VALUES) {
+      throw new ResponseGraphCapacityError(
+        "WebSocket response exceeds its encrypted-content redaction value limit",
+      );
     }
+    if (!Array.isArray(frame.source) && key === "encrypted_content") {
+      delete (copy(frame) as Record<string, unknown>)[key];
+      continue;
+    }
+
+    const child = (frame.source as any)[key] as unknown;
+    if (!child || typeof child !== "object") continue;
+    if (frame.depth >= MAX_REDACTION_DEPTH) {
+      throw new ResponseGraphCapacityError(
+        "WebSocket response exceeds its encrypted-content redaction depth limit",
+      );
+    }
+    if (ancestors.has(child)) {
+      throw new TypeError("WebSocket response must contain an acyclic JSON graph");
+    }
+    ancestors.add(child);
+    stack.push(frameFor(
+      child as unknown[] | Record<string, unknown>,
+      frame.depth + 1,
+      frame,
+      key,
+    ));
   }
-  return output ?? value;
+  return value;
 }
 
 export class ResponseGraph {
@@ -386,7 +446,6 @@ export class ResponseGraph {
   private readonly maxRetainedItems: number;
   private readonly maxRetainedDepth: number;
   private readonly sharedBudget: SharedByteBudget;
-  private readonly defaultAuthorizationScope = createAuthenticatedTenantScope();
   private readonly activeMaterializations = new Map<string, number>();
   /** Logically evicted aliases whose payload is still pinned by a router handoff. */
   private readonly retiredNodeBytes = new Map<string, number>();
@@ -432,7 +491,7 @@ export class ResponseGraph {
    */
   resolve(
     event: ResponseCreateEvent,
-    options: ResponseGraphResolveOptions = {},
+    options: ResponseGraphResolveOptions,
   ): ResolvedRelayRequest {
     // Apply the upstream persistence invariant before deciding whether any
     // connection-local warmup state needs expansion.
@@ -441,18 +500,12 @@ export class ResponseGraph {
     delete relayBody.type;
     delete relayBody.stream_id;
     delete relayBody.generate;
-    delete relayBody.background;
-    delete relayBody.stream;
-    relayBody.stream = true;
 
     const authorizationScope = this.resolveAuthorizationScope(options?.authorizationScope);
-    const inputDelta = normalizeInput(event.input, options.inputOwnership === "owned");
-    relayBody.input = inputDelta;
 
     const previousResponseId = typeof event.previous_response_id === "string"
       ? event.previous_response_id
       : undefined;
-    let parentId: string | undefined;
     let clientPreviousResponseId: string | undefined;
     let materializedLocally = false;
     let materialization: {
@@ -466,7 +519,6 @@ export class ResponseGraph {
       if (previousResponseId && isSyntheticWarmupId(previousResponseId)) {
         const parent = this.nodes.get(previousResponseId);
         if (!parent) throw new PreviousResponseNotFoundError(previousResponseId);
-        parentId = previousResponseId;
         clientPreviousResponseId = previousResponseId;
         materializedLocally = true;
         materialization = this.reserveLineage(
@@ -474,6 +526,7 @@ export class ResponseGraph {
           normalizedInputItemCount(event.input),
           authorizationScope,
         );
+        const inputDelta = normalizeMaterializedInput(event.input);
         relayBody.input = Object.freeze(
           this.materialize(materialization.lineage, inputDelta),
         );
@@ -485,17 +538,13 @@ export class ResponseGraph {
         if (relayBody.model == null && materialization.inheritedModel) {
           relayBody.model = materialization.inheritedModel;
         }
-        MATERIALIZATION_RESERVATIONS.set(relayBody, materialization.reservation);
       }
 
       const requestedIncludes = Array.isArray(event.include) ? event.include : [];
       const resolved: ResolvedRelayRequest = {
         relayBody,
         authorizationScope,
-        parentId,
         clientPreviousResponseId,
-        inputDelta,
-        cacheLocally: false,
         exposeEncryptedReasoning: requestedIncludes.includes("reasoning.encrypted_content"),
         materializedLocally,
       };
@@ -516,7 +565,7 @@ export class ResponseGraph {
   recordWarmup(
     id: string,
     event: ResponseCreateEvent,
-    options: ResponseGraphResolveOptions = {},
+    options: ResponseGraphResolveOptions,
   ): void {
     if (event.generate !== false) {
       throw new TypeError("Only explicit generate:false requests may create warmup aliases");
@@ -557,7 +606,7 @@ export class ResponseGraph {
       throw new ResponseGraphCapacityError("WebSocket warmup alias exceeds cache capacity");
     }
 
-    const input = normalizeInput(event.input, options.inputOwnership === "owned");
+    const input = normalizeRetainedInput(event.input, options.inputOwnership === "owned");
     const protectedIds = this.ancestorsOf(parentId);
     for (const protectedId of protectedIds) {
       const node = this.nodes.get(protectedId);
@@ -593,11 +642,6 @@ export class ResponseGraph {
       this.sharedBudget.release(nodeBytes);
       throw error;
     }
-  }
-
-  /** Generated provider responses deliberately never become local aliases. */
-  record(resolved: ResolvedRelayRequest, _final: unknown): void {
-    releaseResponseGraphResolution(resolved);
   }
 
   sanitizeOutbound<T>(value: T, resolved: ResolvedRelayRequest): T {
@@ -696,17 +740,12 @@ export class ResponseGraph {
         (this.activeMaterializations.get(entry.id) ?? 0) + 1,
       );
     }
-    let payloadReleased = false;
-    let pinReleased = false;
+    let released = false;
     const reservation: MaterializationReservation = {
-      releasePayload: () => {
-        if (payloadReleased) return;
-        payloadReleased = true;
+      release: () => {
+        if (released) return;
+        released = true;
         this.sharedBudget.release(materializationBytes);
-      },
-      releasePin: () => {
-        if (pinReleased) return;
-        pinReleased = true;
         for (const entry of lineage) {
           const remaining = (this.activeMaterializations.get(entry.id) ?? 1) - 1;
           if (remaining <= 0) {
@@ -720,10 +759,9 @@ export class ResponseGraph {
             this.activeMaterializations.set(entry.id, remaining);
           }
         }
-      },
-      release: () => {
-        reservation.releasePayload();
-        reservation.releasePin();
+        // The request already owns its flattened input; do not keep evicted
+        // alias nodes or their retained payloads alive through this closure.
+        lineage.length = 0;
       },
     };
     return {
@@ -787,9 +825,8 @@ export class ResponseGraph {
   }
 
   private resolveAuthorizationScope(
-    value: AuthenticatedTenantScope | undefined,
+    value: unknown,
   ): AuthenticatedTenantScope {
-    if (value === undefined) return this.defaultAuthorizationScope;
     if (!isAuthenticatedTenantScope(value)) {
       throw new TypeError("authorizationScope must be an AuthenticatedTenantScope");
     }

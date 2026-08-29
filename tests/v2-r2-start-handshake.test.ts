@@ -349,7 +349,11 @@ describe("R2 prepared/start host boundary", () => {
     await harness.settle();
     expect(harness.starts()).toHaveLength(0);
     controller.abort();
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await expect(pending).rejects.toMatchObject({
+      name: "V2PreCommitError",
+      code: "cancelled_precommit",
+      committed: false,
+    });
     expect(harness.session.snapshot().quarantined).toBe(0);
     await harness.close();
   });

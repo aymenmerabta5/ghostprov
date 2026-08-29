@@ -3,8 +3,11 @@ type PreparationJob<T> = {
   readonly costBytes: number;
   readonly signal: AbortSignal;
   readonly resolve: (value: T | null) => void;
+  bypasses: number;
   onAbort?: () => void;
 };
+
+const MAX_PREPARATION_BYPASSES = 8;
 
 export type BoundedPreparationSchedulerOptions = Readonly<{
   maxQueued: number;
@@ -21,6 +24,7 @@ export class BoundedPreparationScheduler<T> {
   readonly #maxQueued: number;
   readonly #maxQueuedBytes: number;
   #queuedBytes = 0;
+  #runningBytes = 0;
   #scheduled = false;
   #running = false;
   #closed = false;
@@ -46,11 +50,17 @@ export class BoundedPreparationScheduler<T> {
     const cost = costBytes;
     if (
       this.#queue.length >= this.#maxQueued ||
-      this.#queuedBytes + cost > this.#maxQueuedBytes
+      this.#queuedBytes + this.#runningBytes + cost > this.#maxQueuedBytes
     ) return Promise.resolve(null);
 
     return new Promise(resolve => {
-      const job: PreparationJob<T> = { task, costBytes: cost, signal, resolve };
+      const job: PreparationJob<T> = {
+        task,
+        costBytes: cost,
+        signal,
+        resolve,
+        bypasses: 0,
+      };
       job.onAbort = () => {
         const index = this.#queue.indexOf(job);
         if (index < 0) return;
@@ -78,15 +88,29 @@ export class BoundedPreparationScheduler<T> {
   #schedule(): void {
     if (this.#closed || this.#scheduled || this.#running || this.#queue.length === 0) return;
     this.#scheduled = true;
-    setTimeout(() => {
+    setImmediate(() => {
       this.#scheduled = false;
       void this.#drainOne();
-    }, 0);
+    });
   }
 
   async #drainOne(): Promise<void> {
     if (this.#running) return;
-    const job = this.#queue.shift();
+    let index = 0;
+    if ((this.#queue[0]?.bypasses ?? 0) < MAX_PREPARATION_BYPASSES) {
+      for (let candidate = 1; candidate < this.#queue.length; candidate++) {
+        if (this.#queue[candidate]!.costBytes < this.#queue[index]!.costBytes) {
+          index = candidate;
+        }
+      }
+    }
+    if (index > 0) {
+      this.#queue[0]!.bypasses = Math.min(
+        MAX_PREPARATION_BYPASSES,
+        this.#queue[0]!.bypasses + 1,
+      );
+    }
+    const [job] = this.#queue.splice(index, 1);
     if (!job) return;
     this.#queuedBytes = Math.max(0, this.#queuedBytes - job.costBytes);
     job.signal.removeEventListener("abort", job.onAbort!);
@@ -97,6 +121,7 @@ export class BoundedPreparationScheduler<T> {
     }
 
     this.#running = true;
+    this.#runningBytes = job.costBytes;
     let result: T | null = null;
     try {
       result = await job.task();
@@ -104,6 +129,7 @@ export class BoundedPreparationScheduler<T> {
       // Preprocessing is optional; the full-payload path remains authoritative.
     } finally {
       this.#running = false;
+      this.#runningBytes = 0;
     }
     job.resolve(result);
     this.#schedule();

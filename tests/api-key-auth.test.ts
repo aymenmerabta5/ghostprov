@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   apiKeyAuthorized,
   apiKeyMatches,
+  createAuthenticatedTenantScope,
   resolveGhostProvApiKey,
 } from "../src/http/api-key";
 import { createGhostProvApp, type RouterLike } from "../src/server/app";
@@ -10,7 +11,9 @@ import { createGhostProvServer } from "../src/server/runtime";
 const API_KEY = "GHOST_IS_KING";
 
 function router(): RouterLike {
+  const authorizationScope = createAuthenticatedTenantScope();
   return {
+    responseProvenanceAuthorizationScope: () => authorizationScope,
     async startRelay() { throw new Error("authentication test must not relay"); },
     snapshot: () => ({
       capacity: 1,

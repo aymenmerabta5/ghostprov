@@ -20,6 +20,9 @@ import { RouterTrafficTelemetry, type RouterTrafficSnapshot } from "./telemetry"
 import {
   classifyWorkload,
   jsonEncodedByteLength,
+  jsonEncodedByteLengthAsync,
+  MAX_WORKLOAD_JSON_ITEMS,
+  WorkloadTraversalLimitError,
   type WorkloadDescriptor,
 } from "./workload";
 import type { LoggerLike } from "../observability/logger";
@@ -27,18 +30,19 @@ import { observabilityEvent, type JsonValue } from "../observability/events";
 import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
-import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
 import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 import {
   releaseAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
+import { V2_LATENCY_CRITICAL_REQUEST_BYTES } from "../v2/transport/session";
 import {
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
 import {
-  ResponseProvenanceCapacityError,
   ResponseProvenanceCommitError,
+  ResponseProvenanceObsoleteError,
   ResponseProvenanceRegistry,
   ResponseProvenanceScopeError,
   type ResponseProvenance,
@@ -56,6 +60,7 @@ import {
   type RateLimitHint,
   type RateLimitProblem,
 } from "../v2/rate-limit";
+import { V2CommittedError, V2PreCommitError } from "../v2/transport/run-handle";
 
 export type RelaySource = "http" | "websocket" | "image" | "anthropic" | "internal";
 
@@ -95,6 +100,7 @@ const MAX_PREPARED_PROOF_GRACE_MS = 5_000;
 const MIN_FIRST_PROGRESS_TIMEOUT_MS = 5_000;
 const MAX_FIRST_PROGRESS_TIMEOUT_MS = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
+const SHALLOW_UPSTREAM_POLICY_HEADROOM_BYTES = 128;
 const RESPONSE_TERMINAL_EVENTS = new Set([
   "response.completed",
   "response.incomplete",
@@ -311,6 +317,8 @@ export interface IncomingResourceLease extends ReleasableLease {
 export interface IncomingBodyAcquireOptions {
   /** Structural route limit used only to cap geometric growth. */
   maxBytes?: number;
+  /** Endpoint-specific peak multiplier reserved before retaining each chunk. */
+  reservationMultiplier?: number;
 }
 
 export interface StartRelayOptions {
@@ -326,19 +334,25 @@ export interface StartRelayOptions {
   structuralBodyBytes?: number;
   /** Preprocessing bytes charged only to fair queue scheduling. */
   fairnessRequestBytes?: number;
+  /** Keep the original ingress allocation inside the atomic workload swap. */
+  retainIncomingLeaseBytes?: boolean;
+  /** Optional request-graph lifetime which must end before ingress memory releases. */
+  retainMemoryUntil?: Promise<unknown>;
 }
 
 interface QueuedJob {
   body: Record<string, unknown>;
   workload: WorkloadDescriptor;
+  decodedRequestBytes: number;
   clientId: string;
-  source: RelaySource;
   authorizationScope: AuthenticatedTenantScope | null;
   continuationProvenance: ResponseProvenance | null;
   provenanceReservation: ResponseProvenanceReservation | null;
   signal?: AbortSignal;
   memoryLease: ResourceLease;
   retainFullLeaseAfterCommit: boolean;
+  retainMemoryUntil: Promise<unknown> | null;
+  memoryReleaseScheduled: boolean;
   attempts: number;
   excluded: Map<string, {
     retryEpoch: number;
@@ -350,7 +364,6 @@ interface QueuedJob {
   onAbort?: () => void;
   traceId: string;
   acceptedAtMs: number;
-  admittedAtMs: number;
   queuedAtMs: number;
   queueWaitMs: number;
   queueDeadlineMs: number;
@@ -364,6 +377,7 @@ interface QueuedJob {
   queueLane: ClientLane | null;
   queuePrevious: QueuedJob | null;
   queueNext: QueuedJob | null;
+  queueCapacityHeld: boolean;
   deadlineIndex: number;
   retryWakeTimer?: ReturnType<typeof setTimeout>;
   retryWakeAtMs: number | null;
@@ -378,6 +392,8 @@ interface RouteSelection {
   retryEpoch: number;
   admissionCost: number;
   fleetTransferCost: number;
+  fleetTransferPacerCost: number;
+  selectedAvailable: number;
 }
 
 interface FleetTransferLease {
@@ -456,6 +472,111 @@ function abortError(): DOMException {
   return new DOMException("Relay request aborted while queued", "AbortError");
 }
 
+type JsonCloneFrame = {
+  readonly source: Record<string, unknown> | unknown[];
+  readonly target: Record<string, unknown> | unknown[];
+  readonly keys: readonly string[] | null;
+  index: number;
+};
+
+async function immutableRelaySnapshot(
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  expired: () => boolean,
+): Promise<Record<string, unknown>> {
+  const root: Record<string, unknown> = Object.create(null);
+  let flat = true;
+  let flatKeys = 0;
+  for (const key in body) {
+    if (!Object.prototype.hasOwnProperty.call(body, key) || ++flatKeys > 256) {
+      flat = false;
+      break;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(body, key);
+    if (!descriptor || !("value" in descriptor) ||
+      (descriptor.value !== null && typeof descriptor.value === "object") ||
+      typeof descriptor.value === "undefined" || typeof descriptor.value === "function" ||
+      typeof descriptor.value === "symbol" || typeof descriptor.value === "bigint") {
+      flat = false;
+      break;
+    }
+    root[key] = descriptor.value;
+  }
+  if (flat) return Object.freeze(root);
+  for (const key of Object.keys(root)) delete root[key];
+  const active = new WeakSet<object>();
+  active.add(body);
+  const stack: JsonCloneFrame[] = [{
+    source: body,
+    target: root,
+    keys: Object.keys(body),
+    index: 0,
+  }];
+  let nodes = 1;
+  let nodesSinceYield = 0;
+  let work = 0;
+  const checkpoint = async (): Promise<void> => {
+    if (signal?.aborted) throw signal.reason ?? abortError();
+    if (expired()) throw new RouterCapacityTimeoutError();
+    if (nodes > MAX_WORKLOAD_JSON_ITEMS) {
+      throw new RangeError("Relay request contains too many JSON values");
+    }
+    if (work < 64 * KiB && nodesSinceYield < 256) return;
+    work = 0;
+    nodesSinceYield = 0;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (signal?.aborted) throw signal.reason ?? abortError();
+    if (expired()) throw new RouterCapacityTimeoutError();
+  };
+  while (stack.length > 0) {
+    const frame = stack.at(-1)!;
+    const isArray = Array.isArray(frame.source);
+    const length = isArray ? frame.source.length : frame.keys!.length;
+    if (frame.index >= length) {
+      Object.freeze(frame.target);
+      active.delete(frame.source);
+      stack.pop();
+      continue;
+    }
+    const sourceKey = isArray ? String(frame.index) : frame.keys![frame.index]!;
+    const targetKey = isArray ? frame.index : sourceKey;
+    frame.index++;
+    const descriptor = Object.getOwnPropertyDescriptor(frame.source, sourceKey);
+    if (!descriptor || !("value" in descriptor)) {
+      throw new TypeError("Relay request changed during immutable snapshotting");
+    }
+    const value = descriptor.value;
+    nodes++;
+    nodesSinceYield++;
+    work += sourceKey.length + (typeof value === "string" ? value.length : 1);
+    if (value && typeof value === "object") {
+      if (active.has(value)) throw new TypeError("Converting circular structure to JSON");
+      if (Array.isArray(value) && value.length > MAX_WORKLOAD_JSON_ITEMS - nodes) {
+        throw new WorkloadTraversalLimitError("items");
+      }
+      const child = Array.isArray(value) ? new Array<unknown>(value.length) : Object.create(null);
+      if (isArray) (frame.target as unknown[])[targetKey as number] = child;
+      else (frame.target as Record<string, unknown>)[targetKey as string] = child;
+      active.add(value);
+      stack.push({
+        source: value as Record<string, unknown> | unknown[],
+        target: child,
+        keys: Array.isArray(value) ? null : Object.keys(value),
+        index: 0,
+      });
+    } else {
+      if (typeof value === "undefined" || typeof value === "function" ||
+        typeof value === "symbol" || typeof value === "bigint") {
+        throw new TypeError("Relay request contains a non-JSON value");
+      }
+      if (isArray) (frame.target as unknown[])[targetKey as number] = value;
+      else (frame.target as Record<string, unknown>)[targetKey as string] = value;
+    }
+    await checkpoint();
+  }
+  return root;
+}
+
 function isLocalCpuTransformFailure(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const value = error as { name?: unknown; code?: unknown };
@@ -466,23 +587,9 @@ function isLocalCpuTransformFailure(error: unknown): boolean {
 }
 
 function isSafePreCommitFailure(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const value = error as {
-    name?: unknown;
-    committed?: unknown;
-    ambiguous?: unknown;
-    providerError?: unknown;
-    provider_error?: unknown;
-  };
-  if (
-    value.committed === true ||
-    value.ambiguous === true ||
-    value.providerError !== undefined ||
-    value.provider_error !== undefined
-  ) return false;
-  // V2 owns this contract: only an explicit pre-commit proof is safe to move
-  // to another sandbox. A generic rejected Promise is not such a proof.
-  return value.committed === false && value.name === "V2PreCommitError";
+  // This boundary is process-local. Only the actual class is authoritative;
+  // duck-typed name/committed fields cannot authorize duplicate execution.
+  return error instanceof V2PreCommitError;
 }
 
 function isDeterministicRequestTooLarge(error: unknown): boolean {
@@ -493,6 +600,35 @@ function isDeterministicRequestTooLarge(error: unknown): boolean {
 
 function isRetryablePreCommitFailure(error: unknown): boolean {
   return isSafePreCommitFailure(error) && !isDeterministicRequestTooLarge(error);
+}
+
+function releaseLateRunHandle(handle: RunHandle): Promise<void> {
+  const cleanup: Promise<unknown>[] = [];
+  try {
+    const discard = (handle as RunHandle & {
+      discardUnconsumedEvents?: () => void;
+    }).discardUnconsumedEvents;
+    if (typeof discard === "function") discard.call(handle);
+    else {
+      const iterator = handle.events();
+      // Async-generator return() before the first next() does not execute its
+      // body/finally in Bun. Start one cancellation-bound read, release any
+      // transferred frame it yields, then close the iterator.
+      cleanup.push(iterator.next().then(result => {
+        if (!result.done) releaseAtomicBytePermit(result.value);
+        return iterator.return(undefined);
+      }).catch(() => undefined));
+    }
+  } catch {
+    // The already-aborted runtime signal remains the primary cleanup path.
+  }
+  try {
+    cleanup.push(Promise.resolve(handle.final).then(releaseAtomicBytePermit, () => undefined));
+  } catch {
+    // A throwing final accessor cannot own a resolved terminal allocation.
+  }
+  if (handle.upstreamPrelude) cleanup.push(handle.upstreamPrelude.catch(() => undefined));
+  return Promise.allSettled(cleanup).then(() => undefined);
 }
 
 function queueClassFor(workload: WorkloadDescriptor): RouterQueueClass {
@@ -548,6 +684,8 @@ export class MultiSandboxRouter {
   readonly #runtimeCache = new Map<ProjectId, CachedRuntime>();
   readonly #incomingRequests = new Set<IncomingRequestTracker>();
   readonly #pendingAdmissions = new Set<IncomingRequestTracker>();
+  readonly #deferredMemoryReleases = new Set<Promise<void>>();
+  readonly #lateAttemptCleanups = new Set<Promise<void>>();
   /**
    * Host run calls not yet handed off to the runtime's own admission-credit
    * accounting. The per-job callback below is the only valid handoff proof.
@@ -586,6 +724,8 @@ export class MultiSandboxRouter {
   #classCursor: RouterQueueClass = "latency";
   #queuedJobs = 0;
   #queuedBytes = 0;
+  #queueCapacityJobs = 0;
+  #queueCapacityBytes = 0;
   #fleetTransferReserved = 0;
   #fleetTransferPacerTokens = FLEET_TRANSFER_PACER_BURST;
   #fleetTransferPacerNextTokenAtMs: number | null = null;
@@ -660,26 +800,32 @@ export class MultiSandboxRouter {
       if (event.type === "removed") {
         this.#runtimeCache.delete(event.projectId);
         this.#rateLimitObservations.delete(event.projectId);
+        this.#rejectObsoleteContinuations(event.projectId);
         return;
       }
       const runtime = this.#registry.get(event.projectId);
       if (!runtime) return;
       const previous = this.#runtimeCache.get(event.projectId);
       const previousCredits = previous
-        ? this.#candidateCredits(this.#agedCandidate(previous))
-        : 0;
+        ? this.#candidateCreditLanes(this.#agedCandidate(previous))
+        : { admission: 0, prefetch: 0, transfer: 0 };
       const previousIncarnation = previous?.snapshot.incarnation ?? 0;
       const next = this.#refreshRuntime(runtime);
-      const nextCredits = this.#candidateCredits(next.candidate);
+      const nextCredits = this.#candidateCreditLanes(next.candidate);
       const incarnationChanged = !!previous &&
         (next.snapshot.incarnation ?? 0) !== previousIncarnation;
-      if (incarnationChanged) this.#rateLimitObservations.delete(event.projectId);
+      if (incarnationChanged) {
+        this.#rateLimitObservations.delete(event.projectId);
+        this.#rejectObsoleteContinuations(event.projectId);
+      }
       // Awareness publishes frequently for frame/RTT progress. Queue draining
       // only becomes useful when admission credits increase, health returns,
       // or a fresh incarnation makes an excluded retry target safe again.
       if (
         !previous ||
-        nextCredits > previousCredits ||
+        nextCredits.admission > previousCredits.admission ||
+        nextCredits.prefetch > previousCredits.prefetch ||
+        nextCredits.transfer > previousCredits.transfer ||
         incarnationChanged ||
         next.retryEpoch > previous.retryEpoch
       ) this.#scheduleDrain();
@@ -689,6 +835,35 @@ export class MultiSandboxRouter {
   async startRelay(
     body: Record<string, unknown>,
     options: StartRelayOptions = {},
+  ): Promise<RunHandle> {
+    let incomingLeaseOwned = options.incomingLease !== undefined;
+    const releaseIncomingLease = () => {
+      if (!incomingLeaseOwned) return;
+      incomingLeaseOwned = false;
+      this.#releaseLeaseAfter(options.incomingLease!, options.retainMemoryUntil);
+    };
+    try {
+      return await this.#startRelayWithIncomingLeaseOwnership(body, options, {
+        release: releaseIncomingLease,
+        transfer: () => { incomingLeaseOwned = false; },
+      });
+    } catch (error) {
+      // Until replace() succeeds, the router owns the caller's ingress lease.
+      // One boundary covers normalization, provenance, structural sizing,
+      // classification, and resource-admission failures without relying on an
+      // adapter-specific outer finally. The one-shot guard prevents duplicates.
+      releaseIncomingLease();
+      throw error;
+    }
+  }
+
+  async #startRelayWithIncomingLeaseOwnership(
+    body: Record<string, unknown>,
+    options: StartRelayOptions,
+    incomingLeaseOwnership: Readonly<{
+      release(): void;
+      transfer(): void;
+    }>,
   ): Promise<RunHandle> {
     if (this.#closed || this.#shuttingDown) throw new RouterShutdownError();
     this.#traffic.accepted();
@@ -701,13 +876,13 @@ export class MultiSandboxRouter {
     const inheritedDeadlineMs = options.incomingLease?.deadlineMs;
     const traceId = this.#random.uuid();
     const source = options.source ?? "internal";
-    let authorizationScope: AuthenticatedTenantScope | null =
-      options.authorizationScope ?? this.#defaultAuthorizationScope;
+    const authorizationScope = this.#defaultAuthorizationScope;
     if (
+      (options.authorizationScope !== undefined &&
+        options.authorizationScope !== authorizationScope) ||
       authorizationScope !== null &&
       !isAuthenticatedTenantScope(authorizationScope)
     ) {
-      options.incomingLease?.release();
       const error = new ResponseProvenanceScopeError();
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
       this.#failure(traceId, acceptedAtMs, "continuation", error, 0);
@@ -718,33 +893,11 @@ export class MultiSandboxRouter {
     // stream semantics and caller-owned request objects unchanged.
     const normalizedBody = normalizeUpstreamResponsesRequest(body);
     const relayBody: Record<string, unknown> = applyUpstreamServiceTierPolicy(normalizedBody);
-    const hasPreviousResponse = Object.hasOwn(relayBody, "previous_response_id") &&
-      relayBody.previous_response_id !== undefined &&
-      relayBody.previous_response_id !== null;
-    if (hasPreviousResponse && authorizationScope === null) {
-      options.incomingLease?.release();
-      const error = new ResponseProvenanceScopeError();
-      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
-      this.#failure(traceId, acceptedAtMs, "continuation", error, 0);
-      throw error;
-    }
-    const provenanceLookup = authorizationScope === null
-      ? ({ kind: "unknown" } as const)
-      : this.#responseProvenance.lookup(
-          relayBody.previous_response_id,
-          authorizationScope,
-        );
-    if (provenanceLookup.kind === "scope_mismatch") {
-      options.incomingLease?.release();
-      const error = new ResponseProvenanceScopeError();
-      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
-      this.#failure(traceId, acceptedAtMs, "continuation", error, 0);
-      throw error;
-    }
-    const continuationProvenance = provenanceLookup.kind === "known"
-      ? provenanceLookup.provenance
-      : null;
-    const incomingBodyBytes = source === "http" ? options.incomingLease?.bodyBytes : undefined;
+    // The caller can retain and mutate its graph while resource admission is
+    // pending. Continuation authority is therefore resolved only from the
+    // immutable, policy-normalized snapshot which will actually execute.
+    let continuationProvenance: ResponseProvenance | null = null;
+    const incomingBodyBytes = options.incomingLease?.bodyBytes;
     const encodedBodyBytes = options.encodedBodyBytes ?? incomingBodyBytes;
     for (const [name, value] of [
       ["encodedBodyBytes", encodedBodyBytes],
@@ -758,18 +911,24 @@ export class MultiSandboxRouter {
     const originalStructuralBytes = options.structuralBodyBytes ?? jsonEncodedByteLength(body);
     const relayStructuralBytes = relayBody === body
       ? originalStructuralBytes
-      : jsonEncodedByteLength(relayBody);
+      : options.structuralBodyBytes !== undefined
+        ? Math.min(
+            Number.MAX_SAFE_INTEGER,
+            originalStructuralBytes + SHALLOW_UPSTREAM_POLICY_HEADROOM_BYTES,
+          )
+        : jsonEncodedByteLength(relayBody);
     const adjustedEncodedBytes = encodedBodyBytes === undefined
       ? undefined
       : Math.min(
           Number.MAX_SAFE_INTEGER,
           Math.max(0, encodedBodyBytes - originalStructuralBytes) + relayStructuralBytes,
         );
-    const workload = classifyWorkload(relayBody, {
+    let workload = classifyWorkload(relayBody, {
       structuralBytes: relayStructuralBytes,
       ...(adjustedEncodedBytes === undefined ? {} : { encodedBytes: adjustedEncodedBytes }),
     });
-    const schedulingWorkload = options.fairnessRequestBytes !== undefined &&
+    let decodedRequestBytes = relayStructuralBytes;
+    let schedulingWorkload = options.fairnessRequestBytes !== undefined &&
         options.fairnessRequestBytes > workload.requestBytes
       ? classifyWorkload(relayBody, {
           encodedBytes: options.fairnessRequestBytes,
@@ -780,12 +939,12 @@ export class MultiSandboxRouter {
       workload.requestBytes,
       this.#queueTimeoutMs,
     );
-    const routeAttemptTimeoutMs = scaledRouteAttemptTimeoutMs(
+    let routeAttemptTimeoutMs = scaledRouteAttemptTimeoutMs(
       workload.requestBytes,
       this.#routeAttemptTimeoutMs,
     );
     const payloadDeadlineMs = acceptedAtMs + queueTimeoutMs;
-    const admissionDeadlineMs = typeof inheritedDeadlineMs === "number" &&
+    let admissionDeadlineMs = typeof inheritedDeadlineMs === "number" &&
         Number.isFinite(inheritedDeadlineMs) && inheritedDeadlineMs >= acceptedAtMs
       ? Math.max(inheritedDeadlineMs, payloadDeadlineMs)
       : payloadDeadlineMs;
@@ -793,13 +952,15 @@ export class MultiSandboxRouter {
     // together until the compatibility request finishes. The first fan-out
     // job receives the one-shot ingress lease and conservatively reserves both
     // phases in one replacement lease; later jobs use ordinary admission.
-    const retainedIngressBytes = options.source === "image" &&
+    const retainIncomingLeaseBytes = options.source === "image" ||
+      options.retainIncomingLeaseBytes === true;
+    const retainedIngressBytes = retainIncomingLeaseBytes &&
         typeof options.incomingLease?.reservedBytes === "number" &&
         Number.isSafeInteger(options.incomingLease.reservedBytes) &&
         options.incomingLease.reservedBytes > 0
       ? options.incomingLease.reservedBytes
       : 0;
-    const admissionWorkload = retainedIngressBytes > 0
+    let admissionWorkload = retainedIngressBytes > 0
       ? {
           ...workload,
           reservedBytes: Math.min(
@@ -808,9 +969,9 @@ export class MultiSandboxRouter {
           ),
         }
       : workload;
-    const standardAdmissionCost = v2RequestTransferCost(workload.requestBytes, "standard");
-    const bulkAdmissionCost = v2RequestTransferCost(workload.requestBytes, "bulk-v1");
-    const initial = this.snapshot();
+    let standardAdmissionCost = v2RequestTransferCost(decodedRequestBytes, "standard");
+    let bulkAdmissionCost = v2RequestTransferCost(decodedRequestBytes, "bulk-v1");
+    const acceptedSnapshot = this.snapshot();
     this.#emit("request.accepted", {
       trace_id: traceId,
       source: options.source ?? "internal",
@@ -819,30 +980,18 @@ export class MultiSandboxRouter {
       stream: workload.stream,
       workload_class: schedulingWorkload.class,
       request_bytes: schedulingWorkload.requestBytes,
-      // No runtime is selected yet; emit the conservative rollback profile.
       transfer_admission_cost: standardAdmissionCost,
       reserved_bytes: admissionWorkload.reservedBytes,
-      capacity: initial.capacity,
-      active: initial.active,
-      available: initial.available,
-      queued: initial.queued,
+      capacity: acceptedSnapshot.capacity,
+      active: acceptedSnapshot.active,
+      available: acceptedSnapshot.available,
+      queued: acceptedSnapshot.queued,
     });
     try {
       validateResponsesInputJson(relayBody);
     } catch (error) {
-      options.incomingLease?.release();
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
       this.#failure(traceId, acceptedAtMs, "validation", error, 0);
-      throw error;
-    }
-    const provenanceReservation = authorizationScope === null
-      ? null
-      : this.#responseProvenance.reserve();
-    if (authorizationScope !== null && provenanceReservation === null) {
-      options.incomingLease?.release();
-      const error = new ResponseProvenanceCapacityError();
-      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
-      this.#failure(traceId, acceptedAtMs, "continuation", error, 0);
       throw error;
     }
     const admissionWaitController = new AbortController();
@@ -857,22 +1006,26 @@ export class MultiSandboxRouter {
     if (options.signal?.aborted) abortAdmissionWait();
     else options.signal?.addEventListener("abort", abortAdmissionWait, { once: true });
     this.#pendingAdmissions.add(admissionTracker);
-    let memoryLease: ResourceLease;
+    let memoryLease: ResourceLease | null = null;
     try {
-      memoryLease = typeof options.incomingLease?.replace === "function"
-        ? await options.incomingLease.replace(
-            admissionWorkload,
-            admissionWaitController.signal,
-            { deadlineMs: admissionDeadlineMs },
-          )
-        : await this.#governor.acquire(
-            admissionWorkload,
-            admissionWaitController.signal,
-            { deadlineMs: admissionDeadlineMs },
-          );
+      if (options.incomingLease?.replace) {
+        memoryLease = await options.incomingLease.replace(
+          admissionWorkload,
+          admissionWaitController.signal,
+          { deadlineMs: admissionDeadlineMs },
+        );
+        incomingLeaseOwnership.transfer();
+      } else {
+        memoryLease = await this.#governor.acquire(
+          admissionWorkload,
+          admissionWaitController.signal,
+          { deadlineMs: admissionDeadlineMs },
+        );
+        incomingLeaseOwnership.release();
+      }
     } catch (error) {
+      if (memoryLease) this.#releaseLeaseAfter(memoryLease, options.retainMemoryUntil);
       finishAdmissionWait();
-      this.#responseProvenance.release(provenanceReservation);
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
       const failure = admissionWaitController.signal.reason instanceof RouterShutdownError
         ? admissionWaitController.signal.reason
@@ -880,7 +1033,10 @@ export class MultiSandboxRouter {
       this.#failure(traceId, acceptedAtMs, "admission", failure, 0);
       throw failure;
     }
-    finishAdmissionWait();
+    if (!memoryLease) {
+      finishAdmissionWait();
+      throw new Error("Resource admission returned no lease");
+    }
     const admittedAtMs = this.#clock.now();
     const resources = this.#governor.snapshot();
     this.#emit("admission.acquired", {
@@ -892,8 +1048,120 @@ export class MultiSandboxRouter {
       memory_paused: resources.paused,
     });
     if (options.signal?.aborted || this.#closed || this.#shuttingDown) {
-      memoryLease.release();
-      this.#responseProvenance.release(provenanceReservation);
+      finishAdmissionWait();
+      this.#releaseLeaseAfter(memoryLease, options.retainMemoryUntil);
+      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
+      if (options.signal?.aborted) throw abortError();
+      throw new RouterShutdownError();
+    }
+    let immutableBody: Record<string, unknown>;
+    try {
+      const immutableCallerBody = await immutableRelaySnapshot(
+        body,
+        admissionWaitController.signal,
+        () => this.#clock.now() >= admissionDeadlineMs,
+      );
+      const normalizedSnapshot = normalizeUpstreamResponsesRequest(immutableCallerBody);
+      const policySnapshot = applyUpstreamServiceTierPolicy(normalizedSnapshot);
+      immutableBody = Object.isFrozen(policySnapshot)
+        ? policySnapshot
+        : Object.freeze(policySnapshot);
+    } catch (error) {
+      finishAdmissionWait();
+      this.#releaseLeaseAfter(memoryLease, options.retainMemoryUntil);
+      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
+      this.#failure(traceId, acceptedAtMs, "snapshot", error, 0);
+      throw error;
+    }
+    try {
+      // The caller-owned graph may have changed while admission awaited. All
+      // execution, fairness, deadlines, and permits are derived again from the
+      // frozen snapshot so a small measured request cannot grow into a large
+      // under-accounted attempt.
+      const needsExactAdmissionBoundary = Math.abs(
+        relayStructuralBytes - V2_LATENCY_CRITICAL_REQUEST_BYTES,
+      ) <= SHALLOW_UPSTREAM_POLICY_HEADROOM_BYTES;
+      const finalStructuralBytes = options.structuralBodyBytes !== undefined &&
+          !needsExactAdmissionBoundary
+        // Public adapters measure their owned body cooperatively immediately
+        // before this call. Only router-owned shallow policy fields can differ.
+        ? relayStructuralBytes
+        : workload.requestBytes <= 256 * KiB
+          ? jsonEncodedByteLength(immutableBody)
+          : await jsonEncodedByteLengthAsync(immutableBody, {
+              signal: admissionWaitController.signal,
+            });
+      validateResponsesInputJson(immutableBody);
+      const finalEncodedBytes = adjustedEncodedBytes === undefined
+        ? undefined
+        : Math.max(adjustedEncodedBytes, finalStructuralBytes);
+      const finalWorkload = classifyWorkload(immutableBody, {
+        structuralBytes: finalStructuralBytes,
+        ...(finalEncodedBytes === undefined ? {} : { encodedBytes: finalEncodedBytes }),
+      });
+      continuationProvenance = this.#resolveContinuationProvenance(
+        immutableBody,
+        authorizationScope,
+      );
+      const finalSchedulingWorkload = options.fairnessRequestBytes !== undefined &&
+          options.fairnessRequestBytes > finalWorkload.requestBytes
+        ? classifyWorkload(immutableBody, {
+            encodedBytes: options.fairnessRequestBytes,
+            structuralBytes: finalStructuralBytes,
+          })
+        : finalWorkload;
+      const finalAdmissionWorkload = retainedIngressBytes > 0
+        ? {
+            ...finalWorkload,
+            reservedBytes: Math.min(
+              Number.MAX_SAFE_INTEGER,
+              finalWorkload.reservedBytes + retainedIngressBytes,
+            ),
+          }
+        : finalWorkload;
+      admissionDeadlineMs = Math.max(
+        admissionDeadlineMs,
+        acceptedAtMs + scaledQueueTimeoutMs(finalWorkload.requestBytes, this.#queueTimeoutMs),
+      );
+      routeAttemptTimeoutMs = scaledRouteAttemptTimeoutMs(
+        finalWorkload.requestBytes,
+        this.#routeAttemptTimeoutMs,
+      );
+      if (finalAdmissionWorkload.reservedBytes > memoryLease.reservedBytes) {
+        memoryLease = await memoryLease.replace(
+          finalAdmissionWorkload,
+          admissionWaitController.signal,
+          { deadlineMs: admissionDeadlineMs },
+        );
+      }
+      workload = finalWorkload;
+      decodedRequestBytes = finalStructuralBytes;
+      schedulingWorkload = finalSchedulingWorkload;
+      admissionWorkload = finalAdmissionWorkload;
+      standardAdmissionCost = v2RequestTransferCost(decodedRequestBytes, "standard");
+      bulkAdmissionCost = v2RequestTransferCost(decodedRequestBytes, "bulk-v1");
+    } catch (error) {
+      finishAdmissionWait();
+      this.#releaseLeaseAfter(memoryLease, options.retainMemoryUntil);
+      this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
+      this.#failure(
+        traceId,
+        acceptedAtMs,
+        error instanceof ResponseProvenanceScopeError ||
+            error instanceof ResponseProvenanceObsoleteError
+          ? "continuation"
+          : "snapshot",
+        error,
+        0,
+      );
+      throw error;
+    }
+    // A flat snapshot can resolve in the same microtask turn. An abort queued
+    // behind that resolution would otherwise land before the job listener is
+    // installed and remain queued until its full routing deadline.
+    if (options.signal?.aborted || this.#closed || this.#shuttingDown) {
+      finishAdmissionWait();
+      this.#releaseLeaseAfter(memoryLease, options.retainMemoryUntil);
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
       if (options.signal?.aborted) throw abortError();
       throw new RouterShutdownError();
@@ -902,23 +1170,25 @@ export class MultiSandboxRouter {
       const clientId = boundedClientId(options.clientId, source);
       const enqueuedAtMs = this.#clock.now();
       const job: QueuedJob = {
-        body: relayBody,
+        body: immutableBody,
         workload,
+        decodedRequestBytes,
         clientId,
-        source,
         authorizationScope,
         continuationProvenance,
-        provenanceReservation,
+        provenanceReservation: null,
         signal: options.signal,
         memoryLease,
-        retainFullLeaseAfterCommit: retainedIngressBytes > 0,
+        retainFullLeaseAfterCommit: retainedIngressBytes > 0 ||
+          options.retainMemoryUntil !== undefined,
+        retainMemoryUntil: options.retainMemoryUntil ?? null,
+        memoryReleaseScheduled: false,
         attempts: 0,
         excluded: new Map(),
         resolve,
         reject,
         traceId,
         acceptedAtMs,
-        admittedAtMs,
         queuedAtMs: enqueuedAtMs,
         queueWaitMs: 0,
         // One absolute admission deadline starts when the public request is
@@ -935,24 +1205,30 @@ export class MultiSandboxRouter {
         queueLane: null,
         queuePrevious: null,
         queueNext: null,
+        queueCapacityHeld: false,
         deadlineIndex: -1,
         retryWakeAtMs: null,
       };
       job.onAbort = () => {
         if (!this.#removeJob(job)) return;
         this.#clearRetryWake(job);
-        memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         const error = abortError();
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
         reject(error);
       };
       options.signal?.addEventListener("abort", job.onAbort, { once: true });
+      // Ownership has moved atomically from the shutdown-visible admission
+      // tracker to the queued job and its abort listener.
+      finishAdmissionWait();
       if (!this.#enqueue(job)) {
         options.signal?.removeEventListener("abort", job.onAbort);
-        memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         const error = new RouterQueueFullError();
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
@@ -990,6 +1266,11 @@ export class MultiSandboxRouter {
     }
     if (maxBytes !== undefined && bytes > maxBytes) {
       throw new RangeError("Incoming body reservation exceeds its structural maximum");
+    }
+    const reservationMultiplier = options.reservationMultiplier ?? 2;
+    if (!Number.isSafeInteger(reservationMultiplier) ||
+      reservationMultiplier < 2 || reservationMultiplier > 6) {
+      throw new RangeError("Incoming body reservation multiplier must be an integer from 2 through 6");
     }
     const acceptedAtMs = this.#clock.now();
     let deadlineMs = acceptedAtMs + scaledQueueTimeoutMs(bytes, this.#queueTimeoutMs);
@@ -1031,13 +1312,15 @@ export class MultiSandboxRouter {
 
     const incomingWorkload = (
       bodyBytes: number,
-      reservedBytes = Math.max(8 * MiB, bodyBytes * 2 + 2 * MiB),
+      reservedBytes = Math.max(
+        8 * MiB,
+        bodyBytes * reservationMultiplier + 2 * MiB,
+      ),
     ): WorkloadDescriptor => ({
       class: bodyBytes > 512 * KiB ? "text-large" : "text-small",
       requestBytes: bodyBytes,
       // Chunk buffers and the final contiguous Buffer coexist briefly.
       reservedBytes,
-      cpuPermits: 0,
       stream: false,
     });
 
@@ -1049,9 +1332,16 @@ export class MultiSandboxRouter {
       );
     } catch (error) {
       cleanup();
-      if (controller.signal.reason instanceof RouterShutdownError) {
+      if (controller.signal.aborted && controller.signal.reason !== undefined) {
         throw controller.signal.reason;
       }
+      throw error;
+    }
+    if (controller.signal.aborted || !active) {
+      const error = controller.signal.reason ?? abortError();
+      lease.release();
+      lease = null;
+      cleanup();
       throw error;
     }
 
@@ -1090,16 +1380,30 @@ export class MultiSandboxRouter {
           Math.max(required, Math.min(Number.MAX_SAFE_INTEGER, lease.reservedBytes * 2)),
         );
         const next = incomingWorkload(nextBytes, grown);
-        lease = await lease.replace(next, controller.signal, { deadlineMs });
+        const current = lease;
+        const replacement = await current.replace(next, controller.signal, { deadlineMs });
+        if (!active || controller.signal.aborted || lease !== current) {
+          // release() may win while the governor atomically invalidates current
+          // and this async continuation is still queued. Never publish an
+          // orphaned replacement lease after ownership has ended.
+          replacement.release();
+          if (controller.signal.aborted) throw controller.signal.reason ?? abortError();
+          throw new Error("Incoming body lease was released during growth");
+        }
+        lease = replacement;
       },
       replace: async (workload, replacementSignal, options) => {
-        if (!active || !admissionActive || !lease) {
+        if (!active || !lease) {
           throw new Error("Incoming body lease is no longer available for replacement");
         }
         if (replacementSignal?.aborted) throw replacementSignal.reason ?? abortError();
-        const maximumDeadline = acceptedAtMs + scaledQueueTimeoutMs(
-          workload.requestBytes,
-          this.#queueTimeoutMs,
+        const effectiveSignal = replacementSignal ?? controller.signal;
+        const maximumDeadline = Math.max(
+          deadlineMs,
+          acceptedAtMs + scaledQueueTimeoutMs(
+            workload.requestBytes,
+            this.#queueTimeoutMs,
+          ),
         );
         const requestedDeadline = options?.deadlineMs;
         const effectiveDeadline = typeof requestedDeadline === "number" &&
@@ -1110,11 +1414,17 @@ export class MultiSandboxRouter {
         // replacement governor wait now owns its payload-aware deadline.
         if (deadlineTimer) clearTimeout(deadlineTimer);
         deadlineTimer = undefined;
-        const replacement = await lease.replace(
+        const current = lease;
+        const replacement = await current.replace(
           workload,
-          controller.signal,
+          effectiveSignal,
           { deadlineMs: effectiveDeadline },
         );
+        if (!active || effectiveSignal.aborted || lease !== current) {
+          replacement.release();
+          if (effectiveSignal.aborted) throw effectiveSignal.reason ?? abortError();
+          throw new Error("Incoming body lease was released during replacement");
+        }
         lease = null;
         cleanup();
         return replacement;
@@ -1138,11 +1448,41 @@ export class MultiSandboxRouter {
     responseId: unknown,
     authorizationScope?: AuthenticatedTenantScope,
   ): ResponseProvenanceLookup {
-    const scope = authorizationScope ?? this.#defaultAuthorizationScope;
-    if (!scope || !isAuthenticatedTenantScope(scope)) {
+    if (
+      authorizationScope !== undefined &&
+      authorizationScope !== this.#defaultAuthorizationScope
+    ) return { kind: "scope_mismatch" };
+    const scope = this.#defaultAuthorizationScope;
+    if (
+      !scope ||
+      !isAuthenticatedTenantScope(scope) ||
+      (this.#defaultAuthorizationScope !== null &&
+        scope !== this.#defaultAuthorizationScope)
+    ) {
       return { kind: "scope_mismatch" };
     }
     return this.#responseProvenance.lookup(responseId, scope);
+  }
+
+  #resolveContinuationProvenance(
+    body: Readonly<Record<string, unknown>>,
+    authorizationScope: AuthenticatedTenantScope | null,
+  ): ResponseProvenance | null {
+    const hasPreviousResponse = Object.hasOwn(body, "previous_response_id") &&
+      body.previous_response_id !== undefined &&
+      body.previous_response_id !== null;
+    if (!hasPreviousResponse) return null;
+    if (authorizationScope === null) throw new ResponseProvenanceScopeError();
+    const lookup = this.#responseProvenance.lookup(
+      body.previous_response_id,
+      authorizationScope,
+    );
+    if (lookup.kind === "scope_mismatch") throw new ResponseProvenanceScopeError();
+    if (lookup.kind !== "known") return null;
+    if (this.#isContinuationIncarnationObsolete(lookup.provenance)) {
+      throw new ResponseProvenanceObsoleteError();
+    }
+    return lookup.provenance;
   }
 
   trafficSnapshotAndReset(): RouterTrafficSnapshot {
@@ -1162,8 +1502,76 @@ export class MultiSandboxRouter {
   }
 
   #releaseJobProvenance(job: QueuedJob): void {
+    if (!job.provenanceReservation) return;
     this.#responseProvenance.release(job.provenanceReservation);
     job.provenanceReservation = null;
+    this.#scheduleDrain();
+  }
+
+  #releaseQueueCapacity(job: QueuedJob): void {
+    if (!job.queueCapacityHeld) return;
+    job.queueCapacityHeld = false;
+    this.#queueCapacityJobs = Math.max(0, this.#queueCapacityJobs - 1);
+    this.#queueCapacityBytes = Math.max(
+      0,
+      this.#queueCapacityBytes - Math.max(0, job.workload.requestBytes),
+    );
+  }
+
+  #releaseLeaseAfter(
+    lease: ReleasableLease,
+    retainUntil: Promise<unknown> | null | undefined,
+  ): void {
+    if (!retainUntil) {
+      lease.release();
+      return;
+    }
+    const release = Promise.resolve(retainUntil)
+      .catch(() => undefined)
+      .then(() => { lease.release(); })
+      .catch(() => undefined);
+    this.#deferredMemoryReleases.add(release);
+    void release.finally(() => {
+      this.#deferredMemoryReleases.delete(release);
+    });
+  }
+
+  #releaseJobMemory(job: QueuedJob): void {
+    if (job.memoryReleaseScheduled) return;
+    job.memoryReleaseScheduled = true;
+    const retainUntil = job.retainMemoryUntil;
+    job.retainMemoryUntil = null;
+    this.#releaseLeaseAfter(job.memoryLease, retainUntil);
+  }
+
+  #isContinuationIncarnationObsolete(provenance: ResponseProvenance): boolean {
+    const current = this.#runtimeCache.get(provenance.projectId);
+    return !current ||
+      (current.snapshot.incarnation ?? 0) !== provenance.incarnation;
+  }
+
+  #failObsoleteContinuation(job: QueuedJob): boolean {
+    if (job.queueLane && !this.#removeJob(job)) return false;
+    this.#clearRetryWake(job);
+    job.signal?.removeEventListener("abort", job.onAbort!);
+    this.#releaseJobMemory(job);
+    this.#releaseJobProvenance(job);
+    this.#releaseQueueCapacity(job);
+    const error = new ResponseProvenanceObsoleteError();
+    this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
+    this.#failure(job.traceId, job.acceptedAtMs, "continuation", error, job.attempts);
+    job.reject(error);
+    return true;
+  }
+
+  #rejectObsoleteContinuations(projectId: ProjectId): void {
+    for (const job of [...this.#deadlines]) {
+      if (
+        job.continuationProvenance?.projectId !== projectId ||
+        !this.#isContinuationIncarnationObsolete(job.continuationProvenance)
+      ) continue;
+      this.#failObsoleteContinuation(job);
+    }
   }
 
   #reserveRuntime(job: QueuedJob, projectId: ProjectId): void {
@@ -1326,8 +1734,9 @@ export class MultiSandboxRouter {
       if (!this.#removeJob(job)) continue;
       this.#clearRetryWake(job);
       job.signal?.removeEventListener("abort", job.onAbort!);
-      job.memoryLease.release();
+      this.#releaseJobMemory(job);
       this.#releaseJobProvenance(job);
+      this.#releaseQueueCapacity(job);
       this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
       this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
       job.reject(error);
@@ -1348,7 +1757,9 @@ export class MultiSandboxRouter {
         snapshot.active === 0 &&
         snapshot.queued === 0 &&
         this.#incomingRequests.size === 0 &&
-        this.#pendingAdmissions.size === 0
+        this.#pendingAdmissions.size === 0 &&
+        this.#deferredMemoryReleases.size === 0 &&
+        this.#lateAttemptCleanups.size === 0
       ) return;
       if (this.#clock.now() >= deadline) {
         throw new RouterShutdownError("Router idle wait timed out with active work");
@@ -1368,10 +1779,15 @@ export class MultiSandboxRouter {
   #enqueue(job: QueuedJob, front = false): boolean {
     if (job.queueLane) throw new Error("Router job is already queued");
     const requestBytes = Math.max(0, job.workload.requestBytes);
-    if (
-      this.#queuedJobs >= this.#queueCapacity ||
-      requestBytes > this.#queueByteCapacity - this.#queuedBytes
-    ) return false;
+    if (!job.queueCapacityHeld) {
+      if (
+        this.#queueCapacityJobs >= this.#queueCapacity ||
+        requestBytes > this.#queueByteCapacity - this.#queueCapacityBytes
+      ) return false;
+      job.queueCapacityHeld = true;
+      this.#queueCapacityJobs++;
+      this.#queueCapacityBytes += requestBytes;
+    }
 
     const key = `${job.queueClass}\0${job.clientId}`;
     let lane = this.#lanes.get(key);
@@ -1546,6 +1962,10 @@ export class MultiSandboxRouter {
         this.#classCursor = this.#classCursor === "latency" ? "bulk" : "latency";
         continue;
       }
+      // Rotate classes after every successful dispatch while retaining each
+      // class's byte deficit. This preserves weighted DRR credit without
+      // allowing hundreds of tiny latency requests to monopolize one turn.
+      this.#classCursor = this.#classCursor === "latency" ? "bulk" : "latency";
       return job;
     }
     return null;
@@ -1717,7 +2137,7 @@ export class MultiSandboxRouter {
     let remainingScan = this.#queuedJobs;
     const candidates = [...this.#runtimeCache.values()]
       .map(cached => this.#candidateWithReservations(this.#agedCandidate(cached)))
-      .filter(isRuntimeEligible);
+      .filter(candidate => this.#candidateCredits(candidate) > 0);
     if (candidates.length === 0) return;
     while (remainingScan-- > 0) {
       const job = this.#nextJob();
@@ -1729,12 +2149,20 @@ export class MultiSandboxRouter {
       if (job.signal?.aborted) {
         job.signal.removeEventListener("abort", job.onAbort!);
         this.#clearRetryWake(job);
-        job.memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         const error = abortError();
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
         job.reject(error);
+        continue;
+      }
+      if (
+        job.continuationProvenance &&
+        this.#isContinuationIncarnationObsolete(job.continuationProvenance)
+      ) {
+        this.#failObsoleteContinuation(job);
         continue;
       }
       const routeStarted = this.#clock.now();
@@ -1742,8 +2170,9 @@ export class MultiSandboxRouter {
       if (!selection) {
         if (!this.#enqueue(job)) {
           job.signal?.removeEventListener("abort", job.onAbort!);
-          job.memoryLease.release();
+          this.#releaseJobMemory(job);
           this.#releaseJobProvenance(job);
+          this.#releaseQueueCapacity(job);
           const error = new RouterQueueFullError();
           this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
           this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
@@ -1753,6 +2182,30 @@ export class MultiSandboxRouter {
         }
         continue;
       }
+      if (job.authorizationScope && !job.provenanceReservation) {
+        const reservation = this.#responseProvenance.reserve();
+        if (!reservation) {
+          // Terminal metadata capacity is an execution gate, not an ingress
+          // quota. Keep the request in the already-bounded router queue until
+          // an active terminal consumes or releases a reservation.
+          if (!this.#enqueue(job)) {
+            job.signal?.removeEventListener("abort", job.onAbort!);
+            this.#releaseJobMemory(job);
+            this.#releaseQueueCapacity(job);
+            const error = new RouterQueueFullError();
+            this.#traffic.rejected({
+              totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs),
+            });
+            this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
+            job.reject(error);
+          }
+          // No terminal can free metadata capacity synchronously inside this
+          // drain pass. commit/release explicitly schedules the next pass; stop
+          // here rather than rescanning up to the full 4,096-job queue.
+          return;
+        }
+        job.provenanceReservation = reservation;
+      }
       const runtime = selection.runtime;
       this.#clearRetryWake(job);
       this.#chargeFairness(job);
@@ -1760,6 +2213,9 @@ export class MultiSandboxRouter {
       job.queueWaitMs = Math.max(0, selectedAtMs - job.queuedAtMs);
       const candidate = selection.candidate;
       job.admissionCost = selection.admissionCost;
+      if (selection.fleetTransferPacerCost > 0) {
+        this.#consumeFleetTransferPacer(selection.fleetTransferPacerCost, selectedAtMs);
+      }
       this.#emit("route.selected", {
         trace_id: job.traceId,
         project_id: runtime.projectId,
@@ -1767,7 +2223,7 @@ export class MultiSandboxRouter {
         queue_wait_ms: job.queueWaitMs,
         sandbox_capacity: candidate.capacity,
         sandbox_active: candidate.active,
-        sandbox_admission_credits: candidate.available ?? null,
+        sandbox_admission_credits: selection.selectedAvailable,
         sandbox_reserved: candidate.reserved,
         sandbox_queued: candidate.queueDepth,
         sandbox_quarantined: candidate.quarantined,
@@ -1800,7 +2256,7 @@ export class MultiSandboxRouter {
       candidate.reserved++;
       candidate.reservedTransferCost = (candidate.reservedTransferCost ?? 0) +
         job.admissionCost;
-      if (!isRuntimeEligible(candidate)) {
+      if (this.#candidateCredits(candidate) <= 0) {
         const index = candidates.indexOf(candidate);
         if (index >= 0) candidates.splice(index, 1);
       }
@@ -1822,8 +2278,9 @@ export class MultiSandboxRouter {
   #expireJob(job: QueuedJob): void {
     job.signal?.removeEventListener("abort", job.onAbort!);
     this.#clearRetryWake(job);
-    job.memoryLease.release();
+    this.#releaseJobMemory(job);
     this.#releaseJobProvenance(job);
+    this.#releaseQueueCapacity(job);
     const error = new RouterCapacityTimeoutError();
     this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
     this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
@@ -1916,20 +2373,69 @@ export class MultiSandboxRouter {
     };
   }
 
-  #candidateCredits(candidate: RouteCandidate): number {
+  #candidateCreditLanes(candidate: RouteCandidate): {
+    admission: number;
+    prefetch: number;
+    transfer: number;
+  } {
     const current = this.#candidateWithReservations(candidate);
-    if (!isRuntimeHealthy(current)) return 0;
+    if (!isRuntimeHealthy(current)) return { admission: 0, prefetch: 0, transfer: 0 };
     const usable = current.capacity - current.quarantined;
-    const advertised = Number.isFinite(current.available)
+    const fallback = Number.isFinite(current.available)
       ? Math.max(0, current.available!)
       : Math.max(0, usable - current.active);
-    return Math.max(0, advertised - current.reserved);
+    const admission = Number.isFinite(current.admissionCredits)
+      ? Math.max(0, current.admissionCredits!)
+      : fallback;
+    const prefetch = Number.isFinite(current.prefetchCredits)
+      ? Math.max(0, current.prefetchCredits!)
+      : fallback;
+    return {
+      admission: Math.max(0, admission - current.reserved),
+      prefetch: Math.max(0, prefetch - current.reserved),
+      transfer: Math.max(
+        0,
+        (Number.isFinite(current.transferCredits)
+          ? Math.max(0, current.transferCredits!)
+          : v2HostTransferBudget(
+              current.transportProfile === "bulk-v1" ? "bulk-v1" : "standard",
+            )) - (current.reservedTransferCost ?? 0),
+      ),
+    };
+  }
+
+  #candidateCredits(candidate: RouteCandidate): number {
+    const lanes = this.#candidateCreditLanes(candidate);
+    return Math.max(lanes.admission, lanes.prefetch);
+  }
+
+  #hasUnreflectedLatencyReservation(projectId: ProjectId): boolean {
+    const jobs = this.#reserved.get(projectId);
+    if (!jobs) return false;
+    for (const reserved of jobs) {
+      if (reserved.decodedRequestBytes <= V2_LATENCY_CRITICAL_REQUEST_BYTES) return true;
+    }
+    return false;
+  }
+
+  #candidateForJob(job: QueuedJob, candidate: RouteCandidate): RouteCandidate {
+    const fallback = candidate.available;
+    const mayPrefetch = candidate.transportProfile === "bulk-v1" &&
+      job.decodedRequestBytes > V2_LATENCY_CRITICAL_REQUEST_BYTES &&
+      !this.#hasUnreflectedLatencyReservation(candidate.projectId);
+    const selected = mayPrefetch
+      ? candidate.prefetchCredits ?? fallback
+      : candidate.admissionCredits ?? fallback;
+    return {
+      ...candidate,
+      available: selected,
+    };
   }
 
   #fleetTransferCost(job: QueuedJob, candidate: RouteCandidate): number {
     return this.#runtimeCache.size > 1 &&
         candidate.transportProfile === "bulk-v1" &&
-        job.workload.requestBytes > FLEET_TRANSFER_EXEMPT_BYTES
+        job.decodedRequestBytes > FLEET_TRANSFER_EXEMPT_BYTES
       ? job.bulkAdmissionCost
       : 0;
   }
@@ -1954,23 +2460,26 @@ export class MultiSandboxRouter {
           fleetTransferCost > 0 &&
           this.#fleetTransferReserved + fleetTransferCost > FLEET_TRANSFER_BUDGET
         ) return false;
-        if (
-          v2HostTransferBudget(profile) - (candidate.reservedTransferCost ?? 0) <
-            admissionCost
-        ) return false;
+        const reflectedTransferCredits = Number.isFinite(candidate.transferCredits)
+          ? Math.max(0, candidate.transferCredits!)
+          : v2HostTransferBudget(profile);
+        if (reflectedTransferCredits - (candidate.reservedTransferCost ?? 0) < admissionCost) {
+          return false;
+        }
         const block = job.excluded.get(runtimeIncarnationKey(candidate));
         if (!block) return true;
         const retryEpoch = this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0;
         return retryEpoch > block.retryEpoch || now >= block.retryAtMs;
       },
     );
-    const eligibleCandidates = candidates.filter(isRuntimeEligible);
-    const fleetTransferPacerCost = job.workload.requestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES
+    const eligibleCandidates = candidates.filter(candidate =>
+      isRuntimeEligible(this.#candidateForJob(job, candidate)));
+    const fleetTransferPacerCost = job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES
       ? FLEET_TRANSFER_PACER_BURST
       : 1;
     const paceFleetTransfer =
-      job.workload.requestBytes > FLEET_TRANSFER_EXEMPT_BYTES &&
-      job.workload.requestBytes <= FLEET_TRANSFER_PACED_MAX_BYTES &&
+      job.decodedRequestBytes > FLEET_TRANSFER_EXEMPT_BYTES &&
+      job.decodedRequestBytes <= FLEET_TRANSFER_PACED_MAX_BYTES &&
       eligibleCandidates.length > 1 &&
       eligibleCandidates.every(candidate => candidate.transportProfile === "bulk-v1");
     if (paceFleetTransfer) {
@@ -1986,14 +2495,15 @@ export class MultiSandboxRouter {
         candidate.active + candidate.reserved === leastActive
       ));
     }
-    const decision = chooseRuntime(job.workload, candidates, this.#random);
+    const scoredCandidates = candidates.map(candidate => this.#candidateForJob(job, candidate));
+    const decision = chooseRuntime(job.workload, scoredCandidates, this.#random);
     if (!decision) return null;
     const runtime = this.#runtimeCache.get(decision.projectId)?.runtime;
     const candidate = candidates.find(value => value.projectId === decision.projectId);
-    if (runtime && candidate && paceFleetTransfer) {
-      this.#consumeFleetTransferPacer(fleetTransferPacerCost, now);
-    }
-    return runtime && candidate
+    const selectedCandidate = scoredCandidates.find(
+      value => value.projectId === decision.projectId,
+    );
+    return runtime && candidate && selectedCandidate
       ? {
           runtime,
           candidate,
@@ -2005,6 +2515,8 @@ export class MultiSandboxRouter {
             ? job.bulkAdmissionCost
             : job.standardAdmissionCost,
           fleetTransferCost: this.#fleetTransferCost(job, candidate),
+          fleetTransferPacerCost: paceFleetTransfer ? fleetTransferPacerCost : 0,
+          selectedAvailable: Math.max(0, selectedCandidate.available ?? 0),
         }
       : null;
   }
@@ -2032,13 +2544,26 @@ export class MultiSandboxRouter {
     let admissionTimer: ReturnType<typeof setTimeout> | undefined;
     let admissionTimerAtMs: number | null = null;
     let cancellationProofTimer: ReturnType<typeof setTimeout> | undefined;
+    let executionRiskReflected = false;
+    let runtimeRunStarted = false;
+    let runtimeRun: Promise<RunHandle> | null = null;
+    const runtimeRunState: {
+      outcome: "pending" | "fulfilled" | "rejected";
+      handle: RunHandle | null;
+    } = { outcome: "pending", handle: null };
+    let lateReturnedHandle: RunHandle | null = null;
+    let runtimeHandleClaimed = false;
     const progressAwareAttempt = selectedBulkProfile &&
-      job.workload.requestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
-      job.workload.requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES;
+      job.decodedRequestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
+      job.decodedRequestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES;
     const mediumProgressProbe = selectedBulkProfile &&
-      job.workload.requestBytes > MEDIUM_PROGRESS_PROBE_MIN_BYTES &&
-      job.workload.requestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES;
-    const observeAdmissionProgress = progressAwareAttempt || mediumProgressProbe;
+      job.decodedRequestBytes > MEDIUM_PROGRESS_PROBE_MIN_BYTES &&
+      job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES;
+    // Every fleet-gated body must surface exact preparation proof so its data
+    // share can be released independently of the one control unit retained
+    // until request_start/commit. Timing probes remain size/profile specific.
+    const observeAdmissionProgress = fleetTransferLease !== null ||
+      progressAwareAttempt || mediumProgressProbe;
     const progressFreshnessMs = progressAwareAttempt
       ? admissionProgressFreshnessMs(selectedRttMs)
       : 0;
@@ -2064,6 +2589,31 @@ export class MultiSandboxRouter {
         ? null
         : Math.max(0, now - admissionProgressAtMs);
     };
+    const rejectAfterCancellationProof = (
+      fallback: unknown,
+      code: string,
+      proofDeadlineMs: number,
+    ) => {
+      if (!runtimeRunStarted) {
+        rejectAdmissionWait(fallback);
+        return;
+      }
+      if (cancellationProofTimer) clearTimeout(cancellationProofTimer);
+      cancellationProofTimer = setTimeout(() => {
+        const unproven = new V2CommittedError(
+          "Runtime cancellation did not produce definitive pre-execution proof",
+          code,
+          true,
+        );
+        // Settle the router-owned race before abort listeners can synchronously
+        // resume a non-cooperative runtime with a late handle in the same turn.
+        // That handle is cleanup-only; it must never replace this authoritative
+        // cancellation-proof failure or become eligible for replay.
+        rejectAdmissionWait(unproven);
+        if (!admissionController.signal.aborted) admissionController.abort(unproven);
+      }, Math.max(1, Math.ceil(proofDeadlineMs - this.#clock.now())));
+      cancellationProofTimer.unref?.();
+    };
     const onCallerAbort = () => {
       if (admissionTimer) clearTimeout(admissionTimer);
       admissionTimer = undefined;
@@ -2080,7 +2630,11 @@ export class MultiSandboxRouter {
         captureAttemptProgress(this.#clock.now());
       }
       admissionController.abort(error);
-      rejectAdmissionWait(error);
+      rejectAfterCancellationProof(
+        error,
+        "caller_cancellation_unproven",
+        this.#clock.now() + ROUTE_CANCELLATION_PROOF_GRACE_MS,
+      );
     };
     if (job.signal?.aborted) onCallerAbort();
     else job.signal?.addEventListener("abort", onCallerAbort, { once: true });
@@ -2108,11 +2662,11 @@ export class MultiSandboxRouter {
         captureAttemptProgress(now);
         const error = new RouterCapacityTimeoutError();
         admissionController.abort(error);
-        cancellationProofTimer = setTimeout(
-          () => rejectAdmissionWait(error),
-          ROUTE_CANCELLATION_PROOF_GRACE_MS,
+        rejectAfterCancellationProof(
+          error,
+          "capacity_timeout_cancellation_unproven",
+          now + ROUTE_CANCELLATION_PROOF_GRACE_MS,
         );
-        cancellationProofTimer.unref?.();
         return;
       }
       if (mediumProgressProbe && initialAttemptDeadlineMs !== null) {
@@ -2165,11 +2719,11 @@ export class MultiSandboxRouter {
       captureAttemptProgress(now);
       const error = new RouterRouteAttemptTimeoutError();
       admissionController.abort(error);
-      cancellationProofTimer = setTimeout(
-        () => rejectAdmissionWait(error),
-        ROUTE_CANCELLATION_PROOF_GRACE_MS,
+      rejectAfterCancellationProof(
+        error,
+        "route_timeout_cancellation_unproven",
+        job.queueDeadlineMs + ROUTE_CANCELLATION_PROOF_GRACE_MS,
       );
-      cancellationProofTimer.unref?.();
     };
     const remainingAdmissionMs = job.queueDeadlineMs - this.#clock.now();
     if (admissionController.signal.aborted) {
@@ -2217,9 +2771,26 @@ export class MultiSandboxRouter {
           this.#scheduleDrain();
         },
         onExecutionRiskReflected: () => {
-          if (admissionController.signal.aborted) return;
+          if (executionRiskReflected) return;
+          executionRiskReflected = true;
+          const cancellationAlreadyPending = admissionController.signal.aborted;
+          // Once request_start is authoritative this job can never re-enter the
+          // safe pre-commit queue, so its retained retry permit is no longer
+          // needed even if the committed handle arrives later.
+          this.#releaseQueueCapacity(job);
           if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
-          clearAdmissionDeadline();
+          if (!cancellationAlreadyPending) {
+            clearAdmissionDeadline();
+            rejectAfterCancellationProof(
+              new V2CommittedError(
+                "Runtime reported execution risk without returning a committed handle",
+                "execution_risk_handle_unproven",
+                true,
+              ),
+              "execution_risk_handle_unproven",
+              job.queueDeadlineMs + ROUTE_CANCELLATION_PROOF_GRACE_MS,
+            );
+          }
         },
       };
       if (observeAdmissionProgress) {
@@ -2257,37 +2828,67 @@ export class MultiSandboxRouter {
             totalEncodedBytes: progress.totalEncodedBytes,
           });
           admissionProgressAtMs = now;
-          if (progressAwareAttempt &&
+          if (progress.stage === "request_prepared") {
+            // Exact assembly/claim proof ends body-transfer ownership for every
+            // gated size. Keep one control unit until request_start/commit so a
+            // prepared backlog cannot turn the shared link into an unbounded
+            // zero-cost handshake queue.
+            if (this.#downgradeFleetTransferToControl(fleetTransferLease)) {
+              this.#scheduleDrain();
+            }
+          } else if (
+            progressAwareAttempt &&
             progress.acknowledgedEncodedBytes === progress.totalEncodedBytes
           ) {
-            if (progress.stage === "request_prepared") {
-              // Exact assembly/claim proof ends shared-link body ownership.
-              // Local transport/start reservations remain unchanged.
-              if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
-            } else {
-              // The payload is complete, but assembly/claim still consumes the
-              // shared path. Retain one control unit rather than releasing the
-              // lease entirely: two outstanding proofs can admit only one new
-              // observed-size body, avoiding both head-of-line starvation and
-              // the overload reproduced by a zero-cost prepared handshake.
-              if (this.#downgradeFleetTransferToControl(fleetTransferLease)) {
-                this.#scheduleDrain();
-              }
-              armAdmissionTimerAt(now + preparedProofGrace);
-            }
+            // Full data ACK is not preparation proof. Retain the entire data
+            // share and bound the remaining assembly/claim wait separately.
+            armAdmissionTimerAt(now + preparedProofGrace);
           }
         };
       }
-      const runtimeRun = Promise.resolve(runtime.run(
+      if (job.signal?.aborted) throw job.signal.reason ?? abortError();
+      if (admissionController.signal.aborted) {
+        throw admissionController.signal.reason ?? new RouterCapacityTimeoutError();
+      }
+      if (this.#clock.now() >= job.queueDeadlineMs) {
+        admissionDeadlineExpired = true;
+        const error = new RouterCapacityTimeoutError();
+        admissionController.abort(error);
+        throw error;
+      }
+      runtimeRunStarted = true;
+      runtimeRun = Promise.resolve(runtime.run(
         job.body,
         admissionController.signal,
         runOptions,
-      ));
+      )).then(handle => {
+        runtimeRunState.outcome = "fulfilled";
+        runtimeRunState.handle = handle;
+        return handle;
+      }, error => {
+        runtimeRunState.outcome = "rejected";
+        throw error;
+      });
       // Promise.race installs terminal handlers on runtimeRun. If a broken test
       // seam ignores cancellation, its late rejection remains consumed. V2's
       // abort path synchronously proves pre-execution safety or committed risk
       // before the short cancellation-proof fence permits a retry.
       const handle = await Promise.race([runtimeRun, admissionWait]);
+      if (
+        admissionController.signal.aborted ||
+        (!executionRiskReflected && this.#clock.now() >= job.queueDeadlineMs)
+      ) {
+        lateReturnedHandle = handle;
+        throw new V2CommittedError(
+          "Runtime returned a handle after its admission deadline or cancellation",
+          "late_handle_after_cancellation",
+          true,
+        );
+      }
+      runtimeHandleClaimed = true;
+      // A committed handle can no longer need safe pre-commit replay. Only now
+      // may a new ingress request consume this request's bounded queue permit.
+      this.#releaseQueueCapacity(job);
       if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
       // Commitment also ends any remaining attempt deadline immediately.
       // Optional memory accounting work must never turn an accepted upstream
@@ -2307,7 +2908,6 @@ export class MultiSandboxRouter {
           job.memoryLease = await committedLease.replace({
             ...job.workload,
             reservedBytes: POST_COMMIT_RESERVATION_BYTES,
-            cpuPermits: 0,
           });
         } catch {
           // Downgrading is an accounting optimization, never part of request
@@ -2419,21 +3019,90 @@ export class MultiSandboxRouter {
         () => undefined,
       ).finally(() => {
         job.signal?.removeEventListener("abort", onCallerAbort);
-        job.memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#refreshRuntimeSafely(runtime);
         void started;
         this.#scheduleDrain();
       });
       this.#scheduleDrain();
     } catch (error) {
+      let runtimeReservationDeferred = false;
+      if (runtimeRun && !runtimeHandleClaimed && runtimeRunState.outcome !== "rejected") {
+        // If the bounded cancellation outcome wins, a broken/slow runtime can
+        // still return a committed handle later. Drain its local buffers and
+        // terminal permit; never expose or retry it as a second execution.
+        const returnedHandle = lateReturnedHandle ?? runtimeRunState.handle;
+        const lateCleanup = returnedHandle
+          ? releaseLateRunHandle(returnedHandle)
+          : runtimeRun.then(
+              handle => releaseLateRunHandle(handle),
+              () => undefined,
+            );
+        this.#lateAttemptCleanups.add(lateCleanup);
+        runtimeReservationDeferred = true;
+        const retained = job.retainMemoryUntil;
+        job.retainMemoryUntil = retained
+          ? Promise.allSettled([retained, lateCleanup])
+          : lateCleanup;
+        void lateCleanup.finally(() => {
+          this.#lateAttemptCleanups.delete(lateCleanup);
+          this.#releaseRuntimeReservation(job, runtime.projectId);
+          this.#refreshRuntimeSafely(runtime);
+          this.#scheduleDrain();
+        });
+      }
       detachAdmission();
-      this.#releaseRuntimeReservation(job, runtime.projectId);
+      if (!runtimeReservationDeferred) this.#releaseRuntimeReservation(job, runtime.projectId);
       if (this.#releaseFleetTransfer(fleetTransferLease)) this.#scheduleDrain();
+      if (
+        executionRiskReflected &&
+        !(error && typeof error === "object" &&
+          (error as { committed?: unknown }).committed === true)
+      ) {
+        error = new V2CommittedError(
+          "Runtime failed after reporting irreversible execution risk",
+          "execution_risk_reflected",
+          true,
+        );
+      }
+      const cancellationCommitment = error && typeof error === "object"
+        ? error as { committed?: unknown; ambiguous?: unknown }
+        : {};
+      if (
+        runtimeRunStarted &&
+        admissionController.signal.aborted &&
+        cancellationCommitment.committed !== true &&
+        cancellationCommitment.ambiguous !== true &&
+        !isSafePreCommitFailure(error)
+      ) {
+        error = new V2CommittedError(
+          "Runtime cancellation ended without definitive pre-execution proof",
+          routeAttemptExpired
+            ? "timeout_cancellation_unproven"
+            : "caller_cancellation_unproven",
+          true,
+        );
+      }
+      const rawCommitment = error && typeof error === "object"
+        ? error as { committed?: unknown; ambiguous?: unknown }
+        : {};
+      if (
+        routeAttemptExpired &&
+        rawCommitment.committed !== true &&
+        rawCommitment.ambiguous !== true &&
+        !isSafePreCommitFailure(error)
+      ) {
+        error = new V2CommittedError(
+          "Runtime timeout ended without definitive pre-execution proof",
+          "timeout_cancellation_unproven",
+          true,
+        );
+      }
       const commitment = error && typeof error === "object"
         ? error as { committed?: unknown; ambiguous?: unknown }
         : {};
-      const committed = commitment.committed === true;
-      const ambiguous = commitment.ambiguous === true;
+      const committed = executionRiskReflected || commitment.committed === true;
+      const ambiguous = executionRiskReflected || commitment.ambiguous === true;
       const timedOutBeforeCommit = routeAttemptExpired &&
         !isDeterministicRequestTooLarge(error) &&
         !committed &&
@@ -2462,12 +3131,17 @@ export class MultiSandboxRouter {
       if (
         admissionDeadlineExpired &&
         !isDeterministicRequestTooLarge(error) &&
-        commitment.committed !== true &&
-        commitment.ambiguous !== true
+        !committed &&
+        !ambiguous
       ) {
         this.#expireJob(job);
         this.#scheduleDrain();
         return;
+      }
+      if (job.signal?.aborted && isSafePreCommitFailure(error)) {
+        // The runtime proof controls replay safety, but the public cancellation
+        // reason still owns the caller-visible outcome once that proof arrives.
+        error = job.signal.reason ?? abortError();
       }
       const rateLimit = rateLimitHintFromError(error);
       if (rateLimit) {
@@ -2480,8 +3154,9 @@ export class MultiSandboxRouter {
           selectedIncarnationKey,
         );
         job.signal?.removeEventListener("abort", job.onAbort!);
-        job.memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         this.#traffic.rejected({
           totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs),
           rateLimited: true,
@@ -2493,15 +3168,26 @@ export class MultiSandboxRouter {
       }
       if (isLocalCpuTransformFailure(error)) {
         job.signal?.removeEventListener("abort", job.onAbort!);
-        job.memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "host-transform", error, job.attempts);
         job.reject(error);
         this.#scheduleDrain();
         return;
       }
-      const retryablePreCommit = timedOutBeforeCommit || isRetryablePreCommitFailure(error);
+      const retryablePreCommit = !committed && !ambiguous &&
+        isRetryablePreCommitFailure(error);
+      if (
+        retryablePreCommit &&
+        job.continuationProvenance &&
+        this.#isContinuationIncarnationObsolete(job.continuationProvenance)
+      ) {
+        this.#failObsoleteContinuation(job);
+        this.#scheduleDrain();
+        return;
+      }
       if (
         retryablePreCommit &&
         !job.signal?.aborted &&
@@ -2520,6 +3206,10 @@ export class MultiSandboxRouter {
       ) {
         job.attempts++;
         this.#traffic.retried();
+        // This attempt proved no provider execution began. Return its terminal
+        // metadata reservation while retaining the job's bounded queue permit;
+        // the next eligible attempt will reserve again immediately pre-run.
+        this.#releaseJobProvenance(job);
         const previousBlock = job.excluded.get(selectedIncarnationKey);
         const failures = (previousBlock?.failures ?? 0) + 1;
         const retryDelayMs = Math.min(
@@ -2536,8 +3226,9 @@ export class MultiSandboxRouter {
         });
         if (!this.#enqueue(job, true)) {
           job.signal?.removeEventListener("abort", job.onAbort!);
-          job.memoryLease.release();
+          this.#releaseJobMemory(job);
           this.#releaseJobProvenance(job);
+          this.#releaseQueueCapacity(job);
           const queueError = new RouterQueueFullError();
           this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
           this.#failure(job.traceId, job.acceptedAtMs, "queue", queueError, job.attempts);
@@ -2547,8 +3238,9 @@ export class MultiSandboxRouter {
         }
       } else {
         job.signal?.removeEventListener("abort", job.onAbort!);
-        job.memoryLease.release();
+        this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
         this.#failure(
           job.traceId,
@@ -2573,6 +3265,7 @@ export class MultiSandboxRouter {
       value => {
         if (value?.status !== "completed") {
           this.#responseProvenance.release(reservation);
+          this.#scheduleDrain();
           return value;
         }
         let recorded = false;
@@ -2589,6 +3282,9 @@ export class MultiSandboxRouter {
           this.#responseProvenance.release(reservation);
           // Registry internals and provider IDs never enter the public/logged error.
         }
+        // commit() consumes the reservation on both success and conflict. Wake
+        // metadata-gated queueing only after that capacity is actually free.
+        this.#scheduleDrain();
         if (!recorded) {
           releaseAtomicBytePermit(value);
           throw new ResponseProvenanceCommitError();
@@ -2597,6 +3293,7 @@ export class MultiSandboxRouter {
       },
       error => {
         this.#responseProvenance.release(reservation);
+        this.#scheduleDrain();
         throw error;
       },
     );
@@ -2615,6 +3312,7 @@ export class MultiSandboxRouter {
           yield frame;
         }
       },
+      discardUnconsumedEvents: () => handle.discardUnconsumedEvents?.(),
       final,
       get rateLimit() { return handle.rateLimit; },
       get upstreamPrelude() { return handle.upstreamPrelude; },

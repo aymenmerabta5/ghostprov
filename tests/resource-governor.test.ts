@@ -34,12 +34,11 @@ function sample(totalGiB: number, freeGiB: number, rssMiB = 320): MachineSample 
   };
 }
 
-function workload(reservedBytes: number, cpuPermits: 0 | 1 = 0): WorkloadDescriptor {
+function workload(reservedBytes: number): WorkloadDescriptor {
   return {
     class: "text-large",
     requestBytes: 2 * MiB,
     reservedBytes,
-    cpuPermits,
     stream: true,
   };
 }
@@ -103,6 +102,8 @@ describe("resource sizing", () => {
 describe("ResourceGovernor", () => {
   it("accounts one fixed process pool and fails it closed without queueing", () => {
     const governor = new ResourceGovernor({ probe: new MutableProbe(sample(8, 5)) });
+    expect(governor.snapshot()).not.toHaveProperty("cpuActive");
+    expect(governor.snapshot()).not.toHaveProperty("cpuQueued");
     const fixed = governor.reserveFixedBytes(256 * MiB);
     expect(governor.snapshot()).toMatchObject({
       reservedBytes: 256 * MiB,
@@ -122,7 +123,7 @@ describe("ResourceGovernor", () => {
     expect(textLeases.every(Boolean)).toBe(true);
     textLeases.forEach(lease => lease?.release());
 
-    const imageLeases = Array.from({ length: 120 }, () => governor.tryAcquire(workload(152 * MiB, 1)));
+    const imageLeases = Array.from({ length: 120 }, () => governor.tryAcquire(workload(152 * MiB)));
     const admitted = imageLeases.filter(Boolean);
     expect(admitted.length).toBeGreaterThan(16);
     expect(admitted.length).toBeLessThan(120);
@@ -153,17 +154,6 @@ describe("ResourceGovernor", () => {
     first.release();
     first.release();
     expect(governor.snapshot().reservedBytes).toBe(0);
-  });
-
-  it("limits CPU transforms independently from request byte leases", async () => {
-    const probe = new MutableProbe(sample(32, 19));
-    const governor = new ResourceGovernor({ probe });
-    const permits = await Promise.all(Array.from({ length: 6 }, () => governor.acquireCpu()));
-    expect(governor.snapshot().cpuActive).toBe(6);
-    expect(governor.tryAcquireCpu()).toBeNull();
-    permits[0].release();
-    expect(governor.tryAcquireCpu()).not.toBeNull();
-    permits.slice(1).forEach(permit => permit.release());
   });
 
   it("advertises a bounded V2 capacity from remaining byte reservations", () => {
@@ -343,6 +333,43 @@ describe("ResourceGovernor", () => {
     smallLease.release();
   });
 
+  it("ratchets aged-waiter headroom so repeated small releases cannot recycle it", async () => {
+    const probe = new MutableProbe(sample(8, 5));
+    const governor = new ResourceGovernor({ probe });
+    const capacity = governor.snapshot().reservationCapacityBytes;
+    const blocker = governor.tryAcquire(workload(capacity - 6 * MiB))!;
+    const firstGrowth = governor.tryAcquire(workload(2 * MiB))!;
+    const secondGrowth = governor.tryAcquire(workload(2 * MiB))!;
+    const large = governor.acquire(workload(6 * MiB));
+
+    for (let index = 0; index < 8; index++) {
+      const small = await governor.acquire(workload(MiB));
+      small.release();
+    }
+    let recycled = 0;
+    const followers = Array.from({ length: 4 }, () => (
+      governor.acquire(workload(MiB)).then(lease => {
+        recycled++;
+        lease.release();
+      })
+    ));
+    await Bun.sleep(0);
+    expect(recycled).toBe(0);
+
+    // The newly freed bytes must raise the aged waiter's protected floor.
+    // Otherwise each resolving follower can release and recycle the same MiB,
+    // permanently keeping the 6 MiB request below its required headroom.
+    firstGrowth.release();
+    await Bun.sleep(0);
+    expect(recycled).toBe(0);
+
+    secondGrowth.release();
+    const largeLease = await large;
+    largeLease.release();
+    await Promise.all(followers);
+    blocker.release();
+  });
+
   it("self-wakes after host memory pressure recovers", async () => {
     const probe = new MutableProbe(sample(32, 19));
     const governor = new ResourceGovernor({ probe, pressurePollMs: 5 });
@@ -435,26 +462,19 @@ describe("ResourceGovernor", () => {
     expect(governor.snapshot().reservedBytes).toBe(0);
   });
 
-  it("closes byte and CPU queues and rejects future acquisition", async () => {
+  it("closes the byte queue and rejects future acquisition", async () => {
     const probe = new MutableProbe(sample(32, 19));
     const governor = new ResourceGovernor({ probe });
     const byteLease = governor.tryAcquire(workload(governor.snapshot().reservationCapacityBytes))!;
     const byteWaiter = governor.acquire(workload(MiB)).catch(error => error);
-    const cpuLeases = await Promise.all(
-      Array.from({ length: governor.snapshot().cpuTransformWorkers }, () => governor.acquireCpu()),
-    );
-    const cpuWaiter = governor.acquireCpu().catch(error => error);
 
     governor.close();
     expect(await byteWaiter).toBeInstanceOf(ResourceGovernorClosedError);
-    expect(await cpuWaiter).toBeInstanceOf(ResourceGovernorClosedError);
     await expect(governor.acquire(workload(MiB))).rejects.toBeInstanceOf(
       ResourceGovernorClosedError,
     );
-    await expect(governor.acquireCpu()).rejects.toBeInstanceOf(ResourceGovernorClosedError);
-    expect(governor.snapshot()).toMatchObject({ closed: true, queued: 0, cpuQueued: 0 });
+    expect(governor.snapshot()).toMatchObject({ closed: true, queued: 0 });
 
     byteLease.release();
-    cpuLeases.forEach(lease => lease.release());
   });
 });

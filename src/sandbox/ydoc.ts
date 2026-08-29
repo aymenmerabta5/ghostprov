@@ -33,11 +33,6 @@ export interface YDocFileMeta {
   deleted: boolean;
 }
 
-export interface ScopedYDocFile {
-  path: string;
-  content: string;
-}
-
 export interface YDocSnapshot {
   projectId: ProjectId;
   connected: boolean;

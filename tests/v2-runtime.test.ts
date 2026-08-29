@@ -743,6 +743,12 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
 
     const wrapped = await harness.runtime.run({ model: "gpt-5.6-sol", input: "metadata" });
+    await realHandle.acceptEvent({
+      event: "response.output_text.delta",
+      data: JSON.stringify({ type: "response.output_text.delta", delta: "discard me" }),
+    });
+    wrapped.discardUnconsumedEvents?.();
+    expect(await Array.fromAsync(wrapped.events())).toEqual([]);
     realHandle.acceptUpstreamPrelude({
       status: 200,
       contentType: "text/event-stream",
@@ -835,7 +841,6 @@ describe("V2SandboxRuntime", () => {
       class: "text-small",
       requestBytes: 1_024,
       reservedBytes: 8 * 1024 ** 2,
-      cpuPermits: 0,
       stream: true,
     };
     const candidate = (
@@ -1498,6 +1503,11 @@ describe("V2SandboxRuntime", () => {
     }
     expect(harness.transports).toHaveLength(2);
     expect(harness.transports[1]!.connectCalls).toBe(1);
+    let candidateForceStarted = false;
+    harness.transports[1]!.forceStop = async () => {
+      candidateForceStarted = true;
+      return new Promise<void>(() => undefined);
+    };
 
     let stopSettled = false;
     const stopping = harness.runtime.stop().then(() => { stopSettled = true; });
@@ -1506,8 +1516,11 @@ describe("V2SandboxRuntime", () => {
     for (let turn = 0; turn < 200 && !stopSettled; turn++) await Promise.resolve();
 
     expect(stopSettled).toBe(true);
-    expect(harness.transports[1]!.forceStops).toBeGreaterThanOrEqual(1);
-    expect(harness.bootstraps[1]!.forceStops).toBeGreaterThanOrEqual(1);
+    expect(candidateForceStarted).toBe(true);
+    expect(harness.transports[1]!.closes).toBe(1);
+    expect(harness.transports[1]!.recoveryFailures).toBe(1);
+    expect(harness.bootstraps[1]!.forceStops).toBe(1);
+    expect(harness.sandboxFailures).toHaveLength(0);
     expect(harness.runtime.snapshot().state).toBe("stopped");
     await stopping;
   });
@@ -1801,6 +1814,155 @@ describe("V2SandboxRuntime", () => {
     expect(harness.runtime.snapshot().state).toBe("stopped");
   });
 
+  it("uses one shutdown budget and locally fences non-cooperative remote retirement", async () => {
+    const harness = runtimeHarness({ stopTimeoutMs: 10 });
+    await harness.runtime.start();
+    const events: string[] = [];
+    let releaseTransport!: () => void;
+    let releaseBootstrap!: () => void;
+    const transportStopped = new Promise<void>(resolve => { releaseTransport = resolve; });
+    const bootstrapStopped = new Promise<void>(resolve => { releaseBootstrap = resolve; });
+    harness.transport.forceStop = async () => {
+      events.push("transport-force-start");
+      await transportStopped;
+      events.push("transport-force-end");
+    };
+    harness.transport.close = async () => {
+      events.push("transport-close");
+      harness.transport.closes++;
+    };
+    harness.bootstrap.forceStop = async () => {
+      events.push("bootstrap-force-start");
+      await bootstrapStopped;
+      events.push("bootstrap-force-end");
+    };
+
+    let stopped = false;
+    const stopping = harness.runtime.stop().then(() => { stopped = true; });
+    for (let turn = 0; turn < 50 && events.length < 2; turn++) await Promise.resolve();
+    expect(events).toEqual(["transport-force-start", "bootstrap-force-start"]);
+
+    await harness.clock.advanceBy(9);
+    expect(stopped).toBe(false);
+    await harness.clock.advanceBy(1);
+    for (let turn = 0; turn < 50 && !stopped; turn++) await Promise.resolve();
+
+    expect(stopped).toBe(true);
+    expect(harness.clock.now()).toBe(10);
+    expect(events).toEqual([
+      "transport-force-start",
+      "bootstrap-force-start",
+      "transport-close",
+    ]);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+
+    releaseTransport();
+    releaseBootstrap();
+    for (let turn = 0; turn < 50 && events.length < 5; turn++) {
+      await Promise.resolve();
+    }
+    expect(events).toEqual([
+      "transport-force-start",
+      "bootstrap-force-start",
+      "transport-close",
+      "transport-force-end",
+      "bootstrap-force-end",
+    ]);
+    await stopping;
+  });
+
+  it("does not reset the shutdown deadline after graceful drain fails", async () => {
+    const harness = runtimeHarness({ stopTimeoutMs: 10 });
+    await harness.runtime.start();
+    let releaseTransport!: () => void;
+    let releaseBootstrap!: () => void;
+    let transportForceStarted = false;
+    let bootstrapForceStarted = false;
+    const transportStopped = new Promise<void>(resolve => { releaseTransport = resolve; });
+    const bootstrapStopped = new Promise<void>(resolve => { releaseBootstrap = resolve; });
+    harness.transport.drain = async () => {
+      await harness.clock.sleep(6);
+      throw new Error("synthetic drain failure");
+    };
+    harness.transport.forceStop = async () => {
+      transportForceStarted = true;
+      await transportStopped;
+    };
+    harness.bootstrap.forceStop = async () => {
+      bootstrapForceStarted = true;
+      await bootstrapStopped;
+    };
+
+    let stopped = false;
+    const stopping = harness.runtime.drain("graceful shutdown")
+      .then(() => { stopped = true; });
+    await harness.clock.advanceBy(6);
+    for (
+      let turn = 0;
+      turn < 50 && !transportForceStarted;
+      turn++
+    ) {
+      await Promise.resolve();
+    }
+    expect(transportForceStarted).toBe(true);
+    expect(bootstrapForceStarted).toBe(true);
+    expect(stopped).toBe(false);
+
+    await harness.clock.advanceBy(3);
+    expect(stopped).toBe(false);
+    await harness.clock.advanceBy(1);
+    for (let turn = 0; turn < 50 && !stopped; turn++) await Promise.resolve();
+
+    expect(stopped).toBe(true);
+    expect(harness.clock.now()).toBe(10);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+    expect(harness.transport.closes).toBe(1);
+
+    releaseTransport();
+    releaseBootstrap();
+    for (let turn = 0; turn < 50 && harness.transport.closes < 1; turn++) {
+      await Promise.resolve();
+    }
+    expect(bootstrapForceStarted).toBe(true);
+    expect(harness.transport.closes).toBe(1);
+    await stopping;
+  });
+
+  it("does not overlap an escalated drain with force-stop or close", async () => {
+    const harness = runtimeHarness({ stopTimeoutMs: 50 });
+    await harness.runtime.start();
+    const events: string[] = [];
+    let releaseDrain!: () => void;
+    const drained = new Promise<void>(resolve => { releaseDrain = resolve; });
+    harness.transport.drain = async () => {
+      events.push("drain-start");
+      await drained;
+      events.push("drain-end");
+    };
+    harness.transport.forceStop = async () => {
+      events.push("force-stop");
+    };
+    harness.transport.close = async () => {
+      events.push("close");
+      harness.transport.closes++;
+    };
+
+    const draining = harness.runtime.drain("graceful shutdown");
+    for (let turn = 0; turn < 50 && !events.includes("drain-start"); turn++) {
+      await Promise.resolve();
+    }
+    const stopping = harness.runtime.stop();
+    for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+
+    expect(events).toEqual(["drain-start"]);
+    releaseDrain();
+    await stopping;
+
+    expect(events).toEqual(["drain-start", "drain-end", "force-stop", "close"]);
+    expect(stopping).toBe(draining);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
   it("preserves graceful transport drain without invoking force retirement", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();
@@ -1828,7 +1990,7 @@ describe("V2SandboxRuntime", () => {
     expect(harness.runtime.snapshot().state).toBe("failed");
   });
 
-  it("bounds a hung remote force-stop and still closes the old runtime", async () => {
+  it("bounds a hung remote force-stop and fences its local transport", async () => {
     const harness = runtimeHarness({ stopTimeoutMs: 10 });
     await harness.runtime.start();
     harness.transport.forceStop = async () => new Promise<void>(() => undefined);

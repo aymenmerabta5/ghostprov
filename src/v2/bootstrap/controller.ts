@@ -1000,9 +1000,21 @@ function safeReason(value: string): string {
   return normalized || "shutdown";
 }
 
+function bootstrapAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("V2 bootstrap aborted", "AbortError");
+}
+
 function abortable<T>(source: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return source;
-  if (signal.aborted) return Promise.reject(new DOMException("V2 bootstrap aborted", "AbortError"));
+  if (signal.aborted) {
+    // Callers create the physical retirement before wrapping it so cleanup can
+    // continue after their bounded wait expires. Always observe that source;
+    // otherwise a late retirement failure becomes an unhandled rejection.
+    void source.catch(() => undefined);
+    return Promise.reject(bootstrapAbortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const finish = (operation: () => void) => {
@@ -1011,11 +1023,7 @@ function abortable<T>(source: Promise<T>, signal: AbortSignal | undefined): Prom
       signal.removeEventListener("abort", onAbort);
       operation();
     };
-    const onAbort = () => finish(() => reject(
-      signal.reason instanceof Error
-        ? signal.reason
-        : new DOMException("V2 bootstrap aborted", "AbortError"),
-    ));
+    const onAbort = () => finish(() => reject(bootstrapAbortReason(signal)));
     signal.addEventListener("abort", onAbort, { once: true });
     source.then(
       value => finish(() => resolve(value)),

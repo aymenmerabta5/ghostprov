@@ -13,7 +13,6 @@ const TEXT: WorkloadDescriptor = {
   class: "text-small",
   requestBytes: 1024,
   reservedBytes: 8 * 1024 ** 2,
-  cpuPermits: 0,
   stream: true,
 };
 

@@ -365,7 +365,7 @@ describe("V2 browserless system composition", () => {
     expect(isAuthenticatedTenantScope(
       system.router.responseProvenanceAuthorizationScope(),
     )).toBe(true);
-    expect(system.anthropicContinuationIndex.snapshot()).toMatchObject({ entries: 0 });
+    expect(system.anthropicContinuationIndex.snapshot()).toMatchObject({ records: 0 });
 
     await system.start();
 

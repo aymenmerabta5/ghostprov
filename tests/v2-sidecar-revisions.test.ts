@@ -9,8 +9,6 @@ import {
   loadV2SidecarAssets,
   V2_R1_RELEASE,
   V2_R2_RELEASE,
-  V2_R5_RELEASE,
-  V2_R6_RELEASE,
   V2_R7_RELEASE,
   V2_R8_RELEASE,
   type V2SidecarAssets,

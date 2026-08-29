@@ -16,17 +16,33 @@ import {
   validateTerminalResponseProjection,
 } from "./response-validation";
 import type { AnthropicAdapterMessage } from "./types";
+import { MAX_RESPONSES_JSON_DEPTH } from "../relay/responses-validation";
 
-export const ANTHROPIC_CONTINUATION_MAX_ENTRIES = 4_096;
+export const ANTHROPIC_CONTINUATION_MAX_RECORDS = 4_096;
 export const ANTHROPIC_CONTINUATION_TTL_MS = 60 * 60 * 1_000;
-export const ANTHROPIC_CONTINUATION_METADATA_BYTES = 2 * 1024 * 1024;
+/** Conservative per-record heap estimate, including map keys and maximum IDs. */
+export const ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES = 1_536;
+export const ANTHROPIC_CONTINUATION_METADATA_BYTES =
+  ANTHROPIC_CONTINUATION_MAX_RECORDS * ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES;
+export const ANTHROPIC_CONTINUATION_MAX_CANONICAL_BYTES = 64 * 1024 * 1024;
+export const ANTHROPIC_CONTINUATION_MAX_CANONICAL_NODES = 1_000_000;
+
+/** @deprecated Use the record names: ambiguity tombstones also consume capacity. */
+export const ANTHROPIC_CONTINUATION_MAX_ENTRIES = ANTHROPIC_CONTINUATION_MAX_RECORDS;
+/** @deprecated Use the record names: ambiguity tombstones also consume capacity. */
 export const ANTHROPIC_CONTINUATION_ENTRY_METADATA_BYTES =
-  ANTHROPIC_CONTINUATION_METADATA_BYTES / ANTHROPIC_CONTINUATION_MAX_ENTRIES;
+  ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES;
 
 const HMAC_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const MAX_PROVIDER_RESPONSE_ID_BYTES = 256;
 const MAX_REPLAY_ITEMS = 4_096;
+// Replay inference is advisory. Keep its remaining synchronous projection work
+// below one interactive turn; larger outputs simply use their explicit full
+// history on the next request and can still be committed by other lanes.
+const MAX_SYNCHRONOUS_REPLAY_STRING_UNITS = 1024 * 1024;
+const MAX_SYNCHRONOUS_REPLAY_NODES = 8_192;
+const MAX_SYNCHRONOUS_REPLAY_TERMINAL_BYTES = 1024 * 1024;
 const SCOPE_DOMAIN = "ghostprov/anthropic-continuation/v1/scope\0";
 const SETTINGS_DOMAIN = "ghostprov/anthropic-continuation/v1/settings\0";
 const INPUT_SEED_DOMAIN = "ghostprov/anthropic-continuation/v1/input-seed\0";
@@ -45,12 +61,14 @@ export type AnthropicContinuationDecision =
   | "hit"
   | "miss"
   | "ambiguous"
-  | "empty_suffix";
+  | "empty_suffix"
+  | "explicit";
 
 export type AnthropicContinuationDigest = Readonly<{
   digest: string;
   itemCount: number;
   canonicalBytes: number;
+  canonicalNodes: number;
 }>;
 
 export type AnthropicContinuationMatch = Readonly<{
@@ -64,27 +82,24 @@ export type AnthropicContinuationMatch = Readonly<{
 }>;
 
 export type PreparedAnthropicContinuation = Readonly<{
+  /** Exact full request snapshot whose bytes produced inputDigest. */
+  fullRelayBody: ResponsesRequestBody;
   relayBody: ResponsesRequestBody;
   decision: AnthropicContinuationDecision;
   match: AnthropicContinuationMatch | null;
   inputDigest: AnthropicContinuationDigest;
   settingsDigest: string;
+  settingsCanonicalBytes: number;
+  settingsCanonicalNodes: number;
   scopeDigest: string;
 }>;
 
-export type AnthropicContinuationCommit = Readonly<{
-  generation: number;
-  itemCount: number;
-  canonicalBytes: number;
-  historyDigest: string;
-}>;
-
 export type AnthropicContinuationSnapshot = Readonly<{
-  entries: number;
+  records: number;
   uniqueEntries: number;
   ambiguousBuckets: number;
   logicalMetadataBytes: number;
-  maxEntries: number;
+  maxRecords: number;
   metadataBudgetBytes: number;
   ttlMs: number;
   nextGeneration: number;
@@ -98,6 +113,7 @@ type MutableDigest = {
   digest: string;
   itemCount: number;
   canonicalBytes: number;
+  canonicalNodes: number;
 };
 
 type ContinuationEntry = {
@@ -106,11 +122,10 @@ type ContinuationEntry = {
   historyDigest: string;
   itemCount: number;
   canonicalBytes: number;
+  canonicalNodes: number;
   providerResponseId: string;
   generation: number;
-  createdAt: number;
   expiresAt: number;
-  lastUsedAt: number;
 };
 
 type UniqueContinuationBucket = {
@@ -127,21 +142,110 @@ type AmbiguousContinuationBucket = {
 type ContinuationBucket = UniqueContinuationBucket | AmbiguousContinuationBucket;
 
 type ContinuationPreparationState = {
-  readonly ambiguityEpoch: number;
+  readonly mutationEpoch: number;
   readonly scopeDigest: string;
   readonly settingsDigest: string;
+  readonly settingsCanonicalBytes: number;
+  readonly settingsCanonicalNodes: number;
   digest: MutableDigest;
-  longest: { entry: ContinuationEntry | null; ambiguous: boolean } | null;
+  longest: {
+    readonly key: string;
+    readonly bucket: ContinuationBucket;
+    readonly entry: ContinuationEntry | null;
+  } | null;
 };
 
-const PREPARE_ITEMS_PER_YIELD = 512;
+const CANONICAL_BYTES_PER_YIELD = 64 * 1024;
+const CANONICAL_NODES_PER_YIELD = 256;
+const CANONICAL_STRING_CHUNK_UNITS = 16 * 1024;
+const MAX_ADVISORY_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_ADVISORY_SNAPSHOT_NODES = 65_536;
+const MAX_CANONICAL_OBJECT_KEYS = 8_192;
+const MAX_SHUTDOWN_HOOKS = 4;
 
 export type AnthropicContinuationIndexOptions = {
   /** Test seam only. Production callers must rely on a random process-local key. */
   key?: Uint8Array;
   /** Monotonic wall-clock test seam. */
   now?: () => number;
+  /** Bounded cooperative canonicalization test seam. */
+  maxCanonicalBytes?: number;
+  /** Bounded cooperative canonicalization test seam. */
+  maxCanonicalNodes?: number;
 };
+
+type CooperativeCanonicalWork = {
+  readonly signal?: AbortSignal;
+  readonly maxBytes: number;
+  readonly maxNodes: number;
+  bytesSinceYield: number;
+  nodesSinceYield: number;
+  totalBytes: number;
+  totalNodes: number;
+};
+
+async function cloneCanonicalJsonAsync(
+  value: unknown,
+  work: CooperativeCanonicalWork,
+  seen = new Set<object>(),
+): Promise<unknown> {
+  const entryCheckpoint = canonicalCheckpoint(work, 0, 1);
+  if (entryCheckpoint) await entryCheckpoint;
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") {
+    const stringCheckpoint = canonicalCheckpoint(work, byteLength(value));
+    if (stringCheckpoint) await stringCheckpoint;
+    return value;
+  }
+  if (typeof value === "bigint") throw new TypeError("canonical JSON does not support bigint");
+  if (typeof value !== "object") return null;
+  if (seen.has(value)) throw new TypeError("canonical JSON does not support cycles");
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > work.maxNodes - work.totalNodes) {
+        throw new RangeError("continuation canonical nodes exceed the configured limit");
+      }
+      const snapshot = new Array<unknown>(value.length);
+      for (let index = 0; index < value.length; index += 1) {
+        const child = value[index];
+        snapshot[index] = await cloneCanonicalJsonAsync(
+          child === undefined || typeof child === "function" || typeof child === "symbol"
+            ? null
+            : child,
+          work,
+          seen,
+        );
+      }
+      return snapshot;
+    }
+
+    const source = value as Record<string, unknown>;
+    const keys = await boundedOwnEnumerableKeysAsync(
+      source,
+      Math.min(
+        MAX_CANONICAL_OBJECT_KEYS,
+        Math.max(0, work.maxNodes - work.totalNodes),
+      ),
+      work,
+    );
+    const keysCheckpoint = canonicalCheckpoint(work, 0, keys.length, keys.length);
+    if (keysCheckpoint) await keysCheckpoint;
+    const snapshot: Record<string, unknown> = Object.create(null);
+    for (const key of keys) {
+      const child = source[key];
+      if (child === undefined || typeof child === "function" || typeof child === "symbol") {
+        continue;
+      }
+      const keyCheckpoint = canonicalCheckpoint(work, byteLength(key), 0, 1);
+      if (keyCheckpoint) await keyCheckpoint;
+      snapshot[key] = await cloneCanonicalJsonAsync(child, work, seen);
+    }
+    return snapshot;
+  } finally {
+    seen.delete(value);
+  }
+}
 
 function addSafe(left: number, right: number, name: string): number {
   const value = left + right;
@@ -153,6 +257,25 @@ function addSafe(left: number, right: number, name: string): number {
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
+}
+
+async function boundedOwnEnumerableKeysAsync(
+  value: Record<string, unknown>,
+  maximumEnumerated: number,
+  work: CooperativeCanonicalWork,
+): Promise<string[]> {
+  const keys: string[] = [];
+  let enumerated = 0;
+  for (const key in value) {
+    enumerated++;
+    if (enumerated > maximumEnumerated) {
+      throw new RangeError("continuation canonical nodes exceed the configured limit");
+    }
+    if (Object.prototype.hasOwnProperty.call(value, key)) keys.push(key);
+    const checkpoint = canonicalCheckpoint(work, 0, 0, 1);
+    if (checkpoint) await checkpoint;
+  }
+  return keys;
 }
 
 function ownJsonKeys(value: Record<string, unknown>): string[] {
@@ -207,7 +330,9 @@ function updateCanonical(
   value: unknown,
   onBytes: (bytes: number) => void,
   seen: Set<object>,
+  onNode: () => void = () => undefined,
 ): void {
+  onNode();
   const emit = (text: string): void => {
     sink.update(text);
     onBytes(byteLength(text));
@@ -249,6 +374,7 @@ function updateCanonical(
             : child,
           onBytes,
           seen,
+          onNode,
         );
       }
       emit("]");
@@ -263,9 +389,284 @@ function updateCanonical(
       const key = keys[index];
       updateCanonicalString(emit, key);
       emit(":");
-      updateCanonical(sink, object[key], onBytes, seen);
+      updateCanonical(sink, object[key], onBytes, seen, onNode);
     }
     emit("}");
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function canonicalAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("Request aborted", "AbortError");
+}
+
+function linkedAbortSignal(
+  request: AbortSignal | undefined,
+  shutdown: AbortSignal,
+): { signal: AbortSignal; dispose(): void } {
+  if (!request) return { signal: shutdown, dispose() {} };
+  const controller = new AbortController();
+  const abortRequest = () => controller.abort(request.reason);
+  const abortShutdown = () => controller.abort(shutdown.reason);
+  if (request.aborted) abortRequest();
+  else request.addEventListener("abort", abortRequest, { once: true });
+  if (shutdown.aborted) abortShutdown();
+  else shutdown.addEventListener("abort", abortShutdown, { once: true });
+  return {
+    signal: controller.signal,
+    dispose() {
+      request.removeEventListener("abort", abortRequest);
+      shutdown.removeEventListener("abort", abortShutdown);
+    },
+  };
+}
+
+function createCanonicalWork(
+  maxBytes: number,
+  maxNodes: number,
+  signal?: AbortSignal,
+): CooperativeCanonicalWork {
+  if (signal?.aborted) throw canonicalAbortReason(signal);
+  return {
+    signal,
+    maxBytes,
+    maxNodes,
+    bytesSinceYield: 0,
+    nodesSinceYield: 0,
+    totalBytes: 0,
+    totalNodes: 0,
+  };
+}
+
+function canonicalCheckpoint(
+  work: CooperativeCanonicalWork,
+  bytes = 0,
+  nodes = 0,
+  workUnits = nodes,
+): Promise<void> | null {
+  if (work.signal?.aborted) throw canonicalAbortReason(work.signal);
+  work.totalBytes = addSafe(work.totalBytes, bytes, "cooperative canonical bytes");
+  work.totalNodes = addSafe(work.totalNodes, nodes, "cooperative canonical nodes");
+  if (work.totalBytes > work.maxBytes) {
+    throw new RangeError("continuation canonical bytes exceed the configured limit");
+  }
+  if (work.totalNodes > work.maxNodes) {
+    throw new RangeError("continuation canonical nodes exceed the configured limit");
+  }
+  work.bytesSinceYield = addSafe(work.bytesSinceYield, bytes, "canonical yield bytes");
+  work.nodesSinceYield = addSafe(
+    work.nodesSinceYield,
+    workUnits,
+    "canonical yield nodes",
+  );
+  if (work.bytesSinceYield < CANONICAL_BYTES_PER_YIELD &&
+    work.nodesSinceYield < CANONICAL_NODES_PER_YIELD) return null;
+
+  work.bytesSinceYield = 0;
+  work.nodesSinceYield = 0;
+  return new Promise<void>(resolve => setImmediate(resolve)).then(() => {
+    if (work.signal?.aborted) throw canonicalAbortReason(work.signal);
+  });
+}
+
+async function updateCanonicalText(
+  sink: CanonicalSink,
+  text: string,
+  onBytes: (bytes: number) => void,
+  work: CooperativeCanonicalWork,
+): Promise<void> {
+  sink.update(text);
+  const bytes = byteLength(text);
+  onBytes(bytes);
+  const checkpoint = canonicalCheckpoint(work, bytes);
+  if (checkpoint) await checkpoint;
+}
+
+async function updateCanonicalStringAsync(
+  sink: CanonicalSink,
+  value: string,
+  onBytes: (bytes: number) => void,
+  work: CooperativeCanonicalWork,
+): Promise<void> {
+  let parts: string[] = ['"'];
+  let bufferedUnits = 1;
+  let rawStart = 0;
+  const append = (part: string): void => {
+    if (!part) return;
+    parts.push(part);
+    bufferedUnits = addSafe(bufferedUnits, part.length, "canonical string chunk units");
+  };
+  const flush = async (): Promise<void> => {
+    if (parts.length === 0) return;
+    const chunk = parts.join("");
+    parts = [];
+    bufferedUnits = 0;
+    await updateCanonicalText(sink, chunk, onBytes, work);
+  };
+
+  for (let index = 0; index < value.length;) {
+    const unit = value.charCodeAt(index);
+    let escaped: string | null = null;
+    let width = 1;
+    switch (unit) {
+      case 0x22: escaped = '\\"'; break;
+      case 0x5c: escaped = "\\\\"; break;
+      case 0x08: escaped = "\\b"; break;
+      case 0x09: escaped = "\\t"; break;
+      case 0x0a: escaped = "\\n"; break;
+      case 0x0c: escaped = "\\f"; break;
+      case 0x0d: escaped = "\\r"; break;
+      default: {
+        if (unit < 0x20 || (unit >= 0xd800 && unit <= 0xdfff)) {
+          if (unit >= 0xd800 && unit <= 0xdbff) {
+            const low = value.charCodeAt(index + 1);
+            if (low >= 0xdc00 && low <= 0xdfff) width = 2;
+            else escaped = `\\u${unit.toString(16).padStart(4, "0")}`;
+          } else {
+            escaped = `\\u${unit.toString(16).padStart(4, "0")}`;
+          }
+        }
+      }
+    }
+
+    if (escaped !== null) {
+      if (index > rawStart) append(value.slice(rawStart, index));
+      append(escaped);
+      index += 1;
+      rawStart = index;
+    } else {
+      index += width;
+    }
+
+    if (bufferedUnits + index - rawStart >= CANONICAL_STRING_CHUNK_UNITS) {
+      if (index > rawStart) append(value.slice(rawStart, index));
+      rawStart = index;
+      await flush();
+    }
+  }
+  if (rawStart < value.length) append(value.slice(rawStart));
+  append('"');
+  await flush();
+}
+
+async function cooperativeSortKeys(
+  keys: string[],
+  work: CooperativeCanonicalWork,
+): Promise<string[]> {
+  if (keys.length < 2) return keys;
+  let source = keys;
+  let target = new Array<string>(keys.length);
+  for (let width = 1; width < keys.length; width *= 2) {
+    for (let start = 0; start < keys.length; start += width * 2) {
+      const middle = Math.min(start + width, keys.length);
+      const end = Math.min(start + width * 2, keys.length);
+      let left = start;
+      let right = middle;
+      for (let cursor = start; cursor < end; cursor += 1) {
+        if (right >= end || (left < middle && source[left]! <= source[right]!)) {
+          target[cursor] = source[left++]!;
+        } else {
+          target[cursor] = source[right++]!;
+        }
+        const checkpoint = canonicalCheckpoint(work, 0, 0, 1);
+        if (checkpoint) await checkpoint;
+      }
+    }
+    [source, target] = [target, source];
+    if (width > Math.floor(keys.length / 2)) break;
+  }
+  return source;
+}
+
+async function ownJsonKeysAsync(
+  value: Record<string, unknown>,
+  work: CooperativeCanonicalWork,
+): Promise<string[]> {
+  // Object.keys matches JSON's own-enumerable contract and does not walk a
+  // hostile prototype chain. Charge the first (and only) complete key array
+  // before cooperative merge sort allocates its equally-sized scratch array.
+  const keys = await boundedOwnEnumerableKeysAsync(
+    value,
+    Math.min(
+      MAX_CANONICAL_OBJECT_KEYS,
+      Math.max(0, work.maxNodes - work.totalNodes),
+    ),
+    work,
+  );
+  // Key enumeration/sort work contributes to cooperative yield accounting,
+  // but keys are not separate canonical JSON value nodes. Semantic node
+  // metadata must match the synchronous digest path exactly.
+  const keysCheckpoint = canonicalCheckpoint(work, 0, 0, keys.length);
+  if (keysCheckpoint) await keysCheckpoint;
+  let retained = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]!;
+    const child = value[key];
+    if (child !== undefined && typeof child !== "function" && typeof child !== "symbol") {
+      keys[retained++] = key;
+    }
+    const checkpoint = canonicalCheckpoint(work, 0, 0, 1);
+    if (checkpoint) await checkpoint;
+  }
+  keys.length = retained;
+  return cooperativeSortKeys(keys, work);
+}
+
+async function updateCanonicalAsync(
+  sink: CanonicalSink,
+  value: unknown,
+  onBytes: (bytes: number) => void,
+  seen: Set<object>,
+  work: CooperativeCanonicalWork,
+): Promise<void> {
+  const checkpoint = canonicalCheckpoint(work, 0, 1);
+  if (checkpoint) await checkpoint;
+  const emit = (text: string): Promise<void> =>
+    updateCanonicalText(sink, text, onBytes, work);
+
+  if (value === null) return emit("null");
+  if (typeof value === "string") {
+    await updateCanonicalStringAsync(sink, value, onBytes, work);
+    return;
+  }
+  if (typeof value === "boolean") return emit(value ? "true" : "false");
+  if (typeof value === "number") return emit(Number.isFinite(value) ? JSON.stringify(value) : "null");
+  if (typeof value === "bigint") throw new TypeError("canonical JSON does not support bigint");
+  if (typeof value !== "object") return emit("null");
+  if (seen.has(value)) throw new TypeError("canonical JSON does not support cycles");
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      await emit("[");
+      for (let index = 0; index < value.length; index += 1) {
+        if (index > 0) await emit(",");
+        const child = value[index];
+        await updateCanonicalAsync(
+          sink,
+          child === undefined || typeof child === "function" || typeof child === "symbol"
+            ? null
+            : child,
+          onBytes,
+          seen,
+          work,
+        );
+      }
+      await emit("]");
+      return;
+    }
+
+    const object = value as Record<string, unknown>;
+    const keys = await ownJsonKeysAsync(object, work);
+    await emit("{");
+    for (let index = 0; index < keys.length; index += 1) {
+      if (index > 0) await emit(",");
+      const key = keys[index]!;
+      await updateCanonicalStringAsync(sink, key, onBytes, work);
+      await emit(":");
+      await updateCanonicalAsync(sink, object[key], onBytes, seen, work);
+    }
+    await emit("}");
   } finally {
     seen.delete(value);
   }
@@ -274,8 +675,9 @@ function updateCanonical(
 function updateCanonicalSettings(
   sink: CanonicalSink,
   body: Record<string, unknown>,
-): void {
+): { bytes: number; nodes: number } {
   let ignoredBytes = 0;
+  let nodes = 1;
   const count = (bytes: number): void => { ignoredBytes = addSafe(ignoredBytes, bytes, "canonical settings bytes"); };
   const emit = (text: string): void => {
     sink.update(text);
@@ -288,9 +690,35 @@ function updateCanonicalSettings(
     const key = keys[index];
     updateCanonicalString(emit, key);
     emit(":");
-    updateCanonical(sink, body[key], count, new Set());
+    updateCanonical(sink, body[key], count, new Set(), () => { nodes++; });
   }
   emit("}");
+  return { bytes: ignoredBytes, nodes };
+}
+
+async function updateCanonicalSettingsAsync(
+  sink: CanonicalSink,
+  body: Record<string, unknown>,
+  work: CooperativeCanonicalWork,
+): Promise<void> {
+  let ignoredBytes = 0;
+  const rootCheckpoint = canonicalCheckpoint(work, 0, 1);
+  if (rootCheckpoint) await rootCheckpoint;
+  const count = (bytes: number): void => {
+    ignoredBytes = addSafe(ignoredBytes, bytes, "canonical settings bytes");
+  };
+  const emit = (text: string): Promise<void> => updateCanonicalText(sink, text, count, work);
+  const keys = (await ownJsonKeysAsync(body, work))
+    .filter(key => !EXCLUDED_SETTINGS_FIELDS.has(key));
+  await emit("{");
+  for (let index = 0; index < keys.length; index += 1) {
+    if (index > 0) await emit(",");
+    const key = keys[index]!;
+    await updateCanonicalStringAsync(sink, key, count, work);
+    await emit(":");
+    await updateCanonicalAsync(sink, body[key], count, new Set(), work);
+  }
+  await emit("}");
 }
 
 function digestBuffer(value: string): Buffer {
@@ -306,6 +734,7 @@ function initialInputDigest(key: Buffer): MutableDigest {
     digest: createHmac("sha256", key).update(INPUT_SEED_DOMAIN, "utf8").digest("base64url"),
     itemCount: 0,
     canonicalBytes: 0,
+    canonicalNodes: 0,
   };
 }
 
@@ -318,24 +747,81 @@ function appendInputItem(
   hmac.update(INPUT_ITEM_DOMAIN, "utf8");
   hmac.update(digestBuffer(previous.digest));
   let itemBytes = 0;
+  let itemNodes = 0;
   updateCanonical(
     hmac,
     item,
     bytes => { itemBytes = addSafe(itemBytes, bytes, "canonical input item bytes"); },
     new Set(),
+    () => { itemNodes++; },
   );
   return {
     digest: hmac.digest("base64url"),
     itemCount: addSafe(previous.itemCount, 1, "continuation input item count"),
     canonicalBytes: addSafe(previous.canonicalBytes, itemBytes, "continuation canonical bytes"),
+    canonicalNodes: addSafe(previous.canonicalNodes, itemNodes, "continuation canonical nodes"),
   };
 }
 
-function settingsDigest(key: Buffer, body: Record<string, unknown>): string {
+async function appendInputItemAsync(
+  key: Buffer,
+  previous: AnthropicContinuationDigest,
+  item: ResponsesInputItem,
+  work: CooperativeCanonicalWork,
+): Promise<MutableDigest> {
+  const hmac = createHmac("sha256", key);
+  hmac.update(INPUT_ITEM_DOMAIN, "utf8");
+  hmac.update(digestBuffer(previous.digest));
+  let itemBytes = 0;
+  const nodesBefore = work.totalNodes;
+  await updateCanonicalAsync(
+    hmac,
+    item,
+    bytes => { itemBytes = addSafe(itemBytes, bytes, "canonical input item bytes"); },
+    new Set(),
+    work,
+  );
+  return {
+    digest: hmac.digest("base64url"),
+    itemCount: addSafe(previous.itemCount, 1, "continuation input item count"),
+    canonicalBytes: addSafe(
+      previous.canonicalBytes,
+      itemBytes,
+      "continuation canonical bytes",
+    ),
+    canonicalNodes: addSafe(
+      previous.canonicalNodes,
+      work.totalNodes - nodesBefore,
+      "continuation canonical nodes",
+    ),
+  };
+}
+
+function settingsDigest(
+  key: Buffer,
+  body: Record<string, unknown>,
+): { digest: string; bytes: number; nodes: number } {
   const hmac = createHmac("sha256", key);
   hmac.update(SETTINGS_DOMAIN, "utf8");
-  updateCanonicalSettings(hmac, body);
-  return hmac.digest("base64url");
+  const measured = updateCanonicalSettings(hmac, body);
+  return { digest: hmac.digest("base64url"), ...measured };
+}
+
+async function settingsDigestAsync(
+  key: Buffer,
+  body: Record<string, unknown>,
+  work: CooperativeCanonicalWork,
+): Promise<{ digest: string; bytes: number; nodes: number }> {
+  const hmac = createHmac("sha256", key);
+  hmac.update(SETTINGS_DOMAIN, "utf8");
+  const bytesBefore = work.totalBytes;
+  const nodesBefore = work.totalNodes;
+  await updateCanonicalSettingsAsync(hmac, body, work);
+  return {
+    digest: hmac.digest("base64url"),
+    bytes: work.totalBytes - bytesBefore,
+    nodes: work.totalNodes - nodesBefore,
+  };
 }
 
 function opaqueScopeDigest(key: Buffer, scope: AnthropicContinuationScope): string {
@@ -427,20 +913,40 @@ function replayProjectionEquivalent(
   return thinkingIndex === thinkingBlocks.length;
 }
 
-function replaySafeJsonNumbers(value: unknown, seen = new Set<object>()): boolean {
-  if (typeof value === "number") {
-    return Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value));
+function replaySafeJsonNumbers(
+  value: unknown,
+  budget: { remaining: number },
+): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (--budget.remaining < 0) return false;
+    if (typeof current.value === "number") {
+      if (!Number.isFinite(current.value) ||
+        (Number.isInteger(current.value) && !Number.isSafeInteger(current.value))) return false;
+      continue;
+    }
+    if (!current.value || typeof current.value !== "object") continue;
+    if (current.depth > MAX_RESPONSES_JSON_DEPTH || seen.has(current.value)) return false;
+    seen.add(current.value);
+    if (Array.isArray(current.value)) {
+      if (current.value.length > budget.remaining) return false;
+      for (let index = current.value.length - 1; index >= 0; index--) {
+        pending.push({ value: current.value[index], depth: current.depth + 1 });
+      }
+      continue;
+    }
+    const keys = Object.keys(current.value);
+    if (keys.length > budget.remaining) return false;
+    for (let index = keys.length - 1; index >= 0; index--) {
+      pending.push({
+        value: (current.value as Record<string, unknown>)[keys[index]!],
+        depth: current.depth + 1,
+      });
+    }
   }
-  if (!value || typeof value !== "object") return true;
-  if (seen.has(value)) return false;
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) return value.every(child => replaySafeJsonNumbers(child, seen));
-    return Object.values(value as Record<string, unknown>)
-      .every(child => replaySafeJsonNumbers(child, seen));
-  } finally {
-    seen.delete(value);
-  }
+  return true;
 }
 
 const MESSAGE_REPLAY_KEYS = new Set([
@@ -461,15 +967,33 @@ function hasOnlyReplayKeys(
   value: Record<string, unknown>,
   allowed: ReadonlySet<string>,
 ): boolean {
-  return Object.keys(value).every(key => allowed.has(key));
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  let count = 0;
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    // A replay-safe object cannot contain more distinct keys than its allowlist.
+    // Reject at the first additive provider field without allocating/scanning a
+    // potentially million-entry Object.keys array.
+    if (++count > allowed.size || !allowed.has(key)) return false;
+  }
+  return true;
 }
 
 function expectedReplayItems(
   terminal: ReturnType<typeof validateTerminalResponseProjection>,
+  projected: AnthropicAdapterMessage,
+  validatedFunctionArguments?: (
+    outputIndex: number,
+    item: Readonly<Record<string, unknown>>,
+  ) => boolean,
+  replayBudget: { remaining: number } = { remaining: MAX_SYNCHRONOUS_REPLAY_NODES },
 ): { items: ResponsesInputItem[]; meaningful: boolean } | null {
   if (terminal.output.length > MAX_REPLAY_ITEMS) return null;
   const items: ResponsesInputItem[] = [];
   const text: string[] = [];
+  const projectedTools = projected.content.filter(block => block.type === "tool_use");
+  let projectedToolIndex = 0;
   let meaningful = false;
   const flushText = (): void => {
     if (text.length === 0) return;
@@ -478,7 +1002,8 @@ function expectedReplayItems(
     items.push({ type: "message", role: "assistant", content });
   };
 
-  for (const value of terminal.output) {
+  for (let outputIndex = 0; outputIndex < terminal.output.length; outputIndex += 1) {
+    const value = terminal.output[outputIndex];
     const item = validateTerminalOutputItemProjection(value, terminal.status);
     if (item.type === "message") {
       if (!hasOnlyReplayKeys(item, MESSAGE_REPLAY_KEYS) ||
@@ -520,8 +1045,12 @@ function expectedReplayItems(
           !hasOnlyReplayKeys(item.caller, DIRECT_CALLER_REPLAY_KEYS)))) {
       return null;
     }
-    let input: Record<string, unknown> = {};
-    if (item.arguments.trim().length > 0) {
+    let input: Record<string, unknown>;
+    const projectedTool = projectedTools[projectedToolIndex++];
+    if (validatedFunctionArguments?.(outputIndex, item) && projectedTool &&
+      projectedTool.id === item.call_id && projectedTool.name === item.name) {
+      input = projectedTool.input;
+    } else if (item.arguments.trim().length > 0) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(item.arguments);
@@ -529,9 +1058,12 @@ function expectedReplayItems(
         return null;
       }
       const parsedRecord = record(parsed);
-      if (!parsedRecord || !replaySafeJsonNumbers(parsedRecord)) return null;
+      if (!parsedRecord) return null;
       input = parsedRecord;
+    } else {
+      input = {};
     }
+    if (!replaySafeJsonNumbers(input, replayBudget)) return null;
     let argumentsJson: string;
     try {
       argumentsJson = JSON.stringify(input);
@@ -558,9 +1090,23 @@ function expectedReplayItems(
 export function projectAnthropicReplay(
   finalValue: unknown,
   projected: AnthropicAdapterMessage,
-  options: { limits?: Partial<AnthropicRequestLimits> } = {},
+  options: {
+    limits?: Partial<AnthropicRequestLimits>;
+    /** Trusted transport byte count; absent/large terminals are not replayed synchronously. */
+    terminalBytes?: number;
+    /** Internal SSE proof that the exact argument string was already validated. */
+    validatedFunctionArguments?(
+      outputIndex: number,
+      item: Readonly<Record<string, unknown>>,
+    ): boolean;
+  } = {},
 ): ResponsesInputItem[] | null {
   try {
+    if (!Number.isSafeInteger(options.terminalBytes) ||
+      options.terminalBytes! < 1 ||
+      options.terminalBytes! > MAX_SYNCHRONOUS_REPLAY_TERMINAL_BYTES) {
+      return null;
+    }
     const terminal = validateTerminalResponseProjection(finalValue);
     if (terminal.status !== "completed" || terminal.incompleteReason !== null ||
       terminal.output.length === 0 || projected.stop_reason === "refusal" ||
@@ -568,7 +1114,57 @@ export function projectAnthropicReplay(
       projected.stop_sequence !== null) {
       return null;
     }
-    const expected = expectedReplayItems(terminal);
+    if (terminal.output.length > MAX_REPLAY_ITEMS) return null;
+    let replayStringUnits = 0;
+    let replayNodes = 0;
+    const add = (candidate: unknown): boolean => {
+      if (typeof candidate !== "string") return true;
+      replayStringUnits = addSafe(
+        replayStringUnits,
+        candidate.length,
+        "replay projection string units",
+      );
+      return replayStringUnits <= MAX_SYNCHRONOUS_REPLAY_STRING_UNITS;
+    };
+    for (const value of terminal.output) {
+      if (++replayNodes > MAX_SYNCHRONOUS_REPLAY_NODES) return null;
+      const item = record(value);
+      if (!item) return null;
+      if (!add(item.type) || !add(item.id) || !add(item.status) || !add(item.role) ||
+        !add(item.phase) || !add(item.call_id) || !add(item.name) ||
+        !add(item.arguments) || !add(item.encrypted_content)) return null;
+      if (Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (++replayNodes > MAX_SYNCHRONOUS_REPLAY_NODES) return null;
+          const child = record(part);
+          if (child && (!add(child.type) || !add(child.text) || !add(child.refusal))) return null;
+          if ((Array.isArray(child?.annotations) && child.annotations.length > 0) ||
+            (Array.isArray(child?.logprobs) && child.logprobs.length > 0)) return null;
+        }
+      }
+      if (Array.isArray(item.summary)) {
+        for (const part of item.summary) {
+          if (++replayNodes > MAX_SYNCHRONOUS_REPLAY_NODES) return null;
+          const child = record(part);
+          if (child && (!add(child.type) || !add(child.text))) return null;
+        }
+      }
+    }
+    if (projected.content.length > MAX_SYNCHRONOUS_REPLAY_NODES - replayNodes) return null;
+    for (const block of projected.content) {
+      replayNodes++;
+      if (block.type === "text") {
+        if (!add(block.text)) return null;
+      } else if (block.type === "thinking") {
+        if (!add(block.thinking) || !add(block.signature)) return null;
+      } else if (!add(block.id) || !add(block.name)) return null;
+    }
+    const expected = expectedReplayItems(
+      terminal,
+      projected,
+      options.validatedFunctionArguments,
+      { remaining: MAX_SYNCHRONOUS_REPLAY_NODES - replayNodes },
+    );
     if (!expected || !expected.meaningful || expected.items.length === 0) return null;
     const limits = resolveAnthropicRequestLimits(options.limits);
     const replayed = translateAnthropicAssistantReplay(projected.content, limits);
@@ -587,13 +1183,17 @@ export function projectAnthropicReplay(
 export class AnthropicContinuationIndex {
   readonly #key: Buffer;
   readonly #now: () => number;
+  readonly #maxCanonicalBytes: number;
+  readonly #maxCanonicalNodes: number;
   readonly #entries = new Map<number, ContinuationEntry>();
   readonly #buckets = new Map<string, ContinuationBucket>();
   /** Absolute-expiry order is independent from the entry LRU order. */
   readonly #entryExpiry = new Map<number, ContinuationEntry>();
   readonly #ambiguityExpiry = new Map<string, AmbiguousContinuationBucket>();
+  readonly #shutdownHooks = new Set<() => void>();
+  readonly #shutdown = new AbortController();
   #nextGeneration = 1;
-  #ambiguityEpoch = 0;
+  #mutationEpoch = 0;
   #lastNow = 0;
   #acceptingCommits = true;
 
@@ -602,6 +1202,16 @@ export class AnthropicContinuationIndex {
     if (key.length !== HMAC_KEY_BYTES) throw new RangeError(`continuation HMAC key must be ${HMAC_KEY_BYTES} bytes`);
     this.#key = Buffer.from(key);
     this.#now = options.now ?? Date.now;
+    this.#maxCanonicalBytes = this.#canonicalLimit(
+      options.maxCanonicalBytes,
+      ANTHROPIC_CONTINUATION_MAX_CANONICAL_BYTES,
+      "maxCanonicalBytes",
+    );
+    this.#maxCanonicalNodes = this.#canonicalLimit(
+      options.maxCanonicalNodes,
+      ANTHROPIC_CONTINUATION_MAX_CANONICAL_NODES,
+      "maxCanonicalNodes",
+    );
   }
 
   digestInput(items: readonly ResponsesInputItem[]): AnthropicContinuationDigest {
@@ -611,13 +1221,14 @@ export class AnthropicContinuationIndex {
   }
 
   fingerprintSettings(body: Record<string, unknown>): string {
-    return settingsDigest(this.#key, body);
+    return settingsDigest(this.#key, body).digest;
   }
 
   prepare(
     body: ResponsesRequestBody,
     scope: AnthropicContinuationScope,
   ): PreparedAnthropicContinuation {
+    if (Object.hasOwn(body, "previous_response_id")) return this.#explicitPreparation(body);
     const state = this.#beginPreparation(body, scope);
     for (const item of body.input) this.#appendPreparationItem(state, item);
     return this.#finishPreparation(body, state);
@@ -628,42 +1239,153 @@ export class AnthropicContinuationIndex {
     scope: AnthropicContinuationScope,
     signal?: AbortSignal,
   ): Promise<PreparedAnthropicContinuation> {
-    if (signal?.aborted) throw signal.reason ?? new DOMException("Request aborted", "AbortError");
-    const state = this.#beginPreparation(body, scope);
-    for (let index = 0; index < body.input.length; index += 1) {
-      this.#appendPreparationItem(state, body.input[index]!);
-      if ((index + 1) % PREPARE_ITEMS_PER_YIELD === 0 && index + 1 < body.input.length) {
-        await new Promise<void>(resolve => setImmediate(resolve));
-        if (signal?.aborted) {
-          throw signal.reason ?? new DOMException("Request aborted", "AbortError");
-        }
+    const linked = linkedAbortSignal(signal, this.#shutdown.signal);
+    try {
+      if (linked.signal.aborted) throw canonicalAbortReason(linked.signal);
+      if (Object.hasOwn(body, "previous_response_id")) return this.#explicitPreparation(body);
+      const snapshotWork = createCanonicalWork(
+        Math.min(this.#maxCanonicalBytes, MAX_ADVISORY_SNAPSHOT_BYTES),
+        Math.min(this.#maxCanonicalNodes, MAX_ADVISORY_SNAPSHOT_NODES),
+        linked.signal,
+      );
+      const snapshotValue = await cloneCanonicalJsonAsync(body, snapshotWork);
+      const snapshotRecord = record(snapshotValue);
+      if (!snapshotRecord || !Array.isArray(snapshotRecord.input)) {
+        throw new TypeError("Continuation request snapshot is malformed");
       }
+      // Strings remain shared immutable primitives; only containers are copied.
+      // Hashing and both initial/fallback relay attempts now own this exact
+      // bounded snapshot, so caller mutation cannot change executed lineage.
+      const stableBody = snapshotRecord as unknown as ResponsesRequestBody;
+      let work = createCanonicalWork(
+        this.#maxCanonicalBytes,
+        this.#maxCanonicalNodes,
+        linked.signal,
+      );
+      let state = await this.#beginPreparationAsync(stableBody, scope, work);
+      await this.#scanPreparationAsync(state, stableBody.input, work);
+      if (state.mutationEpoch !== this.#mutationEpoch) {
+        // Metadata changed while cooperative hashing yielded. Re-scan once from
+        // the immutable request so a new longer/replaced relevant prefix is
+        // observed without retaining one digest key per input item. Continuous
+        // churn remains a conservative miss at #finishPreparation.
+        work = createCanonicalWork(
+          this.#maxCanonicalBytes,
+          this.#maxCanonicalNodes,
+          linked.signal,
+        );
+        state = await this.#beginPreparationAsync(stableBody, scope, work);
+        await this.#scanPreparationAsync(state, stableBody.input, work);
+      }
+      if (linked.signal.aborted) throw canonicalAbortReason(linked.signal);
+      return this.#finishPreparation(stableBody, state);
+    } finally {
+      linked.dispose();
     }
-    return this.#finishPreparation(body, state);
   }
 
   commit(
     prepared: Pick<
       PreparedAnthropicContinuation,
-      "inputDigest" | "settingsDigest" | "scopeDigest"
+      "decision" | "inputDigest" | "settingsDigest" |
+        "settingsCanonicalBytes" | "settingsCanonicalNodes" | "scopeDigest"
     >,
     scope: AnthropicContinuationScope,
     providerResponseId: string,
     replayItems: readonly ResponsesInputItem[],
-  ): AnthropicContinuationCommit | null {
-    if (!this.#acceptingCommits) return null;
+  ): boolean {
+    const responseId = this.#validateCommit(prepared, scope, providerResponseId, replayItems);
+    if (responseId === null) return false;
+
+    let digest: AnthropicContinuationDigest = prepared.inputDigest;
+    for (const item of replayItems) digest = appendInputItem(this.#key, digest, item);
+    if (digest.itemCount <= prepared.inputDigest.itemCount) return false;
+    if (!this.#withinCanonicalBounds(prepared, digest)) return false;
+    return this.#commitDigest(prepared, responseId, digest);
+  }
+
+  async commitAsync(
+    prepared: Pick<
+      PreparedAnthropicContinuation,
+      "decision" | "inputDigest" | "settingsDigest" |
+        "settingsCanonicalBytes" | "settingsCanonicalNodes" | "scopeDigest"
+    >,
+    scope: AnthropicContinuationScope,
+    providerResponseId: string,
+    replayItems: readonly ResponsesInputItem[],
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const linked = linkedAbortSignal(signal, this.#shutdown.signal);
+    try {
+      if (linked.signal.aborted) throw canonicalAbortReason(linked.signal);
+      const responseId = this.#validateCommit(prepared, scope, providerResponseId, replayItems);
+      if (responseId === null) return false;
+      const work = createCanonicalWork(
+        this.#maxCanonicalBytes,
+        this.#maxCanonicalNodes,
+        linked.signal,
+      );
+      let digest: AnthropicContinuationDigest = prepared.inputDigest;
+      for (const item of replayItems) {
+        digest = await appendInputItemAsync(this.#key, digest, item, work);
+      }
+      if (digest.itemCount <= prepared.inputDigest.itemCount) return false;
+      if (linked.signal.aborted) throw canonicalAbortReason(linked.signal);
+      if (!this.#withinCanonicalBounds(prepared, digest)) return false;
+      return this.#commitDigest(prepared, responseId, digest);
+    } catch (error) {
+      if (this.#shutdown.signal.aborted) return false;
+      throw error;
+    } finally {
+      linked.dispose();
+    }
+  }
+
+  #validateCommit(
+    prepared: Pick<
+      PreparedAnthropicContinuation,
+      "decision" | "inputDigest" | "settingsDigest" |
+        "settingsCanonicalBytes" | "settingsCanonicalNodes" | "scopeDigest"
+    >,
+    scope: AnthropicContinuationScope,
+    providerResponseId: string,
+    replayItems: readonly ResponsesInputItem[],
+  ): string | null {
+    if (!this.#acceptingCommits || prepared.decision === "empty_suffix" ||
+      prepared.decision === "explicit" || replayItems.length === 0 ||
+      replayItems.length > MAX_REPLAY_ITEMS) return null;
     const commitScopeDigest = opaqueScopeDigest(this.#key, scope);
     if (!timingSafeEqual(
       digestBuffer(commitScopeDigest),
       digestBuffer(prepared.scopeDigest),
     )) return null;
-    const responseId = boundedReference(providerResponseId, MAX_PROVIDER_RESPONSE_ID_BYTES);
-    if (!responseId || replayItems.length === 0) return null;
+    return boundedReference(providerResponseId, MAX_PROVIDER_RESPONSE_ID_BYTES);
+  }
 
-    let digest: AnthropicContinuationDigest = prepared.inputDigest;
-    for (const item of replayItems) digest = appendInputItem(this.#key, digest, item);
-    if (digest.itemCount <= prepared.inputDigest.itemCount) return null;
+  #withinCanonicalBounds(
+    prepared: Pick<
+      PreparedAnthropicContinuation,
+      "settingsCanonicalBytes" | "settingsCanonicalNodes"
+    >,
+    digest: AnthropicContinuationDigest,
+  ): boolean {
+    return prepared.settingsCanonicalBytes + digest.canonicalBytes <=
+        this.#maxCanonicalBytes &&
+      prepared.settingsCanonicalNodes + digest.canonicalNodes <=
+        this.#maxCanonicalNodes;
+  }
 
+  #commitDigest(
+    prepared: Pick<
+      PreparedAnthropicContinuation,
+      "settingsDigest" | "scopeDigest"
+    >,
+    responseId: string,
+    digest: AnthropicContinuationDigest,
+  ): boolean {
+    // Cooperative commits can race shutdown while hashing. Never repopulate the
+    // index after the lifecycle barrier has fired.
+    if (!this.#acceptingCommits) return false;
     const now = this.#time();
     this.#pruneExpired(now);
     const expiresAt = addSafe(now, ANTHROPIC_CONTINUATION_TTL_MS, "continuation expiry");
@@ -675,23 +1397,13 @@ export class AnthropicContinuationIndex {
         this.#ambiguityExpiry.delete(key);
         this.#ambiguityExpiry.set(key, existingBucket);
       }
-      return Object.freeze({
-        generation: existingBucket.generation,
-        itemCount: digest.itemCount,
-        canonicalBytes: digest.canonicalBytes,
-        historyDigest: digest.digest,
-      });
+      return true;
     }
     if (existingBucket?.kind === "unique") {
       const existing = this.#entries.get(existingBucket.generation);
       if (existing?.providerResponseId === responseId) {
-        this.#touch(existing, now);
-        return Object.freeze({
-          generation: existing.generation,
-          itemCount: existing.itemCount,
-          canonicalBytes: existing.canonicalBytes,
-          historyDigest: existing.historyDigest,
-        });
+        this.#touch(existing);
+        return true;
       }
       if (existing) {
         const ambiguityExpiry = Math.max(existing.expiresAt, expiresAt);
@@ -703,19 +1415,14 @@ export class AnthropicContinuationIndex {
           expiresAt: ambiguityExpiry,
         };
         this.#buckets.set(key, ambiguous);
+        this.#markMutation();
         this.#ambiguityExpiry.set(key, ambiguous);
-        this.#markAmbiguity();
-        return Object.freeze({
-          generation,
-          itemCount: digest.itemCount,
-          canonicalBytes: digest.canonicalBytes,
-          historyDigest: digest.digest,
-        });
+        return true;
       }
-      this.#buckets.delete(key);
+      if (this.#buckets.delete(key)) this.#markMutation();
     }
 
-    if (!this.#makeRoomForRecord()) return null;
+    if (!this.#makeRoomForRecord()) return false;
     const generation = this.#allocateGeneration();
     const entry: ContinuationEntry = {
       scopeDigest: prepared.scopeDigest,
@@ -723,21 +1430,16 @@ export class AnthropicContinuationIndex {
       historyDigest: digest.digest,
       itemCount: digest.itemCount,
       canonicalBytes: digest.canonicalBytes,
+      canonicalNodes: digest.canonicalNodes,
       providerResponseId: responseId,
       generation,
-      createdAt: now,
       expiresAt,
-      lastUsedAt: now,
     };
     this.#entries.set(generation, entry);
     this.#entryExpiry.set(generation, entry);
     this.#buckets.set(key, { kind: "unique", generation });
-    return Object.freeze({
-      generation,
-      itemCount: entry.itemCount,
-      canonicalBytes: entry.canonicalBytes,
-      historyDigest: entry.historyDigest,
-    });
+    this.#markMutation();
+    return true;
   }
 
   compareDelete(match: AnthropicContinuationMatch): boolean {
@@ -753,10 +1455,39 @@ export class AnthropicContinuationIndex {
 
   /** Prevents in-flight HTTP/SSE completions from repopulating shutdown state. */
   beginShutdown(): void {
+    if (!this.#acceptingCommits) return;
     this.#acceptingCommits = false;
+    this.#shutdown.abort(new DOMException("Continuation index is shutting down", "AbortError"));
+    for (const hook of this.#shutdownHooks) {
+      try {
+        hook();
+      } catch {
+        // Shutdown remains authoritative even if an optional optimizer hook fails.
+      }
+    }
+    this.#shutdownHooks.clear();
+  }
+
+  /** Links bounded optimizer state to the index lifecycle. */
+  onShutdown(hook: () => void): () => void {
+    if (!this.#acceptingCommits) {
+      hook();
+      return () => undefined;
+    }
+    if (this.#shutdownHooks.size >= MAX_SHUTDOWN_HOOKS) {
+      throw new RangeError("continuation shutdown hook limit exceeded");
+    }
+    this.#shutdownHooks.add(hook);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.#shutdownHooks.delete(hook);
+    };
   }
 
   clear(): void {
+    if (this.#buckets.size > 0) this.#markMutation();
     this.#entries.clear();
     this.#buckets.clear();
     this.#entryExpiry.clear();
@@ -765,13 +1496,13 @@ export class AnthropicContinuationIndex {
 
   snapshot(): AnthropicContinuationSnapshot {
     this.#pruneExpired(this.#time());
-    const entries = this.#recordCount();
+    const records = this.#recordCount();
     return Object.freeze({
-      entries,
+      records,
       uniqueEntries: this.#entries.size,
       ambiguousBuckets: this.#ambiguityExpiry.size,
-      logicalMetadataBytes: entries * ANTHROPIC_CONTINUATION_ENTRY_METADATA_BYTES,
-      maxEntries: ANTHROPIC_CONTINUATION_MAX_ENTRIES,
+      logicalMetadataBytes: records * ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES,
+      maxRecords: ANTHROPIC_CONTINUATION_MAX_RECORDS,
       metadataBudgetBytes: ANTHROPIC_CONTINUATION_METADATA_BYTES,
       ttlMs: ANTHROPIC_CONTINUATION_TTL_MS,
       nextGeneration: this.#nextGeneration,
@@ -784,10 +1515,32 @@ export class AnthropicContinuationIndex {
   ): ContinuationPreparationState {
     const now = this.#time();
     this.#pruneExpired(now);
+    const settings = settingsDigest(this.#key, body);
     return {
-      ambiguityEpoch: this.#ambiguityEpoch,
+      mutationEpoch: this.#mutationEpoch,
       scopeDigest: opaqueScopeDigest(this.#key, scope),
-      settingsDigest: settingsDigest(this.#key, body),
+      settingsDigest: settings.digest,
+      settingsCanonicalBytes: settings.bytes,
+      settingsCanonicalNodes: settings.nodes,
+      digest: initialInputDigest(this.#key),
+      longest: null,
+    };
+  }
+
+  async #beginPreparationAsync(
+    body: ResponsesRequestBody,
+    scope: AnthropicContinuationScope,
+    work: CooperativeCanonicalWork,
+  ): Promise<ContinuationPreparationState> {
+    const now = this.#time();
+    this.#pruneExpired(now);
+    const settings = await settingsDigestAsync(this.#key, body, work);
+    return {
+      mutationEpoch: this.#mutationEpoch,
+      scopeDigest: opaqueScopeDigest(this.#key, scope),
+      settingsDigest: settings.digest,
+      settingsCanonicalBytes: settings.bytes,
+      settingsCanonicalNodes: settings.nodes,
       digest: initialInputDigest(this.#key),
       longest: null,
     };
@@ -798,18 +1551,44 @@ export class AnthropicContinuationIndex {
     item: ResponsesInputItem,
   ): void {
     state.digest = appendInputItem(this.#key, state.digest, item);
-    const bucket = this.#buckets.get(entryKey(
+    this.#observePreparationBucket(state);
+  }
+
+  async #appendPreparationItemAsync(
+    state: ContinuationPreparationState,
+    item: ResponsesInputItem,
+    work: CooperativeCanonicalWork,
+  ): Promise<void> {
+    state.digest = await appendInputItemAsync(this.#key, state.digest, item, work);
+    this.#observePreparationBucket(state);
+  }
+
+  async #scanPreparationAsync(
+    state: ContinuationPreparationState,
+    input: readonly ResponsesInputItem[],
+    work: CooperativeCanonicalWork,
+  ): Promise<void> {
+    for (let index = 0; index < input.length; index += 1) {
+      await this.#appendPreparationItemAsync(state, input[index]!, work);
+    }
+  }
+
+  #observePreparationBucket(state: ContinuationPreparationState): void {
+    const key = entryKey(
       state.scopeDigest,
       state.settingsDigest,
       state.digest,
-    ));
+    );
+    const bucket = this.#buckets.get(key);
     if (!bucket) return;
+    let entry: ContinuationEntry | null = null;
     if (bucket.kind === "ambiguous") {
-      state.longest = { entry: null, ambiguous: true };
-      return;
+      entry = null;
+    } else {
+      entry = this.#entries.get(bucket.generation) ?? null;
+      if (!entry) return;
     }
-    const entry = this.#entries.get(bucket.generation);
-    if (entry) state.longest = { entry, ambiguous: false };
+    state.longest = { key, bucket, entry };
   }
 
   #finishPreparation(
@@ -819,33 +1598,58 @@ export class AnthropicContinuationIndex {
     const inputDigest = Object.freeze({ ...state.digest });
     const finishNow = this.#time();
     this.#pruneExpired(finishNow);
-    if (state.ambiguityEpoch !== this.#ambiguityEpoch) {
+    if (state.mutationEpoch !== this.#mutationEpoch) {
       return Object.freeze({
+        fullRelayBody: body,
         relayBody: body,
         decision: "miss",
         match: null,
         inputDigest,
         settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
+        scopeDigest: state.scopeDigest,
+      });
+    }
+    if (
+      state.longest &&
+      this.#buckets.get(state.longest.key) !== state.longest.bucket
+    ) {
+      return Object.freeze({
+        fullRelayBody: body,
+        relayBody: body,
+        decision: "miss",
+        match: null,
+        inputDigest,
+        settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
         scopeDigest: state.scopeDigest,
       });
     }
     if (!state.longest) {
       return Object.freeze({
+        fullRelayBody: body,
         relayBody: body,
         decision: "miss",
         match: null,
         inputDigest,
         settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
         scopeDigest: state.scopeDigest,
       });
     }
-    if (state.longest.ambiguous || !state.longest.entry) {
+    if (state.longest.bucket.kind === "ambiguous" || !state.longest.entry) {
       return Object.freeze({
+        fullRelayBody: body,
         relayBody: body,
         decision: "ambiguous",
         match: null,
         inputDigest,
         settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
         scopeDigest: state.scopeDigest,
       });
     }
@@ -853,25 +1657,31 @@ export class AnthropicContinuationIndex {
     const entry = state.longest.entry;
     if (this.#entries.get(entry.generation) !== entry) {
       return Object.freeze({
+        fullRelayBody: body,
         relayBody: body,
         decision: "miss",
         match: null,
         inputDigest,
         settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
         scopeDigest: state.scopeDigest,
       });
     }
     if (entry.itemCount >= body.input.length) {
       return Object.freeze({
+        fullRelayBody: body,
         relayBody: body,
         decision: "empty_suffix",
         match: null,
         inputDigest,
         settingsDigest: state.settingsDigest,
+        settingsCanonicalBytes: state.settingsCanonicalBytes,
+        settingsCanonicalNodes: state.settingsCanonicalNodes,
         scopeDigest: state.scopeDigest,
       });
     }
-    this.#touch(entry, finishNow);
+    this.#touch(entry);
     const match: AnthropicContinuationMatch = Object.freeze({
       generation: entry.generation,
       providerResponseId: entry.providerResponseId,
@@ -882,6 +1692,7 @@ export class AnthropicContinuationIndex {
       scopeDigest: entry.scopeDigest,
     });
     return Object.freeze({
+      fullRelayBody: body,
       relayBody: {
         ...body,
         store: true as const,
@@ -892,6 +1703,8 @@ export class AnthropicContinuationIndex {
       match,
       inputDigest,
       settingsDigest: state.settingsDigest,
+      settingsCanonicalBytes: state.settingsCanonicalBytes,
+      settingsCanonicalNodes: state.settingsCanonicalNodes,
       scopeDigest: state.scopeDigest,
     });
   }
@@ -905,11 +1718,29 @@ export class AnthropicContinuationIndex {
     return this.#lastNow;
   }
 
-  #markAmbiguity(): void {
-    if (this.#ambiguityEpoch >= Number.MAX_SAFE_INTEGER) {
-      throw new RangeError("continuation ambiguity epoch is exhausted");
+  #explicitPreparation(body: ResponsesRequestBody): PreparedAnthropicContinuation {
+    const inputDigest = Object.freeze({ ...initialInputDigest(this.#key) });
+    return Object.freeze({
+      fullRelayBody: body,
+      relayBody: body,
+      decision: "explicit",
+      match: null,
+      inputDigest,
+      // Explicit lineage never reaches commit. Content-free sentinels keep the
+      // common result shape without canonicalizing ignored history/settings.
+      settingsDigest: inputDigest.digest,
+      settingsCanonicalBytes: 0,
+      settingsCanonicalNodes: 0,
+      scopeDigest: inputDigest.digest,
+    });
+  }
+
+  #canonicalLimit(value: number | undefined, ceiling: number, name: string): number {
+    const resolved = value ?? ceiling;
+    if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > ceiling) {
+      throw new RangeError(`${name} must be a positive safe integer no greater than ${ceiling}`);
     }
-    this.#ambiguityEpoch += 1;
+    return resolved;
   }
 
   #allocateGeneration(): number {
@@ -921,8 +1752,14 @@ export class AnthropicContinuationIndex {
     return generation;
   }
 
-  #touch(entry: ContinuationEntry, now: number): void {
-    entry.lastUsedAt = now;
+  #markMutation(): void {
+    if (this.#mutationEpoch >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError("continuation mutation epoch is exhausted");
+    }
+    this.#mutationEpoch++;
+  }
+
+  #touch(entry: ContinuationEntry): void {
     this.#entries.delete(entry.generation);
     this.#entries.set(entry.generation, entry);
   }
@@ -948,8 +1785,8 @@ export class AnthropicContinuationIndex {
 
   #makeRoomForRecord(): boolean {
     while (
-      this.#recordCount() >= ANTHROPIC_CONTINUATION_MAX_ENTRIES ||
-      (this.#recordCount() + 1) * ANTHROPIC_CONTINUATION_ENTRY_METADATA_BYTES >
+      this.#recordCount() >= ANTHROPIC_CONTINUATION_MAX_RECORDS ||
+      (this.#recordCount() + 1) * ANTHROPIC_CONTINUATION_RECORD_METADATA_BYTES >
         ANTHROPIC_CONTINUATION_METADATA_BYTES
     ) {
       // Ambiguity tombstones cannot be evicted early: doing so could turn an
@@ -969,16 +1806,19 @@ export class AnthropicContinuationIndex {
       digest: entry.historyDigest,
       itemCount: entry.itemCount,
       canonicalBytes: entry.canonicalBytes,
+      canonicalNodes: entry.canonicalNodes,
     });
     const bucket = this.#buckets.get(key);
     if (bucket?.kind === "unique" && bucket.generation === entry.generation) {
       this.#buckets.delete(key);
+      this.#markMutation();
     }
   }
 
   #deleteAmbiguity(key: string, bucket: AmbiguousContinuationBucket): void {
     if (this.#buckets.get(key) !== bucket) return;
     this.#buckets.delete(key);
+    this.#markMutation();
     this.#ambiguityExpiry.delete(key);
   }
 }
