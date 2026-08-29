@@ -461,6 +461,9 @@ async function measuredPostJson(
   if (measured.transport.flightCompletions < 1) {
     throw new Error("Candidate transport did not record a completed request flight");
   }
+  if (measured.value.service_tier !== "priority") {
+    throw new Error("Candidate did not apply the required fast service tier");
+  }
   return Object.freeze({
     value: measured.value,
     clientBytes,
@@ -733,6 +736,27 @@ function measuredResponseSummary(measured: MeasuredResponse): Record<string, unk
     flightCompletions: measured.transport.flightCompletions,
     retransmittedBytes: measured.transport.retransmittedBytes,
     runtimesUsed: measured.transport.runtimesUsed,
+    serviceTier: measured.value.service_tier ?? null,
+  };
+}
+
+function anthropicUsageSummary(value: Record<string, unknown>): Record<string, unknown> {
+  const usage = value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)
+    ? value.usage as Record<string, unknown>
+    : {};
+  const count = (candidate: unknown): number =>
+    Number.isSafeInteger(candidate) && Number(candidate) >= 0 ? Number(candidate) : 0;
+  const uncached = count(usage.input_tokens);
+  const cacheRead = count(usage.cache_read_input_tokens);
+  const cacheWrite = count(usage.cache_creation_input_tokens);
+  const logical = uncached + cacheRead + cacheWrite;
+  return {
+    uncachedInputTokens: uncached,
+    cacheReadInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
+    logicalInputTokens: logical,
+    cacheReadPercent: logical === 0 ? 0 : rounded(cacheRead / logical * 100),
+    serviceTier: usage.service_tier ?? null,
   };
 }
 
@@ -915,6 +939,12 @@ async function verifyClaudeMeasured(
           `Current Anthropic route failed with HTTP ${response.status}: ${errorType}: ${message}`,
         );
       }
+      const usage = value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)
+        ? value.usage as Record<string, unknown>
+        : null;
+      if (usage?.service_tier !== "priority") {
+        throw new Error("Current Anthropic route did not apply the required fast service tier");
+      }
       return value;
     });
     if (measured.transport.flightCompletions < 1) {
@@ -998,6 +1028,7 @@ async function verifyClaudeMeasured(
     root: {
       ...measuredResponseSummary(first),
       relayJsonBytes: rootObservation.requestBytes,
+      usage: anthropicUsageSummary(first.value),
     },
     fullHistoryContinuation: {
       ...measuredResponseSummary(second),
@@ -1006,6 +1037,7 @@ async function verifyClaudeMeasured(
       clientToDataChannelReductionPercent: wireReduction,
       inputItems: continuationObservation.inputItems,
       hasPreviousResponse: continuationObservation.hasPreviousResponse,
+      usage: anthropicUsageSummary(second.value),
     },
     memoryRecall: "passed",
   };

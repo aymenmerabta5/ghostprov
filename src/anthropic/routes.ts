@@ -290,6 +290,36 @@ async function nonStreamingFinal(
   return winner.value;
 }
 
+/**
+ * Charges only preprocessing memory not already covered by the HTTP ingress
+ * lease. Production ingress reserves roughly two body copies plus scratch, so
+ * retaining the parsed Anthropic body and translated Responses body while the
+ * bounded digest scheduler runs must not be counted a second time. The queue's
+ * count limit remains authoritative even when the byte cost is fully covered.
+ *
+ * @internal Exported for deterministic capacity proofs.
+ */
+export function continuationPreparationCostBytes(
+  inboundBytes: number,
+  relayBytes: number,
+  reservedBytes = 0,
+): number {
+  for (const [name, value] of [
+    ["inboundBytes", inboundBytes],
+    ["relayBytes", relayBytes],
+    ["reservedBytes", reservedBytes],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+  }
+  const retainedBytes = inboundBytes + relayBytes;
+  if (!Number.isSafeInteger(retainedBytes)) {
+    throw new RangeError("continuation preparation bytes exceed the safe integer range");
+  }
+  return Math.max(1, retainedBytes - Math.min(retainedBytes, reservedBytes));
+}
+
 function continuationPreparationBytes(
   translated: ReturnType<typeof translateAnthropicRequest>,
   incomingLease: IncomingResourceLease | undefined,
@@ -298,7 +328,11 @@ function continuationPreparationBytes(
   const inbound = Number.isSafeInteger(leased) && Number(leased) >= 0
     ? Number(leased)
     : translated.inboundBytes;
-  return Math.min(Number.MAX_SAFE_INTEGER, inbound + translated.relayBytes);
+  const reserved = Number.isSafeInteger(incomingLease?.reservedBytes) &&
+      Number(incomingLease?.reservedBytes) >= 0
+    ? Number(incomingLease?.reservedBytes)
+    : 0;
+  return continuationPreparationCostBytes(inbound, translated.relayBytes, reserved);
 }
 
 async function prepareContinuation(

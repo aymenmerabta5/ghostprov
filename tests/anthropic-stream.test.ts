@@ -6,6 +6,8 @@ import {
   type AnthropicSseEvent,
 } from "../src/anthropic/stream";
 import { ApiError } from "../src/http/errors";
+import { decodeReasoningItem } from "../src/anthropic/reasoning";
+import type { AnthropicAdapterMessage } from "../src/anthropic/types";
 import {
   CONTEXT,
   context,
@@ -23,6 +25,67 @@ import {
 } from "./support/anthropic-stream";
 
 describe("Responses to Anthropic stream translation", () => {
+  it("keeps response.output_item.done reasoning authoritative when terminal encryption rotates", () => {
+    const completedReasoning = reasoning("rs_rotated", "careful plan", "done-ciphertext");
+    const terminal = finalResponse("resp_rotated", [
+      { ...completedReasoning, encrypted_content: "terminal-ciphertext" },
+      tool("fc_rotated", "call_rotated", "Read", '{"file_path":"a"}'),
+    ]);
+    const committedFinals: unknown[] = [];
+    const committedProjections: AnthropicAdapterMessage[] = [];
+    const translator = new AnthropicStreamTranslator(CONTEXT, {
+      beforeMessageStop(finalValue, projected) {
+        committedFinals.push(finalValue);
+        committedProjections.push(projected);
+      },
+    });
+    const events = collect(translator, [
+      frame("response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_rotated", summary: [] },
+      }),
+      frame("response.output_item.done", {
+        output_index: 0,
+        item: completedReasoning,
+      }),
+      frame("response.output_item.added", {
+        output_index: 1,
+        item: {
+          type: "function_call",
+          id: "fc_rotated",
+          status: "in_progress",
+          call_id: "call_rotated",
+          name: "Read",
+          arguments: "",
+        },
+      }),
+      frame("response.output_item.done", {
+        output_index: 1,
+        item: terminal.output[1],
+      }),
+      frame("response.completed", { response: terminal }),
+    ]);
+
+    expect(events.map(event => event.type)).not.toContain("error");
+    expect(events.at(-1)?.type).toBe("message_stop");
+    const signatureEvent = events.find(event =>
+      event.type === "content_block_delta" && event.delta.type === "signature_delta");
+    expect(signatureEvent?.type).toBe("content_block_delta");
+    if (signatureEvent?.type !== "content_block_delta" ||
+      signatureEvent.delta.type !== "signature_delta") {
+      throw new Error("missing reasoning signature");
+    }
+    expect(decodeReasoningItem(signatureEvent.delta.signature, "careful plan"))
+      .toMatchObject({ encrypted_content: "done-ciphertext" });
+    expect(committedProjections[0]?.content[0]).toMatchObject({
+      type: "thinking",
+      signature: signatureEvent.delta.signature,
+    });
+    expect((committedFinals[0] as { output: Array<{ encrypted_content?: string }> }).output[0]
+      ?.encrypted_content).toBe("done-ciphertext");
+    expect(terminal.output[0]?.encrypted_content).toBe("terminal-ciphertext");
+  });
+
   it("emits canonical ordered thinking, text, and interleaved parallel tool blocks", () => {
     const final = finalResponse("resp_stream", [
       reasoning("rs_1", "considering"),

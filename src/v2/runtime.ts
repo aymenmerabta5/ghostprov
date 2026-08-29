@@ -43,6 +43,7 @@ import {
 import { DecayingRuntimeCompletionEstimate } from "./runtime-completion";
 import type { AtomicBytePermitPool } from "./memory/atomic-byte-permits";
 import { isRateLimited, rateLimitHintFromError } from "./rate-limit";
+import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 
 function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
   // Successful Responses calls commonly carry budget headers. Those headers
@@ -495,7 +496,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const startedAt = this.#clock.now();
     let handle: RunHandle;
     try {
-      handle = await this.#transport.run(body, signal, options);
+      handle = await this.#transport.run(
+        applyUpstreamServiceTierPolicy(body),
+        signal,
+        options,
+      );
     } catch (error) {
       this.#runtimeHealth.record(classifyRuntimeError(error));
       this.#deferAmbiguityHealthDuringRelaunch(error);

@@ -173,6 +173,7 @@ class FakeTransport implements V2RuntimeTransport {
     reject: (error: unknown) => void;
   }> = [];
   hostCeilings: number[] = [];
+  readonly bodies: Record<string, unknown>[] = [];
   rotations = 0;
   awarenessResumes = 0;
   drains = 0;
@@ -214,10 +215,11 @@ class FakeTransport implements V2RuntimeTransport {
     this.snapshotValue.connected = true;
   }
   async run(
-    _body?: Record<string, unknown>,
+    body: Record<string, unknown> = {},
     _signal?: AbortSignal,
     options?: SandboxRunOptions,
   ): Promise<RunHandle> {
+    this.bodies.push(body);
     this.snapshotValue.active++;
     this.snapshotValue.committed++;
     options?.onAdmissionReflected?.();
@@ -670,6 +672,7 @@ describe("V2SandboxRuntime", () => {
     expect(reflected).toBe(1);
     expect(progress).toBe(1);
     expect(executionRisks).toBe(1);
+    expect(harness.transport.bodies[0]).toMatchObject({ service_tier: "fast" });
     harness.transport.pending.shift()?.resolve({ id: "resp_handoff", status: "completed" });
     await handle.final;
     await harness.runtime.stop();

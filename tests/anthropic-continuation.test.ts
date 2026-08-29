@@ -480,6 +480,33 @@ describe("Anthropic persisted continuation index", () => {
 });
 
 describe("Anthropic lossless replay projection", () => {
+  it("projects omitted reasoning summaries through their authoritative encrypted item", () => {
+    const final = finalResponse("resp_omitted_summary", [
+      {
+        ...reasoningOutput("rs_omitted_summary", "hidden summary", "ciphertext"),
+        summary: [{ type: "summary_text", text: "hidden summary" }],
+      },
+      toolOutput("fc_after_reasoning", "call_after_reasoning", "Read", "{}"),
+    ]);
+    const projected = responseToAnthropic(final, context({ thinkingDisplay: "omitted" }));
+
+    expect(projected.content[0]).toMatchObject({ type: "thinking", thinking: "" });
+    expect(projectAnthropicReplay(final, projected)).toEqual([
+      {
+        type: "reasoning",
+        id: "rs_omitted_summary",
+        encrypted_content: "ciphertext",
+        summary: [],
+      },
+      {
+        type: "function_call",
+        call_id: "call_after_reasoning",
+        name: "Read",
+        arguments: "{}",
+      },
+    ]);
+  });
+
   it("round-trips ordered text, encrypted reasoning, and completed tool calls", () => {
     const final = finalResponse("resp_projection", [
       messageOutput("msg_1", [textPart("first"), textPart(" second")]),

@@ -28,6 +28,7 @@ import { sanitizeDiagnosticMessage } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
 import { normalizeUpstreamResponsesRequest } from "../relay/upstream-policy";
+import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 import {
   releaseAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
@@ -396,17 +397,6 @@ interface IncomingRequestTracker {
   controller: AbortController;
 }
 
-function usesImageGeneration(body: Record<string, unknown>): boolean {
-  if (typeof body.model === "string" && body.model.startsWith("gpt-image-")) return true;
-  if (!Array.isArray(body.tools)) return false;
-  return body.tools.some(tool => (
-    tool !== null &&
-    typeof tool === "object" &&
-    !Array.isArray(tool) &&
-    (tool as Record<string, unknown>).type === "image_generation"
-  ));
-}
-
 export interface MultiSandboxRouterSnapshot {
   capacity: number;
   active: number;
@@ -727,17 +717,7 @@ export class MultiSandboxRouter {
     // callers normalize defensively too, while copy-on-write keeps client-facing
     // stream semantics and caller-owned request objects unchanged.
     const normalizedBody = normalizeUpstreamResponsesRequest(body);
-    const imageGeneration = usesImageGeneration(normalizedBody);
-    const injectFastTier = normalizedBody.service_tier === undefined && !imageGeneration;
-    let relayBody: Record<string, unknown>;
-    if (imageGeneration && "service_tier" in normalizedBody) {
-      const { service_tier: _unsupportedImageTier, ...withoutImageTier } = normalizedBody;
-      relayBody = withoutImageTier;
-    } else {
-      relayBody = injectFastTier
-        ? { ...normalizedBody, service_tier: "fast" }
-        : normalizedBody;
-    }
+    const relayBody: Record<string, unknown> = applyUpstreamServiceTierPolicy(normalizedBody);
     const hasPreviousResponse = Object.hasOwn(relayBody, "previous_response_id") &&
       relayBody.previous_response_id !== undefined &&
       relayBody.previous_response_id !== null;

@@ -303,6 +303,23 @@ describe("Anthropic stream reasoning privacy", () => {
     ]))).toMatchObject([{ type: "error", error: { type: "api_error" } }]);
   });
 
+  it("still rejects same-length reasoning summary changes across completed and terminal items", () => {
+    const completed = reasoningParts("rs_changed_summary", ["same"]);
+    const terminal = finalResponse([
+      reasoningParts("rs_changed_summary", ["else"]),
+    ]);
+    const translator = new AnthropicStreamTranslator(CONTEXT);
+    const events = [...translator.start()];
+    events.push(...translator.push(frame(0, "response.output_item.done", {
+      output_index: 0,
+      item: completed,
+    })));
+    events.push(...translator.push(frame(1, "response.completed", { response: terminal })));
+
+    expect(events.at(-1)).toMatchObject({ type: "error", error: { type: "api_error" } });
+    expect(events.some(event => event.type === "message_stop")).toBe(false);
+  });
+
   it("rejects invalid reasoning-summary surrogates before thinking emission", () => {
     const low = new AnthropicStreamTranslator(CONTEXT);
     low.start();

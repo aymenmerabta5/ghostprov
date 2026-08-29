@@ -280,7 +280,9 @@ export function resolveMultiSandboxConfig(
     );
   }
   const v2DiagnosticsEnabled = binaryFlag(env.GP_V2_DIAGNOSTICS, "GP_V2_DIAGNOSTICS");
-  const v2BatchingEnabled = binaryFlag(env.GP_V2_BATCHING, "GP_V2_BATCHING");
+  const v2BatchingEnabled = env.GP_V2_BATCHING === undefined
+    ? true
+    : binaryFlag(env.GP_V2_BATCHING, "GP_V2_BATCHING");
   const v2SidecarRevision = resolveV2SidecarRevision(
     env.GP_V2_SIDECAR_REVISION?.trim() || DEFAULT_V2_SIDECAR_REVISION,
   );

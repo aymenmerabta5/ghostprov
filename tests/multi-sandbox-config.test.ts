@@ -103,7 +103,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2SidecarMemoryBudgetBytes).toBe(512 * 1024 * 1024);
     expect(config.v2DiagnosticsEnabled).toBe(false);
     expect(config.v2DiagnosticsIntervalMs).toBe(1_000);
-    expect(config.v2BatchingEnabled).toBe(false);
+    expect(config.v2BatchingEnabled).toBe(true);
     expect(config.v2SidecarRevision).toBe(DEFAULT_V2_SIDECAR_REVISION);
     expect(config.v2SidecarProjectRevisions).toEqual({});
     expect(config.desiredSandboxes).toBe(1);
@@ -163,7 +163,7 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow(/unsupported.*R1/i);
   });
 
-  it("parses bounded opt-in V2 diagnostics", () => {
+  it("parses bounded V2 diagnostics and the explicit batching rollback", () => {
     const config = resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
@@ -175,6 +175,11 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2DiagnosticsEnabled).toBe(true);
     expect(config.v2DiagnosticsIntervalMs).toBe(500);
     expect(config.v2BatchingEnabled).toBe(true);
+    expect(resolveMultiSandboxConfig({
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_BATCHING: "0",
+    }, MACHINE).v2BatchingEnabled).toBe(false);
     expect(() => resolveMultiSandboxConfig({
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,

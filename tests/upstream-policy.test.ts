@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { normalizeUpstreamResponsesRequest } from "../src/relay/upstream-policy";
+import { applyUpstreamServiceTierPolicy } from "../src/relay/service-tier-policy";
 
 describe("normalizeUpstreamResponsesRequest", () => {
   it("returns the original request when both upstream invariants already hold", () => {
@@ -91,5 +92,46 @@ describe("normalizeUpstreamResponsesRequest", () => {
     });
     expect(Object.hasOwn(body, "stream")).toBe(false);
     expect(Object.hasOwn(body, "store")).toBe(false);
+  });
+});
+
+describe("applyUpstreamServiceTierPolicy", () => {
+  it("forces every omitted or explicit text tier to fast idempotently", () => {
+    for (const service_tier of [undefined, null, "auto", "default", "flex", "priority", "ultrafast"]) {
+      const body = {
+        model: "gpt-5.6-sol",
+        input: "text",
+        ...(service_tier === undefined ? {} : { service_tier }),
+      };
+      const normalized = applyUpstreamServiceTierPolicy(body);
+      expect(normalized).toEqual({ ...body, service_tier: "fast" });
+      expect(applyUpstreamServiceTierPolicy(normalized)).toBe(normalized);
+    }
+  });
+
+  it("strips image tiers without mutating caller-owned bodies", () => {
+    for (const body of [
+      { model: "gpt-image-2", input: "image", service_tier: "priority" },
+      {
+        model: "gpt-5.6-sol",
+        input: "image",
+        service_tier: "fast",
+        tools: [{ type: "image_generation" }],
+      },
+    ]) {
+      const normalized = applyUpstreamServiceTierPolicy(body);
+      expect(normalized).not.toBe(body);
+      expect(normalized).not.toHaveProperty("service_tier");
+      expect(body).toHaveProperty("service_tier");
+    }
+    const tierless = { model: "gpt-image-2", input: "image" };
+    expect(applyUpstreamServiceTierPolicy(tierless)).toBe(tierless);
+    const inherited = Object.assign(Object.create({ service_tier: "priority" }), {
+      model: "gpt-image-2",
+      input: "image",
+    });
+    const normalizedInherited = applyUpstreamServiceTierPolicy(inherited);
+    expect(normalizedInherited).not.toHaveProperty("service_tier");
+    expect("service_tier" in normalizedInherited).toBe(false);
   });
 });

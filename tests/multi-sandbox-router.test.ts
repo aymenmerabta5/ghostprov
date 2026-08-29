@@ -1441,6 +1441,10 @@ describe("MultiSandboxRouter", () => {
     await flush(200);
     expect(system.router.snapshot()).toMatchObject({ active: 120, queued: 1, capacity: 120 });
     expect(system.runtimes.map(runtime => runtime.active)).toEqual([30, 30, 30, 30]);
+    expect(system.runtimes.flatMap(runtime => runtime.bodies))
+      .toHaveLength(120);
+    expect(system.runtimes.flatMap(runtime => runtime.bodies)
+      .every(body => body.service_tier === "fast")).toBe(true);
 
     const firstHandle = await jobs[0];
     system.runtimes.forEach(runtime => runtime.completeOne());
@@ -1541,7 +1545,7 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("defaults non-image work to fast, preserves explicit text tiers, and strips image tiers", async () => {
+  it("forces every non-image tier to fast and strips every image tier", async () => {
     const system = createSystem(1, 1);
     const implicit = await system.router.startRelay({
       model: "gpt-5.6-sol",
@@ -1551,21 +1555,29 @@ describe("MultiSandboxRouter", () => {
     system.runtimes[0].completeOne();
     await implicit.final;
 
-    const explicit = await system.router.startRelay({
-      model: "gpt-5.6-sol",
-      input: "explicit",
-      service_tier: "priority",
-    });
-    expect(system.runtimes[0].bodies[1]).toMatchObject({ service_tier: "priority" });
-    system.runtimes[0].completeOne();
-    await explicit.final;
+    for (const [index, service_tier] of [
+      "auto",
+      "default",
+      "flex",
+      "priority",
+      "ultrafast",
+    ].entries()) {
+      const explicit = await system.router.startRelay({
+        model: "gpt-5.6-sol",
+        input: `explicit-${service_tier}`,
+        service_tier,
+      });
+      expect(system.runtimes[0].bodies[index + 1]).toMatchObject({ service_tier: "fast" });
+      system.runtimes[0].completeOne();
+      await explicit.final;
+    }
 
     const implicitImage = await system.router.startRelay({
       model: "gpt-5.6-sol",
       input: "implicit image tier",
       tools: [{ type: "image_generation", model: "gpt-image-2", quality: "medium" }],
     });
-    expect(system.runtimes[0].bodies[2]).not.toHaveProperty("service_tier");
+    expect(system.runtimes[0].bodies[6]).not.toHaveProperty("service_tier");
     system.runtimes[0].completeOne();
     await implicitImage.final;
 
@@ -1575,7 +1587,7 @@ describe("MultiSandboxRouter", () => {
       service_tier: "priority",
       tools: [{ type: "image_generation", model: "gpt-image-2", quality: "medium" }],
     });
-    expect(system.runtimes[0].bodies[3]).not.toHaveProperty("service_tier");
+    expect(system.runtimes[0].bodies[7]).not.toHaveProperty("service_tier");
     system.runtimes[0].completeOne();
     await explicitImage.final;
   });

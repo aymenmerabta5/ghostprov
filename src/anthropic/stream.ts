@@ -1,6 +1,7 @@
 import type { SseFrame } from "../relay/sse";
 import { normalizeApiError } from "../http/errors";
 import { createHash } from "node:crypto";
+import { decodeReasoningItem } from "./reasoning";
 import {
   AnthropicRequestError,
   anthropicErrorEvent,
@@ -12,7 +13,12 @@ import {
 } from "./request-validation";
 import { responseToAnthropic, type AnthropicResponseContext } from "./response";
 import { responseStopSequences } from "./response-stop";
-import { invalidUpstream, record } from "./response-validation";
+import {
+  invalidUpstream,
+  record,
+  validateTerminalOutputItemProjection,
+  validateTerminalResponseProjection,
+} from "./response-validation";
 import { usageFromResponses } from "./response-usage";
 import {
   createStreamBlock,
@@ -57,6 +63,7 @@ const FAILED_EVENT_MESSAGE = "Responses stream failed.";
 type ReasoningSummaryStreamState = {
   seenUnits: number;
   scalar: UnicodeStopFilter<StreamBlock>;
+  completedDigest: string | null;
 };
 
 function malformedEvent(): never {
@@ -78,6 +85,20 @@ function outputItemId(item: Record<string, unknown>): string | null {
   return typeof item.id === "string" && item.id.length > 0 ? item.id : null;
 }
 
+function sameReasoningSummary(left: readonly unknown[], right: readonly unknown[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const leftPart = record(left[index]);
+    const rightPart = record(right[index]);
+    if (!leftPart || !rightPart || leftPart.type !== "summary_text" ||
+      rightPart.type !== "summary_text" || typeof leftPart.text !== "string" ||
+      typeof rightPart.text !== "string" || leftPart.text !== rightPart.text) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export type AnthropicStreamTranslatorOptions = {
   /** Runs after terminal reconciliation and immediately before message_stop. */
   beforeMessageStop?(
@@ -90,8 +111,10 @@ export type AnthropicStreamTranslatorOptions = {
  * Pure, pull-safe Responses-frame translator.
  *
  * The retained state is bounded to block metadata, pending data for a block that
- * is waiting behind an earlier block, counters, and at most the longest stop
- * sequence minus one character of ordinary text. It never retains prior frames.
+ * is waiting behind an earlier block, completed reasoning signatures awaiting
+ * terminal reconciliation (within maxReasoningBytes), counters, and at most the
+ * longest stop sequence minus one character of ordinary text. It never retains
+ * prior frames.
  */
 export class AnthropicStreamTranslator {
   readonly #context: AnthropicResponseContext;
@@ -416,7 +439,7 @@ export class AnthropicStreamTranslator {
     this.#endOrdinarySegment(events);
     if (this.#matchedStop) return;
     const block = this.#block("thinking", itemId, outputIndex, null);
-    this.#reconcileReasoningSummary(block, summaryIndex, text, false);
+    this.#reconcileReasoningSummary(block, summaryIndex, text, false, true);
     this.#drain(events);
   }
 
@@ -445,7 +468,7 @@ export class AnthropicStreamTranslator {
         summaryParts.push(part.text);
       }
       const summary = summaryParts.join("");
-      this.#reconcileReasoningSummaries(block, summaryParts, true);
+      this.#reconcileReasoningSummaries(block, summaryParts, true, true);
       this.#assertStreamedPrefix(
         block,
         this.#context.thinkingDisplay === "omitted" ? "" : summary,
@@ -514,9 +537,10 @@ export class AnthropicStreamTranslator {
 
   #complete(finalValue: unknown): AnthropicSseEvent[] {
     this.#protocol.validateFinal(finalValue);
-    const converted = responseToAnthropic(finalValue, this.#context);
+    const projectionFinal = this.#projectionFinal(finalValue);
+    const converted = responseToAnthropic(projectionFinal, this.#context);
     const descriptors = finalStreamDescriptors(
-      finalValue,
+      projectionFinal,
       converted,
       this.#context.maxTokensZero,
     );
@@ -559,6 +583,7 @@ export class AnthropicStreamTranslator {
           block,
           descriptor.reasoningSummary ?? [],
           true,
+          false,
         );
         assertUnicodeWellFormed(thinking.thinking);
         if (thinking.thinking.length > block.seenUnits) {
@@ -650,7 +675,7 @@ export class AnthropicStreamTranslator {
     });
     if (this.#beforeMessageStop) {
       try {
-        this.#beforeMessageStop(finalValue, converted);
+        this.#beforeMessageStop(projectionFinal, converted);
       } catch {
         // Continuation metadata is advisory and must never alter public SSE.
       }
@@ -660,6 +685,69 @@ export class AnthropicStreamTranslator {
     this.#terminal = true;
     this.#clearRetainedState();
     return events;
+  }
+
+  /**
+   * OpenAI designates the completed reasoning item from
+   * response.output_item.done as the streaming continuation authority. The
+   * terminal response may carry an independently encrypted representation of
+   * the same item. Reconcile only that opaque field, copy-on-write, after the
+   * item ID and exact completed summary have been proven equal.
+   */
+  #projectionFinal(finalValue: unknown): unknown {
+    const terminal = validateTerminalResponseProjection(finalValue);
+    let output: unknown[] | null = null;
+    for (let outputIndex = 0; outputIndex < terminal.output.length; outputIndex += 1) {
+      const item = validateTerminalOutputItemProjection(
+        terminal.output[outputIndex],
+        terminal.status,
+      );
+      if (item.type !== "reasoning") continue;
+      const block = this.#blocksByPosition.get(`thinking:${outputIndex}:-`);
+      if (!block?.signature) continue;
+
+      this.#assertCompletedReasoningSummaries(
+        block,
+        item.summary.map(part => part.text),
+      );
+      const summaryText = item.summary.map(part => part.text).join("");
+      const completed = decodeReasoningItem(block.signature, summaryText);
+      if (!completed || completed.id !== item.id ||
+        !sameReasoningSummary(completed.summary, item.summary)) {
+        throw invalidUpstream(
+          "Responses stream could not be reconciled with its final response.",
+        );
+      }
+      if (completed.encrypted_content === item.encrypted_content) continue;
+      output ??= [...terminal.output];
+      output[outputIndex] = {
+        ...item,
+        encrypted_content: completed.encrypted_content,
+      };
+    }
+    return output === null ? finalValue : { ...terminal.record, output };
+  }
+
+  #assertCompletedReasoningSummaries(
+    block: StreamBlock,
+    texts: readonly string[],
+  ): void {
+    const summaries = this.#reasoningSummaries.get(block);
+    if (!summaries) return;
+    for (const [summaryIndex, summary] of summaries) {
+      if (summaryIndex >= texts.length) {
+        throw invalidUpstream(
+          "Responses stream could not be reconciled with its final response.",
+        );
+      }
+      if (summary.completedDigest === null) continue;
+      const digest = createHash("sha256").update(texts[summaryIndex]!, "utf8").digest("hex");
+      if (summary.completedDigest !== digest) {
+        throw invalidUpstream(
+          "Responses stream could not be reconciled with its final response.",
+        );
+      }
+    }
   }
 
   #clearRetainedState(): void {
@@ -833,6 +921,7 @@ export class AnthropicStreamTranslator {
       summary = {
         seenUnits: 0,
         scalar: new UnicodeStopFilter<StreamBlock>([]),
+        completedDigest: null,
       };
       summaries.set(summaryIndex, summary);
     }
@@ -858,6 +947,7 @@ export class AnthropicStreamTranslator {
     summaryIndex: number,
     text: string,
     countSuffix: boolean,
+    markCompleted: boolean,
   ): void {
     const summary = this.#reasoningSummary(block, summaryIndex);
     if (text.length < summary.seenUnits) malformedEvent();
@@ -870,12 +960,20 @@ export class AnthropicStreamTranslator {
     if (this.#context.thinkingDisplay !== "omitted") {
       for (const chunk of chunks) this.#appendPending(chunk.owner, chunk.text);
     }
+    const digest = createHash("sha256").update(text, "utf8").digest("hex");
+    if (summary.completedDigest !== null && summary.completedDigest !== digest) {
+      throw invalidUpstream(
+        "Responses stream could not be reconciled with its final response.",
+      );
+    }
+    if (markCompleted) summary.completedDigest = digest;
   }
 
   #reconcileReasoningSummaries(
     block: StreamBlock,
     texts: readonly string[],
     countSuffix: boolean,
+    markCompleted: boolean,
   ): void {
     const summaries = this.#reasoningSummaries.get(block);
     if (summaries && Array.from(summaries.keys()).some(index => index >= texts.length)) {
@@ -884,7 +982,13 @@ export class AnthropicStreamTranslator {
     let aggregateUnits = 0;
     for (let summaryIndex = 0; summaryIndex < texts.length; summaryIndex += 1) {
       const text = texts[summaryIndex];
-      this.#reconcileReasoningSummary(block, summaryIndex, text, countSuffix);
+      this.#reconcileReasoningSummary(
+        block,
+        summaryIndex,
+        text,
+        countSuffix,
+        markCompleted,
+      );
       aggregateUnits = this.#addUnits(aggregateUnits, text.length);
     }
     if (block.seenUnits !== aggregateUnits) malformedEvent();
@@ -973,7 +1077,6 @@ export class AnthropicStreamTranslator {
           delta: { type: "signature_delta", signature },
         });
         block.signatureEmitted = true;
-        block.signature = null;
       }
 
       const hasBufferedText = block.kind === "text" && this.#textFilter.hasPending(block);
