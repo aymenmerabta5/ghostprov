@@ -4,6 +4,7 @@ import type { RunHandle } from "../src/relay/run-handle";
 import type { LoggerLike } from "../src/observability/logger";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { traceRunHandle } from "../src/observability/traced-run-handle";
+import { assertSafeObservabilityEvent } from "../src/observability/redaction";
 import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 
@@ -169,6 +170,110 @@ describe("traceRunHandle", () => {
       quarantined: true,
       error_kind: "sidecar_unreachable",
     });
+  });
+
+  it("retains a validated prelude request ID for a generic stream failure", async () => {
+    const logger = new MemoryLogger();
+    const original = new V2RunHandle({
+      maxBufferedBytes: 4_096,
+      expectUpstreamPrelude: true,
+    });
+    const traced = traceRunHandle(original, {
+      logger,
+      clock: new FakeClock(),
+      traceId: "trace-stream-correlation",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+
+    original.acceptUpstreamPrelude({
+      status: 200,
+      contentType: "text/event-stream",
+      upstreamRequestId: "req_generic_stream_failure",
+    });
+    original.fail(new V2CommittedError(
+      "Upstream event stream failed after request start",
+      "stream",
+      true,
+    ));
+
+    await expect(traced.final).rejects.toThrow("Upstream event stream failed");
+    expect(logger.events).toHaveLength(1);
+    expect(logger.events[0]).toMatchObject({
+      event: "request.failed",
+      error_kind: "stream",
+      upstream_request_id: "req_generic_stream_failure",
+      committed: true,
+      quarantined: true,
+    });
+    expect(logger.events[0]).not.toHaveProperty("provider_origin");
+  });
+
+  it("ignores a malformed prelude without creating an unhandled rejection", async () => {
+    const logger = new MemoryLogger();
+    const final = Promise.reject(Object.assign(new Error("stream failed"), {
+      kind: "stream",
+    }));
+    void final.catch(() => undefined);
+    const traced = traceRunHandle({
+      async *events() {},
+      upstreamPrelude: Promise.resolve(null as any),
+      final,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }, {
+      logger,
+      clock: new FakeClock(),
+      traceId: "trace-malformed-prelude",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+
+    await expect(traced.final).rejects.toThrow("stream failed");
+    await Bun.sleep(0);
+    expect(logger.events[0]).not.toHaveProperty("upstream_request_id");
+  });
+
+  it("omits a credential-shaped prelude ID without dropping the failure", async () => {
+    const logger = new MemoryLogger();
+    const final = deferred<any>();
+    const traced = traceRunHandle({
+      async *events() {},
+      upstreamPrelude: Promise.resolve({
+        status: 200,
+        contentType: "text/event-stream",
+        upstreamRequestId: "sk-not-a-safe-request-identifier",
+      }),
+      final: final.promise,
+      stats: { bytes: 0, firstByteMs: null, frames: 0 },
+    }, {
+      logger,
+      clock: new FakeClock(),
+      traceId: "trace-private-prelude",
+      projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90,
+      queueWaitMs: 1,
+      commitAckMs: 2,
+      committedAtMs: 99,
+      retryCount: 0,
+      slowRequestMs: 1_000,
+    });
+    await Bun.sleep(0);
+    final.reject(Object.assign(new Error("stream failed"), { kind: "stream" }));
+
+    await expect(traced.final).rejects.toThrow("stream failed");
+    expect(logger.events).toHaveLength(1);
+    expect(logger.events[0]).not.toHaveProperty("upstream_request_id");
+    expect(() => assertSafeObservabilityEvent(logger.events[0]!)).not.toThrow();
   });
 
   it("attributes a committed provider failure without logging its payload", async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  V2_RESEARCH_MODEL_REVISION,
   V2_RESEARCH_SCENARIOS,
   compareV2ResearchSnapshots,
   main,
@@ -46,6 +47,7 @@ function result(
 function snapshot(value: V2ResearchScenarioResult): V2ResearchSnapshot {
   return {
     schemaVersion: 1,
+    modelRevision: V2_RESEARCH_MODEL_REVISION,
     suite: "ghostprov-v2-performance-research",
     commit: "a".repeat(40),
     transportProfile: "bulk-v1",
@@ -114,6 +116,10 @@ describe("V2 continuous performance research", () => {
 
   it("rejects missing, added, or silently changed scenarios and invalid CLI input", async () => {
     const baseline = snapshot(result());
+    expect(() => compareV2ResearchSnapshots(
+      { ...baseline, modelRevision: "legacy-wall-clock" },
+      baseline,
+    )).toThrow("Incompatible V2 research model revision");
     expect(compareV2ResearchSnapshots(baseline, { ...baseline, results: [] }).decision)
       .toBe("reject");
     expect(compareV2ResearchSnapshots({ ...baseline, results: [] }, baseline).decision)

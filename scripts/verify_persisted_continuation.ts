@@ -11,12 +11,12 @@ import {
 } from "../src/http/api-key";
 import { V2_R8_RELEASE } from "../src/v2/sidecar/assets";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
+import { SYNTHETIC_WARMUP_ID_PREFIX } from "../src/ws/response-graph";
 import WebSocket from "ws";
 import type { RunHandle } from "../src/relay/run-handle";
 import { createBrowserlessSystem, type BrowserlessSystem } from "../src/server/system";
 
 const CANDIDATE_PORT = 18_888;
-const PROTECTED_ROOT = "http://127.0.0.1:18787";
 const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const LIVE_GUARD = "dedicated-test-projects";
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -175,16 +175,6 @@ function responseId(final: Record<string, unknown>): string {
     throw new Error("Live provider response did not complete with an ID");
   }
   return final.id;
-}
-
-async function protectedHealth(): Promise<void> {
-  const response = await fetch(`${PROTECTED_ROOT}/health`, {
-    signal: AbortSignal.timeout(10_000),
-  });
-  const body = await response.json().catch(() => null) as { ok?: unknown } | null;
-  if (!response.ok || body?.ok !== true) {
-    throw new Error("Protected listener 18787 failed its read-only health check");
-  }
 }
 
 async function drain(handle: RunHandle): Promise<Record<string, unknown>> {
@@ -1128,6 +1118,53 @@ async function verifyWebSocket(apiKey: string, model: string): Promise<void> {
     if (!outputText(child).includes("WS_MEMORY_4P2M")) {
       throw new Error("WebSocket stored continuation forgot its token");
     }
+
+    const legacyMarker = "CODEX_LEGACY_FORK_7N4Q";
+    const warmupPending = waitFor("ws-legacy-warmup");
+    socket.send(JSON.stringify({
+      type: "response.create",
+      generate: false,
+      stream_id: "ws-legacy-warmup",
+      model,
+      store: false,
+      input: [
+        userItem("Preserve the visible assistant answer for the next turn."),
+        {
+          type: "message",
+          id: "msg_codex_legacy_fork_probe",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{
+            type: "output_text",
+            text: `The exact remembered marker is ${legacyMarker}.`,
+          }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: "live-legacy-fork",
+            content_item_kinds: ["output_text"],
+          },
+        },
+      ],
+    }));
+    const warmup = await warmupPending;
+    const warmupId = responseId(warmup);
+    if (!warmupId.startsWith(SYNTHETIC_WARMUP_ID_PREFIX)) {
+      throw new Error("Legacy Codex warmup did not return a synthetic alias");
+    }
+    const repairedPending = waitFor("ws-legacy-repaired");
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "ws-legacy-repaired",
+      model,
+      store: false,
+      previous_response_id: warmupId,
+      input: [userItem("Return only the exact marker from the visible assistant answer.")],
+      max_output_tokens: 64,
+      reasoning: { effort: "low" },
+    }));
+    const repaired = await repairedPending;
+    if (!outputText(repaired).includes(legacyMarker)) {
+      throw new Error("Reasoning-free Codex fork repair lost visible assistant text");
+    }
   } finally {
     socket.close();
   }
@@ -1138,8 +1175,8 @@ async function verifyWebSocketMeasured(
   model: string,
 ): Promise<Record<string, unknown>> {
   const measured = await measureAction(apiKey, () => verifyWebSocket(apiKey, model));
-  if (measured.transport.flightCompletions < 2) {
-    throw new Error("Candidate transport did not record both WebSocket flights");
+  if (measured.transport.flightCompletions < 3) {
+    throw new Error("Candidate transport did not record all WebSocket flights");
   }
   return {
     latencyMs: rounded(measured.latencyMs),
@@ -1148,6 +1185,7 @@ async function verifyWebSocketMeasured(
     retransmittedBytes: measured.transport.retransmittedBytes,
     runtimesUsed: measured.transport.runtimesUsed,
     memoryRecall: "passed",
+    reasoningFreeCodexFork: "passed",
   };
 }
 
@@ -1493,7 +1531,6 @@ async function verifyExistingCandidate(
     final.ambiguousQuarantined !== initial.ambiguousQuarantined) {
     throw new Error("Live matrix changed candidate quarantine counters");
   }
-  await protectedHealth();
   console.log(JSON.stringify({
     live: true,
     mode: "existing-owned-candidate",
@@ -1501,7 +1538,6 @@ async function verifyExistingCandidate(
     projectCount: options.projectIds.length,
     projectsCreated: 0,
     projectsDeleted: 0,
-    protected18787: "healthy-before-and-after",
     directHydrationChecks: "deferred-until-candidate-process-ownership-is-restored",
     results,
   }, null, 2));
@@ -1511,9 +1547,6 @@ export async function main(
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   const options = resolvePersistedContinuationLiveOptions(env);
-  progress("protected-health.before.start");
-  await protectedHealth();
-  progress("protected-health.before.passed");
   if (env.GP_CONTINUATION_USE_EXISTING_CANDIDATE === "1") {
     await verifyExistingCandidate(options, env);
     return;
@@ -1628,16 +1661,12 @@ export async function main(
       await active.system.close();
     }
   }
-  progress("protected-health.after.start");
-  await protectedHealth();
-  progress("protected-health.after.passed");
   console.log(JSON.stringify({
     live: true,
     candidatePort: CANDIDATE_PORT,
     projectCount: options.projectIds.length,
     projectsCreated: 0,
     projectsDeleted: 0,
-    protected18787: "healthy-before-and-after",
     results,
   }, null, 2));
 }

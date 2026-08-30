@@ -264,6 +264,54 @@ describe("DirectResponsesClient", () => {
     });
   });
 
+  it("keeps the validated prelude identity when a stream later fails ambiguously", async () => {
+    const encoder = new TextEncoder();
+    const first = encoder.encode(
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_partial"}}\n\n',
+    );
+    let pull = 0;
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("api-secret"),
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pull++ === 0) controller.enqueue(first);
+          else controller.error(new Error("socket reset api-secret"));
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "x-request-id": "req_partial_stream",
+        },
+      }),
+    });
+    const events: SseFrame[] = [];
+    const upstreamRequestIds: Array<string | null> = [];
+
+    try {
+      await client.execute({
+        body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"x"}'),
+        beforeFetch: async () => {},
+        onPrelude: async prelude => {
+          upstreamRequestIds.push(prelude.upstreamRequestId);
+        },
+        onEvent: async event => { events.push(event); },
+      });
+      throw new Error("expected stream failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamExecutionError);
+      expect(error).toMatchObject({
+        message: "Upstream event stream failed after request start",
+        ambiguous: true,
+        code: "stream",
+      });
+      expect(String(error)).not.toContain("api-secret");
+    }
+    expect(upstreamRequestIds).toEqual(["req_partial_stream"]);
+    expect(events).toHaveLength(1);
+  });
+
   it("converts a streamed error event into a definitive rate-limit failure", async () => {
     const events: SseFrame[] = [];
     const client = new DirectResponsesClient({

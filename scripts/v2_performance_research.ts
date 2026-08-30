@@ -8,6 +8,7 @@ import {
 const KiB = 1024;
 const MiB = KiB ** 2;
 const DEFAULT_BASELINE = path.resolve("benchmarks/v2-performance-baseline.json");
+export const V2_RESEARCH_MODEL_REVISION = "virtual-publication-timer-v1" as const;
 
 export type ResearchRequestClass = "tiny" | "medium" | "large";
 
@@ -48,6 +49,7 @@ export interface V2ResearchScenarioResult {
 
 export interface V2ResearchSnapshot {
   schemaVersion: 1;
+  modelRevision: string;
   suite: "ghostprov-v2-performance-research";
   commit: string;
   transportProfile: "bulk-v1";
@@ -238,6 +240,12 @@ export function compareV2ResearchSnapshots(
   if (baseline.schemaVersion !== 1 || candidate.schemaVersion !== 1) {
     throw new Error("Unsupported V2 research snapshot schema");
   }
+  if (
+    baseline.modelRevision !== V2_RESEARCH_MODEL_REVISION ||
+    candidate.modelRevision !== V2_RESEARCH_MODEL_REVISION
+  ) {
+    throw new Error("Incompatible V2 research model revision");
+  }
   const candidateById = new Map(candidate.results.map(result => [result.scenario.id, result]));
   const improvements: string[] = [];
   const regressions: string[] = [];
@@ -385,6 +393,7 @@ export async function runV2ResearchSnapshot(options: {
   }
   return Object.freeze({
     schemaVersion: 1,
+    modelRevision: V2_RESEARCH_MODEL_REVISION,
     suite: "ghostprov-v2-performance-research",
     commit: await currentCommit(),
     transportProfile: "bulk-v1",

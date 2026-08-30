@@ -96,6 +96,37 @@ describe("native Responses full-history continuation", () => {
     });
   });
 
+  it("matches a complete reasoning and message output sequence without reordering", async () => {
+    const index = new ResponsesHttpContinuationIndex({ key: KEY });
+    const controller = new AbortController();
+    const root = user("root");
+    const prepared = await index.prepare(body([root]), SCOPE, controller.signal, 1_024);
+    const reasoning = {
+      type: "reasoning",
+      id: "rs_complete",
+      encrypted_content: "opaque",
+      summary: [],
+    };
+    const message = assistant("complete");
+    expect(await index.commit(
+      prepared?.token ?? null,
+      SCOPE,
+      final("resp_reasoned", [reasoning, message]),
+    )).toBeTrue();
+
+    const next = body([root, reasoning, message, user("next")]);
+    const continued = await index.prepare(next, SCOPE, controller.signal, 2_048);
+    expect(continued?.token).toMatchObject({
+      decision: "hit",
+      match: { providerResponseId: "resp_reasoned", prefixItemCount: 3 },
+    });
+    expect(continued?.relayBody).toEqual({
+      ...next,
+      input: [user("next")],
+      previous_response_id: "resp_reasoned",
+    });
+  });
+
   it("never replaces an explicit caller continuation field", async () => {
     const index = new ResponsesHttpContinuationIndex({ key: KEY });
     const controller = new AbortController();

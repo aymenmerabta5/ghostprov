@@ -321,6 +321,289 @@ describe("ResponseGraph synthetic warmup aliases", () => {
     expect(shared.used).toBe(0);
   });
 
+  it("projects an orphan Codex output message into ordinary assistant history", () => {
+    const shared = new SharedByteBudget(1024 * 1024);
+    const graph = new ResponseGraph({ sharedBudget: shared });
+    const root = alias("legacy-user");
+    const assistant = alias("legacy-assistant");
+    const orphan = {
+      type: "message",
+      id: "msg_legacy_without_reasoning",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "preserve this answer" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "client-only",
+        content_item_kinds: ["unknown"],
+      },
+    };
+    const nullPhase = {
+      ...orphan,
+      id: "msg_legacy_null_phase",
+      phase: null,
+      content: [{ type: "output_text", text: "preserve explicit null" }],
+    };
+
+    recordWarmup(graph, root, request([user("legacy question")], {
+      generate: false,
+    }));
+    recordWarmup(graph, assistant, request([orphan, nullPhase], {
+      generate: false,
+      previous_response_id: root,
+    }));
+
+    const resolved = resolveGraph(graph, request([user("continue safely")], {
+      previous_response_id: assistant,
+    }));
+
+    expect(resolved.relayBody.input).toEqual([
+      user("legacy question"),
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "preserve this answer" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: null,
+        content: [{ type: "output_text", text: "preserve explicit null" }],
+      },
+      user("continue safely"),
+    ]);
+    expect(orphan).toEqual({
+      type: "message",
+      id: "msg_legacy_without_reasoning",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "preserve this answer" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "client-only",
+        content_item_kinds: ["unknown"],
+      },
+    });
+    releaseResponseGraphResolution(resolved);
+    expect(shared.used).toBe(graph.stats().bytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
+  it("preserves exact reasoning/output replay and unsafe orphan shapes", () => {
+    const graph = new ResponseGraph();
+    const exact = alias("exact-reasoning");
+    const reasoning = {
+      type: "reasoning",
+      id: "rs_exact",
+      encrypted_content: "opaque",
+      summary: [],
+    };
+    const message = {
+      type: "message",
+      id: "msg_exact",
+      role: "assistant",
+      phase: "final_answer",
+      status: "completed",
+      content: [{ type: "output_text", text: "exact", annotations: [], logprobs: [] }],
+    };
+    recordWarmup(graph, exact, request([reasoning, message], {
+      generate: false,
+    }));
+    const exactResolved = resolveGraph(graph, request("next", {
+      previous_response_id: exact,
+    }));
+    expect(exactResolved.relayBody.input).toEqual([
+      reasoning,
+      message,
+      user("next"),
+    ]);
+    releaseResponseGraphResolution(exactResolved);
+
+    const unsafe = alias("unsafe-orphan");
+    const annotated = {
+      type: "message",
+      id: "msg_annotated",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{
+        type: "output_text",
+        text: "keep exact",
+        annotations: [{ type: "citation" }],
+      }],
+    };
+    const otherwiseProjectable = {
+      type: "message",
+      id: "msg_safe_sibling",
+      role: "assistant",
+      phase: null,
+      content: [{ type: "output_text", text: "do not partially project" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "safe-sibling",
+        content_item_kinds: ["unknown"],
+      },
+    };
+    recordWarmup(graph, unsafe, request([otherwiseProjectable, annotated], {
+      generate: false,
+    }));
+    const unsafeResolved = resolveGraph(graph, request("next", {
+      previous_response_id: unsafe,
+    }));
+    expect(unsafeResolved.relayBody.input).toEqual([
+      otherwiseProjectable,
+      annotated,
+      user("next"),
+    ]);
+    releaseResponseGraphResolution(unsafeResolved);
+
+    const providerShapedUser = {
+      ...user("provider-shaped user"),
+      id: "msg_user_identity",
+    };
+    const mixedRole = alias("mixed-role-output");
+    recordWarmup(graph, mixedRole, request([
+      otherwiseProjectable,
+      providerShapedUser,
+    ], { generate: false }));
+    const mixedRoleResolved = resolveGraph(graph, request("next", {
+      previous_response_id: mixedRole,
+    }));
+    expect(mixedRoleResolved.relayBody.input).toEqual([
+      otherwiseProjectable,
+      providerShapedUser,
+      user("next"),
+    ]);
+    releaseResponseGraphResolution(mixedRoleResolved);
+
+    const malformedSibling = {
+      ...otherwiseProjectable,
+      id: "msg_!",
+    };
+    const nonStringIdentity = {
+      ...otherwiseProjectable,
+      id: null,
+    };
+    const malformedIdentity = alias("malformed-output-identity");
+    recordWarmup(graph, malformedIdentity, request([
+      otherwiseProjectable,
+      malformedSibling,
+      nonStringIdentity,
+    ], { generate: false }));
+    const malformedResolved = resolveGraph(graph, request("next", {
+      previous_response_id: malformedIdentity,
+    }));
+    expect(malformedResolved.relayBody.input).toEqual([
+      otherwiseProjectable,
+      malformedSibling,
+      nonStringIdentity,
+      user("next"),
+    ]);
+    releaseResponseGraphResolution(malformedResolved);
+
+    const providerBacked = alias("provider-backed-output");
+    const providerMessage = {
+      type: "message",
+      id: "msg_provider_backed",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "provider-backed" }],
+    };
+    recordWarmup(graph, providerBacked, request([providerMessage], {
+      generate: false,
+      previous_response_id: "resp_provider_ancestor",
+    }));
+    const providerResolved = resolveGraph(graph, request("next", {
+      previous_response_id: providerBacked,
+    }));
+    expect(providerResolved.relayBody).toMatchObject({
+      previous_response_id: "resp_provider_ancestor",
+      input: [providerMessage, user("next")],
+    });
+    releaseResponseGraphResolution(providerResolved);
+
+    const currentDelta = {
+      type: "message",
+      id: "msg_current_delta",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "current delta" }],
+    };
+    const root = alias("current-delta-root");
+    recordWarmup(graph, root, request([user("root")], { generate: false }));
+    const currentResolved = resolveGraph(graph, request([currentDelta], {
+      previous_response_id: root,
+    }));
+    expect(currentResolved.relayBody.input).toEqual([user("root"), currentDelta]);
+    releaseResponseGraphResolution(currentResolved);
+
+    const genericOutput = alias("generic-output");
+    const validProviderMessage = {
+      type: "message",
+      id: "msg_valid_provider_output",
+      role: "assistant",
+      phase: "final_answer",
+      status: "completed",
+      content: [{ type: "output_text", text: "keep provider identity" }],
+    };
+    recordWarmup(graph, genericOutput, request([validProviderMessage], {
+      generate: false,
+    }));
+    const genericResolved = resolveGraph(graph, request("next", {
+      previous_response_id: genericOutput,
+    }));
+    expect(genericResolved.relayBody.input).toEqual([
+      validProviderMessage,
+      user("next"),
+    ]);
+    releaseResponseGraphResolution(genericResolved);
+
+    const invalidMetadata = alias("invalid-metadata");
+    recordWarmup(graph, invalidMetadata, request([{
+      type: "message",
+      id: "msg_invalid_metadata",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "valid text" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "\ud800",
+        content_item_kinds: ["unknown"],
+      },
+    }], { generate: false }));
+    expect(() => resolveGraph(graph, request("next", {
+      previous_response_id: invalidMetadata,
+    }))).toThrow("valid Unicode");
+    graph.clear();
+  });
+
+  it("releases every projection reservation when legacy recovery exceeds capacity", () => {
+    const measure = new ResponseGraph();
+    const measuredAlias = alias("measure-projection");
+    const orphan = {
+      type: "message",
+      id: "msg_capacity",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "bounded" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "bounded",
+        content_item_kinds: ["unknown"],
+      },
+    };
+    recordWarmup(measure, measuredAlias, request([orphan], { generate: false }));
+    const retainedBytes = measure.stats().bytes;
+    measure.clear();
+
+    const shared = new SharedByteBudget(retainedBytes + 1_500);
+    const graph = new ResponseGraph({ sharedBudget: shared });
+    const id = alias("bounded-projection");
+    recordWarmup(graph, id, request([orphan], { generate: false }));
+    expect(() => resolveGraph(graph, request("next", {
+      previous_response_id: id,
+    }))).toThrow("legacy warmup projection exceeds shared capacity");
+    expect(shared.used).toBe(graph.stats().bytes);
+    graph.clear();
+    expect(shared.used).toBe(0);
+  });
+
   it.each([undefined, false, true])(
     "caches generate:false warmup independent of client store %p",
     store => {

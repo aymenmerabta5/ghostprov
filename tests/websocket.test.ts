@@ -1006,6 +1006,90 @@ describe("Responses WebSocket server", () => {
     expect(graph.stats().nodes).toBe(2);
   });
 
+  it("recovers a reasoning-free Codex fork as a new stored text lineage", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const socket = await startServer(async body => {
+      bodies.push(body);
+      return relayHandle(Promise.resolve(completed(
+        bodies.length === 1 ? "resp_legacy_recovered" : "resp_legacy_next",
+      )));
+    });
+    const messages = collect(socket);
+    const userItem = (text: string) => ({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    });
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      generate: false,
+      stream_id: "legacy-fork",
+      model: "gpt-5.6-sol",
+      input: [
+        userItem("legacy question"),
+        {
+          type: "message",
+          id: "msg_orphaned_by_codex_fork",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "legacy answer" }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: "local-only",
+            content_item_kinds: ["unknown"],
+          },
+        },
+      ],
+    }));
+    await waitFor(() => messages.some(message =>
+      message.response?.id?.startsWith(SYNTHETIC_WARMUP_ID_PREFIX)));
+    const alias = messages.find(message =>
+      message.response?.id?.startsWith(SYNTHETIC_WARMUP_ID_PREFIX)).response.id;
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "legacy-fork",
+      model: "gpt-5.6-sol",
+      previous_response_id: alias,
+      input: [userItem("continue")],
+    }));
+    await waitFor(() => messages.some(message =>
+      message.response?.id === "resp_legacy_recovered"));
+
+    expect(bodies[0]).toMatchObject({
+      store: true,
+      stream: true,
+      input: [
+        userItem("legacy question"),
+        {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "legacy answer" }],
+        },
+        userItem("continue"),
+      ],
+    });
+    expect(bodies[0]).not.toHaveProperty("previous_response_id");
+    expect(JSON.stringify(bodies[0])).not.toContain("msg_orphaned_by_codex_fork");
+
+    socket.send(JSON.stringify({
+      type: "response.create",
+      stream_id: "legacy-fork",
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_legacy_recovered",
+      input: "small delta",
+    }));
+    await waitFor(() => messages.some(message =>
+      message.response?.id === "resp_legacy_next"));
+    expect(bodies[1]).toMatchObject({
+      store: true,
+      stream: true,
+      previous_response_id: "resp_legacy_recovered",
+      input: "small delta",
+    });
+  });
+
   it("withholds a provider terminal before allowing cross-lane persisted forks", async () => {
     const parent = completed("resp_terminal_barrier");
     const parentFinal = deferred<any>();

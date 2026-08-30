@@ -618,7 +618,11 @@ describe("V2 browserless system composition", () => {
       controller.signal,
     );
     const starting = system.start();
-    for (let attempt = 0; attempt < 100 && !reconciliationSignal; attempt++) await Bun.sleep(0);
+    const reconciliationDeadline = Date.now() + 2_000;
+    while (!reconciliationSignal && Date.now() < reconciliationDeadline) {
+      await Bun.sleep(5);
+    }
+    expect(reconciliationSignal).toBeDefined();
     controller.abort(new DOMException("cancel fleet reconciliation", "AbortError"));
     await expect(starting).rejects.toMatchObject({ name: "AbortError" });
     expect(reconciliationSignal?.aborted).toBe(true);

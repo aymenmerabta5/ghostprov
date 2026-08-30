@@ -3,6 +3,7 @@ import {
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
 } from "../http/api-key";
+import { validateResponsesInputJson } from "../relay/responses-validation";
 
 export interface ResponseCreateEvent {
   type: "response.create";
@@ -29,6 +30,7 @@ export interface ResolvedRelayRequest {
 }
 
 interface MaterializationReservation {
+  reserveAdditional(bytes: number): boolean;
   release(): void;
 }
 
@@ -189,6 +191,174 @@ function normalizeMaterializedInput(input: unknown): readonly unknown[] {
     }];
   }
   return [input];
+}
+
+const PROVIDER_MESSAGE_ID = /^msg_[A-Za-z0-9_-]{1,507}$/;
+const LEGACY_MESSAGE_PROJECTION_BYTES = 512;
+const LEGACY_TEXT_PART_PROJECTION_BYTES = 256;
+const LEGACY_MESSAGE_KEYS = new Set([
+  "type",
+  "id",
+  "role",
+  "phase",
+  "status",
+  "content",
+  "internal_chat_message_metadata_passthrough",
+]);
+const LEGACY_TEXT_PART_KEYS = new Set([
+  "type",
+  "text",
+  "annotations",
+  "logprobs",
+]);
+const LEGACY_CODEX_METADATA_KEYS = new Set([
+  "turn_id",
+  "content_item_kinds",
+]);
+
+function jsonRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+): boolean {
+  for (const key in value) {
+    if (Object.hasOwn(value, key) && !allowed.has(key)) return false;
+  }
+  return true;
+}
+
+function validLegacyCodexMetadata(value: unknown): boolean {
+  if (value === undefined) return true;
+  const metadata = jsonRecord(value);
+  if (!metadata || !hasOnlyKeys(metadata, LEGACY_CODEX_METADATA_KEYS)) return false;
+  if (Object.hasOwn(metadata, "turn_id") &&
+    (typeof metadata.turn_id !== "string" || metadata.turn_id.length > 256)) return false;
+  if (Object.hasOwn(metadata, "content_item_kinds")) {
+    if (!Array.isArray(metadata.content_item_kinds) ||
+      metadata.content_item_kinds.length > 16) return false;
+    for (const kind of metadata.content_item_kinds) {
+      if (typeof kind !== "string" || kind.length < 1 || kind.length > 64 ||
+        !/^[A-Za-z0-9_.:-]+$/.test(kind)) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Codex can fork an edited or legacy task with provider-shaped assistant
+ * messages while omitting every paired reasoning item. Replaying those msg_*
+ * identities is invalid, but the Responses API also supports ordinary
+ * assistant input messages. This recognizes only the lossless visible-text
+ * subset that can be projected without inventing reasoning or tool state.
+ */
+function legacyAssistantProjectionPartCount(value: unknown): number | null {
+  const message = jsonRecord(value);
+  if (!message || !hasOnlyKeys(message, LEGACY_MESSAGE_KEYS) ||
+    message.type !== "message" || message.role !== "assistant" ||
+    typeof message.id !== "string" || !PROVIDER_MESSAGE_ID.test(message.id) ||
+    (Object.hasOwn(message, "status") && message.status !== "completed") ||
+    (Object.hasOwn(message, "phase") &&
+      message.phase !== null && message.phase !== "commentary" &&
+      message.phase !== "final_answer") ||
+    !Object.hasOwn(message, "internal_chat_message_metadata_passthrough") ||
+    !validLegacyCodexMetadata(message.internal_chat_message_metadata_passthrough) ||
+    !Array.isArray(message.content) || message.content.length === 0) return null;
+  for (const value of message.content) {
+    const part = jsonRecord(value);
+    if (!part || !hasOnlyKeys(part, LEGACY_TEXT_PART_KEYS) ||
+      part.type !== "output_text" || typeof part.text !== "string" ||
+      (Object.hasOwn(part, "annotations") &&
+        (!Array.isArray(part.annotations) || part.annotations.length !== 0)) ||
+      (Object.hasOwn(part, "logprobs") &&
+        (!Array.isArray(part.logprobs) || part.logprobs.length !== 0))) return null;
+  }
+  return message.content.length;
+}
+
+function legacyAssistantProjection(value: unknown): Readonly<Record<string, unknown>> {
+  const message = value as Record<string, unknown>;
+  const content = Object.freeze((message.content as Array<Record<string, unknown>>)
+    .map(part => Object.freeze({ type: "output_text", text: part.text })));
+  return Object.freeze({
+    type: "message",
+    role: "assistant",
+    content,
+    ...(Object.hasOwn(message, "phase") ? { phase: message.phase } : {}),
+  });
+}
+
+function projectLegacyWarmupMessages(
+  input: unknown[],
+  warmupItemCount: number,
+  reservation: MaterializationReservation,
+): void {
+  // Exact reasoning/output replay remains authoritative whenever the client
+  // retained even one reasoning item. The compatibility projection is only
+  // for a fully reasoning-free legacy fork.
+  for (let index = 0; index < warmupItemCount; index++) {
+    if (jsonRecord(input[index])?.type === "reasoning") return;
+  }
+
+  let projectionBytes = 0;
+  let projections = 0;
+  for (let index = 0; index < warmupItemCount; index++) {
+    const value = input[index];
+    const partCount = legacyAssistantProjectionPartCount(value);
+    if (partCount === null) {
+      const item = jsonRecord(value);
+      const providerShapedAssistant = item?.type === "message" &&
+        item.role === "assistant" && (
+          Object.hasOwn(item, "id") || Object.hasOwn(item, "status") ||
+          Object.hasOwn(item, "internal_chat_message_metadata_passthrough") ||
+          (Array.isArray(item.content) && item.content.some(part => (
+            jsonRecord(part)?.type === "output_text"
+          )))
+        );
+      // Never partially rewrite a provider-output sequence. An unsupported
+      // output identity leaves the complete warmup prefix exact so the caller
+      // receives the provider's definitive validation instead.
+      if (
+        item && (
+          providerShapedAssistant ||
+          (item.type !== "message" && Object.hasOwn(item, "id")) ||
+          (
+            typeof item.id === "string" && item.id.startsWith("msg_")
+          )
+        )
+      ) return;
+      continue;
+    }
+    projectionBytes = checkedAdd(
+      projectionBytes,
+      checkedAdd(
+        LEGACY_MESSAGE_PROJECTION_BYTES,
+        checkedMultiply(partCount, LEGACY_TEXT_PART_PROJECTION_BYTES),
+      ),
+    );
+    projections++;
+  }
+  if (projections === 0) return;
+  // Validate the original retained representation before dropping provider-
+  // only identity/metadata so projection cannot hide invalid Unicode, nested
+  // function JSON, or structural-limit violations from the normal preflight.
+  validateResponsesInputJson({ input });
+  if (!reservation.reserveAdditional(projectionBytes)) {
+    throw new ResponseGraphCapacityError(
+      "WebSocket legacy warmup projection exceeds shared capacity",
+    );
+  }
+  for (let index = 0; index < warmupItemCount; index++) {
+    if (legacyAssistantProjectionPartCount(input[index]) !== null) {
+      input[index] = legacyAssistantProjection(input[index]);
+    }
+  }
 }
 
 const RETAINED_ARRAY_HEADER_BYTES = 64;
@@ -510,6 +680,7 @@ export class ResponseGraph {
     let materializedLocally = false;
     let materialization: {
       lineage: WarmupAliasNode[];
+      lineageItemCount: number;
       providerAncestorId?: string;
       inheritedModel?: string;
       reservation: MaterializationReservation;
@@ -527,9 +698,15 @@ export class ResponseGraph {
           authorizationScope,
         );
         const inputDelta = normalizeMaterializedInput(event.input);
-        relayBody.input = Object.freeze(
-          this.materialize(materialization.lineage, inputDelta),
-        );
+        const materializedInput = this.materialize(materialization.lineage, inputDelta);
+        if (materialization.providerAncestorId === undefined) {
+          projectLegacyWarmupMessages(
+            materializedInput,
+            materialization.lineageItemCount,
+            materialization.reservation,
+          );
+        }
+        relayBody.input = Object.freeze(materializedInput);
         if (materialization.providerAncestorId !== undefined) {
           relayBody.previous_response_id = materialization.providerAncestorId;
         } else {
@@ -691,6 +868,7 @@ export class ResponseGraph {
     authorizationScope: AuthenticatedTenantScope,
   ): {
     lineage: WarmupAliasNode[];
+    lineageItemCount: number;
     providerAncestorId?: string;
     inheritedModel?: string;
     reservation: MaterializationReservation;
@@ -740,12 +918,21 @@ export class ResponseGraph {
         (this.activeMaterializations.get(entry.id) ?? 0) + 1,
       );
     }
+    let reservedBytes = materializationBytes;
     let released = false;
     const reservation: MaterializationReservation = {
+      reserveAdditional: (bytes: number) => {
+        if (released || !Number.isSafeInteger(bytes) || bytes < 0) return false;
+        if (bytes === 0) return true;
+        const nextReservedBytes = checkedAdd(reservedBytes, bytes);
+        if (!this.sharedBudget.reserve(bytes)) return false;
+        reservedBytes = nextReservedBytes;
+        return true;
+      },
       release: () => {
         if (released) return;
         released = true;
-        this.sharedBudget.release(materializationBytes);
+        this.sharedBudget.release(reservedBytes);
         for (const entry of lineage) {
           const remaining = (this.activeMaterializations.get(entry.id) ?? 1) - 1;
           if (remaining <= 0) {
@@ -766,6 +953,7 @@ export class ResponseGraph {
     };
     return {
       lineage,
+      lineageItemCount: lineageItems,
       providerAncestorId,
       inheritedModel,
       reservation,

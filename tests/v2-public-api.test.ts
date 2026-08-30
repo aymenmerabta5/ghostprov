@@ -6,6 +6,7 @@ import { parseFrames } from "../src/relay/sse";
 import { createGhostProvApp } from "../src/server/app";
 import { createGhostProvServer } from "../src/server/runtime";
 import { createAuthenticatedTenantScope } from "../src/http/api-key";
+import { DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES } from "../src/ws/server";
 import { createFakeV2System } from "./support/fake-v2-system";
 
 const API_KEY = "test-ghostprov-key-0123456789abcdef";
@@ -251,6 +252,86 @@ describe("V2 public API compatibility", () => {
       await value.close();
     }
   });
+
+  it("bootstraps an oversized request over HTTP then continues by ID", async () => {
+    const value = await harness();
+    let client: Awaited<ReturnType<typeof openSocket>> | null = null;
+    try {
+      const oversizedInput = "x".repeat(DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES + 1_024);
+      const tool = {
+        type: "function",
+        name: "bootstrap_complete",
+        parameters: { type: "object", properties: {} },
+      };
+      const bootstrapBody = JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: oversizedInput,
+        stream: false,
+        store: false,
+        tools: [tool],
+        tool_choice: { type: "function", name: tool.name },
+      });
+      expect(Buffer.byteLength(bootstrapBody))
+        .toBeGreaterThan(DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES);
+      expect(Buffer.byteLength(bootstrapBody)).toBeLessThan(64 * 1024 ** 2);
+      const bootstrap = await fetch(`${value.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: AUTHORIZATION,
+        },
+        body: bootstrapBody,
+      });
+      const first = await bootstrap.json() as any;
+      expect(bootstrap.status).toBe(200);
+      expect(typeof first.id).toBe("string");
+      expect(first.status).toBe("completed");
+      const firstResponseId = first.id as string;
+      const call = first.output.find((item: any) => item.type === "function_call");
+      expect(typeof call?.call_id).toBe("string");
+      expect(value.upstream.receivedBodies[0]).toMatchObject({
+        input: oversizedInput,
+        stream: true,
+        store: true,
+      });
+
+      client = await openSocket(value.baseUrl);
+      const continuationFrame = JSON.stringify({
+        type: "response.create",
+        stream_id: "http-bootstrap",
+        model: "gpt-5.6-sol",
+        previous_response_id: firstResponseId,
+        input: [{
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: "small delta",
+        }],
+        tools: [tool],
+        tool_choice: "auto",
+      });
+      expect(Buffer.byteLength(continuationFrame))
+        .toBeLessThan(DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES);
+      client.socket.send(continuationFrame);
+      await client.next(message => (
+        message.stream_id === "http-bootstrap" && message.type === "response.completed"
+      ));
+      expect(value.upstream.receivedBodies[1]).toMatchObject({
+        input: [{
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: "small delta",
+        }],
+        previous_response_id: firstResponseId,
+        stream: true,
+        store: true,
+      });
+      expect(value.upstream.receivedBodies).toHaveLength(2);
+      expect(value.upstream.calls).toBe(2);
+    } finally {
+      client?.socket.close();
+      await value.close();
+    }
+  }, 100_000);
 
   it("routes an Anthropic message through the real app, router, and V2 transport", async () => {
     const value = await harness();

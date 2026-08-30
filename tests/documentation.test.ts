@@ -25,6 +25,11 @@ const historicalPolicyMarker = "Historical and superseded continuation policy (2
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const liveMultiSandbox = fs.readFileSync(path.join(root, "scripts", "live_multi_sandbox.ts"), "utf8");
 const liveVerify = fs.readFileSync(path.join(root, "scripts", "live_verify.ts"), "utf8");
+const persistedContinuationVerifier = fs.readFileSync(path.join(
+  root,
+  "scripts",
+  "verify_persisted_continuation.ts",
+), "utf8");
 const anthropicDesign = fs.readFileSync(path.join(
   root,
   "docs",
@@ -298,11 +303,15 @@ describe("project documentation", () => {
     expect(readme).toContain(
       "persisted-continuation verifier is the only live verification command",
     );
+    expect(readme).toContain("never contacts the protected listener on `18787`");
+    expect(persistedContinuationVerifier).not.toContain("18787");
     expect(readme).not.toContain("the only live command authorized");
     expect(readme).toContain("refuses protected port `18787`");
     expect(readme).not.toContain("port 8787 health");
     expect(readme).not.toContain("service on 8787");
     expect(readme).toContain("single-token value of at least 12 characters");
+    expect(readme).toContain("fully reasoning-free legacy warmup");
+    expect(readme).toContain("starts a new stored text lineage");
     expect(envExample).toContain("GP_V2_DIAGNOSTIC_ROOT=http://127.0.0.1:18888");
   });
 

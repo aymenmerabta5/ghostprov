@@ -18,11 +18,26 @@ export interface RunTraceContext {
   slowRequestMs: number;
 }
 
-function errorFields(error: unknown): Record<string, JsonValue> {
+const SAFE_PROVIDER_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+function observableProviderRequestId(value: unknown): string | null {
+  const safe = typeof value === "string" && SAFE_PROVIDER_REQUEST_ID.test(value)
+    ? value
+    : null;
+  return safe !== null && sanitizeDiagnosticMessage(safe) === safe ? safe : null;
+}
+
+function errorFields(
+  error: unknown,
+  preludeRequestId: string | null,
+): Record<string, JsonValue> {
   const value = error && typeof error === "object"
     ? error as Record<string, unknown>
     : {};
   const providerError = providerErrorEnvelopeFrom(error);
+  const upstreamRequestId = observableProviderRequestId(
+    providerError?.upstreamRequestId,
+  ) ?? preludeRequestId;
   return {
     error_name: error instanceof Error ? error.name : "Error",
     error_kind: typeof value.kind === "string"
@@ -38,10 +53,8 @@ function errorFields(error: unknown): Record<string, JsonValue> {
     ),
     ...(providerError ? {
       provider_origin: providerError.origin,
-      ...(providerError.upstreamRequestId
-        ? { upstream_request_id: providerError.upstreamRequestId }
-        : {}),
     } : {}),
+    ...(upstreamRequestId ? { upstream_request_id: upstreamRequestId } : {}),
   };
 }
 
@@ -51,6 +64,25 @@ export function traceRunHandle(
 ): RunHandle {
   let firstEventAtMs: number | null = null;
   let terminalLogged = false;
+  let preludeRequestId: string | null = null;
+  try {
+    const prelude = handle.upstreamPrelude;
+    if (prelude) {
+      void Promise.resolve(prelude).then(value => {
+        try {
+          preludeRequestId = observableProviderRequestId(
+            value && typeof value === "object"
+              ? (value as { upstreamRequestId?: unknown }).upstreamRequestId
+              : null,
+          );
+        } catch {
+          // A hostile accessor cannot escape an optional telemetry observer.
+        }
+      }, () => undefined).catch(() => undefined);
+    }
+  } catch {
+    // Correlation metadata is optional and cannot alter relay settlement.
+  }
   const final = handle.final.then(
     value => {
       if (!terminalLogged) {
@@ -82,7 +114,7 @@ export function traceRunHandle(
           project_id: context.projectId,
           total_ms: Math.max(0, context.clock.now() - context.acceptedAtMs),
           stage: "terminal",
-          ...errorFields(error),
+          ...errorFields(error, preludeRequestId),
           committed: true,
           quarantined: (error as any)?.ambiguous === true ||
             (error as any)?.kind === "ambiguous",

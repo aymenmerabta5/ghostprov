@@ -114,7 +114,9 @@ describe("GhostProv host supervisor", () => {
       upgrades: 1,
       forwardedTotal: expect.any(Number),
     });
-    await Bun.sleep(20);
+    // Closing joins the asynchronous diagnostic pumps; a fixed sleep can read
+    // the append-only history before a heavily loaded filesystem flushes it.
+    await supervisor.close();
     const persisted = JSON.parse(await readFile(statusFile, "utf8"));
     expect(persisted).toMatchObject({ schema: 1, generation: 3 });
     const history = await readFile(path.join(directory, "supervisor.jsonl"), "utf8");

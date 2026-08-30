@@ -325,3 +325,27 @@ production distribution and intermittently crossed the physical shared-link
 deadline. A large-first scheduler experiment was worse (7/14 timeouts) and was
 fully rolled back. The accepted scheduler remains the previously proven
 four-unit gate and tiny-request bypass; tests were not loosened or relabeled.
+
+## 2026-08-30 - deterministic publication-clock model - RECALIBRATE
+
+The performance baseline recorded at `f893b518` mixed real wall-clock
+publication timers with a virtual network clock. Commit `395a322` made the
+existing publication-pacer timer injectable in tests and moved harness
+publication deadlines onto the same virtual clock as link delivery. Production
+does not supply that test seam and its publication pacer is byte-identical, so
+this is a benchmark-model correction rather than a production transport change.
+
+A commit-by-commit check stayed within 0.003 ms of the old tiny p95 through
+`a8bbbef` and first moved at `395a322`. Factorial checks were decisive: either
+the old production session with the corrected harness, or the current session
+with the old harness, matched the old baseline; removing only the injected
+virtual timer also restored both affected scenarios within 0.001 ms. With the
+corrected model, the approximately 200 ms shift at 400 ms RTT is one virtual
+one-way delivery bucket. It came with no retransmission, no lost concurrency,
+and fewer tiny ACK rounds; the full modeled makespan was equal or better.
+
+The baseline is therefore re-recorded from clean commit `bf5d45f` and stamped
+with model revision `virtual-publication-timer-v1`. The tiny-p95, exactness,
+concurrency, retransmission, window, and wire thresholds remain unchanged.
+Future snapshots from a different or unstamped timing model fail as
+incompatible instead of being compared against unrelated numbers.
