@@ -1,5 +1,5 @@
 import type { Server } from "node:http";
-import { WebSocketServer, type RawData } from "ws";
+import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   ResponsesWebSocketSession,
   WebSocketProcessBudget,
@@ -9,6 +9,7 @@ import {
   type WebSocketRelayStarter,
 } from "./session";
 import type { ResponseGraph } from "./response-graph";
+import type { WebSocketCloseCause } from "./telemetry";
 import {
   apiKeyAuthorized,
   isAuthenticatedTenantScope,
@@ -102,6 +103,22 @@ export interface AttachResponsesWebSocketOptions extends Omit<
 }
 
 const attachedServers = new WeakMap<Server, readonly WebSocketServer[]>();
+// One weak entry per process-budget-bounded accepted socket; no peer metadata.
+const socketCloseCauses = new WeakMap<WebSocket, WebSocketCloseCause>();
+const socketCloseHandlers = new WeakMap<
+  WebSocket,
+  (cause: WebSocketCloseCause) => void
+>();
+
+function firstSocketCloseCause(
+  socket: WebSocket,
+  cause: WebSocketCloseCause,
+): WebSocketCloseCause {
+  const existing = socketCloseCauses.get(socket);
+  if (existing) return existing;
+  socketCloseCauses.set(socket, cause);
+  return cause;
+}
 
 function rejectUpgradeAuthority(
   socket: { end(data: string): unknown },
@@ -205,7 +222,7 @@ export function attachResponsesWebSocket(
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
   const pendingLeases = new WeakMap<object, WebSocketProcessLease>();
   const acceptConnection = (
-    socket: import("ws").WebSocket,
+    socket: WebSocket,
     parserLimitBytes: number,
     baseReservationBytes: number,
     automaticPromotion: boolean,
@@ -213,6 +230,7 @@ export function attachResponsesWebSocket(
     const processLease = pendingLeases.get(socket);
     pendingLeases.delete(socket);
     if (!processLease) {
+      firstSocketCloseCause(socket, "ingress_capacity");
       socket.close(1013, "GhostProv WebSocket ingress capacity unavailable");
       return;
     }
@@ -231,6 +249,12 @@ export function attachResponsesWebSocket(
     } catch (error) {
       processLease.close();
       recordIngressBudget();
+      firstSocketCloseCause(
+        socket,
+        error instanceof WebSocketSessionCapacityError
+          ? "ingress_capacity"
+          : "socket_error",
+      );
       socket.close(
         error instanceof WebSocketSessionCapacityError ? 1013 : 1011,
         error instanceof WebSocketSessionCapacityError
@@ -241,37 +265,51 @@ export function attachResponsesWebSocket(
     }
     let cleaned = false;
     let pingSentAt: number | null = null;
-    const cleanup = () => {
+    const cleanup = (cause: WebSocketCloseCause = "remote_close") => {
       if (cleaned) return;
       cleaned = true;
+      const firstCause = firstSocketCloseCause(socket, cause);
+      socketCloseHandlers.delete(socket);
       processLease.releaseIngress();
       clearInterval(heartbeat);
-      session.close();
+      session.close(firstCause);
       recordIngressBudget();
     };
-    const terminate = () => {
-      cleanup();
+    const terminate = (cause: WebSocketCloseCause) => {
+      cleanup(cause);
       try { socket.terminate(); } catch {}
     };
     const heartbeat = setInterval(() => {
       if (cleaned) return;
       const now = Date.now();
-      if (session.isIdle() && now - lastApplicationActivityAt >= idleTimeoutMs) {
-        terminate();
+      const idleDueAt = session.isIdle()
+        ? lastApplicationActivityAt + idleTimeoutMs
+        : Number.POSITIVE_INFINITY;
+      const heartbeatDueAt = pingSentAt === null
+        ? Number.POSITIVE_INFINITY
+        : pingSentAt + pongTimeoutMs;
+      const idleExpired = now >= idleDueAt;
+      const heartbeatExpired = now >= heartbeatDueAt;
+      if (idleExpired || heartbeatExpired) {
+        terminate(
+          heartbeatExpired && (!idleExpired || heartbeatDueAt <= idleDueAt)
+            ? "heartbeat_timeout"
+            : "idle_timeout",
+        );
         return;
       }
       if (pingSentAt !== null) {
-        if (now - pingSentAt >= pongTimeoutMs) terminate();
         return;
       }
       try {
         socket.ping();
         pingSentAt = now;
       } catch {
-        terminate();
+        terminate("socket_error");
       }
     }, heartbeatIntervalMs);
     heartbeat.unref?.();
+    socketCloseHandlers.set(socket, cleanup);
     socket.on("pong", () => { pingSentAt = null; });
     const consumeMessage = (data: RawData, releaseIngress: boolean) => {
       try {
@@ -302,7 +340,7 @@ export function attachResponsesWebSocket(
       // cross-runtime check before decoding the message as text.
       if (bytes > parserLimitBytes) {
         recordParserRejection();
-        cleanup();
+        cleanup("protocol_error");
         socket.close(1009, "WebSocket message exceeds configured limit");
         return;
       }
@@ -325,18 +363,28 @@ export function attachResponsesWebSocket(
         return;
       }
       options.telemetry?.ingressRejected();
-      cleanup();
+      cleanup("ingress_capacity");
       socket.close(1013, "GhostProv WebSocket large-message ingress is unavailable");
     });
     socket.once("close", (code, reason) => {
-      if (code === 1009 || isWebSocketPayloadLimitError(reason)) {
+      // Bun's native 16 MiB ceiling reports only an internal abnormal 1006
+      // close with this ws-parser reason. Peers cannot put reserved code 1006
+      // on the wire; never trust their valid close codes (including 1009) or
+      // reason text as evidence of a local parser rejection.
+      if (!cleaned && code === 1006 && isWebSocketPayloadLimitError(reason)) {
         recordParserRejection();
+        cleanup("protocol_error");
+        return;
       }
       cleanup();
     });
     socket.once("error", error => {
-      if (isWebSocketPayloadLimitError(error)) recordParserRejection();
-      cleanup();
+      if (isWebSocketPayloadLimitError(error)) {
+        recordParserRejection();
+        cleanup("protocol_error");
+        return;
+      }
+      cleanup("socket_error");
     });
   };
   wss.on("connection", socket => acceptConnection(
@@ -507,7 +555,11 @@ export async function closeResponsesWebSockets(
     timer.unref?.();
     let remaining = servers.length;
     for (const wss of servers) {
-      for (const socket of wss.clients) socket.close(code, reason);
+      for (const socket of wss.clients) {
+        firstSocketCloseCause(socket, "server_shutdown");
+        socketCloseHandlers.get(socket)?.("server_shutdown");
+        socket.close(code, reason);
+      }
       wss.close(() => {
         remaining--;
         if (remaining === 0) finish();

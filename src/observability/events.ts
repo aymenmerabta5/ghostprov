@@ -58,6 +58,7 @@ export const SANDBOX_RECOVERY_OPERATIONS = [
   "bootstrap",
   "heartbeat",
   "sidecar_ping",
+  "sidecar_liveness",
   "credential_refresh",
   "account_revalidate",
   "replace",

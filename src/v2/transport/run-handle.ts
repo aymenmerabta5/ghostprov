@@ -170,6 +170,7 @@ export class V2RunHandle implements RunHandle {
     knownWireBytes?: number,
     transferredMemoryPermit?: AtomicBytePermit,
     terminalFinalizationAnchor?: object,
+    signal?: AbortSignal,
   ): Promise<void> {
     let createdFinalAnchor = false;
     let permitAttachedBeforeWait = false;
@@ -186,6 +187,9 @@ export class V2RunHandle implements RunHandle {
       const bytes = knownWireBytes ??
         utf8Bytes(sseFrame(frame.event, frame.data)).byteLength;
       this.#assertPermitCoverage(bytes, transferredMemoryPermit);
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("Event delivery was aborted", "AbortError");
+      }
       if (
         transferredMemoryPermit &&
         terminalFinalizationAnchor &&
@@ -228,12 +232,16 @@ export class V2RunHandle implements RunHandle {
       while (
         !this.#closed &&
         !this.#eventStreamClosed &&
+        !signal?.aborted &&
         (
           this.#bufferedEvents >= this.#maxBufferedEvents ||
           (this.#bufferedBytes > 0 && this.#bufferedBytes + bytes > this.#maxBufferedBytes)
         )
       ) {
-        await new Promise<void>(resolve => this.#spaceWaiters.add(resolve));
+        await this.#waitForSpace(signal);
+      }
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("Event delivery was aborted", "AbortError");
       }
       if (this.#closed || this.#eventStreamClosed) {
         throw this.#failure ?? new Error("V2 run handle event stream is closed");
@@ -443,6 +451,32 @@ export class V2RunHandle implements RunHandle {
   #wakeAll(): void {
     this.#wake(this.#eventWaiters);
     this.#wake(this.#spaceWaiters);
+  }
+
+  #waitForSpace(signal?: AbortSignal): Promise<void> {
+    if (!signal) {
+      return new Promise<void>(resolve => this.#spaceWaiters.add(resolve));
+    }
+    if (signal.aborted) return Promise.reject(
+      signal.reason ?? new DOMException("Event delivery was aborted", "AbortError"),
+    );
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        this.#spaceWaiters.delete(onSpace);
+        signal.removeEventListener("abort", onAbort);
+        error === undefined ? resolve() : reject(error);
+      };
+      const onSpace = () => finish();
+      const onAbort = () => finish(
+        signal.reason ?? new DOMException("Event delivery was aborted", "AbortError"),
+      );
+      this.#spaceWaiters.add(onSpace);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
   }
 
   #assertPermitCoverage(bytes: number, permit?: AtomicBytePermit): void {

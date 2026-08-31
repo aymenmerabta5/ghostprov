@@ -396,6 +396,7 @@ async function canonicalHostRequestBytes(
   let itemsSinceYield = 0;
   let canonicalKeyUnits = 0;
   let containsLargeInlineBase64 = false;
+  let inlineBase64Units = 0;
   const flush = (): void => {
     if (!buffered) return;
     const encoded = utf8Bytes(buffered);
@@ -545,9 +546,14 @@ async function canonicalHostRequestBytes(
       } else if (typeof candidate === "string") {
         if (
           !containsLargeInlineBase64 &&
-          candidate.length >= LARGE_INLINE_BASE64_BYTES &&
           /^data:[^;,]{1,127};base64,/i.test(candidate)
-        ) containsLargeInlineBase64 = true;
+        ) {
+          inlineBase64Units = Math.min(
+            LARGE_INLINE_BASE64_BYTES,
+            inlineBase64Units + candidate.length,
+          );
+          containsLargeInlineBase64 = inlineBase64Units >= LARGE_INLINE_BASE64_BYTES;
+        }
         const pendingString = appendJsonString(candidate);
         if (pendingString) await pendingString;
       } else if (typeof candidate === "boolean") {
@@ -1143,6 +1149,13 @@ export class V2TransportSession {
   readonly #completedInboundSequences = new Set<number>();
   /** Global protocol markers form a barrier across every earlier request tail. */
   #inboundFrameBarrier: Promise<void> = Promise.resolve();
+  /**
+   * Event-memory waits deliberately backpressure the reliable data lane. A
+   * terminal close or same-session recovery must abort those waits before it
+   * joins the processing tail, otherwise an occupied jumbo lane could make
+   * teardown wait on downstream delivery owned by another session.
+   */
+  readonly #eventMemoryWaitAbort = new AbortController();
   #lifecycleEpoch = 0;
   #teardownPromise: Promise<void> | null = null;
   #dataRevision = 0;
@@ -1739,6 +1752,7 @@ export class V2TransportSession {
     this.#draining = true;
     this.#remoteCredits = 0;
     this.#connected = false;
+    this.#abortEventMemoryWaits("V2 sidecar recovery interrupted event-memory backpressure");
     for (const preparation of this.#preparations) {
       preparation.abort(abortError("V2 sidecar recovery interrupted request preparation"));
     }
@@ -2027,6 +2041,7 @@ export class V2TransportSession {
       return;
     }
     this.#draining = true;
+    this.#abortEventMemoryWaits("V2 sandbox recovery interrupted event-memory backpressure");
     this.#abortPreparations(new V2PreCommitError(
       "V2 sandbox recovery interrupted request preparation",
       "sandbox_recovery",
@@ -2212,6 +2227,7 @@ export class V2TransportSession {
     this.#draining = true;
     this.#remoteCredits = 0;
     this.#startupRecoveryOpen = false;
+    this.#abortEventMemoryWaits("V2 transport closed during event-memory backpressure");
     for (const preparation of this.#preparations) {
       preparation.abort(abortError("V2 transport closed during request preparation"));
     }
@@ -3120,12 +3136,14 @@ export class V2TransportSession {
             if (!this.#requests.has(state.requestId)) return;
             continue;
           }
-          if (!this.#acceptWholeEncodedEvent(
+          const acceptedWhole = await this.#acceptWholeEncodedEvent(
             state,
             eventIndex,
             item.event,
             item.dataBase64Url,
-          )) return;
+            lifecycleEpoch,
+          );
+          if (!acceptedWhole) return;
         }
         await this.#drainCompletedEvents(state, lifecycleEpoch);
         return;
@@ -3487,17 +3505,37 @@ export class V2TransportSession {
     this.#stagePreparedStarts();
   }
 
-  #tryAcquireEventPermit(
+  #abortEventMemoryWaits(message: string): void {
+    if (this.#eventMemoryWaitAbort.signal.aborted) return;
+    this.#eventMemoryWaitAbort.abort(abortError(message));
+  }
+
+  #eventMemoryWaitInterrupted(lifecycleEpoch: number): boolean {
+    return this.#eventMemoryWaitAbort.signal.aborted || !this.#ownsLifecycle(lifecycleEpoch);
+  }
+
+  async #acquireEventPermit(
     logicalBytes: number,
     label: string,
-  ): AtomicBytePermit | null | undefined {
+    wait = true,
+  ): Promise<AtomicBytePermit | null | undefined> {
+    const signal = this.#eventMemoryWaitAbort.signal;
+    if (signal.aborted) return null;
     if (!this.#eventMemoryPool) return undefined;
     try {
-      return this.#eventMemoryPool.tryAcquire(
-        estimateAtomicEventPermitBytes(logicalBytes),
+      const requestedBytes = estimateAtomicEventPermitBytes(logicalBytes);
+      if (!wait) {
+        return this.#eventMemoryPool.tryAcquire(requestedBytes, {
+          region: logicalBytes > this.#maxBufferedResponseBytes ? "jumbo" : "auto",
+          label,
+        });
+      }
+      return await this.#eventMemoryPool.acquire(
+        requestedBytes,
         {
           region: logicalBytes > this.#maxBufferedResponseBytes ? "jumbo" : "auto",
           label,
+          signal,
         },
       );
     } catch {
@@ -3505,14 +3543,24 @@ export class V2TransportSession {
     }
   }
 
-  #tryResizeEventPermit(
+  async #resizeEventPermit(
     permit: AtomicBytePermit | null,
     logicalBytes: number,
-  ): boolean {
+    wait = true,
+  ): Promise<boolean> {
+    const signal = this.#eventMemoryWaitAbort.signal;
+    if (signal.aborted) return false;
     if (!this.#eventMemoryPool) return true;
     if (!permit) return false;
     try {
       const targetBytes = estimateAtomicEventPermitBytes(logicalBytes);
+      if (!wait) {
+        if (
+          logicalBytes > this.#maxBufferedResponseBytes &&
+          permit.region !== "jumbo"
+        ) return permit.tryPromote(targetBytes);
+        return permit.tryResize(targetBytes, { allowJumbo: true });
+      }
       // RunHandle deliberately admits an event above its soft queue bound only
       // while that event owns the single jumbo lane. A normal resize prefers
       // spare ordinary capacity, so force the region transition before the
@@ -3520,10 +3568,15 @@ export class V2TransportSession {
       if (
         logicalBytes > this.#maxBufferedResponseBytes &&
         permit.region !== "jumbo"
-      ) return permit.tryPromote(targetBytes);
-      return permit.tryResize(targetBytes, {
+      ) {
+        await permit.promote(targetBytes, signal);
+        return true;
+      }
+      await permit.resize(targetBytes, {
         allowJumbo: true,
+        signal,
       });
+      return true;
     } catch {
       return false;
     }
@@ -3549,6 +3602,48 @@ export class V2TransportSession {
     }
   }
 
+  #retainsOtherJumboEvent(state: RequestState, eventIndex: number): boolean {
+    for (const [index, completed] of state.completedEvents) {
+      if (index === eventIndex || !completed.permit?.active) continue;
+      if (completed.permit.region === "jumbo") return true;
+    }
+    for (const [index, assembly] of state.assemblies) {
+      if (index === eventIndex || !assembly.permit?.active) continue;
+      if (assembly.permit.region === "jumbo") return true;
+    }
+    return false;
+  }
+
+  #retainsOtherEvent(state: RequestState, eventIndex: number): boolean {
+    for (const index of state.completedEvents.keys()) {
+      if (index !== eventIndex) return true;
+    }
+    for (const index of state.assemblies.keys()) {
+      if (index !== eventIndex) return true;
+    }
+    return false;
+  }
+
+  #rejectConflictingJumboReorder(
+    state: RequestState,
+    eventIndex: number,
+    logicalBytes: number,
+  ): boolean {
+    if (
+      logicalBytes <= this.#maxBufferedResponseBytes ||
+      !this.#retainsOtherJumboEvent(state, eventIndex)
+    ) return false;
+    // Reliable priority may place a terminal ahead of an earlier logical
+    // event. One withheld jumbo is safe, but waiting for a second jumbo on the
+    // same serialized request tail can never make progress: the first cannot
+    // drain until the missing index is processed behind this task.
+    this.#failEventMemory(
+      state,
+      "Host event memory cannot reorder multiple jumbo response events",
+    );
+    return true;
+  }
+
   #failEventMemory(state: RequestState, message: string): void {
     if (!this.#requests.has(state.requestId)) return;
     this.#failCommitted(state, new V2CommittedError(
@@ -3564,16 +3659,29 @@ export class V2TransportSession {
     this.#requestPublication(this.#pump());
   }
 
-  #acceptWholeEncodedEvent(
+  async #acceptWholeEncodedEvent(
     state: RequestState,
     eventIndex: number,
     event: string,
     encoded: string,
-  ): boolean {
+    lifecycleEpoch: number,
+  ): Promise<boolean> {
     const recoveryPrefix = state.recoveryPrefix;
     const nextEventIndex = recoveryPrefix
       ? recoveryPrefix.nextEventIndex
       : state.nextEventIndex;
+    if (
+      eventIndex < nextEventIndex ||
+      state.completedEvents.has(eventIndex) ||
+      state.assemblies.has(eventIndex)
+    ) {
+      this.#failCommitted(state, new V2CommittedError(
+        "Response batch event indexes conflict",
+        "response_conflict",
+        true,
+      ));
+      return false;
+    }
     const decodedLength = base64UrlDecodedBytes(encoded);
     if (decodedLength === null) {
       this.#failCommitted(state, new V2CommittedError(
@@ -3583,12 +3691,29 @@ export class V2TransportSession {
       ));
       return false;
     }
-    let permit = this.#tryAcquireEventPermit(
-      partialEventLogicalBytes(event, decodedLength),
+    const initialLogicalBytes = partialEventLogicalBytes(event, decodedLength);
+    if (this.#rejectConflictingJumboReorder(state, eventIndex, initialLogicalBytes)) {
+      return false;
+    }
+    const canWaitForMemory = !this.#retainsOtherEvent(state, eventIndex);
+    const permit = await this.#acquireEventPermit(
+      initialLogicalBytes,
       `host-response:${state.requestId}`,
+      canWaitForMemory,
     );
     if (permit === null) {
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state
+      ) return false;
       this.#failEventMemory(state, "Host event memory is unavailable");
+      return false;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#requests.get(state.requestId) !== state
+    ) {
+      permit?.release();
       return false;
     }
     let bytes: Uint8Array;
@@ -3604,24 +3729,39 @@ export class V2TransportSession {
       return false;
     }
     const wireBytes = canonicalEventWireBytes(event, [bytes]);
-    if (
-      (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) &&
-        state.responseBytes + wireBytes > this.#maxResponseBytes ||
-      !this.#tryResizeEventPermit(permit ?? null, wireBytes)
-    ) {
+    const overLimit = (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) &&
+      state.responseBytes + wireBytes > this.#maxResponseBytes;
+    if (overLimit) {
+      permit?.release();
+      this.#failCommitted(state, new V2CommittedError(
+        "Response exceeds the configured canonical byte limit",
+        "response_too_large",
+        true,
+      ));
+      return false;
+    }
+    if (this.#rejectConflictingJumboReorder(state, eventIndex, wireBytes)) {
+      permit?.release();
+      return false;
+    }
+    if (!await this.#resizeEventPermit(
+      permit ?? null,
+      wireBytes,
+      canWaitForMemory,
+    )) {
       permit?.release();
       if (
-        (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) &&
-        state.responseBytes + wireBytes > this.#maxResponseBytes
-      ) {
-        this.#failCommitted(state, new V2CommittedError(
-          "Response exceeds the configured canonical byte limit",
-          "response_too_large",
-          true,
-        ));
-      } else {
-        this.#failEventMemory(state, "Host event memory cannot grow without blocking");
-      }
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state
+      ) return false;
+      this.#failEventMemory(state, "Host event memory cannot grow without blocking");
+      return false;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#requests.get(state.requestId) !== state
+    ) {
+      permit?.release();
       return false;
     }
     let data: string;
@@ -3654,6 +3794,11 @@ export class V2TransportSession {
       this.#failEventMemory(state, "Host event memory cannot retain the completed event");
       return false;
     }
+    // A response_batch is one reliable frame and may contain multiple events.
+    // Hand a jumbo event to the consumer before the batch loop acquires the
+    // next item, otherwise this task could wait behind the jumbo permit it
+    // still owns itself.
+    const drainBeforeNextBatchItem = permit?.region === "jumbo";
     if (!recoveryPrefix || eventIndex >= recoveryPrefix.expectedEventCount) {
       state.responseBytes += wireBytes;
     }
@@ -3662,6 +3807,11 @@ export class V2TransportSession {
       wireBytes,
       permit: permit ?? null,
     });
+    if (drainBeforeNextBatchItem) {
+      await this.#drainCompletedEvents(state, lifecycleEpoch);
+      return this.#ownsLifecycle(lifecycleEpoch) &&
+        this.#requests.get(state.requestId) === state;
+    }
     return true;
   }
 
@@ -3697,12 +3847,31 @@ export class V2TransportSession {
     }
     let assembly = state.assemblies.get(frame.eventIndex);
     if (!assembly) {
-      const permit = this.#tryAcquireEventPermit(
-        partialEventLogicalBytes(frame.event, decodedLength),
+      const initialLogicalBytes = partialEventLogicalBytes(frame.event, decodedLength);
+      if (this.#rejectConflictingJumboReorder(
+        state,
+        frame.eventIndex,
+        initialLogicalBytes,
+      )) return;
+      const canWaitForMemory = !this.#retainsOtherEvent(state, frame.eventIndex);
+      const permit = await this.#acquireEventPermit(
+        initialLogicalBytes,
         `host-response:${state.requestId}`,
+        canWaitForMemory,
       );
       if (permit === null) {
+        if (
+          this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+          this.#requests.get(state.requestId) !== state
+        ) return;
         this.#failEventMemory(state, "Host event memory is unavailable");
+        return;
+      }
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state
+      ) {
+        permit?.release();
         return;
       }
       assembly = {
@@ -3723,12 +3892,34 @@ export class V2TransportSession {
       return;
     }
     const existing = assembly.parts.get(frame.partIndex);
-    if (!existing && !this.#tryResizeEventPermit(
-      assembly.permit,
-      partialEventLogicalBytes(assembly.event, assembly.rawBytes + decodedLength),
-    )) {
-      this.#failEventMemory(state, "Host event memory cannot grow without blocking");
-      return;
+    if (!existing) {
+      const resizedLogicalBytes = partialEventLogicalBytes(
+        assembly.event,
+        assembly.rawBytes + decodedLength,
+      );
+      if (this.#rejectConflictingJumboReorder(
+        state,
+        frame.eventIndex,
+        resizedLogicalBytes,
+      )) return;
+      const canWaitForMemory = !this.#retainsOtherEvent(state, frame.eventIndex);
+      if (!await this.#resizeEventPermit(
+        assembly.permit,
+        resizedLogicalBytes,
+        canWaitForMemory,
+      )) {
+        if (
+          this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+          this.#requests.get(state.requestId) !== state
+        ) return;
+        this.#failEventMemory(state, "Host event memory cannot grow without blocking");
+        return;
+      }
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state ||
+        state.assemblies.get(frame.eventIndex) !== assembly
+      ) return;
     }
     let bytes: Uint8Array;
     try {
@@ -3782,10 +3973,27 @@ export class V2TransportSession {
       ));
       return;
     }
-    if (!this.#tryResizeEventPermit(assembly.permit, wireBytes)) {
+    if (this.#rejectConflictingJumboReorder(state, frame.eventIndex, wireBytes)) {
+      return;
+    }
+    const canWaitForMemory = !this.#retainsOtherEvent(state, frame.eventIndex);
+    if (!await this.#resizeEventPermit(
+      assembly.permit,
+      wireBytes,
+      canWaitForMemory,
+    )) {
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#requests.get(state.requestId) !== state
+      ) return;
       this.#failEventMemory(state, "Host event memory cannot materialize the complete event");
       return;
     }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#requests.get(state.requestId) !== state ||
+      state.assemblies.get(frame.eventIndex) !== assembly
+    ) return;
     let data: string;
     try {
       data = utf8Text(concat(parts, expectedOffset));
@@ -3916,6 +4124,7 @@ export class V2TransportSession {
           wireBytes,
           permit,
           terminalFinalizationAnchor,
+          this.#eventMemoryWaitAbort.signal,
         );
         permit = undefined;
       } catch (error) {
@@ -3928,6 +4137,14 @@ export class V2TransportSession {
           !this.#requests.has(state.requestId) ||
           state.cancelled
         ) return;
+        if (this.#eventMemoryWaitAbort.signal.aborted) {
+          this.#failCommitted(state, new V2CommittedError(
+            "V2 sidecar recovery interrupted pending response delivery",
+            "sidecar_recovery",
+            true,
+          ));
+          return;
+        }
         this.#failCommitted(state, new V2CommittedError(
           error instanceof Error ? error.message : "Host event delivery failed",
           "event_memory_delivery",
@@ -4201,16 +4418,27 @@ export class V2TransportSession {
       );
       return false;
     }
-    const permit = this.#tryAcquireEventPermit(
+    const permit = await this.#acquireEventPermit(
       wireBytes,
       `host-orphan-recovery:${candidate.requestId}`,
     );
     if (permit === null) {
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+      ) return false;
       this.#failOrphanRecoveryCandidate(
         candidate,
         "Host event memory is unavailable for orphan recovery",
         "event_memory_capacity",
       );
+      return false;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+    ) {
+      permit?.release();
       return false;
     }
     let bytes: Uint8Array;
@@ -4225,14 +4453,26 @@ export class V2TransportSession {
       );
       return false;
     }
-    if (!this.#tryResizeEventPermit(permit ?? null, wireBytes)) {
+    if (!await this.#resizeEventPermit(permit ?? null, wireBytes)) {
       bytes.fill(0);
       permit?.release();
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+      ) return false;
       this.#failOrphanRecoveryCandidate(
         candidate,
         "Host event memory cannot verify the recovered orphan event",
         "event_memory_capacity",
       );
+      return false;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+    ) {
+      bytes.fill(0);
+      permit?.release();
       return false;
     }
     let data: string;
@@ -4296,16 +4536,27 @@ export class V2TransportSession {
         );
         return;
       }
-      const permit = this.#tryAcquireEventPermit(
+      const permit = await this.#acquireEventPermit(
         partialBytes,
         `host-orphan-recovery:${candidate.requestId}`,
       );
       if (permit === null) {
+        if (
+          this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+          this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+        ) return;
         this.#failOrphanRecoveryCandidate(
           candidate,
           "Host event memory is unavailable for orphan recovery",
           "event_memory_capacity",
         );
+        return;
+      }
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+      ) {
+        permit?.release();
         return;
       }
       assembly = {
@@ -4341,8 +4592,7 @@ export class V2TransportSession {
     if (
       decodedLength === null ||
       partialBytes === null ||
-      candidate.responseBytes + partialBytes > this.#maxResponseBytes ||
-      !this.#tryResizeEventPermit(assembly.permit, partialBytes)
+      candidate.responseBytes + partialBytes > this.#maxResponseBytes
     ) {
       this.#failOrphanRecoveryCandidate(
         candidate,
@@ -4359,6 +4609,23 @@ export class V2TransportSession {
       );
       return;
     }
+    if (!await this.#resizeEventPermit(assembly.permit, partialBytes)) {
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+      ) return;
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Host event memory cannot grow the recovered orphan event",
+        "event_memory_capacity",
+      );
+      return;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate ||
+      candidate.assembly !== assembly
+    ) return;
     let bytes: Uint8Array;
     try {
       bytes = decodeCanonicalBase64Url(frame.dataBase64Url, decodedLength);
@@ -4378,21 +4645,31 @@ export class V2TransportSession {
 
     const parts = [...assembly.parts.values()].map(part => part.bytes);
     const wireBytes = canonicalEventWireBytes(assembly.event, parts);
-    if (
-      candidate.responseBytes + wireBytes > this.#maxResponseBytes ||
-      !this.#tryResizeEventPermit(assembly.permit, wireBytes)
-    ) {
+    if (candidate.responseBytes + wireBytes > this.#maxResponseBytes) {
       this.#failOrphanRecoveryCandidate(
         candidate,
-        candidate.responseBytes + wireBytes > this.#maxResponseBytes
-          ? "Recovered orphan response exceeds the configured byte limit"
-          : "Host event memory cannot verify the recovered orphan event",
-        candidate.responseBytes + wireBytes > this.#maxResponseBytes
-          ? "response_too_large"
-          : "event_memory_capacity",
+        "Recovered orphan response exceeds the configured byte limit",
+        "response_too_large",
       );
       return;
     }
+    if (!await this.#resizeEventPermit(assembly.permit, wireBytes)) {
+      if (
+        this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+        this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate
+      ) return;
+      this.#failOrphanRecoveryCandidate(
+        candidate,
+        "Host event memory cannot verify the recovered orphan event",
+        "event_memory_capacity",
+      );
+      return;
+    }
+    if (
+      this.#eventMemoryWaitInterrupted(lifecycleEpoch) ||
+      this.#orphanRecoveryCandidates.get(candidate.requestId) !== candidate ||
+      candidate.assembly !== assembly
+    ) return;
     let data: string;
     try {
       data = utf8Text(concat(parts, assembly.rawBytes));
@@ -4609,8 +4886,14 @@ export class V2TransportSession {
       : R1_REQUEST_PART_BYTES;
     let encoded = decoded;
     let encoding: RequestEncoding = "identity";
-    const gzipPriority = decoded.byteLength >= BULK_GZIP_MIN_BYTES ? "bulk" : "latency";
     const inlineBase64 = canonical.containsLargeInlineBase64;
+    // Non-tiny inline data URLs recover roughly one quarter of their base64
+    // expansion only with balanced gzip on Bun. Keep latency-critical inline
+    // data URLs on the existing zero-compression path and ordinary text unchanged.
+    const gzipPriority = decoded.byteLength >= BULK_GZIP_MIN_BYTES ||
+        (inlineBase64 && decoded.byteLength > V2_LATENCY_CRITICAL_REQUEST_BYTES)
+      ? "bulk"
+      : "latency";
     if (
       this.#gzip &&
       decoded.byteLength > partBytes &&

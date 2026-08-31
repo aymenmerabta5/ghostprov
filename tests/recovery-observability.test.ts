@@ -47,6 +47,38 @@ describe("recovery observability schema", () => {
     });
   });
 
+  it("recovers structured sidecar diagnostics through bounded lifecycle wrappers", () => {
+    const nested = new V2BootstrapError(
+      "sidecar failed",
+      "hello",
+      1,
+      {
+        sidecarDiagnostic: {
+          errorName: "SidecarOwnershipError",
+          errorCode: "contended",
+          causeName: null,
+        },
+      },
+    );
+    const aggregate = new AggregateError([new Error("cleanup failed"), nested], "retirement failed");
+    const outer = new Error("runtime failed", { cause: aggregate }) as Error & {
+      kind: string;
+      operation: string;
+    };
+    outer.name = "V2RuntimeLifecycleFailure";
+    outer.kind = "sidecar_unreachable";
+    outer.operation = "sidecar_liveness";
+
+    expect(describeSandboxFailure(outer)).toMatchObject({
+      name: "V2RuntimeLifecycleFailure",
+      kind: "sidecar_unreachable",
+      operation: "sidecar_liveness",
+      sidecarErrorName: "SidecarOwnershipError",
+      sidecarErrorCode: "contended",
+      sidecarCauseName: null,
+    });
+  });
+
   it("accepts the fixed recovery, refresh, and circuit event vocabulary", () => {
     for (const eventName of RECOVERY_OBSERVABILITY_EVENT_NAMES) {
       const event = recoveryObservabilityEvent(eventName, {
@@ -101,6 +133,7 @@ describe("recovery observability schema", () => {
     expect(normalizeSandboxRecoveryCause("heartbeat-stale")).toBe("heartbeat");
     expect(normalizeSandboxRecoveryCause("SUPER_SECRET_CANARY")).toBe("unknown");
     expect(normalizeSandboxRecoveryOperation("wait-for-sync")).toBe("wait_for_sync");
+    expect(normalizeSandboxRecoveryOperation("sidecar_liveness")).toBe("sidecar_liveness");
     expect(normalizeSandboxRecoveryOperation("SUPER_SECRET_CANARY")).toBe("unknown");
     expect(normalizeSandboxRecoveryErrorName("ProvisioningError")).toBe("ProvisioningError");
     expect(normalizeSandboxRecoveryErrorName("SUPER_SECRET_CANARY")).toBe("Error");

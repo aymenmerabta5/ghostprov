@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { WebSocketTelemetry } from "../src/ws/telemetry";
+import {
+  WEBSOCKET_CLOSE_CAUSES,
+  WebSocketTelemetry,
+} from "../src/ws/telemetry";
 
 describe("WebSocketTelemetry", () => {
   it("keeps aggregate fixed-memory delivery metrics without identities", () => {
@@ -75,6 +78,46 @@ describe("WebSocketTelemetry", () => {
     telemetry.sendSettled(1_024, true); telemetry.sendSettled(512);
     telemetry.responseFinished(512);
     telemetry.requestSettled(512); telemetry.requestSettled(256);
-    telemetry.sessionClosed();
+    telemetry.sessionClosed("remote_close");
+  });
+
+  it("keeps a fixed, resettable close-cause aggregate", () => {
+    expect(Object.isFrozen(WEBSOCKET_CLOSE_CAUSES)).toBe(true);
+    expect(() => (WEBSOCKET_CLOSE_CAUSES as unknown as string[]).push("injected"))
+      .toThrow();
+    const telemetry = new WebSocketTelemetry({ capacity: 8 });
+    for (let index = 0; index < WEBSOCKET_CLOSE_CAUSES.length; index++) {
+      telemetry.sessionOpened();
+    }
+    for (const cause of WEBSOCKET_CLOSE_CAUSES) {
+      telemetry.sessionClosed(cause, cause === "remote_close" ? 3 : 0);
+    }
+
+    const value = telemetry.snapshotAndReset();
+    expect(value).toMatchObject({
+      activeSessions: 0,
+      closedSessions: WEBSOCKET_CLOSE_CAUSES.length,
+      closedActiveResponses: 3,
+      closeCauses: {
+        remote_close: 1,
+        heartbeat_timeout: 1,
+        delivery_error: 1,
+        protocol_error: 1,
+        server_shutdown: 1,
+        idle_timeout: 1,
+        ingress_capacity: 1,
+        socket_error: 1,
+      },
+    });
+    expect(Object.keys(value.closeCauses)).toEqual([...WEBSOCKET_CLOSE_CAUSES]);
+    expect(JSON.stringify(value)).not.toMatch(/reason|error message|client|stream|url|token|prompt/i);
+
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      closedSessions: 0,
+      closedActiveResponses: 0,
+      closeCauses: Object.fromEntries(
+        WEBSOCKET_CLOSE_CAUSES.map(cause => [cause, 0]),
+      ),
+    });
   });
 });

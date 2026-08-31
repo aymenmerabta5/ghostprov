@@ -3,8 +3,28 @@ import {
   type DistributionSnapshot,
 } from "../v2/diagnostics/statistics";
 
+export const WEBSOCKET_CLOSE_CAUSES = Object.freeze([
+  "remote_close",
+  "heartbeat_timeout",
+  "delivery_error",
+  "protocol_error",
+  "server_shutdown",
+  "idle_timeout",
+  "ingress_capacity",
+  "socket_error",
+] as const);
+
+export type WebSocketCloseCause = typeof WEBSOCKET_CLOSE_CAUSES[number];
+
+export type WebSocketCloseCauseCounts = Readonly<
+  Record<WebSocketCloseCause, number>
+>;
+
 export interface WebSocketTelemetrySnapshot {
   activeSessions: number;
+  closedSessions: number;
+  closedActiveResponses: number;
+  closeCauses: WebSocketCloseCauseCounts;
   activeResponses: number;
   activeResponseBytes: number;
   pendingRequests: number;
@@ -54,6 +74,9 @@ export class WebSocketTelemetry {
   readonly #queue: BoundedDistribution;
   readonly #callback: BoundedDistribution;
   #sessions = 0;
+  #closedSessions = 0;
+  #closedActiveResponses = 0;
+  readonly #closeCauses = emptyCloseCauseCounts();
   #responses = 0;
   #activeResponseBytes = 0;
   #pendingRequests = 0;
@@ -99,7 +122,25 @@ export class WebSocketTelemetry {
   }
 
   sessionOpened(): void { this.#sessions++; }
-  sessionClosed(): void { this.#sessions = Math.max(0, this.#sessions - 1); }
+  sessionClosed(cause: WebSocketCloseCause, activeResponses = 0): void {
+    switch (cause) {
+      case "remote_close":
+      case "heartbeat_timeout":
+      case "delivery_error":
+      case "protocol_error":
+      case "server_shutdown":
+      case "idle_timeout":
+      case "ingress_capacity":
+      case "socket_error":
+        this.#closeCauses[cause]++;
+        break;
+      default:
+        throw new TypeError("Unsupported WebSocket close cause");
+    }
+    this.#sessions = Math.max(0, this.#sessions - 1);
+    this.#closedSessions++;
+    this.#closedActiveResponses += nonNegativeInteger(activeResponses);
+  }
   responseStarted(bytes = 0): void {
     this.#responses++;
     this.#activeResponseBytes += nonNegativeInteger(bytes);
@@ -238,6 +279,9 @@ export class WebSocketTelemetry {
   snapshotAndReset(): WebSocketTelemetrySnapshot {
     const value = {
       activeSessions: this.#sessions,
+      closedSessions: this.#closedSessions,
+      closedActiveResponses: this.#closedActiveResponses,
+      closeCauses: Object.freeze({ ...this.#closeCauses }),
       activeResponses: this.#responses,
       activeResponseBytes: this.#activeResponseBytes,
       pendingRequests: this.#pendingRequests,
@@ -292,6 +336,9 @@ export class WebSocketTelemetry {
       this.#pendingRequestBytes - this.#activeResponseBytes,
     );
     this.#rejectedRequests = 0;
+    this.#closedSessions = 0;
+    this.#closedActiveResponses = 0;
+    for (const cause of WEBSOCKET_CLOSE_CAUSES) this.#closeCauses[cause] = 0;
     this.#sendQueuePeak = this.#sendQueueDepth;
     this.#sendQueueBytesPeak = this.#sendQueueBytes;
     this.#waitingSendPeak = this.#waitingSends;
@@ -325,4 +372,17 @@ export class WebSocketTelemetry {
 
 function nonNegativeInteger(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function emptyCloseCauseCounts(): Record<WebSocketCloseCause, number> {
+  return {
+    remote_close: 0,
+    heartbeat_timeout: 0,
+    delivery_error: 0,
+    protocol_error: 0,
+    server_shutdown: 0,
+    idle_timeout: 0,
+    ingress_capacity: 0,
+    socket_error: 0,
+  };
 }

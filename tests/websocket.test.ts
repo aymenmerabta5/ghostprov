@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 import {
   attachResponsesWebSocket,
+  closeResponsesWebSockets,
   DEFAULT_WS_AUTOMATIC_MAX_PAYLOAD_BYTES,
   DEFAULT_WS_MAX_PAYLOAD_BYTES,
   DEFAULT_WS_PROMOTION_HEADROOM_BYTES,
@@ -476,6 +477,11 @@ describe("Responses WebSocket server", () => {
       ingressPromotions: 1,
       ingressRejections: 1,
       ingressReservedBytes: 53 * MiB,
+      closedSessions: 1,
+      closeCauses: {
+        ingress_capacity: 1,
+        remote_close: 0,
+      },
     });
     await waitFor(() => budget.snapshot().sessions === 1);
     expect(budget.snapshot().ingressReservedBytes).toBe(53 * MiB);
@@ -680,9 +686,11 @@ describe("Responses WebSocket server", () => {
       maxQueuedBytes: 1024 * 1024,
       maxIngressBytes: normalBytes,
     });
+    const telemetry = new WebSocketTelemetry();
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
     attachTestResponsesWebSocket(server, {
       processBudget: budget,
+      telemetry,
       heartbeatIntervalMs: 10,
       pongTimeoutMs: 30,
       idleTimeoutMs: 60,
@@ -701,8 +709,100 @@ describe("Responses WebSocket server", () => {
     const closed = new Promise<number>(resolve => socket.once("close", resolve));
     expect(await closed).toBe(1006);
     expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      closeCauses: {
+        idle_timeout: 1,
+        heartbeat_timeout: 0,
+        remote_close: 0,
+      },
+    });
     await new Promise(resolve => setTimeout(resolve, 40));
     expect(budget.snapshot()).toMatchObject({ sessions: 0, ingressReservedBytes: 0 });
+  });
+
+  it("classifies an unanswered heartbeat separately from application idleness", async () => {
+    const telemetry = new WebSocketTelemetry();
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const wss = attachTestResponsesWebSocket(server, {
+      telemetry,
+      heartbeatIntervalMs: 50,
+      pongTimeoutMs: 30,
+      idleTimeoutMs: 1_000,
+      startRelay: async () => relayHandle(new Promise(() => {})),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const serverSocket = [...wss.clients][0];
+    if (!serverSocket) throw new Error("missing accepted websocket");
+    serverSocket.ping = (() => undefined) as typeof serverSocket.ping;
+
+    const code = await new Promise<number>(resolve => socket.once("close", resolve));
+    expect(code).toBe(1006);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      closeCauses: {
+        heartbeat_timeout: 1,
+        idle_timeout: 0,
+        remote_close: 0,
+      },
+    });
+  });
+
+  it("uses the earliest expired deadline when heartbeat and idle time out together", async () => {
+    const originalNow = Date.now;
+    let now = originalNow();
+    Date.now = () => now;
+    try {
+      const telemetry = new WebSocketTelemetry();
+      const server = createServer((_req, res) => { res.writeHead(404).end(); });
+      const wss = attachTestResponsesWebSocket(server, {
+        telemetry,
+        heartbeatIntervalMs: 50,
+        pongTimeoutMs: 30,
+        idleTimeoutMs: 80,
+        startRelay: async () => relayHandle(new Promise(() => {})),
+      });
+      servers.push(server);
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("missing test address");
+      const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+      sockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", resolve);
+        socket.once("error", reject);
+      });
+      const serverSocket = [...wss.clients][0];
+      if (!serverSocket) throw new Error("missing accepted websocket");
+      let pingCalls = 0;
+      serverSocket.ping = (() => { pingCalls++; }) as typeof serverSocket.ping;
+      await waitFor(() => pingCalls === 1);
+
+      now += 1_000;
+      expect(await new Promise<number>(resolve => socket.once("close", resolve))).toBe(1006);
+      expect(telemetry.snapshotAndReset()).toMatchObject({
+        activeSessions: 0,
+        closedSessions: 1,
+        closeCauses: {
+          heartbeat_timeout: 1,
+          idle_timeout: 0,
+          remote_close: 0,
+        },
+      });
+    } finally {
+      Date.now = originalNow;
+    }
   });
 
   it("does not idle-expire a live silent relay", async () => {
@@ -725,6 +825,180 @@ describe("Responses WebSocket server", () => {
     await new Promise(resolve => setTimeout(resolve, 120));
     expect(socket.readyState).toBe(WebSocket.OPEN);
     socket.close();
+  });
+
+  it("classifies a peer-selected close code as remote without retaining its reason", async () => {
+    const telemetry = new WebSocketTelemetry();
+    const processBudget = new WebSocketProcessBudget({
+      maxSessions: 1,
+      maxQueuedBytes: 64 * 1024 * 1024,
+      maxIngressBytes: 64 * 1024 * 1024,
+    });
+    const socket = await startServer(
+      async () => relayHandle(Promise.resolve(completed("unused"))),
+      { telemetry, processBudget },
+    );
+    const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+    socket.close(1009, "CLOSE_REASON_CANARY");
+    await closed;
+    await waitFor(() => processBudget.snapshot().sessions === 0);
+
+    const snapshot = telemetry.snapshotAndReset();
+    expect(snapshot).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      ingressParserRejections: 0,
+      closeCauses: {
+        remote_close: 1,
+        protocol_error: 0,
+        server_shutdown: 0,
+      },
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("CLOSE_REASON_CANARY");
+  });
+
+  it("keeps server shutdown as the first close cause", async () => {
+    const telemetry = new WebSocketTelemetry();
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    attachTestResponsesWebSocket(server, {
+      telemetry,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const closed = new Promise<number>(resolve => socket.once("close", resolve));
+
+    await closeResponsesWebSockets(server, {
+      timeoutMs: 1_000,
+      reason: "SERVER_SHUTDOWN_REASON_CANARY",
+    });
+    await closeResponsesWebSockets(server, { timeoutMs: 1_000 });
+    expect(await closed).toBe(1012);
+    const snapshot = telemetry.snapshotAndReset();
+    expect(snapshot).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      closeCauses: {
+        server_shutdown: 1,
+        remote_close: 0,
+      },
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("SERVER_SHUTDOWN_REASON_CANARY");
+  });
+
+  it("latches server shutdown before active delivery observes a closing socket", async () => {
+    const telemetry = new WebSocketTelemetry();
+    const final = deferred<any>();
+    let relayStarted = false;
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const wss = attachTestResponsesWebSocket(server, {
+      telemetry,
+      startRelay: async () => {
+        relayStarted = true;
+        return relayHandle(final.promise);
+      },
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    socket.send(JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.6-sol",
+      store: false,
+      input: "finish during shutdown",
+    }));
+    await waitFor(() => relayStarted);
+
+    const serverSocket = [...wss.clients][0];
+    if (!serverSocket) throw new Error("missing accepted websocket");
+    const originalClose = serverSocket.close;
+    const originalTerminate = serverSocket.terminate;
+    const ownReadyState = Object.getOwnPropertyDescriptor(serverSocket, "readyState");
+    serverSocket.close = (() => {
+      Object.defineProperty(serverSocket, "readyState", {
+        configurable: true,
+        value: serverSocket.CLOSING,
+      });
+    }) as typeof serverSocket.close;
+    serverSocket.terminate = (() => undefined) as typeof serverSocket.terminate;
+
+    const closing = closeResponsesWebSockets(server, { timeoutMs: 100 });
+    try {
+      final.resolve(completed("resp_shutdown_race"));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(telemetry.snapshotAndReset()).toMatchObject({
+        activeSessions: 0,
+        closedSessions: 1,
+        closedActiveResponses: 1,
+        deliveryErrors: 0,
+        closeCauses: {
+          server_shutdown: 1,
+          delivery_error: 0,
+          remote_close: 0,
+        },
+      });
+    } finally {
+      serverSocket.close = originalClose;
+      serverSocket.terminate = originalTerminate;
+      if (ownReadyState) {
+        Object.defineProperty(serverSocket, "readyState", ownReadyState);
+      } else {
+        Reflect.deleteProperty(serverSocket, "readyState");
+      }
+      try { originalTerminate.call(serverSocket); } catch {}
+      await closing;
+    }
+  });
+
+  it("keeps a socket error as the first close cause without retaining its message", async () => {
+    const telemetry = new WebSocketTelemetry();
+    const server = createServer((_req, res) => { res.writeHead(404).end(); });
+    const wss = attachTestResponsesWebSocket(server, {
+      telemetry,
+      startRelay: async () => relayHandle(Promise.resolve(completed("unused"))),
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test address");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/responses`);
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    const serverSocket = [...wss.clients][0];
+    if (!serverSocket) throw new Error("missing accepted websocket");
+    serverSocket.emit("error", new Error("SOCKET_ERROR_CANARY"));
+    const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+    socket.close();
+    await closed;
+
+    const snapshot = telemetry.snapshotAndReset();
+    expect(snapshot).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      closeCauses: {
+        socket_error: 1,
+        remote_close: 0,
+      },
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("SOCKET_ERROR_CANARY");
   });
 
   it("sends direct event objects, makes streaming implicit, and echoes only named stream IDs", async () => {
@@ -1502,13 +1776,14 @@ describe("Responses WebSocket server", () => {
 
   it("returns direct validation errors without closing other lanes", async () => {
     const gates = new Map<string, ReturnType<typeof deferred<any>>>();
+    const telemetry = new WebSocketTelemetry();
     const startRelay: WebSocketRelayStarter = async body => {
       const label = typeof body.input === "string" ? body.input : "unknown";
       const gate = deferred<any>();
       gates.set(label, gate);
       return relayHandle(gate.promise);
     };
-    const socket = await startServer(startRelay, { maxNamedStreams: 2 });
+    const socket = await startServer(startRelay, { maxNamedStreams: 2, telemetry });
     const messages = collect(socket);
     socket.send("not json");
     socket.send(JSON.stringify({ type: "response.create", stream_id: "bad space", input: "x" }));
@@ -1522,6 +1797,14 @@ describe("Responses WebSocket server", () => {
     expect(messages.some(message => message.error?.param === "stream")).toBe(true);
     expect(messages.some(message => message.error?.code === "websocket_stream_limit_reached")).toBe(true);
     expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 1,
+      closedSessions: 0,
+      closeCauses: {
+        protocol_error: 0,
+        remote_close: 0,
+      },
+    });
     for (const [label, gate] of gates) gate.resolve(completed(`resp_${label}`));
   });
 
@@ -1543,10 +1826,11 @@ describe("Responses WebSocket server", () => {
 
   it("rejects an oversized message at the WebSocket parser boundary", async () => {
     let calls = 0;
+    const telemetry = new WebSocketTelemetry();
     const socket = await startServer(async () => {
       calls++;
       return relayHandle(Promise.resolve(completed("unexpected")));
-    }, { maxPayloadBytes: 256 });
+    }, { maxPayloadBytes: 256, telemetry });
     const closed = new Promise<number>(resolve => {
       socket.once("close", code => resolve(code));
     });
@@ -1559,6 +1843,15 @@ describe("Responses WebSocket server", () => {
 
     expect(await closed).toBe(1009);
     expect(calls).toBe(0);
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      ingressParserRejections: 1,
+      closeCauses: {
+        protocol_error: 1,
+        remote_close: 0,
+      },
+    });
   });
 
   it("bounds pending request count while retaining accepted FIFO work", async () => {
@@ -1872,6 +2165,39 @@ class FakeSocket {
 }
 
 describe("Responses WebSocket bounded delivery", () => {
+  it("counts only semaphore-admitted responses when a session closes", async () => {
+    const socket = new FakeSocket();
+    const telemetry = new WebSocketTelemetry();
+    let relayCalls = 0;
+    const session = createTestSession(socket as unknown as WebSocket, {
+      telemetry,
+      maxActive: 1,
+      startRelay: async () => {
+        relayCalls++;
+        return relayHandle(new Promise(() => {}));
+      },
+    });
+
+    for (const stream_id of ["active", "queued"]) {
+      session.receive(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: false,
+        input: stream_id,
+      }));
+    }
+    await waitFor(() => relayCalls === 1);
+
+    session.close();
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      closedActiveResponses: 1,
+      closeCauses: { remote_close: 1 },
+    });
+  });
+
   it("normalizes omitted, false, and true client store hints before relay", async () => {
     const socket = new FakeSocket();
     const graph = new ResponseGraph();
@@ -2328,6 +2654,16 @@ describe("Responses WebSocket bounded delivery", () => {
     await waitFor(() => socket.closeCode !== null);
     expect(socket.closeCode).toBe(1011);
     expect(signal?.aborted).toBe(true);
-    expect(telemetry.snapshotAndReset().deliveryErrors).toBe(1);
+    session.close();
+    expect(telemetry.snapshotAndReset()).toMatchObject({
+      activeSessions: 0,
+      closedSessions: 1,
+      deliveryErrors: 1,
+      closeCauses: {
+        delivery_error: 1,
+        remote_close: 0,
+        socket_error: 0,
+      },
+    });
   });
 });

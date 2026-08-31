@@ -12,7 +12,10 @@ import {
   type ResponseCreateEvent,
   type ResolvedRelayRequest,
 } from "./response-graph";
-import type { WebSocketTelemetry } from "./telemetry";
+import type {
+  WebSocketCloseCause,
+  WebSocketTelemetry,
+} from "./telemetry";
 import {
   releaseAtomicBytePermit,
   transferAtomicBytePermit,
@@ -534,6 +537,7 @@ export class ResponsesWebSocketSession {
   readonly #namedStreamRefs = new Map<string, number>();
   readonly #laneTails = new Map<string, Promise<void>>();
   readonly #controllers = new Set<AbortController>();
+  #activeResponses = 0;
   readonly #sendQueue: PendingSend[] = [];
   readonly #telemetry?: WebSocketTelemetry;
   readonly #socket: WebSocket;
@@ -671,11 +675,14 @@ export class ResponsesWebSocketSession {
     });
   }
 
-  close(): void {
-    this.#shutdown(new WebSocketDeliveryError(
-      "WebSocket connection closed",
-      "websocket_closed",
-    ));
+  close(cause: WebSocketCloseCause = "remote_close"): void {
+    this.#shutdown(
+      new WebSocketDeliveryError(
+        "WebSocket connection closed",
+        "websocket_closed",
+      ),
+      cause,
+    );
   }
 
   isIdle(): boolean {
@@ -744,6 +751,7 @@ export class ResponsesWebSocketSession {
     let pendingTerminal: Record<string, unknown> | undefined;
     let pendingHandoffCleanup: Promise<void> | null = null;
     let finalObserved = false;
+    let responseStarted = false;
     let requestReleased = false;
     const releaseRequest = () => {
       if (requestReleased) return;
@@ -753,6 +761,8 @@ export class ResponsesWebSocketSession {
     try {
       release = await this.#semaphore.acquire(controller.signal, requestBytes);
       if (this.#closed || controller.signal.aborted) throw abortError();
+      this.#activeResponses++;
+      responseStarted = true;
       this.#telemetry?.responseStarted(requestBytes);
       if (event.generate === false) {
         await this.#completeWarmup(event);
@@ -978,7 +988,10 @@ export class ResponsesWebSocketSession {
       releaseAtomicBytePermit(pendingTerminal);
       if (resolved) releaseResponseGraphResolution(resolved);
       release?.();
-      if (release) this.#telemetry?.responseFinished(requestBytes);
+      if (responseStarted) {
+        this.#activeResponses = Math.max(0, this.#activeResponses - 1);
+        this.#telemetry?.responseFinished(requestBytes);
+      }
       releaseRequest();
     }
   }
@@ -1296,7 +1309,7 @@ export class ResponsesWebSocketSession {
           { cause },
         );
     this.#telemetry?.deliveryFailed();
-    this.#shutdown(error);
+    this.#shutdown(error, "delivery_error");
     try {
       if (
         this.#socket.readyState === this.#socket.OPEN ||
@@ -1309,10 +1322,13 @@ export class ResponsesWebSocketSession {
     }
   }
 
-  #shutdown(error: WebSocketDeliveryError): void {
+  #shutdown(
+    error: WebSocketDeliveryError,
+    cause: WebSocketCloseCause,
+  ): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#telemetry?.sessionClosed();
+    this.#telemetry?.sessionClosed(cause, this.#activeResponses);
     for (const controller of this.#controllers) controller.abort();
     this.#controllers.clear();
     this.#semaphore.close();

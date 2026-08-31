@@ -14,9 +14,38 @@ function redactFailureMessage(value: string): string {
     .slice(0, 240);
 }
 
+/**
+ * Lifecycle failures wrap bounded bootstrap/retirement errors in `cause` and
+ * occasionally `AggregateError.errors`. Walk only a small, cycle-safe set of
+ * data properties so structured sidecar diagnostics survive that wrapping
+ * without retaining arbitrary error graphs or reading dynamic accessors.
+ */
+function failureRecords(error: unknown): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = [];
+  const pending: unknown[] = [error];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0 && records.length < 8) {
+    const value = pending.shift();
+    if (!value || typeof value !== "object" || seen.has(value)) continue;
+    seen.add(value);
+    const record = value as Record<string, unknown>;
+    records.push(record);
+    const cause = Object.getOwnPropertyDescriptor(value, "cause")?.value;
+    if (cause !== undefined) pending.push(cause);
+    const errors = Object.getOwnPropertyDescriptor(value, "errors")?.value;
+    if (Array.isArray(errors)) {
+      for (const nested of errors.slice(0, 8 - records.length)) pending.push(nested);
+    }
+  }
+  return records;
+}
+
 export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
-  const record = error && typeof error === "object" ? error as Record<string, unknown> : {};
-  const rawSidecar = record.sidecarDiagnostic;
+  const records = failureRecords(error);
+  const record = records[0] ?? {};
+  const rawSidecar = records
+    .map(value => Object.getOwnPropertyDescriptor(value, "sidecarDiagnostic")?.value)
+    .find(value => value && typeof value === "object" && !Array.isArray(value));
   const sidecar = rawSidecar && typeof rawSidecar === "object" && !Array.isArray(rawSidecar)
     ? rawSidecar as Record<string, unknown>
     : null;

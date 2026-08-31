@@ -7,6 +7,7 @@ import {
 } from "./events";
 import { assertSafeObservabilityEvent } from "./redaction";
 import { RotatingJsonlSink } from "./rotating-jsonl";
+import { WEBSOCKET_CLOSE_CAUSES } from "../ws/telemetry";
 
 export interface ObservabilitySink {
   writeBatch(lines: readonly string[]): Promise<void>;
@@ -80,6 +81,19 @@ function compactRelease(value: unknown): unknown {
   };
 }
 
+function compactWebSocketCloseCauses(value: unknown): Record<string, number> | undefined {
+  const source = record(value);
+  if (!source) return undefined;
+  const compact: Record<string, number> = {};
+  for (const cause of WEBSOCKET_CLOSE_CAUSES) {
+    const count = source[cause];
+    if (typeof count === "number" && Number.isSafeInteger(count) && count > 0) {
+      compact[cause] = count;
+    }
+  }
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
 /** Full JSONL remains on disk; this only compacts the console representation. */
 export function formatConsoleObservabilityLine(line: string): string {
   const trimmed = line.trimEnd();
@@ -129,6 +143,9 @@ export function formatConsoleObservabilityLine(line: string): string {
       } : null,
       websocket: websocket ? {
         active_sessions: websocket.activeSessions,
+        closed_sessions: websocket.closedSessions,
+        closed_active_responses: websocket.closedActiveResponses,
+        close_causes: compactWebSocketCloseCauses(websocket.closeCauses),
         pending_requests: websocket.pendingRequests,
         ingress_reserved_bytes: websocket.ingressReservedBytes,
         ingress_reserved_peak_bytes: websocket.ingressReservedBytesPeak,

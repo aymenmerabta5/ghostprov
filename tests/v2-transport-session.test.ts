@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { gunzipSync, gzipSync } from "fflate";
+import { gzipSync as nodeGzipSync } from "node:zlib";
 import type { RunHandle } from "../src/relay/run-handle";
 import { sseFrame } from "../src/relay/sse";
 import { projectId } from "../src/sandbox/types";
@@ -30,6 +31,7 @@ import {
 import {
   computeV2RetransmitDelayMs,
   MAX_TERMINAL_OBJECT_KEYS,
+  V2_LATENCY_CRITICAL_REQUEST_BYTES,
   V2_R2_REQUEST_PART_BYTES,
   V2TransportSession,
   validateHostTerminalFinalStructure,
@@ -413,6 +415,113 @@ class TransportHarness {
     await this.session.close();
     await this.sidecar.close();
   }
+}
+
+async function commitR2(
+  harness: TransportHarness,
+  pending: Promise<RunHandle>,
+): Promise<RunHandle> {
+  await harness.settle();
+  const commit = [...harness.hostFrames.values()].find(
+    (frame): frame is ReliableFrame<R2RequestCommitFrame> => frame.kind === "request_commit",
+  );
+  if (!commit) throw new Error("R2 request_commit was not published");
+  harness.credits = 127;
+  harness.publish([{
+    kind: "request_prepared",
+    requestId: commit.requestId,
+    protocolRevision: "r2",
+    schemaVersion: GP_V2_R2_SCHEMA_VERSION,
+    projectId: commit.projectId,
+    sessionId: commit.sessionId,
+    leaderGeneration: commit.leaderGeneration,
+    buildHash: commit.buildHash,
+    schemaHash: commit.schemaHash,
+    launchNonce: commit.launchNonce,
+    hostInstanceId: commit.hostInstanceId,
+    targetInstanceId: commit.targetInstanceId,
+    requestDigest: commit.requestDigest,
+    decodedBytes: commit.decodedBytes,
+    encodedBytes: commit.encodedBytes,
+    encoding: commit.encoding,
+    partCount: commit.partCount,
+  }]);
+  await harness.settleUntil(() => [...harness.hostFrames.values()].some(
+    frame => frame.kind === "request_start" && frame.requestId === commit.requestId,
+  ));
+  harness.publish([{
+    kind: "request_ack",
+    requestId: commit.requestId,
+    requestDigest: commit.requestDigest,
+    committed: true,
+  }, {
+    kind: "upstream_prelude",
+    requestId: commit.requestId,
+    status: 200,
+    contentType: "text/event-stream",
+    upstreamRequestId: null,
+  }]);
+  await harness.settle();
+  return pending;
+}
+
+function segmentedEvent(
+  requestId: string,
+  data = "x".repeat(512),
+): SidecarFrame[] {
+  const bytes = utf8Bytes(data);
+  const partBytes = 64;
+  const partCount = Math.ceil(bytes.byteLength / partBytes);
+  return Array.from({ length: partCount }, (_, partIndex) => {
+    const offset = partIndex * partBytes;
+    return {
+      kind: "response_event" as const,
+      requestId,
+      eventIndex: 0,
+      event: "response.output_text.delta",
+      partIndex,
+      partCount,
+      offset,
+      dataBase64Url: base64UrlEncode(bytes.subarray(offset, offset + partBytes)),
+    };
+  });
+}
+
+async function contendingJumboSessions(controller?: AbortController) {
+  const pool = new AtomicBytePermitPool({
+    ordinaryBytes: 4 * 1024 * 1024,
+    jumboBytes: 2 * 1024 * 1024,
+  });
+  const options = {
+    binding: R2_BINDING,
+    maxResponseBytes: 4_096,
+    maxBufferedResponseBytes: 160,
+    eventMemoryPool: pool,
+  } as const;
+  const first = new TransportHarness(options);
+  const second = new TransportHarness(options);
+  await Promise.all([first.start(), second.start()]);
+  const [firstHandle, secondHandle] = await Promise.all([
+    commitR2(first, first.session.run(BODY)),
+    commitR2(second, second.session.run(BODY, controller?.signal)),
+  ]);
+  const firstFinal = firstHandle.final.catch(error => error);
+  const secondFinal = secondHandle.final.catch(error => error);
+
+  first.publish(segmentedEvent(first.requestIdentity().requestId));
+  await first.settleUntil(() => pool.snapshot().jumboActive);
+  second.publish(segmentedEvent(second.requestIdentity().requestId));
+  await second.settleUntil(() => pool.snapshot().promotionWaiters === 1);
+
+  return {
+    pool,
+    first,
+    second,
+    firstHandle,
+    secondHandle,
+    firstFinal,
+    secondFinal,
+  };
 }
 
 describe("V2TransportSession", () => {
@@ -2211,6 +2320,55 @@ describe("V2TransportSession", () => {
     await expect(handle.final).rejects.toMatchObject({ committed: true, code: "closed" });
   });
 
+  it("suspends sidecar recovery without waiting on a full client event buffer", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    harness.publish([0, 1].map(eventIndex => ({
+      kind: "response_event" as const,
+      requestId,
+      eventIndex,
+      event: "response.output_text.delta",
+      partIndex: 0,
+      partCount: 1,
+      offset: 0,
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+    })));
+    await harness.settle();
+
+    const token = await Promise.race([
+      harness.session.suspendSidecarRecovery("test-client-backpressure"),
+      Bun.sleep(1_000).then(() => {
+        throw new Error("sidecar recovery remained blocked on client delivery");
+      }),
+    ]);
+    await expect(handle.final).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "sidecar_recovery",
+    });
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      waiters: 0,
+    });
+
+    harness.session.failSidecarRecovery(token, new Error("test recovery cleanup"));
+    await harness.close();
+    pool.close();
+  });
+
   it("shares one event pool across sessions without letting slow A block B", async () => {
     const pool = new AtomicBytePermitPool({
       ordinaryBytes: 3 * 1024 * 1024,
@@ -2274,6 +2432,291 @@ describe("V2TransportSession", () => {
     await a.close();
     await b.close();
     pool.close();
+  });
+
+  it("backpressures a second jumbo event until the shared FIFO lane is released", async () => {
+    const value = await contendingJumboSessions();
+    expect(value.pool.snapshot()).toMatchObject({
+      jumboActive: true,
+      promotionWaiters: 1,
+      waiters: 1,
+      activePermits: 2,
+    });
+    expect(await promiseState(value.secondHandle.final)).toBe("pending");
+    expect(value.second.session.snapshot().connected).toBe(true);
+
+    const firstEvents = value.firstHandle.events();
+    await expect(firstEvents.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: "response.output_text.delta", data: "x".repeat(512) },
+    });
+    await firstEvents.return(undefined);
+
+    await value.second.settleUntil(() => {
+      const snapshot = value.pool.snapshot();
+      return snapshot.promotionWaiters === 0 && snapshot.jumboActive;
+    });
+    const secondEvents = value.secondHandle.events();
+    await expect(secondEvents.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: "response.output_text.delta", data: "x".repeat(512) },
+    });
+    await secondEvents.return(undefined);
+    expect(value.pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      waiters: 0,
+    });
+
+    await Promise.all([value.first.close(), value.second.close()]);
+    await Promise.all([value.firstFinal, value.secondFinal]);
+    value.pool.close();
+  });
+
+  it("fails closed instead of self-deadlocking on multiple reordered jumbo events", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    const jumboItem = {
+      event: "response.output_text.delta",
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(512))),
+    };
+    harness.publish([{
+      kind: "response_batch",
+      requestId,
+      firstEventIndex: 1,
+      items: [jumboItem, jumboItem],
+    }]);
+    await harness.settle();
+
+    await expect(Promise.race([
+      handle.final,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("reordered jumbo events deadlocked the request tail");
+      }),
+    ])).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "event_memory_capacity",
+    });
+    await harness.settle();
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      waiters: 0,
+    });
+
+    await harness.close();
+    pool.close();
+  });
+
+  it("rejects a repeated reordered jumbo index before waiting on its own permit", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      maxResponseBytes: 4_096,
+      maxBufferedResponseBytes: 160,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    const repeated = {
+      kind: "response_batch" as const,
+      requestId,
+      firstEventIndex: 1,
+      items: [{
+        event: "response.output_text.delta",
+        dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(512))),
+      }],
+    };
+    harness.publish([repeated, repeated]);
+    await harness.settle();
+
+    await expect(Promise.race([
+      handle.final,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("repeated jumbo index waited on its own retained permit");
+      }),
+    ])).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "response_conflict",
+    });
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      waiters: 0,
+    });
+
+    await harness.close();
+    pool.close();
+  });
+
+  it("fails closed instead of waiting behind retained reordered ordinary events", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 1_100_000,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      maxResponseBytes: 64 * 1024,
+      maxBufferedResponseBytes: 1_024,
+      eventMemoryPool: pool,
+    });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    const requestId = harness.requestIdentity().requestId;
+    const ordinaryItem = {
+      event: "response.output_text.delta",
+      dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(512))),
+    };
+    harness.publish([{
+      kind: "response_batch",
+      requestId,
+      firstEventIndex: 1,
+      items: Array.from({ length: 16 }, () => ordinaryItem),
+    }]);
+    await harness.settle();
+
+    await expect(Promise.race([
+      handle.final,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("reordered ordinary events deadlocked the request tail");
+      }),
+    ])).rejects.toMatchObject({
+      committed: true,
+      ambiguous: true,
+      code: "event_memory_capacity",
+    });
+    expect(pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+      waiters: 0,
+    });
+
+    await harness.close();
+    pool.close();
+  });
+
+  it("keeps a cancelled jumbo waiter safe until its accepted frame can drain", async () => {
+    const controller = new AbortController();
+    const value = await contendingJumboSessions(controller);
+
+    controller.abort();
+    await expect(value.secondFinal).resolves.toMatchObject({
+      code: "cancelled",
+      committed: true,
+      ambiguous: true,
+    });
+    expect(value.second.session.snapshot()).toMatchObject({
+      connected: true,
+      quarantined: 1,
+    });
+    // Client cancellation settles immediately, but an already-accepted frame
+    // must retain its FIFO place until it can be hashed and acknowledged.
+    expect(value.pool.snapshot()).toMatchObject({ promotionWaiters: 1 });
+
+    const firstEvents = value.firstHandle.events();
+    await firstEvents.next();
+    await firstEvents.return(undefined);
+    await value.second.settleUntil(() => {
+      const snapshot = value.pool.snapshot();
+      return snapshot.promotionWaiters === 0 && !snapshot.jumboActive;
+    });
+    expect(value.pool.snapshot()).toMatchObject({
+      activePermits: 0,
+      ordinaryUsedBytes: 0,
+      jumboUsedBytes: 0,
+    });
+
+    value.second.publish([{
+      kind: "request_cancelled",
+      requestId: value.second.requestIdentity().requestId,
+    }]);
+    await value.second.settle();
+    expect(value.second.session.snapshot()).toMatchObject({
+      connected: true,
+      quarantined: 0,
+    });
+
+    await Promise.all([value.first.close(), value.second.close()]);
+    await value.firstFinal;
+    value.pool.close();
+  });
+
+  it("aborts a queued jumbo promotion before close joins frame processing", async () => {
+    const value = await contendingJumboSessions();
+    await expect(Promise.race([
+      value.second.session.close(),
+      Bun.sleep(1_000).then(() => { throw new Error("close waited on the occupied jumbo lane"); }),
+    ])).resolves.toBeUndefined();
+    await expect(value.secondFinal).resolves.toMatchObject({ code: "closed" });
+    expect(value.pool.snapshot()).toMatchObject({
+      promotionWaiters: 0,
+      waiters: 0,
+      activePermits: 1,
+      ordinaryUsedBytes: 0,
+      jumboActive: true,
+    });
+
+    const firstEvents = value.firstHandle.events();
+    await firstEvents.next();
+    await firstEvents.return(undefined);
+    await Promise.all([value.first.close(), value.second.close()]);
+    await value.firstFinal;
+    expect(value.pool.snapshot()).toMatchObject({ activePermits: 0, waiters: 0 });
+    value.pool.close();
+  });
+
+  it("aborts a queued jumbo promotion before sidecar recovery snapshots its prefix", async () => {
+    const value = await contendingJumboSessions();
+    const capsule = await Promise.race([
+      value.second.session.suspendSidecarRecovery("test-jumbo-contention"),
+      Bun.sleep(1_000).then(() => {
+        throw new Error("sidecar recovery waited on the occupied jumbo lane");
+      }),
+    ]);
+    expect(value.pool.snapshot()).toMatchObject({
+      promotionWaiters: 0,
+      waiters: 0,
+      activePermits: 1,
+      ordinaryUsedBytes: 0,
+      jumboActive: true,
+    });
+    expect(await promiseState(value.secondHandle.final)).toBe("pending");
+
+    value.second.session.failSidecarRecovery(capsule, new Error("test recovery cleanup"));
+    await expect(value.secondFinal).resolves.toMatchObject({
+      code: "sidecar_recovery_failed",
+      committed: true,
+      ambiguous: true,
+    });
+
+    const firstEvents = value.firstHandle.events();
+    await firstEvents.next();
+    await firstEvents.return(undefined);
+    await Promise.all([value.first.close(), value.second.close()]);
+    await value.firstFinal;
+    expect(value.pool.snapshot()).toMatchObject({ activePermits: 0, waiters: 0 });
+    value.pool.close();
   });
 
   it("releases an incomplete event assembly permit on session close", async () => {
@@ -2851,7 +3294,7 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
-  it("keeps sub-bulk inline base64 off the compression workers", async () => {
+  it("keeps latency-critical inline base64 off the compression workers", async () => {
     let gzipCalls = 0;
     const harness = new TransportHarness({
       gzip: async bytes => {
@@ -2878,6 +3321,193 @@ describe("V2TransportSession", () => {
     await harness.commit(pending);
     await harness.close();
   });
+
+  it("uses balanced gzip for aggregate inline images below the per-string threshold", async () => {
+    let state = 0x71c0ffee;
+    const raw = new Uint8Array(8 * 45_000);
+    for (let index = 0; index < raw.length; index++) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      raw[index] = state & 0xff;
+    }
+    const imageUrls = Array.from({ length: 8 }, (_, index) => (
+      `data:image/png;base64,${Buffer.from(
+        raw.subarray(index * 45_000, (index + 1) * 45_000),
+      ).toString("base64")}`
+    ));
+    expect(imageUrls.every(value => value.length < 64 * 1024)).toBe(true);
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{
+        role: "user",
+        content: imageUrls.map(image_url => ({ type: "input_image", image_url })),
+      }],
+      stream: true,
+    };
+    const canonical = utf8Bytes(canonicalJson({ ...body, store: true }));
+    expect(canonical.byteLength).toBeGreaterThan(V2_LATENCY_CRITICAL_REQUEST_BYTES);
+
+    const priorities: Array<V2GzipOptions["priority"]> = [];
+    const controller = new AbortController();
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      gzip: async (input, options) => {
+        priorities.push(options?.priority);
+        const level = options?.priority === "bulk" ? 6 : 1;
+        return Uint8Array.from(nodeGzipSync(input, { level }));
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run(body, controller.signal);
+    try {
+      await harness.settleUntil(() => [...harness.hostFrames.values()].some(
+        frame => frame.kind === "request_open",
+      ));
+      const open = [...harness.hostFrames.values()].find(
+        (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+          frame.kind === "request_open"
+        ),
+      )!;
+      expect(open).toMatchObject({
+        decodedBytes: canonical.byteLength,
+        encoding: "gzip+base64",
+      });
+      expect(open.encodedBytes).toBeLessThan(canonical.byteLength * 0.8);
+      expect(open.partCount).toBeLessThan(
+        Math.ceil(canonical.byteLength / V2_R2_REQUEST_PART_BYTES),
+      );
+      expect(priorities).toEqual(["bulk", "bulk"]);
+
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({
+        code: "cancelled_precommit",
+        committed: false,
+      });
+      await harness.settleUntil(() => {
+        const snapshot = harness.session.snapshot();
+        return snapshot.active === 0 && snapshot.queued === 0 && snapshot.preparing === 0;
+      });
+    } finally {
+      controller.abort();
+      await Promise.allSettled([pending]);
+      await harness.close();
+    }
+  }, 15_000);
+
+  it("uses balanced gzip losslessly for an exact medium inline image and releases admission", async () => {
+    const targetBytes = 1_494_771;
+    let state = 0x5eed1234;
+    const imageBytes = new Uint8Array(1_120_000);
+    for (let index = 0; index < imageBytes.length; index++) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      imageBytes[index] = state & 0xff;
+    }
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{
+        role: "user",
+        content: [{
+          type: "input_image",
+          image_url: `data:image/png;base64,${Buffer.from(imageBytes).toString("base64")}`,
+        }],
+      }],
+      metadata: { padding: "" },
+      stream: true,
+    };
+    let canonical = utf8Bytes(canonicalJson({ ...body, store: true }));
+    const paddingBytes = targetBytes - canonical.byteLength;
+    expect(paddingBytes).toBeGreaterThanOrEqual(0);
+    body.metadata.padding = "x".repeat(paddingBytes);
+    canonical = utf8Bytes(canonicalJson({ ...body, store: true }));
+    expect(canonical.byteLength).toBe(targetBytes);
+
+    const priorities: Array<V2GzipOptions["priority"]> = [];
+    const levels: number[] = [];
+    const controller = new AbortController();
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      gzip: async (input, options) => {
+        const level = options?.priority === "bulk" ? 6 : 1;
+        priorities.push(options?.priority);
+        levels.push(level);
+        return Uint8Array.from(nodeGzipSync(input, { level }));
+      },
+    });
+    await harness.start();
+    const pending = harness.session.run(body, controller.signal);
+    try {
+      await harness.settleUntil(() => [...harness.hostFrames.values()].some(
+        frame => frame.kind === "request_open",
+      ));
+      const open = [...harness.hostFrames.values()].find(
+        (frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_open" }> => (
+          frame.kind === "request_open"
+        ),
+      )!;
+      expect(open).toMatchObject({
+        decodedBytes: targetBytes,
+        encoding: "gzip+base64",
+      });
+      expect(open.encodedBytes).toBeLessThan(targetBytes * 0.8);
+      expect(open.partCount).toBeLessThan(
+        Math.ceil(targetBytes / V2_R2_REQUEST_PART_BYTES),
+      );
+      expect(priorities).toEqual(["bulk", "bulk"]);
+      expect(levels).toEqual([6, 6]);
+
+      for (let round = 0; round < 64; round++) {
+        if ([...harness.hostFrames.values()].some(frame => (
+          frame.kind === "request_commit" && frame.requestId === open.requestId
+        ))) break;
+        harness.publish([]);
+        await harness.settle();
+      }
+      const commit = [...harness.hostFrames.values()].find(
+        (frame): frame is ReliableFrame<R2RequestCommitFrame> => (
+          frame.kind === "request_commit" && frame.requestId === open.requestId
+        ),
+      )!;
+      expect(commit).toBeDefined();
+      expect(commit.requestDigest).toBe(await sha256Hex(canonical));
+      const data = [...harness.hostFrames.values()]
+        .filter((frame): frame is Extract<ReliableFrame<HostFrame>, { kind: "request_data" }> => (
+          frame.kind === "request_data" && frame.requestId === open.requestId
+        ))
+        .sort((left, right) => left.partIndex - right.partIndex);
+      expect(data).toHaveLength(open.partCount);
+      const encoded = Buffer.concat(data.map(frame => Buffer.from(
+        base64UrlDecode(frame.dataBase64Url),
+      )));
+      expect(encoded.byteLength).toBe(open.encodedBytes);
+      expect(Buffer.compare(Buffer.from(gunzipSync(encoded)), Buffer.from(canonical))).toBe(0);
+
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({
+        code: "cancelled_precommit",
+        committed: false,
+      });
+      await harness.settleUntil(() => {
+        const snapshot = harness.session.snapshot();
+        return snapshot.active === 0 && snapshot.queued === 0 && snapshot.preparing === 0;
+      });
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true,
+        active: 0,
+        preparing: 0,
+        queued: 0,
+        transferCredits: 6,
+      });
+    } finally {
+      controller.abort();
+      await Promise.allSettled([pending]);
+      await harness.close();
+    }
+  }, 15_000);
 
   it("recovers base64 expansion for a large high-entropy inline image", async () => {
     let state = 0x12345678;

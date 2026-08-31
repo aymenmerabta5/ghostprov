@@ -56,6 +56,18 @@ describe("ObservabilityLogger", () => {
       },
       websocket: {
         activeSessions: 8,
+        closedSessions: 5,
+        closedActiveResponses: 4,
+        closeCauses: {
+          remote_close: 5,
+          heartbeat_timeout: 0,
+          delivery_error: 0,
+          protocol_error: 0,
+          server_shutdown: 0,
+          idle_timeout: 0,
+          ingress_capacity: 0,
+          socket_error: 0,
+        },
         pendingRequests: 2,
         ingressReservedBytes: 136 * 1024 * 1024,
         ingressReservedBytesPeak: 160 * 1024 * 1024,
@@ -83,6 +95,9 @@ describe("ObservabilityLogger", () => {
       traffic: { requests_per_second: 20, total_p95_ms: 1_000 },
       websocket: {
         active_sessions: 8,
+        closed_sessions: 5,
+        closed_active_responses: 4,
+        close_causes: { remote_close: 5 },
         ingress_promotions: 1,
         ingress_guaranteed_sessions: 27,
         ingress_parser_rejections: 1,

@@ -113,6 +113,33 @@ describe("V2RunHandle", () => {
     await expect(events.next()).resolves.toEqual({ value: undefined, done: true });
   });
 
+  it("interrupts a blocked delivery wait without permanently closing the handle", async () => {
+    const handle = new V2RunHandle({ maxBufferedBytes: 160 });
+    const first = { event: "delta", data: "a".repeat(100) };
+    const second = { event: "delta", data: "b".repeat(100) };
+    const controller = new AbortController();
+    const interruption = new Error("recovery boundary");
+
+    await handle.acceptEvent(first);
+    const blocked = handle.acceptEvent(
+      second,
+      undefined,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+    expect(await promiseState(blocked)).toBe("pending");
+    controller.abort(interruption);
+    await expect(blocked).rejects.toBe(interruption);
+
+    const events = handle.events();
+    await expect(events.next()).resolves.toEqual({ value: first, done: false });
+    await expect(handle.acceptEvent(second)).resolves.toBeUndefined();
+    handle.settle({ id: "resp_1", status: "completed" });
+    await expect(events.next()).resolves.toEqual({ value: second, done: false });
+    await expect(events.next()).resolves.toEqual({ value: undefined, done: true });
+  });
+
   it("admits an event above the soft buffer only with transferred jumbo coverage", async () => {
     const handle = new V2RunHandle({
       maxBufferedBytes: 32,
