@@ -84,6 +84,29 @@ describe("workload classification", () => {
     expect(workload).not.toHaveProperty("serializedBody");
   });
 
+  it("budgets a single 4K RGBA data-url request below the V2 body ceiling", () => {
+    const rawImageBytes = 3_840 * 2_160 * 4;
+    const base64Bytes = 4 * Math.ceil(rawImageBytes / 3);
+    const requestBytes = base64Bytes + 4 * 1024;
+    const workload = classifyWorkload({
+      model: "gpt-5.6-sol",
+      input: [{ role: "user", content: [{ type: "input_image" }] }],
+      stream: true,
+    }, {
+      encodedBytes: requestBytes,
+      structuralBytes: requestBytes,
+    });
+
+    expect(requestBytes).toBeLessThan(64 * MiB);
+    expect(workload).toEqual({
+      class: "text-large",
+      requestBytes,
+      reservedBytes: requestBytes * 6 + 4 * MiB,
+      stream: true,
+      model: "gpt-5.6-sol",
+    });
+  });
+
   it("never trusts a shorter wire spelling than canonical structural JSON", () => {
     const body = { model: "gpt-5.6-sol", input: Array(1_000).fill(1e-6) };
     const canonicalBytes = Buffer.byteLength(JSON.stringify(body), "utf8");

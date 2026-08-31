@@ -53,6 +53,31 @@ function asWorker(worker: FakeWorker): Worker {
 }
 
 describe("CpuTransformPool", () => {
+  it("recovers inline-image base64 expansion for bulk request transport", async () => {
+    let state = 0x5eed1234;
+    const imageBytes = new Uint8Array(512 * 1024);
+    for (let index = 0; index < imageBytes.length; index++) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      imageBytes[index] = state & 0xff;
+    }
+    const payload = new TextEncoder().encode(JSON.stringify({
+      type: "input_image",
+      image_url: `data:image/png;base64,${Buffer.from(imageBytes).toString("base64")}`,
+    }));
+    const pool = new CpuTransformPool({ workers: 1 });
+
+    try {
+      const compressed = await pool.gzip(payload, { priority: "bulk" });
+
+      expect(compressed.byteLength).toBeLessThan(payload.byteLength * 0.8);
+      expect(new Uint8Array(gunzipSync(compressed))).toEqual(payload);
+    } finally {
+      await pool.close();
+    }
+  });
+
   it("runs compression away from the main event loop with bounded workers", async () => {
     const pool = new CpuTransformPool({ workers: 2 });
     const payloads = Array.from({ length: 6 }, (_, index) => new TextEncoder().encode(`payload-${index}-`.repeat(80_000)));

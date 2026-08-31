@@ -30,7 +30,11 @@ export interface CpuTransformJobOptions {
   signal?: AbortSignal;
   /** Total time in the queue and worker. */
   timeoutMs?: number;
-  /** Latency work may use every worker; bulk work leaves one worker reserved. */
+  /**
+   * Latency work may use every worker and favors fast gzip. Bulk work leaves
+   * one worker reserved and uses balanced gzip so inline-image base64 does not
+   * cross the V2 transport almost uncompressed on Bun.
+   */
   priority?: "latency" | "bulk";
 }
 
@@ -489,7 +493,12 @@ export class CpuTransformPool {
               throw new TypeError("CPU transform input is not transferable");
             }
             worker.postMessage(
-              { id: job.id, operation: "gzip", data: job.data },
+              {
+                id: job.id,
+                operation: "gzip",
+                data: job.data,
+                priority: job.priority,
+              },
               [job.data.buffer],
             );
           } catch (error) {
