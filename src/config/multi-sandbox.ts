@@ -63,6 +63,8 @@ export interface MultiSandboxConfig {
   v2SidecarProjectRevisions: Readonly<Record<string, V2SidecarRevision>>;
   desiredSandboxes: number;
   provisionConcurrency: number;
+  /** Separate ceiling for projects which have never reached verified readiness. */
+  coldStartConcurrency: number;
   /** Null selects the identity-scoped ~/.ghostprov/fleets/<fingerprint> path. */
   fleetManifestFile: string | null;
   /** Repeated identical project-local failures required before replacement. */
@@ -329,6 +331,13 @@ export function resolveMultiSandboxConfig(
     desiredSandboxes,
     positiveInteger(env.GP_PROVISION_CONCURRENCY, 4, "GP_PROVISION_CONCURRENCY"),
   );
+  const coldStartConcurrency = boundedPositiveInteger(
+    env.GP_COLD_START_CONCURRENCY,
+    Math.min(2, provisionConcurrency),
+    "GP_COLD_START_CONCURRENCY",
+    1,
+    provisionConcurrency,
+  );
   const v2HostEventMemory = deriveV2HostEventMemorySizing({
     responseMaxBytes: v2ResponseMaxBytes,
     runtimes: desiredSandboxes,
@@ -366,6 +375,7 @@ export function resolveMultiSandboxConfig(
     v2SidecarProjectRevisions: v2SidecarRevisionOverrides,
     desiredSandboxes,
     provisionConcurrency,
+    coldStartConcurrency,
     fleetManifestFile: env.GP_FLEET_MANIFEST_FILE?.trim()
       ? path.resolve(env.GP_FLEET_MANIFEST_FILE.trim())
       : null,

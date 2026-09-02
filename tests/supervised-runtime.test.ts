@@ -15,6 +15,7 @@ import {
 } from "../src/sandbox/supervised-runtime";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import { FleetStartupPermitPool } from "../src/fleet/startup-permits";
 
 const PROJECT = projectId("00000000-0000-4000-8000-000000000042");
 
@@ -992,6 +993,51 @@ describe("SupervisedSandboxRuntime", () => {
 });
 
 describe("supervisor recovery utilities", () => {
+  it("limits never-ready cold starts without blocking warm recovery headroom", async () => {
+    const transitions: Array<{
+      action: string;
+      coldStart: boolean;
+      coldInUse: number;
+      totalInUse: number;
+    }> = [];
+    const pool = new FleetStartupPermitPool(4, 2, {
+      onTransition: transition => transitions.push({
+        action: transition.action,
+        coldStart: transition.coldStart,
+        coldInUse: transition.snapshot.cold.inUse,
+        totalInUse: transition.snapshot.total.inUse,
+      }),
+    });
+    const coldA = await pool.acquire(true);
+    const coldB = await pool.acquire(true);
+    const waitingCold = pool.acquire(true);
+    const warmA = await pool.acquire(false);
+    const warmB = await pool.acquire(false);
+    expect(pool.snapshot()).toEqual({
+      total: { limit: 4, inUse: 4, queued: 0 },
+      cold: { limit: 2, inUse: 2, queued: 1 },
+    });
+
+    warmA();
+    warmB();
+    coldA();
+    const coldC = await waitingCold;
+    expect(pool.snapshot()).toEqual({
+      total: { limit: 4, inUse: 2, queued: 0 },
+      cold: { limit: 2, inUse: 2, queued: 0 },
+    });
+    coldB();
+    coldC();
+    expect(pool.snapshot()).toEqual({
+      total: { limit: 4, inUse: 0, queued: 0 },
+      cold: { limit: 2, inUse: 0, queued: 0 },
+    });
+    expect(Math.max(...transitions.map(value => value.coldInUse))).toBe(2);
+    expect(Math.max(...transitions.map(value => value.totalInUse))).toBe(4);
+    expect(transitions.filter(value => value.action === "acquired" && value.coldStart))
+      .toHaveLength(3);
+  });
+
   it("uses bounded exponential jitter", () => {
     expect(sandboxRecoveryBackoffMs(1, 1_000, 60_000, () => 0)).toBe(1_000);
     expect(sandboxRecoveryBackoffMs(2, 1_000, 60_000, () => 1)).toBe(2_400);

@@ -136,6 +136,7 @@ describe("multi-sandbox configuration", () => {
     expect(config.desiredSandboxes).toBe(8);
     expect(config.fleetManifestFile).toBeNull();
     expect(config.projectReplacementFailureThreshold).toBe(3);
+    expect(config.coldStartConcurrency).toBe(2);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
     expect(config.shutdownDrainMs).toBe(300_000);
@@ -247,6 +248,13 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       GP_PROJECT_REPLACEMENT_FAILURES: "2",
     }, MACHINE)).toThrow("GP_PROJECT_REPLACEMENT_FAILURES");
+    expect(() => resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      GP_TARGET_SANDBOXES: "4",
+      GP_PROVISION_CONCURRENCY: "2",
+      GP_COLD_START_CONCURRENCY: "3",
+    }, MACHINE)).toThrow("GP_COLD_START_CONCURRENCY");
   });
 
   it("bounds transport-active capacity below the physical engine ceiling", () => {

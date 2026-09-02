@@ -11,6 +11,80 @@ export type FleetWorkerState =
 
 export type FleetRetirementReason = "replacement" | "missing" | "surplus";
 
+export type FleetReplacementFailureKind = "hello" | "readiness" | "render" | "timeout";
+
+export type FleetMutationOperation = "replace" | "create" | "delete";
+
+export type FleetMutationBlockReason =
+  | "release_policy"
+  | "recovery_circuit"
+  | "mutation_backoff"
+  | "runtime_missing"
+  | "runtime_healthy"
+  | "work_in_flight"
+  | "continuation_binding"
+  | "healthy_majority"
+  | "project_client"
+  | "control_plane";
+
+/** Content-free fleet transitions suitable for bounded observability. */
+export type FleetLifecycleEvent =
+  | {
+      type: "replacement_qualified";
+      projectId: ProjectId;
+      workerIndex: number;
+      leaderGeneration: number;
+      failureKind: FleetReplacementFailureKind;
+      failureCount: number;
+    }
+  | {
+      type: "replacement_started";
+      projectId: ProjectId;
+      workerIndex: number;
+      leaderGeneration: number;
+      failureKind: FleetReplacementFailureKind;
+      failureCount: number;
+    }
+  | {
+      type: "successor_reserved" | "successor_created";
+      projectId: ProjectId;
+      workerIndex: number;
+    }
+  | {
+      type: "successor_activated";
+      projectId: ProjectId;
+      workerIndex: number;
+      leaderGeneration: number;
+    }
+  | {
+      type: "old_retired";
+      projectId: ProjectId;
+      workerIndex: number;
+      retirementReason: Exclude<FleetRetirementReason, "surplus">;
+      managed: boolean;
+    }
+  | {
+      type: "mutation_blocked";
+      projectId: ProjectId;
+      workerIndex: number;
+      operation: FleetMutationOperation;
+      reason: FleetMutationBlockReason;
+    };
+
+export interface FleetReplacementEvidence {
+  /** SHA-256 of fixed, credential-free failure atoms; never a raw message. */
+  signatureHash: string;
+  kind: FleetReplacementFailureKind;
+  count: number;
+  firstObservedAtMs: number;
+  lastObservedAtMs: number;
+  lastAttempt: number;
+  lastIncarnation: number;
+  /** Durable generation identity used to ignore a replayed supervisor callback. */
+  lastLeaderGeneration: number;
+  totalDurationMs: number;
+}
+
 export interface FleetWorkerRecord {
   index: number;
   projectId: ProjectId;
@@ -19,8 +93,11 @@ export interface FleetWorkerRecord {
   createdAtMs: number;
   updatedAtMs: number;
   leaderGeneration: number;
+  /** Monotonic readiness proof; unlike `state`, failure never resets it. */
+  hasReachedReady: boolean;
   managed: boolean;
   retirementReason: FleetRetirementReason | null;
+  replacementEvidence: FleetReplacementEvidence | null;
 }
 
 export interface ManagedProjectInspection {
@@ -44,6 +121,8 @@ export interface ManagedRuntimeFactory {
     projectId: ProjectId;
     workerIndex: number;
     leaderGeneration: number;
+    /** True only when the manifest proves this project was previously ready. */
+    previouslyReady?: boolean;
   }): RoutableSandboxRuntime;
 }
 

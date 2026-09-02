@@ -6,7 +6,7 @@ import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
 import type { Clock, MachineSample } from "../src/core/ports";
 import { ProjectFleetManager } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
-import type { ManagedRuntimeFactory } from "../src/fleet/types";
+import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../src/fleet/types";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
   SandboxRegistry,
@@ -59,6 +59,7 @@ function recoveryRetry(
   projectId: ProjectId,
   consecutiveFailures: number,
   kind = "timeout",
+  leaderGeneration = consecutiveFailures,
 ): SandboxSupervisorEvent {
   return {
     type: "retry_scheduled",
@@ -68,6 +69,7 @@ function recoveryRetry(
     reason: "start",
     attempt: consecutiveFailures,
     incarnation: consecutiveFailures,
+    leaderGeneration,
     consecutiveFailures,
     retryDelayMs: 1_000,
     attemptDurationMs: 70_000,
@@ -79,6 +81,22 @@ function recoveryRetry(
       operation: "bootstrap",
       message: `Sidecar bootstrap ${kind} failure`,
     },
+  };
+}
+
+function recoveryCompleted(projectId: ProjectId): SandboxSupervisorEvent {
+  return {
+    type: "completed",
+    projectId,
+    workerIndex: 1,
+    transport: "v2",
+    reason: "start",
+    attempt: 1,
+    incarnation: 1,
+    consecutiveFailures: 0,
+    attemptDurationMs: 1,
+    totalDurationMs: 1,
+    failure: null,
   };
 }
 
@@ -267,12 +285,55 @@ class FakeRuntime implements RoutableSandboxRuntime {
 }
 
 class FakeFactory implements ManagedRuntimeFactory {
-  readonly created: Array<{ projectId: ProjectId; workerIndex: number; leaderGeneration: number }> = [];
+  readonly created: Array<{
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+    previouslyReady?: boolean;
+  }> = [];
   readonly runtimes = new Map<ProjectId, FakeRuntime>();
 
-  create(input: { projectId: ProjectId; workerIndex: number; leaderGeneration: number }): FakeRuntime {
+  create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+    previouslyReady?: boolean;
+  }): FakeRuntime {
     this.created.push(input);
     const runtime = new FakeRuntime(input.projectId);
+    this.runtimes.set(input.projectId, runtime);
+    return runtime;
+  }
+}
+
+class CompletionEventRuntime extends FakeRuntime {
+  stops = 0;
+
+  constructor(project: ProjectId, readonly onReady: () => void) {
+    super(project);
+  }
+
+  override async start(): Promise<void> {
+    await super.start();
+    this.onReady();
+  }
+
+  override async stop(): Promise<void> {
+    this.stops++;
+    await super.stop();
+  }
+}
+
+class CompletionEventFactory extends FakeFactory {
+  onReady: () => void = () => {};
+
+  override create(input: {
+    projectId: ProjectId;
+    workerIndex: number;
+    leaderGeneration: number;
+  }): CompletionEventRuntime {
+    this.created.push(input);
+    const runtime = new CompletionEventRuntime(input.projectId, () => this.onReady());
     this.runtimes.set(input.projectId, runtime);
     return runtime;
   }
@@ -593,6 +654,7 @@ function manager(input: {
   randomUuid?: () => string;
   recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
   canRetireProject?: (projectId: ProjectId) => boolean;
+  onLifecycleEvent?: (event: FleetLifecycleEvent) => void;
 }) {
   const factory = input.factory ?? new FakeFactory();
   const registry = input.registry ?? new SandboxRegistry();
@@ -615,6 +677,7 @@ function manager(input: {
       runtimeCleanupTimeoutMs: input.runtimeCleanupTimeoutMs,
       recoveryCircuitSnapshot: input.recoveryCircuitSnapshot,
       canRetireProject: input.canRetireProject,
+      onLifecycleEvent: input.onLifecycleEvent,
     }),
   };
 }
@@ -652,6 +715,59 @@ async function waitForCondition(
 }
 
 describe("ProjectFleetManager", () => {
+  it("does not let a completed recovery wake cancel its own active reconciliation", async () => {
+    const files = await state();
+    const projects = new TransportMissingProjects([]);
+    const factory = new CompletionEventFactory();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A], target: 1 }),
+      manifest: files.manifest,
+      projects,
+      factory,
+      retryInitialDelayMs: 1,
+      retryMaxDelayMs: 4,
+    });
+    factory.onReady = () => harness.value.observeRecoveryEvent(recoveryCompleted(A));
+
+    await harness.value.reconcile();
+    projects.remote.push(project(A));
+    await waitForCondition(
+      () => harness.value.snapshot().ready === 1 &&
+        (factory.runtimes.get(A) as CompletionEventRuntime | undefined)?.stops === 0,
+      "stable completed retry",
+      1_000,
+    );
+    await Bun.sleep(20);
+    expect(harness.value.snapshot()).toMatchObject({ ready: 1, unavailable: 0 });
+    expect((factory.runtimes.get(A) as CompletionEventRuntime).stops).toBe(0);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("keeps a previously ready failed project on the warm recovery lane", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "worker 1",
+      nowMs: 1,
+    });
+    await files.manifest.markCreated(A, 2);
+    await files.manifest.markState(A, "ready", 3);
+    await files.manifest.markState(A, "failed", 4);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 1 }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+    });
+
+    await harness.value.reconcile();
+    expect(harness.factory.created).toHaveLength(1);
+    expect(harness.factory.created[0]?.previouslyReady).toBe(true);
+    await harness.value.shutdown("test-complete");
+  });
+
   it("creates a project-less fleet once and restarts from the manifest without environment IDs", async () => {
     const files = await state();
     const projects = new FakeProjects([]);
@@ -687,12 +803,14 @@ describe("ProjectFleetManager", () => {
   it("replaces a conclusively failed managed project only after identical local failures", async () => {
     const files = await state();
     const projects = new FakeProjects([]);
+    const lifecycle: FleetLifecycleEvent[] = [];
     const harness = manager({
       config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
       manifest: files.manifest,
       projects,
       randomUuid: uuidSequence(A, B, C, D, E),
       canRetireProject: () => true,
+      onLifecycleEvent: event => lifecycle.push(event),
     });
     await harness.value.reconcile();
     const failed = harness.factory.runtimes.get(A)!;
@@ -705,8 +823,8 @@ describe("ProjectFleetManager", () => {
     expect(projects.created).toHaveLength(4);
     expect(projects.deleted).toEqual([]);
 
-    harness.value.observeRecoveryEvent(recoveryRetry(A, 2, "hello"));
-    harness.value.observeRecoveryEvent(recoveryRetry(A, 3, "hello"));
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 2, "hello", 4));
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 3, "hello", 5));
     await expect(harness.value.reconcile()).resolves.toMatchObject({
       desired: 4,
       ready: 4,
@@ -716,6 +834,14 @@ describe("ProjectFleetManager", () => {
     expect(projects.deleted).toEqual([A]);
     expect((await files.manifest.load()).workers.map(worker => worker.projectId).sort())
       .toEqual([B, C, D, E].sort());
+    expect(lifecycle.map(event => event.type)).toEqual([
+      "replacement_qualified",
+      "replacement_started",
+      "successor_reserved",
+      "successor_created",
+      "successor_activated",
+      "old_retired",
+    ]);
     await harness.value.shutdown("test-complete");
   });
 
@@ -724,6 +850,7 @@ describe("ProjectFleetManager", () => {
     const projects = new FakeProjects([]);
     let continuationBound = true;
     let circuit = recoveryCircuit("open", "outage");
+    const lifecycle: FleetLifecycleEvent[] = [];
     const harness = manager({
       config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
       manifest: files.manifest,
@@ -731,6 +858,7 @@ describe("ProjectFleetManager", () => {
       randomUuid: uuidSequence(A, B, C, D, E),
       canRetireProject: id => id !== A || !continuationBound,
       recoveryCircuitSnapshot: () => circuit,
+      onLifecycleEvent: event => lifecycle.push(event),
     });
 
     // The open common-mode circuit permits local intent persistence but no
@@ -749,6 +877,12 @@ describe("ProjectFleetManager", () => {
     await harness.value.reconcile();
     expect(projects.created).toHaveLength(4);
     expect(projects.deleted).toEqual([]);
+    expect(lifecycle).toContainEqual(expect.objectContaining({
+      type: "mutation_blocked",
+      projectId: A,
+      operation: "replace",
+      reason: "continuation_binding",
+    }));
 
     continuationBound = false;
     await harness.value.reconcile();
@@ -845,6 +979,76 @@ describe("ProjectFleetManager", () => {
     expect(projects.deleted).toEqual([A]);
     expect((await files.manifest.load()).workers.map(worker => worker.projectId).sort())
       .toEqual([B, C, D, E].sort());
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("cleans an automatic replacement even when older manual surplus records exist", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({
+      index: 4,
+      projectId: D,
+      title: "manual surplus",
+      nowMs: 1,
+      managed: false,
+    });
+    await files.manifest.markCreated(D, 2);
+    await files.manifest.markDraining(D, "surplus", 3);
+    for (const [index, id] of [A, B, C].entries()) {
+      await files.manifest.reserveWorker({
+        index: index + 1,
+        projectId: id,
+        title: `worker ${index + 1}`,
+        nowMs: 10 + index,
+      });
+      await files.manifest.markCreated(id, 20 + index);
+    }
+    await files.manifest.markDraining(A, "replacement", 30);
+    const projects = new FakeProjects([A, B, C, D].map(id => project(id)));
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 2 }),
+      manifest: files.manifest,
+      projects,
+      canRetireProject: () => true,
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 2 });
+    expect(projects.deleted).toEqual([A]);
+    const remaining = await files.manifest.load();
+    expect(remaining.workers.find(worker => worker.projectId === D)).toMatchObject({
+      state: "draining",
+      retirementReason: "surplus",
+    });
+    expect(remaining.workers.some(worker => worker.projectId === A)).toBe(false);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("can replace every failed minority without deadlocking behind the first successor", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    const clock = new BlockingClock();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 5, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(A, B, C, D, E, F, G),
+      canRetireProject: () => true,
+      clock,
+    });
+    await harness.value.reconcile();
+    harness.factory.runtimes.get(A)!.state = "recovering";
+    harness.factory.runtimes.get(B)!.state = "recovering";
+    for (let count = 1; count <= 3; count++) {
+      harness.value.observeRecoveryEvent(recoveryRetry(A, count));
+      harness.value.observeRecoveryEvent(recoveryRetry(B, count));
+    }
+
+    await harness.value.reconcile();
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C, D, E, F]);
+    await harness.value.reconcile();
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C, D, E, F, G]);
+    expect(harness.value.snapshot()).toMatchObject({ desired: 5, ready: 5 });
     await harness.value.shutdown("test-complete");
   });
 

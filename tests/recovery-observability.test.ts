@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   CREDENTIAL_REFRESH_OUTCOMES,
+  FLEET_LIFECYCLE_EVENT_NAMES,
   PRISM_CIRCUIT_SCOPES,
   PRISM_CIRCUIT_STATES,
   RECOVERY_OBSERVABILITY_EVENT_NAMES,
@@ -14,6 +15,7 @@ import {
   normalizeSandboxRecoveryErrorName,
   normalizeSandboxRecoveryOperation,
   observabilityEvent,
+  fleetLifecycleObservabilityEvent,
   recoveryObservabilityEvent,
 } from "../src/observability/events";
 import { assertSafeObservabilityEvent } from "../src/observability/redaction";
@@ -126,6 +128,56 @@ describe("recovery observability schema", () => {
         ))).not.toThrow();
       }
     }
+  });
+
+  it("accepts the fixed fleet replacement and startup-permit vocabulary", () => {
+    const shared = {
+      project_id: PROJECT_ID,
+      worker_index: 3,
+      leader_generation: 7,
+      failure_kind: "readiness" as const,
+      failure_count: 3,
+      retirement_reason: "replacement" as const,
+      managed: true,
+      mutation_operation: "replace" as const,
+      block_reason: "healthy_majority" as const,
+      cold_start: true,
+      permit_action: "acquired" as const,
+      total_limit: 4,
+      total_in_use: 2,
+      total_queued: 0,
+      cold_limit: 2,
+      cold_in_use: 2,
+      cold_queued: 1,
+    };
+    for (const eventName of FLEET_LIFECYCLE_EVENT_NAMES) {
+      expect(() => assertSafeObservabilityEvent(
+        fleetLifecycleObservabilityEvent(eventName, shared),
+      )).not.toThrow();
+    }
+  });
+
+  it("rejects free-form fleet lifecycle categories and overcommitted permits", () => {
+    expect(() => assertSafeObservabilityEvent(observabilityEvent(
+      "fleet.mutation.blocked",
+      {
+        project_id: PROJECT_ID,
+        worker_index: 1,
+        mutation_operation: "replace",
+        block_reason: "SUPER_SECRET_CANARY",
+      },
+    ))).toThrow();
+    expect(() => assertSafeObservabilityEvent(fleetLifecycleObservabilityEvent(
+      "fleet.startup_permits.changed",
+      {
+        cold_start: true,
+        permit_action: "acquired",
+        total_limit: 4,
+        total_in_use: 5,
+        cold_limit: 2,
+        cold_in_use: 2,
+      },
+    ))).toThrow();
   });
 
   it("normalizes dynamic reasons and errors without retaining free-form text", () => {

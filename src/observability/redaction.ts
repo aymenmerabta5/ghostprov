@@ -1,5 +1,11 @@
 import {
   CREDENTIAL_REFRESH_OUTCOMES,
+  FLEET_LIFECYCLE_EVENT_NAMES,
+  FLEET_MUTATION_BLOCK_REASONS,
+  FLEET_MUTATION_OPERATIONS,
+  FLEET_REPLACEMENT_FAILURE_KINDS,
+  FLEET_RETIREMENT_REASONS,
+  FLEET_STARTUP_PERMIT_ACTIONS,
   PRISM_CIRCUIT_SCOPES,
   PRISM_CIRCUIT_STATES,
   RECOVERY_OBSERVABILITY_EVENT_NAMES,
@@ -75,6 +81,25 @@ const RECOVERY_FIELDS = new Set([
   "circuit_scope",
   "queued",
 ]);
+const FLEET_LIFECYCLE_FIELDS = new Set([
+  "project_id",
+  "worker_index",
+  "leader_generation",
+  "failure_kind",
+  "failure_count",
+  "retirement_reason",
+  "managed",
+  "mutation_operation",
+  "block_reason",
+  "cold_start",
+  "permit_action",
+  "total_limit",
+  "total_in_use",
+  "total_queued",
+  "cold_limit",
+  "cold_in_use",
+  "cold_queued",
+]);
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release"]),
   "server.stopping": new Set(["reason", "active", "queued"]),
@@ -92,6 +117,14 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
   "logger.error": new Set(["sink", "error_name", "error_message", "count"]),
+  "fleet.replacement.qualified": FLEET_LIFECYCLE_FIELDS,
+  "fleet.replacement.started": FLEET_LIFECYCLE_FIELDS,
+  "fleet.replacement.successor_reserved": FLEET_LIFECYCLE_FIELDS,
+  "fleet.replacement.successor_created": FLEET_LIFECYCLE_FIELDS,
+  "fleet.replacement.successor_activated": FLEET_LIFECYCLE_FIELDS,
+  "fleet.replacement.old_retired": FLEET_LIFECYCLE_FIELDS,
+  "fleet.mutation.blocked": FLEET_LIFECYCLE_FIELDS,
+  "fleet.startup_permits.changed": FLEET_LIFECYCLE_FIELDS,
   "sandbox.recovery.started": RECOVERY_FIELDS,
   "sandbox.recovery.retry_scheduled": RECOVERY_FIELDS,
   "sandbox.recovery.completed": RECOVERY_FIELDS,
@@ -101,6 +134,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
 };
 
 const RECOVERY_EVENTS = new Set<string>(RECOVERY_OBSERVABILITY_EVENT_NAMES);
+const FLEET_LIFECYCLE_EVENTS = new Set<string>(FLEET_LIFECYCLE_EVENT_NAMES);
 const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RECOVERY_ENUM_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
   transport: new Set(SANDBOX_RECOVERY_TRANSPORTS),
@@ -129,6 +163,24 @@ const RECOVERY_DURATION_FIELDS = new Set([
   "retry_delay_ms",
   "attempt_duration_ms",
   "duration_ms",
+]);
+const FLEET_LIFECYCLE_ENUM_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  failure_kind: new Set(FLEET_REPLACEMENT_FAILURE_KINDS),
+  retirement_reason: new Set(FLEET_RETIREMENT_REASONS),
+  mutation_operation: new Set(FLEET_MUTATION_OPERATIONS),
+  block_reason: new Set(FLEET_MUTATION_BLOCK_REASONS),
+  permit_action: new Set(FLEET_STARTUP_PERMIT_ACTIONS),
+};
+const FLEET_LIFECYCLE_INTEGER_FIELDS = new Set([
+  "worker_index",
+  "leader_generation",
+  "failure_count",
+  "total_limit",
+  "total_in_use",
+  "total_queued",
+  "cold_limit",
+  "cold_in_use",
+  "cold_queued",
 ]);
 const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
   "error_name",
@@ -263,6 +315,42 @@ function assertSafeRecoveryFields(event: ObservabilityEvent): void {
     ) {
       throw new TypeError(`Recovery observability ${key} is not an allowed category`);
     }
+  }
+}
+
+function assertSafeFleetLifecycleFields(event: ObservabilityEvent): void {
+  for (const [key, value] of Object.entries(event)) {
+    if (COMMON.has(key)) continue;
+    if (key === "project_id") {
+      if (typeof value !== "string" || !PROJECT_ID.test(value)) {
+        throw new TypeError("Fleet lifecycle project_id is invalid");
+      }
+      continue;
+    }
+    if (key === "managed" || key === "cold_start") {
+      if (typeof value !== "boolean") {
+        throw new TypeError(`Fleet lifecycle ${key} must be boolean`);
+      }
+      continue;
+    }
+    if (FLEET_LIFECYCLE_INTEGER_FIELDS.has(key)) {
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new TypeError(`Fleet lifecycle ${key} must be a non-negative integer`);
+      }
+      continue;
+    }
+    const allowed = FLEET_LIFECYCLE_ENUM_FIELDS[key];
+    if (!allowed || typeof value !== "string" || !allowed.has(value)) {
+      throw new TypeError(`Fleet lifecycle ${key} is not an allowed category`);
+    }
+  }
+  if (typeof event.total_in_use === "number" && typeof event.total_limit === "number" &&
+    event.total_in_use > event.total_limit) {
+    throw new TypeError("Fleet total startup permit usage exceeds its limit");
+  }
+  if (typeof event.cold_in_use === "number" && typeof event.cold_limit === "number" &&
+    event.cold_in_use > event.cold_limit) {
+    throw new TypeError("Fleet cold startup permit usage exceeds its limit");
   }
 }
 
@@ -433,4 +521,5 @@ export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
   assertSafeRouterTelemetry(event);
   assertSafeFleetRelease(event);
   if (RECOVERY_EVENTS.has(event.event)) assertSafeRecoveryFields(event);
+  if (FLEET_LIFECYCLE_EVENTS.has(event.event)) assertSafeFleetLifecycleFields(event);
 }

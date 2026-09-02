@@ -155,7 +155,7 @@ describe("ObservabilityLogger", () => {
     expect(logger.snapshot().sinkErrors).toBeGreaterThan(0);
   });
 
-  it("keeps terminal recovery and circuit transitions at error log level", async () => {
+  it("keeps actionable recovery and circuit transitions at error log level", async () => {
     const sink = new MemorySink();
     const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink] });
     logger.emit(recoveryObservabilityEvent("sandbox.recovery.started", {
@@ -177,6 +177,7 @@ describe("ObservabilityLogger", () => {
     expect(sink.events().map(event => event.event)).toEqual([
       "sandbox.recovery.started",
       "prism.circuit.changed",
+      "sandbox.recovery.retry_scheduled",
     ]);
   });
 
@@ -281,12 +282,20 @@ describe("ObservabilityLogger", () => {
     for (let index = 0; index < 500; index++) {
       logger.emit(observabilityEvent("route.selected", { trace_id: `progress-${index}` }), "progress");
     }
+    logger.emit(observabilityEvent("fleet.replacement.qualified", {
+      project_id: "e631d12c-d917-4434-b360-41b4715d6679",
+      worker_index: 3,
+      leader_generation: 7,
+      failure_kind: "readiness",
+      failure_count: 3,
+    }), "progress");
     await logger.close();
 
     expect(writes.length).toBeLessThanOrEqual(10);
     const output = writes.join("\n");
     expect(output.match(/"event":"request.completed"/g)).toHaveLength(1_000);
     expect(output.match(/"event":"route.selected"/g)?.length ?? 0).toBeLessThanOrEqual(1);
+    expect(output.match(/"event":"fleet.replacement.qualified"/g)).toHaveLength(1);
 
     const beforeRateLimited = writes.length;
     await consoleSink.writeBatch([

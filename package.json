@@ -42,7 +42,8 @@
     "monitor:v2": "bun scripts/monitor_v2.ts",
     "diagnose:v2-concurrency": "bun scripts/diagnose_v2_concurrency.ts",
     "verify:v2-transport-stability": "bun scripts/live_transport_stability.ts",
-    "verify:v2-dual-channel-live": "bun scripts/live_dual_channel_liveness.ts"
+    "verify:v2-dual-channel-live": "bun scripts/live_dual_channel_liveness.ts",
+    "verify:fresh-fleet-recovery": "bun scripts/live_fresh_fleet_recovery.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.0",

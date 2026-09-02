@@ -13,6 +13,8 @@ import type { PrismIdentityKind } from "../prism/session-manager";
 import { projectId, type ProjectId } from "../sandbox/types";
 import type {
   FleetManifest,
+  FleetReplacementEvidence,
+  FleetReplacementFailureKind,
   FleetRetirementReason,
   FleetWorkerRecord,
   FleetWorkerState,
@@ -66,6 +68,12 @@ const RETIREMENT_REASONS = new Set<FleetRetirementReason>([
   "missing",
   "surplus",
 ]);
+const REPLACEMENT_FAILURE_KINDS = new Set<FleetReplacementFailureKind>([
+  "hello",
+  "readiness",
+  "render",
+  "timeout",
+]);
 
 function isNodeError(error: unknown, code: string): boolean {
   return !!error && typeof error === "object" && (error as { code?: unknown }).code === code;
@@ -85,6 +93,61 @@ function finiteNonnegative(value: unknown, label: string): number {
   return value;
 }
 
+function parseReplacementEvidence(value: unknown): FleetReplacementEvidence | null {
+  if (value === undefined || value === null) return null;
+  const raw = record(value, "Fleet replacement evidence");
+  if (typeof raw.signatureHash !== "string" || !SHA256.test(raw.signatureHash)) {
+    throw new FleetManifestError("Fleet replacement evidence signature is invalid", "protocol");
+  }
+  if (typeof raw.kind !== "string" ||
+    !REPLACEMENT_FAILURE_KINDS.has(raw.kind as FleetReplacementFailureKind)) {
+    throw new FleetManifestError("Fleet replacement evidence kind is invalid", "protocol");
+  }
+  for (const key of ["count", "lastAttempt", "lastIncarnation"] as const) {
+    if (!Number.isSafeInteger(raw[key]) || (raw[key] as number) < 0) {
+      throw new FleetManifestError(`Fleet replacement evidence ${key} is invalid`, "protocol");
+    }
+  }
+  if ((raw.count as number) < 1 || (raw.count as number) > 100) {
+    throw new FleetManifestError("Fleet replacement evidence count is invalid", "protocol");
+  }
+  if (!Number.isSafeInteger(raw.lastLeaderGeneration) ||
+    (raw.lastLeaderGeneration as number) < 1) {
+    throw new FleetManifestError(
+      "Fleet replacement evidence leader generation is invalid",
+      "protocol",
+    );
+  }
+  const firstObservedAtMs = finiteNonnegative(
+    raw.firstObservedAtMs,
+    "Fleet replacement evidence first observation",
+  );
+  const lastObservedAtMs = finiteNonnegative(
+    raw.lastObservedAtMs,
+    "Fleet replacement evidence last observation",
+  );
+  if (lastObservedAtMs < firstObservedAtMs) {
+    throw new FleetManifestError(
+      "Fleet replacement evidence observations are not monotonic",
+      "protocol",
+    );
+  }
+  return Object.freeze({
+    signatureHash: raw.signatureHash,
+    kind: raw.kind as FleetReplacementFailureKind,
+    count: raw.count as number,
+    firstObservedAtMs,
+    lastObservedAtMs,
+    lastAttempt: raw.lastAttempt as number,
+    lastIncarnation: raw.lastIncarnation as number,
+    lastLeaderGeneration: raw.lastLeaderGeneration as number,
+    totalDurationMs: finiteNonnegative(
+      raw.totalDurationMs,
+      "Fleet replacement evidence total duration",
+    ),
+  });
+}
+
 function parseWorker(value: unknown): FleetWorkerRecord {
   const raw = record(value, "Fleet worker");
   if (!Number.isInteger(raw.index) || (raw.index as number) < 1) {
@@ -102,6 +165,9 @@ function parseWorker(value: unknown): FleetWorkerRecord {
   if (typeof raw.managed !== "boolean") {
     throw new FleetManifestError("Fleet worker management flag is invalid", "protocol");
   }
+  if (raw.hasReachedReady !== undefined && typeof raw.hasReachedReady !== "boolean") {
+    throw new FleetManifestError("Fleet worker readiness proof is invalid", "protocol");
+  }
   if (!Number.isInteger(raw.leaderGeneration) || (raw.leaderGeneration as number) < 0) {
     throw new FleetManifestError("Fleet worker leader generation is invalid", "protocol");
   }
@@ -114,6 +180,10 @@ function parseWorker(value: unknown): FleetWorkerRecord {
   if (raw.state !== "draining" && retirementReason != null) {
     throw new FleetManifestError("Only a draining worker may have a retirement reason", "protocol");
   }
+  const replacementEvidence = parseReplacementEvidence(raw.replacementEvidence);
+  if (raw.state === "draining" && replacementEvidence !== null) {
+    throw new FleetManifestError("A draining worker cannot retain replacement evidence", "protocol");
+  }
   return Object.freeze({
     index: raw.index as number,
     projectId: projectId(raw.projectId),
@@ -122,8 +192,14 @@ function parseWorker(value: unknown): FleetWorkerRecord {
     createdAtMs: finiteNonnegative(raw.createdAtMs, "Fleet worker creation time"),
     updatedAtMs: finiteNonnegative(raw.updatedAtMs, "Fleet worker update time"),
     leaderGeneration: raw.leaderGeneration as number,
+    // Version-one manifests written before this field existed can prove only
+    // a currently-ready worker. Treat every other legacy state as cold rather
+    // than accidentally exceeding the stricter cold-start ceiling.
+    hasReachedReady: raw.hasReachedReady === true ||
+      (raw.hasReachedReady === undefined && raw.state === "ready"),
     managed: raw.managed,
     retirementReason: retirementReason ?? null,
+    replacementEvidence,
   });
 }
 
@@ -184,6 +260,7 @@ function updatedWorker(
   update: Partial<Pick<
     FleetWorkerRecord,
     "state" | "updatedAtMs" | "leaderGeneration" | "retirementReason"
+      | "replacementEvidence" | "hasReachedReady"
   >>,
 ): FleetWorkerRecord {
   return Object.freeze({ ...worker, ...update });
@@ -310,8 +387,10 @@ export class FleetManifestStore {
         createdAtMs: input.nowMs,
         updatedAtMs: input.nowMs,
         leaderGeneration: 0,
+        hasReachedReady: false,
         managed: input.managed ?? true,
         retirementReason: null,
+        replacementEvidence: null,
       });
       return { ...current, workers: Object.freeze([...current.workers, worker]) };
     });
@@ -341,6 +420,11 @@ export class FleetManifestStore {
           state,
           updatedAtMs: nowMs,
           ...(state === "draining" ? {} : { retirementReason: null }),
+          ...(state === "ready"
+            ? { hasReachedReady: true, replacementEvidence: null }
+            : state === "draining"
+              ? { replacementEvidence: null }
+              : {}),
         });
       });
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
@@ -370,7 +454,93 @@ export class FleetManifestStore {
         return updatedWorker(worker, {
           state: "draining",
           retirementReason: reason,
+          replacementEvidence: null,
           updatedAtMs: nowMs,
+        });
+      });
+      if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
+      return { ...current, workers: Object.freeze(workers) };
+    });
+  }
+
+  recordReplacementFailure(input: {
+    id: ProjectId;
+    signatureHash: string;
+    kind: FleetReplacementFailureKind;
+    observedAtMs: number;
+    attempt: number;
+    incarnation: number;
+    leaderGeneration: number;
+    consecutiveFailures: number;
+    totalDurationMs: number;
+  }): Promise<FleetManifest> {
+    if (!SHA256.test(input.signatureHash) || !REPLACEMENT_FAILURE_KINDS.has(input.kind)) {
+      return Promise.reject(new FleetManifestError("Replacement failure identity is invalid", "protocol"));
+    }
+    if (!Number.isFinite(input.observedAtMs) || input.observedAtMs < 0 ||
+      !Number.isSafeInteger(input.attempt) || input.attempt < 0 ||
+      !Number.isSafeInteger(input.incarnation) || input.incarnation < 0 ||
+      !Number.isSafeInteger(input.leaderGeneration) || input.leaderGeneration < 1 ||
+      !Number.isSafeInteger(input.consecutiveFailures) || input.consecutiveFailures < 1 ||
+      !Number.isFinite(input.totalDurationMs) || input.totalDurationMs < 0) {
+      return Promise.reject(new FleetManifestError("Replacement failure counters are invalid", "protocol"));
+    }
+    return this.#mutate(current => {
+      let found = false;
+      const workers = current.workers.map(worker => {
+        if (worker.projectId !== input.id) return worker;
+        found = true;
+        if (worker.state === "draining") return worker;
+        const previous = worker.replacementEvidence;
+        const same = previous?.signatureHash === input.signatureHash &&
+          previous.kind === input.kind;
+        const duplicate = same &&
+          previous.lastLeaderGeneration === input.leaderGeneration &&
+          previous.lastAttempt === input.attempt &&
+          previous.lastIncarnation === input.incarnation;
+        const nextCount = duplicate
+          ? previous.count
+          : same
+            ? Math.min(100, previous.count + 1)
+            : 1;
+        const evidence: FleetReplacementEvidence = Object.freeze({
+          signatureHash: input.signatureHash,
+          kind: input.kind,
+          count: nextCount,
+          firstObservedAtMs: same ? previous.firstObservedAtMs : input.observedAtMs,
+          lastObservedAtMs: same
+            ? Math.max(previous.lastObservedAtMs, input.observedAtMs)
+            : input.observedAtMs,
+          lastAttempt: input.attempt,
+          lastIncarnation: input.incarnation,
+          lastLeaderGeneration: input.leaderGeneration,
+          totalDurationMs: same
+            ? Math.max(previous.totalDurationMs, input.totalDurationMs)
+            : input.totalDurationMs,
+        });
+        return updatedWorker(worker, {
+          replacementEvidence: evidence,
+          updatedAtMs: Math.max(worker.updatedAtMs, input.observedAtMs),
+        });
+      });
+      if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
+      return { ...current, workers: Object.freeze(workers) };
+    });
+  }
+
+  clearReplacementFailure(id: ProjectId, nowMs: number): Promise<FleetManifest> {
+    if (!Number.isFinite(nowMs) || nowMs < 0) {
+      return Promise.reject(new FleetManifestError("Worker timestamp is invalid", "protocol"));
+    }
+    return this.#mutate(current => {
+      let found = false;
+      const workers = current.workers.map(worker => {
+        if (worker.projectId !== id) return worker;
+        found = true;
+        if (worker.replacementEvidence === null) return worker;
+        return updatedWorker(worker, {
+          replacementEvidence: null,
+          updatedAtMs: Math.max(worker.updatedAtMs, nowMs),
         });
       });
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");

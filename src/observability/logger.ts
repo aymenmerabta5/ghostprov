@@ -173,9 +173,18 @@ const CONSOLE_ALWAYS = new Set<ObservabilityEventName>([
   "logger.dropped",
   "logger.error",
   "sandbox.recovery.started",
+  "sandbox.recovery.retry_scheduled",
   "sandbox.recovery.completed",
   "sandbox.recovery.aborted",
   "prism.circuit.changed",
+  "fleet.replacement.qualified",
+  "fleet.replacement.started",
+  "fleet.replacement.successor_reserved",
+  "fleet.replacement.successor_created",
+  "fleet.replacement.successor_activated",
+  "fleet.replacement.old_retired",
+  "fleet.mutation.blocked",
+  "fleet.startup_permits.changed",
 ]);
 
 function lineEvent(line: string): ObservabilityEventName | null {
@@ -445,9 +454,17 @@ export class ObservabilityLogger implements LoggerLike {
       "monitor.error",
       "logger.error",
       "sandbox.recovery.started",
+      "sandbox.recovery.retry_scheduled",
       "sandbox.recovery.completed",
       "sandbox.recovery.aborted",
       "prism.circuit.changed",
+      "fleet.replacement.qualified",
+      "fleet.replacement.started",
+      "fleet.replacement.successor_reserved",
+      "fleet.replacement.successor_created",
+      "fleet.replacement.successor_activated",
+      "fleet.replacement.old_retired",
+      "fleet.mutation.blocked",
     ].includes(eventName)) return;
     const normalizedPriority: ObservabilityPriority = priority in this.#queues
       ? priority

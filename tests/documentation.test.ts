@@ -66,6 +66,7 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000`");
     expect(readme).toContain("| `GP_TARGET_SANDBOXES` | `8`");
     expect(readme).toContain("| `GP_PROJECT_REPLACEMENT_FAILURES` | `3`");
+    expect(readme).toContain("| `GP_COLD_START_CONCURRENCY` | `2`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
     expect(readme).toContain("| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912`");
     expect(readme).toContain("| WebSocket active responses | `16`");
@@ -91,6 +92,7 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
     expect(envExample).toContain("GP_TARGET_SANDBOXES=8");
     expect(envExample).toContain("GP_PROJECT_REPLACEMENT_FAILURES=3");
+    expect(envExample).toContain("GP_COLD_START_CONCURRENCY=2");
     expect(envExample).not.toMatch(/^PRISM_PROJECT_IDS=/m);
     expect(envExample).not.toMatch(/^GP_AUTO_CREATE_PROJECTS=/m);
     expect(readme).toContain("~/.ghostprov/fleets/<identity-fingerprint>/fleet.json");
@@ -262,6 +264,7 @@ describe("project documentation", () => {
       "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",
       "verify:v2-single": "bun scripts/live_v2_single.ts",
       "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
+      "verify:fresh-fleet-recovery": "bun scripts/live_fresh_fleet_recovery.ts",
       "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
       "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
       "monitor:v2": "bun scripts/monitor_v2.ts",
@@ -297,6 +300,7 @@ describe("project documentation", () => {
     expect(fs.existsSync(path.join(root, "scripts", "live_multi_sandbox.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_single.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "live_v2_fleet.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "scripts", "live_fresh_fleet_recovery.ts"))).toBe(true);
     expect(fs.existsSync(path.join(root, "scripts", "smoke_v2_candidate.ts"))).toBe(true);
     expect(JSON.parse(scriptsTsconfig)).toMatchObject({
       extends: "./tsconfig.json",

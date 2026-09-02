@@ -73,6 +73,8 @@ export interface SandboxSupervisorEvent {
   reason: string;
   attempt: number;
   incarnation: number;
+  /** Added by the system factory from the durable manifest generation. */
+  leaderGeneration?: number;
   consecutiveFailures: number;
   retryDelayMs?: number;
   /** Wall time spent in the attempt represented by this event, excluding backoff. */

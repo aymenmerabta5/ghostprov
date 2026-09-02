@@ -2,7 +2,8 @@ import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
-import type { ManagedRuntimeFactory } from "../fleet/types";
+import { FleetStartupPermitPool } from "../fleet/startup-permits";
+import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
 import { PrismProvisioningClient } from "../prism/provisioning-client";
@@ -27,7 +28,6 @@ import { SandboxHeartbeat } from "../sandbox/heartbeat";
 import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registry";
 import type { ProjectId } from "../sandbox/types";
 import {
-  RecoveryPermitPool,
   SupervisedSandboxRuntime,
   type SandboxSupervisorEvent,
 } from "../sandbox/supervised-runtime";
@@ -72,6 +72,7 @@ import {
   normalizeV2SidecarFatalErrorName,
   normalizeV2SidecarFatalPermission,
   normalizeV2SidecarFatalPhase,
+  fleetLifecycleObservabilityEvent,
   observabilityEvent,
   recoveryObservabilityEvent,
   type JsonValue,
@@ -359,6 +360,69 @@ export function selectV2ProjectRelease(
   return selected;
 }
 
+function emitFleetLifecycle(logger: LoggerLike, event: FleetLifecycleEvent): void {
+  switch (event.type) {
+    case "replacement_qualified":
+    case "replacement_started":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        event.type === "replacement_qualified"
+          ? "fleet.replacement.qualified"
+          : "fleet.replacement.started",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          leader_generation: event.leaderGeneration,
+          failure_kind: event.failureKind,
+          failure_count: event.failureCount,
+        },
+      ), "terminal");
+      return;
+    case "successor_reserved":
+    case "successor_created":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        event.type === "successor_reserved"
+          ? "fleet.replacement.successor_reserved"
+          : "fleet.replacement.successor_created",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+        },
+      ), "terminal");
+      return;
+    case "successor_activated":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        "fleet.replacement.successor_activated",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          leader_generation: event.leaderGeneration,
+        },
+      ), "terminal");
+      return;
+    case "old_retired":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        "fleet.replacement.old_retired",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          retirement_reason: event.retirementReason,
+          managed: event.managed,
+        },
+      ), "terminal");
+      return;
+    case "mutation_blocked":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        "fleet.mutation.blocked",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          mutation_operation: event.operation,
+          block_reason: event.reason,
+        },
+      ), "terminal");
+  }
+}
+
 function defaultRuntimeFactory(options: {
   config: ReturnType<typeof resolveMultiSandboxConfig>;
   identity: ResolvedPrismIdentity;
@@ -521,7 +585,28 @@ function defaultRuntimeFactory(options: {
     });
   };
 
-  const recoveryPermits = new RecoveryPermitPool(config.provisionConcurrency);
+  const startupPermits = new FleetStartupPermitPool(
+    config.provisionConcurrency,
+    config.coldStartConcurrency,
+    {
+      onTransition: transition => {
+        const snapshot = transition.snapshot;
+        logger.emit(fleetLifecycleObservabilityEvent(
+          "fleet.startup_permits.changed",
+          {
+            cold_start: transition.coldStart,
+            permit_action: transition.action,
+            total_limit: snapshot.total.limit,
+            total_in_use: snapshot.total.inUse,
+            total_queued: snapshot.total.queued,
+            cold_limit: snapshot.cold.limit,
+            cold_in_use: snapshot.cold.inUse,
+            cold_queued: snapshot.cold.queued,
+          },
+        ), "progress");
+      },
+    },
+  );
   const acquireSandboxForAuth = async (
     _projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"],
     _status: number,
@@ -530,7 +615,7 @@ function defaultRuntimeFactory(options: {
     let release: (() => void) | null = null;
     try {
       await revalidateAccount(signal);
-      release = await recoveryPermits.acquire(signal);
+      release = await startupPermits.acquire(false, signal);
       return await provisioning.acquireSandbox(signal, { maxAttempts: 1 });
     } finally {
       release?.();
@@ -543,22 +628,28 @@ function defaultRuntimeFactory(options: {
 
   return {
     create(input) {
+      let reachedReady = input.previouslyReady === true;
+      let currentLeaderGeneration = input.leaderGeneration;
       const initialChild = createRuntime(input);
       return new SupervisedSandboxRuntime({
         projectId: input.projectId,
         initialChild,
         // Recovery always reuses the same Prism project/worker. Only the
         // disposable sandbox session and its fenced leader generation change.
-        createChild: async seed => createRuntime({
-          projectId: input.projectId,
-          workerIndex: input.workerIndex,
-          leaderGeneration: await nextLeaderGeneration(input.projectId),
-        }, seed),
-        acquirePermit: signal => recoveryPermits.acquire(signal),
+        createChild: async seed => {
+          currentLeaderGeneration = await nextLeaderGeneration(input.projectId);
+          return createRuntime({
+            projectId: input.projectId,
+            workerIndex: input.workerIndex,
+            leaderGeneration: currentLeaderGeneration,
+          }, seed);
+        },
+        acquirePermit: signal => startupPermits.acquire(!reachedReady, signal),
         recoveryCoordinator,
         workerIndex: input.workerIndex,
         transport: "v2",
         onRecoveryEvent: event => {
+          if (event.type === "completed") reachedReady = true;
           const failure = event.failure;
           const name = event.type === "started"
             ? "sandbox.recovery.started"
@@ -574,6 +665,7 @@ function defaultRuntimeFactory(options: {
             cause: normalizeSandboxRecoveryCause(event.reason),
             attempt: event.attempt,
             incarnation: event.incarnation,
+            leader_generation: currentLeaderGeneration,
             consecutive_failures: event.consecutiveFailures,
             ...(event.retryDelayMs === undefined
               ? {}
@@ -606,7 +698,9 @@ function defaultRuntimeFactory(options: {
               ? normalizeSandboxRecoveryOperation(failure.operation)
               : null,
           }), event.type === "retry_scheduled" ? "progress" : "terminal");
-          try { onRecoveryEvent?.(event); } catch {}
+          try {
+            onRecoveryEvent?.({ ...event, leaderGeneration: currentLeaderGeneration });
+          } catch {}
         },
       });
     },
@@ -843,6 +937,7 @@ export async function createBrowserlessSystem(
     runtimeFactory,
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
     canRetireProject: project => router.responseProvenanceBindingsForProject(project) === 0,
+    onLifecycleEvent: event => emitFleetLifecycle(logger, event),
   });
   const responsesContinuationIndex = dependencies.responsesContinuationIndex ??
     new ResponsesHttpContinuationIndex();

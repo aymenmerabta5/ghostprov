@@ -107,6 +107,129 @@ describe("FleetManifestStore", () => {
     if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
   });
 
+  it("persists bounded replacement evidence across store restarts and clears it on drain", async () => {
+    const file = await manifestPath();
+    const first = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await first.initialize("authenticated");
+    await first.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "GhostProv Worker 1",
+      nowMs: 1,
+    });
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await first.recordReplacementFailure({
+        id: A,
+        signatureHash: "c".repeat(64),
+        kind: "timeout",
+        observedAtMs: attempt + 1,
+        attempt,
+        incarnation: attempt,
+        leaderGeneration: attempt,
+        consecutiveFailures: attempt,
+        totalDurationMs: attempt * 70_000,
+      });
+    }
+    const second = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    expect((await second.load()).workers[0]?.replacementEvidence).toMatchObject({
+      signatureHash: "c".repeat(64),
+      kind: "timeout",
+      count: 2,
+      totalDurationMs: 140_000,
+    });
+    await second.recordReplacementFailure({
+      id: A,
+      signatureHash: "c".repeat(64),
+      kind: "timeout",
+      observedAtMs: 4,
+      attempt: 3,
+      incarnation: 3,
+      leaderGeneration: 3,
+      consecutiveFailures: 3,
+      totalDurationMs: 210_000,
+    });
+    expect((await second.load()).workers[0]?.replacementEvidence?.count).toBe(3);
+    await second.markDraining(A, "replacement", 5);
+    expect((await second.load()).workers[0]?.replacementEvidence).toBeNull();
+  });
+
+  it("deduplicates one recovery observation and resets every signature-local counter", async () => {
+    const file = await manifestPath();
+    const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await store.initialize("authenticated");
+    await store.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "GhostProv Worker 1",
+      nowMs: 1,
+    });
+    const first = {
+      id: A,
+      signatureHash: "c".repeat(64),
+      kind: "timeout" as const,
+      observedAtMs: 2,
+      attempt: 1,
+      incarnation: 1,
+      leaderGeneration: 1,
+      consecutiveFailures: 1,
+      totalDurationMs: 70_000,
+    };
+    await store.recordReplacementFailure(first);
+    await store.recordReplacementFailure({
+      ...first,
+      observedAtMs: 3,
+      totalDurationMs: 71_000,
+    });
+    expect((await store.load()).workers[0]?.replacementEvidence).toMatchObject({
+      count: 1,
+      lastObservedAtMs: 3,
+      totalDurationMs: 71_000,
+      lastLeaderGeneration: 1,
+    });
+
+    await store.recordReplacementFailure({
+      ...first,
+      signatureHash: "d".repeat(64),
+      kind: "hello",
+      observedAtMs: 4,
+      attempt: 2,
+      incarnation: 2,
+      leaderGeneration: 2,
+      consecutiveFailures: 2,
+      totalDurationMs: 5,
+    });
+    expect((await store.load()).workers[0]?.replacementEvidence).toMatchObject({
+      signatureHash: "d".repeat(64),
+      kind: "hello",
+      count: 1,
+      firstObservedAtMs: 4,
+      lastObservedAtMs: 4,
+      totalDurationMs: 5,
+      lastLeaderGeneration: 2,
+    });
+  });
+
+  it("remembers verified readiness after a later failed state", async () => {
+    const file = await manifestPath();
+    const first = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await first.initialize("authenticated");
+    await first.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "GhostProv Worker 1",
+      nowMs: 1,
+    });
+    expect((await first.load()).workers[0]?.hasReachedReady).toBe(false);
+    await first.markState(A, "ready", 2);
+    await first.markState(A, "failed", 3);
+
+    const restarted = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    expect((await restarted.load()).workers[0]).toMatchObject({
+      state: "failed",
+      hasReachedReady: true,
+    });
+  });
+
   it("serializes concurrent updates without dropping workers", async () => {
     const file = await manifestPath();
     const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });

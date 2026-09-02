@@ -4,6 +4,38 @@ export type ObservabilityPriority = "terminal" | "progress" | "sample";
 export const ROUTER_QUEUE_CLASSES = ["latency", "bulk"] as const;
 export type RouterQueueClass = typeof ROUTER_QUEUE_CLASSES[number];
 
+export const FLEET_LIFECYCLE_EVENT_NAMES = [
+  "fleet.replacement.qualified",
+  "fleet.replacement.started",
+  "fleet.replacement.successor_reserved",
+  "fleet.replacement.successor_created",
+  "fleet.replacement.successor_activated",
+  "fleet.replacement.old_retired",
+  "fleet.mutation.blocked",
+  "fleet.startup_permits.changed",
+] as const;
+export type FleetLifecycleObservabilityEventName =
+  typeof FLEET_LIFECYCLE_EVENT_NAMES[number];
+
+export const FLEET_REPLACEMENT_FAILURE_KINDS = [
+  "hello", "readiness", "render", "timeout",
+] as const;
+export const FLEET_RETIREMENT_REASONS = ["replacement", "missing"] as const;
+export const FLEET_MUTATION_OPERATIONS = ["replace", "create", "delete"] as const;
+export const FLEET_MUTATION_BLOCK_REASONS = [
+  "release_policy",
+  "recovery_circuit",
+  "mutation_backoff",
+  "runtime_missing",
+  "runtime_healthy",
+  "work_in_flight",
+  "continuation_binding",
+  "healthy_majority",
+  "project_client",
+  "control_plane",
+] as const;
+export const FLEET_STARTUP_PERMIT_ACTIONS = ["acquired", "released"] as const;
+
 export const SANDBOX_AVAILABILITY_REASONS = [
   "available",
   "lifecycle_unavailable",
@@ -247,6 +279,7 @@ export type ObservabilityEventName =
   | "monitor.error"
   | "logger.dropped"
   | "logger.error"
+  | FleetLifecycleObservabilityEventName
   | RecoveryObservabilityEventName;
 
 export type JsonScalar = string | number | boolean | null;
@@ -286,6 +319,27 @@ export interface RecoveryObservabilityFields {
   circuit_state?: PrismCircuitState;
   circuit_scope?: PrismCircuitScope;
   queued?: number;
+}
+
+/** Fixed, content-free fields accepted by fleet lifecycle events. */
+export interface FleetLifecycleObservabilityFields {
+  project_id?: string;
+  worker_index?: number;
+  leader_generation?: number;
+  failure_kind?: typeof FLEET_REPLACEMENT_FAILURE_KINDS[number];
+  failure_count?: number;
+  retirement_reason?: typeof FLEET_RETIREMENT_REASONS[number];
+  managed?: boolean;
+  mutation_operation?: typeof FLEET_MUTATION_OPERATIONS[number];
+  block_reason?: typeof FLEET_MUTATION_BLOCK_REASONS[number];
+  cold_start?: boolean;
+  permit_action?: typeof FLEET_STARTUP_PERMIT_ACTIONS[number];
+  total_limit?: number;
+  total_in_use?: number;
+  total_queued?: number;
+  cold_limit?: number;
+  cold_in_use?: number;
+  cold_queued?: number;
 }
 
 const RECOVERY_CAUSE_SET = new Set<string>(SANDBOX_RECOVERY_CAUSES);
@@ -406,6 +460,20 @@ export function observabilityEvent(
 export function recoveryObservabilityEvent(
   event: RecoveryObservabilityEventName,
   fields: RecoveryObservabilityFields = {},
+  now = Date.now(),
+  monoMs = performance.now(),
+): ObservabilityEvent {
+  return observabilityEvent(
+    event,
+    fields as unknown as Record<string, JsonValue>,
+    now,
+    monoMs,
+  );
+}
+
+export function fleetLifecycleObservabilityEvent(
+  event: FleetLifecycleObservabilityEventName,
+  fields: FleetLifecycleObservabilityFields = {},
   now = Date.now(),
   monoMs = performance.now(),
 ): ObservabilityEvent {
