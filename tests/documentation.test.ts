@@ -30,6 +30,11 @@ const persistedContinuationVerifier = fs.readFileSync(path.join(
   "scripts",
   "verify_persisted_continuation.ts",
 ), "utf8");
+const standaloneSearchProbe = fs.readFileSync(path.join(
+  root,
+  "scripts",
+  "probe_standalone_search.ts",
+), "utf8");
 const anthropicDesign = fs.readFileSync(path.join(
   root,
   "docs",
@@ -97,6 +102,41 @@ describe("project documentation", () => {
     expect(readme).toContain("PRISM_PROJECT_IDS");
     expect(readme).toContain("PRISM_COOKIE_FILE");
     expect(readme).toContain("18787");
+  });
+
+  it("documents Codex standalone search routing, bounds, and guarded live proof", () => {
+    for (const value of [
+      "POST /v1/alpha/search",
+      "hosted `web_search` tool",
+      "Request collection is capped at 16 MiB",
+      "public unary JSON result at 8 MiB",
+      'model_provider = "ghostprov"',
+      'web_search = "live"',
+      "supports_standalone_web_search = true",
+      "standalone_web_search = true",
+      "non-Responses-Lite models such as `gpt-5.5`",
+      "bun run verify:standalone-search",
+      "GP_LIVE_STANDALONE_SEARCH",
+      "GP_ALLOW_PROJECT_DELETE",
+      "never contacts, restarts, or signals the protected listener on `18787`",
+    ]) expect(readme).toContain(value);
+    expect(pkg.scripts["verify:standalone-search"])
+      .toBe("bun scripts/probe_standalone_search.ts");
+    for (const test of [
+      "tests/standalone-search-probe.test.ts",
+      "tests/standalone-search-session.test.ts",
+    ]) expect(pkg.scripts["test:focused:unit"]).toContain(test);
+    for (const test of [
+      "tests/standalone-search-http.test.ts",
+      "tests/standalone-search-adapter.test.ts",
+    ]) expect(pkg.scripts["test:focused:integration"]).toContain(test);
+    for (const guard of [
+      "GP_LIVE_STANDALONE_SEARCH",
+      "GP_LIVE_CREATE_TEST_PROJECTS",
+      "GP_LIVE_SANDBOX_PROBE",
+      "GP_ALLOW_PROJECT_DELETE",
+    ]) expect(standaloneSearchProbe).toContain(guard);
+    expect(standaloneSearchProbe).not.toContain("18787");
   });
 
   it("documents same-port Claude Code setup, routes, auth, and tier mapping", () => {
@@ -208,6 +248,7 @@ describe("project documentation", () => {
       "test:focused:unit": expect.any(String),
       "test:focused:integration": expect.any(String),
       "verify:live": expect.any(String),
+      "verify:standalone-search": "bun scripts/probe_standalone_search.ts",
       "verify:browserless": expect.any(String),
       "verify:multi-sandbox": expect.any(String),
       "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",

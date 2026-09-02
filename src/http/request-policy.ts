@@ -1,3 +1,5 @@
+import { STANDALONE_SEARCH_MAX_REQUEST_BYTES } from "../search/limits";
+
 export const ANTHROPIC_HTTP_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 export function requestPath(value: string | undefined): string {
@@ -13,7 +15,11 @@ export function isAnthropicRequestPath(path: string): boolean {
 }
 
 export function requestBodyLimitForUrl(value: string | undefined, sharedLimit: number): number {
-  return isAnthropicRequestPath(requestPath(value))
+  const path = requestPath(value);
+  if (path === "/v1/alpha/search") {
+    return Math.min(sharedLimit, STANDALONE_SEARCH_MAX_REQUEST_BYTES);
+  }
+  return isAnthropicRequestPath(path)
     ? Math.min(sharedLimit, ANTHROPIC_HTTP_MAX_BODY_BYTES)
     : sharedLimit;
 }

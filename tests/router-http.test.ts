@@ -23,6 +23,7 @@ import { V2CommittedError, V2RunHandle } from "../src/v2/transport/run-handle";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { resolveHttpClientId } from "../src/http/request-lease";
 import { ResponsesHttpContinuationIndex } from "../src/http/responses-continuation";
+import { ResponseProvenanceObsoleteError } from "../src/router/provenance";
 import {
   createAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
@@ -729,6 +730,83 @@ describe("router HTTP composition", () => {
     });
     expect(calls[2]).not.toHaveProperty("previous_response_id");
     expect(calls[2]!.input).toEqual([root, answer, next]);
+  });
+
+  it("retries one locally obsolete inferred parent but preserves an explicit caller ID", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const root = { type: "message", role: "user", content: "root" };
+    const answer = {
+      type: "message",
+      id: "msg_locally_obsolete_parent",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "answer", annotations: [], logprobs: [] }],
+    };
+    const next = { type: "message", role: "user", content: "next" };
+    const calls: Record<string, unknown>[] = [];
+    const router = {
+      responseProvenanceAuthorizationScope: () => authorizationScope,
+      snapshot: () => ({
+        capacity: 1,
+        active: 0,
+        available: 1,
+        queued: 0,
+        runtimes: [],
+        resources: {},
+      }),
+      startRelay: async (body: Record<string, unknown>) => {
+        calls.push(structuredClone(body));
+        if (calls.length === 1) {
+          return handle(final("resp_locally_obsolete_parent", [answer]));
+        }
+        if (body.previous_response_id === "resp_locally_obsolete_parent") {
+          throw new ResponseProvenanceObsoleteError();
+        }
+        if (body.previous_response_id === "resp_explicit_caller") {
+          throw new ResponseProvenanceObsoleteError();
+        }
+        return handle(final("resp_locally_rehydrated"));
+      },
+    };
+    const app = createGhostProvApp({ router, authorizationScope });
+    await (await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [root] }),
+    })).json();
+
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [root, answer, next],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.json();
+    expect(calls[1]).toMatchObject({
+      previous_response_id: "resp_locally_obsolete_parent",
+      input: [next],
+    });
+    expect(calls[2]).not.toHaveProperty("previous_response_id");
+    expect(calls[2]!.input).toEqual([root, answer, next]);
+
+    const explicit = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        previous_response_id: "resp_explicit_caller",
+        input: [next],
+      }),
+    });
+    expect(explicit.status).toBe(409);
+    expect(calls).toHaveLength(4);
+    expect(calls[3]).toMatchObject({
+      previous_response_id: "resp_explicit_caller",
+      input: [next],
+    });
   });
 
   it("lets every concurrent definitive stale inferred Responses hit retry its own immutable full history once", async () => {

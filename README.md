@@ -127,6 +127,31 @@ curl.exe -X POST http://127.0.0.1:18787/v1/responses `
 
 Every `/v1/*` OpenAI-compatible route requires `Authorization: Bearer <GHOSTPROV_API_KEY>`, including the Responses WebSocket upgrade. `GHOSTPROV_API_KEY` must be explicitly configured as a single-token value of at least 12 characters; a random 32-byte value remains recommended. There is no shared development-key fallback. `GET /health` remains unauthenticated, while `GET /__sandboxes` and the supervisor's `GET /__supervisor` require the same bearer credential. Use `stream:true` for incremental SSE; omitted or false client `stream` still produces a JSON final while the upstream body is normalized to `stream:true`. Client `store` hints are accepted for compatibility but the upstream body is always `store:true`. Every non-image upstream request is forced to `service_tier:"fast"`; image-tool requests continue to omit unsupported service tiers. Reasoning fields including `effort:"max"`, `mode:"pro"`, `context`, and `summary` pass through verbatim.
 
+## Codex standalone web search
+
+GhostProv implements Codex's unary `POST /v1/alpha/search` contract. It does not forward the private sandbox `/alpha/search` shape. Instead, the validated Codex command batch is translated into a native stored Responses request with the hosted `web_search` tool and is executed through the same bounded router, exact-once V2 transport, sandbox fleet, authentication scope, and `service_tier:"fast"` policy as ordinary Responses traffic. No separate search API key or second proxy is required.
+
+The route accepts current `search_query`, `image_query`, `open`, `click`, `find`, `screenshot`, finance, weather, sports, and time command objects. A request ID gets tenant-scoped, content-free serialization and provider `previous_response_id` continuity for follow-up reference commands; the index retains no search prompt or result content. Request collection is capped at 16 MiB and the public unary JSON result at 8 MiB. Unsupported or malformed commands fail before sandbox admission, while provider status and bounded error metadata are preserved.
+
+Point Codex at the normal GhostProv provider and enable live search in `config.toml`:
+
+```toml
+model_provider = "ghostprov"
+web_search = "live"
+
+[model_providers.ghostprov]
+name = "GhostProv"
+env_key = "OPENAI_API_KEY"
+base_url = "http://127.0.0.1:18787/v1"
+supports_websockets = true
+supports_standalone_web_search = true
+
+[features]
+standalone_web_search = true
+```
+
+The explicit feature flag also enables the standalone tool for non-Responses-Lite models such as `gpt-5.5`; GhostProv's Sol, Terra, and Luna catalog entries advertise Responses Lite and can expose it from provider capability alone.
+
 ## Anthropic Messages and Claude Code
 
 The production Anthropic adapter is part of the same `createGhostProvApp` and uses the same router, queue, sandbox capacity, and listener as the OpenAI routes. Point Claude Code directly at the GhostProv origin; `ANTHROPIC_BASE_URL` is a root URL and must not end in `/v1`:
@@ -498,6 +523,10 @@ The isolated suite includes:
 - `tests/session-manager.test.ts`
 - `tests/server-main-lifecycle.test.ts`
 - `tests/sse.test.ts`
+- `tests/standalone-search-adapter.test.ts`
+- `tests/standalone-search-http.test.ts`
+- `tests/standalone-search-probe.test.ts`
+- `tests/standalone-search-session.test.ts`
 - `tests/system-v2.test.ts`
 - `tests/upstream-policy.test.ts`
 - `tests/v2-awareness-channel.test.ts`
@@ -590,6 +619,20 @@ $env:GP_CONTINUATION_TEST_PROJECT_IDS = "<test-uuid-1>,<test-uuid-2>"
 $env:GP_CONTINUATION_TEST_COOKIE_FILE = "D:\secrets\test-prism-cookies.json"
 bun run verify:persisted-continuation
 ```
+
+Standalone search has a separate destructive live verifier. It creates exactly one disposable Prism project, provisions one sandbox, performs one native stored Responses `web_search` request, and deletes that exact project in cleanup. It never enumerates or mutates configured fleet projects and never contacts, restarts, or signals the protected listener on `18787`. Because it creates/deletes a project and incurs provider search usage, all four explicit guards are required:
+
+```powershell
+$env:GP_LIVE_STANDALONE_SEARCH = "1"
+$env:GP_LIVE_CREATE_TEST_PROJECTS = "1"
+$env:GP_LIVE_SANDBOX_PROBE = "1"
+$env:GP_ALLOW_PROJECT_DELETE = "1"
+$env:GP_LIVE_PROJECT_COUNT = "1"
+$env:PRISM_COOKIE_FILE = "D:\secrets\test-prism-cookies.json"
+bun run verify:standalone-search
+```
+
+The verifier records only bounded metadata under `.ghostprov/standalone-search-probes`; it never writes search prompts, result text, cookies, or credentials. A cleanup failure retains the exact project ID in that state directory for deliberate operator recovery rather than deleting any unrelated project.
 
 Create dedicated test projects only with explicit authorization:
 

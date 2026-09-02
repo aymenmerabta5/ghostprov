@@ -97,6 +97,7 @@ import {
   processResponseGraphBudget,
   type SharedByteBudget,
 } from "../ws/response-graph";
+import { createRouterStandaloneSearchHandler } from "../search/router-handler";
 
 export interface BrowserlessSystemServer {
   readonly listening: boolean;
@@ -838,6 +839,7 @@ export async function createBrowserlessSystem(
     new ResponsesHttpContinuationIndex();
   const anthropicContinuationIndex = dependencies.anthropicContinuationIndex ??
     new AnthropicContinuationIndex();
+  const standaloneSearch = createRouterStandaloneSearchHandler(router);
   const webSocketTelemetry = config.v2DiagnosticsEnabled ? new WebSocketTelemetry() : undefined;
   const sampler = dependencies.sampler ?? new FleetSampler({
     logger,
@@ -860,6 +862,7 @@ export async function createBrowserlessSystem(
     responsesContinuationIndex,
     anthropicContinuationIndex,
     anthropicModels: anthropicModelsFromEnv(env),
+    standaloneSearch,
   });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -1025,6 +1028,7 @@ export async function createBrowserlessSystem(
         router.beginShutdown();
         responsesContinuationIndex.beginShutdown();
         anthropicContinuationIndex.beginShutdown();
+        standaloneSearch.beginShutdown();
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
         try {
@@ -1049,6 +1053,7 @@ export async function createBrowserlessSystem(
         // continuation metadata survives process teardown.
         responsesContinuationIndex.clear();
         anthropicContinuationIndex.clear();
+        standaloneSearch.clear();
         // Reject any governor waiters which are not owned by the router (for
         // example a body reservation or CPU transform waiting during teardown).
         // Never close the permit pool while a slow HTTP/SSE output may still

@@ -17,7 +17,10 @@ import {
   anthropicModelsFromEnv,
   type AnthropicModelOptions,
 } from "../anthropic/model";
-import type { ResponseProvenanceLookup } from "../router/provenance";
+import {
+  ResponseProvenanceObsoleteError,
+  type ResponseProvenanceLookup,
+} from "../router/provenance";
 import {
   jsonEncodedByteLengthAsync,
 } from "../router/workload";
@@ -51,6 +54,10 @@ import {
   newAnthropicRequestId,
 } from "../anthropic/errors";
 import { safeObservabilityModel, sanitizeDiagnosticMessage } from "../observability/redaction";
+import {
+  registerStandaloneSearchRoute,
+  type StandaloneSearchHandler,
+} from "../http/standalone-search";
 
 export interface RouterLike {
   startRelay(
@@ -105,6 +112,8 @@ export interface GhostProvAppOptions {
   /** Additional explicit hostnames accepted beside loopback authorities. */
   allowedHosts?: readonly string[];
   keepAliveMs?: number;
+  /** Fixed-contract Codex standalone search executor; never a generic HTTP forwarder. */
+  standaloneSearch?: StandaloneSearchHandler;
 }
 
 const CODEX_BASE_INSTRUCTIONS =
@@ -1120,6 +1129,11 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     models: CODEX_MODELS,
   }));
 
+  registerStandaloneSearchRoute(app, {
+    handler: options.standaloneSearch,
+    authorizationScope,
+  });
+
 
   app.post("/v1/responses", async c => {
     let parsedBody: unknown;
@@ -1331,9 +1345,11 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           if (stream && !streamOwnsAttempt) void stream.cancel(error).catch(() => undefined);
           const safeFailure = stage === "start" || stage === "prelude" ||
             (stage === "nonstream" && nonstreamFailureSource === "final" && !sawRelayEvent);
+          const locallyObsoleteInferredParent = stage === "start" && rawHandle === null &&
+            error instanceof ResponseProvenanceObsoleteError;
           const retry = attempt === 0 && hit && continuationToken !== null &&
             continuationToken.match !== null && !relayAbort.signal.aborted && safeFailure &&
-            definitivePreviousResponseNotFound(error);
+            (definitivePreviousResponseNotFound(error) || locallyObsoleteInferredParent);
           if (retry) {
             // Exact compare-delete protects a concurrently replaced generation,
             // but every request with its own definitive pre-event rejection is

@@ -46,6 +46,8 @@ export class StandaloneSearchSessionIndex {
   readonly #ttlMs: number;
   readonly #now: () => number;
   #bytes = 0;
+  #generation = 0;
+  #shutdown = false;
 
   constructor(options: StandaloneSearchSessionIndexOptions = {}) {
     this.#maxRecords = positive(options.maxRecords ?? DEFAULT_MAX_RECORDS, "maxRecords");
@@ -65,7 +67,10 @@ export class StandaloneSearchSessionIndex {
   async run<T>(
     scope: AuthenticatedTenantScope,
     sessionId: string,
-    operation: (previousResponseId: string | null) => Promise<StandaloneSearchSessionOutcome<T>>,
+    operation: (
+      previousResponseId: string | null,
+      compareDelete: (expectedResponseId: string) => boolean,
+    ) => Promise<StandaloneSearchSessionOutcome<T>>,
   ): Promise<T> {
     if (!isAuthenticatedTenantScope(scope)) {
       throw new TypeError("Standalone search requires an authenticated tenant scope");
@@ -73,23 +78,38 @@ export class StandaloneSearchSessionIndex {
     if (typeof sessionId !== "string" || sessionId.length < 1 || sessionId.length > 128) {
       throw new TypeError("Standalone search session ID is invalid");
     }
+    if (this.#shutdown) {
+      return (await operation(null, () => false)).value;
+    }
     const key = this.#digest(scope, sessionId);
     if (!this.#tails.has(key) && this.#tails.size >= this.#maxActiveKeys) {
       // Metadata pressure must not become a global execution quota. The call
       // remains safe but deliberately loses cross-call ref continuity.
-      return (await operation(null)).value;
+      return (await operation(null, () => false)).value;
     }
 
+    const generation = this.#generation;
     const previous = this.#tails.get(key) ?? Promise.resolve();
     const execution = previous.catch(() => undefined).then(async () => {
       const now = this.#time();
       this.#pruneExpired(now);
-      const entry = this.#entries.get(key);
+      const entry = !this.#shutdown && generation === this.#generation
+        ? this.#entries.get(key)
+        : undefined;
       const previousResponseId = entry && entry.expiresAtMs > now
         ? entry.responseId
         : null;
-      const outcome = await operation(previousResponseId);
-      this.#commit(key, outcome.responseId, this.#time());
+      const compareDelete = (expectedResponseId: string): boolean => {
+        if (this.#shutdown || generation !== this.#generation) return false;
+        const current = this.#entries.get(key);
+        if (!current || current.responseId !== expectedResponseId) return false;
+        this.#delete(key);
+        return true;
+      };
+      const outcome = await operation(previousResponseId, compareDelete);
+      if (!this.#shutdown && generation === this.#generation) {
+        this.#commit(key, outcome.responseId, this.#time());
+      }
       return outcome.value;
     });
     const tail = execution.then(() => undefined, () => undefined);
@@ -102,8 +122,18 @@ export class StandaloneSearchSessionIndex {
   }
 
   clear(): void {
+    this.#generation = this.#generation === Number.MAX_SAFE_INTEGER
+      ? 0
+      : this.#generation + 1;
     this.#entries.clear();
+    this.#tails.clear();
     this.#bytes = 0;
+  }
+
+  beginShutdown(): void {
+    if (this.#shutdown) return;
+    this.#shutdown = true;
+    this.clear();
   }
 
   snapshot(): Readonly<{

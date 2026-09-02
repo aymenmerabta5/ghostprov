@@ -669,6 +669,39 @@ function safeRetryAfter(value: unknown): string {
   upstreamContractFailure();
 }
 
+export interface ValidatedStandaloneSearchSuccess {
+  readonly status: number;
+  readonly body: StandaloneSearchResponse;
+  readonly encodedBytes: number;
+}
+
+/**
+ * Validate the public success contract before server-owned continuation state
+ * advances. The route repeats this check for custom handlers; the router-backed
+ * handler calls it before committing its provider response ID.
+ */
+export async function validateStandaloneSearchSuccess(
+  statusValue: unknown,
+  bodyValue: unknown,
+  signal: AbortSignal,
+): Promise<ValidatedStandaloneSearchSuccess> {
+  const status = safeSuccessStatus(statusValue);
+  if (bodyValue === null || typeof bodyValue !== "object" || Array.isArray(bodyValue)) {
+    upstreamContractFailure();
+  }
+  const body = bodyValue as StandaloneSearchResponse;
+  try {
+    validateAndFreezeJsonTree(body, upstreamContractFailure, "body");
+    if (typeof body.output !== "string") upstreamContractFailure();
+    const encodedBytes = await jsonEncodedByteLengthAsync(body, { signal });
+    if (encodedBytes > STANDALONE_SEARCH_MAX_RESPONSE_BYTES) upstreamContractFailure();
+    return Object.freeze({ status, body, encodedBytes });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    upstreamContractFailure();
+  }
+}
+
 async function handlerResultResponse(
   value: unknown,
   signal: AbortSignal,
@@ -678,22 +711,10 @@ async function handlerResultResponse(
   try {
     if (result.kind === "success") {
       exactResultKeys(result, new Set(["kind", "status", "body"]));
-      const status = safeSuccessStatus(result.status);
       const body = result.body;
       bodyOwner = body;
-      if (body === null || typeof body !== "object" || Array.isArray(body)) upstreamContractFailure();
-      try {
-        validateAndFreezeJsonTree(body, upstreamContractFailure, "body");
-        const response = body as Record<string, unknown>;
-        if (typeof response.output !== "string") upstreamContractFailure();
-        if (await jsonEncodedByteLengthAsync(body, { signal }) > STANDALONE_SEARCH_MAX_RESPONSE_BYTES) {
-          upstreamContractFailure();
-        }
-      } catch (error) {
-        if (signal.aborted) throw error;
-        upstreamContractFailure();
-      }
-      const response = permittedJsonResponse(body, { status });
+      const validated = await validateStandaloneSearchSuccess(result.status, body, signal);
+      const response = permittedJsonResponse(validated.body, { status: validated.status });
       bodyOwner = null;
       return response;
     }

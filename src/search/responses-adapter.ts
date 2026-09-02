@@ -7,8 +7,6 @@ import { STANDALONE_SEARCH_MAX_RESPONSE_BYTES } from "./limits";
 const MAX_INNER_OUTPUT_TOKENS = 10_000;
 const MAX_SOURCES = 64;
 const MAX_OPAQUE_RESULTS = 128;
-const MAX_SOURCE_URL_UNITS = 2_048;
-const MAX_SOURCE_TITLE_UNITS = 256;
 const MAX_OUTPUT_UNITS = Math.floor(STANDALONE_SEARCH_MAX_RESPONSE_BYTES / 4);
 
 export class StandaloneSearchAdapterError extends Error {
@@ -109,67 +107,28 @@ export function buildStandaloneSearchResponsesRequest(
   };
 }
 
-interface Source {
-  readonly url: string;
-  readonly title?: string;
-}
-
-function safeUrl(value: unknown): string | null {
-  if (typeof value !== "string" || value.length < 1 || value.length > MAX_SOURCE_URL_UNITS) {
-    return null;
-  }
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === "https:" || parsed.protocol === "http:" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function safeTitle(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0
-    ? value.slice(0, MAX_SOURCE_TITLE_UNITS)
-    : undefined;
-}
-
-function addSource(
-  output: Source[],
-  seen: Set<string>,
-  urlValue: unknown,
-  titleValue?: unknown,
+function addOpaqueResult(
+  output: Record<string, unknown>[],
+  seen: Set<object>,
+  value: unknown,
 ): void {
-  if (output.length >= MAX_SOURCES) return;
-  const url = safeUrl(urlValue);
-  if (!url || seen.has(url)) return;
-  seen.add(url);
-  const title = safeTitle(titleValue);
-  output.push(Object.freeze({ url, ...(title === undefined ? {} : { title }) }));
-}
-
-function collectAnnotations(
-  annotations: unknown,
-  sources: Source[],
-  seen: Set<string>,
-  opaqueResults: unknown[],
-): void {
-  if (!Array.isArray(annotations)) return;
-  for (const raw of annotations.slice(0, MAX_SOURCES)) {
-    const annotation = record(raw);
-    if (!annotation) continue;
-    addOpaqueResult(opaqueResults, raw);
-    addSource(sources, seen, annotation.url, annotation.title);
-  }
-}
-
-function addOpaqueResult(output: unknown[], value: unknown): void {
   if (output.length >= MAX_OPAQUE_RESULTS) return;
-  // Provider results are JSON. Reparse one bounded item so the public result
-  // preserves every forward-compatible field without retaining aliases into
-  // the much larger provider final object.
-  try {
-    output.push(JSON.parse(JSON.stringify(value)));
-  } catch {
-    // A malformed trusted extension is omitted; the text result remains usable.
+  const item = record(value);
+  if (!item || seen.has(item)) return;
+  // Retaining a child does not retain its parent. Keep the provider's already
+  // charged JSON object instead of materializing an unreserved clone.
+  seen.add(item);
+  output.push(item);
+}
+
+function collectOpaqueResults(
+  values: unknown,
+  output: Record<string, unknown>[],
+  seen: Set<object>,
+): void {
+  if (!Array.isArray(values)) return;
+  for (const value of values.slice(0, MAX_SOURCES)) {
+    addOpaqueResult(output, seen, value);
   }
 }
 
@@ -183,9 +142,8 @@ export function standaloneSearchResponseFromFinal(
   }
 
   const text: string[] = [];
-  const sources: Source[] = [];
-  const opaqueResults: unknown[] = [];
-  const seenSources = new Set<string>();
+  const opaqueResults: Record<string, unknown>[] = [];
+  const seenResults = new Set<object>();
   let textUnits = 0;
   let encryptedOutput: string | undefined;
   for (const rawItem of final.output) {
@@ -211,43 +169,17 @@ export function standaloneSearchResponseFromFinal(
             textUnits += chunk.length;
           }
         }
-        collectAnnotations(part.annotations, sources, seenSources, opaqueResults);
+        collectOpaqueResults(part.annotations, opaqueResults, seenResults);
       }
     }
     if (item.type === "web_search_call") {
       const action = record(item.action);
-      if (Array.isArray(action?.sources)) {
-        for (const rawSource of action.sources.slice(0, MAX_SOURCES)) {
-          const source = record(rawSource);
-          if (source) {
-            addOpaqueResult(opaqueResults, rawSource);
-            addSource(sources, seenSources, source.url, source.title);
-          }
-        }
-      }
-      if (Array.isArray(item.results)) {
-        for (const rawResult of item.results.slice(0, MAX_SOURCES)) {
-          addOpaqueResult(opaqueResults, rawResult);
-          const result = record(rawResult);
-          if (!result) continue;
-          addSource(
-            sources,
-            seenSources,
-            result.source_website_url ?? result.url ?? result.image_url,
-            result.caption ?? result.title,
-          );
-        }
-      }
+      collectOpaqueResults(action?.sources, opaqueResults, seenResults);
+      collectOpaqueResults(item.results, opaqueResults, seenResults);
     }
   }
 
   let output = text.join("\n").trim();
-  if (sources.length > 0) {
-    const rendered = sources.map((source, index) => (
-      `[source ${index + 1}] ${source.title ? `${source.title}: ` : ""}${source.url}`
-    )).join("\n");
-    output = `${output}${output ? "\n\n" : ""}Sources:\n${rendered}`;
-  }
   if (!output) {
     throw new StandaloneSearchAdapterError("Native web search returned no usable output");
   }

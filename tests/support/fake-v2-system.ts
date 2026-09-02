@@ -94,6 +94,10 @@ export class FakeScaleUpstream {
       const tools = Array.isArray(body.tools) ? body.tools as Array<Record<string, unknown>> : [];
       const imageTool = tools.find(tool => tool.type === "image_generation");
       const functionTool = tools.find(tool => tool.type === "function");
+      const webSearchTool = tools.find(tool => tool.type === "web_search");
+      const responseText = webSearchTool
+        ? "The official OpenAI API documentation is available at https://developers.openai.com/api/docs."
+        : String(body.input ?? "");
       const output = imageTool
         ? [{
           id: `ig_${this.runtimeIndex}_${call}`,
@@ -106,6 +110,35 @@ export class FakeScaleUpstream {
           quality: imageTool.quality ?? "low",
           size: imageTool.size ?? "1024x1024",
         }]
+        : webSearchTool
+          ? [{
+            id: `ws_${this.runtimeIndex}_${call}`,
+            type: "web_search_call",
+            status: "completed",
+            action: {
+              type: "search",
+              query: "OpenAI API documentation",
+              sources: [{
+                url: "https://developers.openai.com/api/docs",
+                title: "OpenAI API documentation",
+              }],
+            },
+          }, {
+            id: `msg_${this.runtimeIndex}_${call}`,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{
+              type: "output_text",
+              text: responseText,
+              annotations: [{
+                type: "url_citation",
+                url: "https://developers.openai.com/api/docs",
+                title: "OpenAI API documentation",
+              }],
+              logprobs: [],
+            }],
+          }]
         : functionTool
           ? [{
             id: `fc_${this.runtimeIndex}_${call}`,
@@ -122,7 +155,7 @@ export class FakeScaleUpstream {
             status: "completed",
             content: [{
               type: "output_text",
-              text: String(body.input ?? ""),
+              text: responseText,
               annotations: [],
               logprobs: [],
             }],
@@ -154,7 +187,7 @@ export class FakeScaleUpstream {
           event: "response.output_text.delta",
           data: JSON.stringify({
             type: "response.output_text.delta",
-            delta: String(body.input ?? ""),
+            delta: responseText,
           }),
         }] : []),
         {
