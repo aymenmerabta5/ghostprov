@@ -15,10 +15,17 @@ import {
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import type { PrismProjectSummary } from "../src/prism/projects-client";
+import type { FleetRecoverySnapshot } from "../src/prism/recovery-coordinator";
+import type { SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
 
 const A = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const B = projectId("69288e8b-c183-45f3-9131-d64b05b98928");
 const C = projectId("11111111-1111-4111-8111-111111111111");
+const D = projectId("22222222-2222-4222-8222-222222222222");
+const E = projectId("33333333-3333-4333-8333-333333333333");
+const F = projectId("44444444-4444-4444-8444-444444444444");
+const G = projectId("55555555-5555-4555-8555-555555555555");
+const H = projectId("66666666-6666-4666-8666-666666666666");
 const FINGERPRINT = "a".repeat(64);
 const roots: string[] = [];
 
@@ -39,6 +46,58 @@ function project(id: ProjectId, title = `GhostProv Worker ${id === A ? 1 : id ==
   return { projectId: id, title, owner: "owner", deleted: false, createdAt: "2026-08-22T10:00:00.000Z" };
 }
 
+function uuidSequence(...values: readonly ProjectId[]): () => string {
+  let index = 0;
+  return () => {
+    const value = values[index++];
+    if (!value) throw new Error("test UUID sequence exhausted");
+    return value;
+  };
+}
+
+function recoveryRetry(
+  projectId: ProjectId,
+  consecutiveFailures: number,
+  kind = "timeout",
+): SandboxSupervisorEvent {
+  return {
+    type: "retry_scheduled",
+    projectId,
+    workerIndex: 1,
+    transport: "v2",
+    reason: "start",
+    attempt: consecutiveFailures,
+    incarnation: consecutiveFailures,
+    consecutiveFailures,
+    retryDelayMs: 1_000,
+    attemptDurationMs: 70_000,
+    totalDurationMs: consecutiveFailures * 71_000,
+    failure: {
+      name: "V2BootstrapError",
+      kind,
+      status: null,
+      operation: "bootstrap",
+      message: `Sidecar bootstrap ${kind} failure`,
+    },
+  };
+}
+
+function recoveryCircuit(
+  state: FleetRecoverySnapshot["state"],
+  scope: FleetRecoverySnapshot["scope"],
+): Readonly<FleetRecoverySnapshot> {
+  return {
+    state,
+    scope,
+    consecutiveFailures: state === "closed" ? 0 : 2,
+    queued: 0,
+    probeInFlight: false,
+    revalidationInFlight: false,
+    nextProbeAtMs: state === "closed" ? null : Date.now() + 60_000,
+    lastFailureKind: state === "closed" ? null : "account_transport",
+  };
+}
+
 class FakeProjects {
   readonly created: Array<{ projectId: ProjectId; title: string }> = [];
   readonly deleted: ProjectId[] = [];
@@ -51,7 +110,16 @@ class FakeProjects {
   async get(id: ProjectId): Promise<PrismProjectSummary> {
     this.getCalls.push(id);
     const found = this.remote.find(value => value.projectId === id && !value.deleted);
-    if (!found) throw new Error(`missing project ${id}`);
+    if (!found) {
+      const error = new Error(`missing project ${id}`) as Error & {
+        status: number;
+        kind: string;
+      };
+      error.name = "PrismProjectError";
+      error.status = 404;
+      error.kind = "http";
+      throw error;
+    }
     return found;
   }
 
@@ -62,7 +130,11 @@ class FakeProjects {
     return value;
   }
 
-  async deleteManaged(id: ProjectId): Promise<void> { this.deleted.push(id); }
+  async deleteManaged(id: ProjectId): Promise<void> {
+    this.deleted.push(id);
+    const found = this.remote.find(value => value.projectId === id);
+    if (found) found.deleted = true;
+  }
 }
 
 class InvalidMetadataProjects extends FakeProjects {
@@ -93,6 +165,37 @@ class SelectivelyHungProjects extends FakeProjects {
   }
 }
 
+class TransportMissingProjects extends FakeProjects {
+  override async get(id: ProjectId): Promise<PrismProjectSummary> {
+    const found = this.remote.find(value => value.projectId === id && !value.deleted);
+    if (found) return super.get(id);
+    this.getCalls.push(id);
+    const error = new TypeError("project control plane unavailable") as TypeError & {
+      kind: string;
+    };
+    error.name = "AccountTransportError";
+    error.kind = "transport";
+    throw error;
+  }
+}
+
+class FailingCreateProjects extends FakeProjects {
+  createCalls = 0;
+
+  override async create(
+    input: { projectId: ProjectId; title: string },
+  ): Promise<PrismProjectSummary> {
+    this.createCalls++;
+    const error = new TypeError("project creation transport unavailable") as TypeError & {
+      kind: string;
+    };
+    error.name = "AccountTransportError";
+    error.kind = "transport";
+    void input;
+    throw error;
+  }
+}
+
 class DeferredMissingProjects extends FakeProjects {
   readonly missingStarted: Promise<void>;
   #markMissingStarted!: () => void;
@@ -112,7 +215,7 @@ class DeferredMissingProjects extends FakeProjects {
     this.getCalls.push(id);
     this.#markMissingStarted();
     await this.#missingGate;
-    throw new Error(`missing project ${id}`);
+    return super.get(id);
   }
 }
 
@@ -145,6 +248,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   snapshot(): RoutableSandboxSnapshot {
     return {
       projectId: this.projectId,
+      releaseRevision: "r8",
       state: this.state,
       capacity: this.state === "ready" ? 128 : 0,
       active: 0,
@@ -456,12 +560,14 @@ function config(cookieFile: string, input: {
   sessionMode?: "authenticated" | "auto" | "anonymous";
   guestMax?: number;
   provisionConcurrency?: number;
+  target?: number;
 }) {
   const explicit = input.explicit;
   return resolveMultiSandboxConfig({
     GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
     PRISM_COOKIE_FILE: cookieFile,
     PRISM_PROJECT_IDS: explicit.join(","),
+    GP_TARGET_SANDBOXES: String(input.target ?? explicit.length),
     GP_PRISM_SESSION: input.sessionMode ?? "authenticated",
     GP_ALLOW_ANONYMOUS: input.sessionMode === "auto" ? "1" : "0",
     GP_GUEST_MAX_PROJECTS: String(input.guestMax ?? 4),
@@ -484,6 +590,9 @@ function manager(input: {
   random?: () => number;
   metadataAttemptTimeoutMs?: number;
   runtimeCleanupTimeoutMs?: number;
+  randomUuid?: () => string;
+  recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
+  canRetireProject?: (projectId: ProjectId) => boolean;
 }) {
   const factory = input.factory ?? new FakeFactory();
   const registry = input.registry ?? new SandboxRegistry();
@@ -501,8 +610,11 @@ function manager(input: {
       retryInitialDelayMs: input.retryInitialDelayMs,
       retryMaxDelayMs: input.retryMaxDelayMs,
       random: input.random ?? (() => 0.5),
+      randomUuid: input.randomUuid,
       metadataAttemptTimeoutMs: input.metadataAttemptTimeoutMs,
       runtimeCleanupTimeoutMs: input.runtimeCleanupTimeoutMs,
+      recoveryCircuitSnapshot: input.recoveryCircuitSnapshot,
+      canRetireProject: input.canRetireProject,
     }),
   };
 }
@@ -540,6 +652,202 @@ async function waitForCondition(
 }
 
 describe("ProjectFleetManager", () => {
+  it("creates a project-less fleet once and restarts from the manifest without environment IDs", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    const first = manager({
+      config: config(files.cookieFile, { explicit: [], target: 3, provisionConcurrency: 3 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(A, B, C),
+    });
+
+    await expect(first.value.reconcile()).resolves.toMatchObject({
+      desired: 3,
+      ready: 3,
+      unavailable: 0,
+    });
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C]);
+    const persisted = await files.manifest.load();
+    expect(persisted.legacyMigrationCompleted).toBe(true);
+    expect(persisted.workers.every(worker => worker.managed)).toBe(true);
+    await first.value.shutdown("restart");
+
+    const second = manager({
+      config: config(files.cookieFile, { explicit: [], target: 3, provisionConcurrency: 3 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: () => { throw new Error("restart must not allocate a project"); },
+    });
+    await expect(second.value.reconcile()).resolves.toMatchObject({ ready: 3 });
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C]);
+    await second.value.shutdown("test-complete");
+  });
+
+  it("replaces a conclusively failed managed project only after identical local failures", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(A, B, C, D, E),
+      canRetireProject: () => true,
+    });
+    await harness.value.reconcile();
+    const failed = harness.factory.runtimes.get(A)!;
+    failed.state = "recovering";
+
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 1, "timeout"));
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 2, "timeout"));
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 3, "hello"));
+    await harness.value.reconcile();
+    expect(projects.created).toHaveLength(4);
+    expect(projects.deleted).toEqual([]);
+
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 2, "hello"));
+    harness.value.observeRecoveryEvent(recoveryRetry(A, 3, "hello"));
+    await expect(harness.value.reconcile()).resolves.toMatchObject({
+      desired: 4,
+      ready: 4,
+      unavailable: 0,
+    });
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C, D, E]);
+    expect(projects.deleted).toEqual([A]);
+    expect((await files.manifest.load()).workers.map(worker => worker.projectId).sort())
+      .toEqual([B, C, D, E].sort());
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("fences replacement while a continuation binding or fleet outage exists", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    let continuationBound = true;
+    let circuit = recoveryCircuit("open", "outage");
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(A, B, C, D, E),
+      canRetireProject: id => id !== A || !continuationBound,
+      recoveryCircuitSnapshot: () => circuit,
+    });
+
+    // The open common-mode circuit permits local intent persistence but no
+    // remote create storm.
+    const first = await harness.value.reconcile();
+    expect(first.projectMutation).toMatchObject({ state: "open" });
+    expect(projects.created).toEqual([]);
+
+    circuit = recoveryCircuit("closed", null);
+    await harness.value.reconcile();
+    const failed = harness.factory.runtimes.get(A)!;
+    failed.state = "recovering";
+    for (let count = 1; count <= 3; count++) {
+      harness.value.observeRecoveryEvent(recoveryRetry(A, count));
+    }
+    await harness.value.reconcile();
+    expect(projects.created).toHaveLength(4);
+    expect(projects.deleted).toEqual([]);
+
+    continuationBound = false;
+    await harness.value.reconcile();
+    expect(projects.created).toHaveLength(5);
+    expect(projects.deleted).toEqual([A]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("opens a local project-mutation circuit and suppresses create storms", async () => {
+    const files = await state();
+    const projects = new FailingCreateProjects([]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(A, B, C, D, E, F, G, H),
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({
+      desired: 8,
+      ready: 0,
+      unavailable: 8,
+      projectMutation: {
+        state: "open",
+        consecutiveFailures: 1,
+      },
+    });
+    expect(projects.createCalls).toBe(4);
+    await harness.value.reconcile();
+    expect(projects.createCalls).toBe(4);
+    expect((await files.manifest.load()).workers).toHaveLength(8);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("does not replace a whole persisted fleet when project metadata all returns 404", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (const [index, id] of [A, B, C, D].entries()) {
+      await files.manifest.reserveWorker({
+        index: index + 1,
+        projectId: id,
+        title: `GhostProv Worker ${index + 1}`,
+        nowMs: index + 1,
+      });
+      await files.manifest.markState(id, "ready", index + 10);
+    }
+    const projects = new FakeProjects([]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: uuidSequence(E),
+      canRetireProject: () => true,
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 0, unavailable: 4 });
+    expect(projects.created).toEqual([]);
+    expect((await files.manifest.load()).workers.every(worker => worker.state !== "draining"))
+      .toBe(true);
+
+    projects.remote.push(project(B), project(C), project(D));
+    await harness.value.reconcile();
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, unavailable: 0 });
+    expect(projects.created.map(value => value.projectId)).toEqual([E]);
+    expect(projects.deleted).toEqual([A]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("resumes a crash-interrupted replacement and deletes only its managed old project", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (const [index, id] of [A, B, C, D, E].entries()) {
+      await files.manifest.reserveWorker({
+        index: index + 1,
+        projectId: id,
+        title: `GhostProv Worker ${index + 1}`,
+        nowMs: index + 1,
+      });
+      await files.manifest.markCreated(id, index + 10);
+    }
+    await files.manifest.markDraining(A, "replacement", 100);
+    const projects = new FakeProjects([A, B, C, D, E].map(id => project(id)));
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      randomUuid: () => { throw new Error("persisted replacement must not allocate"); },
+      canRetireProject: () => true,
+    });
+
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4 });
+    expect(projects.deleted).toEqual([A]);
+    expect((await files.manifest.load()).workers.map(worker => worker.projectId).sort())
+      .toEqual([B, C, D, E].sort());
+    await harness.value.shutdown("test-complete");
+  });
+
   it("keeps fresh worker indexes in configured order when metadata completes in reverse", async () => {
     const files = await state();
     const harness = manager({
@@ -565,7 +873,7 @@ describe("ProjectFleetManager", () => {
     await harness.value.shutdown("test-complete");
   });
 
-  it("fails an all-missing explicit fleet before provisioning or project creation", async () => {
+  it("replaces missing legacy migration seeds without deleting user projects", async () => {
     const files = await state();
     const projects = new FakeProjects([project(B, "Unlisted project")]);
     const harness = manager({
@@ -574,24 +882,21 @@ describe("ProjectFleetManager", () => {
       projects,
     });
 
-    await expect(harness.value.reconcile()).rejects.toMatchObject({
-      kind: "explicit_project_missing",
-    });
-    expect(harness.factory.created).toEqual([]);
-    expect(projects.created).toEqual([]);
-    expect(harness.registry.runtimes()).toEqual([]);
-    expect(harness.value.snapshot()).toMatchObject({
+    const snapshot = await harness.value.reconcile();
+    expect(snapshot).toMatchObject({
       desired: 2,
-      ready: 0,
-      failed: 2,
-      unavailable: 2,
-      unavailableProjects: [A, C],
-      projects: [A, C],
+      ready: 2,
+      unavailable: 0,
     });
+    expect(projects.created).toHaveLength(2);
+    expect(harness.factory.created.map(value => value.projectId).sort())
+      .toEqual(projects.created.map(value => value.projectId).sort());
+    expect(projects.deleted).toEqual([]);
+    expect((await files.manifest.load()).legacyMigrationCompleted).toBe(true);
     await harness.value.shutdown("test-complete");
   });
 
-  it("starts a verified project while one explicit project is unavailable", async () => {
+  it("keeps an available legacy project while filling a missing slot", async () => {
     const files = await state();
     const projects = new FakeProjects([project(B)]);
     const harness = manager({
@@ -604,15 +909,13 @@ describe("ProjectFleetManager", () => {
 
     expect(snapshot).toMatchObject({
       desired: 2,
-      ready: 1,
-      failed: 1,
-      unavailable: 1,
-      unavailableProjects: [A],
-      projects: [A, B],
+      ready: 2,
+      failed: 0,
+      unavailable: 0,
     });
-    expect(harness.factory.created.map(value => value.projectId)).toEqual([B]);
-    expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
-    expect(projects.created).toEqual([]);
+    expect(harness.factory.created.map(value => value.projectId)).toContain(B);
+    expect(projects.created).toHaveLength(1);
+    expect(projects.deleted).toEqual([]);
     await harness.value.shutdown("test-complete");
   });
 
@@ -648,7 +951,7 @@ describe("ProjectFleetManager", () => {
     await harness.value.shutdown("test-complete");
   });
 
-  it("rejects deleted and wrong-project metadata without adopting a substitute", async () => {
+  it("rejects deleted and wrong-project metadata and creates a managed substitute", async () => {
     for (const invalid of [
       { ...project(A), deleted: true },
       project(C, "Wrong returned project"),
@@ -662,13 +965,13 @@ describe("ProjectFleetManager", () => {
       });
 
       await expect(harness.value.reconcile()).resolves.toMatchObject({
-        ready: 1,
-        unavailable: 1,
-        unavailableProjects: [A],
+        ready: 2,
+        unavailable: 0,
       });
-      expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+      expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toContain(B);
       expect(harness.registry.get(C)).toBeUndefined();
-      expect(projects.created).toEqual([]);
+      expect(projects.created).toHaveLength(1);
+      expect(projects.deleted).toEqual([]);
       await harness.value.shutdown("test-complete");
     }
   });
@@ -712,7 +1015,7 @@ describe("ProjectFleetManager", () => {
     } finally {
       projects.releaseMissing();
     }
-    await expect(reconciling).resolves.toMatchObject({ ready: 1, unavailable: 1 });
+    await expect(reconciling).resolves.toMatchObject({ ready: 2, unavailable: 0 });
     await harness.value.shutdown("test-complete");
   });
 
@@ -819,7 +1122,7 @@ describe("ProjectFleetManager", () => {
 
   it("recovers unavailable metadata in the background without another caller reconcile", async () => {
     const files = await state();
-    const projects = new FakeProjects([project(B)]);
+    const projects = new TransportMissingProjects([project(B)]);
     const harness = manager({
       config: config(files.cookieFile, { explicit: [A, B] }),
       manifest: files.manifest,
@@ -866,24 +1169,23 @@ describe("ProjectFleetManager", () => {
     await expect(harness.value.reconcile()).resolves.toMatchObject({
       ready: 1,
       unavailable: 2,
-      unavailableProjects: [A, B],
     });
     expect(harness.registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([C]);
+    expect(projects.created).toEqual([]);
 
-    projects.remote.push(project(A));
     await expect(Promise.race([
       harness.value.waitForReady(2),
       Bun.sleep(2_000).then(() => { throw new Error("independent metadata recovery stalled"); }),
     ])).resolves.toMatchObject({ ready: 2, unavailable: 1 });
     expect(harness.registry.get(B)).toBeUndefined();
-    expect(projects.created).toEqual([]);
+    expect(projects.created).toHaveLength(1);
     await harness.value.shutdown("test-complete");
   });
 
   it("uses one jittered bounded retry loop and resets backoff after progress", async () => {
     const files = await state();
     const clock = new StepClock();
-    const projects = new FakeProjects([project(B)]);
+    const projects = new TransportMissingProjects([project(B)]);
     const harness = manager({
       config: config(files.cookieFile, { explicit: [A, B, C] }),
       manifest: files.manifest,
@@ -905,7 +1207,7 @@ describe("ProjectFleetManager", () => {
 
     clock.releaseNext();
     await waitForCondition(() => clock.delays.length === 3, "bounded metadata retry");
-    expect(clock.delays).toEqual([12, 24, 25]);
+    expect(clock.delays).toEqual([12, 24, 40]);
     expect(clock.maxPending).toBe(1);
 
     projects.remote.push(project(A));
@@ -914,7 +1216,7 @@ describe("ProjectFleetManager", () => {
       () => harness.registry.readyRuntimes().length === 2 && clock.delays.length === 4,
       "partial retry progress",
     );
-    expect(clock.delays).toEqual([12, 24, 25, 12]);
+    expect(clock.delays).toEqual([12, 24, 40, 12]);
     expect(clock.maxPending).toBe(1);
     expect(harness.value.snapshot()).toMatchObject({ ready: 2, unavailable: 1 });
     expect(projects.getCalls.filter(id => id === B)).toHaveLength(1);
@@ -925,7 +1227,7 @@ describe("ProjectFleetManager", () => {
   it("aborts the single metadata retry task during shutdown", async () => {
     const files = await state();
     const clock = new BlockingClock();
-    const projects = new FakeProjects([project(B)]);
+    const projects = new TransportMissingProjects([project(B)]);
     const harness = manager({
       config: config(files.cookieFile, { explicit: [A, B] }),
       manifest: files.manifest,
@@ -991,7 +1293,7 @@ describe("ProjectFleetManager", () => {
     expect((await files.manifest.load()).workers[0].state).toBe("ready");
   });
 
-  it("does not reuse a manifest project after it leaves the allowlist", async () => {
+  it("keeps the manifest authoritative after a later environment seed changes", async () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
     await files.manifest.reserveWorker({
@@ -1014,11 +1316,11 @@ describe("ProjectFleetManager", () => {
 
     const snapshot = await harness.value.reconcile();
 
-    expect(snapshot.projects).toEqual([B]);
+    expect(snapshot.projects).toEqual([A]);
     expect(projects.created).toEqual([]);
   });
 
-  it("drains excess local runtimes without deleting Prism projects", async () => {
+  it("never auto-deletes healthy surplus capacity without manual decommission", async () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
     await files.manifest.reserveWorker({ index: 1, projectId: A, title: "GhostProv Worker 1", nowMs: 1 });
@@ -1041,23 +1343,30 @@ describe("ProjectFleetManager", () => {
     await harness.value.reconcile();
 
     expect(registry.get(A)).toBe(left);
-    expect(registry.get(B)).toBeUndefined();
-    expect(right.drains).toBe(1);
+    expect(registry.get(B)).toBe(right);
+    expect(right.drains).toBe(0);
     expect(projects.deleted).toEqual([]);
+    await harness.value.shutdown("test-complete");
   });
 
   it("force-stops an excess runtime before publishing configured readiness", async () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
-    await files.manifest.reserveWorker({ index: 1, projectId: C, title: "Old worker", nowMs: 1 });
-    await files.manifest.markCreated(C, 2);
+    await files.manifest.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "Current worker",
+      nowMs: 1,
+      managed: false,
+    });
+    await files.manifest.markCreated(A, 2);
     const excess = new FailingDrainRuntime(C);
     await excess.start();
     const registry = new SandboxRegistry([excess]);
     const harness = manager({
-      config: config(files.cookieFile, { explicit: [B] }),
+      config: config(files.cookieFile, { explicit: [A] }),
       manifest: files.manifest,
-      projects: new FakeProjects([project(B)]),
+      projects: new FakeProjects([project(A)]),
       registry,
     });
 
@@ -1066,8 +1375,8 @@ describe("ProjectFleetManager", () => {
     expect(excess.drains).toBe(1);
     expect(excess.state).toBe("stopped");
     expect(registry.get(C)).toBeUndefined();
-    expect(snapshot).toMatchObject({ ready: 1, unavailable: 0, projects: [B] });
-    expect(registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([B]);
+    expect(snapshot).toMatchObject({ ready: 1, unavailable: 0, projects: [A] });
+    expect(registry.readyRuntimes().map(runtime => runtime.projectId)).toEqual([A]);
     await harness.value.shutdown("test-complete");
   });
 
@@ -1088,7 +1397,7 @@ describe("ProjectFleetManager", () => {
     expect(harness.registry.runtimes()).toHaveLength(1);
   });
 
-  it("fails closed when auto session resolution exceeds the anonymous project cap", async () => {
+  it("caps an auto-resolved anonymous fleet without creating excess projects", async () => {
     const files = await state();
     const projects = new FakeProjects([project(A), project(B)]);
     const harness = manager({
@@ -1098,9 +1407,9 @@ describe("ProjectFleetManager", () => {
       projects,
     });
 
-    await expect(harness.value.reconcile()).rejects.toThrow("anonymous fleet limit");
-    expect(projects.getCalls).toEqual([]);
-    expect(harness.factory.created).toEqual([]);
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ desired: 1, ready: 1 });
+    expect(projects.getCalls).toEqual([A]);
+    expect(harness.factory.created.map(value => value.projectId)).toEqual([A]);
   });
 
   it("rejects reconciliation after shutdown without creating projects", async () => {

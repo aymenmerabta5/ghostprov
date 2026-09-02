@@ -1,7 +1,7 @@
 import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
-import { FleetManifestStore } from "../fleet/manifest";
+import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
 import type { ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
@@ -29,6 +29,7 @@ import type { ProjectId } from "../sandbox/types";
 import {
   RecoveryPermitPool,
   SupervisedSandboxRuntime,
+  type SandboxSupervisorEvent,
 } from "../sandbox/supervised-runtime";
 import { SandboxYDoc } from "../sandbox/ydoc";
 import { YSweetAwarenessChannel } from "../v2/awareness/y-sweet-channel";
@@ -334,16 +335,12 @@ export function createV2CpuGzip(
 }
 
 function fixedV2RevisionSelector(
-  projectIds: readonly ProjectId[],
+  _projectIds: readonly ProjectId[],
   assets: V2SidecarAssets,
 ): BrowserlessV2RevisionSelector {
-  const projects = new Set(projectIds);
   return {
     async preload() {},
     loadedForProject(projectId) {
-      if (!projects.has(projectId)) {
-        throw new Error(`Cannot select V2 assets for unknown project: ${projectId}`);
-      }
       return { revision: assets.revision, assets };
     },
   };
@@ -375,6 +372,7 @@ function defaultRuntimeFactory(options: {
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
+  onRecoveryEvent?(event: SandboxSupervisorEvent): void;
 }): ManagedRuntimeFactory {
   const {
     config,
@@ -389,6 +387,7 @@ function defaultRuntimeFactory(options: {
     revalidateAccount,
     logger,
     heartbeatFactory,
+    onRecoveryEvent,
   } = options;
   const gzip = createV2CpuGzip(cpuPool);
 
@@ -607,6 +606,7 @@ function defaultRuntimeFactory(options: {
               ? normalizeSandboxRecoveryOperation(failure.operation)
               : null,
           }), event.type === "retry_scheduled" ? "progress" : "terminal");
+          try { onRecoveryEvent?.(event); } catch {}
         },
       });
     },
@@ -712,6 +712,7 @@ export async function createBrowserlessSystem(
         projectIds: config.projectIds,
         defaultRevision: config.v2SidecarRevision,
         projectOverrides: config.v2SidecarProjectRevisions,
+        allowUnlistedProjects: true,
       }));
   // A selected release must be present and authentic before account/session,
   // server, fleet, or sandbox state is created. Never fall back to R1 here.
@@ -774,6 +775,7 @@ export async function createBrowserlessSystem(
     throw error;
   }
   const provisioning = new PrismProvisioningClient({ account: identity.account });
+  let fleet!: ProjectFleetManager;
   const recoveryCoordinator = new FleetRecoveryCoordinator({
     revalidateAccount: signal => sessionManager.revalidate
       ? sessionManager.revalidate(signal)
@@ -789,12 +791,28 @@ export async function createBrowserlessSystem(
         consecutive_failures: snapshot.consecutiveFailures,
         queued: snapshot.queued,
       }), "terminal");
+      fleet?.observeRecoveryCircuit(snapshot);
     },
   });
   const projects = dependencies.projects ?? new PrismProjectsClient(identity.account);
   const manifest = dependencies.manifest ?? new FleetManifestStore({
-    file: config.fleetManifestFile,
+    file: config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint),
     identityFingerprint: identity.fingerprint,
+    ...(config.fleetManifestFile === null
+      ? { legacyFile: ".ghostprov/fleet.json" }
+      : {}),
+  });
+  const registry = dependencies.registry ?? new SandboxRegistry();
+  const router = dependencies.router ?? new MultiSandboxRouter({
+    registry,
+    governor,
+    logger,
+    queueTimeoutMs: config.routerQueueTimeoutMs,
+    authorizationScope,
+    observability: {
+      slowRequestMs: observabilityConfig.slowRequestMs,
+      transport: "v2",
+    },
   });
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
@@ -814,26 +832,17 @@ export async function createBrowserlessSystem(
       : Promise.resolve(identity),
     logger,
     heartbeatFactory: dependencies.heartbeatFactory,
+    onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
   });
-  const registry = dependencies.registry ?? new SandboxRegistry();
-  const fleet = new ProjectFleetManager({
+  fleet = new ProjectFleetManager({
     config,
     identity: { kind: identity.kind, fingerprint: identity.fingerprint },
     projects,
     manifest,
     registry,
     runtimeFactory,
-  });
-  const router = dependencies.router ?? new MultiSandboxRouter({
-    registry,
-    governor,
-    logger,
-    queueTimeoutMs: config.routerQueueTimeoutMs,
-    authorizationScope,
-    observability: {
-      slowRequestMs: observabilityConfig.slowRequestMs,
-      transport: "v2",
-    },
+    recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
+    canRetireProject: project => router.responseProvenanceBindingsForProject(project) === 0,
   });
   const responsesContinuationIndex = dependencies.responsesContinuationIndex ??
     new ResponsesHttpContinuationIndex();
@@ -971,14 +980,10 @@ export async function createBrowserlessSystem(
           await Promise.race([
             fleet.waitForReady(1, startupController.signal),
             reconciliation.then(snapshot => {
-              if (
-                (snapshot as { ready: number }).ready < 1 &&
-                registry.runtimes().length === 0
-              ) {
-                throw new Error("Fleet reconciliation produced no ready runtime");
-              }
-              // Registered supervisors continue retrying failed sandbox
-              // generations in the background. Keep waiting for one to recover.
+              void snapshot;
+              // Managed project creation and registered supervisors both retry
+              // in the background. A transient zero-runtime control-plane
+              // outage must not turn startup into a destructive restart loop.
               return new Promise<never>(() => undefined);
             }),
           ]);

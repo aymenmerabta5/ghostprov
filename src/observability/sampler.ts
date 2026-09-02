@@ -340,6 +340,10 @@ export class FleetSampler {
         unavailable_projects: unavailableProjects,
         unavailable_projects_truncated:
           (fleet?.unavailableProjects.length ?? 0) > unavailableProjects.length,
+        pending_retirements: fleet?.pendingRetirements ?? 0,
+        project_mutation_state: fleet?.projectMutation?.state ?? "closed",
+        project_mutation_failures: fleet?.projectMutation?.consecutiveFailures ?? 0,
+        project_mutation_retry_ms: fleet?.projectMutation?.retryInMs ?? null,
         rss_bytes: memory.rss,
         heap_bytes: memory.heapUsed,
         external_bytes: memory.external,

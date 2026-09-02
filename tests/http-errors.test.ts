@@ -3,6 +3,7 @@ import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "..
 import { RelayError } from "../src/relay/run-handle";
 import {
   RouterCapacityTimeoutError,
+  RouterTransportAdmissionTimeoutError,
   RouterQueueFullError,
   RouterShutdownError,
 } from "../src/router/router";
@@ -62,6 +63,18 @@ describe("OpenAI-compatible HTTP errors", () => {
         type: "service_unavailable_error",
         param: null,
         code: "router_capacity_timeout",
+      },
+    });
+  });
+
+  it("distinguishes a selected route's transport-admission timeout", () => {
+    expect(normalizeApiError(new RouterTransportAdmissionTimeoutError())).toEqual({
+      status: 503,
+      error: {
+        message: "A selected sandbox did not acquire transport admission before the routing deadline",
+        type: "service_unavailable_error",
+        param: null,
+        code: "transport_admission_timeout",
       },
     });
   });

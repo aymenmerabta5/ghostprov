@@ -227,6 +227,10 @@ describe("observability privacy", () => {
       unavailable: 1,
       unavailable_projects: [unavailable],
       unavailable_projects_truncated: false,
+      pending_retirements: 1,
+      project_mutation_state: "open",
+      project_mutation_failures: 2,
+      project_mutation_retry_ms: 1000,
     }))).not.toThrow();
     expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.sample", {
       desired: 1,

@@ -85,7 +85,12 @@ const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
 const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
-const PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
+// Real Prism telemetry showed 3.68-3.82 MiB JSON histories compressing to
+// roughly 1.75 MiB and making steady ACK progress at about 50 KiB/s. Scaling
+// only above 8 MiB made those healthy transfers deterministically hit 30s.
+const QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES = 2 * MiB;
+const ROUTE_PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
+const PROGRESS_AWARE_MAX_REQUEST_BYTES = 8 * MiB;
 const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
 const MEDIUM_PROGRESS_PROBE_MIN_BYTES = 256 * KiB;
 const FLEET_TRANSFER_EXEMPT_BYTES = 256 * KiB;
@@ -217,16 +222,28 @@ export interface RequestRoutingTimeouts {
 }
 
 function scaledRouteAttemptTimeoutMs(requestBytes: number, baseTimeoutMs: number): number {
-  if (requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
+  if (requestBytes <= ROUTE_PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
   return Math.min(
     MAX_TIMER_MS,
-    Math.ceil(baseTimeoutMs * (requestBytes / PAYLOAD_AWARE_DEADLINE_BYTES)),
+    Math.ceil(baseTimeoutMs * (requestBytes / ROUTE_PAYLOAD_AWARE_DEADLINE_BYTES)),
   );
 }
 
 function scaledQueueTimeoutMs(requestBytes: number, baseTimeoutMs: number): number {
-  if (requestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
-  const scale = requestBytes / PAYLOAD_AWARE_DEADLINE_BYTES;
+  if (requestBytes <= QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
+  // Give the observed 2-8 MiB history band up to four base windows, then let
+  // the established 8 MiB large-payload slope take over. This fixes the
+  // measured 3.8 MiB false timeout without turning a legal 64 MiB request into
+  // a sixteen-minute admission lease (its prior proven cap remains 245 s).
+  const observedHistoryScale = Math.min(
+    4,
+    requestBytes / QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES,
+  );
+  const legalPayloadScale = Math.max(
+    1,
+    requestBytes / ROUTE_PAYLOAD_AWARE_DEADLINE_BYTES,
+  );
+  const scale = Math.max(observedHistoryScale, legalPayloadScale);
   const failoverSlackMs = Math.max(1, Math.ceil(baseTimeoutMs / 6));
   return Math.min(
     MAX_TIMER_MS,
@@ -235,10 +252,11 @@ function scaledQueueTimeoutMs(requestBytes: number, baseTimeoutMs: number): numb
 }
 
 /**
- * Keep the established deadlines byte-for-byte for requests through 8 MiB.
- * Above that boundary, scale by payload size so a legal 64 MiB transfer gets
- * enough ACK rounds even on a 400 ms link. The global deadline retains one-sixth
- * of its base as failover slack beyond two normal 15-second attempts.
+ * Keep the established global deadline byte-for-byte through 2 MiB. Above it,
+ * scale queue/admission time for measured slow-but-progressing transfers up to
+ * four base windows; above 8 MiB the established legal-payload slope takes
+ * over. The per-runtime no-progress attempt remains 15 seconds through 8 MiB,
+ * so the longer global budget does not pin a dead route and permits failover.
  */
 export function requestRoutingTimeouts(
   requestBytes: number,
@@ -356,6 +374,8 @@ interface QueuedJob {
   retainMemoryUntil: Promise<unknown> | null;
   memoryReleaseScheduled: boolean;
   attempts: number;
+  /** True after at least one healthy runtime was selected for transport admission. */
+  routeSelected: boolean;
   excluded: Map<string, {
     retryEpoch: number;
     retryAtMs: number;
@@ -456,6 +476,16 @@ export class RouterCapacityTimeoutError extends Error {
   }
 }
 
+export class RouterTransportAdmissionTimeoutError extends Error {
+  readonly name = "RouterTransportAdmissionTimeoutError";
+  readonly status = 503;
+  readonly code = "transport_admission_timeout";
+
+  constructor() {
+    super("A selected sandbox did not acquire transport admission before the routing deadline");
+  }
+}
+
 class RouterRouteAttemptTimeoutError extends Error {
   readonly name = "RouterRouteAttemptTimeoutError";
   readonly code = "router_route_attempt_timeout";
@@ -484,10 +514,17 @@ function sanitizedRouterAbortReason(signal: AbortSignal | undefined): unknown {
   const reason = signal?.reason;
   if (
     reason instanceof RouterCapacityTimeoutError ||
+    reason instanceof RouterTransportAdmissionTimeoutError ||
     reason instanceof RouterShutdownError ||
     (reason instanceof DOMException && reason.name === "AbortError")
   ) return reason;
   return abortError();
+}
+
+function selectedRouteDeadlineError(error: unknown, routeSelected: boolean): unknown {
+  return routeSelected && error instanceof RouterCapacityTimeoutError
+    ? new RouterTransportAdmissionTimeoutError()
+    : error;
 }
 
 type JsonCloneFrame = {
@@ -1319,6 +1356,7 @@ export class MultiSandboxRouter {
         retainMemoryUntil: options.retainMemoryUntil ?? null,
         memoryReleaseScheduled: false,
         attempts: 0,
+        routeSelected: false,
         excluded: new Map(),
         resolve,
         reject,
@@ -1350,7 +1388,10 @@ export class MultiSandboxRouter {
         this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
         this.#releaseQueueCapacity(job);
-        const error = sanitizedRouterAbortReason(job.signal);
+        const error = selectedRouteDeadlineError(
+          sanitizedRouterAbortReason(job.signal),
+          job.routeSelected,
+        );
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
         reject(error);
@@ -1495,7 +1536,7 @@ export class MultiSandboxRouter {
           throw new Error("Incoming body lease is no longer accepting bytes");
         }
         observedBodyBytes = Math.max(observedBodyBytes, nextBytes);
-        if (observedBodyBytes > PAYLOAD_AWARE_DEADLINE_BYTES) {
+        if (observedBodyBytes > QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES) {
           const nextDeadlineMs = acceptedAtMs + scaledQueueTimeoutMs(
             observedBodyBytes,
             this.#queueTimeoutMs,
@@ -1597,6 +1638,11 @@ export class MultiSandboxRouter {
       return { kind: "scope_mismatch" };
     }
     return this.#responseProvenance.lookup(responseId, scope);
+  }
+
+  /** Fleet retirement fence for retained provider-lineage routing hints. */
+  responseProvenanceBindingsForProject(projectId: ProjectId): number {
+    return this.#responseProvenance.bindingsForProject(projectId);
   }
 
   #resolveContinuationProvenance(
@@ -2454,7 +2500,10 @@ export class MultiSandboxRouter {
         this.#releaseJobMemory(job);
         this.#releaseJobProvenance(job);
         this.#releaseQueueCapacity(job);
-        const error = sanitizedRouterAbortReason(job.signal);
+        const error = selectedRouteDeadlineError(
+          sanitizedRouterAbortReason(job.signal),
+          job.routeSelected,
+        );
         this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
         this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
         job.reject(error);
@@ -2520,6 +2569,7 @@ export class MultiSandboxRouter {
       job.queueWaitMs = Math.max(0, selectedAtMs - job.queuedAtMs);
       const candidate = selection.candidate;
       job.admissionCost = selection.admissionCost;
+      job.routeSelected = true;
       if (selection.fleetTransferPacerCost > 0) {
         this.#consumeFleetTransferPacer(selection.fleetTransferPacerCost, selectedAtMs);
       }
@@ -2588,9 +2638,17 @@ export class MultiSandboxRouter {
     this.#releaseJobMemory(job);
     this.#releaseJobProvenance(job);
     this.#releaseQueueCapacity(job);
-    const error = new RouterCapacityTimeoutError();
+    const error = job.routeSelected
+      ? new RouterTransportAdmissionTimeoutError()
+      : new RouterCapacityTimeoutError();
     this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
-    this.#failure(job.traceId, job.acceptedAtMs, "queue", error, job.attempts);
+    this.#failure(
+      job.traceId,
+      job.acceptedAtMs,
+      job.routeSelected ? "transport-admission" : "queue",
+      error,
+      job.attempts,
+    );
     job.reject(error);
   }
 
@@ -2880,7 +2938,7 @@ export class MultiSandboxRouter {
     let runtimeHandleClaimed = false;
     const progressAwareAttempt = selectedBulkProfile &&
       job.decodedRequestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
-      job.decodedRequestBytes <= PAYLOAD_AWARE_DEADLINE_BYTES;
+      job.decodedRequestBytes <= PROGRESS_AWARE_MAX_REQUEST_BYTES;
     const mediumProgressProbe = selectedBulkProfile &&
       job.decodedRequestBytes > MEDIUM_PROGRESS_PROBE_MIN_BYTES &&
       job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES;

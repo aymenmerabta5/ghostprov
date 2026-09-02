@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { PrismAccountSession } from "../src/prism/account-session";
 import { PrismProjectsClient } from "../src/prism/projects-client";
@@ -73,32 +73,10 @@ if (missing.length > 0) {
   throw new Error(`Created projects are not visible to this account: ${missing.map(item => item.projectId).join(", ")}`);
 }
 
-const ids = created.map(item => item.projectId).join(",");
-const envLine = `PRISM_PROJECT_IDS=${ids}`;
-const envFile = path.resolve(process.env.GP_PROJECT_ENV_FILE?.trim() || ".env");
-let envSource: string;
-try {
-  envSource = await readFile(envFile, "utf8");
-} catch (error) {
-  const code = (error as { code?: unknown }).code;
-  if (code !== "ENOENT") throw error;
-  envSource = "";
-}
-const existingLines = [...envSource.matchAll(/^PRISM_PROJECT_IDS=.*$/gm)];
-if (existingLines.length > 1) {
-  throw new Error(`Refusing to update ${envFile}: multiple PRISM_PROJECT_IDS lines exist`);
-}
-const updatedEnv = existingLines.length === 1
-  ? envSource.replace(existingLines[0][0], envLine)
-  : `${envSource}${envSource && !envSource.endsWith("\n") ? "\n" : ""}${envLine}\n`;
-const envTemporary = `${envFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-await writeFile(envTemporary, updatedEnv);
-await rename(envTemporary, envFile);
-
 const directory = path.resolve(process.env.GP_PROJECT_STATE_DIR ?? ".ghostprov");
 const manifest = path.join(directory, "projects.json");
 await mkdir(directory, { recursive: true });
 const temporary = `${manifest}.${process.pid}.${crypto.randomUUID()}.tmp`;
-await writeFile(temporary, JSON.stringify({ created, envFile, envLine }, null, 2));
+await writeFile(temporary, JSON.stringify({ created }, null, 2));
 await rename(temporary, manifest);
-console.log(JSON.stringify({ created: created.length, envFile, manifest, envLine }, null, 2));
+console.log(JSON.stringify({ created: created.length, manifest }, null, 2));

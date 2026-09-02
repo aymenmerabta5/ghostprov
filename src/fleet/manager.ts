@@ -1,18 +1,20 @@
+import { randomUUID } from "node:crypto";
 import type { MultiSandboxConfig } from "../config/multi-sandbox";
-import {
-  SYSTEM_CLOCK,
-  type Clock,
-} from "../core/ports";
+import { SYSTEM_CLOCK, type Clock } from "../core/ports";
+import type { FleetRecoverySnapshot } from "../prism/recovery-coordinator";
 import type { PrismIdentityKind } from "../prism/session-manager";
 import type { PrismProjectSummary } from "../prism/projects-client";
+import { isRuntimeHealthy } from "../router/policy";
 import {
   SandboxRegistry,
   type RoutableSandboxRuntime,
+  type RoutableSandboxSnapshot,
 } from "../sandbox/registry";
-import type { ProjectId } from "../sandbox/types";
-import { isRuntimeHealthy } from "../router/policy";
+import type { SandboxSupervisorEvent } from "../sandbox/supervised-runtime";
+import { projectId, type ProjectId } from "../sandbox/types";
 import { FleetManifestStore } from "./manifest";
 import type {
+  FleetManifest,
   FleetSnapshot,
   FleetWorkerRecord,
   ManagedRuntimeFactory,
@@ -20,6 +22,11 @@ import type {
 
 export interface FleetProjectsClient {
   get(id: ProjectId, signal?: AbortSignal): Promise<PrismProjectSummary>;
+  create?(
+    input: { projectId: ProjectId; title: string },
+    signal?: AbortSignal,
+  ): Promise<PrismProjectSummary>;
+  deleteManaged?(id: ProjectId, signal?: AbortSignal): Promise<void>;
 }
 
 export interface FleetIdentity {
@@ -27,9 +34,7 @@ export interface FleetIdentity {
   fingerprint: string;
 }
 
-export type FleetReconciliationErrorKind =
-  | "explicit_project_missing"
-  | "runtime";
+export type FleetReconciliationErrorKind = "insufficient_projects" | "runtime";
 
 export class FleetReconciliationError extends Error {
   readonly name = "FleetReconciliationError";
@@ -42,15 +47,29 @@ export class FleetReconciliationError extends Error {
   }
 }
 
-type ProjectReconcileOutcome =
-  | { kind: "registered"; projectId: ProjectId }
-  | { kind: "metadata_unavailable"; projectId: ProjectId }
-  | { kind: "runtime_unavailable"; projectId: ProjectId; error: unknown };
+interface ControlPlaneEvidence {
+  successes: number;
+  globalFailures: number;
+  freezeMutations: boolean;
+  managedMissingClaimed: boolean;
+}
+
+interface ReplacementEvidence {
+  signature: string;
+  consecutiveFailures: number;
+}
 
 const DEFAULT_RETRY_INITIAL_DELAY_MS = 500;
 const DEFAULT_RETRY_MAX_DELAY_MS = 30_000;
 const DEFAULT_METADATA_ATTEMPT_TIMEOUT_MS = 15_000;
+const DEFAULT_MUTATION_MAX_BACKOFF_MS = 300_000;
 const RETRY_JITTER_RATIO = 0.2;
+const REPLACEABLE_BOOTSTRAP_KINDS = new Set([
+  "hello",
+  "readiness",
+  "render",
+  "timeout",
+]);
 
 function emptySnapshot(): FleetSnapshot {
   return {
@@ -62,6 +81,12 @@ function emptySnapshot(): FleetSnapshot {
     unavailable: 0,
     unavailableProjects: Object.freeze([]),
     projects: Object.freeze([]),
+    pendingRetirements: 0,
+    projectMutation: Object.freeze({
+      state: "closed",
+      consecutiveFailures: 0,
+      retryInMs: null,
+    }),
   };
 }
 
@@ -91,13 +116,90 @@ function concurrencyGate(
   };
 }
 
-async function allOrThrow<T>(operations: readonly Promise<T>[]): Promise<T[]> {
-  const settled = await Promise.allSettled(operations);
-  const failed = settled.find(
-    (value): value is PromiseRejectedResult => value.status === "rejected",
-  );
-  if (failed) throw failed.reason;
-  return settled.map(value => (value as PromiseFulfilledResult<T>).value);
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function statusOf(error: unknown): number | null {
+  const status = record(error)?.status;
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : null;
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError" ||
+    record(error)?.name === "AbortError";
+}
+
+function isDefinitiveMissingProject(error: unknown): boolean {
+  const status = statusOf(error);
+  return status === 404 || status === 410;
+}
+
+function isGlobalControlPlaneFailure(error: unknown): boolean {
+  if (isAbort(error) || isDefinitiveMissingProject(error)) return false;
+  const value = record(error);
+  const status = statusOf(error);
+  if (status === 401 || status === 403 || status === 429 || (status !== null && status >= 500)) {
+    return true;
+  }
+  if (status !== null) return false;
+  const name = typeof value?.name === "string" ? value.name.toLowerCase() : "";
+  const kind = typeof value?.kind === "string" ? value.kind.toLowerCase() : "";
+  return error instanceof TypeError ||
+    name.includes("transport") ||
+    name.includes("timeout") ||
+    name.includes("fetch") ||
+    kind.includes("transport") ||
+    kind.includes("timeout") ||
+    kind === "auth" ||
+    kind === "rate_limit";
+}
+
+function validProjectSummary(expected: ProjectId, value: PrismProjectSummary): boolean {
+  return value.projectId === expected && value.deleted === false;
+}
+
+function replacementFailureSignature(
+  failure: SandboxSupervisorEvent["failure"],
+): string | null {
+  if (!failure || failure.name !== "V2BootstrapError") return null;
+  if (!failure.kind || !REPLACEABLE_BOOTSTRAP_KINDS.has(failure.kind)) return null;
+  if (failure.operation !== "bootstrap" && failure.operation !== "render") return null;
+  return [
+    failure.name,
+    failure.kind,
+    failure.status ?? "",
+    failure.operation,
+    failure.sidecarErrorName ?? "",
+    failure.sidecarErrorCode ?? "",
+    failure.sidecarCauseName ?? "",
+    failure.sidecarPhase ?? "",
+    failure.sidecarPermission ?? "",
+    failure.message,
+  ].join("|");
+}
+
+function missingSnapshot(project: ProjectId): RoutableSandboxSnapshot {
+  return {
+    projectId: project,
+    state: "missing",
+    capacity: 0,
+    active: 0,
+    available: 0,
+    quarantined: 0,
+    heartbeatAgeMs: null,
+    credentialExpiresInMs: null,
+    ackEwmaMs: 0,
+    completionEwmaMs: 0,
+    recentFailureRate: 0,
+    queueDepth: 0,
+    memoryPressure: 0,
+    failure: null,
+  };
 }
 
 export interface ProjectFleetManagerOptions {
@@ -108,20 +210,28 @@ export interface ProjectFleetManagerOptions {
   registry: SandboxRegistry;
   runtimeFactory: ManagedRuntimeFactory;
   clock?: Clock;
-  /** Test seam; production uses a 500 ms through 30 s bounded backoff. */
   retryInitialDelayMs?: number;
-  /** Test seam; must be at least retryInitialDelayMs. */
   retryMaxDelayMs?: number;
-  /** Test seam for retry jitter. The returned value is clamped to [0, 1]. */
   random?: () => number;
-  /** Bounds one project metadata attempt, including a non-cooperative client. */
+  randomUuid?: () => string;
   metadataAttemptTimeoutMs?: number;
-  /** Bounds graceful drain and forced-stop operations during cleanup. */
   runtimeCleanupTimeoutMs?: number;
+  recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
+  canRetireProject?: (projectId: ProjectId) => boolean;
 }
 
+/**
+ * Identity-scoped managed Prism fleet.
+ *
+ * Environment IDs are copied once into the manifest as unmanaged migration
+ * records. Every subsequent selection comes exclusively from that manifest.
+ * Managed create intent is durable before the remote POST, and managed removal
+ * happens only after a replacement is healthy, the old runtime has drained,
+ * continuation routing hints are gone, and the remote DELETE succeeds.
+ */
 export class ProjectFleetManager {
   readonly #config: MultiSandboxConfig;
+  readonly #desiredSandboxes: number;
   readonly #identity: FleetIdentity;
   readonly #projects: FleetProjectsClient;
   readonly #manifest: FleetManifestStore;
@@ -131,9 +241,19 @@ export class ProjectFleetManager {
   readonly #retryInitialDelayMs: number;
   readonly #retryMaxDelayMs: number;
   readonly #random: () => number;
+  readonly #randomUuid: () => string;
   readonly #metadataAttemptTimeoutMs: number;
   readonly #runtimeCleanupTimeoutMs: number;
+  readonly #recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
+  readonly #canRetireProject: (projectId: ProjectId) => boolean;
   readonly #unavailableProjects = new Set<ProjectId>();
+  readonly #replacementEvidence = new Map<ProjectId, ReplacementEvidence>();
+  readonly #replacementCandidates = new Set<ProjectId>();
+  #selectedProjects: readonly ProjectId[] = Object.freeze([]);
+  #pendingRetirements = 0;
+  #pendingMaintenance = false;
+  #mutationFailureCount = 0;
+  #mutationsFrozenUntilMs: number | null = null;
   #snapshot: FleetSnapshot = emptySnapshot();
   #chain: Promise<void> = Promise.resolve();
   #activeReconcile: AbortController | null = null;
@@ -145,6 +265,9 @@ export class ProjectFleetManager {
   constructor(options: ProjectFleetManagerOptions) {
     this.#config = options.config;
     this.#identity = options.identity;
+    this.#desiredSandboxes = options.identity.kind === "anonymous"
+      ? Math.min(options.config.desiredSandboxes, options.config.guestMaxProjects)
+      : options.config.desiredSandboxes;
     this.#projects = options.projects;
     this.#manifest = options.manifest;
     this.#registry = options.registry;
@@ -153,10 +276,13 @@ export class ProjectFleetManager {
     this.#retryInitialDelayMs = options.retryInitialDelayMs ?? DEFAULT_RETRY_INITIAL_DELAY_MS;
     this.#retryMaxDelayMs = options.retryMaxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS;
     this.#random = options.random ?? Math.random;
+    this.#randomUuid = options.randomUuid ?? randomUUID;
     this.#metadataAttemptTimeoutMs = options.metadataAttemptTimeoutMs ??
       DEFAULT_METADATA_ATTEMPT_TIMEOUT_MS;
     this.#runtimeCleanupTimeoutMs = options.runtimeCleanupTimeoutMs ??
       this.#config.shutdownDrainMs;
+    this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
+    this.#canRetireProject = options.canRetireProject ?? (() => true);
     if (
       !Number.isSafeInteger(this.#retryInitialDelayMs) ||
       this.#retryInitialDelayMs < 1 ||
@@ -171,46 +297,60 @@ export class ProjectFleetManager {
     }
     this.#snapshot = Object.freeze({
       ...emptySnapshot(),
-      desired: this.#config.projectIds.length,
-      projects: Object.freeze([...this.#config.projectIds]),
+      desired: this.#desiredSandboxes,
     });
   }
 
   reconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
-    return this.#enqueueReconcile(this.#config.projectIds, signal);
+    return this.#enqueueReconcile(signal);
   }
 
-  #enqueueReconcile(
-    projectIds: readonly ProjectId[],
-    signal?: AbortSignal,
-  ): Promise<FleetSnapshot> {
-    if (this.#shuttingDown) {
-      return Promise.reject(new FleetReconciliationError(
-        "Fleet manager is shutting down",
-        "runtime",
-      ));
+  /** Receives the supervisor's already-sanitized, bounded recovery record. */
+  observeRecoveryEvent(event: SandboxSupervisorEvent): void {
+    if (this.#shuttingDown) return;
+    if (event.type === "completed" || event.type === "aborted") {
+      this.#replacementEvidence.delete(event.projectId);
+      this.#replacementCandidates.delete(event.projectId);
+      this.#pendingMaintenance = this.#pendingRetirements > 0 ||
+        this.#unavailableProjects.size > 0;
+      if (event.type === "completed") this.#wakeRetry();
+      return;
     }
-    const pending = this.#chain.then(
-      () => this.#runReconcile(projectIds, signal),
-      () => this.#runReconcile(projectIds, signal),
-    );
-    this.#chain = pending.then(() => undefined, () => undefined);
-    return pending;
+    if (event.type !== "retry_scheduled") return;
+    const signature = replacementFailureSignature(event.failure);
+    if (!signature) {
+      this.#replacementEvidence.delete(event.projectId);
+      this.#replacementCandidates.delete(event.projectId);
+      return;
+    }
+    const previous = this.#replacementEvidence.get(event.projectId);
+    const consecutiveFailures = previous?.signature === signature
+      ? Math.max(previous.consecutiveFailures, event.consecutiveFailures)
+      : 1;
+    this.#replacementEvidence.set(event.projectId, { signature, consecutiveFailures });
+    if (consecutiveFailures < this.#config.projectReplacementFailureThreshold) return;
+    if (this.#replacementCandidates.size >= this.#config.maxProjects) return;
+    this.#replacementCandidates.add(event.projectId);
+    this.#pendingMaintenance = true;
+    this.#scheduleRetry();
   }
 
-  async waitForReady(
-    minimum: number,
-    signal?: AbortSignal,
-  ): Promise<FleetSnapshot> {
+  /** Wakes project maintenance when the shared outage circuit closes early. */
+  observeRecoveryCircuit(snapshot: Readonly<FleetRecoverySnapshot>): void {
+    if (this.#shuttingDown || snapshot.state !== "closed" || snapshot.scope !== null) return;
+    this.#wakeRetry();
+  }
+
+  async waitForReady(minimum: number, signal?: AbortSignal): Promise<FleetSnapshot> {
     if (!Number.isInteger(minimum) || minimum < 1) {
       throw new RangeError("minimum ready runtimes must be positive");
     }
-    this.#refreshSnapshot(this.#snapshot.desired, this.#snapshot.projects);
+    this.#refreshSnapshot();
     if (this.#snapshot.ready >= minimum) return this.#snapshot;
     if (signal?.aborted) throw new DOMException("Fleet readiness wait aborted", "AbortError");
     return new Promise<FleetSnapshot>((resolve, reject) => {
       const unsubscribe = this.#registry.subscribe(() => {
-        this.#refreshSnapshot(this.#snapshot.desired, this.#snapshot.projects);
+        this.#refreshSnapshot();
         if (this.#snapshot.ready < minimum) return;
         cleanup();
         resolve(this.#snapshot);
@@ -231,10 +371,7 @@ export class ProjectFleetManager {
     this.#shuttingDown = true;
     this.#retryController?.abort();
     this.#activeReconcile?.abort();
-    await Promise.allSettled([
-      this.#chain,
-      this.#retryTask ?? Promise.resolve(),
-    ]);
+    await Promise.allSettled([this.#chain, this.#retryTask ?? Promise.resolve()]);
     const runtimes = [...this.#registry.runtimes()];
     const stopped = await Promise.allSettled(runtimes.map(async runtime => {
       await this.#settleWithin(
@@ -253,9 +390,17 @@ export class ProjectFleetManager {
     );
     if (this.#registry.runtimes().length === 0) {
       this.#unavailableProjects.clear();
-      this.#refreshSnapshot(0, []);
+      this.#selectedProjects = Object.freeze([]);
+      this.#pendingRetirements = 0;
+      this.#pendingMaintenance = false;
+      this.#refreshSnapshot(0);
     } else {
-      this.#refreshSnapshot(this.#config.projectIds.length, this.#config.projectIds);
+      this.#selectedProjects = Object.freeze(
+        this.#registry.runtimes()
+          .map(runtime => runtime.projectId)
+          .slice(0, this.#desiredSandboxes),
+      );
+      this.#refreshSnapshot();
       failures.push(new FleetReconciliationError(
         "Fleet shutdown left registered runtimes",
         "runtime",
@@ -265,188 +410,26 @@ export class ProjectFleetManager {
   }
 
   snapshot(): FleetSnapshot {
-    // Runtime supervisors keep recovering after the initial reconciliation
-    // has returned. Recompute health on every public read so /health,
-    // /__sandboxes, and fleet.sample cannot keep reporting the older partial
-    // ready count (for example 7) after the registry already exposes all 8
-    // healthy runtimes and full routing capacity.
-    this.#refreshSnapshot(this.#snapshot.desired, this.#snapshot.projects);
+    this.#refreshSnapshot();
     return this.#snapshot;
   }
 
-  async #reconcile(
-    projectIds: readonly ProjectId[],
-    signal: AbortSignal,
-  ): Promise<FleetSnapshot> {
-    if (signal?.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
-    let manifest = await this.#manifest.initialize(this.#identity.kind);
-    // A brand-new explicit fleet owns a deterministic index namespace. Remote
-    // metadata calls intentionally run in parallel and may finish out of
-    // order, but that network race must never change project-to-worker
-    // ownership or conflict with an existing worker marker in the project.
-    const preserveConfiguredOrder = manifest.workers.length === 0;
-    const configuredIndexes = new Map(
-      projectIds.map((projectId, index) => [projectId, index + 1] as const),
-    );
-    if (signal?.aborted || this.#shuttingDown) {
-      throw new DOMException("Fleet reconciliation aborted", "AbortError");
-    }
-    const desired = this.#config.projectIds.length;
-    if (this.#identity.kind === "anonymous" && desired > this.#config.guestMaxProjects) {
-      throw new FleetReconciliationError(
-        `Configured ${desired} projects exceeds anonymous fleet limit ${this.#config.guestMaxProjects}`,
+  #enqueueReconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
+    if (this.#shuttingDown) {
+      return Promise.reject(new FleetReconciliationError(
+        "Fleet manager is shutting down",
         "runtime",
-      );
+      ));
     }
-    this.#refreshSnapshot(desired, this.#config.projectIds);
-    const configuredIds = new Set(this.#config.projectIds);
-    // The router reads this registry directly. Retire every non-allowlisted
-    // runtime before any configured runtime can publish readiness; otherwise a
-    // fast configured start could bind the server while an excess runtime is
-    // still routable.
-    await this.#drainExcess(configuredIds, signal);
-    if (signal?.aborted || this.#shuttingDown) {
-      throw new DOMException("Fleet reconciliation aborted", "AbortError");
-    }
-    let reservationChain: Promise<void> = Promise.resolve();
-    const ensureWorker = (project: PrismProjectSummary): Promise<FleetWorkerRecord> => {
-      let selected!: FleetWorkerRecord;
-      const reserve = async (): Promise<void> => {
-        if (signal?.aborted || this.#shuttingDown) {
-          throw new DOMException("Fleet reconciliation aborted", "AbortError");
-        }
-        manifest = await this.#manifest.load();
-        let worker = manifest.workers.find(value => value.projectId === project.projectId);
-        if (!worker) {
-          const index = preserveConfiguredOrder
-            ? configuredIndexes.get(project.projectId)!
-            : nextWorkerIndex(manifest.workers);
-          manifest = await this.#manifest.reserveWorker({
-            index,
-            projectId: project.projectId,
-            title: project.title,
-            nowMs: this.#clock.now(),
-            managed: false,
-          });
-          manifest = await this.#manifest.markCreated(project.projectId, this.#clock.now());
-          worker = manifest.workers.find(value => value.projectId === project.projectId)!;
-        }
-        selected = worker;
-      };
-      const pending = reservationChain.then(reserve, reserve);
-      reservationChain = pending.then(() => undefined, () => undefined);
-      return pending.then(() => selected);
-    };
-
-    const withProvisionPermit = concurrencyGate(this.#config.provisionConcurrency);
-    // Start every bounded, explicitly configured metadata read immediately.
-    // Provisioning/startup remains separately limited, so slow leading reads
-    // cannot occupy every provisioning slot and hide later healthy projects.
-    const projectReconciliation = allOrThrow(projectIds.map(
-      async (id): Promise<ProjectReconcileOutcome> => {
-        let project: PrismProjectSummary;
-        try {
-          project = await this.#getProject(id, signal);
-        } catch (error) {
-          if (signal?.aborted || this.#shuttingDown) {
-            throw new DOMException("Fleet reconciliation aborted", "AbortError");
-          }
-          this.#markUnavailable(id);
-          return { kind: "metadata_unavailable", projectId: id };
-        }
-        if (project.deleted || project.projectId !== id) {
-          this.#markUnavailable(id);
-          return { kind: "metadata_unavailable", projectId: id };
-        }
-        return withProvisionPermit(async () => {
-          try {
-            const worker = await ensureWorker(project);
-            if (signal?.aborted || this.#shuttingDown) {
-              throw new DOMException("Fleet reconciliation aborted", "AbortError");
-            }
-            const existing = this.#registry.get(worker.projectId);
-            if (existing) {
-              this.#unavailableProjects.delete(id);
-              return { kind: "registered", projectId: id };
-            }
-            const generation = await this.#manifest.nextLeaderGeneration(
-              worker.projectId,
-              this.#clock.now(),
-            );
-            if (signal?.aborted || this.#shuttingDown) {
-              throw new DOMException("Fleet reconciliation aborted", "AbortError");
-            }
-            const runtime = this.#runtimeFactory.create({
-              projectId: worker.projectId,
-              workerIndex: worker.index,
-              leaderGeneration: generation,
-            });
-            if (runtime.projectId !== worker.projectId) {
-              await this.#stopAndRemoveRuntime(runtime);
-              throw new FleetReconciliationError(
-                `Runtime factory returned project ${runtime.projectId} for ${worker.projectId}`,
-                "runtime",
-              );
-            }
-            this.#registry.add(runtime);
-            try {
-              await this.#startRuntime(runtime, signal);
-              await this.#manifest.markState(runtime.projectId, "ready", this.#clock.now());
-            } catch (error) {
-              if (signal?.aborted || this.#shuttingDown) throw error;
-              await this.#manifest.markState(runtime.projectId, "failed", this.#clock.now());
-            }
-            this.#unavailableProjects.delete(id);
-            return { kind: "registered", projectId: id };
-          } catch (error) {
-            if (signal?.aborted || this.#shuttingDown) {
-              if (!this.#shuttingDown && !this.#registry.get(id)) {
-                this.#unavailableProjects.add(id);
-              }
-              throw error;
-            }
-            // A verified explicit project whose local setup failed remains an
-            // exact pending project. The retry loop never substitutes or creates
-            // a Prism project.
-            this.#unavailableProjects.add(id);
-            return { kind: "runtime_unavailable", projectId: id, error };
-          }
-        });
-      },
-    ));
-    const outcomes = await projectReconciliation;
-
-    this.#refreshSnapshot(
-      desired,
-      this.#config.projectIds,
+    const pending = this.#chain.then(
+      () => this.#runReconcile(signal),
+      () => this.#runReconcile(signal),
     );
-    const hasConfiguredRuntime = this.#registry.runtimes().some(
-      runtime => configuredIds.has(runtime.projectId),
-    );
-    if (!hasConfiguredRuntime) {
-      const runtimeFailure = outcomes.find(
-        (outcome): outcome is Extract<ProjectReconcileOutcome, { kind: "runtime_unavailable" }> =>
-          outcome.kind === "runtime_unavailable",
-      );
-      if (runtimeFailure) {
-        throw new FleetReconciliationError(
-          `Explicit Prism project runtime is unavailable: ${runtimeFailure.projectId}`,
-          "runtime",
-        );
-      }
-      throw new FleetReconciliationError(
-        `Explicit Prism projects are unavailable: ${this.#config.projectIds.join(", ")}`,
-        "explicit_project_missing",
-      );
-    }
-    this.#scheduleRetry();
-    return this.#snapshot;
+    this.#chain = pending.then(() => undefined, () => undefined);
+    return pending;
   }
 
-  async #runReconcile(
-    projectIds: readonly ProjectId[],
-    signal?: AbortSignal,
-  ): Promise<FleetSnapshot> {
+  async #runReconcile(signal?: AbortSignal): Promise<FleetSnapshot> {
     if (this.#shuttingDown) {
       throw new FleetReconciliationError("Fleet manager is shutting down", "runtime");
     }
@@ -456,41 +439,447 @@ export class ProjectFleetManager {
     if (signal?.aborted) controller.abort();
     this.#activeReconcile = controller;
     try {
-      return await this.#reconcile(projectIds, controller.signal);
+      return await this.#reconcile(controller.signal);
     } finally {
       signal?.removeEventListener("abort", onAbort);
       if (this.#activeReconcile === controller) this.#activeReconcile = null;
     }
   }
 
-  async #drainExcess(
-    selected: ReadonlySet<ProjectId>,
+  async #reconcile(signal: AbortSignal): Promise<FleetSnapshot> {
+    this.#throwIfAborted(signal);
+    let manifest = await this.#manifest.initialize(this.#identity.kind);
+    manifest = await this.#importLegacyProjects(manifest, signal);
+    manifest = await this.#applyReplacementCandidates(manifest, signal);
+    manifest = await this.#retireSurplusIntents(manifest, signal);
+    this.#throwIfAborted(signal);
+
+    const evidence: ControlPlaneEvidence = {
+      successes: 0,
+      globalFailures: 0,
+      freezeMutations: false,
+      managedMissingClaimed: false,
+    };
+    const firstWorkers = manifest.workers
+      .filter(worker => worker.state !== "draining")
+      .sort((left, right) => left.index - right.index)
+      .slice(0, this.#desiredSandboxes);
+    this.#selectedProjects = Object.freeze(firstWorkers.map(worker => worker.projectId));
+    this.#refreshSnapshot();
+    const withProvisionPermit = concurrencyGate(this.#config.provisionConcurrency);
+    const withMutationPermit = concurrencyGate(this.#config.provisionConcurrency);
+    await Promise.all(firstWorkers.map(worker =>
+      this.#reconcileWorker(
+        worker,
+        evidence,
+        signal,
+        withProvisionPermit,
+        withMutationPermit,
+      )
+    ));
+
+    manifest = await this.#manifest.load();
+    manifest = await this.#reserveManagedCapacity(manifest, signal);
+    const firstIds = new Set(firstWorkers.map(worker => worker.projectId));
+    const addedWorkers = manifest.workers
+      .filter(worker => worker.state !== "draining" && !firstIds.has(worker.projectId))
+      .sort((left, right) => left.index - right.index)
+      .slice(0, this.#desiredSandboxes);
+    this.#selectedProjects = Object.freeze(
+      manifest.workers
+        .filter(worker => worker.state !== "draining")
+        .sort((left, right) => left.index - right.index)
+        .slice(0, this.#desiredSandboxes)
+        .map(worker => worker.projectId),
+    );
+    this.#refreshSnapshot();
+    await Promise.all(addedWorkers.map(worker =>
+      this.#reconcileWorker(
+        worker,
+        evidence,
+        signal,
+        withProvisionPermit,
+        withMutationPermit,
+      )
+    ));
+
+    this.#finishControlPlaneEvidence(evidence);
+    manifest = await this.#manifest.load();
+    const active = manifest.workers
+      .filter(worker => worker.state !== "draining")
+      .sort((left, right) => left.index - right.index)
+      .slice(0, this.#desiredSandboxes);
+    this.#selectedProjects = Object.freeze(active.map(worker => worker.projectId));
+    await this.#drainOrphanRuntimes(new Set(manifest.workers.map(worker => worker.projectId)), signal);
+    this.#refreshSnapshot();
+
+    if (this.#snapshot.ready >= this.#desiredSandboxes) {
+      manifest = await this.#cleanupOneRetirement(manifest, signal);
+    }
+    this.#pendingRetirements = manifest.workers.filter(
+      worker => worker.state === "draining",
+    ).length;
+    const automaticRetirements = manifest.workers.filter(worker =>
+      worker.state === "draining" &&
+      (worker.retirementReason === "replacement" || worker.retirementReason === "missing")
+    ).length;
+    const activeCount = manifest.workers.filter(worker => worker.state !== "draining").length;
+    this.#pendingMaintenance = this.#unavailableProjects.size > 0 ||
+      activeCount < this.#desiredSandboxes ||
+      automaticRetirements > 0 ||
+      this.#replacementCandidates.size > 0 ||
+      this.#mutationRetryInMs() !== null;
+    this.#refreshSnapshot();
+    this.#scheduleRetry();
+    return this.#snapshot;
+  }
+
+  async #importLegacyProjects(
+    manifest: FleetManifest,
     signal: AbortSignal,
-  ): Promise<void> {
-    const excess = [...this.#registry.runtimes()]
-      .filter(runtime => !selected.has(runtime.projectId))
-      .sort((left, right) => right.projectId.localeCompare(left.projectId));
-    for (const runtime of excess) {
-      const record = (await this.#manifest.load()).workers.find(
-        worker => worker.projectId === runtime.projectId,
+  ): Promise<FleetManifest> {
+    if (manifest.legacyMigrationCompleted) return manifest;
+    let current = manifest;
+    for (let offset = 0; offset < this.#config.projectIds.length; offset++) {
+      this.#throwIfAborted(signal);
+      const id = this.#config.projectIds[offset]!;
+      if (current.workers.some(worker => worker.projectId === id)) continue;
+      current = await this.#manifest.reserveWorker({
+        index: nextWorkerIndex(current.workers),
+        projectId: id,
+        title: `Imported Prism project ${offset + 1}`,
+        nowMs: this.#clock.now(),
+        managed: false,
+      });
+    }
+    return this.#manifest.completeLegacyMigration();
+  }
+
+  async #applyReplacementCandidates(
+    manifest: FleetManifest,
+    signal: AbortSignal,
+  ): Promise<FleetManifest> {
+    if (manifest.workers.some(worker =>
+      worker.state === "draining" && worker.retirementReason === "replacement"
+    )) return manifest;
+    let current = manifest;
+    for (const id of [...this.#replacementCandidates]) {
+      this.#throwIfAborted(signal);
+      const worker = current.workers.find(value => value.projectId === id);
+      if (!worker || worker.state === "draining") {
+        this.#replacementCandidates.delete(id);
+        continue;
+      }
+      if (!this.#replacementEligible(worker, current)) continue;
+      current = await this.#manifest.markDraining(id, "replacement", this.#clock.now());
+      this.#replacementCandidates.delete(id);
+      this.#replacementEvidence.delete(id);
+      // One replacement transaction at a time bounds destructive fan-out. A
+      // verified healthy successor and old-project cleanup precede the next.
+      return current;
+    }
+    return current;
+  }
+
+  #replacementEligible(worker: FleetWorkerRecord, manifest: FleetManifest): boolean {
+    if (
+      this.#config.v2SidecarRevision !== "r8" ||
+      Object.hasOwn(this.#config.v2SidecarProjectRevisions, worker.projectId) ||
+      !this.#mutationsAllowed()
+    ) return false;
+    const runtime = this.#registry.get(worker.projectId);
+    if (!runtime) return false;
+    const snapshot = runtime.snapshot();
+    if (isRuntimeHealthy(snapshot)) return false;
+    if (snapshot.active !== 0 || snapshot.quarantined !== 0 ||
+      (snapshot.ambiguousQuarantined ?? 0) !== 0) return false;
+    try {
+      if (!this.#canRetireProject(worker.projectId)) return false;
+    } catch {
+      return false;
+    }
+    const selected = new Set(
+      manifest.workers
+        .filter(value => value.state !== "draining")
+        .map(value => value.projectId),
+    );
+    const healthyPeers = this.#registry.snapshots().filter(value =>
+      value.projectId !== worker.projectId &&
+      selected.has(value.projectId) &&
+      isRuntimeHealthy(value) &&
+      value.releaseRevision === "r8"
+    ).length;
+    return healthyPeers >= Math.floor(this.#desiredSandboxes / 2) + 1;
+  }
+
+  async #retireSurplusIntents(
+    manifest: FleetManifest,
+    signal: AbortSignal,
+  ): Promise<FleetManifest> {
+    const active = manifest.workers.filter(worker => worker.state !== "draining");
+    if (active.length <= this.#desiredSandboxes) return manifest;
+    const ranked = [...active].sort((left, right) => {
+      const leftHealthy = isRuntimeHealthy(
+        this.#registry.get(left.projectId)?.snapshot() ?? missingSnapshot(left.projectId),
       );
-      if (record) {
-        await this.#manifest.markState(runtime.projectId, "draining", this.#clock.now());
+      const rightHealthy = isRuntimeHealthy(
+        this.#registry.get(right.projectId)?.snapshot() ?? missingSnapshot(right.projectId),
+      );
+      if (leftHealthy !== rightHealthy) return leftHealthy ? -1 : 1;
+      return left.index - right.index;
+    });
+    const keep = new Set(
+      ranked.slice(0, this.#desiredSandboxes).map(worker => worker.projectId),
+    );
+    let current = manifest;
+    for (const worker of active) {
+      this.#throwIfAborted(signal);
+      if (!keep.has(worker.projectId)) {
+        current = await this.#manifest.markDraining(
+          worker.projectId,
+          "surplus",
+          this.#clock.now(),
+        );
       }
-      await this.#drainExcessRuntime(runtime, signal);
-      if (record) {
-        await this.#manifest.markState(runtime.projectId, "created", this.#clock.now());
+    }
+    return current;
+  }
+
+  async #reserveManagedCapacity(
+    manifest: FleetManifest,
+    signal: AbortSignal,
+  ): Promise<FleetManifest> {
+    let current = manifest;
+    let active = current.workers.filter(worker => worker.state !== "draining").length;
+    while (active < this.#desiredSandboxes) {
+      this.#throwIfAborted(signal);
+      if (active >= this.#config.maxProjects) {
+        throw new FleetReconciliationError(
+          `Only ${active} of ${this.#desiredSandboxes} managed projects fit the fleet limit`,
+          "insufficient_projects",
+        );
       }
+      const index = nextWorkerIndex(current.workers);
+      const id = this.#newProjectId(current.workers);
+      current = await this.#manifest.reserveWorker({
+        index,
+        projectId: id,
+        title: `GhostProv Worker ${index}`,
+        nowMs: this.#clock.now(),
+        managed: true,
+      });
+      active++;
+    }
+    return current;
+  }
+
+  #newProjectId(workers: readonly FleetWorkerRecord[]): ProjectId {
+    const existing = new Set(workers.map(worker => worker.projectId));
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const id = projectId(this.#randomUuid());
+      if (!existing.has(id)) return id;
+    }
+    throw new FleetReconciliationError("Could not allocate a unique managed project ID", "runtime");
+  }
+
+  async #reconcileWorker(
+    worker: FleetWorkerRecord,
+    evidence: ControlPlaneEvidence,
+    signal: AbortSignal,
+    withProvisionPermit: <T>(operation: () => Promise<T>) => Promise<T>,
+    withMutationPermit: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<void> {
+    this.#throwIfAborted(signal);
+    const existing = this.#registry.get(worker.projectId);
+    if (existing) {
+      const snapshot = existing.snapshot();
+      if (isRuntimeHealthy(snapshot)) {
+        this.#unavailableProjects.delete(worker.projectId);
+        await this.#manifest.markState(worker.projectId, "ready", this.#clock.now());
+      } else {
+        this.#unavailableProjects.add(worker.projectId);
+      }
+      return;
+    }
+
+    const project = await this.#resolveProject(
+      worker,
+      evidence,
+      signal,
+      withMutationPermit,
+    );
+    if (!project) return;
+    const latest = (await this.#manifest.load()).workers.find(
+      value => value.projectId === worker.projectId,
+    );
+    if (!latest || latest.state === "draining") return;
+    await withProvisionPermit(async () => {
+      const generation = await this.#manifest.nextLeaderGeneration(
+        worker.projectId,
+        this.#clock.now(),
+      );
+      this.#throwIfAborted(signal);
+      const runtime = this.#runtimeFactory.create({
+        projectId: worker.projectId,
+        workerIndex: worker.index,
+        leaderGeneration: generation,
+      });
+      if (runtime.projectId !== worker.projectId) {
+        await this.#stopAndRemoveRuntime(runtime);
+        this.#unavailableProjects.add(worker.projectId);
+        await this.#manifest.markState(worker.projectId, "failed", this.#clock.now());
+        return;
+      }
+      this.#registry.add(runtime);
+      try {
+        await this.#startRuntime(runtime, signal);
+        await this.#manifest.markState(worker.projectId, "ready", this.#clock.now());
+        this.#unavailableProjects.delete(worker.projectId);
+      } catch (error) {
+        if (signal.aborted || this.#shuttingDown) throw error;
+        await this.#manifest.markState(worker.projectId, "failed", this.#clock.now());
+        this.#unavailableProjects.add(worker.projectId);
+      }
+    });
+  }
+
+  async #resolveProject(
+    worker: FleetWorkerRecord,
+    evidence: ControlPlaneEvidence,
+    signal: AbortSignal,
+    withMutationPermit: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<PrismProjectSummary | null> {
+    try {
+      let project: PrismProjectSummary;
+      if (worker.state === "creating" && worker.managed) {
+        if (!this.#mutationsAllowed() || evidence.freezeMutations) {
+          this.#unavailableProjects.add(worker.projectId);
+          return null;
+        }
+        if (!this.#projects.create) {
+          throw new FleetReconciliationError(
+            "Fleet project client cannot create managed projects",
+            "runtime",
+          );
+        }
+        try {
+          project = await this.#getProject(worker.projectId, signal);
+        } catch (readError) {
+          if (!isDefinitiveMissingProject(readError)) throw readError;
+          const created = await withMutationPermit(async () => {
+            if (!this.#mutationsAllowed() || evidence.freezeMutations) return null;
+            try {
+              return await this.#withMetadataTimeout(
+                attempt => this.#projects.create!({
+                  projectId: worker.projectId,
+                  title: worker.title,
+                }, attempt),
+                signal,
+                "creation",
+                worker.projectId,
+              );
+            } catch (createError) {
+              if (statusOf(createError) === 409) {
+                return this.#getProject(worker.projectId, signal);
+              }
+              if (isGlobalControlPlaneFailure(createError)) {
+                evidence.globalFailures++;
+                evidence.freezeMutations = true;
+                return null;
+              }
+              throw createError;
+            }
+          });
+          if (!created) {
+            this.#unavailableProjects.add(worker.projectId);
+            return null;
+          }
+          project = created;
+        }
+      } else {
+        project = await this.#getProject(worker.projectId, signal);
+      }
+      if (!validProjectSummary(worker.projectId, project)) {
+        if (this.#canReplaceMissingWorker(worker, evidence)) {
+          await this.#manifest.markDraining(worker.projectId, "missing", this.#clock.now());
+          this.#unavailableProjects.delete(worker.projectId);
+        } else {
+          this.#unavailableProjects.add(worker.projectId);
+        }
+        return null;
+      }
+      evidence.successes++;
+      if (worker.state === "creating") {
+        await this.#manifest.markCreated(worker.projectId, this.#clock.now());
+      }
+      return project;
+    } catch (error) {
+      if (signal.aborted || this.#shuttingDown || isAbort(error)) {
+        throw new DOMException("Fleet reconciliation aborted", "AbortError");
+      }
+      if (error instanceof FleetReconciliationError) throw error;
+      if (isDefinitiveMissingProject(error) &&
+        !(worker.state === "creating" && worker.managed)) {
+        if (this.#canReplaceMissingWorker(worker, evidence)) {
+          await this.#manifest.markDraining(worker.projectId, "missing", this.#clock.now());
+          this.#unavailableProjects.delete(worker.projectId);
+        } else {
+          this.#unavailableProjects.add(worker.projectId);
+        }
+        return null;
+      }
+      if (isGlobalControlPlaneFailure(error)) {
+        evidence.globalFailures++;
+        evidence.freezeMutations = true;
+      }
+      this.#unavailableProjects.add(worker.projectId);
+      return null;
     }
   }
 
-  async #getProject(
-    id: ProjectId,
+  #canReplaceMissingWorker(
+    worker: FleetWorkerRecord,
+    evidence: ControlPlaneEvidence,
+  ): boolean {
+    if (!worker.managed) return true;
+    if (
+      this.#config.v2SidecarRevision !== "r8" ||
+      Object.hasOwn(this.#config.v2SidecarProjectRevisions, worker.projectId) ||
+      evidence.managedMissingClaimed ||
+      !this.#mutationsAllowed()
+    ) return false;
+    try {
+      if (!this.#canRetireProject(worker.projectId)) return false;
+    } catch {
+      return false;
+    }
+    const healthyPeers = this.#registry.snapshots().filter(snapshot =>
+      snapshot.projectId !== worker.projectId &&
+      isRuntimeHealthy(snapshot) &&
+      snapshot.releaseRevision === "r8"
+    ).length;
+    if (healthyPeers < Math.floor(this.#desiredSandboxes / 2) + 1) return false;
+    evidence.managedMissingClaimed = true;
+    return true;
+  }
+
+  async #getProject(id: ProjectId, signal: AbortSignal): Promise<PrismProjectSummary> {
+    return this.#withMetadataTimeout(
+      attempt => this.#projects.get(id, attempt),
+      signal,
+      "metadata read",
+      id,
+    );
+  }
+
+  async #withMetadataTimeout<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
-  ): Promise<PrismProjectSummary> {
-    if (signal.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
+    operationName: string,
+    id: ProjectId,
+  ): Promise<T> {
+    this.#throwIfAborted(signal);
     const attempt = new AbortController();
-    const reading = Promise.resolve().then(() => this.#projects.get(id, attempt.signal));
     let rejectAbort!: (error: DOMException) => void;
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
     const onAbort = () => {
@@ -503,15 +892,20 @@ export class ProjectFleetManager {
     const timedOut = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
         attempt.abort();
-        reject(new FleetReconciliationError(
-          `Explicit Prism project metadata timed out: ${id}`,
-          "explicit_project_missing",
-        ));
+        const error = new Error(`Prism project ${operationName} timed out: ${id}`) as Error & {
+          kind: string;
+          operation: string;
+        };
+        error.name = "FleetProjectTimeoutError";
+        error.kind = "timeout";
+        error.operation = "project_control_plane";
+        reject(error);
       }, this.#metadataAttemptTimeoutMs);
       timeout.unref?.();
     });
+    const pending = Promise.resolve().then(() => operation(attempt.signal));
     try {
-      return await Promise.race([reading, aborted, timedOut]);
+      return await Promise.race([pending, aborted, timedOut]);
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
       signal.removeEventListener("abort", onAbort);
@@ -519,13 +913,113 @@ export class ProjectFleetManager {
     }
   }
 
-  async #drainExcessRuntime(
-    runtime: RoutableSandboxRuntime,
+  #finishControlPlaneEvidence(evidence: ControlPlaneEvidence): void {
+    if (evidence.globalFailures > 0 &&
+      (evidence.successes === 0 || evidence.globalFailures >= 2)) {
+      this.#mutationFailureCount = Math.min(30, this.#mutationFailureCount + 1);
+      this.#mutationsFrozenUntilMs = this.#clock.now() + Math.min(
+        DEFAULT_MUTATION_MAX_BACKOFF_MS,
+        this.#retryInitialDelayMs * (2 ** Math.min(20, this.#mutationFailureCount - 1)),
+      );
+      return;
+    }
+    if (evidence.successes > 0 && evidence.globalFailures === 0) {
+      this.#mutationFailureCount = 0;
+      this.#mutationsFrozenUntilMs = null;
+    }
+  }
+
+  #mutationsAllowed(): boolean {
+    const circuit = this.#recoveryCircuitSnapshot?.();
+    if (circuit && (circuit.state !== "closed" || circuit.scope !== null)) return false;
+    return this.#mutationRetryInMs() === null;
+  }
+
+  #mutationRetryInMs(): number | null {
+    if (this.#mutationsFrozenUntilMs === null) return null;
+    const remaining = this.#mutationsFrozenUntilMs - this.#clock.now();
+    if (remaining <= 0) {
+      this.#mutationsFrozenUntilMs = null;
+      return null;
+    }
+    return Math.ceil(remaining);
+  }
+
+  async #cleanupOneRetirement(
+    manifest: FleetManifest,
+    signal: AbortSignal,
+  ): Promise<FleetManifest> {
+    const worker = manifest.workers
+      .filter(value => value.state === "draining")
+      .sort((left, right) => left.updatedAtMs - right.updatedAtMs || left.index - right.index)[0];
+    if (!worker || worker.retirementReason === "surplus" ||
+      worker.retirementReason === null || !this.#mutationsAllowed()) return manifest;
+    try {
+      if (!this.#canRetireProject(worker.projectId)) return manifest;
+    } catch {
+      return manifest;
+    }
+    const runtime = this.#registry.get(worker.projectId);
+    if (runtime) {
+      const snapshot = runtime.snapshot();
+      // Healthy capacity is never destructively shrunk in-band. Operators can
+      // use the digest-confirmed decommission command; automatic deletion is
+      // reserved for an already-unhealthy replacement target.
+      if (isRuntimeHealthy(snapshot)) return manifest;
+      if (snapshot.active !== 0 || snapshot.quarantined !== 0 ||
+        (snapshot.ambiguousQuarantined ?? 0) !== 0) return manifest;
+      await this.#drainRuntime(runtime, signal);
+      try {
+        if (!this.#canRetireProject(worker.projectId)) return manifest;
+      } catch {
+        return manifest;
+      }
+    }
+    if (!worker.managed) {
+      return this.#manifest.removeImported(worker.projectId);
+    }
+    if (!this.#projects.deleteManaged) return manifest;
+    try {
+      await this.#withMetadataTimeout(
+        attempt => this.#projects.deleteManaged!(worker.projectId, attempt),
+        signal,
+        "deletion",
+        worker.projectId,
+      );
+    } catch (error) {
+      if (signal.aborted || this.#shuttingDown || isAbort(error)) throw error;
+      if (!isDefinitiveMissingProject(error)) {
+        if (isGlobalControlPlaneFailure(error)) this.#openMutationCircuit();
+        return manifest;
+      }
+    }
+    this.#mutationFailureCount = 0;
+    this.#mutationsFrozenUntilMs = null;
+    return this.#manifest.removeManaged(worker.projectId);
+  }
+
+  #openMutationCircuit(): void {
+    this.#mutationFailureCount = Math.min(30, this.#mutationFailureCount + 1);
+    this.#mutationsFrozenUntilMs = this.#clock.now() + Math.min(
+      DEFAULT_MUTATION_MAX_BACKOFF_MS,
+      this.#retryInitialDelayMs * (2 ** Math.min(20, this.#mutationFailureCount - 1)),
+    );
+  }
+
+  async #drainOrphanRuntimes(
+    manifestProjects: ReadonlySet<ProjectId>,
     signal: AbortSignal,
   ): Promise<void> {
-    if (signal.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
+    for (const runtime of [...this.#registry.runtimes()]) {
+      if (manifestProjects.has(runtime.projectId)) continue;
+      await this.#drainRuntime(runtime, signal);
+    }
+  }
+
+  async #drainRuntime(runtime: RoutableSandboxRuntime, signal: AbortSignal): Promise<void> {
+    this.#throwIfAborted(signal);
     const draining = Promise.resolve().then(() =>
-      this.#registry.drain(runtime.projectId, "fleet-reconcile")
+      this.#registry.drain(runtime.projectId, "fleet-retirement")
     );
     let rejectAbort!: (error: DOMException) => void;
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
@@ -549,17 +1043,14 @@ export class ProjectFleetManager {
     }
     if (!await this.#stopAndRemoveRuntime(runtime)) {
       throw new FleetReconciliationError(
-        `Excess runtime could not be retired: ${runtime.projectId}`,
+        `Retired runtime could not be stopped: ${runtime.projectId}`,
         "runtime",
       );
     }
   }
 
-  async #startRuntime(
-    runtime: RoutableSandboxRuntime,
-    signal: AbortSignal,
-  ): Promise<void> {
-    if (signal.aborted) throw new DOMException("Fleet reconciliation aborted", "AbortError");
+  async #startRuntime(runtime: RoutableSandboxRuntime, signal: AbortSignal): Promise<void> {
+    this.#throwIfAborted(signal);
     const starting = Promise.resolve().then(() => runtime.start());
     let rejectAbort!: (error: DOMException) => void;
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
@@ -570,15 +1061,10 @@ export class ProjectFleetManager {
     if (signal.aborted) onAbort();
     try {
       await Promise.race([starting, aborted]);
-      if (signal.aborted) {
-        throw new DOMException("Fleet reconciliation aborted", "AbortError");
-      }
+      this.#throwIfAborted(signal);
     } catch (error) {
       if (!signal.aborted) throw error;
       await this.#stopAndRemoveRuntime(runtime);
-      // A non-cooperative start may settle after stop. Fence that late
-      // settlement with another idempotent stop/removal without blocking the
-      // bounded shutdown path on the original start promise.
       void starting.finally(() => this.#stopAndRemoveRuntime(runtime)).catch(() => undefined);
       throw error;
     } finally {
@@ -601,10 +1087,7 @@ export class ProjectFleetManager {
     return this.#registry.get(runtime.projectId) !== runtime;
   }
 
-  async #settleWithin(
-    operation: () => Promise<void>,
-    timeoutMs: number,
-  ): Promise<boolean> {
+  async #settleWithin(operation: () => Promise<void>, timeoutMs: number): Promise<boolean> {
     const observed = Promise.resolve().then(operation).then(
       () => true,
       () => false,
@@ -623,23 +1106,8 @@ export class ProjectFleetManager {
     }
   }
 
-  #markUnavailable(id: ProjectId): void {
-    // An already registered exact runtime remains authoritative during a
-    // transient metadata outage. Never take healthy traffic offline merely
-    // because the control-plane read failed.
-    if (this.#registry.get(id)) this.#unavailableProjects.delete(id);
-    else this.#unavailableProjects.add(id);
-  }
-
   #scheduleRetry(): void {
-    if (
-      this.#shuttingDown ||
-      this.#retryTask ||
-      this.#unavailableProjects.size === 0 ||
-      !this.#registry.runtimes().some(runtime =>
-        this.#config.projectIds.includes(runtime.projectId)
-      )
-    ) return;
+    if (this.#shuttingDown || this.#retryTask || !this.#pendingMaintenance) return;
     const controller = new AbortController();
     this.#retryController = controller;
     const task = this.#runRetryLoop(controller.signal);
@@ -647,27 +1115,34 @@ export class ProjectFleetManager {
     void task.catch(() => undefined).finally(() => {
       if (this.#retryTask === task) this.#retryTask = null;
       if (this.#retryController === controller) this.#retryController = null;
-      if (!this.#shuttingDown && this.#unavailableProjects.size > 0) {
-        this.#scheduleRetry();
-      }
+      if (!this.#shuttingDown && this.#pendingMaintenance) this.#scheduleRetry();
     });
   }
 
+  #wakeRetry(): void {
+    if (!this.#pendingMaintenance || this.#shuttingDown) return;
+    if (this.#retryController) {
+      this.#retryController.abort();
+      return;
+    }
+    this.#scheduleRetry();
+  }
+
   async #runRetryLoop(signal: AbortSignal): Promise<void> {
-    while (!this.#shuttingDown && this.#unavailableProjects.size > 0) {
+    while (!this.#shuttingDown && this.#pendingMaintenance) {
       await this.#clock.sleep(this.#retryDelayMs(), signal);
       if (signal.aborted || this.#shuttingDown) return;
-      const before = new Set(this.#unavailableProjects);
+      const before = `${this.#snapshot.ready}:${this.#snapshot.unavailable}:` +
+        `${this.#pendingRetirements}:${this.#replacementCandidates.size}`;
       try {
-        await this.#enqueueReconcile([...before], signal);
+        await this.#enqueueReconcile(signal);
       } catch (error) {
         if (signal.aborted || this.#shuttingDown) return;
         void error;
       }
-      const madeProgress = [...before].some(id => !this.#unavailableProjects.has(id));
-      this.#retryAttempt = madeProgress
-        ? 0
-        : Math.min(this.#retryAttempt + 1, 30);
+      const after = `${this.#snapshot.ready}:${this.#snapshot.unavailable}:` +
+        `${this.#pendingRetirements}:${this.#replacementCandidates.size}`;
+      this.#retryAttempt = before === after ? Math.min(this.#retryAttempt + 1, 30) : 0;
     }
     this.#retryAttempt = 0;
   }
@@ -682,27 +1157,44 @@ export class ProjectFleetManager {
       ? Math.min(1, Math.max(0, sampled))
       : 0.5;
     const jitter = 1 - RETRY_JITTER_RATIO + (2 * RETRY_JITTER_RATIO * random);
-    return Math.max(1, Math.min(this.#retryMaxDelayMs, Math.round(exponential * jitter)));
+    const retry = Math.max(1, Math.min(this.#retryMaxDelayMs, Math.round(exponential * jitter)));
+    const circuit = this.#recoveryCircuitSnapshot?.();
+    const circuitRetry = circuit?.nextProbeAtMs === null || circuit?.nextProbeAtMs === undefined
+      ? 0
+      : Math.ceil(Math.max(0, circuit.nextProbeAtMs - this.#clock.now()));
+    return Math.max(retry, this.#mutationRetryInMs() ?? 0, circuitRetry);
   }
 
   #refreshSnapshot(
-    desired: number,
-    projects: readonly ProjectId[],
+    desired = this.#shuttingDown && this.#registry.runtimes().length === 0
+      ? 0
+      : this.#desiredSandboxes,
   ): void {
-    const selectedProjects = new Set(projects);
-    const snapshots = this.#registry.snapshots().filter(
-      snapshot => selectedProjects.has(snapshot.projectId),
-    );
+    const selectedProjects = new Set(this.#selectedProjects);
+    const allSnapshots = this.#registry.snapshots();
+    const snapshots = allSnapshots.filter(snapshot => selectedProjects.has(snapshot.projectId));
     const snapshotsByProject = new Map(
       snapshots.map(snapshot => [snapshot.projectId, snapshot] as const),
     );
-    const unavailableProjects = projects.filter(
-      id => {
-        const snapshot = snapshotsByProject.get(id);
-        return !snapshot || !isRuntimeHealthy(snapshot);
-      },
-    );
-    const missingRuntimeCount = projects.filter(id => !snapshotsByProject.has(id)).length;
+    const unavailableProjects = this.#selectedProjects.filter(id => {
+      const snapshot = snapshotsByProject.get(id);
+      return !snapshot || !isRuntimeHealthy(snapshot);
+    });
+    const missingRuntimeCount = this.#selectedProjects.filter(
+      id => !snapshotsByProject.has(id),
+    ).length;
+    const localRetryInMs = this.#mutationRetryInMs();
+    const circuit = this.#recoveryCircuitSnapshot?.();
+    const circuitOpen = circuit !== undefined &&
+      (circuit.state !== "closed" || circuit.scope !== null);
+    const circuitRetryInMs = circuit?.nextProbeAtMs === null || circuit?.nextProbeAtMs === undefined
+      ? null
+      : Math.ceil(Math.max(0, circuit.nextProbeAtMs - this.#clock.now()));
+    const retryInMs = localRetryInMs === null
+      ? circuitRetryInMs
+      : circuitRetryInMs === null
+        ? localRetryInMs
+        : Math.max(localRetryInMs, circuitRetryInMs);
     this.#snapshot = Object.freeze({
       desired,
       ready: snapshots.filter(isRuntimeHealthy).length,
@@ -715,12 +1207,27 @@ export class ProjectFleetManager {
         "connecting_transport",
         "recovering",
       ].includes(value.state)).length,
-      draining: snapshots.filter(value => value.state === "draining").length,
+      draining: allSnapshots.filter(value => value.state === "draining").length,
       failed: snapshots.filter(value => value.state === "failed" || value.state === "auth_required").length +
         missingRuntimeCount,
       unavailable: unavailableProjects.length,
       unavailableProjects: Object.freeze([...unavailableProjects]),
-      projects: Object.freeze([...projects]),
+      projects: Object.freeze([...this.#selectedProjects]),
+      pendingRetirements: this.#pendingRetirements,
+      projectMutation: Object.freeze({
+        state: localRetryInMs === null && !circuitOpen ? "closed" : "open",
+        consecutiveFailures: Math.max(
+          this.#mutationFailureCount,
+          circuit?.consecutiveFailures ?? 0,
+        ),
+        retryInMs,
+      }),
     });
+  }
+
+  #throwIfAborted(signal: AbortSignal): void {
+    if (signal.aborted || this.#shuttingDown) {
+      throw new DOMException("Fleet reconciliation aborted", "AbortError");
+    }
   }
 }

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { FleetDecommissionService } from "../src/fleet/decommission";
-import { FleetManifestStore } from "../src/fleet/manifest";
+import { defaultFleetManifestFile, FleetManifestStore } from "../src/fleet/manifest";
 import { PrismProjectsClient } from "../src/prism/projects-client";
 import { PrismSessionManager } from "../src/prism/session-manager";
 import { projectId, type ProjectId } from "../src/sandbox/types";
@@ -72,7 +72,9 @@ export async function main(
   try {
     const identity = await session.resolve();
     const manifest = new FleetManifestStore({
-      file: path.resolve(env.GP_FLEET_MANIFEST_FILE?.trim() || ".ghostprov/fleet.json"),
+      file: env.GP_FLEET_MANIFEST_FILE?.trim()
+        ? path.resolve(env.GP_FLEET_MANIFEST_FILE.trim())
+        : defaultFleetManifestFile(identity.fingerprint),
       identityFingerprint: identity.fingerprint,
     });
     const service = new FleetDecommissionService({

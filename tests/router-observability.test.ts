@@ -205,7 +205,7 @@ describe("router observability", () => {
       }, {
         source: "http",
         encodedBodyBytes: Math.floor(2.9 * 1024 * 1024),
-      })).rejects.toMatchObject({ code: "router_capacity_timeout" });
+      })).rejects.toMatchObject({ code: "transport_admission_timeout" });
       const expired = logger.events.filter(event => event.event === "route.attempt_expired");
       expect(expired.length).toBeGreaterThan(0);
       expect(expired[0]).toMatchObject({

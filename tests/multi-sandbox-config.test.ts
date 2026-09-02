@@ -84,11 +84,10 @@ describe("multi-sandbox configuration", () => {
     expect(config.apiKey).toBe(BASE_ENV.GHOSTPROV_API_KEY);
   });
 
-  it("defaults to authenticated V2-ready fleet policy", () => {
+  it("defaults to an authenticated eight-project managed V2 fleet", () => {
     const config = resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      PRISM_PROJECT_IDS: A,
       GP_CANDIDATE: "1",
     }, MACHINE);
 
@@ -113,7 +112,7 @@ describe("multi-sandbox configuration", () => {
         V2_EVENT_JUMBO_OVERHEAD_BYTES +
         V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_RETAINED_FACTOR +
         V2_EVENT_MAX_BUFFERED_EVENTS * V2_EVENT_RETAINED_OVERHEAD_BYTES
-      ) * 8,
+      ) * 8 * 8,
       jumboBytes: 64 * 1024 * 1024 * V2_EVENT_PHYSICAL_FACTOR +
         V2_EVENT_JUMBO_OVERHEAD_BYTES,
       totalBytes: (
@@ -121,7 +120,7 @@ describe("multi-sandbox configuration", () => {
         V2_EVENT_JUMBO_OVERHEAD_BYTES +
         V2_EVENT_SOFT_BUFFER_BYTES * V2_EVENT_RETAINED_FACTOR +
         V2_EVENT_MAX_BUFFERED_EVENTS * V2_EVENT_RETAINED_OVERHEAD_BYTES
-      ) * 8 +
+      ) * 8 * 8 +
         64 * 1024 * 1024 * V2_EVENT_PHYSICAL_FACTOR +
         V2_EVENT_JUMBO_OVERHEAD_BYTES,
     });
@@ -133,7 +132,10 @@ describe("multi-sandbox configuration", () => {
     expect(config.v2BatchingEnabled).toBe(true);
     expect(config.v2SidecarRevision).toBe(DEFAULT_V2_SIDECAR_REVISION);
     expect(config.v2SidecarProjectRevisions).toEqual({});
-    expect(config.desiredSandboxes).toBe(1);
+    expect(config.projectIds).toEqual([]);
+    expect(config.desiredSandboxes).toBe(8);
+    expect(config.fleetManifestFile).toBeNull();
+    expect(config.projectReplacementFailureThreshold).toBe(3);
     expect(config.heartbeatMs).toBe(10_000);
     expect(config.routerQueueTimeoutMs).toBe(30_000);
     expect(config.shutdownDrainMs).toBe(300_000);
@@ -183,12 +185,12 @@ describe("multi-sandbox configuration", () => {
         GP_V2_SIDECAR_PROJECT_REVISIONS: revisions,
       }, MACHINE)).toThrow();
     }
-    expect(() => resolveMultiSandboxConfig({
+    expect(resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
       GP_V2_SIDECAR_PROJECT_REVISIONS: `${B}=r1`,
-    }, MACHINE)).toThrow(/unknown configured project/i);
+    }, MACHINE).v2SidecarProjectRevisions).toEqual({ [B]: "r1" });
     expect(() => resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
@@ -224,20 +226,27 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow("GP_V2_DIAGNOSTICS");
   });
 
-  it("rejects project creation and project-less V2 configuration", () => {
-    expect(() => resolveMultiSandboxConfig({
+  it("accepts project-less automatic provisioning and legacy creation flags", () => {
+    const config = resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       GP_AUTO_CREATE_PROJECTS: "1",
       GP_TARGET_CONCURRENCY: "1024",
       GP_MAX_PROJECTS: "16",
       GP_CANDIDATE: "1",
+    }, MACHINE);
+    expect(config.projectIds).toEqual([]);
+    expect(config.desiredSandboxes).toBe(8);
+    expect(() => resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      GP_AUTO_CREATE_PROJECTS: "yes",
     }, MACHINE)).toThrow("GP_AUTO_CREATE_PROJECTS");
     expect(() => resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
-      GP_CANDIDATE: "1",
-    }, MACHINE)).toThrow("PRISM_PROJECT_IDS");
+      GP_PROJECT_REPLACEMENT_FAILURES: "2",
+    }, MACHINE)).toThrow("GP_PROJECT_REPLACEMENT_FAILURES");
   });
 
   it("bounds transport-active capacity below the physical engine ceiling", () => {
@@ -252,7 +261,7 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE);
     expect(config.v2InitialActivePerSandbox).toBe(4);
     expect(config.v2MaxActivePerSandbox).toBe(8);
-    expect(config.desiredSandboxes).toBe(2);
+    expect(config.desiredSandboxes).toBe(1);
     expect(config).not.toHaveProperty("targetSandboxes");
     expect(config).not.toHaveProperty("targetConcurrency");
     expect(() => resolveMultiSandboxConfig({
@@ -299,15 +308,20 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE)).toThrow("GP_GUEST_MAX_PROJECTS=1");
   });
 
-  it("rejects every non-explicit project reuse policy", () => {
-    for (const projectReuse of ["managed", "eligible-owned"]) {
+  it("accepts only non-adopting legacy project reuse values", () => {
+    for (const projectReuse of ["explicit", "managed"]) {
       expect(() => resolveMultiSandboxConfig({
       ...BASE_ENV,
         PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
         PRISM_PROJECT_IDS: A,
         GP_PROJECT_REUSE: projectReuse,
-      }, MACHINE)).toThrow("must be explicit");
+      }, MACHINE)).not.toThrow();
     }
+    expect(() => resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      GP_PROJECT_REUSE: "eligible-owned",
+    }, MACHINE)).toThrow("explicit or managed");
   });
 
   it("preserves legacy PRISM_DOC_ID as a single-project allowlist", () => {
@@ -342,9 +356,9 @@ describe("multi-sandbox configuration", () => {
     }, MACHINE).port).toBe(18_888);
   });
 
-  it("rejects missing projects, duplicate invalid IDs, and missing cookie sources", () => {
-    expect(() => resolveMultiSandboxConfig({
-      ...BASE_ENV, PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json" }, MACHINE)).toThrow("PRISM_PROJECT_IDS");
+  it("accepts missing migration IDs but rejects invalid IDs and missing cookie sources", () => {
+    expect(resolveMultiSandboxConfig({
+      ...BASE_ENV, PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json" }, MACHINE).projectIds).toEqual([]);
     expect(() => resolveMultiSandboxConfig({
       ...BASE_ENV, PRISM_PROJECT_IDS: "bad", PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json" }, MACHINE)).toThrow("ProjectId");
     expect(() => resolveMultiSandboxConfig({

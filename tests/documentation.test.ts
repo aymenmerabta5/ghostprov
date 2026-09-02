@@ -64,6 +64,8 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
     expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `30000`");
+    expect(readme).toContain("| `GP_TARGET_SANDBOXES` | `8`");
+    expect(readme).toContain("| `GP_PROJECT_REPLACEMENT_FAILURES` | `3`");
     expect(readme).toContain("| `GP_V2_TRANSPORT_RESERVATION_BYTES` | `16777216`");
     expect(readme).toContain("| `GP_V2_SIDECAR_MEMORY_BUDGET_BYTES` | `536870912`");
     expect(readme).toContain("| WebSocket active responses | `16`");
@@ -87,6 +89,12 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r8");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
+    expect(envExample).toContain("GP_TARGET_SANDBOXES=8");
+    expect(envExample).toContain("GP_PROJECT_REPLACEMENT_FAILURES=3");
+    expect(envExample).not.toMatch(/^PRISM_PROJECT_IDS=/m);
+    expect(envExample).not.toMatch(/^GP_AUTO_CREATE_PROJECTS=/m);
+    expect(readme).toContain("~/.ghostprov/fleets/<identity-fingerprint>/fleet.json");
+    expect(readme).toContain("transport_admission_timeout");
     expect(envExample).toContain("GP_CANDIDATE=0");
     expect(envExample).toContain("PORT=18787");
     expect(envExample.split(/\r?\n/)).toContain("GHOSTPROV_API_KEY=");
@@ -364,8 +372,7 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_PRISM_SESSION=authenticated");
     expect(envExample).toContain("GP_ALLOW_ANONYMOUS=0");
     expect(envExample).toContain("GP_GUEST_MAX_PROJECTS=1");
-    expect(envExample).toContain("GP_AUTO_CREATE_PROJECTS=0");
-    expect(envExample).toContain("GP_PROJECT_REUSE=explicit");
+    expect(envExample).toContain("GP_TARGET_SANDBOXES=8");
   });
 
   it("documents privacy-safe performance tracing and its diagnosis order", () => {
@@ -441,7 +448,7 @@ describe("project documentation", () => {
     expect(readme).toContain("Admission-credit ownership does not end R2 failover");
     expect(readme).toContain("request_start");
     expect(readme).toContain("four times the selected RTT clamped to 5–10 seconds");
-    expect(readme).toContain("can never extend the unchanged absolute 30-second deadline");
+    expect(readme).toContain("never extends the one payload-scaled global deadline");
     expect(readme).toContain("Requests through 2 MiB and standard/R4 rollback retain their exact prior attempt behavior");
     expect(readme).toContain("never duplicated");
   });

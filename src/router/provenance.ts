@@ -225,6 +225,16 @@ export class ResponseProvenanceRegistry {
     });
   }
 
+  /** Rare fleet-maintenance query; bounded by maxRecords and never on routing hot paths. */
+  bindingsForProject(projectId: ProjectId): number {
+    this.#pruneExpired(this.#now());
+    let count = 0;
+    for (const entry of this.#entries.values()) {
+      if (entry.provenance.projectId === projectId) count++;
+    }
+    return count;
+  }
+
   clear(): void {
     this.#entries.clear();
     this.#expiryHeap.length = 0;

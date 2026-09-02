@@ -232,6 +232,22 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("ResponseProvenanceRegistry", () => {
+  it("exposes only a bounded per-project retirement fence and prunes it at TTL", () => {
+    let now = 1;
+    const registry = new ResponseProvenanceRegistry(() => now);
+    const scope = createAuthenticatedTenantScope();
+    const first = projectId("00000000-0000-4000-8000-000000000001");
+    const second = projectId("00000000-0000-4000-8000-000000000002");
+    expect(recordProvenance(registry, "resp_retirement_fence", scope, {
+      projectId: first,
+      incarnation: 1,
+    })).toBe(true);
+    expect(registry.bindingsForProject(first)).toBe(1);
+    expect(registry.bindingsForProject(second)).toBe(0);
+    now += RESPONSE_PROVENANCE_LIMITS.ttlMs;
+    expect(registry.bindingsForProject(first)).toBe(0);
+  });
+
   it("keeps scope/project/incarnation binding immutable under poisoning and races", async () => {
     let now = 1;
     const registry = new ResponseProvenanceRegistry(() => now);

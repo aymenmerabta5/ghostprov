@@ -857,17 +857,25 @@ describe("MultiSandboxRouter", () => {
     await Promise.allSettled(observedPending);
   });
 
-  it("keeps small deadlines exact and scales only genuinely large request admission", () => {
+  it("keeps small deadlines exact and scales observed long-history admission", () => {
     expect(requestRoutingTimeouts(128 * 1024, 30_000, 15_000)).toEqual({
       queueTimeoutMs: 30_000,
       routeAttemptTimeoutMs: 15_000,
     });
-    expect(requestRoutingTimeouts(8 * 1024 ** 2, 30_000, 15_000)).toEqual({
+    expect(requestRoutingTimeouts(2 * 1024 ** 2, 30_000, 15_000)).toEqual({
       queueTimeoutMs: 30_000,
       routeAttemptTimeoutMs: 15_000,
     });
+    expect(requestRoutingTimeouts(3.75 * 1024 ** 2, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 61_250,
+      routeAttemptTimeoutMs: 15_000,
+    });
+    expect(requestRoutingTimeouts(8 * 1024 ** 2, 30_000, 15_000)).toEqual({
+      queueTimeoutMs: 125_000,
+      routeAttemptTimeoutMs: 15_000,
+    });
     expect(requestRoutingTimeouts(13 * 1024 ** 2, 30_000, 15_000)).toEqual({
-      queueTimeoutMs: 53_750,
+      queueTimeoutMs: 125_000,
       routeAttemptTimeoutMs: 24_375,
     });
     expect(requestRoutingTimeouts(64 * 1024 ** 2, 30_000, 15_000)).toEqual({
@@ -997,7 +1005,7 @@ describe("MultiSandboxRouter", () => {
       stream: true,
     }, { source: "http", incomingLease });
     expect(replacementRequestBytes).toBe(13 * 1024 ** 2 + 13);
-    expect(replacementDeadlineMs).toBe(acceptedAtMs + 53_751);
+    expect(replacementDeadlineMs).toBe(acceptedAtMs + 125_000);
     system.runtimes[0]!.completeOne();
     await handle.final;
     await system.router.close();
@@ -1008,7 +1016,7 @@ describe("MultiSandboxRouter", () => {
     const declared = await system.router.acquireIncomingBody(13 * 1024 ** 2, undefined, {
       maxBytes: 64 * 1024 ** 2,
     });
-    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(53_750);
+    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(125_000);
     declared.release();
 
     const chunked = await system.router.acquireIncomingBody(0, undefined, {
@@ -1016,7 +1024,7 @@ describe("MultiSandboxRouter", () => {
     });
     expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(30_000);
     await chunked.ensureBytes!(13 * 1024 ** 2);
-    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(53_750);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(125_000);
     chunked.release();
     await system.router.close();
   });
@@ -1425,7 +1433,7 @@ describe("MultiSandboxRouter", () => {
     ]);
     const elapsed = performance.now() - started;
     await system.router.close();
-    expect(result).toMatchObject({ code: "router_capacity_timeout" });
+    expect(result).toMatchObject({ code: "transport_admission_timeout" });
     expect(elapsed).toBeLessThan(32);
     expect(system.runtimes[0].executions).toBe(1);
   });
@@ -1719,7 +1727,7 @@ describe("MultiSandboxRouter", () => {
     await expect(system.router.startRelay(
       { model: "gpt-5.6-sol", input: "persistent-precommit", stream: true },
       { clientId: "persistent-precommit", source: "websocket" },
-    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    )).rejects.toMatchObject({ code: "transport_admission_timeout" });
     const elapsed = performance.now() - started;
     expect(runtime.executions).toBeLessThanOrEqual(3);
     expect(runtime.executions).toBeGreaterThanOrEqual(1);
@@ -1755,7 +1763,7 @@ describe("MultiSandboxRouter", () => {
     await expect(system.router.startRelay(
       { model: "gpt-5.6-sol", input: "stuck-preparation", stream: true },
       { clientId: "stuck-preparation", source: "websocket" },
-    )).rejects.toMatchObject({ code: "router_capacity_timeout" });
+    )).rejects.toMatchObject({ code: "transport_admission_timeout" });
     expect(performance.now() - started).toBeLessThan(60);
     expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0 });
     expect(system.governor.snapshot().reservedBytes).toBe(0);
@@ -1996,7 +2004,7 @@ describe("MultiSandboxRouter", () => {
 
     const result = await pending.then(() => null, error => error);
     const elapsed = performance.now() - started;
-    expect(result).toMatchObject({ code: "router_capacity_timeout" });
+    expect(result).toMatchObject({ code: "transport_admission_timeout" });
     expect(elapsed).toBeGreaterThanOrEqual(55);
     expect(elapsed).toBeLessThan(130);
     expect(selected.lastRunSignal?.aborted).toBe(true);
@@ -2007,7 +2015,7 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("retains a stale but provably near-complete 2.9 MiB transfer instead of a doomed retry", async () => {
+  it("retries stale 2.9 MiB progress when the scaled deadline can fit a full failover", async () => {
     let clockOffsetMs = 0;
     const clock: Clock = {
       now: () => performance.timeOrigin + performance.now() + clockOffsetMs,
@@ -2042,7 +2050,8 @@ describe("MultiSandboxRouter", () => {
     expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
 
     // Model the live trace without sleeping 15 seconds: 2.25 MiB was uniquely
-    // acknowledged by 9.337s, then the 15s timer observes it 5.663s later.
+    // acknowledged by 9.337s, then becomes stale. The new global budget is
+    // long enough for one complete safe retransmit, so the stale route moves.
     clockOffsetMs = 9_337;
     selected.emitAdmissionProgress({
       stage: "request_data",
@@ -2052,10 +2061,11 @@ describe("MultiSandboxRouter", () => {
     clockOffsetMs = 15_000;
     await Bun.sleep(60);
 
-    expect(selected.lastRunSignal?.aborted).toBe(false);
-    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
-    controller.abort(new DOMException("test complete", "AbortError"));
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(selected.lastRunSignal?.aborted).toBe(true);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+    const handle = await pending;
+    system.runtimes[0]!.completeOne();
+    await handle.final;
     await system.router.close();
   });
 

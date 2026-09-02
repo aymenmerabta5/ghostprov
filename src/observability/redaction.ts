@@ -87,7 +87,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "response.first_event": new Set(["trace_id", "project_id", "first_event_ms", "post_commit_first_event_ms", "upstream_first_event_ms", "sidecar_scheduler_ms", "host_ack_to_first_frame_ms", "host_assembly_to_delivery_ms"]),
   "request.completed": new Set(["trace_id", "project_id", "total_ms", "queue_wait_ms", "commit_ack_ms", "first_event_ms", "response_bytes", "frames", "terminal_status", "retry_count", "slow"]),
   "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id", "committed", "quarantined", "retry_count"]),
-  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
+  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
   "monitor.sample": new Set(["poll_ms", "health_status", "sandboxes_status", "capacity", "active", "available", "queued", "resources", "runtimes"]),
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
@@ -355,6 +355,23 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
     "unavailable_projects_truncated" in event &&
     typeof event.unavailable_projects_truncated !== "boolean"
   ) throw new TypeError("Fleet unavailable project truncation flag is invalid");
+  for (const key of ["pending_retirements", "project_mutation_failures"] as const) {
+    if (!(key in event)) continue;
+    const value = event[key];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`Fleet project mutation ${key} is invalid`);
+    }
+  }
+  if ("project_mutation_state" in event &&
+    event.project_mutation_state !== "closed" && event.project_mutation_state !== "open") {
+    throw new TypeError("Fleet project mutation state is invalid");
+  }
+  if ("project_mutation_retry_ms" in event && event.project_mutation_retry_ms !== null &&
+    (typeof event.project_mutation_retry_ms !== "number" ||
+      !Number.isSafeInteger(event.project_mutation_retry_ms) ||
+      event.project_mutation_retry_ms < 0)) {
+    throw new TypeError("Fleet project mutation retry is invalid");
+  }
   if (!Array.isArray(event.runtimes)) return;
   for (const value of event.runtimes) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;

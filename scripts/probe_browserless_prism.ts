@@ -10,6 +10,10 @@ if (process.env.GP_LIVE_VERIFY !== "1") {
 }
 
 const config = resolveMultiSandboxConfig(process.env, new SystemMachineProbe().sample());
+const probeProject = config.projectIds[0];
+if (!probeProject) {
+  throw new Error("Browserless proof requires one dedicated legacy PRISM_PROJECT_IDS seed");
+}
 const account = await PrismAccountSession.create({
   origin: config.prismOrigin,
   cookieFile: config.cookieFile,
@@ -17,16 +21,16 @@ const account = await PrismAccountSession.create({
 });
 const provisioning = new PrismProvisioningClient({ account });
 const started = performance.now();
-const credentials = await provisioning.provision(config.projectIds[0]);
+const credentials = await provisioning.provision(probeProject);
 let first = true;
 const ydoc = new SandboxYDoc({
-  projectId: config.projectIds[0],
+  projectId: probeProject,
   mintYSweet: async () => {
     if (first) {
       first = false;
       return credentials.ySweet;
     }
-    return provisioning.mintYSweet(config.projectIds[0], {
+    return provisioning.mintYSweet(probeProject, {
       source: "proof-reconnect",
       bootstrapAttempt: 1,
       previouslyConnected: true,
@@ -38,7 +42,7 @@ const ydoc = new SandboxYDoc({
 });
 await ydoc.connect();
 const gateway = new SandboxGateway({
-  projectId: config.projectIds[0],
+  projectId: probeProject,
   account,
   sandbox: credentials.sandbox,
 });

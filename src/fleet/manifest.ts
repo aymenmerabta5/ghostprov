@@ -7,11 +7,13 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type { PrismIdentityKind } from "../prism/session-manager";
 import { projectId, type ProjectId } from "../sandbox/types";
 import type {
   FleetManifest,
+  FleetRetirementReason,
   FleetWorkerRecord,
   FleetWorkerState,
 } from "./types";
@@ -30,12 +32,39 @@ export class FleetManifestError extends Error {
   }
 }
 
+const SHA256 = /^[a-f0-9]{64}$/;
+const MAX_MANIFEST_WORKERS = 128;
+
+export function defaultFleetManifestFile(
+  identityFingerprint: string,
+  homeDirectory = homedir(),
+): string {
+  if (!SHA256.test(identityFingerprint)) {
+    throw new TypeError("identityFingerprint must be a lowercase SHA-256 digest");
+  }
+  if (typeof homeDirectory !== "string" || homeDirectory.trim() === "") {
+    throw new TypeError("homeDirectory must not be empty");
+  }
+  return path.join(
+    path.resolve(homeDirectory),
+    ".ghostprov",
+    "fleets",
+    identityFingerprint,
+    "fleet.json",
+  );
+}
+
 const STATES = new Set<FleetWorkerState>([
   "creating",
   "created",
   "ready",
   "draining",
   "failed",
+]);
+const RETIREMENT_REASONS = new Set<FleetRetirementReason>([
+  "replacement",
+  "missing",
+  "surplus",
 ]);
 
 function isNodeError(error: unknown, code: string): boolean {
@@ -76,6 +105,15 @@ function parseWorker(value: unknown): FleetWorkerRecord {
   if (!Number.isInteger(raw.leaderGeneration) || (raw.leaderGeneration as number) < 0) {
     throw new FleetManifestError("Fleet worker leader generation is invalid", "protocol");
   }
+  if (raw.retirementReason !== undefined && raw.retirementReason !== null &&
+    (typeof raw.retirementReason !== "string" ||
+      !RETIREMENT_REASONS.has(raw.retirementReason as FleetRetirementReason))) {
+    throw new FleetManifestError("Fleet worker retirement reason is invalid", "protocol");
+  }
+  const retirementReason = raw.retirementReason as FleetRetirementReason | null | undefined;
+  if (raw.state !== "draining" && retirementReason != null) {
+    throw new FleetManifestError("Only a draining worker may have a retirement reason", "protocol");
+  }
   return Object.freeze({
     index: raw.index as number,
     projectId: projectId(raw.projectId),
@@ -85,6 +123,7 @@ function parseWorker(value: unknown): FleetWorkerRecord {
     updatedAtMs: finiteNonnegative(raw.updatedAtMs, "Fleet worker update time"),
     leaderGeneration: raw.leaderGeneration as number,
     managed: raw.managed,
+    retirementReason: retirementReason ?? null,
   });
 }
 
@@ -99,7 +138,7 @@ function parseManifest(
   if (raw.identityKind !== "authenticated" && raw.identityKind !== "anonymous") {
     throw new FleetManifestError("Fleet identity kind is invalid", "protocol");
   }
-  if (typeof raw.identityFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(raw.identityFingerprint)) {
+  if (typeof raw.identityFingerprint !== "string" || !SHA256.test(raw.identityFingerprint)) {
     throw new FleetManifestError("Fleet identity fingerprint is invalid", "protocol");
   }
   if (raw.identityFingerprint !== expectedFingerprint) {
@@ -110,6 +149,13 @@ function parseManifest(
   }
   if (!Array.isArray(raw.workers)) {
     throw new FleetManifestError("Fleet workers must be an array", "protocol");
+  }
+  if (raw.workers.length > MAX_MANIFEST_WORKERS) {
+    throw new FleetManifestError("Fleet worker limit is exceeded", "protocol");
+  }
+  if (raw.legacyMigrationCompleted !== undefined &&
+    typeof raw.legacyMigrationCompleted !== "boolean") {
+    throw new FleetManifestError("Fleet legacy migration flag is invalid", "protocol");
   }
   const workers = raw.workers.map(parseWorker).sort((left, right) => left.index - right.index);
   const indexes = new Set<number>();
@@ -128,13 +174,17 @@ function parseManifest(
     version: 1,
     identityKind: raw.identityKind,
     identityFingerprint: raw.identityFingerprint,
+    legacyMigrationCompleted: raw.legacyMigrationCompleted === true,
     workers: Object.freeze(workers),
   });
 }
 
 function updatedWorker(
   worker: FleetWorkerRecord,
-  update: Partial<Pick<FleetWorkerRecord, "state" | "updatedAtMs" | "leaderGeneration">>,
+  update: Partial<Pick<
+    FleetWorkerRecord,
+    "state" | "updatedAtMs" | "leaderGeneration" | "retirementReason"
+  >>,
 ): FleetWorkerRecord {
   return Object.freeze({ ...worker, ...update });
 }
@@ -142,19 +192,26 @@ function updatedWorker(
 export interface FleetManifestStoreOptions {
   file: string;
   identityFingerprint: string;
+  /** Optional pre-identity-scoped v1 location, copied once and never deleted. */
+  legacyFile?: string;
 }
 
 export class FleetManifestStore {
   readonly #file: string;
   readonly #identityFingerprint: string;
+  readonly #legacyFile: string | null;
   #chain: Promise<void> = Promise.resolve();
 
   constructor(options: FleetManifestStoreOptions) {
-    if (!/^[a-f0-9]{64}$/.test(options.identityFingerprint)) {
+    if (!SHA256.test(options.identityFingerprint)) {
       throw new TypeError("identityFingerprint must be a lowercase SHA-256 digest");
     }
     this.#file = path.resolve(options.file);
     this.#identityFingerprint = options.identityFingerprint;
+    const legacyFile = options.legacyFile?.trim();
+    this.#legacyFile = legacyFile && path.resolve(legacyFile) !== this.#file
+      ? path.resolve(legacyFile)
+      : null;
   }
 
   initialize(kind: PrismIdentityKind): Promise<FleetManifest> {
@@ -169,10 +226,34 @@ export class FleetManifestStore {
         }
         return existing;
       }
+      if (this.#legacyFile) {
+        let legacy: FleetManifest | null = null;
+        try {
+          legacy = await this.#readMaybe(this.#legacyFile);
+        } catch (error) {
+          // A shared historical path may legitimately belong to another
+          // account. Never adopt it, but do not prevent that account from
+          // receiving its own identity-scoped registry.
+          if (!(error instanceof FleetManifestError) || error.kind !== "identity_mismatch") {
+            throw error;
+          }
+        }
+        if (legacy) {
+          if (legacy.identityKind !== kind) {
+            throw new FleetManifestError(
+              "Legacy fleet manifest identity kind does not match the active session",
+              "identity_mismatch",
+            );
+          }
+          await this.#write(legacy);
+          return legacy;
+        }
+      }
       const created: FleetManifest = {
         version: 1,
         identityKind: kind,
         identityFingerprint: this.#identityFingerprint,
+        legacyMigrationCompleted: false,
         workers: Object.freeze([]),
       };
       await this.#write(created);
@@ -218,6 +299,9 @@ export class FleetManifestStore {
       if (current.workers.some(worker => worker.index === input.index)) {
         throw new FleetManifestError("Worker index reservation conflicts", "conflict");
       }
+      if (current.workers.length >= MAX_MANIFEST_WORKERS) {
+        throw new FleetManifestError("Fleet worker limit is exceeded", "conflict");
+      }
       const worker: FleetWorkerRecord = Object.freeze({
         index: input.index,
         projectId: input.projectId,
@@ -227,6 +311,7 @@ export class FleetManifestStore {
         updatedAtMs: input.nowMs,
         leaderGeneration: 0,
         managed: input.managed ?? true,
+        retirementReason: null,
       });
       return { ...current, workers: Object.freeze([...current.workers, worker]) };
     });
@@ -252,7 +337,41 @@ export class FleetManifestStore {
         if (nowMs < worker.updatedAtMs) {
           throw new FleetManifestError("Worker update time cannot move backwards", "conflict");
         }
-        return updatedWorker(worker, { state, updatedAtMs: nowMs });
+        return updatedWorker(worker, {
+          state,
+          updatedAtMs: nowMs,
+          ...(state === "draining" ? {} : { retirementReason: null }),
+        });
+      });
+      if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
+      return { ...current, workers: Object.freeze(workers) };
+    });
+  }
+
+  markDraining(
+    id: ProjectId,
+    reason: FleetRetirementReason,
+    nowMs: number,
+  ): Promise<FleetManifest> {
+    if (!RETIREMENT_REASONS.has(reason)) {
+      return Promise.reject(new FleetManifestError("Retirement reason is invalid", "protocol"));
+    }
+    if (!Number.isFinite(nowMs) || nowMs < 0) {
+      return Promise.reject(new FleetManifestError("Worker timestamp is invalid", "protocol"));
+    }
+    return this.#mutate(current => {
+      let found = false;
+      const workers = current.workers.map(worker => {
+        if (worker.projectId !== id) return worker;
+        found = true;
+        if (nowMs < worker.updatedAtMs) {
+          throw new FleetManifestError("Worker update time cannot move backwards", "conflict");
+        }
+        return updatedWorker(worker, {
+          state: "draining",
+          retirementReason: reason,
+          updatedAtMs: nowMs,
+        });
       });
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
       return { ...current, workers: Object.freeze(workers) };
@@ -278,6 +397,35 @@ export class FleetManifestStore {
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
       return { ...current, workers: Object.freeze(workers) };
     }).then(() => generation);
+  }
+
+  completeLegacyMigration(): Promise<FleetManifest> {
+    return this.#mutate(current => current.legacyMigrationCompleted
+      ? current
+      : { ...current, legacyMigrationCompleted: true });
+  }
+
+  removeImported(id: ProjectId): Promise<FleetManifest> {
+    return this.#mutate(current => {
+      const selected = current.workers.find(worker => worker.projectId === id);
+      if (selected?.managed) {
+        throw new FleetManifestError(
+          "Managed project requires confirmed remote deletion",
+          "conflict",
+        );
+      }
+      if (selected && selected.state !== "draining") {
+        throw new FleetManifestError(
+          "Imported project must be draining before retirement",
+          "conflict",
+        );
+      }
+      const workers = current.workers.filter(worker => worker.projectId !== id);
+      if (workers.length === current.workers.length) {
+        throw new FleetManifestError("Imported worker was not found", "missing_worker");
+      }
+      return { ...current, workers: Object.freeze(workers) };
+    });
   }
 
   removeManaged(id: ProjectId): Promise<FleetManifest> {
@@ -315,10 +463,10 @@ export class FleetManifestStore {
     return pending;
   }
 
-  async #readMaybe(): Promise<FleetManifest | null> {
+  async #readMaybe(file = this.#file): Promise<FleetManifest | null> {
     let raw: string;
     try {
-      raw = await readFile(this.#file, "utf8");
+      raw = await readFile(file, "utf8");
     } catch (error) {
       if (isNodeError(error, "ENOENT")) return null;
       throw error;

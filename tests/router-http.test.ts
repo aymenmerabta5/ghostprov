@@ -1704,6 +1704,12 @@ describe("router HTTP composition", () => {
       unavailable: recovered ? 0 : 1,
       unavailableProjects: recovered ? [] : [unavailableProject],
       projects: [unavailableProject, readyProject],
+      pendingRetirements: recovered ? 0 : 1,
+      projectMutation: {
+        state: recovered ? "closed" as const : "open" as const,
+        consecutiveFailures: recovered ? 0 : 2,
+        retryInMs: recovered ? null : 5_000,
+      },
     });
     try {
       const app = createGhostProvApp({ router, fleetSnapshot });
@@ -1712,6 +1718,8 @@ describe("router HTTP composition", () => {
         desired: 2,
         ready: 1,
         unavailable: 1,
+        pendingRetirements: 1,
+        projectMutation: { state: "open", consecutiveFailures: 2, retryInMs: 5_000 },
       });
       expect(await (await app.request("/__sandboxes")).json()).toMatchObject({
         desired: 2,

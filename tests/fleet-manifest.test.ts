@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  defaultFleetManifestFile,
   FleetManifestError,
   FleetManifestStore,
 } from "../src/fleet/manifest";
@@ -26,6 +27,60 @@ async function manifestPath(): Promise<string> {
 }
 
 describe("FleetManifestStore", () => {
+  it("places default fleet state under an identity-scoped home directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-home-"));
+    roots.push(root);
+    expect(defaultFleetManifestFile(FINGERPRINT, root)).toBe(path.join(
+      root,
+      ".ghostprov",
+      "fleets",
+      FINGERPRINT,
+      "fleet.json",
+    ));
+    expect(() => defaultFleetManifestFile("not-a-fingerprint", root)).toThrow("SHA-256");
+  });
+
+  it("upgrades a version-one manifest with an idempotent legacy migration marker", async () => {
+    const file = await manifestPath();
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      identityKind: "authenticated",
+      identityFingerprint: FINGERPRINT,
+      workers: [],
+    }));
+    const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    expect((await store.load()).legacyMigrationCompleted).toBe(false);
+    await store.completeLegacyMigration();
+    await store.completeLegacyMigration();
+    expect((await store.load()).legacyMigrationCompleted).toBe(true);
+  });
+
+  it("copies a matching legacy registry into the identity-scoped path without deleting it", async () => {
+    const legacyFile = await manifestPath();
+    const targetFile = await manifestPath();
+    const legacy = new FleetManifestStore({
+      file: legacyFile,
+      identityFingerprint: FINGERPRINT,
+    });
+    await legacy.initialize("authenticated");
+    await legacy.reserveWorker({
+      index: 1,
+      projectId: A,
+      title: "Legacy worker",
+      nowMs: 1,
+      managed: false,
+    });
+    const target = new FleetManifestStore({
+      file: targetFile,
+      legacyFile,
+      identityFingerprint: FINGERPRINT,
+    });
+
+    expect((await target.initialize("authenticated")).workers[0]?.projectId).toBe(A);
+    expect((await target.load()).workers[0]?.managed).toBe(false);
+    expect((await legacy.load()).workers[0]?.projectId).toBe(A);
+  });
+
   it("persists creation intent before completion and increments leader generations", async () => {
     const file = await manifestPath();
     const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
@@ -132,6 +187,10 @@ describe("FleetManifestStore", () => {
 
     expect((await store.load()).workers[0].managed).toBe(false);
     await expect(store.removeManaged(A)).rejects.toMatchObject({ kind: "conflict" });
+    await expect(store.removeImported(A)).rejects.toMatchObject({ kind: "conflict" });
+    await store.markState(A, "draining", 1_001);
+    await store.removeImported(A);
+    expect((await store.load()).workers).toEqual([]);
   });
 
   it("never persists credential-shaped fields", async () => {

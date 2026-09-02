@@ -21,9 +21,16 @@ import { resolveGhostProvApiKey } from "../http/api-key";
 
 export type PrismSessionMode = "authenticated" | "auto" | "anonymous";
 
+export const DEFAULT_MANAGED_SANDBOXES = 8;
+export const MAX_MANAGED_SANDBOXES = 32;
+
 export interface MultiSandboxConfig {
   /** Shared inbound credential for the OpenAI and Anthropic compatibility APIs. */
   apiKey: string;
+  /**
+   * Deprecated one-time migration seeds. The identity-scoped fleet manifest,
+   * never this array, is the runtime project authority.
+   */
   projectIds: readonly ProjectId[];
   prismOrigin: string;
   cookieFile: string;
@@ -52,11 +59,14 @@ export interface MultiSandboxConfig {
   v2BatchingEnabled: boolean;
   /** Process-wide immutable sidecar release. R8 is normal operation; prior releases are rollback. */
   v2SidecarRevision: V2SidecarRevision;
-  /** Exact configured-project overrides only; no prefix, cohort, or fallback matching. */
+  /** Exact persisted-project overrides only; no prefix, cohort, or fallback matching. */
   v2SidecarProjectRevisions: Readonly<Record<string, V2SidecarRevision>>;
   desiredSandboxes: number;
   provisionConcurrency: number;
-  fleetManifestFile: string;
+  /** Null selects the identity-scoped ~/.ghostprov/fleets/<fingerprint> path. */
+  fleetManifestFile: string | null;
+  /** Repeated identical project-local failures required before replacement. */
+  projectReplacementFailureThreshold: number;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -94,10 +104,8 @@ function binaryFlag(value: string | undefined, name: string): boolean {
 
 function v2SidecarProjectRevisions(
   value: string | undefined,
-  projectIds: readonly ProjectId[],
 ): Readonly<Record<string, V2SidecarRevision>> {
   if (value === undefined || value.trim() === "") return Object.freeze({});
-  const known = new Set<string>(projectIds);
   const overrides: Record<string, V2SidecarRevision> = {};
   for (const rawEntry of value.split(",")) {
     const entry = rawEntry.trim();
@@ -113,11 +121,6 @@ function v2SidecarProjectRevisions(
     }
     const rawProjectId = entry.slice(0, separator).trim();
     const selectedProject = projectId(rawProjectId);
-    if (!known.has(selectedProject)) {
-      throw new TypeError(
-        `GP_V2_SIDECAR_PROJECT_REVISIONS names an unknown configured project: ${rawProjectId}`,
-      );
-    }
     if (Object.hasOwn(overrides, selectedProject)) {
       throw new TypeError(
         `GP_V2_SIDECAR_PROJECT_REVISIONS repeats project: ${rawProjectId}`,
@@ -142,36 +145,35 @@ export function resolveMultiSandboxConfig(
     "GP_PRISM_SESSION",
   );
   const allowAnonymous = binaryFlag(env.GP_ALLOW_ANONYMOUS, "GP_ALLOW_ANONYMOUS");
-  const autoCreateProjects = binaryFlag(
-    env.GP_AUTO_CREATE_PROJECTS,
-    "GP_AUTO_CREATE_PROJECTS",
-  );
-  if (autoCreateProjects) {
-    throw new TypeError(
-      "GP_AUTO_CREATE_PROJECTS is unsupported in V2-only mode; configure existing PRISM_PROJECT_IDS",
-    );
+  // These legacy switches no longer control behavior. Accept their two safe
+  // historical values so an existing installation can upgrade before removing
+  // them, while project creation remains an unconditional managed-fleet duty.
+  if (env.GP_AUTO_CREATE_PROJECTS !== undefined) {
+    binaryFlag(env.GP_AUTO_CREATE_PROJECTS, "GP_AUTO_CREATE_PROJECTS");
   }
-  const projectReuse = env.GP_PROJECT_REUSE?.trim() || "explicit";
-  if (projectReuse !== "explicit") {
+  const projectReuse = env.GP_PROJECT_REUSE?.trim();
+  if (projectReuse && projectReuse !== "explicit" && projectReuse !== "managed") {
     throw new TypeError(
-      "GP_PROJECT_REUSE must be explicit in V2-only mode",
+      "GP_PROJECT_REUSE may only be explicit or managed during migration",
     );
   }
 
-  const rawProjects = (env.PRISM_PROJECT_IDS ?? env.PRISM_DOC_ID ?? "").trim();
-  if (!rawProjects) {
-    throw new TypeError(
-      "PRISM_PROJECT_IDS or PRISM_DOC_ID is required in V2-only mode",
-    );
-  }
+  // Environment IDs are imported exactly once into the account-bound
+  // manifest. They are deliberately not an allowlist and are not required for
+  // subsequent starts (or for a fresh automatically managed fleet).
+  const rawProjects = (
+    env.PRISM_PROJECT_IDS?.trim() || env.PRISM_DOC_ID?.trim() || ""
+  );
   const projectIds = rawProjects
     ? [...new Set(rawProjects.split(",").map(value => value.trim()).filter(Boolean))]
       .map(projectId)
     : [];
-  const maxProjects = positiveInteger(
+  const maxProjects = boundedPositiveInteger(
     env.GP_MAX_PROJECTS,
-    Math.max(32, projectIds.length),
+    MAX_MANAGED_SANDBOXES,
     "GP_MAX_PROJECTS",
+    1,
+    MAX_MANAGED_SANDBOXES,
   );
   const guestMaxProjects = positiveInteger(
     env.GP_GUEST_MAX_PROJECTS,
@@ -186,7 +188,29 @@ export function resolveMultiSandboxConfig(
       `Configured ${projectIds.length} projects exceeds GP_GUEST_MAX_PROJECTS=${guestMaxProjects}`,
     );
   }
-  if (projectIds.length > maxProjects) throw new RangeError(`Configured ${projectIds.length} projects exceeds GP_MAX_PROJECTS=${maxProjects}`);
+  if (projectIds.length > maxProjects) {
+    throw new RangeError(
+      `Legacy migration contains ${projectIds.length} projects, exceeding GP_MAX_PROJECTS=${maxProjects}`,
+    );
+  }
+  const targetWasConfigured = env.GP_TARGET_SANDBOXES !== undefined &&
+    env.GP_TARGET_SANDBOXES.trim() !== "";
+  const requestedSandboxes = targetWasConfigured
+    ? positiveInteger(env.GP_TARGET_SANDBOXES, 1, "GP_TARGET_SANDBOXES")
+    : Math.min(DEFAULT_MANAGED_SANDBOXES, maxProjects);
+  if (requestedSandboxes > maxProjects) {
+    throw new RangeError("GP_TARGET_SANDBOXES must not exceed GP_MAX_PROJECTS");
+  }
+  if (
+    sessionMode === "anonymous" &&
+    targetWasConfigured &&
+    requestedSandboxes > guestMaxProjects
+  ) {
+    throw new RangeError("GP_TARGET_SANDBOXES must not exceed GP_GUEST_MAX_PROJECTS in anonymous mode");
+  }
+  const desiredSandboxes = sessionMode === "anonymous"
+    ? Math.min(requestedSandboxes, guestMaxProjects)
+    : requestedSandboxes;
 
   const cookieFile = env.PRISM_COOKIE_FILE?.trim();
   const initialCookieHeader = env.PRISM_COOKIE?.trim();
@@ -297,19 +321,17 @@ export function resolveMultiSandboxConfig(
   );
   const v2SidecarRevisionOverrides = v2SidecarProjectRevisions(
     env.GP_V2_SIDECAR_PROJECT_REVISIONS,
-    projectIds,
   );
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
-  const desiredSandboxes = projectIds.length;
   const provisionConcurrency = Math.min(
     desiredSandboxes,
     positiveInteger(env.GP_PROVISION_CONCURRENCY, 4, "GP_PROVISION_CONCURRENCY"),
   );
   const v2HostEventMemory = deriveV2HostEventMemorySizing({
     responseMaxBytes: v2ResponseMaxBytes,
-    runtimes: projectIds.length,
+    runtimes: desiredSandboxes,
     maxActivePerRuntime: v2MaxActivePerSandbox,
   });
 
@@ -344,8 +366,15 @@ export function resolveMultiSandboxConfig(
     v2SidecarProjectRevisions: v2SidecarRevisionOverrides,
     desiredSandboxes,
     provisionConcurrency,
-    fleetManifestFile: path.resolve(
-      env.GP_FLEET_MANIFEST_FILE?.trim() || ".ghostprov/fleet.json",
+    fleetManifestFile: env.GP_FLEET_MANIFEST_FILE?.trim()
+      ? path.resolve(env.GP_FLEET_MANIFEST_FILE.trim())
+      : null,
+    projectReplacementFailureThreshold: boundedPositiveInteger(
+      env.GP_PROJECT_REPLACEMENT_FAILURES,
+      3,
+      "GP_PROJECT_REPLACEMENT_FAILURES",
+      3,
+      100,
     ),
   };
 }

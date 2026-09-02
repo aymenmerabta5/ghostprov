@@ -265,6 +265,10 @@ describe("FleetSampler", () => {
       unavailable: 1,
       unavailable_projects: [unavailableProject],
       unavailable_projects_truncated: false,
+      pending_retirements: 0,
+      project_mutation_state: "closed",
+      project_mutation_failures: 0,
+      project_mutation_retry_ms: null,
     });
     webSocketTelemetry.recordIngressBudget({
       ingressReservedBytes: 17 * 1024 ** 2,

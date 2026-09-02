@@ -355,6 +355,12 @@ function publicFleetState(
   unavailable: number;
   unavailableProjects: string[];
   unavailableProjectsTruncated: boolean;
+  pendingRetirements: number;
+  projectMutation: {
+    state: "closed" | "open";
+    consecutiveFailures: number;
+    retryInMs: number | null;
+  };
 } {
   if (!value) {
     return {
@@ -363,6 +369,8 @@ function publicFleetState(
       unavailable: 0,
       unavailableProjects: [],
       unavailableProjectsTruncated: false,
+      pendingRetirements: 0,
+      projectMutation: { state: "closed", consecutiveFailures: 0, retryInMs: null },
     };
   }
   const all = value.unavailableProjects.slice(0, MAX_PUBLIC_UNAVAILABLE_PROJECTS + 1)
@@ -375,6 +383,15 @@ function publicFleetState(
     unavailableProjectsTruncated:
       value.unavailableProjects.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS ||
       all.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS,
+    pendingRetirements: publicInteger(value.pendingRetirements) ?? 0,
+    projectMutation: {
+      state: value.projectMutation?.state === "open" ? "open" : "closed",
+      consecutiveFailures: publicInteger(value.projectMutation?.consecutiveFailures) ?? 0,
+      retryInMs: value.projectMutation?.retryInMs === null ||
+          value.projectMutation?.retryInMs === undefined
+        ? null
+        : publicInteger(value.projectMutation.retryInMs) ?? null,
+    },
   };
 }
 
@@ -1094,6 +1111,8 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       desired: fleet.desired,
       ready: fleet.ready,
       unavailable: fleet.unavailable,
+      pendingRetirements: fleet.pendingRetirements,
+      projectMutation: fleet.projectMutation,
     }, healthy ? 200 : 503);
   });
 

@@ -191,6 +191,7 @@ export async function main(): Promise<void> {
     PORT: String(PORT),
     GP_CANDIDATE: "1",
     GP_AUTO_CREATE_PROJECTS: "0",
+    GP_TARGET_SANDBOXES: String(projectIds.length),
     GP_MAX_PROJECTS: "8",
     GP_PROVISION_CONCURRENCY: "4",
     GP_V2_SIDECAR_REVISION: "r8",

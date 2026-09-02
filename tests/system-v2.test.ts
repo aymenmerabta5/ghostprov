@@ -278,6 +278,7 @@ async function harness(): Promise<{
       GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
       PRISM_COOKIE_FILE: cookieFile,
       PRISM_PROJECT_IDS: IDS.join(","),
+      GP_TARGET_SANDBOXES: String(IDS.length),
       GP_PRISM_SESSION: "authenticated",
       GP_MAX_PROJECTS: "8",
       GP_PROVISION_CONCURRENCY: "4",
@@ -319,6 +320,54 @@ async function harness(): Promise<{
 }
 
 describe("V2 browserless system composition", () => {
+  it("boots a managed fleet without PRISM_PROJECT_IDS and persists created projects", async () => {
+    const value = await harness();
+    const remote: PrismProjectSummary[] = [];
+    const created: ProjectId[] = [];
+    value.dependencies.projects = {
+      get: async id => {
+        const found = remote.find(project => project.projectId === id && !project.deleted);
+        if (found) return found;
+        const error = Object.assign(new Error("missing managed project"), {
+          name: "PrismProjectError",
+          kind: "http",
+          status: 404,
+        });
+        throw error;
+      },
+      create: async input => {
+        const project: PrismProjectSummary = {
+          projectId: input.projectId,
+          title: input.title,
+          owner: "owner",
+          deleted: false,
+          createdAt: "2026-09-02T00:00:00.000Z",
+        };
+        created.push(project.projectId);
+        remote.push(project);
+        return project;
+      },
+      deleteManaged: async () => {},
+    };
+    value.dependencies.runtimeFactory = {
+      create: input => new DeferredRuntime(input.projectId, false, value.order),
+    };
+    const system = await createBrowserlessSystem({
+      ...value.env,
+      PRISM_PROJECT_IDS: undefined,
+      GP_TARGET_SANDBOXES: "2",
+    }, value.dependencies);
+
+    await system.start();
+    await system.fleet.waitForReady(2);
+    expect(system.config.projectIds).toEqual([]);
+    expect(created).toHaveLength(2);
+    expect(system.fleet.snapshot()).toMatchObject({ desired: 2, ready: 2 });
+    expect((await value.dependencies.manifest!.load()).workers.every(worker => worker.managed))
+      .toBe(true);
+    await system.close();
+  });
+
   it("rejects invalid public host allowlists before acquiring system ownership", async () => {
     let machineSamples = 0;
     let releasePreloads = 0;
@@ -327,6 +376,7 @@ describe("V2 browserless system composition", () => {
       GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
       PRISM_COOKIE_FILE: "D:/unused.json",
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
       GP_CANDIDATE: "1",
     }, {
       allowedHosts: ["host/path"],
@@ -556,6 +606,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
       GP_ANTHROPIC_OPUS_MODEL: "system-explicit-opus",
     }, value.dependencies);
     await system.start();
@@ -642,6 +693,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: [IDS[0], IDS[1]].join(","),
+      GP_TARGET_SANDBOXES: "2",
     }, value.dependencies);
 
     await system.start();
@@ -665,29 +717,37 @@ describe("V2 browserless system composition", () => {
     await system.close();
   }, 30_000);
 
-  it("fails startup when every exact configured project metadata read fails", async () => {
+  it("waits through a fleet-wide project control-plane outage instead of restart-looping", async () => {
     const value = await harness();
     value.dependencies.projects = {
       get: async () => { throw new Error("project metadata unavailable"); },
     };
+    const controller = new AbortController();
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: [IDS[0], IDS[1]].join(","),
-    }, value.dependencies);
+      GP_TARGET_SANDBOXES: "2",
+    }, value.dependencies, controller.signal);
 
-    await expect(system.start()).rejects.toMatchObject({
-      name: "FleetReconciliationError",
-      kind: "explicit_project_missing",
-    });
-    expect(value.server.listening).toBe(false);
-    expect(system.registry.runtimes()).toEqual([]);
-    expect(system.fleet.snapshot()).toMatchObject({
-      desired: 0,
-      ready: 0,
-      failed: 0,
-      unavailable: 0,
-    });
-    await system.close();
+    const starting = system.start();
+    try {
+      const deadline = Date.now() + 2_000;
+      while (system.fleet.snapshot().projects.length < 2 && Date.now() < deadline) {
+        await Bun.sleep(5);
+      }
+      expect(value.server.listening).toBe(false);
+      expect(system.registry.runtimes()).toEqual([]);
+      expect(system.fleet.snapshot()).toMatchObject({
+        desired: 2,
+        ready: 0,
+        failed: 2,
+        unavailable: 2,
+      });
+    } finally {
+      controller.abort(new DOMException("test outage complete", "AbortError"));
+      await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+      await system.close();
+    }
   }, 30_000);
 
   it("fails closed when one legal jumbo event cannot fit host headroom", async () => {
@@ -739,6 +799,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
     }, value.dependencies);
 
     await system.start();
@@ -753,6 +814,7 @@ describe("V2 browserless system composition", () => {
     const env = {
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
     };
     const system = await createBrowserlessSystem(env, value.dependencies);
     const beginShutdown = system.router.beginShutdown.bind(system.router);
@@ -787,6 +849,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
     }, value.dependencies);
 
     const starting = system.start();
@@ -812,6 +875,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
     }, value.dependencies);
 
     await expect(system.start()).rejects.toThrow("synthetic listen failure");
@@ -830,6 +894,7 @@ describe("V2 browserless system composition", () => {
     const system = await createBrowserlessSystem({
       ...value.env,
       PRISM_PROJECT_IDS: IDS[0],
+      GP_TARGET_SANDBOXES: "1",
       GP_SHUTDOWN_DRAIN_MS: "1000",
     }, value.dependencies);
     await system.start();

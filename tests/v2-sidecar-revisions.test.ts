@@ -75,6 +75,32 @@ describe("V2SidecarRevisionSelector", () => {
     expect(calls).toEqual({ r1: 1, r2: 1 });
   });
 
+  it("preloads the immutable default and assigns it to projects created after startup", async () => {
+    const r1 = assets("r1", "dynamic-default");
+    const r2 = assets("r2", "exact-rollback");
+    const selector = new V2SidecarRevisionSelector<TestRevision, TestAssets>({
+      projectIds: [],
+      defaultRevision: "r1",
+      projectOverrides: { [PROJECT_2]: "r2" },
+      allowUnlistedProjects: true,
+      loaders: new Map([
+        ["r1", async () => r1],
+        ["r2", async () => r2],
+      ]),
+    });
+
+    expect(selector.selectedRevisions()).toEqual(["r1", "r2"]);
+    await selector.preload();
+    expect(selector.loadedForProject(PROJECT_1)).toMatchObject({
+      revision: "r1",
+      assets: r1,
+    });
+    expect(selector.loadedForProject(PROJECT_2)).toMatchObject({
+      revision: "r2",
+      assets: r2,
+    });
+  });
+
   it("rejects unknown projects, unknown override revisions, and duplicate project registration", () => {
     const loaders = new Map<TestRevision, () => Promise<TestAssets>>([
       ["r1", async () => assets("r1", "stable")],

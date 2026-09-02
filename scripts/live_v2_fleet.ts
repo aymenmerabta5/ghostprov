@@ -74,6 +74,7 @@ export async function main(
   const system = await createBrowserlessSystem({
     ...env,
     GP_CANDIDATE: "1",
+    GP_TARGET_SANDBOXES: "4",
     PORT: String(options.port),
   });
   const summaries: Record<string, unknown>[] = [];

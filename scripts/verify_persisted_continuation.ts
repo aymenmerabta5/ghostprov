@@ -199,6 +199,7 @@ async function launch(
     ...env,
     GP_CANDIDATE: "1",
     GP_AUTO_CREATE_PROJECTS: "0",
+    GP_TARGET_SANDBOXES: String(options.projectIds.length),
     PORT: String(CANDIDATE_PORT),
     PRISM_COOKIE_FILE: env.GP_CONTINUATION_TEST_COOKIE_FILE!.trim(),
     GP_FLEET_MANIFEST_FILE: env.GP_CONTINUATION_TEST_MANIFEST_FILE?.trim() ||

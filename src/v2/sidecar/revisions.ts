@@ -35,11 +35,13 @@ export interface V2SidecarRevisionSelectorOptions<
   Revision extends string,
   Assets extends RevisionAddressedAssets<Revision>,
 > {
-  /** Exact existing Prism projects this process may route. */
+  /** Exact projects known at startup; dynamic mode also accepts later managed IDs. */
   readonly projectIds: readonly ProjectId[];
   readonly defaultRevision: Revision;
-  /** Exact project ID matches only; unknown projects fail construction. */
+  /** Exact project ID matches only; dynamic projects never inherit an override. */
   readonly projectOverrides?: V2ProjectRevisionOverrides<Revision>;
+  /** Managed projects created after startup use the immutable default release. */
+  readonly allowUnlistedProjects?: boolean;
   /** Every selectable revision must have one explicit immutable loader. */
   readonly loaders: ReadonlyMap<Revision, V2RevisionAssetLoader<Revision, Assets>>;
 }
@@ -75,6 +77,7 @@ export class V2SidecarRevisionSelector<
   readonly #projectIds: readonly ProjectId[];
   readonly #projects: ReadonlySet<ProjectId>;
   readonly #defaultRevision: Revision;
+  readonly #allowUnlistedProjects: boolean;
   readonly #overrides: ReadonlyMap<ProjectId, Revision>;
   readonly #loaders: ReadonlyMap<Revision, V2RevisionAssetLoader<Revision, Assets>>;
   readonly #loading = new Map<Revision, Promise<Assets>>();
@@ -96,7 +99,7 @@ export class V2SidecarRevisionSelector<
     const overrides = new Map<ProjectId, Revision>();
     for (const [rawProjectId, revision] of overrideEntries(options.projectOverrides)) {
       const projectId = rawProjectId as ProjectId;
-      if (!projects.has(projectId)) {
+      if (!projects.has(projectId) && !options.allowUnlistedProjects) {
         throw new Error(`V2 revision override names an unknown project: ${rawProjectId}`);
       }
       if (overrides.has(projectId)) {
@@ -110,6 +113,7 @@ export class V2SidecarRevisionSelector<
     this.#projectIds = Object.freeze(projectIds);
     this.#projects = projects;
     this.#defaultRevision = options.defaultRevision;
+    this.#allowUnlistedProjects = options.allowUnlistedProjects === true;
     this.#overrides = overrides;
     this.#loaders = loaders;
   }
@@ -119,15 +123,16 @@ export class V2SidecarRevisionSelector<
   }
 
   revisionForProject(projectId: ProjectId): Revision {
-    if (!this.#projects.has(projectId)) {
+    if (!this.#projects.has(projectId) && !this.#allowUnlistedProjects) {
       throw new Error(`Cannot select a V2 revision for unknown project: ${projectId}`);
     }
     return this.#overrides.get(projectId) ?? this.#defaultRevision;
   }
 
   selectedRevisions(): readonly Revision[] {
-    const revisions = new Set<Revision>();
+    const revisions = new Set<Revision>([this.#defaultRevision]);
     for (const projectId of this.#projectIds) revisions.add(this.revisionForProject(projectId));
+    for (const revision of this.#overrides.values()) revisions.add(revision);
     return Object.freeze([...revisions]);
   }
 
@@ -194,6 +199,7 @@ export interface BundledV2SidecarRevisionSelectorOptions {
   readonly projectIds: readonly ProjectId[];
   readonly defaultRevision?: V2SidecarRevision;
   readonly projectOverrides?: V2ProjectRevisionOverrides<V2SidecarRevision>;
+  readonly allowUnlistedProjects?: boolean;
 }
 
 /** Production registry with immutable R8 and explicit prior-release rollback. */
@@ -214,6 +220,7 @@ export function createBundledV2SidecarRevisionSelector(
     projectIds: options.projectIds,
     defaultRevision: options.defaultRevision ?? DEFAULT_V2_SIDECAR_REVISION,
     projectOverrides: options.projectOverrides,
+    allowUnlistedProjects: options.allowUnlistedProjects,
     loaders,
   });
 }

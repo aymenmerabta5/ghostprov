@@ -149,6 +149,7 @@ describe("dynamic V2 fleet scale", () => {
         GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef",
         PRISM_COOKIE_FILE: cookieFile,
         PRISM_PROJECT_IDS: configuredIds.join(","),
+        GP_TARGET_SANDBOXES: String(size),
         GP_PRISM_SESSION: "authenticated",
         GP_MAX_PROJECTS: "32",
         GP_PROVISION_CONCURRENCY: "32",

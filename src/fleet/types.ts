@@ -9,6 +9,8 @@ export type FleetWorkerState =
   | "draining"
   | "failed";
 
+export type FleetRetirementReason = "replacement" | "missing" | "surplus";
+
 export interface FleetWorkerRecord {
   index: number;
   projectId: ProjectId;
@@ -18,6 +20,7 @@ export interface FleetWorkerRecord {
   updatedAtMs: number;
   leaderGeneration: number;
   managed: boolean;
+  retirementReason: FleetRetirementReason | null;
 }
 
 export interface ManagedProjectInspection {
@@ -50,16 +53,24 @@ export interface FleetSnapshot {
   provisioning: number;
   draining: number;
   failed: number;
-  /** Explicit projects without a currently healthy runtime, including recovery. */
+  /** Selected manifest projects without a currently healthy runtime. */
   unavailable: number;
-  /** Configured explicit projects lacking healthy capacity; never contains substitutes. */
+  /** Selected manifest projects lacking healthy capacity. */
   unavailableProjects: readonly ProjectId[];
   projects: readonly ProjectId[];
+  pendingRetirements?: number;
+  projectMutation?: Readonly<{
+    state: "closed" | "open";
+    consecutiveFailures: number;
+    retryInMs: number | null;
+  }>;
 }
 
 export interface FleetManifest {
   version: 1;
   identityKind: PrismIdentityKind;
   identityFingerprint: string;
+  /** True once legacy environment project IDs have been copied into workers. */
+  legacyMigrationCompleted: boolean;
   workers: readonly FleetWorkerRecord[];
 }

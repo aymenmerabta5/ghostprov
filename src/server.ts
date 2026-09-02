@@ -182,9 +182,12 @@ export async function runGhostProvMain(
       await close();
       return;
     }
+    const projectCount = Number.isSafeInteger(system.config.desiredSandboxes)
+      ? system.config.desiredSandboxes
+      : system.config.projectIds.length;
     console.log(
       `ghostprov browserless router listening on http://127.0.0.1:${system.config.port} ` +
-      `projects=${system.config.projectIds.length}`,
+      `projects=${projectCount}`,
     );
     workerProcess.send?.({
       type: "ghostprov.ready",

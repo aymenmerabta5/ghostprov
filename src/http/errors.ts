@@ -291,6 +291,23 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
     };
   }
   if (
+    structured?.name === "RouterTransportAdmissionTimeoutError" &&
+    structured.status === 503 &&
+    structured.code === "transport_admission_timeout"
+  ) {
+    return {
+      status: 503,
+      error: {
+        message: error instanceof Error
+          ? error.message
+          : "A selected sandbox did not acquire transport admission before the routing deadline",
+        type: "service_unavailable_error",
+        param: null,
+        code: "transport_admission_timeout",
+      },
+    };
+  }
+  if (
     structured?.name === "RouterCapacityTimeoutError" &&
     structured.status === 503 &&
     structured.code === "router_capacity_timeout"
