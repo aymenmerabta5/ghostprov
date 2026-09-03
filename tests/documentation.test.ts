@@ -265,6 +265,7 @@ describe("project documentation", () => {
       "verify:v2-single": "bun scripts/live_v2_single.ts",
       "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",
       "verify:fresh-fleet-recovery": "bun scripts/live_fresh_fleet_recovery.ts",
+      "verify:memory-accounting-live": "bun scripts/live_memory_accounting.ts",
       "verify:v2-smoke": "bun scripts/smoke_v2_candidate.ts",
       "decommission:v2": "bun scripts/decommission_v2_fleet.ts",
       "monitor:v2": "bun scripts/monitor_v2.ts",

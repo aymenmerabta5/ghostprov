@@ -143,33 +143,50 @@ export interface BrowserlessHostEventMemory {
   close(): void;
 }
 
-/** Fixed governor backing for long-lived WebSocket continuation graph bytes. */
+/** Elastic governor backing for connection-local synthetic warmup graph bytes. */
 export interface BrowserlessResponseGraphMemory {
   readonly budget: SharedByteBudget;
   readonly reservedBytes: number;
+  readonly maximumBytes: number;
   close(): void;
 }
 
 export interface BrowserlessWebSocketIngressMemory {
   readonly budget: WebSocketProcessBudget;
   readonly reservedBytes: number;
+  readonly maximumBytes: number;
   close(): void;
 }
+
+const ELASTIC_PROCESS_POOL_QUANTUM_BYTES = 1024 ** 2;
 
 export function reserveWebSocketIngressMemory(
   governor: ResourceGovernor,
   budget: WebSocketProcessBudget,
+  options: { quantumBytes?: number } = {},
 ): BrowserlessWebSocketIngressMemory {
   const snapshot = budget.snapshot();
-  const reservedBytes = snapshot.maxIngressBytes + snapshot.maxQueuedBytes;
-  if (!Number.isSafeInteger(reservedBytes)) {
+  const maximumBytes = snapshot.maxIngressBytes + snapshot.maxQueuedBytes;
+  if (!Number.isSafeInteger(maximumBytes)) {
     throw new RangeError("WebSocket process memory reservation exceeds the safe integer range");
   }
-  let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
+  const reservation = governor.createElasticReservation(maximumBytes, {
+    quantumBytes: Math.min(
+      maximumBytes,
+      options.quantumBytes ?? ELASTIC_PROCESS_POOL_QUANTUM_BYTES,
+    ),
+  });
+  try {
+    budget.attachElasticBacking(reservation);
+  } catch (error) {
+    reservation.close();
+    throw error;
+  }
   let closed = false;
   return {
     budget,
-    reservedBytes,
+    get reservedBytes() { return reservation.reservedBytes; },
+    maximumBytes,
     close() {
       if (closed) return;
       const snapshot = budget.snapshot();
@@ -183,9 +200,9 @@ export function reserveWebSocketIngressMemory(
           `${snapshot.ingressReservedBytes} ingress bytes and ${snapshot.queuedBytes} queued bytes`,
         );
       }
+      budget.detachElasticBacking(reservation);
+      reservation.close();
       closed = true;
-      reservation?.release();
-      reservation = null;
     },
   };
 }
@@ -193,13 +210,25 @@ export function reserveWebSocketIngressMemory(
 export function reserveResponseGraphMemory(
   governor: ResourceGovernor,
   budget: SharedByteBudget = processResponseGraphBudget,
+  options: { quantumBytes?: number } = {},
 ): BrowserlessResponseGraphMemory {
-  const reservedBytes = budget.limit;
-  let reservation: ResourceLease | null = governor.reserveFixedBytes(reservedBytes);
+  const reservation = governor.createElasticReservation(budget.limit, {
+    quantumBytes: Math.min(
+      budget.limit,
+      options.quantumBytes ?? ELASTIC_PROCESS_POOL_QUANTUM_BYTES,
+    ),
+  });
+  try {
+    budget.attachElasticBacking(reservation);
+  } catch (error) {
+    reservation.close();
+    throw error;
+  }
   let closed = false;
   return {
     budget,
-    reservedBytes,
+    get reservedBytes() { return reservation.reservedBytes; },
+    maximumBytes: budget.limit,
     close() {
       if (closed) return;
       // Never make live graph bytes uncharged. Callers must first close every
@@ -207,9 +236,9 @@ export function reserveResponseGraphMemory(
       if (budget.used !== 0) {
         throw new Error(`Response graph memory closed with ${budget.used} retained bytes`);
       }
+      budget.detachElasticBacking(reservation);
+      reservation.close();
       closed = true;
-      reservation?.release();
-      reservation = null;
     },
   };
 }
@@ -955,6 +984,13 @@ export async function createBrowserlessSystem(
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
     routerTrafficSnapshot: () => router.trafficSnapshotAndReset(),
     hostEventMemorySnapshot: () => hostEventMemory.snapshot(),
+    processMemoryPoolsSnapshot: () => ({
+      hostEventReservedBytes: hostEventMemory.reservedBytes,
+      responseGraphReservedBytes: responseGraphMemory.reservedBytes,
+      responseGraphMaximumBytes: responseGraphMemory.maximumBytes,
+      webSocketReservedBytes: webSocketIngressMemory.reservedBytes,
+      webSocketMaximumBytes: webSocketIngressMemory.maximumBytes,
+    }),
     fleetSnapshot: () => fleet.snapshot(),
   });
   const app = createGhostProvApp({
@@ -1157,23 +1193,23 @@ export async function createBrowserlessSystem(
         // Reject any governor waiters which are not owned by the router (for
         // example a body reservation or CPU transform waiting during teardown).
         // Never close the permit pool while a slow HTTP/SSE output may still
-        // own a carrier. A failed force-close intentionally leaves the fixed
-        // reservation intact rather than making live socket memory uncharged.
+        // own a carrier. A failed force-close intentionally leaves its fixed or
+        // elastic backing intact rather than making live socket memory uncharged.
         if (serverClose.closed) {
-          let fixedMemoryClosed = true;
+          let memoryBackingClosed = true;
           try { webSocketIngressMemory.close(); } catch (error) {
-            fixedMemoryClosed = false;
+            memoryBackingClosed = false;
             firstError ??= error;
           }
           try { responseGraphMemory.close(); } catch (error) {
-            fixedMemoryClosed = false;
+            memoryBackingClosed = false;
             firstError ??= error;
           }
           try { hostEventMemory.close(); } catch (error) {
-            fixedMemoryClosed = false;
+            memoryBackingClosed = false;
             firstError ??= error;
           }
-          if (fixedMemoryClosed) governor.close();
+          if (memoryBackingClosed) governor.close();
         }
         await sessionManager.close().catch(error => { firstError ??= error; });
         await cpuPool.close().catch(error => { firstError ??= error; });

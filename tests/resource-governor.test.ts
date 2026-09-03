@@ -116,6 +116,97 @@ describe("ResourceGovernor", () => {
     expect(governor.snapshot().reservedBytes).toBe(0);
   });
 
+  it("charges elastic process budgets only for their current retained bytes", () => {
+    const governor = new ResourceGovernor({ probe: new MutableProbe(sample(32, 19)) });
+    const fixed = governor.reserveFixedBytes(705 * MiB);
+    const elastic = governor.createElasticReservation(2 * GiB);
+
+    expect(elastic).toMatchObject({ maximumBytes: 2 * GiB, reservedBytes: 0 });
+    expect(governor.snapshot().reservedBytes).toBe(705 * MiB);
+
+    expect(elastic.tryResize(64 * MiB)).toBe(true);
+    expect(elastic.reservedBytes).toBe(64 * MiB);
+    expect(governor.snapshot().reservedBytes).toBe(769 * MiB);
+
+    expect(elastic.tryResize(8 * MiB)).toBe(true);
+    expect(governor.snapshot().reservedBytes).toBe(713 * MiB);
+    expect(elastic.tryResize(0)).toBe(true);
+    expect(governor.snapshot().reservedBytes).toBe(705 * MiB);
+
+    elastic.close();
+    elastic.close();
+    fixed.release();
+    expect(governor.snapshot().reservedBytes).toBe(0);
+    governor.close();
+  });
+
+  it("uses bounded quanta without resizing global accounting for every small frame", () => {
+    let samples = 0;
+    const machine = sample(16, 12);
+    const governor = new ResourceGovernor({
+      probe: { sample: () => { samples++; return { ...machine }; } },
+    });
+    const elastic = governor.createElasticReservation(16 * MiB, { quantumBytes: MiB });
+
+    expect(elastic.tryResize(1)).toBe(true);
+    expect(elastic.reservedBytes).toBe(MiB);
+    const afterFirstGrowth = samples;
+    expect(elastic.tryResize(512 * 1024)).toBe(true);
+    expect(elastic.reservedBytes).toBe(MiB);
+    expect(samples).toBe(afterFirstGrowth);
+    for (let frame = 0; frame < 10_000; frame++) {
+      expect(elastic.tryResize(1 + frame % (512 * 1024))).toBe(true);
+    }
+    expect(samples).toBe(afterFirstGrowth);
+    expect(elastic.tryResize(MiB + 1)).toBe(true);
+    expect(elastic.reservedBytes).toBe(2 * MiB);
+    expect(samples).toBe(afterFirstGrowth + 1);
+    expect(elastic.tryResize(MiB)).toBe(true);
+    expect(elastic.reservedBytes).toBe(2 * MiB);
+    expect(samples).toBe(afterFirstGrowth + 1);
+    expect(elastic.tryResize(0)).toBe(true);
+    expect(elastic.reservedBytes).toBe(0);
+
+    elastic.close();
+    governor.close();
+  });
+
+  it("leaves an elastic reservation unchanged when pressure blocks growth", () => {
+    const probe = new MutableProbe(sample(32, 19));
+    const governor = new ResourceGovernor({ probe });
+    const elastic = governor.createElasticReservation(2 * GiB);
+    expect(elastic.tryResize(64 * MiB)).toBe(true);
+
+    probe.value.freeBytes = gib(6);
+    expect(elastic.tryResize(128 * MiB)).toBe(false);
+    expect(elastic.reservedBytes).toBe(64 * MiB);
+    expect(governor.snapshot().reservedBytes).toBe(64 * MiB);
+
+    expect(elastic.tryResize(0)).toBe(true);
+    elastic.close();
+    governor.close();
+  });
+
+  it("does not let elastic process budgets bypass an older request waiter", async () => {
+    const governor = new ResourceGovernor({ probe: new MutableProbe(sample(16, 12)) });
+    const elastic = governor.createElasticReservation(MiB);
+    const capacity = governor.snapshot().reservationCapacityBytes;
+    const blocker = governor.tryAcquire(workload(capacity - MiB))!;
+    const abort = new AbortController();
+    const waiting = governor.acquire(workload(2 * MiB), abort.signal);
+    expect(governor.snapshot().queued).toBe(1);
+
+    expect(elastic.tryResize(512 * 1024)).toBe(false);
+    expect(elastic.reservedBytes).toBe(0);
+    abort.abort();
+    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    expect(elastic.tryResize(512 * 1024)).toBe(true);
+
+    elastic.close();
+    blocker.release();
+    governor.close();
+  });
+
   it("admits 120 text jobs but throttles maximum image-like reservations by bytes", () => {
     const probe = new MutableProbe(sample(32, 19.19));
     const governor = new ResourceGovernor({ probe });

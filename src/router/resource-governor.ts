@@ -1,5 +1,6 @@
 import * as os from "node:os";
 import type { MachineProbe, MachineSample } from "../core/ports";
+import type { ElasticByteReservation } from "../core/elastic-byte-reservation";
 import type { WorkloadDescriptor } from "./workload";
 import type {
   ReleasableLease,
@@ -324,6 +325,91 @@ export class ResourceGovernor {
       throw new ResourceGovernorCapacityUnavailableError(reservedBytes, availableBytes);
     }
     return lease;
+  }
+
+  /**
+   * Creates a zero-byte reservation which may grow synchronously up to one
+   * immutable hard limit. This is intended for process budgets which already
+   * reject/pause before buffering and therefore must not charge their complete
+   * theoretical ceiling while idle.
+   */
+  createElasticReservation(
+    maximumBytes: number,
+    options: { quantumBytes?: number } = {},
+  ): ElasticByteReservation {
+    if (this.#closed) throw new ResourceGovernorClosedError();
+    this.#assertReservationBytes(maximumBytes);
+    if (maximumBytes < 1) throw new RangeError("Elastic reservation maximum must be positive");
+    const quantumBytes = options.quantumBytes ?? 1;
+    if (
+      !Number.isSafeInteger(quantumBytes) ||
+      quantumBytes < 1 ||
+      quantumBytes > maximumBytes
+    ) throw new RangeError("Elastic reservation quantum is outside its hard byte limit");
+    let reservedBytes = 0;
+    let closed = false;
+
+    const shrinkTo = (nextBytes: number) => {
+      const releasedBytes = reservedBytes - nextBytes;
+      if (releasedBytes <= 0) return;
+      reservedBytes = nextBytes;
+      this.#reservedBytes = Math.max(0, this.#reservedBytes - releasedBytes);
+      if (reservedBytes === 0) {
+        this.#activeByteLeases = Math.max(0, this.#activeByteLeases - 1);
+        if (this.#activeByteLeases === 0) this.#resetRssBaselineOnNextSample = true;
+      }
+      this.#drainBytes();
+    };
+
+    return {
+      maximumBytes,
+      get reservedBytes() {
+        return closed ? 0 : reservedBytes;
+      },
+      tryResize: (nextBytes: number) => {
+        if (!Number.isSafeInteger(nextBytes) || nextBytes < 0 || nextBytes > maximumBytes) {
+          throw new RangeError("Elastic reservation target is outside its hard byte limit");
+        }
+        if (closed) return nextBytes === 0;
+        const roundedBytes = nextBytes === 0
+          ? 0
+          : Math.min(
+              maximumBytes,
+              Math.ceil(nextBytes / quantumBytes) * quantumBytes,
+            );
+        if (roundedBytes === reservedBytes) return true;
+        if (roundedBytes < reservedBytes) {
+          // Retain at most one spare quantum so short-lived send-queue changes
+          // do not sample the host and resize global accounting for every SSE
+          // frame. Zero always releases the complete backing immediately.
+          if (
+            roundedBytes > 0 &&
+            reservedBytes - roundedBytes <= quantumBytes
+          ) return true;
+          shrinkTo(roundedBytes);
+          return true;
+        }
+
+        this.#refreshPressureWithoutDrain();
+        this.#rejectStaleByteWaiters();
+        const growth = roundedBytes - reservedBytes;
+        if (
+          this.#paused ||
+          this.#byteWaiters.length > 0 ||
+          this.#reservedBytes + growth > this.#sizing.reservationCapacityBytes
+        ) return false;
+
+        if (reservedBytes === 0) this.#activeByteLeases++;
+        reservedBytes = roundedBytes;
+        this.#reservedBytes += growth;
+        return true;
+      },
+      close: () => {
+        if (closed) return;
+        shrinkTo(0);
+        closed = true;
+      },
+    };
   }
 
   #tryGrant(reservedBytes: number): ResourceLease | null {

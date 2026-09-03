@@ -83,6 +83,13 @@ describe("FleetSampler", () => {
       clock,
       machineProbe,
       intervalMs: 5_000,
+      processMemoryPoolsSnapshot: () => ({
+        hostEventReservedBytes: 705 * 1024 ** 2,
+        responseGraphReservedBytes: 0,
+        responseGraphMaximumBytes: 512 * 1024 ** 2,
+        webSocketReservedBytes: 65 * 1024 ** 2,
+        webSocketMaximumBytes: 1280 * 1024 ** 2,
+      }),
       routerSnapshot: () => ({
         capacity: 512,
         active: 16,
@@ -302,6 +309,16 @@ describe("FleetSampler", () => {
     expect(event.resources).not.toHaveProperty("cpu_queued");
     expect((event.resources as any).fleet_transfer_reserved).toBe(4);
     expect((event.resources as any).fleet_transfer_budget).toBe(4);
+    expect((event.resources as any).reservation_headroom_bytes).toBe(
+      12 * 1024 ** 3 - 256 * 1024 ** 2,
+    );
+    expect((event.resources as any).process_pools).toEqual({
+      host_event_reserved_bytes: 705 * 1024 ** 2,
+      response_graph_reserved_bytes: 0,
+      response_graph_maximum_bytes: 512 * 1024 ** 2,
+      websocket_reserved_bytes: 65 * 1024 ** 2,
+      websocket_maximum_bytes: 1280 * 1024 ** 2,
+    });
     expect((event.resources as any).event_memory).toMatchObject({
       ordinary_capacity_bytes: 64 * 1024 ** 2,
       ordinary_used_bytes: 2 * 1024 ** 2,

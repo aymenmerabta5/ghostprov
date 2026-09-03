@@ -9,6 +9,10 @@ import {
   main as freshFleetRecoveryMain,
   resolveFreshFleetRecoveryOptions,
 } from "../scripts/live_fresh_fleet_recovery";
+import {
+  main as memoryAccountingMain,
+  resolveLiveMemoryAccountingOptions,
+} from "../scripts/live_memory_accounting";
 
 const API_KEY = "test-ghostprov-key-0123456789abcdef";
 
@@ -18,6 +22,30 @@ describe("V2 live canary guards", () => {
     expect(typeof fleetMain).toBe("function");
     expect(typeof smokeMain).toBe("function");
     expect(typeof freshFleetRecoveryMain).toBe("function");
+    expect(typeof memoryAccountingMain).toBe("function");
+  });
+
+  it("hard-fences the memory proof to one throwaway project and candidate port", () => {
+    expect(() => resolveLiveMemoryAccountingOptions({})).toThrow(
+      "GP_LIVE_MEMORY_ACCOUNTING=1",
+    );
+    expect(() => resolveLiveMemoryAccountingOptions({
+      GP_LIVE_MEMORY_ACCOUNTING: "1",
+    })).toThrow("GP_LIVE_ALLOW_TEST_PROJECT_MUTATION=1");
+    expect(() => resolveLiveMemoryAccountingOptions({
+      GP_LIVE_MEMORY_ACCOUNTING: "1",
+      GP_LIVE_ALLOW_TEST_PROJECT_MUTATION: "1",
+      GHOSTPROV_API_KEY: API_KEY,
+      PRISM_COOKIE_FILE: "cookies.json",
+      PORT: "18787",
+    })).toThrow("protected service port 18787");
+    expect(resolveLiveMemoryAccountingOptions({
+      GP_LIVE_MEMORY_ACCOUNTING: "1",
+      GP_LIVE_ALLOW_TEST_PROJECT_MUTATION: "1",
+      GHOSTPROV_API_KEY: API_KEY,
+      PRISM_COOKIE_FILE: "cookies.json",
+      PORT: "18888",
+    })).toMatchObject({ port: 18_888, timeoutMs: 600_000 });
   });
 
   it("hard-fences the destructive fresh-fleet proof to dedicated projects and 18888", () => {

@@ -21,6 +21,7 @@ import {
   transferAtomicBytePermit,
 } from "../v2/memory/permit-carrier";
 import { jsonEncodedByteLengthAsync } from "../router/workload";
+import type { ElasticByteReservation } from "../core/elastic-byte-reservation";
 
 import {
   isAuthenticatedTenantScope,
@@ -68,6 +69,9 @@ export class WebSocketProcessBudget {
   #sessions = 0;
   #queuedBytes = 0;
   #ingressReservedBytes = 0;
+  #baseIngressReservedBytes = 0;
+  readonly #promotionHeadrooms = new Map<number, number>();
+  #backing: ElasticByteReservation | null = null;
 
   constructor(options: WebSocketProcessBudgetOptions) {
     this.#maxSessions = positiveInteger(options.maxSessions, "maxSessions");
@@ -79,6 +83,31 @@ export class WebSocketProcessBudget {
       options.maxIngressBytes ?? options.maxQueuedBytes,
       "maxIngressBytes",
     );
+  }
+
+  attachElasticBacking(backing: ElasticByteReservation): void {
+    if (this.#backing) throw new Error("WebSocket process budget already has elastic backing");
+    const maximumBytes = this.#maxQueuedBytes + this.#maxIngressBytes;
+    if (!Number.isSafeInteger(maximumBytes) || backing.maximumBytes < maximumBytes) {
+      throw new RangeError("WebSocket elastic backing is smaller than the process budget");
+    }
+    if (!backing.tryResize(this.#requiredBackingBytes())) {
+      throw new Error("WebSocket elastic backing cannot cover existing retained bytes");
+    }
+    this.#backing = backing;
+  }
+
+  detachElasticBacking(backing: ElasticByteReservation): void {
+    if (this.#backing !== backing) throw new Error("WebSocket elastic backing does not match");
+    if (
+      this.#sessions !== 0 ||
+      this.#queuedBytes !== 0 ||
+      this.#ingressReservedBytes !== 0 ||
+      this.#baseIngressReservedBytes !== 0 ||
+      this.#promotionHeadrooms.size !== 0
+    ) throw new Error("WebSocket elastic backing still owns retained bytes");
+    if (!backing.tryResize(0)) throw new Error("WebSocket elastic backing could not be released");
+    this.#backing = null;
   }
 
   openSession(
@@ -93,13 +122,27 @@ export class WebSocketProcessBudget {
       !Number.isSafeInteger(ingressHeadroomBytes) ||
       ingressHeadroomBytes < 0
     ) throw new RangeError("ingressHeadroomBytes must be a non-negative safe integer");
+    const nextIngressReservedBytes = this.#ingressReservedBytes + ingressReservationBytes;
+    const nextBaseIngressReservedBytes =
+      this.#baseIngressReservedBytes + ingressReservationBytes;
+    const nextPromotionHeadroomBytes = Math.max(
+      this.#maximumPromotionHeadroomBytes(),
+      ingressHeadroomBytes,
+    );
     if (
       this.#sessions >= this.#maxSessions ||
-      this.#ingressReservedBytes + ingressReservationBytes + ingressHeadroomBytes >
-        this.#maxIngressBytes
+      nextIngressReservedBytes + nextPromotionHeadroomBytes > this.#maxIngressBytes ||
+      !this.#tryResizeBacking(
+        this.#queuedBytes,
+        nextIngressReservedBytes,
+        nextBaseIngressReservedBytes,
+        nextPromotionHeadroomBytes,
+      )
     ) return null;
     this.#sessions++;
-    this.#ingressReservedBytes += ingressReservationBytes;
+    this.#ingressReservedBytes = nextIngressReservedBytes;
+    this.#baseIngressReservedBytes = nextBaseIngressReservedBytes;
+    this.#addPromotionHeadroom(ingressHeadroomBytes);
     let closed = false;
     let queuedReserved = 0;
     let dynamicIngressReserved = 0;
@@ -115,6 +158,12 @@ export class WebSocketProcessBudget {
       if (target <= dynamicIngressReserved) return true;
       const growth = target - dynamicIngressReserved;
       if (this.#ingressReservedBytes + growth > this.#maxIngressBytes) return false;
+      if (!this.#tryResizeBacking(
+        this.#queuedBytes,
+        this.#ingressReservedBytes + growth,
+        this.#baseIngressReservedBytes,
+        this.#maximumPromotionHeadroomBytes(),
+      )) return false;
       this.#ingressReservedBytes += growth;
       dynamicIngressReserved = target;
       return true;
@@ -124,6 +173,12 @@ export class WebSocketProcessBudget {
       tryReserve: bytes => {
         if (closed || !this.#canReserve(bytes)) return false;
         const value = Math.max(0, Math.floor(bytes));
+        if (!this.#tryResizeBacking(
+          this.#queuedBytes + value,
+          this.#ingressReservedBytes,
+          this.#baseIngressReservedBytes,
+          this.#maximumPromotionHeadroomBytes(),
+        )) return false;
         queuedReserved += value;
         this.#queuedBytes += value;
         return true;
@@ -133,6 +188,7 @@ export class WebSocketProcessBudget {
         const value = Math.min(queuedReserved, Math.max(0, Math.floor(bytes)));
         queuedReserved -= value;
         this.#queuedBytes = Math.max(0, this.#queuedBytes - value);
+        this.#releaseBackingToCurrentUsage();
       },
       tryEnsureIngress,
       releaseIngress: () => {
@@ -142,6 +198,7 @@ export class WebSocketProcessBudget {
           this.#ingressReservedBytes - dynamicIngressReserved,
         );
         dynamicIngressReserved = 0;
+        this.#releaseBackingToCurrentUsage();
       },
       close: () => {
         if (closed) return;
@@ -151,9 +208,15 @@ export class WebSocketProcessBudget {
           0,
           this.#ingressReservedBytes - ingressReservationBytes - dynamicIngressReserved,
         );
+        this.#baseIngressReservedBytes = Math.max(
+          0,
+          this.#baseIngressReservedBytes - ingressReservationBytes,
+        );
+        this.#removePromotionHeadroom(ingressHeadroomBytes);
         queuedReserved = 0;
         dynamicIngressReserved = 0;
         this.#sessions = Math.max(0, this.#sessions - 1);
+        this.#releaseBackingToCurrentUsage();
       },
     };
   }
@@ -172,6 +235,56 @@ export class WebSocketProcessBudget {
   #canReserve(bytes: number): boolean {
     return Number.isSafeInteger(bytes) && bytes >= 0 &&
       this.#queuedBytes + bytes <= this.#maxQueuedBytes;
+  }
+
+  #maximumPromotionHeadroomBytes(): number {
+    let maximum = 0;
+    for (const bytes of this.#promotionHeadrooms.keys()) maximum = Math.max(maximum, bytes);
+    return maximum;
+  }
+
+  #addPromotionHeadroom(bytes: number): void {
+    if (bytes === 0) return;
+    this.#promotionHeadrooms.set(bytes, (this.#promotionHeadrooms.get(bytes) ?? 0) + 1);
+  }
+
+  #removePromotionHeadroom(bytes: number): void {
+    if (bytes === 0) return;
+    const count = this.#promotionHeadrooms.get(bytes) ?? 0;
+    if (count <= 1) this.#promotionHeadrooms.delete(bytes);
+    else this.#promotionHeadrooms.set(bytes, count - 1);
+  }
+
+  #requiredBackingBytes(
+    queuedBytes = this.#queuedBytes,
+    ingressReservedBytes = this.#ingressReservedBytes,
+    baseIngressReservedBytes = this.#baseIngressReservedBytes,
+    promotionHeadroomBytes = this.#maximumPromotionHeadroomBytes(),
+  ): number {
+    return queuedBytes + Math.max(
+      ingressReservedBytes,
+      baseIngressReservedBytes + promotionHeadroomBytes,
+    );
+  }
+
+  #tryResizeBacking(
+    queuedBytes: number,
+    ingressReservedBytes: number,
+    baseIngressReservedBytes: number,
+    promotionHeadroomBytes: number,
+  ): boolean {
+    return this.#backing?.tryResize(this.#requiredBackingBytes(
+      queuedBytes,
+      ingressReservedBytes,
+      baseIngressReservedBytes,
+      promotionHeadroomBytes,
+    )) ?? true;
+  }
+
+  #releaseBackingToCurrentUsage(): void {
+    if (this.#backing && !this.#backing.tryResize(this.#requiredBackingBytes())) {
+      throw new Error("WebSocket elastic backing failed to shrink");
+    }
   }
 
 }

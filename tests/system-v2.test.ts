@@ -575,15 +575,13 @@ describe("V2 browserless system composition", () => {
       jumboCapacityBytes: system.config.v2HostEventMemory.jumboBytes,
       closed: false,
     });
-    expect(system.responseGraphMemory.reservedBytes)
+    expect(system.responseGraphMemory.maximumBytes)
       .toBe(system.responseGraphMemory.budget.limit);
+    expect(system.responseGraphMemory.reservedBytes).toBe(0);
+    expect(system.webSocketIngressMemory.reservedBytes).toBe(0);
     expect(system.responseGraphMemory.budget.used).toBe(0);
     expect(system.governor.snapshot().reservedBytes)
-      .toBeGreaterThanOrEqual(
-        system.hostEventMemory.reservedBytes +
-        system.responseGraphMemory.reservedBytes +
-        system.webSocketIngressMemory.reservedBytes,
-      );
+      .toBe(system.hostEventMemory.reservedBytes);
     value.factory.releaseAll();
     await system.fleet.waitForReady(4);
     expect(system.registry.readyRuntimes()).toHaveLength(4);

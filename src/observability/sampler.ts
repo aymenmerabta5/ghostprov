@@ -182,6 +182,13 @@ export interface FleetSamplerOptions {
   recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
   routerTrafficSnapshot?: () => RouterTrafficSnapshot;
   hostEventMemorySnapshot?: () => AtomicBytePermitPoolSnapshot;
+  processMemoryPoolsSnapshot?: () => {
+    hostEventReservedBytes: number;
+    responseGraphReservedBytes: number;
+    responseGraphMaximumBytes: number;
+    webSocketReservedBytes: number;
+    webSocketMaximumBytes: number;
+  };
   fleetSnapshot?: () => FleetSnapshot;
 }
 
@@ -199,6 +206,7 @@ export class FleetSampler {
   readonly #recoveryCircuitSnapshot?: () => FleetRecoverySnapshot;
   readonly #routerTrafficSnapshot?: () => RouterTrafficSnapshot;
   readonly #hostEventMemorySnapshot?: () => AtomicBytePermitPoolSnapshot;
+  readonly #processMemoryPoolsSnapshot?: FleetSamplerOptions["processMemoryPoolsSnapshot"];
   readonly #fleetSnapshot?: () => FleetSnapshot;
   #lastCpu: NodeJS.CpuUsage;
   #lastSampleAtMs: number;
@@ -223,6 +231,7 @@ export class FleetSampler {
     this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
     this.#routerTrafficSnapshot = options.routerTrafficSnapshot;
     this.#hostEventMemorySnapshot = options.hostEventMemorySnapshot;
+    this.#processMemoryPoolsSnapshot = options.processMemoryPoolsSnapshot;
     this.#fleetSnapshot = options.fleetSnapshot;
     this.#lastCpu = this.#cpuUsage();
     this.#lastSampleAtMs = this.#clock.now();
@@ -254,6 +263,10 @@ export class FleetSampler {
       const resources: JsonValue = {
         reserved_bytes: router.resources.reservedBytes,
         reservation_capacity_bytes: router.resources.reservationCapacityBytes,
+        reservation_headroom_bytes: Math.max(
+          0,
+          router.resources.reservationCapacityBytes - router.resources.reservedBytes,
+        ),
         memory_paused: router.resources.paused,
         governor_queued: router.resources.queued,
         transform_workers: transforms?.workers ?? router.resources.cpuTransformWorkers,
@@ -278,6 +291,18 @@ export class FleetSampler {
                 closed: value.closed,
               };
             })()
+          : null,
+        process_pools: this.#processMemoryPoolsSnapshot
+          ? (() => {
+            const value = this.#processMemoryPoolsSnapshot!();
+            return {
+              host_event_reserved_bytes: value.hostEventReservedBytes,
+              response_graph_reserved_bytes: value.responseGraphReservedBytes,
+              response_graph_maximum_bytes: value.responseGraphMaximumBytes,
+              websocket_reserved_bytes: value.webSocketReservedBytes,
+              websocket_maximum_bytes: value.webSocketMaximumBytes,
+            };
+          })()
           : null,
       };
       const runtimes: JsonValue = router.runtimes.map(runtime => {

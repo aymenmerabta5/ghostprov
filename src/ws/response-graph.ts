@@ -4,6 +4,7 @@ import {
   type AuthenticatedTenantScope,
 } from "../http/api-key";
 import { validateResponsesInputJson } from "../relay/responses-validation";
+import type { ElasticByteReservation } from "../core/elastic-byte-reservation";
 
 export interface ResponseCreateEvent {
   type: "response.create";
@@ -91,6 +92,7 @@ export class ResponseGraphCapacityError extends Error {
 
 export class SharedByteBudget {
   used = 0;
+  #backing: ElasticByteReservation | null = null;
 
   constructor(readonly limit: number) {
     if (!Number.isFinite(limit) || limit < 1) throw new RangeError("shared byte limit must be positive");
@@ -103,12 +105,34 @@ export class SharedByteBudget {
 
   reserve(bytes: number): boolean {
     if (!this.canReserve(bytes)) return false;
+    if (this.#backing && !this.#backing.tryResize(this.used + bytes)) return false;
     this.used += bytes;
     return true;
   }
 
   release(bytes: number): void {
     this.used = Math.max(0, this.used - bytes);
+    if (this.#backing && !this.#backing.tryResize(this.used)) {
+      throw new Error("Response graph elastic backing failed to shrink");
+    }
+  }
+
+  attachElasticBacking(backing: ElasticByteReservation): void {
+    if (this.#backing) throw new Error("Response graph budget already has elastic backing");
+    if (backing.maximumBytes < this.limit) {
+      throw new RangeError("Response graph elastic backing is smaller than its byte limit");
+    }
+    if (!backing.tryResize(this.used)) {
+      throw new Error("Response graph elastic backing cannot cover existing retained bytes");
+    }
+    this.#backing = backing;
+  }
+
+  detachElasticBacking(backing: ElasticByteReservation): void {
+    if (this.#backing !== backing) throw new Error("Response graph elastic backing does not match");
+    if (this.used !== 0) throw new Error("Response graph elastic backing still owns retained bytes");
+    if (!backing.tryResize(0)) throw new Error("Response graph elastic backing could not be released");
+    this.#backing = null;
   }
 }
 
