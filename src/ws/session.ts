@@ -1,7 +1,10 @@
 import type { WebSocket } from "ws";
 import type { RunHandle } from "../relay/run-handle";
 import { config } from "../config";
-import { normalizeApiError } from "../http/errors";
+import {
+  definitiveProviderRateLimitFailedEvent,
+  normalizeApiError,
+} from "../http/errors";
 import {
   PreviousResponseNotFoundError,
   ResponseGraph,
@@ -584,6 +587,14 @@ function normalizedErrorEvent(
   error: unknown,
   streamId?: string,
 ): Record<string, unknown> {
+  const retryableRateLimit = definitiveProviderRateLimitFailedEvent(error);
+  if (retryableRateLimit) {
+    return {
+      ...retryableRateLimit,
+      ...(streamId ? { stream_id: streamId } : {}),
+    };
+  }
+
   const normalized = normalizeApiError(error);
   return {
     type: "error",

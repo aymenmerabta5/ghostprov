@@ -1127,7 +1127,9 @@ describe("router HTTP composition", () => {
     expect((await response.text())).toContain("event: response.completed");
   });
 
-  it("keeps a provider SSE error exact after the successful prelude committed HTTP 200", async () => {
+  it("adapts a definitive provider rate limit to a retryable Responses SSE terminal", async () => {
+    const message = "Rate limit reached in organization org-Late123. " +
+      "Please try again in 136ms.";
     const providerError = await createProviderErrorEnvelope({
       origin: "sse",
       status: 429,
@@ -1135,7 +1137,7 @@ describe("router HTTP composition", () => {
       value: {
         type: "error",
         error: {
-          message: "Rate limit reached in organization org-Late123",
+          message,
           type: "rate_limit_error",
           param: null,
           code: "rate_limit_exceeded",
@@ -1186,10 +1188,14 @@ describe("router HTTP composition", () => {
         delta: "valid prefix",
       }),
     });
-    expect(frames[1]!.event).toBe("error");
+    expect(frames[1]!.event).toBe("response.failed");
     expect(JSON.parse(frames[1]!.data)).toEqual({
-      type: "error",
-      error: providerError.error,
+      type: "response.failed",
+      status: 429,
+      response: {
+        status: "failed",
+        error: providerError.error,
+      },
     });
   });
 

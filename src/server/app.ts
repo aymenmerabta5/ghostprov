@@ -738,7 +738,12 @@ function responseEventStream(
   ): void => {
     if (finished || cancelled) return;
     try {
-      controller.enqueue(encoder.encode(sseFrame("error", apiErrorEvent(error))));
+      const payload = apiErrorEvent(error);
+      const event = payload !== null && typeof payload === "object" &&
+          !Array.isArray(payload) && payload.type === "response.failed"
+        ? "response.failed"
+        : "error";
+      controller.enqueue(encoder.encode(sseFrame(event, payload)));
     } finally {
       discardAndReturnIterator();
       finish(controller);

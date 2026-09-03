@@ -1971,6 +1971,11 @@ describe("Responses WebSocket server", () => {
       origin: "sse",
       status: 429,
       model: "gpt-5.6-sol",
+      headers: new Headers({
+        "retry-after": "0.914",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_websocket_rate_limit",
+      }),
       value: {
         type: "rate_limit_error",
         message: rateMessage,
@@ -1979,7 +1984,13 @@ describe("Responses WebSocket server", () => {
       },
     });
     const failures = [
-      Object.assign(new Error(rateMessage), { providerError }),
+      new V2CommittedError(
+        rateMessage,
+        "rate_limit_exceeded",
+        false,
+        { retryAfterMs: 914, remainingTokens: 0 },
+        providerError,
+      ),
       new ApiError(401, "The upstream session is not authorized", {
         type: "authentication_error",
         param: null,
@@ -2000,17 +2011,28 @@ describe("Responses WebSocket server", () => {
       }));
     }
 
-    await waitFor(() => messages.filter(message => message.type === "error").length === 2);
+    await waitFor(() => messages.length === 2);
     expect(messages.find(message => message.stream_id === "limited")).toMatchObject({
+      type: "response.failed",
       status: 429,
-      error: {
-        message: rateMessage,
-        type: "rate_limit_error",
-        param: "input",
-        code: "rate_limit_exceeded",
+      headers: {
+        "retry-after": "0.914",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_websocket_rate_limit",
+      },
+      response: {
+        status: "failed",
+        error: {
+          message: rateMessage,
+          type: "rate_limit_error",
+          param: "input",
+          code: "rate_limit_exceeded",
+        },
       },
     });
+    expect(messages.find(message => message.stream_id === "limited").error).toBeUndefined();
     expect(messages.find(message => message.stream_id === "unauthorized")).toMatchObject({
+      type: "error",
       status: 401,
       error: {
         message: "The upstream session is not authorized",
@@ -2021,6 +2043,17 @@ describe("Responses WebSocket server", () => {
   });
 
   it("delivers an accepted prefix before a definitive provider error", async () => {
+    const message = "Rate limit reached. Please try again in 136ms.";
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      value: {
+        type: "rate_limit_error",
+        message,
+        param: null,
+        code: "rate_limit_exceeded",
+      },
+    });
     const relay = new V2RunHandle({ maxBufferedBytes: 4_096 });
     let started = false;
     const socket = await startServer(async () => {
@@ -2044,22 +2077,97 @@ describe("Responses WebSocket server", () => {
       }),
     });
     relay.fail(new V2CommittedError(
-      "provider rate limit",
+      message,
       "rate_limit_exceeded",
       false,
+      { retryAfterMs: 136 },
+      providerError,
     ));
 
-    await waitFor(() => messages.some(message => message.type === "error"));
+    await waitFor(() => messages.some(message => message.type === "response.failed"));
     expect(messages.map(message => message.type)).toEqual([
       "response.output_text.delta",
-      "error",
+      "response.failed",
     ]);
     expect(messages[0]).toMatchObject({ stream_id: "prefix", delta: "valid prefix" });
     expect(messages[1]).toMatchObject({
+      type: "response.failed",
       status: 429,
       stream_id: "prefix",
-      error: { code: "rate_limit_exceeded" },
+      response: {
+        status: "failed",
+        error: { code: "rate_limit_exceeded", message },
+      },
     });
+  });
+
+  it("does not advertise ambiguous or quota 429 failures as retryable Responses terminals", async () => {
+    const temporary = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      value: {
+        type: "rate_limit_error",
+        message: "Rate limit reached. Please try again in 136ms.",
+        param: null,
+        code: "rate_limit_exceeded",
+      },
+    });
+    const quota = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      value: {
+        type: "insufficient_quota",
+        message: "Quota is exhausted",
+        param: null,
+        code: "insufficient_quota",
+      },
+    });
+    const failures = [
+      new V2CommittedError(
+        temporary.error.message,
+        "rate_limit_exceeded",
+        true,
+        { retryAfterMs: 136 },
+        temporary,
+      ),
+      new V2CommittedError(
+        quota.error.message,
+        "insufficient_quota",
+        false,
+        undefined,
+        quota,
+      ),
+    ];
+    const socket = await startServer(async () => relayHandle(
+      Promise.reject(failures.shift()!),
+    ));
+    const messages = collect(socket);
+    for (const stream_id of ["ambiguous", "quota"]) {
+      socket.send(JSON.stringify({
+        type: "response.create",
+        stream_id,
+        model: "gpt-5.6-sol",
+        store: true,
+        input: stream_id,
+      }));
+    }
+
+    await waitFor(() => messages.length === 2);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "error",
+        status: 429,
+        stream_id: "ambiguous",
+        error: expect.objectContaining({ code: "rate_limit_exceeded" }),
+      }),
+      expect.objectContaining({
+        type: "error",
+        status: 429,
+        stream_id: "quota",
+        error: expect.objectContaining({ code: "insufficient_quota" }),
+      }),
+    ]));
+    expect(messages.some(message => message.type === "response.failed")).toBe(false);
   });
 
   it("maps router queue pressure to a WebSocket 503 overload", async () => {

@@ -25,7 +25,7 @@ import {
   ResponseProvenanceScopeError,
 } from "../src/router/provenance";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
-import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 
 describe("OpenAI-compatible HTTP errors", () => {
   it("maps deterministic V2 request overflow to an immediate 413", () => {
@@ -327,6 +327,78 @@ describe("OpenAI-compatible HTTP errors", () => {
         code: "rate_limit_exceeded",
       },
     });
+  });
+
+  it("uses the Codex-retryable Responses terminal only for a definitive temporary provider limit", async () => {
+    const message = "Rate limit reached for gpt-5.6-sol on tokens per min (TPM). " +
+      "Please try again in 914ms.";
+    const providerError = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      headers: new Headers({
+        "retry-after": "0.914",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_retryable_rate_limit",
+      }),
+      value: {
+        type: "error",
+        message,
+        param: "input",
+        code: "rate_limit_exceeded",
+      },
+    });
+    const definitive = new V2CommittedError(
+      message,
+      "rate_limit_exceeded",
+      false,
+      { retryAfterMs: 914, remainingTokens: 0 },
+      providerError,
+    );
+
+    expect(apiErrorEvent(definitive)).toEqual({
+      type: "response.failed",
+      status: 429,
+      headers: {
+        "retry-after": "0.914",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-request-id": "req_retryable_rate_limit",
+      },
+      response: {
+        status: "failed",
+        error: {
+          message,
+          type: "error",
+          param: "input",
+          code: "rate_limit_exceeded",
+        },
+      },
+    });
+
+    expect(apiErrorEvent(new V2CommittedError(
+      message,
+      "rate_limit_exceeded",
+      true,
+      { retryAfterMs: 914 },
+      providerError,
+    ))).toMatchObject({ type: "error", code: "rate_limit_exceeded" });
+
+    const quota = await createProviderErrorEnvelope({
+      origin: "sse",
+      status: 429,
+      value: {
+        type: "insufficient_quota",
+        message: "Quota is exhausted",
+        param: null,
+        code: "insufficient_quota",
+      },
+    });
+    expect(apiErrorEvent(new V2CommittedError(
+      quota.error.message,
+      "insufficient_quota",
+      false,
+      undefined,
+      quota,
+    ))).toMatchObject({ type: "insufficient_quota", code: "insufficient_quota" });
   });
 
   it("replays the safe original SSE error data rather than a generic 500", async () => {

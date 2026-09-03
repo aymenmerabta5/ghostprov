@@ -387,6 +387,46 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
   }
 }
 
+/**
+ * Adapt only a durably proven temporary provider rate limit into the canonical
+ * Responses failed-terminal shape. A client such as Codex treats a top-level
+ * WebSocket `type:error,status:429` as an already-exhausted HTTP retry limit,
+ * while `response.failed` with `rate_limit_exceeded` enters its stream retry
+ * policy. Generic, ambiguous, quota, billing, and local 429s must not cross
+ * this boundary as retryable provider terminals.
+ */
+export function definitiveProviderRateLimitFailedEvent(
+  error: unknown,
+): Record<string, unknown> | null {
+  const candidate = record(error);
+  if (candidate?.committed !== true || candidate.ambiguous !== false) return null;
+
+  const providerError = providerErrorEnvelopeFrom(error);
+  if (
+    !providerError ||
+    providerError.status !== 429 ||
+    providerError.error.code !== "rate_limit_exceeded"
+  ) return null;
+
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(providerError.headers)) {
+    if (value !== undefined) headers[name] = value;
+  }
+  if (providerError.upstreamRequestId) {
+    headers["x-request-id"] = providerError.upstreamRequestId;
+  }
+
+  return {
+    type: "response.failed",
+    status: providerError.status,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    response: {
+      status: "failed",
+      error: { ...providerError.error },
+    },
+  };
+}
+
 export function apiErrorResponse(error: unknown): Response {
   const normalized = normalizeApiError(error);
   const metadata = rateLimitMetadata(error);
@@ -436,6 +476,9 @@ export function apiErrorResponse(error: unknown): Response {
 }
 
 export function apiErrorEvent(error: unknown): Record<string, unknown> | string {
+  const retryableRateLimit = definitiveProviderRateLimitFailedEvent(error);
+  if (retryableRateLimit) return retryableRateLimit;
+
   const normalized = normalizeApiError(error);
   if (normalized.providerError) {
     const original = providerErrorPayloadJson(normalized.providerError);
