@@ -35,6 +35,7 @@ import type {
   V2TransportSession,
   V2TransportSnapshot,
 } from "./transport/session";
+import type { V2TransportDiagnostics } from "./diagnostics/types";
 import { V2PreCommitError } from "./transport/run-handle";
 import {
   DecayingRuntimeFailureScore,
@@ -70,6 +71,34 @@ function shouldQuarantineSandboxSession(error: unknown): boolean {
   return value.kind === "heartbeat_unreachable" ||
     value.kind === "sidecar_unreachable" ||
     value.kind === "ambiguity_exhausted";
+}
+
+function reliableTransportStalled(
+  diagnostics: V2TransportDiagnostics | undefined,
+  thresholdMs: number,
+): boolean {
+  if (!diagnostics) return false;
+  const windowStalled = diagnostics.windowFrames > 0 &&
+    diagnostics.ackProgressAgeMs >= thresholdMs;
+  const schedulerStalled = diagnostics.schedulerFrames > 0 &&
+    diagnostics.oldestQueuedFrameMs >= thresholdMs &&
+    (
+      diagnostics.windowFrames === 0 ||
+      diagnostics.ackProgressAgeMs >= thresholdMs
+    );
+  return windowStalled || schedulerStalled;
+}
+
+class V2SidecarRecoveryPreflightUnavailableError extends Error {
+  readonly name = "V2SidecarRecoveryPreflightUnavailableError";
+
+  constructor(cause?: unknown) {
+    super("V2 sidecar recovery preflight is temporarily unavailable", { cause });
+  }
+}
+
+function transientRecoveryPreflightStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
 }
 
 export interface V2RuntimeProvisioning {
@@ -755,6 +784,20 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             this.#emit();
             return;
           }
+          if (
+            this.#state === "ready" &&
+            transport?.connected === true &&
+            this.#sidecarSuspect &&
+            this.#sidecarLoop !== null
+          ) {
+            // The exact-sidecar monitor has already removed this runtime from
+            // routing and owns a bounded same-session recovery. Do not let a
+            // correlated Prism heartbeat outage abort that safer recovery and
+            // force a whole sandbox generation replacement.
+            this.#runtimeHealth.record("unhealthy");
+            this.#emit();
+            return;
+          }
           this.#failGeneration(
             generation,
             new V2RuntimeLifecycleFailure("heartbeat_unreachable", status),
@@ -924,6 +967,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     let monitoredTransport = transport;
     let consecutiveFailures = 0;
     let consecutiveReliableStalls = 0;
+    let recheckSourceBeforeRelaunch = false;
     let deadline = this.#clock.now() + this.#sidecarProbePeriodMs;
     const recover = async (): Promise<boolean> => {
       try {
@@ -931,7 +975,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           generation,
           monitoredTransport,
           signal,
+          recheckSourceBeforeRelaunch,
         );
+        recheckSourceBeforeRelaunch = false;
         consecutiveFailures = 0;
         consecutiveReliableStalls = 0;
         this.#sidecarSuspect = false;
@@ -939,6 +985,19 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         return true;
       } catch (relaunchError) {
         if (signal.aborted || generation !== this.#generation) return false;
+        if (relaunchError instanceof V2SidecarRecoveryPreflightUnavailableError) {
+          // No suspension, retirement, or replacement launch occurred. Keep
+          // the exact source binding fail-closed and retry its liveness on the
+          // normal cadence instead of escalating a common network outage into
+          // destructive fleet-wide generation churn.
+          consecutiveFailures = 0;
+          consecutiveReliableStalls = 0;
+          recheckSourceBeforeRelaunch = true;
+          this.#sidecarSuspect = true;
+          this.#runtimeHealth.record("unhealthy");
+          this.#emit();
+          return true;
+        }
         this.#failGeneration(
           generation,
           new V2RuntimeLifecycleFailure("sidecar_unreachable", null, {
@@ -959,15 +1018,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       let reliableStallReady = false;
       try {
         const diagnostics = monitoredTransport.snapshot().diagnostics?.host;
-        const windowStalled = !!diagnostics && diagnostics.windowFrames > 0 &&
-          diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs;
-        const schedulerStalled = !!diagnostics && diagnostics.schedulerFrames > 0 &&
-          diagnostics.oldestQueuedFrameMs >= this.#sidecarCommitStallMs &&
-          (
-            diagnostics.windowFrames === 0 ||
-            diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs
-          );
-        if (windowStalled || schedulerStalled) {
+        if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs)) {
           consecutiveReliableStalls++;
           if (!this.#sidecarSuspect) {
             this.#sidecarSuspect = true;
@@ -1049,6 +1100,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     generation: number,
     sourceTransport: V2RuntimeTransport,
     parentSignal: AbortSignal,
+    recheckSourceBeforeRelaunch: boolean,
   ): Promise<V2RuntimeTransport> {
     if (this.#sidecarRelaunching) return this.#sidecarRelaunching;
     const controller = new AbortController();
@@ -1066,6 +1118,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       generation,
       sourceTransport,
       controller.signal,
+      recheckSourceBeforeRelaunch,
     ).finally(() => {
       timeoutController.abort();
       parentSignal.removeEventListener("abort", forwardAbort);
@@ -1079,6 +1132,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     generation: number,
     sourceTransport: V2RuntimeTransport,
     signal: AbortSignal,
+    recheckSourceBeforeRelaunch: boolean,
   ): Promise<V2RuntimeTransport> {
     const binding = this.#binding;
     const gateway = this.#gateway;
@@ -1112,6 +1166,15 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       const rotation = this.#ySweetRotation;
       if (rotation) await this.#abortable(rotation, signal);
       this.#assertSidecarRelaunchCurrent(context, signal);
+
+      if (
+        recheckSourceBeforeRelaunch &&
+        await this.#sourceTransportRecovered(sourceTransport, signal)
+      ) {
+        this.#assertSidecarRelaunchCurrent(context, signal);
+        if (this.#sidecarRelaunchContext === context) this.#sidecarRelaunchContext = null;
+        return sourceTransport;
+      }
 
       context.capsule = await sourceTransport.suspendSidecarRecovery(
         "same-session-sidecar-relaunch",
@@ -1204,13 +1267,41 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }
   }
 
+  async #sourceTransportRecovered(
+    transport: V2RuntimeTransport,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!transport.probeLiveness) return false;
+    try {
+      const diagnostics = transport.snapshot().diagnostics?.host;
+      if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs)) return false;
+      await transport.probeLiveness(signal);
+      return true;
+    } catch (error) {
+      if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+        throw error;
+      }
+      return false;
+    }
+  }
+
   async #proveSameSandboxSession(
     generation: number,
     sessionId: string,
     gateway: V2RuntimeGateway,
     signal: AbortSignal,
   ): Promise<void> {
-    let heartbeat = await this.#abortable(gateway.heartbeat(signal), signal);
+    const heartbeatOnce = async (): Promise<V2RuntimeHeartbeatResult> => {
+      try {
+        return await this.#abortable(gateway.heartbeat(signal), signal);
+      } catch (error) {
+        if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+          throw error;
+        }
+        throw new V2SidecarRecoveryPreflightUnavailableError(error);
+      }
+    };
+    let heartbeat = await heartbeatOnce();
     if (!heartbeat.ok && (heartbeat.status === 401 || heartbeat.status === 403)) {
       const refresh = this.#refreshSandboxAuthentication;
       if (!refresh || await refresh(heartbeat.status, signal) !== "retry") {
@@ -1219,9 +1310,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (generation !== this.#generation) {
         throw new DOMException("V2 sidecar recovery generation changed", "AbortError");
       }
-      heartbeat = await this.#abortable(gateway.heartbeat(signal), signal);
+      heartbeat = await heartbeatOnce();
     }
-    if (!heartbeat.ok) throw new Error("Sandbox heartbeat failed before sidecar recovery");
+    if (!heartbeat.ok) {
+      if (transientRecoveryPreflightStatus(heartbeat.status)) {
+        throw new V2SidecarRecoveryPreflightUnavailableError();
+      }
+      throw new Error("Sandbox heartbeat failed before sidecar recovery");
+    }
     if (heartbeat.sessionId !== sessionId) {
       throw new Error("Sandbox session changed before sidecar recovery");
     }

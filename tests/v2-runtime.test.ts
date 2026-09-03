@@ -366,7 +366,7 @@ function runtimeHarness(options: {
   recoveryAdoptPending?: boolean;
   recoveryBootstrapDelayMs?: number;
   recoveryConnectPending?: boolean;
-  gatewayHeartbeatOutcomes?: V2RuntimeHeartbeatResult[];
+  gatewayHeartbeatOutcomes?: Array<V2RuntimeHeartbeatResult | Error>;
   initialRotationPending?: boolean;
 } = {}) {
   const order: string[] = [];
@@ -504,7 +504,9 @@ function runtimeHarness(options: {
     createGateway: (_sandbox: ProvisionedSandbox) => ({
       heartbeat: async () => {
         gatewayHeartbeats++;
-        return heartbeatOutcomes.shift() ?? {
+        const outcome = heartbeatOutcomes.shift();
+        if (outcome instanceof Error) throw outcome;
+        return outcome ?? {
           ok: true,
           status: 200,
           durationMs: 1,
@@ -1190,6 +1192,259 @@ describe("V2SandboxRuntime", () => {
       },
     });
     expect(harness.transport.livenessProbes).toBe(6);
+    await harness.runtime.stop();
+  });
+
+  it("keeps transient Prism heartbeat loss from preempting same-session sidecar recovery", async () => {
+    const miss = () => new Error("sidecar pong timed out");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [
+        null,
+        miss(), miss(), miss(),
+        miss(), miss(), miss(),
+        null,
+      ],
+      gatewayHeartbeatOutcomes: [
+        new Error("Prism heartbeat transport unavailable"),
+        {
+          ok: true,
+          status: 200,
+          durationMs: 1,
+          sessionId: "sandbox-session-1",
+        },
+      ],
+    });
+    await harness.runtime.start();
+    const active = await harness.runtime.run({
+      model: "gpt-5.6-sol",
+      input: "retain one committed request through transient liveness loss",
+    });
+    expect(harness.transport.pending).toHaveLength(1);
+
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      availabilityReason: "sidecar_suspect",
+    });
+    harness.heartbeatUnreachable(503);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      failure: null,
+    });
+    expect(harness.sandboxFailures).toHaveLength(0);
+
+    await harness.clock.advanceBy(2_000);
+    await harness.clock.advanceBy(2_000);
+    for (let turn = 0; turn < 200 && harness.gatewayHeartbeats() < 1; turn++) {
+      await Promise.resolve();
+    }
+    for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+    expect(harness.gatewayHeartbeats()).toBe(1);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      availabilityReason: "sidecar_suspect",
+    });
+
+    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(2_000);
+    await harness.clock.advanceBy(2_000);
+    for (let turn = 0; turn < 200 && harness.runtime.snapshot().capacity === 0; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.gatewayHeartbeats()).toBe(2);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 128,
+      available: 127,
+      failure: null,
+    });
+    expect(harness.sandboxFailures).toHaveLength(0);
+    const final = {
+      id: "resp_recovered_without_replay",
+      status: "completed",
+      output: [],
+    };
+    harness.transport.pending[0]!.resolve(final);
+    await expect(active.final).resolves.toEqual(final);
+    expect(harness.transport.bodies).toHaveLength(1);
+    await harness.runtime.stop();
+  });
+
+  it("defers a transient HTTP recovery preflight before sidecar suspension", async () => {
+    const miss = () => new Error("sidecar pong timed out");
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, miss(), miss(), miss()],
+      gatewayHeartbeatOutcomes: [{
+        ok: false,
+        status: 503,
+        durationMs: 5_000,
+        sessionId: null,
+      }],
+    });
+    await harness.runtime.start();
+
+    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(2_000);
+    await harness.clock.advanceBy(2_000);
+    for (let turn = 0; turn < 200 && harness.gatewayHeartbeats() < 1; turn++) {
+      await Promise.resolve();
+    }
+    for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+
+    expect(harness.gatewayHeartbeats()).toBe(1);
+    expect(harness.transport.recoverySuspends).toBe(0);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      availabilityReason: "sidecar_suspect",
+      failure: null,
+    });
+    expect(harness.sandboxFailures).toHaveLength(0);
+    await harness.runtime.stop();
+  });
+
+  it("recovers an eight-runtime common transport outage without generation replacement", async () => {
+    const fleet = Array.from({ length: 8 }, () => {
+      const miss = () => new Error("sidecar pong timed out");
+      return runtimeHarness({
+        enableR2Recovery: true,
+        livenessOutcomes: [
+          null,
+          miss(), miss(), miss(),
+          miss(), miss(), miss(),
+          null,
+        ],
+        gatewayHeartbeatOutcomes: [
+          new Error("Prism heartbeat transport unavailable"),
+          {
+            ok: true,
+            status: 200,
+            durationMs: 1,
+            sessionId: "sandbox-session-1",
+          },
+        ],
+      });
+    });
+    await Promise.all(fleet.map(harness => harness.runtime.start()));
+
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(10_000)));
+    for (const harness of fleet) harness.heartbeatUnreachable(null);
+    expect(fleet.every(harness => (
+      harness.runtime.snapshot().state === "ready" &&
+      harness.runtime.snapshot().capacity === 0 &&
+      harness.runtime.snapshot().availabilityReason === "sidecar_suspect"
+    ))).toBe(true);
+
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(2_000)));
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(2_000)));
+    for (let turn = 0; turn < 250; turn++) await Promise.resolve();
+    expect(fleet.every(harness => (
+      harness.gatewayHeartbeats() === 1 &&
+      harness.runtime.snapshot().state === "ready" &&
+      harness.transport.recoverySuspends === 0 &&
+      harness.sandboxFailures.length === 0
+    ))).toBe(true);
+
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(10_000)));
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(2_000)));
+    await Promise.all(fleet.map(harness => harness.clock.advanceBy(2_000)));
+    for (let turn = 0; turn < 250 && fleet.some(harness => (
+      harness.runtime.snapshot().capacity === 0
+    )); turn++) await Promise.resolve();
+
+    expect(fleet.every(harness => (
+      harness.gatewayHeartbeats() === 2 &&
+      harness.transports.length === 1 &&
+      harness.transport.recoverySuspends === 0 &&
+      harness.runtime.snapshot().state === "ready" &&
+      harness.runtime.snapshot().capacity === 128 &&
+      harness.sandboxFailures.length === 0
+    ))).toBe(true);
+    await Promise.all(fleet.map(harness => harness.runtime.stop()));
+  });
+
+  it("never trusts a recovered heartbeat while the reliable request window is still stalled", async () => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+      gatewayHeartbeatOutcomes: [
+        new Error("Prism heartbeat transport unavailable"),
+        {
+          ok: true,
+          status: 200,
+          durationMs: 1,
+          sessionId: "sandbox-session-1",
+        },
+      ],
+    });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = {
+      host: stalledHostDiagnostics(),
+      sidecar: null,
+    };
+
+    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(2_000);
+    for (let turn = 0; turn < 250 && harness.gatewayHeartbeats() < 1; turn++) {
+      await Promise.resolve();
+    }
+    for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      availabilityReason: "sidecar_suspect",
+    });
+    expect(harness.transport.recoverySuspends).toBe(0);
+
+    await harness.clock.advanceBy(10_000);
+    await harness.clock.advanceBy(2_000);
+    for (let turn = 0; turn < 250 && harness.transports.length < 2; turn++) {
+      await Promise.resolve();
+    }
+    for (let turn = 0; turn < 250 && harness.runtime.snapshot().capacity === 0; turn++) {
+      await Promise.resolve();
+    }
+
+    expect(harness.transport.livenessProbes).toBe(1);
+    expect(harness.transport.recoverySuspends).toBe(1);
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 128,
+      failure: null,
+    });
+    await harness.runtime.stop();
+  });
+
+  it("still fails closed when a monitored sidecar disconnects during heartbeat loss", async () => {
+    const harness = runtimeHarness({
+      livenessOutcomes: [null, new Error("sidecar pong timed out")],
+    });
+    await harness.runtime.start();
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot().availabilityReason).toBe("sidecar_suspect");
+
+    harness.transport.snapshotValue.connected = false;
+    harness.heartbeatUnreachable(503);
+
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "failed",
+      capacity: 0,
+      transportConnected: false,
+      failure: { kind: "heartbeat_unreachable", status: 503 },
+    });
+    expect(harness.sandboxFailures).toHaveLength(1);
     await harness.runtime.stop();
   });
 
