@@ -266,7 +266,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   snapshot(): RoutableSandboxSnapshot {
     return {
       projectId: this.projectId,
-      releaseRevision: "r8",
+      releaseRevision: "r9",
       state: this.state,
       capacity: this.state === "ready" ? 128 : 0,
       active: 0,

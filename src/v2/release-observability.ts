@@ -1,7 +1,7 @@
 import { V2_SELECTABLE_RELEASE_IDENTITIES } from "./sidecar/assets";
 
 const SHA256 = /^[a-f0-9]{64}$/;
-const RELEASE_REVISIONS = new Set(["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"]);
+const RELEASE_REVISIONS = new Set(["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"]);
 const PROTOCOL_REVISIONS = new Set(["r1", "r2"]);
 const MAX_RELEASE_SELECTIONS = 256;
 const EXACT_RELEASE_IDENTITIES = new Set(
@@ -11,7 +11,7 @@ const EXACT_RELEASE_IDENTITIES = new Set(
 );
 
 export interface SafeV2ReleaseIdentity {
-  releaseRevision: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8";
+  releaseRevision: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8" | "r9";
   protocolRevision: "r1" | "r2";
   buildHash: string;
   schemaHash: string;
@@ -53,7 +53,7 @@ export function safeV2ReleaseIdentity(value: unknown): SafeV2ReleaseIdentity | n
     )
   ) return null;
   return Object.freeze({
-    releaseRevision: raw.releaseRevision as "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8",
+    releaseRevision: raw.releaseRevision as "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8" | "r9",
     protocolRevision: raw.protocolRevision as "r1" | "r2",
     buildHash: raw.buildHash,
     schemaHash: raw.schemaHash,

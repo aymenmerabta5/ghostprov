@@ -10,6 +10,7 @@ import {
   V2_R6,
   V2_R7,
   V2_R8,
+  V2_R9,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "./assets";
@@ -202,7 +203,7 @@ export interface BundledV2SidecarRevisionSelectorOptions {
   readonly allowUnlistedProjects?: boolean;
 }
 
-/** Production registry with immutable R8 and explicit prior-release rollback. */
+/** Production registry with sandbox-relay R9 default and explicit prior-release rollback. */
 export function createBundledV2SidecarRevisionSelector(
   options: BundledV2SidecarRevisionSelectorOptions,
 ): V2SidecarRevisionSelector<V2SidecarRevision, V2SidecarAssets> {
@@ -215,6 +216,7 @@ export function createBundledV2SidecarRevisionSelector(
     [V2_R6, () => loadV2SidecarAssets({ revision: V2_R6 })],
     [V2_R7, () => loadV2SidecarAssets({ revision: V2_R7 })],
     [V2_R8, () => loadV2SidecarAssets({ revision: V2_R8 })],
+    [V2_R9, () => loadV2SidecarAssets({ revision: V2_R9 })],
   ]);
   return new V2SidecarRevisionSelector({
     projectIds: options.projectIds,

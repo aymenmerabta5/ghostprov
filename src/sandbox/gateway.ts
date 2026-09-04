@@ -2,6 +2,8 @@ import {
   boundedAccountRequest,
   type AccountRequestClient,
 } from "../prism/provisioning-client";
+import { CodexExecError, runCodexCommand } from "../prism/codex-exec";
+import { RELAY_LAUNCH_PATH } from "../v2/bootstrap/relay-launcher";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { ProjectId } from "./types";
@@ -14,6 +16,10 @@ export interface SandboxGatewayOptions {
   syncBatchMs?: number;
   requestTimeoutMs?: number;
   responseBodyLimitBytes?: number;
+  /** Maximum Codex status polls per relay exec (default 18, roughly 90 s). */
+  relayExecMaxPolls?: number;
+  /** Delay between Codex status polls (default 5 s). */
+  relayExecPollIntervalMs?: number;
 }
 
 export interface HeartbeatResult {
@@ -53,6 +59,8 @@ export class SandboxGateway {
   readonly #responseBodyLimitBytes: number;
   #sandbox: ProvisionedSandbox;
   #effectiveSessionId: string | null;
+  #relayExecMaxPolls: number;
+  #relayExecPollIntervalMs: number;
   #cacheBust = 0;
   #syncRequestedEpoch = 0;
   #syncCompletedEpoch = 0;
@@ -67,6 +75,8 @@ export class SandboxGateway {
     this.#syncBatchMs = options.syncBatchMs ?? 5;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
     this.#responseBodyLimitBytes = options.responseBodyLimitBytes ?? 8 * 1024 * 1024;
+    this.#relayExecMaxPolls = options.relayExecMaxPolls ?? 18;
+    this.#relayExecPollIntervalMs = options.relayExecPollIntervalMs ?? 5_000;
     if (!Number.isFinite(this.#syncBatchMs) || this.#syncBatchMs < 0 || this.#syncBatchMs > 1_000) {
       throw new RangeError("syncBatchMs must be between 0 and 1000");
     }
@@ -75,6 +85,12 @@ export class SandboxGateway {
     }
     if (!Number.isSafeInteger(this.#responseBodyLimitBytes) || this.#responseBodyLimitBytes < 1) {
       throw new RangeError("responseBodyLimitBytes must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.#relayExecMaxPolls) || this.#relayExecMaxPolls < 1 || this.#relayExecMaxPolls > 64) {
+      throw new RangeError("relayExecMaxPolls must be an integer from 1 through 64");
+    }
+    if (!Number.isSafeInteger(this.#relayExecPollIntervalMs) || this.#relayExecPollIntervalMs < 1 || this.#relayExecPollIntervalMs > 30_000) {
+      throw new RangeError("relayExecPollIntervalMs must be an integer from 1 through 30000");
     }
   }
 
@@ -185,6 +201,38 @@ export class SandboxGateway {
     }, false);
     if (response.status !== 202) {
       throw new SandboxGatewayError(`Render returned ${response.status}`, response.status, "render");
+    }
+  }
+
+  /**
+   * Relay-mode hello acquisition: executes the staged relay launcher inside
+   * the sandbox container through one platform Codex turn and returns the
+   * launcher's printed transcript. The caller extracts and validates the
+   * hello block. Bounded to roughly 90 seconds; at most one turn per call.
+   */
+  async runRelayExec(signal?: AbortSignal): Promise<{ status: number; output: string }> {
+    const sandbox = this.#sandbox;
+    try {
+      const result = await runCodexCommand({
+        account: this.#account,
+        projectId: this.projectId,
+        sandboxUrl: sandbox.url,
+        sandboxToken: sandbox.token.reveal(),
+        command: `Execute exactly this shell command and reply with ONLY its complete stdout verbatim: sh /workspace/${RELAY_LAUNCH_PATH}`,
+        maxPolls: this.#relayExecMaxPolls,
+        pollIntervalMs: this.#relayExecPollIntervalMs,
+        signal,
+      });
+      return { status: 200, output: result.transcript };
+    } catch (error) {
+      if (error instanceof CodexExecError) {
+        throw new SandboxGatewayError(
+          `Relay exec ${error.kind}`,
+          error.status ?? (error.kind === "timeout" ? 408 : 502),
+          "relay-exec",
+        );
+      }
+      throw error;
     }
   }
 

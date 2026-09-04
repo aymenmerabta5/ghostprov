@@ -503,4 +503,68 @@ describe("SandboxGateway", () => {
     await new Promise<void>(resolve => setTimeout(resolve, 20));
     expect(requestSignal.aborted).toBe(true);
   });
+
+  it("validates relay exec budgets at construction", async () => {
+    const account = new FakeAccount(() => Response.json({ ok: true }));
+    expect(() => new SandboxGateway({
+      projectId: PROJECT, account, sandbox: SANDBOX, relayExecMaxPolls: 0,
+    })).toThrow(/relayExecMaxPolls/);
+    expect(() => new SandboxGateway({
+      projectId: PROJECT, account, sandbox: SANDBOX, relayExecPollIntervalMs: 31_000,
+    })).toThrow(/relayExecPollIntervalMs/);
+  });
+
+  it("runs the staged relay launcher through one Codex turn", async () => {
+    const account = new FakeAccount((path: string) => {
+      if (path === "/api/llm/response_with_tools_start") {
+        return Response.json({ status: "started", request_id: "req-9", turn_state: { version: 1 } });
+      }
+      return Response.json({
+        status: "completed",
+        request_id: "req-9",
+        codex_live_progress: {
+          eventPreviews: [{
+            summary: "message",
+            raw: JSON.stringify({
+              type: "response_item",
+              payload: {
+                type: "message",
+                content: [{ type: "output_text", text: "HELLO-BEGIN\nGPV2_BOOTSTRAP abc123\nHELLO-END" }],
+              },
+            }),
+          }],
+        },
+      });
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      relayExecPollIntervalMs: 1,
+    });
+
+    const result = await gateway.runRelayExec();
+
+    expect(result).toMatchObject({ status: 200 });
+    expect(result.output).toContain("GPV2_BOOTSTRAP abc123");
+    const start = account.calls.find(call => call.path === "/api/llm/response_with_tools_start")!;
+    expect(start.method).toBe("POST");
+    const metadata = (start.json as Record<string, unknown>).metadata as Record<string, unknown>;
+    expect(metadata).toMatchObject({ projectId: PROJECT });
+    const input = (start.json as Record<string, unknown>).input as Array<Record<string, unknown>>;
+    const text = (((input[0]!.content as Array<Record<string, unknown>>)[0]!).text as string);
+    expect(text).toContain("sh /workspace/.ghostprov-v2/relay/bootstrap-launch.sh");
+  });
+
+  it("maps Codex exec failures to bounded gateway errors", async () => {
+    const denied = new FakeAccount(() => Response.json({ error: "no" }, { status: 401 }));
+    const deniedGateway = new SandboxGateway({ projectId: PROJECT, account: denied, sandbox: SANDBOX });
+    await expect(deniedGateway.runRelayExec()).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
+
+    const hanging = new FakeAccount(() => Response.json({ status: "started", request_id: "req-9", turn_state: { version: 1 } }));
+    const hangingGateway = new SandboxGateway({
+      projectId: PROJECT, account: hanging, sandbox: SANDBOX, relayExecMaxPolls: 1, relayExecPollIntervalMs: 1,
+    });
+    await expect(hangingGateway.runRelayExec()).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
+  });
 });

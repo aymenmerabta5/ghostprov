@@ -57,8 +57,12 @@ export interface MultiSandboxConfig {
   v2DiagnosticsEnabled: boolean;
   v2DiagnosticsIntervalMs: number;
   v2BatchingEnabled: boolean;
-  /** Process-wide immutable sidecar release. R8 is normal operation; prior releases are rollback. */
+  /** Process-wide immutable sidecar release. R9 is normal operation; prior releases are rollback. */
   v2SidecarRevision: V2SidecarRevision;
+  /** Bootstrap launch transport. Relay stages a sandbox-container launcher; render forks from the render VM. */
+  v2BootstrapLaunchMode: "render" | "relay";
+  /** Phase-zero credential wait published into the sidecar static config. */
+  v2BootstrapTimeoutMs: number;
   /** Exact persisted-project overrides only; no prefix, cohort, or fallback matching. */
   v2SidecarProjectRevisions: Readonly<Record<string, V2SidecarRevision>>;
   desiredSandboxes: number;
@@ -69,6 +73,12 @@ export interface MultiSandboxConfig {
   fleetManifestFile: string | null;
   /** Repeated identical project-local failures required before replacement. */
   projectReplacementFailureThreshold: number;
+  /**
+   * Per-generation startup budget (provision + bootstrap). Slow relay
+   * bootstraps may need more than the historical 120 s; steady-state request
+   * deadlines are separate and unaffected.
+   */
+  sandboxStartupTimeoutMs: number;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -118,7 +128,7 @@ function v2SidecarProjectRevisions(
       separator === entry.length - 1
     ) {
       throw new TypeError(
-        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3|r4|r5|r6|r7|r8 entries",
+        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3|r4|r5|r6|r7|r8|r9 entries",
       );
     }
     const rawProjectId = entry.slice(0, separator).trim();
@@ -324,6 +334,15 @@ export function resolveMultiSandboxConfig(
   const v2SidecarRevisionOverrides = v2SidecarProjectRevisions(
     env.GP_V2_SIDECAR_PROJECT_REVISIONS,
   );
+  const v2BootstrapLaunchMode = enumValue(
+    env.GP_V2_BOOTSTRAP_LAUNCH_MODE,
+    "relay",
+    ["render", "relay"] as const,
+    "GP_V2_BOOTSTRAP_LAUNCH_MODE",
+  );
+  const v2BootstrapTimeoutMs = boundedPositiveInteger(
+    env.GP_V2_BOOTSTRAP_TIMEOUT_MS, 300_000, "GP_V2_BOOTSTRAP_TIMEOUT_MS", 30_000, 600_000,
+  );
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );
@@ -337,6 +356,9 @@ export function resolveMultiSandboxConfig(
     "GP_COLD_START_CONCURRENCY",
     1,
     provisionConcurrency,
+  );
+  const sandboxStartupTimeoutMs = boundedPositiveInteger(
+    env.GP_SANDBOX_STARTUP_TIMEOUT_MS, 120_000, "GP_SANDBOX_STARTUP_TIMEOUT_MS", 120_000, 1_800_000,
   );
   const v2HostEventMemory = deriveV2HostEventMemorySizing({
     responseMaxBytes: v2ResponseMaxBytes,
@@ -373,6 +395,9 @@ export function resolveMultiSandboxConfig(
     v2BatchingEnabled,
     v2SidecarRevision,
     v2SidecarProjectRevisions: v2SidecarRevisionOverrides,
+    v2BootstrapLaunchMode,
+    v2BootstrapTimeoutMs,
+    sandboxStartupTimeoutMs,
     desiredSandboxes,
     provisionConcurrency,
     coldStartConcurrency,

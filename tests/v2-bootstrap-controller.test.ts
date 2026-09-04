@@ -40,6 +40,7 @@ const R5_ASSETS = await loadV2SidecarAssets({ revision: "r5" });
 const R6_ASSETS = await loadV2SidecarAssets({ revision: "r6" });
 const R7_ASSETS = await loadV2SidecarAssets({ revision: "r7" });
 const R8_ASSETS = await loadV2SidecarAssets({ revision: "r8" });
+const R9_ASSETS = await loadV2SidecarAssets({ revision: "r9" });
 const RELEASE_ASSETS = Object.freeze([
   ASSETS,
   R2_ASSETS,
@@ -49,6 +50,7 @@ const RELEASE_ASSETS = Object.freeze([
   R6_ASSETS,
   R7_ASSETS,
   R8_ASSETS,
+  R9_ASSETS,
 ]);
 const BUILD_HASH = ASSETS.buildHash;
 const SCHEMA_HASH = ASSETS.schemaHash;
@@ -225,6 +227,17 @@ class FakeGateway implements V2BootstrapGateway {
       this.logs = `render starting\nGPV2_SIDECAR_HEX ${wrapped}\n) render continues\n`;
       return;
     }
+    const stagedLauncher = this.ydoc.files.get(".latexmkrc") ?? "";
+    const relayNonce = /\.ghostprov-v2\/relay\/hello\.([^'\\]+)\.txt/.exec(
+      stagedLauncher.includes("R9 relay hello printer") ? stagedLauncher : "",
+    )?.[1];
+    if (relayNonce) {
+      const helloFile = this.ydoc.files.get(`.ghostprov-v2/relay/hello.${relayNonce}.txt`);
+      this.logs = helloFile === undefined
+        ? "render starting\n(relay hello pending)\n) render continues\n"
+        : `render starting\n${helloFile}\n) render continues\n`;
+      return;
+    }
     const config = JSON.parse(this.ydoc.files.get(".ghostprov-v2/static.json")!) as {
       binding: BootstrapBinding;
     };
@@ -320,7 +333,7 @@ function bootstrapHarness(
   revision?: V2SidecarRevision | string,
   maxActivePerSandbox = 8,
   assets = ASSETS,
-  controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number } = {},
+  controllerTiming: { attempts?: number; timeoutMs?: number; pollMs?: number; bootstrapTimeoutMs?: number; launchMode?: "render" | "relay" } = {},
 ) {
   const clock = new FakeClock();
   const random = new FakeRandom();
@@ -376,6 +389,10 @@ function bootstrapHarness(
     attempts: controllerTiming.attempts ?? 3,
     timeoutMs: controllerTiming.timeoutMs ?? 20,
     pollMs: controllerTiming.pollMs ?? 5,
+    ...(controllerTiming.bootstrapTimeoutMs === undefined
+      ? {}
+      : { bootstrapTimeoutMs: controllerTiming.bootstrapTimeoutMs }),
+    ...(controllerTiming.launchMode === undefined ? {} : { launchMode: controllerTiming.launchMode }),
     clock,
     random,
     diagnostics: { enabled: true, intervalMs: 1_000 },
@@ -433,7 +450,113 @@ describe("V2BootstrapController", () => {
       .toMatchObject({ revision: "r5", protocolRevision: "r2" });
   });
 
-  it("matches only exact frozen R1-R8 prior sidecar entrypoints", async () => {
+  it("publishes the R9 sandbox-relay credential window into the static config", async () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS);
+    await harness.controller.ensureReady();
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!))
+      .toMatchObject({ bootstrapTimeoutMs: 300_000 });
+
+    const custom = bootstrapHarness("none", "r9", 8, R9_ASSETS, { bootstrapTimeoutMs: 60_000 });
+    await custom.controller.ensureReady();
+    expect(JSON.parse(custom.ydoc.files.get(".ghostprov-v2/static.json")!))
+      .toMatchObject({ bootstrapTimeoutMs: 60_000 });
+
+    expect(() => bootstrapHarness("none", "r9", 8, R9_ASSETS, { bootstrapTimeoutMs: 29_999 }))
+      .toThrow(/bootstrapTimeoutMs/);
+    expect(() => bootstrapHarness("none", "r9", 8, R9_ASSETS, { bootstrapTimeoutMs: 600_001 }))
+      .toThrow(/bootstrapTimeoutMs/);
+  });
+
+  it("bootstraps through the sandbox relay when the render VM cannot fork", async () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
+    const innerOnWrite = harness.ydoc.onWrite;
+    harness.ydoc.onWrite = async (path, content) => {
+      await innerOnWrite?.(path, content);
+      if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
+      // Simulate the relay watcher + sidecar: staging executes the payload and
+      // the launcher copies the hello into the workspace read-back file.
+      const binding = (JSON.parse(
+        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
+      ) as { binding: BootstrapBinding }).binding;
+      const keys = await createBootstrapKeyPair(binding);
+      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
+        version: 1,
+        binding,
+        instanceId: "sidecar-instance-relay",
+        publicJwk: keys.publicJwk,
+      })));
+      harness.gateway.current = { binding, instanceId: "sidecar-instance-relay", keys };
+      harness.ydoc.files.set(
+        `.ghostprov-v2/relay/hello.${binding.nonce}.txt`,
+        `GPV2_BOOTSTRAP ${encoded}\n`,
+      );
+    };
+    const descriptor = await harness.controller.ensureReady();
+    expect(descriptor).toMatchObject({
+      instanceId: "sidecar-instance-relay",
+      releaseRevision: "r9",
+      protocolRevision: "r2",
+      launchNonce: "r9-launch-nonce",
+    });
+    const staged = harness.ydoc.writes
+      .filter(write => write.path === ".ghostprov-v2/relay/bootstrap-launch.sh")
+      .at(-1)!.content;
+    expect(staged).toContain("R9 sandbox-relay sidecar launcher");
+    expect(staged).toContain(`--ghostprov-launch-nonce="$NONCE"`);
+    const printer = harness.ydoc.writes
+      .filter(write => write.path === ".latexmkrc")
+      .map(write => write.content)
+      .find(content => content.includes("R9 relay hello printer"))!;
+    expect(printer).toContain("R9 relay hello printer");
+    expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!))
+      .toMatchObject({ bootstrapTimeoutMs: 300_000 });
+    // Post-readiness cleanup tombstones the ciphertext and the relay
+    // read-back material and parks an inert render launcher.
+    expect(harness.ydoc.files.get(".ghostprov-v2/bootstrap.enc.json")).toBeUndefined();
+    expect(harness.ydoc.files.get(".ghostprov-v2/relay/hello.r9-launch-nonce.txt")).toBeUndefined();
+    expect(harness.ydoc.files.get(".ghostprov-v2/relay/bootstrap-launch.sh")).toBeUndefined();
+    expect(harness.ydoc.files.get(".latexmkrc")).not.toContain("R9 relay hello printer");
+  });
+
+  it("retries the relay render when the hello has not reached the workspace yet", async () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
+    const innerOnWrite = harness.ydoc.onWrite;
+    let stagings = 0;
+    harness.ydoc.onWrite = async (path, content) => {
+      await innerOnWrite?.(path, content);
+      if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
+      stagings++;
+      // First staging races the render: the watcher has not executed yet, so
+      // the first render prints no hello and the attempt times out. The retry
+      // re-stages identical content and finds the hello on disk.
+      if (stagings < 2) return;
+      const binding = (JSON.parse(
+        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
+      ) as { binding: BootstrapBinding }).binding;
+      const keys = await createBootstrapKeyPair(binding);
+      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
+        version: 1,
+        binding,
+        instanceId: "sidecar-instance-relay",
+        publicJwk: keys.publicJwk,
+      })));
+      harness.gateway.current = { binding, instanceId: "sidecar-instance-relay", keys };
+      harness.ydoc.files.set(
+        `.ghostprov-v2/relay/hello.${binding.nonce}.txt`,
+        `GPV2_BOOTSTRAP ${encoded}\n`,
+      );
+    };
+    const descriptor = await harness.controller.ensureReady();
+    expect(descriptor.instanceId).toBe("sidecar-instance-relay");
+    expect(harness.gateway.renders).toBe(2);
+  });
+
+  it("rejects relay launch mode outside the R2 wire protocol", () => {
+    expect(() => bootstrapHarness("none", "r1", 8, ASSETS, { launchMode: "relay" }))
+      .toThrow(/relay.*R2|R2.*relay/i);
+  });
+
+  it("matches only exact registered R1-R9 sidecar entrypoints", async () => {
     const harness = bootstrapHarness("none", "r8", 8, R8_ASSETS);
     await harness.controller.ensureReady();
     const launcher = harness.gateway.launchers[0]!;
@@ -496,9 +619,12 @@ describe("V2BootstrapController", () => {
       }
     }
 
-    const r9Entrypoint = `/workspace/.ghostprov-v2/revisions/r9/${R8_ASSETS.schemaHash}/${R8_ASSETS.buildHash}/sidecar.bundle.js`;
-    expect(allReleases.regex.test(r9Entrypoint)).toBe(false);
-    expect(r2Releases.regex.test(r9Entrypoint)).toBe(false);
+    const mismatchedR9Entrypoint = `/workspace/.ghostprov-v2/revisions/r9/${R8_ASSETS.schemaHash}/${R8_ASSETS.buildHash}/sidecar.bundle.js`;
+    expect(allReleases.regex.test(mismatchedR9Entrypoint)).toBe(false);
+    expect(r2Releases.regex.test(mismatchedR9Entrypoint)).toBe(false);
+    const r10Entrypoint = `/workspace/.ghostprov-v2/revisions/r10/${R9_ASSETS.schemaHash}/${R9_ASSETS.buildHash}/sidecar.bundle.js`;
+    expect(allReleases.regex.test(r10Entrypoint)).toBe(false);
+    expect(r2Releases.regex.test(r10Entrypoint)).toBe(false);
 
     const initialR2Entrypoint = `/workspace/.ghostprov-v2/revisions/r2/${INITIAL_R2_RETIREMENT_IDENTITY.schemaHash}/${INITIAL_R2_RETIREMENT_IDENTITY.buildHash}/sidecar.bundle.js`;
     expect(allReleases.regex.test(initialR2Entrypoint)).toBe(true);
@@ -506,8 +632,8 @@ describe("V2BootstrapController", () => {
   });
 
   it("rejects an unregistered sidecar revision before generating a launcher", () => {
-    expect(() => bootstrapHarness("none", "r9", 8, R8_ASSETS))
-      .toThrow("Unsupported V2 sidecar revision: r9");
+    expect(() => bootstrapHarness("none", "r10", 8, R8_ASSETS))
+      .toThrow("Unsupported V2 sidecar revision: r10");
   });
 
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {
@@ -1557,5 +1683,133 @@ describe("V2BootstrapController", () => {
     expect(harness.gateway.calls.some(call => call.includes("zip"))).toBe(false);
     expect(harness.ydoc.writes.every(write => !write.content.includes(TOKEN))).toBe(true);
     expect(harness.ydoc.files.get(".latexmkrc")).toContain("GhostProv V2 launcher inactive");
+  });
+});
+
+describe("V2BootstrapController relay exec hello", () => {
+  interface ExecGateway extends FakeGateway {
+    execCalls: number;
+    runRelayExec(signal?: AbortSignal): Promise<{ status: number; output: string }>;
+  }
+
+  function relayExecHarness(
+    behavior: "hello" | "throw" | "garbage" | "wrong-nonce",
+    launchMode: "render" | "relay" = "relay",
+  ) {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode });
+    const gateway = harness.gateway as ExecGateway;
+    gateway.execCalls = 0;
+    gateway.runRelayExec = async () => {
+      gateway.execCalls++;
+      const binding = (JSON.parse(
+        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
+      ) as { binding: BootstrapBinding }).binding;
+      if (behavior === "throw") throw new Error("exec channel down");
+      if (behavior === "garbage") {
+        return { status: 200, output: "launcher ran, but no marker was printed" };
+      }
+      const useBinding = behavior === "wrong-nonce"
+        ? { ...binding, nonce: `stale-${binding.nonce}` }
+        : binding;
+      const keys = await createBootstrapKeyPair(useBinding);
+      const instanceId = "sidecar-instance-exec";
+      if (behavior === "hello") {
+        gateway.current = { binding: useBinding, instanceId, keys };
+      }
+      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
+        version: 1,
+        binding: useBinding,
+        instanceId,
+        publicJwk: keys.publicJwk,
+      })));
+      return {
+        status: 200,
+        output: `some agent prose\nHELLO-BEGIN\nGPV2_BOOTSTRAP ${encoded}\nHELLO-END\ntrailing prose`,
+      };
+    };
+    if (launchMode === "relay" && behavior !== "hello") {
+      // Simulate the relay watcher + sidecar for the render-log fallback: when
+      // the controller stages the launcher payload, the hello reaches the
+      // workspace read-back file that the render printer reports.
+      const innerOnWrite = harness.ydoc.onWrite;
+      harness.ydoc.onWrite = async (path, content) => {
+        await innerOnWrite?.(path, content);
+        if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
+        const staged = (JSON.parse(
+          harness.ydoc.files.get(".ghostprov-v2/static.json")!,
+        ) as { binding: BootstrapBinding }).binding;
+        const fileKeys = await createBootstrapKeyPair(staged);
+        const fileEncoded = base64UrlEncode(utf8Bytes(canonicalJson({
+          version: 1,
+          binding: staged,
+          instanceId: "sidecar-instance-logs",
+          publicJwk: fileKeys.publicJwk,
+        })));
+        gateway.current = { binding: staged, instanceId: "sidecar-instance-logs", keys: fileKeys };
+        harness.ydoc.files.set(
+          `.ghostprov-v2/relay/hello.${staged.nonce}.txt`,
+          `GPV2_BOOTSTRAP ${fileEncoded}\n`,
+        );
+      };
+    }
+    return harness as Omit<typeof harness, "gateway"> & { gateway: ExecGateway };
+  }
+
+  function relayController(harness: ReturnType<typeof relayExecHarness>, launchMode: "render" | "relay") {
+    return new V2BootstrapController({
+      projectId: PROJECT,
+      workerIndex: 7,
+      sandboxSessionId: "sandbox-session-1",
+      leaderGeneration: 4,
+      ySweet: harness.ySweet,
+      ydoc: harness.ydoc,
+      gateway: harness.gateway,
+      awareness: harness.awareness,
+      assets: R9_ASSETS,
+      revision: "r9",
+      launchNonce: "r9-launch-nonce",
+      launchMode,
+      attempts: 3,
+      timeoutMs: 20,
+      pollMs: 5,
+      clock: harness.clock,
+      random: harness.random,
+      diagnostics: { enabled: true, intervalMs: 1_000 },
+      initialActivePerSandbox: 4,
+      maxActivePerSandbox: 8,
+    });
+  }
+
+  it("accepts the exec hello without depending on render logs", async () => {
+    const harness = relayExecHarness("hello");
+    const controller = relayController(harness, "relay");
+    const descriptor = await controller.ensureReady();
+    expect(descriptor).toMatchObject({ instanceId: "sidecar-instance-exec", releaseRevision: "r9" });
+    expect(harness.gateway.execCalls).toBe(1);
+    expect(harness.decrypted).toHaveLength(1);
+  });
+
+  it("falls back to render logs when the exec channel fails", async () => {
+    const harness = relayExecHarness("throw");
+    const controller = relayController(harness, "relay");
+    const descriptor = await controller.ensureReady();
+    expect(harness.gateway.execCalls).toBe(1);
+    expect(descriptor.instanceId).toMatch(/^sidecar-instance-/);
+    expect(descriptor.instanceId).not.toBe("sidecar-instance-exec");
+  });
+
+  it("falls back to render logs when the exec hello is stale", async () => {
+    const harness = relayExecHarness("wrong-nonce");
+    const controller = relayController(harness, "relay");
+    const descriptor = await controller.ensureReady();
+    expect(descriptor.instanceId).not.toBe("sidecar-instance-exec");
+    expect(harness.decrypted).toHaveLength(1);
+  });
+
+  it("never calls the exec channel in render mode", async () => {
+    const harness = relayExecHarness("garbage", "render");
+    const controller = relayController(harness, "render");
+    await controller.ensureReady();
+    expect(harness.gateway.execCalls).toBe(0);
   });
 });

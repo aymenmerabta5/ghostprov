@@ -35,6 +35,15 @@ import {
 } from "../sidecar/assets";
 import { deriveV2SidecarEventMemorySizing } from "../memory/event-memory-sizing";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../sidecar/capacity";
+import {
+  RELAY_LAUNCH_PATH,
+  extractRelayExecHello,
+  isRelayMainNonce,
+  relayHelloPath,
+  relayHelloPrinterLatexmkrc,
+  relayMainSource,
+  relaySidecarLaunchScript,
+} from "./relay-launcher";
 
 const STATIC_PATH = ".ghostprov-v2/static.json";
 const WORKER_PATH = ".ghostprov-v2/worker.json";
@@ -491,6 +500,13 @@ export interface V2BootstrapGateway {
     suffix: string,
     init?: RequestInit,
   ): Promise<{ status: number; text: string; headers: Headers }>;
+  /**
+   * Relay-mode hello acquisition: runs the staged relay launcher inside the
+   * sandbox container and returns its printed transcript. Optional so render
+   * transports and older fakes keep working; the controller falls back to
+   * render-log polling when it is absent or fails.
+   */
+  runRelayExec?(signal?: AbortSignal): Promise<{ status: number; output: string }>;
 }
 
 export type V2BootstrapAwareness = AwarenessChannel<HostFrame, SidecarFrame>;
@@ -555,6 +571,20 @@ export interface V2BootstrapControllerOptions {
   launchNonce?: string;
   attempts?: number;
   timeoutMs?: number;
+  /**
+   * R9: phase-zero credential wait published into the sidecar static config.
+   * Must fit the sandbox-relay handshake (exec/agent roundtrip) while staying
+   * bounded. Omission selects 300_000 ms.
+   */
+  bootstrapTimeoutMs?: number;
+  /**
+   * Bootstrap launch transport. `render` forks the sidecar from the
+   * render-VM `.latexmkrc` (legacy: dead on proxy-restricted render VMs).
+   * `relay` stages a shell launcher for the sandbox-container relay watcher
+   * and reads the hello back through a render-log printer. Omission selects
+   * `render`. Relay requires the R2 wire protocol.
+   */
+  launchMode?: "render" | "relay";
   pollMs?: number;
   physicalMax?: number;
   acceptedMax?: number;
@@ -580,6 +610,8 @@ interface BootstrapAttemptAuthority {
   readonly launcher: string;
   readonly mainSource: string;
   readonly outputPath: string;
+  /** Sandbox-relay shell payload; null in legacy render launch mode. */
+  readonly relayPayload: string | null;
 }
 
 function exactKeys(
@@ -1236,6 +1268,8 @@ export class V2BootstrapController {
   readonly #launchNonce: string | null;
   readonly #attempts: number;
   readonly #timeoutMs: number;
+  readonly #bootstrapTimeoutMs: number;
+  readonly #launchMode: "render" | "relay";
   readonly #pollMs: number;
   readonly #physicalMax: number;
   readonly #acceptedMax: number;
@@ -1272,6 +1306,7 @@ export class V2BootstrapController {
   constructor(options: V2BootstrapControllerOptions) {
     const attempts = options.attempts ?? 3;
     const timeoutMs = options.timeoutMs ?? 45_000;
+    const bootstrapTimeoutMs = options.bootstrapTimeoutMs ?? 300_000;
     const pollMs = options.pollMs ?? 100;
     const physicalMax = options.physicalMax ?? 128;
     const acceptedMax = options.acceptedMax ?? 256;
@@ -1294,6 +1329,13 @@ export class V2BootstrapController {
     }
     if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
       throw new RangeError("timeoutMs must be positive");
+    }
+    if (
+      !Number.isSafeInteger(bootstrapTimeoutMs) ||
+      bootstrapTimeoutMs < 30_000 ||
+      bootstrapTimeoutMs > 600_000
+    ) {
+      throw new RangeError("bootstrapTimeoutMs must be an integer from 30000 through 600000");
     }
     if (!Number.isFinite(pollMs) || pollMs < 1 || pollMs > timeoutMs) {
       throw new RangeError("pollMs must be positive and no greater than timeoutMs");
@@ -1365,9 +1407,25 @@ export class V2BootstrapController {
     if (this.#protocolRevision === "r2" && options.launchNonce === undefined) {
       throw new TypeError("R2 bootstrap requires an explicit launchNonce");
     }
+    const launchMode = options.launchMode ?? "render";
+    if (launchMode !== "render" && launchMode !== "relay") {
+      throw new TypeError('launchMode must be "render" or "relay"');
+    }
+    if (launchMode === "relay" && this.#protocolRevision !== "r2") {
+      throw new TypeError("Relay launch mode requires the R2 wire protocol");
+    }
+    if (
+      launchMode === "relay" &&
+      options.launchNonce !== undefined &&
+      !isRelayMainNonce(options.launchNonce)
+    ) {
+      throw new TypeError("Relay launch mode requires a TeX-safe launch nonce");
+    }
     this.#launchNonce = options.launchNonce ?? null;
     this.#attempts = attempts;
     this.#timeoutMs = timeoutMs;
+    this.#bootstrapTimeoutMs = bootstrapTimeoutMs;
+    this.#launchMode = launchMode;
     this.#pollMs = pollMs;
     this.#physicalMax = physicalMax;
     this.#acceptedMax = acceptedMax;
@@ -1690,20 +1748,33 @@ export class V2BootstrapController {
       transportProfile: this.#assets.transportProfile,
       diagnostics: this.#diagnostics,
       batching: this.#batching,
+      bootstrapTimeoutMs: this.#bootstrapTimeoutMs,
     });
-    const launcher = temporaryLauncher(
-      this.#assets.entrypointPath,
-      binding.nonce,
-      this.#protocolRevision,
-      staticConfig,
-    );
-    const mainSource = bootstrapMainSource(artifacts.outputPath);
+    const relayPayload = this.#launchMode === "relay"
+      ? relaySidecarLaunchScript({
+        entrypointPath: this.#assets.entrypointPath,
+        nonce: binding.nonce,
+      })
+      : null;
+    const relayHello = this.#launchMode === "relay" ? relayHelloPath(binding.nonce) : null;
+    const launcher = this.#launchMode === "relay"
+      ? relayHelloPrinterLatexmkrc(binding.nonce)
+      : temporaryLauncher(
+        this.#assets.entrypointPath,
+        binding.nonce,
+        this.#protocolRevision,
+        staticConfig,
+      );
+    const mainSource = this.#launchMode === "relay"
+      ? relayMainSource(binding.nonce)
+      : bootstrapMainSource(artifacts.outputPath);
     const authority: BootstrapAttemptAuthority = Object.freeze({
       binding,
       staticConfig,
       launcher,
       mainSource,
       outputPath: artifacts.outputPath,
+      relayPayload,
     });
     const existingAuthority = this.#attemptAuthorities.get(binding.nonce);
     if (
@@ -1711,7 +1782,8 @@ export class V2BootstrapController {
       (
         existingAuthority.staticConfig !== staticConfig ||
         existingAuthority.launcher !== launcher ||
-        existingAuthority.mainSource !== mainSource
+        existingAuthority.mainSource !== mainSource ||
+        existingAuthority.relayPayload !== relayPayload
       )
     ) throw new V2BootstrapError("V2 bootstrap nonce authority changed", "deploy", attempt);
     if (
@@ -1726,6 +1798,8 @@ export class V2BootstrapController {
     }
     this.#attemptAuthorities.set(binding.nonce, authority);
     this.#ownedStaticConfigs.add(staticConfig);
+    if (relayHello !== null) this.#transientArtifactPaths.add(relayHello);
+    if (relayPayload !== null) this.#transientArtifactPaths.add(RELAY_LAUNCH_PATH);
     // Conservatively retain the nonce before staging. A concurrent shutdown
     // must fence it even if this attempt later fails before render submission.
     this.#possiblyLaunched.set(binding.nonce, authority);
@@ -1738,6 +1812,9 @@ export class V2BootstrapController {
             { kind: "write", path: STATIC_PATH, content: staticConfig },
             { kind: "write", path: LAUNCHER_PATH, content: launcher },
             { kind: "write", path: MAIN_PATH, content: mainSource },
+            ...(relayPayload === null
+              ? []
+              : [{ kind: "write" as const, path: RELAY_LAUNCH_PATH, content: relayPayload }]),
           ],
         });
         if (!applied) throw this.#projectAuthorityFailure();
@@ -1756,14 +1833,15 @@ export class V2BootstrapController {
       }
     });
 
-    const hello = await this.#waitForHello(
-      binding,
-      attempt,
-      staticConfig,
-      launcher,
-      mainSource,
-      signal,
-    );
+    const hello = (await this.#tryRelayExecHello(binding, attempt, signal))
+      ?? await this.#waitForHello(
+        binding,
+        attempt,
+        staticConfig,
+        launcher,
+        mainSource,
+        signal,
+      );
     const rotationKey = this.#reusableRotationKey ?? createCredentialRotationKey();
     this.#reusableRotationKey = rotationKey;
     let sealed: SealedBootstrapCredential;
@@ -1819,6 +1897,44 @@ export class V2BootstrapController {
       throw new V2BootstrapError("Unable to publish V2 bootstrap ciphertext", "deploy", attempt, { cause });
     } finally {
       unsubscribe();
+    }
+  }
+
+  /**
+   * Relay-mode hello acquisition through the platform exec channel. Returns a
+   * validated hello, or null when the exec path is unavailable or fails — the
+   * caller then falls back to render-log polling, which owns the attempt
+   * deadline and terminal errors. Abort signals always propagate.
+   */
+  async #tryRelayExecHello(
+    binding: BootstrapBinding,
+    attempt: number,
+    signal?: AbortSignal,
+  ): Promise<BootstrapHello | null> {
+    if (this.#launchMode !== "relay") return null;
+    const runRelayExec = this.#gateway.runRelayExec?.bind(this.#gateway);
+    if (!runRelayExec) return null;
+    let output: string;
+    try {
+      const result = await runRelayExec(signal);
+      if (result.status < 200 || result.status >= 300 || !result.output) return null;
+      output = result.output;
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+      return null;
+    }
+    const hello = extractRelayExecHello(output);
+    if (!hello) return null;
+    try {
+      const parsed = parseHelloCandidate(hello, binding, attempt);
+      if (
+        this.#reusableHello &&
+        canonicalJson(this.#reusableHello) !== canonicalJson(parsed)
+      ) this.#reusableRotationKey = null;
+      this.#reusableHello = parsed;
+      return parsed;
+    } catch {
+      return null;
     }
   }
 

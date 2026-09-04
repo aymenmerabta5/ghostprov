@@ -29,7 +29,7 @@ export interface UpstreamRateLimitObservation {
 export interface RoutableSandboxSnapshot {
   projectId: ProjectId;
   /** Exact verified V2 release; null until this generation proves readiness. */
-  releaseRevision?: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8" | null;
+  releaseRevision?: "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8" | "r9" | null;
   protocolRevision?: "r1" | "r2" | null;
   transportProfile?: "standard" | "bulk-v1" | null;
   buildHash?: string | null;

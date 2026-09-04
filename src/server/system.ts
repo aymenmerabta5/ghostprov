@@ -593,6 +593,11 @@ function defaultRuntimeFactory(options: {
         // observable backoff. One bounded bootstrap attempt prevents three
         // opaque 45-second tries from exceeding its 120-second child budget.
         attempts: 1,
+        // Relay hello acquisition runs a platform agent turn (tens of seconds),
+        // so relay attempts use the full child budget instead of 45 seconds.
+        timeoutMs: config.v2BootstrapLaunchMode === "relay" ? 120_000 : 45_000,
+        bootstrapTimeoutMs: config.v2BootstrapTimeoutMs,
+        launchMode: config.v2BootstrapLaunchMode,
         physicalMax: config.v2SandboxCapacity,
         acceptedMax: config.v2SandboxCapacity * 2,
         initialActivePerSandbox: config.v2InitialActivePerSandbox,
@@ -663,6 +668,7 @@ function defaultRuntimeFactory(options: {
       return new SupervisedSandboxRuntime({
         projectId: input.projectId,
         initialChild,
+        startupTimeoutMs: config.sandboxStartupTimeoutMs,
         // Recovery always reuses the same Prism project/worker. Only the
         // disposable sandbox session and its fenced leader generation change.
         createChild: async seed => {

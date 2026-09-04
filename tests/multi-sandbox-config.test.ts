@@ -160,7 +160,66 @@ describe("multi-sandbox configuration", () => {
     }
   });
 
-  it("supports immutable R1/R2/R3/R4/R5/R6/R7/R8 releases and exact known-project overrides", () => {
+  it("defaults to relay launch with a bounded credential window", () => {    const defaults = resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+    }, MACHINE);
+    expect(defaults.v2BootstrapLaunchMode).toBe("relay");
+    expect(defaults.v2BootstrapTimeoutMs).toBe(300_000);
+    const render = resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_V2_BOOTSTRAP_LAUNCH_MODE: "render",
+      GP_V2_BOOTSTRAP_TIMEOUT_MS: "60000",
+    }, MACHINE);
+    expect(render.v2BootstrapLaunchMode).toBe("render");
+    expect(render.v2BootstrapTimeoutMs).toBe(60_000);
+    for (const env of [
+      { GP_V2_BOOTSTRAP_LAUNCH_MODE: "exec" },
+      { GP_V2_BOOTSTRAP_TIMEOUT_MS: "29999" },
+      { GP_V2_BOOTSTRAP_TIMEOUT_MS: "600001" },
+      { GP_V2_BOOTSTRAP_TIMEOUT_MS: "sixty" },
+    ]) {
+      expect(() => resolveMultiSandboxConfig({
+        ...BASE_ENV,
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: A,
+        ...env,
+      }, MACHINE)).toThrow(/GP_V2_BOOTSTRAP/);
+    }
+  });
+
+  it("keeps the 120 s startup budget unless the operator opts into slower cold starts", () => {
+    const defaults = resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+    }, MACHINE);
+    expect(defaults.sandboxStartupTimeoutMs).toBe(120_000);
+    const slow = resolveMultiSandboxConfig({
+      ...BASE_ENV,
+      PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+      PRISM_PROJECT_IDS: A,
+      GP_SANDBOX_STARTUP_TIMEOUT_MS: "600000",
+    }, MACHINE);
+    expect(slow.sandboxStartupTimeoutMs).toBe(600_000);
+    for (const env of [
+      { GP_SANDBOX_STARTUP_TIMEOUT_MS: "119999" },
+      { GP_SANDBOX_STARTUP_TIMEOUT_MS: "1800001" },
+      { GP_SANDBOX_STARTUP_TIMEOUT_MS: "ten-minutes" },
+    ]) {
+      expect(() => resolveMultiSandboxConfig({
+        ...BASE_ENV,
+        PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
+        PRISM_PROJECT_IDS: A,
+        ...env,
+      }, MACHINE)).toThrow(/GP_SANDBOX_STARTUP_TIMEOUT_MS/);
+    }
+  });
+
+  it("supports immutable R1/R2/R3/R4/R5/R6/R7/R8/R9 releases and exact known-project overrides", () => {
     const config = resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
@@ -173,7 +232,7 @@ describe("multi-sandbox configuration", () => {
     expect(Object.isFrozen(config.v2SidecarProjectRevisions)).toBe(true);
 
     for (const revisions of [
-      `${B}=r9`,
+      `${B}=r10`,
       `${B}=r1,${B}=r2`,
       "*=r1",
       "not-an-assignment",
