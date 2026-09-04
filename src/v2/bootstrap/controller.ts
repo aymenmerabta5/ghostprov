@@ -35,15 +35,9 @@ import {
 } from "../sidecar/assets";
 import { deriveV2SidecarEventMemorySizing } from "../memory/event-memory-sizing";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../sidecar/capacity";
-import {
-  RELAY_LAUNCH_PATH,
-  extractRelayExecHello,
-  isRelayMainNonce,
-  relayHelloPath,
-  relayHelloPrinterLatexmkrc,
-  relayMainSource,
-  relaySidecarLaunchScript,
-} from "./relay-launcher";
+import type { V2BootstrapSupervisor } from "../supervisor/host";
+import type { SupervisorExecRequest } from "../supervisor/launcher";
+import type { CodexExecContinuation } from "../../prism/codex-exec";
 
 const STATIC_PATH = ".ghostprov-v2/static.json";
 const WORKER_PATH = ".ghostprov-v2/worker.json";
@@ -506,7 +500,12 @@ export interface V2BootstrapGateway {
    * transports and older fakes keep working; the controller falls back to
    * render-log polling when it is absent or fails.
    */
-  runRelayExec?(signal?: AbortSignal): Promise<{ status: number; output: string }>;
+  runRelayExec?(
+    request: SupervisorExecRequest,
+    continuation: CodexExecContinuation,
+    signal?: AbortSignal,
+  ): Promise<{ status: number; output: string }>;
+  prepareRelayExecSession?(signal?: AbortSignal): Promise<CodexExecContinuation>;
 }
 
 export type V2BootstrapAwareness = AwarenessChannel<HostFrame, SidecarFrame>;
@@ -564,6 +563,8 @@ export interface V2BootstrapControllerOptions {
   ydoc: V2BootstrapYDoc;
   gateway: V2BootstrapGateway;
   awareness: V2BootstrapAwareness;
+  /** Persistent same-sandbox process authority used by R9 relay mode. */
+  supervisor?: V2BootstrapSupervisor;
   assets: V2SidecarAssets;
   /** Selected immutable V2 revision. Omission derives only from the supplied assets. */
   revision?: V2SidecarRevision | string;
@@ -597,7 +598,7 @@ export interface V2BootstrapControllerOptions {
   random?: RandomSource;
 }
 
-interface BootstrapHello {
+export interface BootstrapHello {
   version: 1;
   binding: BootstrapBinding;
   instanceId: string;
@@ -1042,7 +1043,7 @@ function extractWrappedMarker(
   return complete && value ? value : null;
 }
 
-function parseHelloCandidate(
+export function parseHelloCandidate(
   encoded: string,
   expected: BootstrapBinding,
   attempt: number,
@@ -1262,6 +1263,7 @@ export class V2BootstrapController {
   readonly #ydoc: V2BootstrapYDoc;
   readonly #gateway: V2BootstrapGateway;
   readonly #awareness: V2BootstrapAwareness;
+  readonly #supervisor: V2BootstrapSupervisor | null;
   readonly #assets: V2SidecarAssets;
   readonly #selectedRevision: V2SidecarRevision;
   readonly #protocolRevision: ProtocolRevision;
@@ -1414,18 +1416,15 @@ export class V2BootstrapController {
     if (launchMode === "relay" && this.#protocolRevision !== "r2") {
       throw new TypeError("Relay launch mode requires the R2 wire protocol");
     }
-    if (
-      launchMode === "relay" &&
-      options.launchNonce !== undefined &&
-      !isRelayMainNonce(options.launchNonce)
-    ) {
-      throw new TypeError("Relay launch mode requires a TeX-safe launch nonce");
+    if (launchMode === "relay" && !options.supervisor) {
+      throw new TypeError("Relay launch mode requires a sandbox supervisor");
     }
     this.#launchNonce = options.launchNonce ?? null;
     this.#attempts = attempts;
     this.#timeoutMs = timeoutMs;
     this.#bootstrapTimeoutMs = bootstrapTimeoutMs;
     this.#launchMode = launchMode;
+    this.#supervisor = options.supervisor ?? null;
     this.#pollMs = pollMs;
     this.#physicalMax = physicalMax;
     this.#acceptedMax = acceptedMax;
@@ -1611,6 +1610,14 @@ export class V2BootstrapController {
     try {
       await this.#claimProjectMutationOwnership();
       await this.#deployAssets();
+      if (this.#launchMode === "relay") {
+        // The supervisor installer runs in the Codex sandbox immediately.
+        // Complete one explicit barrier for the large immutable bundle before
+        // staging the small installer/config barrier; a single coalesced sync
+        // can otherwise expose the launcher before its addressed module.
+        await this.#gateway.syncWorkspace(signal);
+        await this.#supervisor!.ensureReady(signal);
+      }
       await this.#awareness.connect(signal);
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
@@ -1750,15 +1757,8 @@ export class V2BootstrapController {
       batching: this.#batching,
       bootstrapTimeoutMs: this.#bootstrapTimeoutMs,
     });
-    const relayPayload = this.#launchMode === "relay"
-      ? relaySidecarLaunchScript({
-        entrypointPath: this.#assets.entrypointPath,
-        nonce: binding.nonce,
-      })
-      : null;
-    const relayHello = this.#launchMode === "relay" ? relayHelloPath(binding.nonce) : null;
     const launcher = this.#launchMode === "relay"
-      ? relayHelloPrinterLatexmkrc(binding.nonce)
+      ? INERT_LAUNCHER
       : temporaryLauncher(
         this.#assets.entrypointPath,
         binding.nonce,
@@ -1766,7 +1766,7 @@ export class V2BootstrapController {
         staticConfig,
       );
     const mainSource = this.#launchMode === "relay"
-      ? relayMainSource(binding.nonce)
+      ? MAIN_SOURCE
       : bootstrapMainSource(artifacts.outputPath);
     const authority: BootstrapAttemptAuthority = Object.freeze({
       binding,
@@ -1774,7 +1774,7 @@ export class V2BootstrapController {
       launcher,
       mainSource,
       outputPath: artifacts.outputPath,
-      relayPayload,
+      relayPayload: null,
     });
     const existingAuthority = this.#attemptAuthorities.get(binding.nonce);
     if (
@@ -1783,7 +1783,7 @@ export class V2BootstrapController {
         existingAuthority.staticConfig !== staticConfig ||
         existingAuthority.launcher !== launcher ||
         existingAuthority.mainSource !== mainSource ||
-        existingAuthority.relayPayload !== relayPayload
+        existingAuthority.relayPayload !== null
       )
     ) throw new V2BootstrapError("V2 bootstrap nonce authority changed", "deploy", attempt);
     if (
@@ -1798,8 +1798,6 @@ export class V2BootstrapController {
     }
     this.#attemptAuthorities.set(binding.nonce, authority);
     this.#ownedStaticConfigs.add(staticConfig);
-    if (relayHello !== null) this.#transientArtifactPaths.add(relayHello);
-    if (relayPayload !== null) this.#transientArtifactPaths.add(RELAY_LAUNCH_PATH);
     // Conservatively retain the nonce before staging. A concurrent shutdown
     // must fence it even if this attempt later fails before render submission.
     this.#possiblyLaunched.set(binding.nonce, authority);
@@ -1812,9 +1810,6 @@ export class V2BootstrapController {
             { kind: "write", path: STATIC_PATH, content: staticConfig },
             { kind: "write", path: LAUNCHER_PATH, content: launcher },
             { kind: "write", path: MAIN_PATH, content: mainSource },
-            ...(relayPayload === null
-              ? []
-              : [{ kind: "write" as const, path: RELAY_LAUNCH_PATH, content: relayPayload }]),
           ],
         });
         if (!applied) throw this.#projectAuthorityFailure();
@@ -1823,18 +1818,25 @@ export class V2BootstrapController {
         throw new V2BootstrapError("Unable to stage V2 bootstrap files", "deploy", attempt, { cause });
       }
 
-      try {
-        await this.#gateway.triggerRender({
-          mainDocument: MAIN_PATH,
-          ...await this.#ydoc.renderSyncState(),
-        }, signal);
-      } catch (cause) {
-        throw new V2BootstrapError("Unable to trigger V2 sidecar render", "render", attempt, { cause });
+      if (this.#launchMode === "render") {
+        try {
+          await this.#gateway.triggerRender({
+            mainDocument: MAIN_PATH,
+            ...await this.#ydoc.renderSyncState(),
+          }, signal);
+        } catch (cause) {
+          throw new V2BootstrapError("Unable to trigger V2 sidecar render", "render", attempt, { cause });
+        }
       }
     });
 
-    const hello = (await this.#tryRelayExecHello(binding, attempt, signal))
-      ?? await this.#waitForHello(
+    const hello = this.#launchMode === "relay"
+      ? parseHelloCandidate((await this.#supervisor!.launch({
+          sidecarBinding: binding,
+          entrypointPath: this.#assets.entrypointPath,
+          staticConfig,
+        }, signal)).encodedHello, binding, attempt)
+      : await this.#waitForHello(
         binding,
         attempt,
         staticConfig,
@@ -1862,29 +1864,35 @@ export class V2BootstrapController {
       throw new V2BootstrapError("Unable to encrypt V2 bootstrap credential", "crypto", attempt, { cause });
     }
 
-    const readiness: AwarenessEnvelope<SidecarFrame>[] = [];
-    const unsubscribe = this.#awareness.subscribe(update => readiness.push(update.envelope));
+    let readinessObserved = false;
+    const unsubscribe = this.#awareness.subscribe(update => {
+      if (matchesReadiness(update.envelope, binding, hello.instanceId)) readinessObserved = true;
+    });
     try {
-      await this.#withOwnedProjectMutation(true, async () => {
-        const applied = await this.#ydoc.compareAndMutatePaths({
-          guards: [
-            { path: STATIC_PATH, equals: staticConfig },
-            { path: LAUNCHER_PATH, equals: launcher },
-            { path: MAIN_PATH, equals: mainSource },
-          ],
-          mutations: [{
-            kind: "write",
-            path: CIPHERTEXT_PATH,
-            content: canonicalJson(sealed),
-          }],
+      if (this.#launchMode === "relay") {
+        await this.#supervisor!.deliverCredential({ sidecarBinding: binding, sealed }, signal);
+      } else {
+        await this.#withOwnedProjectMutation(true, async () => {
+          const applied = await this.#ydoc.compareAndMutatePaths({
+            guards: [
+              { path: STATIC_PATH, equals: staticConfig },
+              { path: LAUNCHER_PATH, equals: launcher },
+              { path: MAIN_PATH, equals: mainSource },
+            ],
+            mutations: [{
+              kind: "write",
+              path: CIPHERTEXT_PATH,
+              content: canonicalJson(sealed),
+            }],
+          });
+          if (!applied) throw this.#projectAuthorityFailure();
+          await this.#gateway.syncWorkspace(signal);
         });
-        if (!applied) throw this.#projectAuthorityFailure();
-        await this.#gateway.syncWorkspace(signal);
-      });
+      }
       const descriptor = await this.#waitForReadiness(
         binding,
         hello.instanceId,
-        readiness,
+        () => readinessObserved,
         attempt,
         MAIN_PATH,
         signal,
@@ -1897,44 +1905,6 @@ export class V2BootstrapController {
       throw new V2BootstrapError("Unable to publish V2 bootstrap ciphertext", "deploy", attempt, { cause });
     } finally {
       unsubscribe();
-    }
-  }
-
-  /**
-   * Relay-mode hello acquisition through the platform exec channel. Returns a
-   * validated hello, or null when the exec path is unavailable or fails — the
-   * caller then falls back to render-log polling, which owns the attempt
-   * deadline and terminal errors. Abort signals always propagate.
-   */
-  async #tryRelayExecHello(
-    binding: BootstrapBinding,
-    attempt: number,
-    signal?: AbortSignal,
-  ): Promise<BootstrapHello | null> {
-    if (this.#launchMode !== "relay") return null;
-    const runRelayExec = this.#gateway.runRelayExec?.bind(this.#gateway);
-    if (!runRelayExec) return null;
-    let output: string;
-    try {
-      const result = await runRelayExec(signal);
-      if (result.status < 200 || result.status >= 300 || !result.output) return null;
-      output = result.output;
-    } catch (cause) {
-      if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-      return null;
-    }
-    const hello = extractRelayExecHello(output);
-    if (!hello) return null;
-    try {
-      const parsed = parseHelloCandidate(hello, binding, attempt);
-      if (
-        this.#reusableHello &&
-        canonicalJson(this.#reusableHello) !== canonicalJson(parsed)
-      ) this.#reusableRotationKey = null;
-      this.#reusableHello = parsed;
-      return parsed;
-    } catch {
-      return null;
     }
   }
 
@@ -2040,7 +2010,7 @@ export class V2BootstrapController {
   async #waitForReadiness(
     binding: BootstrapBinding,
     instanceId: string,
-    readiness: readonly AwarenessEnvelope<SidecarFrame>[],
+    readinessObserved: () => boolean,
     attempt: number,
     mainPath: string,
     signal?: AbortSignal,
@@ -2048,12 +2018,13 @@ export class V2BootstrapController {
     const deadline = this.#clock.now() + this.#timeoutMs;
     // Reserve a bounded tail of the existing readiness budget for one
     // best-effort render of sidecar.log. Diagnostics never extend the attempt.
-    const diagnosticWindowMs = Math.min(5_000, Math.max(1, this.#timeoutMs / 4));
+    const diagnosticWindowMs = this.#launchMode === "render"
+      ? Math.min(5_000, Math.max(1, this.#timeoutMs / 4))
+      : 0;
     const observationDeadline = deadline - diagnosticWindowMs;
     const diagnosticBudgetMs = Math.max(1, diagnosticWindowMs * 0.8);
     for (;;) {
-      const envelope = readiness.find(candidate => matchesReadiness(candidate, binding, instanceId));
-      if (envelope) {
+      if (readinessObserved()) {
         return {
           instanceId,
           releaseRevision: this.#selectedRevision,
@@ -2067,15 +2038,14 @@ export class V2BootstrapController {
       }
       if (signal?.aborted) throw new DOMException("V2 bootstrap aborted", "AbortError");
       if (this.#clock.now() >= observationDeadline) {
-        const diagnostic = await this.#capturePostHelloDiagnostic(
-          diagnosticBudgetMs,
-          mainPath,
-          signal,
-        );
-        const lateEnvelope = readiness.find(candidate => (
-          matchesReadiness(candidate, binding, instanceId)
-        ));
-        if (lateEnvelope) {
+        const diagnostic = this.#launchMode === "render"
+          ? await this.#capturePostHelloDiagnostic(
+              diagnosticBudgetMs,
+              mainPath,
+              signal,
+            )
+          : null;
+        if (readinessObserved()) {
           return {
             instanceId,
             releaseRevision: this.#selectedRevision,
@@ -2199,7 +2169,7 @@ export class V2BootstrapController {
       if (force && launches.length > 0) {
         await this.#forceTerminateSidecars(launches);
       } else if (descriptor && binding) {
-        await this.#fenceDelayedLaunches(launches);
+        if (this.#launchMode === "render") await this.#fenceDelayedLaunches(launches);
         const frame = this.#controlFrame({ kind: "drain", reason });
         const seen: AwarenessEnvelope<SidecarFrame>[] = [];
         unsubscribe = this.#awareness.subscribe(update => seen.push(update.envelope));
@@ -2326,6 +2296,25 @@ export class V2BootstrapController {
         "readiness",
         1,
       );
+    }
+    if (this.#launchMode === "relay") {
+      try {
+        const stopped = await this.#supervisor!.stop({
+          launchNonces,
+          reason: "bootstrap_retirement",
+        });
+        if (stopped !== null && !launchNonces.includes(stopped)) {
+          throw new Error("Supervisor stopped an unexpected launch identity");
+        }
+        return;
+      } catch (cause) {
+        throw new V2BootstrapError(
+          "Unable to prove supervisor-owned sidecar termination",
+          "readiness",
+          1,
+          { cause },
+        );
+      }
     }
     const retirementNonce = this.#nextRetirementNonce(new Set(launchNonces));
     const retiredStatic = this.#retirementStaticConfig(retirementNonce, launchNonces);

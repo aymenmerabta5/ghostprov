@@ -124,6 +124,9 @@ function buffer(value: Uint8Array): ArrayBuffer {
   ) as ArrayBuffer;
 }
 
+// Public aliases let R9 reuse validation without changing frozen R8 identifiers.
+export { validateBinding as validateBootstrapBinding, validateCredential as validateBootstrapCredential };
+
 function validateBinding(value: BootstrapBinding): BootstrapBinding {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new BootstrapCryptoError("Bootstrap binding is invalid", "binding");

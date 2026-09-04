@@ -5,7 +5,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { protocolSchemaHash, sha256Hex, utf8Bytes } from "../src/v2/protocol/shared";
-import { V2_R8_RELEASE } from "../src/v2/sidecar/assets";
+import { V2_R8_RELEASE, V2_R9_RELEASE, type V2SidecarReleaseIdentity } from "../src/v2/sidecar/assets";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dir, "..");
 export const V2_R8_SIDECAR_ENTRYPOINT = path.join(
@@ -149,17 +149,20 @@ export async function buildV2SidecarRelease(
   });
 }
 
-function assertV2SidecarReleaseIdentity(built: V2SidecarReleaseBuild): void {
+function assertV2SidecarReleaseIdentity(
+  built: V2SidecarReleaseBuild,
+  expected: V2SidecarReleaseIdentity = V2_R8_RELEASE,
+): void {
   if (
-    V2_R8_RELEASE.revision !== built.revision ||
-    V2_R8_RELEASE.protocolRevision !== built.protocolRevision ||
-    V2_R8_RELEASE.transportProfile !== built.transportProfile ||
-    V2_R8_RELEASE.bundleSha256 !== built.bundleSha256 ||
-    V2_R8_RELEASE.buildHash !== built.buildHash ||
-    V2_R8_RELEASE.schemaHash !== built.schemaHash
+    expected.revision !== built.revision ||
+    expected.protocolRevision !== built.protocolRevision ||
+    expected.transportProfile !== built.transportProfile ||
+    expected.bundleSha256 !== built.bundleSha256 ||
+    expected.buildHash !== built.buildHash ||
+    expected.schemaHash !== built.schemaHash
   ) {
     throw new Error(
-      `Frozen V2-R8 sidecar release identity differs from deterministic identity ${JSON.stringify(releaseIdentity(built))}`,
+      `Frozen V2-${expected.revision.toUpperCase()} sidecar release identity differs from deterministic identity ${JSON.stringify(releaseIdentity(built))}`,
     );
   }
 }
@@ -237,6 +240,7 @@ export async function checkV2SidecarR9Release(
   if (!equalBytes(checkedIn, built.bytes)) {
     throw new Error("V2-R9 sidecar artifact differs from the deterministic build");
   }
+  assertV2SidecarReleaseIdentity(built, V2_R9_RELEASE);
   return built;
 }
 
@@ -244,6 +248,7 @@ export async function writeV2SidecarR9Release(
   artifactPath = V2_R9_SIDECAR_ARTIFACT,
 ): Promise<V2SidecarReleaseBuild> {
   const built = await buildV2SidecarRelease("r9");
+  assertV2SidecarReleaseIdentity(built, V2_R9_RELEASE);
   await mkdir(path.dirname(artifactPath), { recursive: true });
   try {
     const existing = new Uint8Array(await readFile(artifactPath));

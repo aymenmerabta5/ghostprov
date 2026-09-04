@@ -39,6 +39,12 @@ export interface CodexExecCommandOptions {
   sandboxToken: string;
   /** Exact shell command for the agent to execute verbatim. */
   command: string;
+  /** Prism conversation identifier returned by a prior completed turn. */
+  conversationId?: string;
+  /** Exact response identifier returned by the prior completed turn. */
+  previousResponseId?: string;
+  /** Credential-free Prism listen snapshot returned by the prior turn. */
+  listenSnapshot?: CodexExecListenSnapshot;
   /** Model identifier accepted by the turn API. Defaults to the observed one. */
   model?: string;
   /** Reasoning effort accepted by the turn API. Defaults to the observed one. */
@@ -53,7 +59,48 @@ export interface CodexExecCommandOptions {
   maxStartAttempts?: number;
   /** Upper bound for any single response body accepted for parsing. */
   maxBodyBytes?: number;
+  /** Content-free progress summaries for a still-running turn. */
+  onProgress?: (progress: CodexExecProgress) => void | Promise<void>;
+  /** Scan bounded status state for a dynamically generated relay hello. */
+  scanBodyForRelayBootstrapHello?: boolean;
+  /** Called once concrete, bounded platform turn identities have been returned. */
+  onStarted?: (started: CodexExecStarted) => void | Promise<void>;
   signal?: AbortSignal;
+}
+
+export interface CodexExecProgress {
+  readonly poll: number;
+  readonly status: string | null;
+  readonly eventTypes: readonly string[];
+  /** Strict public bootstrap payload observed only inside command-tool output. */
+  readonly relayBootstrapHello: string | null;
+}
+
+export interface CodexExecStarted {
+  readonly requestId: string;
+  readonly identifiers: Readonly<Record<string, string>>;
+}
+
+export interface CodexExecListenSnapshot {
+  readonly conversation_id: string;
+  readonly workspace_session_id: string;
+  readonly codex_session_id: string | null;
+  readonly last_turn_id: string | null;
+  readonly endpoint_identity: string | null;
+  readonly last_exec_at: string | null;
+  readonly transcript_cursor: number;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly last_saved_at: string | null;
+  readonly user_id: string | null;
+  readonly project_id: string | null;
+}
+
+export interface CodexExecContinuation {
+  readonly conversationId: string;
+  readonly previousResponseId: string;
+  readonly listenSnapshot: CodexExecListenSnapshot;
+  readonly codexSessionId: string;
 }
 
 export interface CodexExecResult {
@@ -61,6 +108,9 @@ export interface CodexExecResult {
   transcript: string;
   requestId: string;
   polls: number;
+  /** Bounded identifier-only projection of the terminal body. */
+  identifiers: Readonly<Record<string, string>>;
+  listenSnapshot: CodexExecListenSnapshot | null;
 }
 
 const DEFAULT_MODEL = "gpt-5.6-sol";
@@ -164,8 +214,89 @@ async function readBoundedJson(
 
 interface StartedTurn {
   requestId: string;
+  identifiers: Readonly<Record<string, string>>;
+  listenSnapshot: CodexExecListenSnapshot | null;
   turnState: Record<string, unknown> | null;
   terminal: { completed: boolean; transcript: string; reason?: string } | null;
+}
+
+function nullableBoundedString(value: unknown, maximum = 512): string | null | undefined {
+  return value === null
+    ? null
+    : typeof value === "string" && value.length <= maximum
+      ? value
+      : undefined;
+}
+
+function validateListenSnapshot(value: unknown): CodexExecListenSnapshot | null {
+  if (!isRecord(value)) return null;
+  const conversationId = nullableBoundedString(value.conversation_id, 256);
+  const workspaceSessionId = nullableBoundedString(value.workspace_session_id, 256);
+  const codexSessionId = nullableBoundedString(value.codex_session_id, 256);
+  const lastTurnId = nullableBoundedString(value.last_turn_id, 256);
+  const endpointIdentity = nullableBoundedString(value.endpoint_identity, 512);
+  const lastExecAt = nullableBoundedString(value.last_exec_at, 128);
+  const createdAt = nullableBoundedString(value.created_at, 128);
+  const updatedAt = nullableBoundedString(value.updated_at, 128);
+  const lastSavedAt = nullableBoundedString(value.last_saved_at, 128);
+  const userId = nullableBoundedString(value.user_id, 256);
+  const projectId = nullableBoundedString(value.project_id, 256);
+  if (
+    !conversationId || !workspaceSessionId ||
+    codexSessionId === undefined || lastTurnId === undefined ||
+    endpointIdentity === undefined || lastExecAt === undefined ||
+    !createdAt || !updatedAt || lastSavedAt === undefined ||
+    userId === undefined || projectId === undefined ||
+    !Number.isSafeInteger(value.transcript_cursor) || (value.transcript_cursor as number) < 0
+  ) return null;
+  return Object.freeze({
+    conversation_id: conversationId,
+    workspace_session_id: workspaceSessionId,
+    codex_session_id: codexSessionId,
+    last_turn_id: lastTurnId,
+    endpoint_identity: endpointIdentity,
+    last_exec_at: lastExecAt,
+    transcript_cursor: value.transcript_cursor as number,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    last_saved_at: lastSavedAt,
+    user_id: userId,
+    project_id: projectId,
+  });
+}
+
+function listenSnapshotOf(body: unknown): CodexExecListenSnapshot | null {
+  if (!isRecord(body)) return null;
+  const direct = validateListenSnapshot(body.codex_listen_snapshot ?? body.codexListenSnapshot);
+  if (direct) return direct;
+  const response = isRecord(body.response) ? body.response : null;
+  const payload = response && isRecord(response.payload) ? response.payload : null;
+  return validateListenSnapshot(payload?.codexListenSnapshot ?? payload?.codex_listen_snapshot);
+}
+
+function boundedIdentifiers(body: unknown): Readonly<Record<string, string>> {
+  const identifiers: Record<string, string> = {};
+  let visited = 0;
+  const visit = (value: unknown, path: string): void => {
+    if (++visited > 1_024 || Object.keys(identifiers).length >= 64) return;
+    if (Array.isArray(value)) {
+      value.slice(0, 128).forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    if (!isRecord(value)) return;
+    for (const [key, entry] of Object.entries(value)) {
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) continue;
+      const next = path ? `${path}.${key}` : key;
+      if (
+        typeof entry === "string" &&
+        (/(?:^|_)(?:id|identifier)$/i.test(key) || /(?:Id|Identifier)$/.test(key)) &&
+        /^[A-Za-z0-9._:-]{1,128}$/.test(entry)
+      ) identifiers[next] = entry;
+      else visit(entry, next);
+    }
+  };
+  visit(body, "");
+  return Object.freeze(identifiers);
 }
 
 function turnStatusOf(body: unknown): string | null {
@@ -216,6 +347,69 @@ export function collectCodexTranscript(body: unknown): string {
   }
   for (const root of roots) visit(root);
   return parts.join("\n");
+}
+
+export function summarizeCodexProgress(
+  body: unknown,
+  poll: number,
+  scanBodyForRelayBootstrapHello = false,
+): CodexExecProgress {
+  const eventTypes = new Set<string>();
+  const bootstrapHellos = new Set<string>();
+  const progress = isRecord(body) ? body.codex_live_progress : null;
+  const previews = isRecord(progress) && Array.isArray(progress.eventPreviews)
+    ? progress.eventPreviews.slice(0, 128)
+    : [];
+  let visited = 0;
+  const scanToolOutput = (value: unknown): void => {
+    if (typeof value === "string") {
+      for (const match of value.matchAll(/(?:^|[^A-Za-z0-9_])GPV2_BOOTSTRAP ([A-Za-z0-9_-]{1,8192})(?=[^A-Za-z0-9_-]|$)/g)) {
+        bootstrapHellos.add(match[1]!);
+        if (bootstrapHellos.size > 1) return;
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) scanToolOutput(entry);
+      return;
+    }
+    if (!isRecord(value)) return;
+    for (const entry of Object.values(value)) scanToolOutput(entry);
+  };
+  const visit = (value: unknown): void => {
+    if (++visited > 2_048) return;
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry);
+      return;
+    }
+    if (!isRecord(value)) return;
+    if (
+      typeof value.type === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value.type) &&
+      eventTypes.size < 128
+    ) eventTypes.add(value.type);
+    if (value.type === "custom_tool_call_output" || value.type === "output_text") {
+      scanToolOutput(value);
+    }
+    for (const entry of Object.values(value)) visit(entry);
+  };
+  for (const preview of previews) {
+    if (!isRecord(preview) || typeof preview.raw !== "string") continue;
+    try {
+      const parsed = JSON.parse(preview.raw);
+      visit(parsed);
+      if (preview.raw.includes('"custom_tool_call_output"')) scanToolOutput(preview.raw);
+    } catch {}
+  }
+  if (scanBodyForRelayBootstrapHello) {
+    try { scanToolOutput(JSON.stringify(body)); } catch {}
+  }
+  return Object.freeze({
+    poll,
+    status: turnStatusOf(body),
+    eventTypes: Object.freeze([...eventTypes].sort()),
+    relayBootstrapHello: bootstrapHellos.size === 1 ? [...bootstrapHellos][0]! : null,
+  });
 }
 
 function innerTurnError(body: unknown): string | null {
@@ -286,7 +480,7 @@ function throwForHttpStatus(operation: string, status: number): never {
 }
 
 async function startTurn(
-  options: Required<Pick<CodexExecCommandOptions, "account" | "projectId" | "sandboxUrl" | "sandboxToken" | "command" | "model" | "reasoningEffort" | "requestTimeoutMs" | "maxBodyBytes">> & { signal?: AbortSignal },
+  options: Required<Pick<CodexExecCommandOptions, "account" | "projectId" | "sandboxUrl" | "sandboxToken" | "command" | "model" | "reasoningEffort" | "requestTimeoutMs" | "maxBodyBytes">> & Pick<CodexExecCommandOptions, "conversationId" | "previousResponseId" | "listenSnapshot"> & { signal?: AbortSignal },
   origin: string,
 ): Promise<StartedTurn> {
   const started = await postJson(
@@ -300,14 +494,28 @@ async function startTurn(
           content: [{ type: "input_text", text: options.command }],
         },
       ],
+      previousResponseId: options.previousResponseId,
       metadata: {
         projectId: options.projectId,
+        ...(options.listenSnapshot?.user_id ? { userId: options.listenSnapshot.user_id } : {}),
         model: options.model,
         reasoning_effort: options.reasoningEffort,
         frontend_origin: origin,
         sandbox_url: options.sandboxUrl,
         sandbox_token: options.sandboxToken,
+        ...(options.listenSnapshot
+          ? {
+              codex_listen_snapshot: JSON.stringify({
+                ...options.listenSnapshot,
+                conversation_id: options.conversationId ?? options.listenSnapshot.conversation_id,
+                project_id: options.projectId,
+                sandbox_url: options.sandboxUrl,
+                sandbox_token: options.sandboxToken,
+              }),
+            }
+          : {}),
       },
+      conversationId: options.conversationId,
     },
     {
       requestTimeoutMs: options.requestTimeoutMs,
@@ -324,13 +532,15 @@ async function startTurn(
   if (!requestId) {
     throw new CodexExecError("Codex turn start returned no request id", "protocol", started.status);
   }
+  const identifiers = boundedIdentifiers(started.body);
+  const listenSnapshot = listenSnapshotOf(started.body);
   if (status !== null && status !== "pending" && status !== "started") {
     const errorReason = innerTurnError(started.body);
-    if (errorReason) return { requestId, turnState: null, terminal: { completed: false, transcript: "", reason: errorReason } };
+    if (errorReason) return { requestId, identifiers, listenSnapshot, turnState: null, terminal: { completed: false, transcript: "", reason: errorReason } };
     const transcript = collectCodexTranscript(started.body);
-    return { requestId, turnState: null, terminal: { completed: true, transcript } };
+    return { requestId, identifiers, listenSnapshot, turnState: null, terminal: { completed: true, transcript } };
   }
-  return { requestId, turnState: turnStateOf(started.body), terminal: null };
+  return { requestId, identifiers, listenSnapshot, turnState: turnStateOf(started.body), terminal: null };
 }
 
 /**
@@ -346,6 +556,9 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
     sandboxUrl,
     sandboxToken,
     command,
+    conversationId,
+    previousResponseId,
+    listenSnapshot,
     signal,
   } = input;
   if (!command || command.length > MAX_COMMAND_CHARS) {
@@ -353,6 +566,14 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
   }
   if (!sandboxUrl || !sandboxToken) {
     throw new CodexExecError("Codex exec requires a provisioned sandbox session", "protocol");
+  }
+  for (const [name, value] of [
+    ["conversationId", conversationId],
+    ["previousResponseId", previousResponseId],
+  ] as const) {
+    if (value !== undefined && !/^[A-Za-z0-9._:-]{1,256}$/.test(value)) {
+      throw new CodexExecError(`Codex exec ${name} is invalid`, "protocol");
+    }
   }
   const model = input.model ?? DEFAULT_MODEL;
   const reasoningEffort = input.reasoningEffort ?? DEFAULT_REASONING_EFFORT;
@@ -384,7 +605,21 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
     let started: StartedTurn;
     try {
       started = await startTurn(
-        { account, projectId, sandboxUrl, sandboxToken, command, model, reasoningEffort, requestTimeoutMs, maxBodyBytes, signal },
+        {
+          account,
+          projectId,
+          sandboxUrl,
+          sandboxToken,
+          command,
+          model,
+          reasoningEffort,
+          requestTimeoutMs,
+          maxBodyBytes,
+          conversationId,
+          previousResponseId,
+          listenSnapshot,
+          signal,
+        },
         origin,
       );
     } catch (error) {
@@ -395,11 +630,18 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
       throw error;
     }
     if (started.terminal) {
+      await input.onStarted?.({ requestId: started.requestId, identifiers: started.identifiers });
       if (started.terminal.completed) {
         if (!started.terminal.transcript.trim()) {
           throw new CodexExecError("Codex turn completed without transcript text", "protocol");
         }
-        return { transcript: started.terminal.transcript, requestId: started.requestId, polls: 0 };
+        return {
+          transcript: started.terminal.transcript,
+          requestId: started.requestId,
+          polls: 0,
+          identifiers: started.identifiers,
+          listenSnapshot: started.listenSnapshot,
+        };
       }
       if (started.terminal.reason === "sandbox_reconnecting") {
         lastError = new CodexExecError("Codex sandbox is reconnecting", "transport");
@@ -414,6 +656,7 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
     if (!started.turnState) {
       throw new CodexExecError("Codex turn started without resumable state", "protocol");
     }
+    await input.onStarted?.({ requestId: started.requestId, identifiers: started.identifiers });
     return await pollTurn({
       account,
       requestId: started.requestId,
@@ -422,6 +665,8 @@ export async function runCodexCommand(input: CodexExecCommandOptions): Promise<C
       pollIntervalMs,
       maxPolls,
       maxBodyBytes,
+      onProgress: input.onProgress,
+      scanBodyForRelayBootstrapHello: input.scanBodyForRelayBootstrapHello ?? false,
       signal,
     });
   }
@@ -436,6 +681,8 @@ async function pollTurn(input: {
   pollIntervalMs: number;
   maxPolls: number;
   maxBodyBytes: number;
+  onProgress?: (progress: CodexExecProgress) => void | Promise<void>;
+  scanBodyForRelayBootstrapHello: boolean;
   signal?: AbortSignal;
 }): Promise<CodexExecResult> {
   let turnState = input.turnState;
@@ -471,6 +718,11 @@ async function pollTurn(input: {
     if (status < 200 || status >= 300) {
       throwForHttpStatus("turn status", status);
     }
+    await input.onProgress?.(summarizeCodexProgress(
+      body,
+      polls + 1,
+      input.scanBodyForRelayBootstrapHello,
+    ));
     const next = turnStateOf(body);
     if (next) turnState = next;
     const turnStatus = turnStatusOf(body);
@@ -484,7 +736,13 @@ async function pollTurn(input: {
         "turn_failed",
       );
     }
-    return { transcript, requestId: input.requestId, polls: polls + 1 };
+    return {
+      transcript,
+      requestId: input.requestId,
+      polls: polls + 1,
+      identifiers: boundedIdentifiers(body),
+      listenSnapshot: listenSnapshotOf(body),
+    };
   }
   throw new CodexExecError("Codex turn did not complete inside its poll budget", "timeout");
 }

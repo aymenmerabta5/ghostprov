@@ -5,6 +5,7 @@ import {
   collectCodexTranscript,
   runCodexCommand,
   scrubCodexText,
+  summarizeCodexProgress,
 } from "../src/prism/codex-exec";
 import { projectId } from "../src/sandbox/types";
 
@@ -82,6 +83,35 @@ function completedText(text: string) {
 }
 
 describe("codex-exec client", () => {
+  it("extracts a strict bootstrap hello only from bounded command output", () => {
+    const raw = (value: unknown) => ({ raw: JSON.stringify(value) });
+    const summary = summarizeCodexProgress({
+      status: "pending",
+      codex_live_progress: {
+        eventPreviews: [
+          raw({ type: "user_message", text: "GPV2_BOOTSTRAP ignored" }),
+          raw({
+            type: "response_item",
+            payload: {
+              type: "custom_tool_call_output",
+              output: "HELLO-BEGIN\nGPV2_BOOTSTRAP U1VQRVJWSVNPUg\nHELLO-END\n",
+            },
+          }),
+        ],
+      },
+    }, 3);
+    expect(summary).toEqual({
+      poll: 3,
+      status: "pending",
+      eventTypes: ["custom_tool_call_output", "response_item", "user_message"],
+      relayBootstrapHello: "U1VQRVJWSVNPUg",
+    });
+    expect(summarizeCodexProgress({
+      status: "pending",
+      codex_live_progress: { eventPreviews: [raw({ type: "user_message", text: "GPV2_BOOTSTRAP U1VQRVJWSVNPUg" })] },
+    }, 1).relayBootstrapHello).toBeNull();
+  });
+
   it("runs a command through start then status polling", async () => {
     const account = new ScriptedAccount([started(), pending(), completedText("EXEC-PROBE-OK")]);
     const result = await runCodexCommand({ ...baseInput(), account });

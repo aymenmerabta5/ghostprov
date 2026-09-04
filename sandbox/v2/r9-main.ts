@@ -29,12 +29,28 @@ import {
 import type { V2TransportProfile } from "../../src/v2/protocol/shared.ts";
 import { deriveV2SidecarEventMemorySizing } from "../../src/v2/memory/event-memory-sizing.ts";
 import {
+  runR9Supervisor,
+  runR9SupervisorInstaller,
+} from "./supervisor.ts";
+import { canonicalSandboxWorkspacePath } from "./workspace-root.ts";
+import {
   V2_TERMINAL_SPOOL_CAPACITY,
   V2_TERMINAL_SPOOL_RESERVATION_BYTES,
   V2_TERMINAL_SPOOL_TOTAL_BYTES,
 } from "../../src/v2/sidecar/capacity.ts";
 
 const MAX_RESPONSE_EVENT_BYTES = V2_TERMINAL_SPOOL_RESERVATION_BYTES;
+const SIDECAR_STATIC_RELATIVE_PATH = ".ghostprov-v2/static.json" as const;
+const SIDECAR_CREDENTIAL_RELATIVE_PATH = ".ghostprov-v2/bootstrap.enc.json" as const;
+
+function requiredWorkspacePath(relativePath: string): string {
+  const path = canonicalSandboxWorkspacePath(
+    Deno.env.get("GHOSTPROV_WORKSPACE_ROOT") ?? "",
+    relativePath,
+  );
+  if (!path) throw new Error("Canonical sandbox workspace root is invalid");
+  return path;
+}
 
 interface StaticSidecarConfig {
   version: 1;
@@ -156,7 +172,7 @@ async function settleCleanup(
 
 async function run(): Promise<void> {
   const config = readConfig(JSON.parse(
-    await Deno.readTextFile("/workspace/.ghostprov-v2/static.json"),
+    await Deno.readTextFile(requiredWorkspacePath(SIDECAR_STATIC_RELATIVE_PATH)),
   ));
   const binding = protocolBindingFromBootstrap(config.binding, "r2");
   fatalPhase = "environment";
@@ -217,7 +233,7 @@ async function run(): Promise<void> {
     const bootstrap = await phaseZeroBootstrap({
       binding: config.binding,
       instanceId,
-      encryptedPath: "/workspace/.ghostprov-v2/bootstrap.enc.json",
+      encryptedPath: requiredWorkspacePath(SIDECAR_CREDENTIAL_RELATIVE_PATH),
       helloPath: launchIdentity.helloPath,
       beforeHelloPublished: () => ownership!.promoteProcessIdentity(
         config.binding.nonce,
@@ -415,8 +431,18 @@ async function run(): Promise<void> {
   if (failure !== null) throw failure;
 }
 
+const installerNonce = Deno.args.length === 1
+  ? /^--ghostprov-install-supervisor=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/.exec(Deno.args[0]!)?.[1]
+  : undefined;
+const supervisorMode = Deno.args.length === 2 &&
+  /^--ghostprov-supervisor-nonce=/.test(Deno.args[0]!) &&
+  /^--ghostprov-process-start=/.test(Deno.args[1]!);
+const runtimeMode = installerNonce ? "supervisor_install" : supervisorMode ? "supervisor" : "sidecar";
+
 try {
-  await run();
+  if (installerNonce) await runR9SupervisorInstaller(installerNonce);
+  else if (supervisorMode) await runR9Supervisor();
+  else await run();
 } catch (error) {
   const wrapper = error instanceof Error ? error : new Error("Unknown sidecar failure");
   let value = wrapper;
@@ -433,11 +459,13 @@ try {
   const permission = /Requires (read|write|env|net|sys|run|ffi) access/i
     .exec(value.message)?.[1]?.toLowerCase() ?? null;
   console.error(JSON.stringify({
-    event: "ghostprov_v2_sidecar_fatal",
+    event: runtimeMode === "sidecar"
+      ? "ghostprov_v2_sidecar_fatal"
+      : "ghostprov_v2_supervisor_fatal",
     error_name: value.name.slice(0, 64),
     error_code: code,
     cause_name: value.cause instanceof Error ? value.cause.name.slice(0, 64) : null,
-    phase: fatalPhase,
+    phase: runtimeMode === "sidecar" ? fatalPhase : runtimeMode,
     permission,
   }));
   Deno.exit(1);

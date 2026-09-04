@@ -42,7 +42,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
 
-The request path never requests a project export or calls the sandbox ZIP endpoint. Yjs and Render are used only to bootstrap the sidecar; live requests use ephemeral Awareness frames.
+R9 stages immutable assets through Yjs and starts a persistent supervisor in a resumed Prism Codex session. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
 
 The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, sidecar capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
 
@@ -253,6 +253,8 @@ Built-in tracing starts with the upgraded router after the operator's next manua
 
 Recovery tracing adds `sandbox.recovery.started`, `sandbox.recovery.retry_scheduled`, `sandbox.recovery.completed`, `sandbox.recovery.aborted`, `sandbox.credential_refresh`, and transition-only `prism.circuit.changed`. Retry records are always visible on stdout and expose only normalized bootstrap/YDoc categories. Project replacement additionally emits `fleet.replacement.qualified`, `.started`, `.successor_reserved`, `.successor_created`, `.successor_activated`, `.old_retired`, transition-only `fleet.mutation.blocked`, and `fleet.startup_permits.changed`. Recovery events report `attempt_duration_ms` separately from total `duration_ms`, so retry backoff is never mistaken for a slow provisioning attempt. These events contain only project/worker indexes, bounded categories, counters, durations, and HTTP status codes—never sandbox/session IDs, URLs, cookies, tokens, prompts, or responses. `/__sandboxes` exposes process-local runtime incarnations, bounded recovery counters, sidecar peer age, pending retirements, and the sanitized project-mutation circuit; periodic `fleet.sample` additionally records both provisioning and project-mutation circuit state.
 
+Transition-only `sandbox.liveness` records identify Prism heartbeat HTTP, timeout, and transport failures; exact-sidecar probe timeouts and reliable-window stalls; same-session recovery outcomes; and Y-Sweet Awareness failures by data/control lane. Awareness records retain only a bounded numeric connection code, such as WebSocket close code `1006` or HTTP-style `401`/`403`, while liveness records include current heartbeat/sidecar-peer ages and transport connectivity. Routine successful heartbeats and probes remain silent; only recovery from a prior failure is recorded.
+
 Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous head-index queue preserves terminal events ahead of progress and sample events, validates and serializes only during batched drain, and keeps full records in JSONL. Console output batches terminal/error records and rate-limits progress/sample records to a fixed cadence. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 
 Inspect the latest records in PowerShell:
@@ -351,9 +353,13 @@ Before shipping or starting a pinned R2 release, run both independent release ga
 ```text
 bun run check:v2-sidecar-release
 bun run check:v2-sidecar-deno
+bun run check:v2-sidecar-release-r9
+bun run check:v2-sidecar-deno-r9
 ```
 
-The first deterministically rebuilds current sidecar source twice and compares the result, build hash, bundle hash, and R2 `bulk-v1` schema-profile hash with the checked-in R8 artifact (`--check-r9` verifies the R9 sandbox-relay artifact the same way). The second asks pinned Deno 2.9.5 to type/check that frozen offline bundle. Both are read-only and fail closed. Maintainers create a replacement artifact only through the explicit `bun run build:v2-sidecar-release` write command after source is frozen; the ordinary/default release command never overwrites an artifact.
+The release checks build source twice and compare the bytes, build hash, bundle hash, and R2 `bulk-v1` schema-profile hash with the registered R8 and R9 identities. The Deno checks validate both offline bundles with pinned Deno 2.9.5. These checks are read-only and fail closed. Maintainers create an R9 artifact through `bun run build:v2-sidecar-release-r9` after explicitly preparing its immutable identity; ordinary checks never overwrite artifacts.
+
+R9 creates one project conversation and discovers one reusable Codex session. Its session-bound encrypted bootstrap carries supervisor credentials without putting secrets in agent commands. Signed readiness gates ciphertext deletion. The supervisor keeps the exact Deno child resource and verifies its wrapper identity, canonical PID record, held owner lock, and static configuration before delivering credentials or stopping it. Recovery replaces the child within the same supervisor. Shutdown allows the full child cleanup budget and records exact retirement proof; missing proof blocks replacement. Control queues retain at most four host operations and one active plus one pending notification. A failed platform bootstrap is retained as a failed attempt, and cannot silently launch another agent turn.
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
@@ -603,6 +609,16 @@ The isolated suite includes:
 - `tests/v2-sidecar-storage-paths.test.ts`
 - `tests/v2-split-awareness-channel.test.ts`
 - `tests/v2-split-flight-integration.test.ts`
+- `tests/prism-conversation-client.test.ts`
+- `tests/v2-r9-recovery-guards.test.ts`
+- `tests/v2-supervisor-channel.test.ts`
+- `tests/v2-supervisor-controller.test.ts`
+- `tests/v2-supervisor-launcher.test.ts`
+- `tests/v2-supervisor-mailbox.test.ts`
+- `tests/v2-supervisor-process.test.ts`
+- `tests/v2-supervisor-protocol.test.ts`
+- `tests/v2-supervisor-retirement.test.ts`
+- `tests/v2-supervisor-session-bootstrap.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
 - `tests/v2-upstream.test.ts`
@@ -616,6 +632,16 @@ The isolated suite includes:
 The deterministic integration test fills 120 lanes as `30 + 30 + 30 + 30`, verifies terminal settlement and unique execution IDs, and proves a draining project leaves the other 90 lanes usable.
 
 ## Live proof
+
+The R9 supervisor release has a dedicated one- or eight-project stability proof. It creates only fresh UUIDs, copies account cookies to an isolated directory, binds `18888`, checks mixed Responses/Anthropic requests and provider continuation, stops each idle sidecar through its authenticated supervisor, and verifies recovery without another agent bootstrap. It records bounded diagnostics and deletes every project in its own ledger during cleanup:
+
+```powershell
+$env:GP_LIVE_R9_SUPERVISOR_RECOVERY = "1"
+$env:GP_LIVE_ALLOW_TEST_PROJECT_MUTATION = "1"
+$env:GP_LIVE_PROJECT_COUNT = "8" # use 1 for the first gate
+$env:PORT = "18888"
+bun scripts/live_r9_supervisor_recovery.ts
+```
 
 The persisted-continuation verifier is the only live verification command authorized by the local protected-port allowlist. Normal production startup is separate. The verifier hardcodes candidate port `18888`, requires 2-8 explicitly named dedicated test projects, never creates or deletes projects, and never contacts the protected listener on `18787`. It proves explicit and inferred HTTP suffixes, public WebSocket and Claude full-history continuation, same-project restart hydration, different-project hydration, and 1/4/8/16-agent two-turn isolation:
 

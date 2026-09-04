@@ -24,3 +24,21 @@ export function protocolBindingFromBootstrap(
   }
   return { ...base, protocolRevision: "r1" };
 }
+
+export function bootstrapBindingFromProtocol(
+  binding: ProtocolBinding,
+  nonce = binding.launchNonce,
+): BootstrapBinding {
+  const base = {
+    projectId: binding.projectId,
+    sandboxSessionId: binding.sessionId,
+    leaderGeneration: binding.leaderGeneration,
+    buildHash: binding.buildHash,
+    schemaHash: binding.schemaHash,
+    nonce,
+  };
+  if (binding.protocolRevision === "r2") {
+    return { ...base, protocolRevision: "r2", schemaVersion: 2 };
+  }
+  return base;
+}

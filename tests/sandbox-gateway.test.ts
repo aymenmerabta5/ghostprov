@@ -514,7 +514,77 @@ describe("SandboxGateway", () => {
     })).toThrow(/relayExecPollIntervalMs/);
   });
 
+  it("creates a project conversation and proves one reusable Codex session", async () => {
+    const conversationId = "cdx1_11111111-1111-4111-8111-111111111111";
+    const snapshot = {
+      conversation_id: conversationId,
+      workspace_session_id: "workspace-session-1",
+      codex_session_id: "codex-session-1111111111111111",
+      last_turn_id: "turn-1",
+      endpoint_identity: null,
+      last_exec_at: null,
+      transcript_cursor: 0,
+      created_at: "2026-09-04T00:00:00.000Z",
+      updated_at: "2026-09-04T00:00:00.000Z",
+      last_saved_at: null,
+      user_id: null,
+      project_id: PROJECT,
+    };
+    const account = new FakeAccount((path: string) => {
+      if (path === "/") {
+        return new Response(`0:{"a":"$@1"}\n1:"${conversationId}"\n`, {
+          status: 200,
+          headers: { "content-type": "text/x-component" },
+        });
+      }
+      if (path === "/api/llm/response_with_tools_start") {
+        return Response.json({
+          status: "started",
+          request_id: "req-session",
+          turn_state: { codex_session_id: snapshot.codex_session_id },
+          codex_listen_snapshot: snapshot,
+        });
+      }
+      return Response.json({
+        status: "completed",
+        request_id: "req-session",
+        response: {
+          status: "success",
+          payload: {
+            id: "resp_session_ready",
+            conversationId,
+            codexListenSnapshot: snapshot,
+            output: [{
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "GPV2_SESSION_READY" }],
+            }],
+          },
+        },
+      });
+    });
+    const gateway = new SandboxGateway({
+      projectId: PROJECT,
+      account,
+      sandbox: SANDBOX,
+      relayExecPollIntervalMs: 1,
+    });
+
+    await expect(gateway.prepareRelayExecSession()).resolves.toEqual({
+      conversationId,
+      previousResponseId: "resp_session_ready",
+      listenSnapshot: snapshot,
+      codexSessionId: snapshot.codex_session_id,
+    });
+    const action = account.calls.find(call => call.path === "/")!;
+    expect(new Headers(action.headers).get("next-action")).toMatch(/^[a-f0-9]{40,64}$/);
+  });
+
   it("runs the staged relay launcher through one Codex turn", async () => {
+    const supervisorRequest = {
+      entrypointPath: `.ghostprov-v2/revisions/r9/${"a".repeat(64)}/${"b".repeat(64)}/sidecar.bundle.js`,
+      supervisorNonce: "supervisor-nonce-1",
+    };
     const account = new FakeAccount((path: string) => {
       if (path === "/api/llm/response_with_tools_start") {
         return Response.json({ status: "started", request_id: "req-9", turn_state: { version: 1 } });
@@ -542,8 +612,27 @@ describe("SandboxGateway", () => {
       sandbox: SANDBOX,
       relayExecPollIntervalMs: 1,
     });
+    const continuation = {
+      conversationId: "cdx1_11111111-1111-4111-8111-111111111111",
+      previousResponseId: "resp_previous_1",
+      codexSessionId: "codex-session-1111111111111111",
+      listenSnapshot: {
+        conversation_id: "cdx1_11111111-1111-4111-8111-111111111111",
+        workspace_session_id: "workspace-session-1",
+        codex_session_id: "codex-session-1111111111111111",
+        last_turn_id: "turn-1",
+        endpoint_identity: null,
+        last_exec_at: null,
+        transcript_cursor: 0,
+        created_at: "2026-09-04T00:00:00.000Z",
+        updated_at: "2026-09-04T00:00:00.000Z",
+        last_saved_at: null,
+        user_id: null,
+        project_id: PROJECT,
+      },
+    };
 
-    const result = await gateway.runRelayExec();
+    const result = await gateway.runRelayExec(supervisorRequest, continuation);
 
     expect(result).toMatchObject({ status: 200 });
     expect(result.output).toContain("GPV2_BOOTSTRAP abc123");
@@ -551,20 +640,46 @@ describe("SandboxGateway", () => {
     expect(start.method).toBe("POST");
     const metadata = (start.json as Record<string, unknown>).metadata as Record<string, unknown>;
     expect(metadata).toMatchObject({ projectId: PROJECT });
+    expect((start.json as Record<string, unknown>).conversationId).toBe(continuation.conversationId);
+    expect((start.json as Record<string, unknown>).previousResponseId).toBe(continuation.previousResponseId);
     const input = (start.json as Record<string, unknown>).input as Array<Record<string, unknown>>;
     const text = (((input[0]!.content as Array<Record<string, unknown>>)[0]!).text as string);
-    expect(text).toContain("sh /workspace/.ghostprov-v2/relay/bootstrap-launch.sh");
+    expect(text).toContain("--ghostprov-install-supervisor=$NONCE");
+    expect(text).toContain(supervisorRequest.entrypointPath);
   });
 
   it("maps Codex exec failures to bounded gateway errors", async () => {
+    const supervisorRequest = {
+      entrypointPath: `.ghostprov-v2/revisions/r9/${"a".repeat(64)}/${"b".repeat(64)}/sidecar.bundle.js`,
+      supervisorNonce: "supervisor-nonce-1",
+    };
     const denied = new FakeAccount(() => Response.json({ error: "no" }, { status: 401 }));
     const deniedGateway = new SandboxGateway({ projectId: PROJECT, account: denied, sandbox: SANDBOX });
-    await expect(deniedGateway.runRelayExec()).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
+    const continuation = {
+      conversationId: "cdx1_11111111-1111-4111-8111-111111111111",
+      previousResponseId: "resp_previous_1",
+      codexSessionId: "codex-session-1111111111111111",
+      listenSnapshot: {
+        conversation_id: "cdx1_11111111-1111-4111-8111-111111111111",
+        workspace_session_id: "workspace-session-1",
+        codex_session_id: "codex-session-1111111111111111",
+        last_turn_id: "turn-1",
+        endpoint_identity: null,
+        last_exec_at: null,
+        transcript_cursor: 0,
+        created_at: "2026-09-04T00:00:00.000Z",
+        updated_at: "2026-09-04T00:00:00.000Z",
+        last_saved_at: null,
+        user_id: null,
+        project_id: PROJECT,
+      },
+    };
+    await expect(deniedGateway.runRelayExec(supervisorRequest, continuation)).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
 
     const hanging = new FakeAccount(() => Response.json({ status: "started", request_id: "req-9", turn_state: { version: 1 } }));
     const hangingGateway = new SandboxGateway({
       projectId: PROJECT, account: hanging, sandbox: SANDBOX, relayExecMaxPolls: 1, relayExecPollIntervalMs: 1,
     });
-    await expect(hangingGateway.runRelayExec()).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
+    await expect(hangingGateway.runRelayExec(supervisorRequest, continuation)).rejects.toMatchObject({ name: "SandboxGatewayError", operation: "relay-exec" });
   });
 });

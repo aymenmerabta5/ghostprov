@@ -287,7 +287,7 @@ describe("Awareness channels", () => {
 
     provider.emit("connection-error", { status: 401 });
     expect(failures).toHaveLength(1);
-    expect(failures[0]).toMatchObject({ kind: "auth" });
+    expect(failures[0]).toMatchObject({ kind: "auth", connectionCode: 401 });
     expect(() => channel.publish(hostEnvelope())).toThrow("connection failed");
 
     const rotated = parseYSweetEnvelope({
@@ -324,7 +324,7 @@ describe("Awareness channels", () => {
     channel.onConnectionFailure(error => failures.push(error));
     await channel.connect();
     provider.emit("connection-close", { code: 1006 });
-    expect(failures[0]).toMatchObject({ kind: "disconnected" });
+    expect(failures[0]).toMatchObject({ kind: "disconnected", connectionCode: 1006 });
 
     const left = channel.connect();
     const right = channel.connect();

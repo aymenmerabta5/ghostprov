@@ -50,8 +50,9 @@ The primary product goal is high concurrency for mixed Codex and Claude workload
 
 ## Release and bootstrap invariants
 
-- V2 R8 is the authorized minimal sidecar successor for persisted continuation. Keep R1-R7 checked-in bundles and hashes byte-for-byte frozen. R8 may only remove the legacy post-`FETCH_STARTING` `invalid_json` replay and defensively require/normalize upstream `stream:true` plus `store:true`; do not add upstream WebSockets or unrelated behavior.
-- Once generated and verified, the R8 release revision, protocol revision, schema hash, build hash, and bundle hash are frozen identities.
+- V2 R9 is the authorized persistent sandbox-supervisor release. Keep R1-R8 checked-in bundles and hashes byte-for-byte frozen. R9 preserves the R2 stored-request and exact-once transport contract while replacing Render lifecycle operations with authenticated supervisor commands.
+- Once generated and verified, each release revision, protocol revision, schema hash, build hash, and bundle hash is an immutable identity. Run the explicit R9 deterministic and pinned Deno checks for an R9 change.
+- A supervisor retains the exact child resource through launch, credential delivery, stop, and shutdown. Failed identity checks never authorize a replacement child or a raw PID signal. Supervisor replacement waits for exact child-cleanup proof; it must not force-kill the supervisor while that cleanup remains ambiguous.
 - Generated prior-sidecar matching must enumerate exact registered entrypoint paths constructed from each release's revision, `schemaHash`, and `buildHash`. Escape regex literals for Perl and anchor with `\z`.
 - Never accept arbitrary 64-hex placeholders, cross-paired hashes, path prefixes or suffixes, trailing newlines, or unregistered revisions as an immutable sidecar identity.
 - Bootstrap may retire a prior process only after exact PID/start-tick, process-group/session, nonce, owner record, static authority, and immutable entrypoint proof.
@@ -124,11 +125,11 @@ Live operations are opt-in and are not implied by a request to implement or test
 - Do not use live sandboxes or paid provider calls for ordinary unit, integration, typecheck, or compile validation.
 - Keep credentials out of command lines, diffs, test output, logs, and summaries.
 
-## Prohibited scope for the active persisted-continuation release
+## Prohibited scope for the active R9 release
 
 Unless a later task explicitly authorizes them, do not add:
 
-- V2 R9, mutations to frozen R1-R7 assets, or any R8 behavior beyond the explicitly authorized minimal stored-request/exact-once delta.
+- V2 R10, mutations to frozen R1-R8 assets, or unrelated changes to the stored-request/exact-once contract.
 - Native upstream WebSocket transport or header-capable WebSocket probes.
 - Socket affinity or transport-coupled continuation state.
 - Conversations API integration.
@@ -146,7 +147,7 @@ Before reporting a change complete:
 4. Confirm public terminals wait for authoritative final proof, router provenance, and every eligible prefix-index commit.
 5. Confirm no retry path exists after an ambiguous execution boundary; server-injected continuation fallback remains exact compare-delete guarded and single-attempt. It is allowed only for a definitive HTTP-origin 400/404 `previous_response_not_found` before any relay/public event, or a native Responses/standalone-search `ResponseProvenanceObsoleteError` before `startRelay` returns a handle; it retries immutable full history or a rootable current search request without the stale ID, clears rather than replays opaque search references, and never applies to explicit caller or WebSocket IDs.
 6. Confirm all new state, reservations, and buffering are bounded and cleaned up on every terminal, rejection, timeout, abort, disconnect, and recovery path.
-7. Confirm no R9, upstream WebSocket, socket affinity, or Conversations API scope leaked in, and that R8 differs from R7 only by the authorized stored-request/exact-once sidecar delta.
+7. Confirm R1-R8 remain frozen, R9 lifecycle operations use the persistent supervisor, and no upstream WebSocket, socket affinity, Conversations API, or post-send replay was introduced.
 8. Run focused offline tests and `bun run typecheck`.
 9. Re-inspect `git diff --check` and the final file list.
 10. Report tests actually run and any validation intentionally not run.

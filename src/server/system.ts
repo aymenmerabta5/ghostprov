@@ -35,6 +35,7 @@ import { SandboxYDoc } from "../sandbox/ydoc";
 import { YSweetAwarenessChannel } from "../v2/awareness/y-sweet-channel";
 import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
 import { V2BootstrapController } from "../v2/bootstrap/controller";
+import { bootstrapBindingFromProtocol } from "../v2/bootstrap/binding";
 import type { HostFrame, SidecarFrame } from "../v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../v2/protocol/validate";
 import {
@@ -45,6 +46,8 @@ import {
 } from "../v2/runtime";
 import type { V2SidecarAssets } from "../v2/sidecar/assets";
 import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
+import { V2SandboxSupervisor, type V2SandboxSupervisorOptions } from "../v2/supervisor/controller";
+import type { V2BootstrapSupervisor } from "../v2/supervisor/host";
 import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session";
 import { createGhostProvApp } from "./app";
 import { ResponsesHttpContinuationIndex } from "../http/responses-continuation";
@@ -75,6 +78,7 @@ import {
   fleetLifecycleObservabilityEvent,
   observabilityEvent,
   recoveryObservabilityEvent,
+  sandboxLivenessObservabilityEvent,
   type JsonValue,
 } from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
@@ -322,6 +326,8 @@ export interface BrowserlessSystemDependencies {
     gateway: V2RuntimeGateway;
     callbacks: V2RuntimeHeartbeatCallbacks;
   }) => V2RuntimeHeartbeat;
+  /** Integration seam for observing and exercising the authenticated R9 lifecycle. */
+  sandboxSupervisorFactory?: (options: V2SandboxSupervisorOptions) => V2BootstrapSupervisor;
 }
 
 export interface BrowserlessSystem {
@@ -465,6 +471,7 @@ function defaultRuntimeFactory(options: {
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
+  sandboxSupervisorFactory?: BrowserlessSystemDependencies["sandboxSupervisorFactory"];
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
 }): ManagedRuntimeFactory {
   const {
@@ -480,6 +487,7 @@ function defaultRuntimeFactory(options: {
     revalidateAccount,
     logger,
     heartbeatFactory,
+    sandboxSupervisorFactory,
     onRecoveryEvent,
   } = options;
   const gzip = createV2CpuGzip(cpuPool);
@@ -520,6 +528,27 @@ function defaultRuntimeFactory(options: {
           credential_refresh_outcome: outcome,
         }), "progress");
       },
+      onLivenessDiagnostic: diagnostic => {
+        logger.emit(sandboxLivenessObservabilityEvent({
+          project_id: projectId,
+          worker_index: workerIndex,
+          transport: "v2",
+          liveness_signal: diagnostic.signal,
+          liveness_outcome: diagnostic.outcome,
+          attempt: diagnostic.attempt,
+          consecutive_failures: diagnostic.consecutiveFailures,
+          status: diagnostic.status,
+          error_name: diagnostic.errorName,
+          error_kind: diagnostic.errorKind,
+          duration_ms: diagnostic.durationMs,
+          heartbeat_age_ms: diagnostic.heartbeatAgeMs,
+          sidecar_peer_age_ms: diagnostic.sidecarPeerAgeMs,
+          transport_connected: diagnostic.transportConnected,
+          reliable_stall: diagnostic.reliableStall,
+          awareness_lane: diagnostic.awarenessLane,
+          connection_code: diagnostic.connectionCode,
+        }), "terminal");
+      },
       gzip,
       createGateway: sandbox => new SandboxGateway({
         projectId,
@@ -536,6 +565,7 @@ function defaultRuntimeFactory(options: {
             onExpired: callbacks.onExpired,
             onTransientFailure: callbacks.onTransientFailure,
             onUnreachable: callbacks.onUnreachable,
+            onAttempt: callbacks.onAttempt,
           }),
       createYDoc: credentials => {
         let first = true;
@@ -577,6 +607,18 @@ function defaultRuntimeFactory(options: {
           control: createLane("control", "ghostprovV2Control"),
         });
       },
+      createSupervisor: supervisor => config.v2BootstrapLaunchMode === "relay"
+        ? (sandboxSupervisorFactory ?? (input => new V2SandboxSupervisor(input)))({
+            binding: bootstrapBindingFromProtocol(
+              supervisor.binding,
+              `supervisor-${supervisor.binding.launchNonce}`,
+            ),
+            ySweet: supervisor.credentials.ySweet,
+            ydoc: supervisor.ydoc as SandboxYDoc,
+            gateway: supervisor.gateway as SandboxGateway,
+            assets: supervisor.assets,
+          })
+        : null,
       createBootstrap: bootstrap => new V2BootstrapController({
         projectId,
         workerIndex,
@@ -586,6 +628,7 @@ function defaultRuntimeFactory(options: {
         ydoc: bootstrap.ydoc as SandboxYDoc,
         gateway: bootstrap.gateway as SandboxGateway,
         awareness: bootstrap.awareness,
+        ...(bootstrap.supervisor ? { supervisor: bootstrap.supervisor } : {}),
         assets: bootstrap.assets,
         revision: release.revision,
         launchNonce: bootstrap.binding.launchNonce,
@@ -961,6 +1004,7 @@ export async function createBrowserlessSystem(
       : Promise.resolve(identity),
     logger,
     heartbeatFactory: dependencies.heartbeatFactory,
+    sandboxSupervisorFactory: dependencies.sandboxSupervisorFactory,
     onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
   });
   fleet = new ProjectFleetManager({

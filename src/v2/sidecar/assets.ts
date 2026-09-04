@@ -156,9 +156,9 @@ export const V2_R9_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
   revision: V2_R9,
   protocolRevision: "r2",
   transportProfile: "bulk-v1",
-  buildHash: "401ad19933243a8e1135849fd39e0bd13185bfcdfa2d90958236832efc006eb5",
+  buildHash: "b77a82587833f9960e819051abbca8803ac105e66f2d11e7f102f17d083ecdd6",
   schemaHash: "51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f",
-  bundleSha256: "d1a335f605d3131ccb727977379cd8dc19cca787dc43b7221804ff909806e1af",
+  bundleSha256: "032ce82a6104ab513c8efa7a8dd9a7d67fefb8ca41ee73cf47c9f4399d90012d",
 });
 
 /**

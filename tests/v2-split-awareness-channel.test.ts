@@ -5,7 +5,10 @@ import type {
   AwarenessChannel,
   AwarenessPeerUpdate,
 } from "../src/v2/awareness/channel";
-import { SplitAwarenessChannel } from "../src/v2/awareness/split-channel";
+import {
+  SplitAwarenessChannel,
+  SplitAwarenessChannelError,
+} from "../src/v2/awareness/split-channel";
 import type {
   AwarenessEnvelope,
   HostFrame,
@@ -166,6 +169,13 @@ describe("SplitAwarenessChannel", () => {
 
     data.fail(new Error("data lane token expired"));
     expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(SplitAwarenessChannelError);
+    expect(failures[0]).toMatchObject({
+      name: "SplitAwarenessChannelError",
+      lane: "data",
+      kind: "other",
+      connectionCode: null,
+    });
     const credential = parseYSweetEnvelope({
       url: `wss://prism.test/y/d/${PROJECT}/ws`,
       baseUrl: `https://prism.test/y/d/${PROJECT}`,

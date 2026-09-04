@@ -30,6 +30,7 @@ import {
   loadV2SidecarAssets,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
+import type { V2BootstrapSupervisor } from "../src/v2/supervisor/host";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const ASSETS = await loadV2SidecarAssets({ revision: "r1" });
@@ -350,6 +351,60 @@ function bootstrapHarness(
     token: TOKEN,
     authorization: "full",
   });
+  let supervisorLaunches = 0;
+  let supervisorCredentials = 0;
+  let supervisorStops = 0;
+  const supervisor: V2BootstrapSupervisor = {
+    binding: {
+      projectId: PROJECT,
+      sandboxSessionId: "sandbox-session-1",
+      leaderGeneration: 4,
+      buildHash: assets.buildHash,
+      schemaHash: assets.schemaHash,
+      nonce: `supervisor-${assets.revision}`,
+      protocolRevision: "r2",
+      schemaVersion: 2,
+    },
+    instanceId: "supervisor-instance-1",
+    async ensureReady() {},
+    async connect() {},
+    async launch(input) {
+      supervisorLaunches++;
+      const keys = await createBootstrapKeyPair(input.sidecarBinding);
+      const instanceId = "sidecar-instance-supervised";
+      gateway.current = { binding: input.sidecarBinding, instanceId, keys };
+      return {
+        encodedHello: base64UrlEncode(utf8Bytes(canonicalJson({
+          version: 1,
+          binding: input.sidecarBinding,
+          instanceId,
+          publicJwk: keys.publicJwk,
+        }))),
+        process: { pid: 123, startTick: "456", processGroup: 123, session: 123 },
+      };
+    },
+    async deliverCredential(input) {
+      supervisorCredentials++;
+      const current = gateway.current!;
+      const credential = await openBootstrapCredential({
+        sealed: input.sealed,
+        sidecarPrivateKey: current.keys.privateKey,
+        expectedBinding: current.binding,
+      });
+      decrypted.push(credential.token);
+      decryptedCredentials.push(credential);
+      if (fault !== "timeout" && fault !== "post-hello-fatal") {
+        awareness.sidecar(readyEnvelope(current.binding, current.instanceId, fault));
+      }
+    },
+    async stop(input) {
+      supervisorStops++;
+      return input.launchNonces[0] ?? null;
+    },
+    async rotateCredential() {},
+    async shutdown() {},
+    async close() {},
+  };
   ydoc.onWrite = async (path, content) => {
     if (path === ".latexmkrc" && content.includes("temporary bootstrap launcher")) {
       gateway.awaitingReadiness = false;
@@ -393,6 +448,7 @@ function bootstrapHarness(
       ? {}
       : { bootstrapTimeoutMs: controllerTiming.bootstrapTimeoutMs }),
     ...(controllerTiming.launchMode === undefined ? {} : { launchMode: controllerTiming.launchMode }),
+    ...(controllerTiming.launchMode === "relay" ? { supervisor } : {}),
     clock,
     random,
     diagnostics: { enabled: true, intervalMs: 1_000 },
@@ -408,6 +464,10 @@ function bootstrapHarness(
     gateway,
     decrypted,
     decryptedCredentials,
+    supervisor,
+    get supervisorLaunches() { return supervisorLaunches; },
+    get supervisorCredentials() { return supervisorCredentials; },
+    get supervisorStops() { return supervisorStops; },
     ySweet,
   };
 }
@@ -467,88 +527,42 @@ describe("V2BootstrapController", () => {
       .toThrow(/bootstrapTimeoutMs/);
   });
 
-  it("bootstraps through the sandbox relay when the render VM cannot fork", async () => {
+  it("bootstraps through the persistent sandbox supervisor without Render", async () => {
     const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
-    const innerOnWrite = harness.ydoc.onWrite;
-    harness.ydoc.onWrite = async (path, content) => {
-      await innerOnWrite?.(path, content);
-      if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
-      // Simulate the relay watcher + sidecar: staging executes the payload and
-      // the launcher copies the hello into the workspace read-back file.
-      const binding = (JSON.parse(
-        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
-      ) as { binding: BootstrapBinding }).binding;
-      const keys = await createBootstrapKeyPair(binding);
-      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
-        version: 1,
-        binding,
-        instanceId: "sidecar-instance-relay",
-        publicJwk: keys.publicJwk,
-      })));
-      harness.gateway.current = { binding, instanceId: "sidecar-instance-relay", keys };
-      harness.ydoc.files.set(
-        `.ghostprov-v2/relay/hello.${binding.nonce}.txt`,
-        `GPV2_BOOTSTRAP ${encoded}\n`,
-      );
-    };
     const descriptor = await harness.controller.ensureReady();
     expect(descriptor).toMatchObject({
-      instanceId: "sidecar-instance-relay",
+      instanceId: "sidecar-instance-supervised",
       releaseRevision: "r9",
       protocolRevision: "r2",
       launchNonce: "r9-launch-nonce",
     });
-    const staged = harness.ydoc.writes
-      .filter(write => write.path === ".ghostprov-v2/relay/bootstrap-launch.sh")
-      .at(-1)!.content;
-    expect(staged).toContain("R9 sandbox-relay sidecar launcher");
-    expect(staged).toContain(`--ghostprov-launch-nonce="$NONCE"`);
-    const printer = harness.ydoc.writes
-      .filter(write => write.path === ".latexmkrc")
-      .map(write => write.content)
-      .find(content => content.includes("R9 relay hello printer"))!;
-    expect(printer).toContain("R9 relay hello printer");
+    expect(harness.supervisorLaunches).toBe(1);
+    expect(harness.supervisorCredentials).toBe(1);
+    expect(harness.gateway.renders).toBe(0);
     expect(JSON.parse(harness.ydoc.files.get(".ghostprov-v2/static.json")!))
       .toMatchObject({ bootstrapTimeoutMs: 300_000 });
-    // Post-readiness cleanup tombstones the ciphertext and the relay
-    // read-back material and parks an inert render launcher.
     expect(harness.ydoc.files.get(".ghostprov-v2/bootstrap.enc.json")).toBeUndefined();
-    expect(harness.ydoc.files.get(".ghostprov-v2/relay/hello.r9-launch-nonce.txt")).toBeUndefined();
-    expect(harness.ydoc.files.get(".ghostprov-v2/relay/bootstrap-launch.sh")).toBeUndefined();
-    expect(harness.ydoc.files.get(".latexmkrc")).not.toContain("R9 relay hello printer");
+    expect(harness.ydoc.files.get(".latexmkrc")).toContain("launcher inactive");
   });
 
-  it("retries the relay render when the hello has not reached the workspace yet", async () => {
+  it("coalesces concurrent supervisor-backed readiness without duplicate launch", async () => {
     const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
-    const innerOnWrite = harness.ydoc.onWrite;
-    let stagings = 0;
-    harness.ydoc.onWrite = async (path, content) => {
-      await innerOnWrite?.(path, content);
-      if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
-      stagings++;
-      // First staging races the render: the watcher has not executed yet, so
-      // the first render prints no hello and the attempt times out. The retry
-      // re-stages identical content and finds the hello on disk.
-      if (stagings < 2) return;
-      const binding = (JSON.parse(
-        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
-      ) as { binding: BootstrapBinding }).binding;
-      const keys = await createBootstrapKeyPair(binding);
-      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
-        version: 1,
-        binding,
-        instanceId: "sidecar-instance-relay",
-        publicJwk: keys.publicJwk,
-      })));
-      harness.gateway.current = { binding, instanceId: "sidecar-instance-relay", keys };
-      harness.ydoc.files.set(
-        `.ghostprov-v2/relay/hello.${binding.nonce}.txt`,
-        `GPV2_BOOTSTRAP ${encoded}\n`,
-      );
-    };
-    const descriptor = await harness.controller.ensureReady();
-    expect(descriptor.instanceId).toBe("sidecar-instance-relay");
-    expect(harness.gateway.renders).toBe(2);
+    const [first, second] = await Promise.all([
+      harness.controller.ensureReady(),
+      harness.controller.ensureReady(),
+    ]);
+    expect(first).toEqual(second);
+    expect(first.instanceId).toBe("sidecar-instance-supervised");
+    expect(harness.supervisorLaunches).toBe(1);
+    expect(harness.gateway.renders).toBe(0);
+  });
+
+  it("uses supervisor-owned exact stop proof for relay retirement", async () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
+    await harness.controller.ensureReady();
+    await harness.controller.forceStop("supervisor recovery");
+    expect(harness.supervisorStops).toBe(1);
+    expect(harness.gateway.renders).toBe(0);
   });
 
   it("rejects relay launch mode outside the R2 wire protocol", () => {
@@ -1686,77 +1700,19 @@ describe("V2BootstrapController", () => {
   });
 });
 
-describe("V2BootstrapController relay exec hello", () => {
-  interface ExecGateway extends FakeGateway {
-    execCalls: number;
-    runRelayExec(signal?: AbortSignal): Promise<{ status: number; output: string }>;
-  }
-
-  function relayExecHarness(
-    behavior: "hello" | "throw" | "garbage" | "wrong-nonce",
-    launchMode: "render" | "relay" = "relay",
-  ) {
-    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode });
-    const gateway = harness.gateway as ExecGateway;
-    gateway.execCalls = 0;
-    gateway.runRelayExec = async () => {
-      gateway.execCalls++;
-      const binding = (JSON.parse(
-        harness.ydoc.files.get(".ghostprov-v2/static.json")!,
-      ) as { binding: BootstrapBinding }).binding;
-      if (behavior === "throw") throw new Error("exec channel down");
-      if (behavior === "garbage") {
-        return { status: 200, output: "launcher ran, but no marker was printed" };
-      }
-      const useBinding = behavior === "wrong-nonce"
-        ? { ...binding, nonce: `stale-${binding.nonce}` }
-        : binding;
-      const keys = await createBootstrapKeyPair(useBinding);
-      const instanceId = "sidecar-instance-exec";
-      if (behavior === "hello") {
-        gateway.current = { binding: useBinding, instanceId, keys };
-      }
-      const encoded = base64UrlEncode(utf8Bytes(canonicalJson({
-        version: 1,
-        binding: useBinding,
-        instanceId,
-        publicJwk: keys.publicJwk,
-      })));
-      return {
-        status: 200,
-        output: `some agent prose\nHELLO-BEGIN\nGPV2_BOOTSTRAP ${encoded}\nHELLO-END\ntrailing prose`,
-      };
+describe("V2BootstrapController supervisor boundary", () => {
+  it("does not fall back to Render when the sandbox supervisor rejects launch", async () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS, { launchMode: "relay" });
+    (harness.supervisor as any).launch = async () => {
+      throw new Error("supervisor unavailable");
     };
-    if (launchMode === "relay" && behavior !== "hello") {
-      // Simulate the relay watcher + sidecar for the render-log fallback: when
-      // the controller stages the launcher payload, the hello reaches the
-      // workspace read-back file that the render printer reports.
-      const innerOnWrite = harness.ydoc.onWrite;
-      harness.ydoc.onWrite = async (path, content) => {
-        await innerOnWrite?.(path, content);
-        if (path !== ".ghostprov-v2/relay/bootstrap-launch.sh") return;
-        const staged = (JSON.parse(
-          harness.ydoc.files.get(".ghostprov-v2/static.json")!,
-        ) as { binding: BootstrapBinding }).binding;
-        const fileKeys = await createBootstrapKeyPair(staged);
-        const fileEncoded = base64UrlEncode(utf8Bytes(canonicalJson({
-          version: 1,
-          binding: staged,
-          instanceId: "sidecar-instance-logs",
-          publicJwk: fileKeys.publicJwk,
-        })));
-        gateway.current = { binding: staged, instanceId: "sidecar-instance-logs", keys: fileKeys };
-        harness.ydoc.files.set(
-          `.ghostprov-v2/relay/hello.${staged.nonce}.txt`,
-          `GPV2_BOOTSTRAP ${fileEncoded}\n`,
-        );
-      };
-    }
-    return harness as Omit<typeof harness, "gateway"> & { gateway: ExecGateway };
-  }
+    await expect(harness.controller.ensureReady()).rejects.toBeInstanceOf(V2BootstrapError);
+    expect(harness.gateway.renders).toBe(0);
+  });
 
-  function relayController(harness: ReturnType<typeof relayExecHarness>, launchMode: "render" | "relay") {
-    return new V2BootstrapController({
+  it("requires an explicit supervisor for R9 relay mode", () => {
+    const harness = bootstrapHarness("none", "r9", 8, R9_ASSETS);
+    expect(() => new V2BootstrapController({
       projectId: PROJECT,
       workerIndex: 7,
       sandboxSessionId: "sandbox-session-1",
@@ -1768,48 +1724,7 @@ describe("V2BootstrapController relay exec hello", () => {
       assets: R9_ASSETS,
       revision: "r9",
       launchNonce: "r9-launch-nonce",
-      launchMode,
-      attempts: 3,
-      timeoutMs: 20,
-      pollMs: 5,
-      clock: harness.clock,
-      random: harness.random,
-      diagnostics: { enabled: true, intervalMs: 1_000 },
-      initialActivePerSandbox: 4,
-      maxActivePerSandbox: 8,
-    });
-  }
-
-  it("accepts the exec hello without depending on render logs", async () => {
-    const harness = relayExecHarness("hello");
-    const controller = relayController(harness, "relay");
-    const descriptor = await controller.ensureReady();
-    expect(descriptor).toMatchObject({ instanceId: "sidecar-instance-exec", releaseRevision: "r9" });
-    expect(harness.gateway.execCalls).toBe(1);
-    expect(harness.decrypted).toHaveLength(1);
-  });
-
-  it("falls back to render logs when the exec channel fails", async () => {
-    const harness = relayExecHarness("throw");
-    const controller = relayController(harness, "relay");
-    const descriptor = await controller.ensureReady();
-    expect(harness.gateway.execCalls).toBe(1);
-    expect(descriptor.instanceId).toMatch(/^sidecar-instance-/);
-    expect(descriptor.instanceId).not.toBe("sidecar-instance-exec");
-  });
-
-  it("falls back to render logs when the exec hello is stale", async () => {
-    const harness = relayExecHarness("wrong-nonce");
-    const controller = relayController(harness, "relay");
-    const descriptor = await controller.ensureReady();
-    expect(descriptor.instanceId).not.toBe("sidecar-instance-exec");
-    expect(harness.decrypted).toHaveLength(1);
-  });
-
-  it("never calls the exec channel in render mode", async () => {
-    const harness = relayExecHarness("garbage", "render");
-    const controller = relayController(harness, "render");
-    await controller.ensureReady();
-    expect(harness.gateway.execCalls).toBe(0);
+      launchMode: "relay",
+    })).toThrow(/requires a sandbox supervisor/i);
   });
 });

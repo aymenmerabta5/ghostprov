@@ -2,8 +2,16 @@ import {
   boundedAccountRequest,
   type AccountRequestClient,
 } from "../prism/provisioning-client";
-import { CodexExecError, runCodexCommand } from "../prism/codex-exec";
-import { RELAY_LAUNCH_PATH } from "../v2/bootstrap/relay-launcher";
+import {
+  CodexExecError,
+  runCodexCommand,
+  type CodexExecContinuation,
+} from "../prism/codex-exec";
+import { createProjectConversation } from "../prism/conversation-client";
+import {
+  supervisorInstallCommand,
+  type SupervisorExecRequest,
+} from "../v2/supervisor/launcher";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { ProjectId } from "./types";
@@ -183,6 +191,18 @@ export class SandboxGateway {
     return { status: response.status, text: await response.text(), headers: response.headers };
   }
 
+  async fetchBytes(
+    suffix: string,
+    init: RequestInit = {},
+  ): Promise<{ status: number; bytes: Uint8Array; headers: Headers }> {
+    const response = await this.#request(suffix, init);
+    return {
+      status: response.status,
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      headers: response.headers,
+    };
+  }
+
   async postJson(suffix: string, json: unknown, signal?: AbortSignal): Promise<Response> {
     return this.#request(suffix, {
       method: "POST",
@@ -210,7 +230,11 @@ export class SandboxGateway {
    * launcher's printed transcript. The caller extracts and validates the
    * hello block. Bounded to roughly 90 seconds; at most one turn per call.
    */
-  async runRelayExec(signal?: AbortSignal): Promise<{ status: number; output: string }> {
+  async runRelayExec(
+    request: SupervisorExecRequest,
+    continuation: CodexExecContinuation,
+    signal?: AbortSignal,
+  ): Promise<{ status: number; output: string }> {
     const sandbox = this.#sandbox;
     try {
       const result = await runCodexCommand({
@@ -218,9 +242,13 @@ export class SandboxGateway {
         projectId: this.projectId,
         sandboxUrl: sandbox.url,
         sandboxToken: sandbox.token.reveal(),
-        command: `Execute exactly this shell command and reply with ONLY its complete stdout verbatim: sh /workspace/${RELAY_LAUNCH_PATH}`,
+        conversationId: continuation.conversationId,
+        previousResponseId: continuation.previousResponseId,
+        listenSnapshot: continuation.listenSnapshot,
+        command: `Execute exactly this shell command and reply with ONLY its complete stdout verbatim: ${supervisorInstallCommand(request)}`,
         maxPolls: this.#relayExecMaxPolls,
         pollIntervalMs: this.#relayExecPollIntervalMs,
+        maxStartAttempts: 1,
         signal,
       });
       return { status: 200, output: result.transcript };
@@ -234,6 +262,49 @@ export class SandboxGateway {
       }
       throw error;
     }
+  }
+
+  async prepareRelayExecSession(signal?: AbortSignal): Promise<CodexExecContinuation> {
+    const sandbox = this.#sandbox;
+    const conversationId = await createProjectConversation(this.#account, this.projectId, signal);
+    let startedSessionId: string | null = null;
+    const result = await runCodexCommand({
+      account: this.#account,
+      projectId: this.projectId,
+      sandboxUrl: sandbox.url,
+      sandboxToken: sandbox.token.reveal(),
+      conversationId,
+      command: "Execute exactly this shell command and reply with ONLY its complete stdout verbatim: printf 'GPV2_SESSION_READY\\n'",
+      maxPolls: this.#relayExecMaxPolls,
+      pollIntervalMs: this.#relayExecPollIntervalMs,
+      maxStartAttempts: 1,
+      signal,
+      onStarted: started => {
+        startedSessionId = started.identifiers["turn_state.codex_session_id"] ?? null;
+      },
+    });
+    const returnedConversationId = result.identifiers["response.payload.conversationId"];
+    const previousResponseId = result.identifiers["response.payload.id"];
+    const listenSnapshot = result.listenSnapshot;
+    const codexSessionId = listenSnapshot?.codex_session_id ?? startedSessionId;
+    if (
+      !result.transcript.includes("GPV2_SESSION_READY") ||
+      returnedConversationId !== conversationId ||
+      !previousResponseId ||
+      !listenSnapshot ||
+      listenSnapshot.conversation_id !== conversationId ||
+      (listenSnapshot.project_id !== null && listenSnapshot.project_id !== this.projectId) ||
+      !codexSessionId ||
+      codexSessionId !== startedSessionId
+    ) {
+      throw new SandboxGatewayError("Relay session proof is incomplete", 502, "relay-session");
+    }
+    return Object.freeze({
+      conversationId,
+      previousResponseId,
+      listenSnapshot,
+      codexSessionId,
+    });
   }
 
   async #request(

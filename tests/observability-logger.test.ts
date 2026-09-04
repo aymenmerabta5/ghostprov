@@ -5,7 +5,11 @@ import {
   ObservabilityLogger,
   type ObservabilitySink,
 } from "../src/observability/logger";
-import { observabilityEvent, recoveryObservabilityEvent } from "../src/observability/events";
+import {
+  observabilityEvent,
+  recoveryObservabilityEvent,
+  sandboxLivenessObservabilityEvent,
+} from "../src/observability/events";
 import type { ObservabilityConfig } from "../src/observability/config";
 
 function config(overrides: Partial<ObservabilityConfig> = {}): ObservabilityConfig {
@@ -172,11 +176,22 @@ describe("ObservabilityLogger", () => {
       cause: "runtime",
       retry_delay_ms: 1_000,
     }), "progress");
+    logger.emit(sandboxLivenessObservabilityEvent({
+      project_id: "00000000-0000-4000-8000-000000000001",
+      worker_index: 1,
+      transport: "v2",
+      liveness_signal: "heartbeat",
+      liveness_outcome: "failed",
+      error_name: "Error",
+      error_kind: "timeout",
+      consecutive_failures: 1,
+    }), "terminal");
     await logger.close();
 
     expect(sink.events().map(event => event.event)).toEqual([
       "sandbox.recovery.started",
       "prism.circuit.changed",
+      "sandbox.liveness",
       "sandbox.recovery.retry_scheduled",
     ]);
   });

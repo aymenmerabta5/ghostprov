@@ -3,7 +3,11 @@ import {
   assertSafeObservabilityEvent,
   sanitizeDiagnosticMessage,
 } from "../src/observability/redaction";
-import { observabilityEvent, type ObservabilityEvent } from "../src/observability/events";
+import {
+  observabilityEvent,
+  sandboxLivenessObservabilityEvent,
+  type ObservabilityEvent,
+} from "../src/observability/events";
 import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 
 describe("observability privacy", () => {
@@ -116,6 +120,48 @@ describe("observability privacy", () => {
         mono_ms: 100,
         project_id: "e631d12c-d917-4434-b360-41b4715d6679",
         [key]: `SUPER_SECRET_CANARY_${key}`,
+      } as any)).toThrow();
+    }
+  });
+
+  it("accepts only fixed content-free sandbox liveness transitions", () => {
+    const event = sandboxLivenessObservabilityEvent({
+      project_id: "e631d12c-d917-4434-b360-41b4715d6679",
+      worker_index: 3,
+      transport: "v2",
+      liveness_signal: "sidecar_probe",
+      liveness_outcome: "failed",
+      attempt: 2,
+      consecutive_failures: 2,
+      status: null,
+      error_name: "V2TransportLivenessError",
+      error_kind: "timeout",
+      duration_ms: 5_000,
+      heartbeat_age_ms: 18_000,
+      sidecar_peer_age_ms: 20_000,
+      transport_connected: true,
+      reliable_stall: false,
+      awareness_lane: "control",
+      connection_code: 1006,
+    });
+    expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+
+    for (const fields of [
+      { liveness_signal: "private-network-name" },
+      { liveness_outcome: "dump state" },
+      { error_name: "SUPER_SECRET_CANARY" },
+      { error_kind: "private failure text" },
+      { awareness_lane: "secret-lane" },
+      { connection_code: 65_536 },
+      { worker_index: undefined },
+      { duration_ms: Number.POSITIVE_INFINITY },
+      { sidecar_peer_age_ms: -1 },
+      { transport_connected: "yes" },
+      { token: "SUPER_SECRET_CANARY" },
+    ]) {
+      expect(() => assertSafeObservabilityEvent({
+        ...event,
+        ...fields,
       } as any)).toThrow();
     }
   });

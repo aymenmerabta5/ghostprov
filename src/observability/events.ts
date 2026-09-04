@@ -64,6 +64,69 @@ export const RECOVERY_OBSERVABILITY_EVENT_NAMES = [
 export type RecoveryObservabilityEventName =
   typeof RECOVERY_OBSERVABILITY_EVENT_NAMES[number];
 
+export const SANDBOX_LIVENESS_SIGNALS = [
+  "heartbeat",
+  "sidecar_probe",
+  "sidecar_recovery",
+  "awareness",
+] as const;
+export type SandboxLivenessSignal = typeof SANDBOX_LIVENESS_SIGNALS[number];
+
+export const SANDBOX_LIVENESS_OUTCOMES = [
+  "failed",
+  "recovered",
+  "started",
+  "succeeded",
+  "preflight_unavailable",
+  "superseded",
+] as const;
+export type SandboxLivenessOutcome = typeof SANDBOX_LIVENESS_OUTCOMES[number];
+
+export const SANDBOX_LIVENESS_ERROR_NAMES = [
+  "AccountAuthError",
+  "AccountTransportError",
+  "AwarenessChannelError",
+  "Error",
+  "PrismProjectError",
+  "PrismSessionError",
+  "ProvisioningError",
+  "SandboxGatewayError",
+  "SidecarCredentialRotationError",
+  "SplitAwarenessChannelError",
+  "V2SidecarRecoveryPreflightUnavailableError",
+  "V2TransportLivenessError",
+  "YDocSessionError",
+] as const;
+export type SandboxLivenessErrorName = typeof SANDBOX_LIVENESS_ERROR_NAMES[number];
+
+export const SANDBOX_LIVENESS_ERROR_KINDS = [
+  "auth",
+  "account_transport",
+  "closed",
+  "connect",
+  "disconnected",
+  "http",
+  "instance_changed",
+  "other",
+  "preflight_unavailable",
+  "provision_timeout",
+  "provision_transport",
+  "probe_in_flight",
+  "publish",
+  "rate_limit",
+  "reliable_stall",
+  "server",
+  "state",
+  "sync",
+  "timeout",
+  "transport",
+  "unavailable",
+] as const;
+export type SandboxLivenessErrorKind = typeof SANDBOX_LIVENESS_ERROR_KINDS[number];
+
+export const SANDBOX_AWARENESS_LANES = ["data", "control", "unknown"] as const;
+export type SandboxAwarenessLane = typeof SANDBOX_AWARENESS_LANES[number];
+
 /**
  * Recovery events deliberately use bounded categories instead of free-form
  * reasons. Raw exception messages and supervisor reason strings must never be
@@ -279,6 +342,7 @@ export type ObservabilityEventName =
   | "monitor.error"
   | "logger.dropped"
   | "logger.error"
+  | "sandbox.liveness"
   | FleetLifecycleObservabilityEventName
   | RecoveryObservabilityEventName;
 
@@ -319,6 +383,27 @@ export interface RecoveryObservabilityFields {
   circuit_state?: PrismCircuitState;
   circuit_scope?: PrismCircuitScope;
   queued?: number;
+}
+
+/** Fixed, content-free liveness transitions; routine successful probes are omitted. */
+export interface SandboxLivenessObservabilityFields {
+  project_id: string;
+  worker_index: number;
+  transport: SandboxRecoveryTransport;
+  liveness_signal: SandboxLivenessSignal;
+  liveness_outcome: SandboxLivenessOutcome;
+  attempt?: number;
+  consecutive_failures?: number;
+  status?: number | null;
+  error_name?: SandboxLivenessErrorName | null;
+  error_kind?: SandboxLivenessErrorKind | null;
+  duration_ms?: number;
+  heartbeat_age_ms?: number | null;
+  sidecar_peer_age_ms?: number | null;
+  transport_connected?: boolean;
+  reliable_stall?: boolean;
+  awareness_lane?: SandboxAwarenessLane;
+  connection_code?: number | null;
 }
 
 /** Fixed, content-free fields accepted by fleet lifecycle events. */
@@ -465,6 +550,19 @@ export function recoveryObservabilityEvent(
 ): ObservabilityEvent {
   return observabilityEvent(
     event,
+    fields as unknown as Record<string, JsonValue>,
+    now,
+    monoMs,
+  );
+}
+
+export function sandboxLivenessObservabilityEvent(
+  fields: SandboxLivenessObservabilityFields,
+  now = Date.now(),
+  monoMs = performance.now(),
+): ObservabilityEvent {
+  return observabilityEvent(
+    "sandbox.liveness",
     fields as unknown as Record<string, JsonValue>,
     now,
     monoMs,
