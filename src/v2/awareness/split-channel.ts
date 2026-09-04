@@ -8,6 +8,46 @@ export interface SplitAwarenessChannelOptions<TLocal, TRemote> {
   control: AwarenessChannel<TLocal, TRemote>;
 }
 
+export type SplitAwarenessFailureKind =
+  | "auth"
+  | "closed"
+  | "connect"
+  | "disconnected"
+  | "state"
+  | "timeout"
+  | "other";
+
+const SPLIT_AWARENESS_FAILURE_KINDS = new Set<string>([
+  "auth", "closed", "connect", "disconnected", "state", "timeout",
+]);
+
+/** Content-free lane attribution for a post-connect Awareness failure. */
+export class SplitAwarenessChannelError extends Error {
+  readonly name = "SplitAwarenessChannelError";
+  readonly kind: SplitAwarenessFailureKind;
+  readonly connectionCode: number | null;
+
+  constructor(
+    readonly lane: AwarenessLane,
+    cause: Error,
+  ) {
+    super(`Split Awareness ${lane} lane connection failed`, { cause });
+    let kind: unknown;
+    try { kind = "kind" in cause ? cause.kind : undefined; } catch {}
+    this.kind = typeof kind === "string" && SPLIT_AWARENESS_FAILURE_KINDS.has(kind)
+      ? kind as SplitAwarenessFailureKind
+      : "other";
+    let connectionCode: unknown;
+    try {
+      connectionCode = "connectionCode" in cause ? cause.connectionCode : null;
+    } catch {}
+    this.connectionCode = typeof connectionCode === "number" &&
+        Number.isSafeInteger(connectionCode) && connectionCode >= 0 && connectionCode <= 65_535
+      ? connectionCode
+      : null;
+  }
+}
+
 /**
  * Keeps high-volume reliable frames and low-volume ACK/control state on
  * independent Awareness client states while exposing one transport channel.
@@ -33,12 +73,16 @@ implements AwarenessChannel<TLocal, TRemote> {
     this.localPeerId = options.data.localPeerId;
     this.#data = options.data;
     this.#control = options.control;
-    for (const channel of [this.#data, this.#control]) {
+    for (const [lane, channel] of [
+      ["data", this.#data],
+      ["control", this.#control],
+    ] as const) {
       const unsubscribe = channel.onConnectionFailure?.(error => {
         if (this.#closed) return;
         this.#connected = false;
+        const attributed = new SplitAwarenessChannelError(lane, error);
         for (const listener of this.#failureListeners) {
-          try { listener(error); } catch {}
+          try { listener(attributed); } catch {}
         }
       });
       if (unsubscribe) this.#unsubscribeFailures.push(unsubscribe);

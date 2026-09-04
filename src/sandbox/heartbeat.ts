@@ -23,6 +23,30 @@ export interface SandboxHeartbeatOptions {
   onExpired?: (status: number) => void;
   onTransientFailure?: (status: number | null) => void;
   onUnreachable?: (status: number | null) => void;
+  /** Fixed, content-free attempt telemetry. Routine successes may be ignored by callers. */
+  onAttempt?: (diagnostic: SandboxHeartbeatAttemptDiagnostic) => void;
+}
+
+export type SandboxHeartbeatAttemptOutcome =
+  | "success"
+  | "http_error"
+  | "transport_error"
+  | "timeout";
+
+export type SandboxHeartbeatErrorName =
+  | "AccountAuthError"
+  | "AccountTransportError"
+  | "SandboxGatewayError"
+  | "Error";
+
+export interface SandboxHeartbeatAttemptDiagnostic {
+  readonly outcome: SandboxHeartbeatAttemptOutcome;
+  readonly status: number | null;
+  readonly errorName: SandboxHeartbeatErrorName | null;
+  readonly durationMs: number;
+  readonly attempt: number;
+  readonly previousConsecutiveFailures: number;
+  readonly consecutiveFailures: number;
 }
 
 export interface HeartbeatSnapshot {
@@ -41,8 +65,38 @@ export interface HeartbeatSnapshot {
 
 type AttemptOutcome =
   | { type: "result"; result: HeartbeatResult }
-  | { type: "failure" }
+  | {
+      type: "failure";
+      kind: "http" | "transport" | "timeout";
+      errorName: SandboxHeartbeatErrorName;
+      status: number | null;
+    }
   | { type: "stopped" };
+
+function heartbeatErrorName(error: unknown): SandboxHeartbeatErrorName {
+  let name = "Error";
+  try {
+    if (error && typeof error === "object" && "name" in error) name = String(error.name);
+  } catch {}
+  switch (name) {
+    case "AccountAuthError":
+    case "AccountTransportError":
+    case "SandboxGatewayError":
+      return name;
+    default:
+      return "Error";
+  }
+}
+
+function heartbeatErrorStatus(error: unknown): number | null {
+  let status: unknown;
+  try {
+    if (error && typeof error === "object" && "status" in error) status = error.status;
+  } catch {}
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : null;
+}
 
 export function heartbeatPhaseOffset(
   projectId: ProjectId,
@@ -73,6 +127,7 @@ export class SandboxHeartbeat {
   readonly #onExpired?: (status: number) => void;
   readonly #onTransientFailure?: (status: number | null) => void;
   readonly #onUnreachable?: (status: number | null) => void;
+  readonly #onAttempt?: (diagnostic: SandboxHeartbeatAttemptDiagnostic) => void;
   #controller: AbortController | null = null;
   #loop: Promise<void> | null = null;
   #inFlight = false;
@@ -114,6 +169,7 @@ export class SandboxHeartbeat {
     this.#onExpired = options.onExpired;
     this.#onTransientFailure = options.onTransientFailure;
     this.#onUnreachable = options.onUnreachable;
+    this.#onAttempt = options.onAttempt;
   }
 
   start(): void {
@@ -190,6 +246,9 @@ export class SandboxHeartbeat {
   async #attempt(signal: AbortSignal): Promise<AttemptOutcome> {
     if (signal.aborted) return { type: "stopped" };
 
+    const startedAtMs = this.#clock.now();
+    const previousConsecutiveFailures = this.#consecutiveFailures;
+
     const requestController = new AbortController();
     const timeoutController = new AbortController();
     let timeoutCancelled = false;
@@ -215,7 +274,16 @@ export class SandboxHeartbeat {
     }
     const request = gatewayRequest.then(
       result => ({ type: "result", result }) as const,
-      () => ({ type: signal.aborted ? "stopped" : "failure" }) as AttemptOutcome,
+      error => {
+        if (signal.aborted) return { type: "stopped" } as const;
+        const errorName = heartbeatErrorName(error);
+        return {
+          type: "failure",
+          kind: errorName === "AccountAuthError" ? "http" : "transport",
+          errorName,
+          status: heartbeatErrorStatus(error),
+        } as const;
+      },
     );
 
     let timeoutWait: Promise<void>;
@@ -231,12 +299,22 @@ export class SandboxHeartbeat {
       () => {
         if (signal.aborted) return { type: "stopped" } as const;
         requestController.abort();
-        return { type: "failure" } as const;
+        return {
+          type: "failure",
+          kind: "timeout",
+          errorName: "Error",
+          status: null,
+        } as const;
       },
       () => {
         if (signal.aborted || timeoutCancelled) return { type: "stopped" } as const;
         requestController.abort();
-        return { type: "failure" } as const;
+        return {
+          type: "failure",
+          kind: "timeout",
+          errorName: "Error",
+          status: null,
+        } as const;
       },
     );
 
@@ -244,6 +322,30 @@ export class SandboxHeartbeat {
       const outcome = await Promise.race([request, timeout]);
       if (outcome.type === "result") this.#recordResult(outcome.result);
       else if (outcome.type === "failure") this.#recordFailure(null);
+      if (outcome.type !== "stopped") {
+        const status = outcome.type === "result"
+          ? Number.isInteger(outcome.result.status) &&
+              outcome.result.status >= 100 && outcome.result.status <= 599
+            ? outcome.result.status
+            : null
+          : outcome.status;
+        const diagnosticOutcome: SandboxHeartbeatAttemptOutcome = outcome.type === "result"
+          ? outcome.result.ok ? "success" : "http_error"
+          : outcome.kind === "http"
+            ? "http_error"
+            : outcome.kind === "timeout" ? "timeout" : "transport_error";
+        this.#call(this.#onAttempt, {
+          outcome: diagnosticOutcome,
+          status,
+          errorName: diagnosticOutcome === "success"
+            ? null
+            : outcome.type === "failure" ? outcome.errorName : "Error",
+          durationMs: Math.max(0, this.#clock.now() - startedAtMs),
+          attempt: this.#attemptCount,
+          previousConsecutiveFailures,
+          consecutiveFailures: this.#consecutiveFailures,
+        });
+      }
       return outcome;
     } finally {
       signal.removeEventListener("abort", stopAttempt);

@@ -15,6 +15,7 @@ import type {
 import type { SandboxRunOptions } from "../src/sandbox/registry";
 import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
+import { SplitAwarenessChannelError } from "../src/v2/awareness/split-channel";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import type { V2ReadyDescriptor } from "../src/v2/bootstrap/controller";
 import type {
@@ -24,8 +25,9 @@ import type {
   SidecarFrame,
 } from "../src/v2/protocol/shared";
 import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
-import type {
-  V2TransportSnapshot,
+import {
+  V2TransportLivenessError,
+  type V2TransportSnapshot,
 } from "../src/v2/transport/session";
 import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
 import {
@@ -40,6 +42,7 @@ import {
   type V2RuntimeHeartbeat,
   type V2RuntimeHeartbeatCallbacks,
   type V2RuntimeHeartbeatResult,
+  type V2RuntimeLivenessDiagnostic,
   type V2RuntimeTransport,
   type V2RuntimeYDoc,
 } from "../src/v2/runtime";
@@ -381,6 +384,7 @@ function runtimeHarness(options: {
   let gatewayRotations = 0;
   let refreshedSandboxToken: string | null = null;
   const credentialOutcomes: string[] = [];
+  const livenessDiagnostics: V2RuntimeLivenessDiagnostic[] = [];
   const sandboxFailures: ProvisionedSandbox[] = [];
   const sandboxReady: ProvisionedSandbox[] = [];
   const awarenessCredentials: Array<{ sandboxToken: string; ySweetToken: string }> = [];
@@ -501,6 +505,7 @@ function runtimeHarness(options: {
     sidecarSuspectRecheckMs: options.sidecarSuspectRecheckMs,
     initialSandbox: options.initialSandbox,
     onCredentialRefresh: outcome => credentialOutcomes.push(outcome),
+    onLivenessDiagnostic: diagnostic => livenessDiagnostics.push(diagnostic),
     createGateway: (_sandbox: ProvisionedSandbox) => ({
       heartbeat: async () => {
         gatewayHeartbeats++;
@@ -599,6 +604,7 @@ function runtimeHarness(options: {
     gatewayRotations: () => gatewayRotations,
     refreshedSandboxToken: () => refreshedSandboxToken,
     credentialOutcomes,
+    livenessDiagnostics,
     sandboxFailures,
     sandboxReady,
     awarenessCredentials,
@@ -611,6 +617,9 @@ function runtimeHarness(options: {
       durationMs: 1,
       sessionId: "sandbox-session-1",
     }),
+    heartbeatAttempt: (
+      diagnostic: Parameters<V2RuntimeHeartbeatCallbacks["onAttempt"]>[0],
+    ) => heartbeatCallbacks?.onAttempt(diagnostic),
     heartbeatExpired: (status = 401) => heartbeatCallbacks?.onExpired(status),
     heartbeatAuthenticationFailure: (status = 401, signal = new AbortController().signal) =>
       heartbeatCallbacks?.onAuthenticationFailure(status, signal),
@@ -925,6 +934,62 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it("records heartbeat failure mode and recovery without logging routine success", async () => {
+    const harness = runtimeHarness();
+    await harness.runtime.start();
+
+    harness.heartbeatAttempt({
+      outcome: "success",
+      status: 200,
+      errorName: null,
+      durationMs: 20,
+      attempt: 1,
+      previousConsecutiveFailures: 0,
+      consecutiveFailures: 0,
+    });
+    expect(harness.livenessDiagnostics).toEqual([]);
+
+    harness.heartbeatAttempt({
+      outcome: "transport_error",
+      status: null,
+      errorName: "AccountTransportError",
+      durationMs: 5_000,
+      attempt: 2,
+      previousConsecutiveFailures: 0,
+      consecutiveFailures: 1,
+    });
+    harness.heartbeatAttempt({
+      outcome: "success",
+      status: 200,
+      errorName: null,
+      durationMs: 120,
+      attempt: 3,
+      previousConsecutiveFailures: 1,
+      consecutiveFailures: 0,
+    });
+
+    expect(harness.livenessDiagnostics).toMatchObject([
+      {
+        signal: "heartbeat",
+        outcome: "failed",
+        errorName: "AccountTransportError",
+        errorKind: "transport",
+        durationMs: 5_000,
+        heartbeatAgeMs: 0,
+        transportConnected: true,
+      },
+      {
+        signal: "heartbeat",
+        outcome: "recovered",
+        status: 200,
+        errorName: null,
+        errorKind: null,
+        durationMs: 120,
+      },
+    ]);
+    await harness.runtime.stop();
+  });
+
   it("becomes synchronously unroutable on heartbeat expiry without draining", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();
@@ -1153,7 +1218,7 @@ describe("V2SandboxRuntime", () => {
   });
 
   it("removes capacity on a missed sidecar probe, heals, then fails after three misses", async () => {
-    const miss = () => new Error("sidecar pong timed out");
+    const miss = () => new V2TransportLivenessError("sidecar pong timed out", "timeout");
     const harness = runtimeHarness({
       livenessOutcomes: [null, miss(), null, miss(), miss(), miss()],
     });
@@ -1192,6 +1257,20 @@ describe("V2SandboxRuntime", () => {
       },
     });
     expect(harness.transport.livenessProbes).toBe(6);
+    expect(harness.livenessDiagnostics.map(event => ({
+      signal: event.signal,
+      outcome: event.outcome,
+      attempt: event.attempt,
+      errorKind: event.errorKind,
+    }))).toEqual([
+      { signal: "sidecar_probe", outcome: "failed", attempt: 1, errorKind: "timeout" },
+      { signal: "sidecar_probe", outcome: "recovered", attempt: 2, errorKind: undefined },
+      { signal: "sidecar_probe", outcome: "failed", attempt: 1, errorKind: "timeout" },
+      { signal: "sidecar_probe", outcome: "failed", attempt: 2, errorKind: "timeout" },
+      { signal: "sidecar_probe", outcome: "failed", attempt: 3, errorKind: "timeout" },
+      { signal: "sidecar_recovery", outcome: "started", attempt: 3, errorKind: undefined },
+      { signal: "sidecar_recovery", outcome: "failed", attempt: 3, errorKind: "other" },
+    ]);
     await harness.runtime.stop();
   });
 
@@ -1308,6 +1387,13 @@ describe("V2SandboxRuntime", () => {
       capacity: 0,
       availabilityReason: "sidecar_suspect",
       failure: null,
+    });
+    expect(harness.livenessDiagnostics.at(-1)).toMatchObject({
+      signal: "sidecar_recovery",
+      outcome: "preflight_unavailable",
+      status: 503,
+      errorName: "V2SidecarRecoveryPreflightUnavailableError",
+      errorKind: "http",
     });
     expect(harness.sandboxFailures).toHaveLength(0);
     await harness.runtime.stop();
@@ -1469,6 +1555,11 @@ describe("V2SandboxRuntime", () => {
     for (let turn = 0; turn < 200 && harness.transports.length < 2; turn++) {
       await Promise.resolve();
     }
+    for (
+      let turn = 0;
+      turn < 50 && harness.livenessDiagnostics.at(-1)?.outcome !== "succeeded";
+      turn++
+    ) await Promise.resolve();
     expect(harness.runtime.snapshot().state).toBe("ready");
 
     expect(harness.provisions()).toBe(1);
@@ -1509,11 +1600,48 @@ describe("V2SandboxRuntime", () => {
       await Promise.resolve();
     }
 
+    for (
+      let turn = 0;
+      turn < 50 && harness.livenessDiagnostics.at(-1)?.outcome !== "succeeded";
+      turn++
+    ) await Promise.resolve();
+
     expect(harness.transport.livenessProbes).toBe(1);
     expect(harness.transport.recoverySuspends).toBe(1);
     expect(harness.transports).toHaveLength(2);
     expect(harness.transports[1]!.recoveryAdopts).toBe(1);
     expect(harness.runtime.snapshot().state).toBe("ready");
+    expect(harness.livenessDiagnostics.map(event => ({
+      signal: event.signal,
+      outcome: event.outcome,
+      errorKind: event.errorKind,
+      reliableStall: event.reliableStall,
+    }))).toEqual([
+      {
+        signal: "sidecar_probe",
+        outcome: "failed",
+        errorKind: "reliable_stall",
+        reliableStall: true,
+      },
+      {
+        signal: "sidecar_probe",
+        outcome: "failed",
+        errorKind: "reliable_stall",
+        reliableStall: true,
+      },
+      {
+        signal: "sidecar_recovery",
+        outcome: "started",
+        errorKind: undefined,
+        reliableStall: true,
+      },
+      {
+        signal: "sidecar_recovery",
+        outcome: "succeeded",
+        errorKind: undefined,
+        reliableStall: undefined,
+      },
+    ]);
     await harness.runtime.stop();
   });
 
@@ -1721,11 +1849,19 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
     expect(harness.runtime.snapshot().capacity).toBe(128);
 
-    harness.awareness.fail(new Error("revoked Y-Sweet connection"));
+    harness.awareness.fail(new SplitAwarenessChannelError(
+      "control",
+      new AwarenessChannelError("synthetic disconnect", "disconnected", 1006),
+    ));
     expect(harness.runtime.snapshot()).toMatchObject({ capacity: 0, available: 0 });
     for (let turn = 0; turn < 300 && harness.runtime.snapshot().capacity === 0; turn++) {
       await Promise.resolve();
     }
+    for (
+      let turn = 0;
+      turn < 50 && harness.livenessDiagnostics.at(-1)?.outcome !== "succeeded";
+      turn++
+    ) await Promise.resolve();
 
     expect(harness.ySweetMints()).toBe(1);
     expect(harness.transport.rotations).toBe(1);
@@ -1735,6 +1871,39 @@ describe("V2SandboxRuntime", () => {
     expect(harness.runtime.snapshot().capacity).toBe(128);
     expect(harness.transports).toHaveLength(1);
     expect(harness.provisions()).toBe(1);
+    expect(harness.livenessDiagnostics.map(event => ({
+      signal: event.signal,
+      outcome: event.outcome,
+      errorName: event.errorName,
+      errorKind: event.errorKind,
+      lane: event.awarenessLane,
+      connectionCode: event.connectionCode,
+    }))).toEqual([
+      {
+        signal: "awareness",
+        outcome: "failed",
+        errorName: "SplitAwarenessChannelError",
+        errorKind: "disconnected",
+        lane: "control",
+        connectionCode: 1006,
+      },
+      {
+        signal: "awareness",
+        outcome: "started",
+        errorName: undefined,
+        errorKind: undefined,
+        lane: undefined,
+        connectionCode: undefined,
+      },
+      {
+        signal: "awareness",
+        outcome: "succeeded",
+        errorName: undefined,
+        errorKind: undefined,
+        lane: undefined,
+        connectionCode: undefined,
+      },
+    ]);
     await harness.runtime.stop();
   });
 

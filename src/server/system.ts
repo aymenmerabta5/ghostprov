@@ -75,6 +75,7 @@ import {
   fleetLifecycleObservabilityEvent,
   observabilityEvent,
   recoveryObservabilityEvent,
+  sandboxLivenessObservabilityEvent,
   type JsonValue,
 } from "../observability/events";
 import { FleetSampler } from "../observability/sampler";
@@ -520,6 +521,27 @@ function defaultRuntimeFactory(options: {
           credential_refresh_outcome: outcome,
         }), "progress");
       },
+      onLivenessDiagnostic: diagnostic => {
+        logger.emit(sandboxLivenessObservabilityEvent({
+          project_id: projectId,
+          worker_index: workerIndex,
+          transport: "v2",
+          liveness_signal: diagnostic.signal,
+          liveness_outcome: diagnostic.outcome,
+          attempt: diagnostic.attempt,
+          consecutive_failures: diagnostic.consecutiveFailures,
+          status: diagnostic.status,
+          error_name: diagnostic.errorName,
+          error_kind: diagnostic.errorKind,
+          duration_ms: diagnostic.durationMs,
+          heartbeat_age_ms: diagnostic.heartbeatAgeMs,
+          sidecar_peer_age_ms: diagnostic.sidecarPeerAgeMs,
+          transport_connected: diagnostic.transportConnected,
+          reliable_stall: diagnostic.reliableStall,
+          awareness_lane: diagnostic.awarenessLane,
+          connection_code: diagnostic.connectionCode,
+        }), "terminal");
+      },
       gzip,
       createGateway: sandbox => new SandboxGateway({
         projectId,
@@ -536,6 +558,7 @@ function defaultRuntimeFactory(options: {
             onExpired: callbacks.onExpired,
             onTransientFailure: callbacks.onTransientFailure,
             onUnreachable: callbacks.onUnreachable,
+            onAttempt: callbacks.onAttempt,
           }),
       createYDoc: credentials => {
         let first = true;

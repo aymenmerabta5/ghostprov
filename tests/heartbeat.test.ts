@@ -172,6 +172,15 @@ describe("SandboxHeartbeat", () => {
       });
     });
     const transient: Array<number | null> = [];
+    const attempts: Array<{
+      outcome: string;
+      status: number | null;
+      errorName: string | null;
+      durationMs: number;
+      attempt: number;
+      previousConsecutiveFailures: number;
+      consecutiveFailures: number;
+    }> = [];
     const heartbeat = new SandboxHeartbeat({
       projectId: PROJECTS[0],
       gateway,
@@ -179,6 +188,7 @@ describe("SandboxHeartbeat", () => {
       initialDelayMs: 10_000,
       requestTimeoutMs: 2_500,
       onTransientFailure: status => transient.push(status),
+      onAttempt: diagnostic => attempts.push(diagnostic),
     });
 
     heartbeat.start();
@@ -198,6 +208,15 @@ describe("SandboxHeartbeat", () => {
       lastStatus: null,
       inFlight: false,
     });
+    expect(attempts).toEqual([{
+      outcome: "timeout",
+      status: null,
+      errorName: "Error",
+      durationMs: 2_500,
+      attempt: 1,
+      previousConsecutiveFailures: 0,
+      consecutiveFailures: 1,
+    }]);
 
     await clock.advanceBy(7_500);
     expect(gateway.calls).toEqual([10_000, 20_000]);
@@ -346,6 +365,7 @@ describe("SandboxHeartbeat", () => {
     });
     const transient: Array<number | null> = [];
     const unreachable: Array<number | null> = [];
+    const attemptOutcomes: string[] = [];
     const heartbeat = new SandboxHeartbeat({
       projectId: PROJECTS[0],
       gateway,
@@ -354,6 +374,7 @@ describe("SandboxHeartbeat", () => {
       consecutiveTransientFailureThreshold: 3,
       onTransientFailure: status => transient.push(status),
       onUnreachable: status => unreachable.push(status),
+      onAttempt: diagnostic => attemptOutcomes.push(diagnostic.outcome),
     });
 
     heartbeat.start();
@@ -371,6 +392,16 @@ describe("SandboxHeartbeat", () => {
     await clock.advanceBy(10_000);
     expect(unreachable).toEqual([502, 503]);
     expect(transient).toEqual([503, null, 502, 500, 503, 503, 503]);
+    expect(attemptOutcomes).toEqual([
+      "http_error",
+      "transport_error",
+      "http_error",
+      "http_error",
+      "success",
+      "http_error",
+      "http_error",
+      "http_error",
+    ]);
     await heartbeat.stop();
   });
 

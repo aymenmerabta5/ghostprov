@@ -32,9 +32,16 @@ export class AwarenessChannelError extends Error {
   constructor(
     message: string,
     readonly kind: "closed" | "connect" | "timeout" | "state" | "disconnected" | "auth",
+    connectionCode: number | null = null,
   ) {
     super(message);
+    this.connectionCode = Number.isSafeInteger(connectionCode) &&
+        connectionCode !== null && connectionCode >= 0 && connectionCode <= 65_535
+      ? connectionCode
+      : null;
   }
+
+  readonly connectionCode: number | null;
 }
 
 export interface YSweetAwarenessChannelOptions<TRemote> {
@@ -285,14 +292,17 @@ implements AwarenessChannel<TLocal, TRemote> {
       status?: unknown;
       code?: unknown;
     } | undefined;
-    const status = typeof candidate?.status === "number"
+    const connectionCode = typeof candidate?.status === "number"
       ? candidate.status
       : typeof candidate?.code === "number"
         ? candidate.code
         : null;
     return new AwarenessChannelError(
       message,
-      status === 401 || status === 403 ? "auth" : postSync ? "disconnected" : "connect",
+      connectionCode === 401 || connectionCode === 403
+        ? "auth"
+        : postSync ? "disconnected" : "connect",
+      connectionCode,
     );
   }
 

@@ -9,7 +9,12 @@ import {
   PRISM_CIRCUIT_SCOPES,
   PRISM_CIRCUIT_STATES,
   RECOVERY_OBSERVABILITY_EVENT_NAMES,
+  SANDBOX_AWARENESS_LANES,
   SANDBOX_AVAILABILITY_REASONS,
+  SANDBOX_LIVENESS_ERROR_KINDS,
+  SANDBOX_LIVENESS_ERROR_NAMES,
+  SANDBOX_LIVENESS_OUTCOMES,
+  SANDBOX_LIVENESS_SIGNALS,
   ROUTER_QUEUE_CLASSES,
   SANDBOX_RECOVERY_CAUSES,
   SANDBOX_RECOVERY_ERROR_KINDS,
@@ -100,6 +105,25 @@ const FLEET_LIFECYCLE_FIELDS = new Set([
   "cold_in_use",
   "cold_queued",
 ]);
+const LIVENESS_FIELDS = new Set([
+  "project_id",
+  "worker_index",
+  "transport",
+  "liveness_signal",
+  "liveness_outcome",
+  "attempt",
+  "consecutive_failures",
+  "status",
+  "error_name",
+  "error_kind",
+  "duration_ms",
+  "heartbeat_age_ms",
+  "sidecar_peer_age_ms",
+  "transport_connected",
+  "reliable_stall",
+  "awareness_lane",
+  "connection_code",
+]);
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release"]),
   "server.stopping": new Set(["reason", "active", "queued"]),
@@ -117,6 +141,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
   "logger.error": new Set(["sink", "error_name", "error_message", "count"]),
+  "sandbox.liveness": LIVENESS_FIELDS,
   "fleet.replacement.qualified": FLEET_LIFECYCLE_FIELDS,
   "fleet.replacement.started": FLEET_LIFECYCLE_FIELDS,
   "fleet.replacement.successor_reserved": FLEET_LIFECYCLE_FIELDS,
@@ -182,6 +207,12 @@ const FLEET_LIFECYCLE_INTEGER_FIELDS = new Set([
   "cold_in_use",
   "cold_queued",
 ]);
+const LIVENESS_SIGNAL_SET = new Set<string>(SANDBOX_LIVENESS_SIGNALS);
+const LIVENESS_OUTCOME_SET = new Set<string>(SANDBOX_LIVENESS_OUTCOMES);
+const LIVENESS_ERROR_NAME_SET = new Set<string>(SANDBOX_LIVENESS_ERROR_NAMES);
+const LIVENESS_ERROR_KIND_SET = new Set<string>(SANDBOX_LIVENESS_ERROR_KINDS);
+const AWARENESS_LANE_SET = new Set<string>(SANDBOX_AWARENESS_LANES);
+const LIVENESS_TRANSPORT_SET = new Set<string>(SANDBOX_RECOVERY_TRANSPORTS);
 const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
   "error_name",
   "error_kind",
@@ -354,6 +385,73 @@ function assertSafeFleetLifecycleFields(event: ObservabilityEvent): void {
   }
 }
 
+function assertSafeLivenessFields(event: ObservabilityEvent): void {
+  if (typeof event.project_id !== "string" || !PROJECT_ID.test(event.project_id)) {
+    throw new TypeError("Liveness observability project_id is invalid");
+  }
+  if (typeof event.worker_index !== "number" ||
+      !Number.isSafeInteger(event.worker_index) || event.worker_index < 0) {
+    throw new TypeError("Liveness observability worker_index must be a non-negative integer");
+  }
+  for (const key of ["attempt", "consecutive_failures"] as const) {
+    const value = event[key];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`Liveness observability ${key} must be a non-negative integer`);
+    }
+  }
+  if (typeof event.transport !== "string" || !LIVENESS_TRANSPORT_SET.has(event.transport)) {
+    throw new TypeError("Liveness observability transport is invalid");
+  }
+  if (typeof event.liveness_signal !== "string" ||
+      !LIVENESS_SIGNAL_SET.has(event.liveness_signal)) {
+    throw new TypeError("Liveness observability signal is invalid");
+  }
+  if (typeof event.liveness_outcome !== "string" ||
+      !LIVENESS_OUTCOME_SET.has(event.liveness_outcome)) {
+    throw new TypeError("Liveness observability outcome is invalid");
+  }
+  if (event.status !== undefined && event.status !== null &&
+      (typeof event.status !== "number" || !Number.isInteger(event.status) ||
+        event.status < 100 || event.status > 599)) {
+    throw new TypeError("Liveness observability status is invalid");
+  }
+  if (event.error_name !== undefined && event.error_name !== null &&
+      (typeof event.error_name !== "string" ||
+        !LIVENESS_ERROR_NAME_SET.has(event.error_name))) {
+    throw new TypeError("Liveness observability error_name is invalid");
+  }
+  if (event.error_kind !== undefined && event.error_kind !== null &&
+      (typeof event.error_kind !== "string" ||
+        !LIVENESS_ERROR_KIND_SET.has(event.error_kind))) {
+    throw new TypeError("Liveness observability error_kind is invalid");
+  }
+  for (const key of ["duration_ms", "heartbeat_age_ms", "sidecar_peer_age_ms"] as const) {
+    const value = event[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new TypeError(`Liveness observability ${key} must be a non-negative number`);
+    }
+  }
+  for (const key of ["transport_connected", "reliable_stall"] as const) {
+    const value = event[key];
+    if (value !== undefined && typeof value !== "boolean") {
+      throw new TypeError(`Liveness observability ${key} must be boolean`);
+    }
+  }
+  if (event.awareness_lane !== undefined &&
+      (typeof event.awareness_lane !== "string" ||
+        !AWARENESS_LANE_SET.has(event.awareness_lane))) {
+    throw new TypeError("Liveness observability awareness_lane is invalid");
+  }
+  if (event.connection_code !== undefined && event.connection_code !== null &&
+      (typeof event.connection_code !== "number" ||
+        !Number.isSafeInteger(event.connection_code) ||
+        event.connection_code < 0 || event.connection_code > 65_535)) {
+    throw new TypeError("Liveness observability connection_code is invalid");
+  }
+}
+
 function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
   if (
     event.event !== "request.queued" &&
@@ -522,4 +620,5 @@ export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
   assertSafeFleetRelease(event);
   if (RECOVERY_EVENTS.has(event.event)) assertSafeRecoveryFields(event);
   if (FLEET_LIFECYCLE_EVENTS.has(event.event)) assertSafeFleetLifecycleFields(event);
+  if (event.event === "sandbox.liveness") assertSafeLivenessFields(event);
 }

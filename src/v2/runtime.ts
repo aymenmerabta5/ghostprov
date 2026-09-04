@@ -18,6 +18,7 @@ import type {
   SandboxRunOptions,
 } from "../sandbox/registry";
 import { describeSandboxFailure } from "../sandbox/failure";
+import type { SandboxHeartbeatAttemptDiagnostic } from "../sandbox/heartbeat";
 import { hasFreshExactSidecarLiveness } from "../sandbox/liveness";
 import type { ProjectId } from "../sandbox/types";
 import type { AwarenessChannel } from "./awareness/channel";
@@ -28,7 +29,14 @@ import type {
   SidecarFrame,
 } from "./protocol/shared";
 import type { V2SidecarAssets } from "./sidecar/assets";
-import type { CredentialRefreshOutcome } from "../observability/events";
+import type {
+  CredentialRefreshOutcome,
+  SandboxAwarenessLane,
+  SandboxLivenessErrorKind,
+  SandboxLivenessErrorName,
+  SandboxLivenessOutcome,
+  SandboxLivenessSignal,
+} from "../observability/events";
 import type {
   V2GzipOptions,
   V2SidecarRecoveryToken,
@@ -91,10 +99,100 @@ function reliableTransportStalled(
 
 class V2SidecarRecoveryPreflightUnavailableError extends Error {
   readonly name = "V2SidecarRecoveryPreflightUnavailableError";
+  readonly status: number | null;
 
-  constructor(cause?: unknown) {
+  constructor(
+    status: number | null = null,
+    cause?: unknown,
+  ) {
     super("V2 sidecar recovery preflight is temporarily unavailable", { cause });
+    this.status = normalizedHttpStatus(status);
   }
+}
+
+function livenessErrorName(error: unknown): SandboxLivenessErrorName {
+  let name = "Error";
+  try {
+    if (error && typeof error === "object" && "name" in error) name = String(error.name);
+  } catch {}
+  switch (name) {
+    case "AccountAuthError":
+    case "AccountTransportError":
+    case "AwarenessChannelError":
+    case "PrismProjectError":
+    case "PrismSessionError":
+    case "ProvisioningError":
+    case "SandboxGatewayError":
+    case "SidecarCredentialRotationError":
+    case "SplitAwarenessChannelError":
+    case "V2SidecarRecoveryPreflightUnavailableError":
+    case "V2TransportLivenessError":
+    case "YDocSessionError":
+      return name;
+    default:
+      return "Error";
+  }
+}
+
+function livenessErrorKind(
+  error: unknown,
+  fallback: SandboxLivenessErrorKind = "other",
+): SandboxLivenessErrorKind {
+  let kind: string | null = null;
+  try {
+    if (error && typeof error === "object") {
+      if ("kind" in error) kind = String(error.kind);
+      else if ("code" in error) kind = String(error.code);
+    }
+  } catch {}
+  switch (kind) {
+    case "account_transport":
+    case "auth":
+    case "closed":
+    case "connect":
+    case "disconnected":
+    case "instance_changed":
+    case "probe_in_flight":
+    case "provision_timeout":
+    case "provision_transport":
+    case "publish":
+    case "rate_limit":
+    case "server":
+    case "state":
+    case "sync":
+    case "timeout":
+    case "transport":
+    case "unavailable":
+      return kind;
+    default: {
+      let name: string | null = null;
+      try {
+        if (error && typeof error === "object" && "name" in error) name = String(error.name);
+      } catch {}
+      if (name === "TimeoutError") return "timeout";
+      return fallback;
+    }
+  }
+}
+
+function livenessAwarenessLane(error: unknown): SandboxAwarenessLane {
+  let lane = "unknown";
+  try {
+    if (error && typeof error === "object" && "lane" in error) lane = String(error.lane);
+  } catch {}
+  return lane === "data" || lane === "control" ? lane : "unknown";
+}
+
+function livenessConnectionCode(error: unknown): number | null {
+  let code: unknown;
+  try {
+    if (error && typeof error === "object" && "connectionCode" in error) {
+      code = error.connectionCode;
+    }
+  } catch {}
+  return typeof code === "number" && Number.isSafeInteger(code) && code >= 0 && code <= 65_535
+    ? code
+    : null;
 }
 
 function transientRecoveryPreflightStatus(status: number): boolean {
@@ -149,6 +247,7 @@ export interface V2RuntimeHeartbeat {
 }
 
 export interface V2RuntimeHeartbeatCallbacks {
+  onAttempt(diagnostic: SandboxHeartbeatAttemptDiagnostic): void;
   onSuccess(result: V2RuntimeHeartbeatResult): void;
   onAuthenticationFailure(
     status: number,
@@ -157,6 +256,23 @@ export interface V2RuntimeHeartbeatCallbacks {
   onExpired(status: number): void;
   onTransientFailure(status: number | null): void;
   onUnreachable(status: number | null): void;
+}
+
+export interface V2RuntimeLivenessDiagnostic {
+  readonly signal: SandboxLivenessSignal;
+  readonly outcome: SandboxLivenessOutcome;
+  readonly attempt?: number;
+  readonly consecutiveFailures?: number;
+  readonly status?: number | null;
+  readonly errorName?: SandboxLivenessErrorName | null;
+  readonly errorKind?: SandboxLivenessErrorKind | null;
+  readonly durationMs?: number;
+  readonly heartbeatAgeMs?: number | null;
+  readonly sidecarPeerAgeMs?: number | null;
+  readonly transportConnected?: boolean;
+  readonly reliableStall?: boolean;
+  readonly awarenessLane?: SandboxAwarenessLane;
+  readonly connectionCode?: number | null;
 }
 
 export type V2RuntimeLifecycleFailureKind =
@@ -285,6 +401,7 @@ export interface V2SandboxRuntimeOptions {
     outcome: CredentialRefreshOutcome,
     status: number,
   ): void;
+  onLivenessDiagnostic?(diagnostic: V2RuntimeLivenessDiagnostic): void;
   createGateway(sandbox: ProvisionedSandbox): V2RuntimeGateway;
   createHeartbeat(
     gateway: V2RuntimeGateway,
@@ -747,6 +864,30 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       };
       this.#refreshSandboxAuthentication = refreshAuthentication;
       heartbeat = this.#options.createHeartbeat(gateway, {
+        onAttempt: diagnostic => {
+          if (!callbackIsCurrent()) return;
+          const recovered = diagnostic.outcome === "success" &&
+            diagnostic.previousConsecutiveFailures > 0;
+          if (diagnostic.outcome === "success" && !recovered) return;
+          const errorKind: SandboxLivenessErrorKind | null =
+            diagnostic.outcome === "http_error"
+              ? "http"
+              : diagnostic.outcome === "timeout"
+                ? "timeout"
+                : diagnostic.outcome === "transport_error"
+                  ? "transport"
+                  : null;
+          this.#notifyLiveness({
+            signal: "heartbeat",
+            outcome: recovered ? "recovered" : "failed",
+            attempt: diagnostic.attempt,
+            consecutiveFailures: diagnostic.consecutiveFailures,
+            status: diagnostic.status,
+            errorName: recovered ? null : diagnostic.errorName,
+            errorKind,
+            durationMs: diagnostic.durationMs,
+          });
+        },
         onSuccess: () => {
           if (!callbackIsCurrent()) return;
           this.#credentialRefreshPending = false;
@@ -970,6 +1111,15 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     let recheckSourceBeforeRelaunch = false;
     let deadline = this.#clock.now() + this.#sidecarProbePeriodMs;
     const recover = async (): Promise<boolean> => {
+      const startedAtMs = this.#clock.now();
+      const recoveryAttempt = Math.max(consecutiveFailures, consecutiveReliableStalls, 1);
+      this.#notifyLiveness({
+        signal: "sidecar_recovery",
+        outcome: "started",
+        attempt: recoveryAttempt,
+        consecutiveFailures,
+        reliableStall: consecutiveReliableStalls > 0,
+      });
       try {
         monitoredTransport = await this.#relaunchSidecar(
           generation,
@@ -982,6 +1132,13 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         consecutiveReliableStalls = 0;
         this.#sidecarSuspect = false;
         this.#emit();
+        this.#notifyLiveness({
+          signal: "sidecar_recovery",
+          outcome: "succeeded",
+          attempt: recoveryAttempt,
+          consecutiveFailures: 0,
+          durationMs: Math.max(0, this.#clock.now() - startedAtMs),
+        });
         return true;
       } catch (relaunchError) {
         if (signal.aborted || generation !== this.#generation) return false;
@@ -996,8 +1153,28 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           this.#sidecarSuspect = true;
           this.#runtimeHealth.record("unhealthy");
           this.#emit();
+          this.#notifyLiveness({
+            signal: "sidecar_recovery",
+            outcome: "preflight_unavailable",
+            attempt: recoveryAttempt,
+            consecutiveFailures: 0,
+            status: relaunchError.status,
+            errorName: livenessErrorName(relaunchError),
+            errorKind: relaunchError.status === null ? "transport" : "http",
+            durationMs: Math.max(0, this.#clock.now() - startedAtMs),
+          });
           return true;
         }
+        this.#notifyLiveness({
+          signal: "sidecar_recovery",
+          outcome: "failed",
+          attempt: recoveryAttempt,
+          consecutiveFailures,
+          errorName: livenessErrorName(relaunchError),
+          errorKind: livenessErrorKind(relaunchError),
+          durationMs: Math.max(0, this.#clock.now() - startedAtMs),
+          reliableStall: consecutiveReliableStalls > 0,
+        });
         this.#failGeneration(
           generation,
           new V2RuntimeLifecycleFailure("sidecar_unreachable", null, {
@@ -1016,10 +1193,21 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       }
       if (signal.aborted || generation !== this.#generation) return;
       let reliableStallReady = false;
+      const probeStartedAtMs = this.#clock.now();
       try {
         const diagnostics = monitoredTransport.snapshot().diagnostics?.host;
         if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs)) {
           consecutiveReliableStalls++;
+          this.#notifyLiveness({
+            signal: "sidecar_probe",
+            outcome: "failed",
+            attempt: consecutiveReliableStalls,
+            consecutiveFailures,
+            errorName: "Error",
+            errorKind: "reliable_stall",
+            durationMs: Math.max(0, this.#clock.now() - probeStartedAtMs),
+            reliableStall: true,
+          });
           if (!this.#sidecarSuspect) {
             this.#sidecarSuspect = true;
             this.#emit();
@@ -1035,6 +1223,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           acceleratedRecheck = true;
         } else {
           consecutiveReliableStalls = 0;
+          const priorFailures = consecutiveFailures;
+          const wasSuspect = this.#sidecarSuspect;
           await monitoredTransport.probeLiveness!(signal);
           if (generation !== this.#generation) return;
           consecutiveFailures = 0;
@@ -1042,13 +1232,34 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             this.#sidecarSuspect = false;
             this.#emit();
           }
+          if (priorFailures > 0 || wasSuspect) {
+            this.#notifyLiveness({
+              signal: "sidecar_probe",
+              outcome: "recovered",
+              attempt: priorFailures + 1,
+              consecutiveFailures: 0,
+              durationMs: Math.max(0, this.#clock.now() - probeStartedAtMs),
+            });
+          }
         }
       } catch (error) {
         if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           return;
         }
         if (generation !== this.#generation) return;
-        if (!reliableStallReady) consecutiveFailures++;
+        if (!reliableStallReady) {
+          consecutiveFailures++;
+          this.#notifyLiveness({
+            signal: "sidecar_probe",
+            outcome: "failed",
+            attempt: consecutiveFailures,
+            consecutiveFailures,
+            errorName: livenessErrorName(error),
+            errorKind: livenessErrorKind(error),
+            durationMs: Math.max(0, this.#clock.now() - probeStartedAtMs),
+            reliableStall: false,
+          });
+        }
         if (!this.#sidecarSuspect) {
           this.#sidecarSuspect = true;
           this.#emit();
@@ -1298,7 +1509,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           throw error;
         }
-        throw new V2SidecarRecoveryPreflightUnavailableError(error);
+        throw new V2SidecarRecoveryPreflightUnavailableError(null, error);
       }
     };
     let heartbeat = await heartbeatOnce();
@@ -1314,7 +1525,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }
     if (!heartbeat.ok) {
       if (transientRecoveryPreflightStatus(heartbeat.status)) {
-        throw new V2SidecarRecoveryPreflightUnavailableError();
+        throw new V2SidecarRecoveryPreflightUnavailableError(heartbeat.status);
       }
       throw new Error("Sandbox heartbeat failed before sidecar recovery");
     }
@@ -1452,7 +1663,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     generation: number,
   ): void {
     this.#awarenessFailureUnsubscribe?.();
-    this.#awarenessFailureUnsubscribe = awareness.onConnectionFailure?.(() => {
+    this.#awarenessFailureUnsubscribe = awareness.onConnectionFailure?.(error => {
       if (
         generation !== this.#generation ||
         awareness !== this.#awareness ||
@@ -1463,6 +1674,15 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#ySweetRefreshRequested = true;
       this.#wakeYSweetRefresh?.();
       this.#emit();
+      this.#notifyLiveness({
+        signal: "awareness",
+        outcome: "failed",
+        attempt: this.#awarenessFailureVersion,
+        errorName: livenessErrorName(error),
+        errorKind: livenessErrorKind(error),
+        awarenessLane: livenessAwarenessLane(error),
+        connectionCode: livenessConnectionCode(error),
+      });
     }) ?? null;
   }
 
@@ -1524,6 +1744,15 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         !transport?.rotateCredential || !awareness
       ) {
         return;
+      }
+      const reconnectAttempt = this.#ySweetReconnectPending;
+      const reconnectStartedAtMs = this.#clock.now();
+      if (reconnectAttempt) {
+        this.#notifyLiveness({
+          signal: "awareness",
+          outcome: "started",
+          attempt: this.#awarenessFailureVersion,
+        });
       }
       try {
         const rotation = (async () => {
@@ -1589,11 +1818,29 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#ySweetRotation = trackedRotation;
         const applied = await rotation;
         if (applied) this.#emit();
+        if (reconnectAttempt) {
+          this.#notifyLiveness({
+            signal: "awareness",
+            outcome: applied ? "succeeded" : "superseded",
+            attempt: this.#awarenessFailureVersion,
+            durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
+          });
+        }
         deadline = applied
           ? this.#clock.now() + this.#ySweetRefreshMs
           : this.#clock.now();
       } catch (error) {
         if (signal.aborted) return;
+        if (reconnectAttempt) {
+          this.#notifyLiveness({
+            signal: "awareness",
+            outcome: "failed",
+            attempt: this.#awarenessFailureVersion,
+            errorName: livenessErrorName(error),
+            errorKind: livenessErrorKind(error),
+            durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
+          });
+        }
         this.#runtimeHealth.record("unhealthy");
         await this.#clock.sleep(30_000, signal);
         deadline = this.#clock.now();
@@ -1947,6 +2194,31 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
 
   #emit(): void {
     for (const listener of this.#listeners) listener();
+  }
+
+  #notifyLiveness(diagnostic: V2RuntimeLivenessDiagnostic): void {
+    const notify = this.#options.onLivenessDiagnostic;
+    if (!notify) return;
+    let heartbeatAgeMs: number | null = null;
+    let sidecarPeerAgeMs: number | null = null;
+    let transportConnected = false;
+    try {
+      const heartbeatAt = this.#heartbeat?.snapshot().lastSuccessAtMs ?? null;
+      heartbeatAgeMs = heartbeatAt === null
+        ? null
+        : Math.max(0, this.#clock.now() - heartbeatAt);
+      const transport = this.#transport?.snapshot() ?? null;
+      sidecarPeerAgeMs = transport?.sidecarPeerAgeMs ?? null;
+      transportConnected = transport?.connected ?? false;
+    } catch {}
+    try {
+      notify({
+        ...diagnostic,
+        heartbeatAgeMs,
+        sidecarPeerAgeMs,
+        transportConnected,
+      });
+    } catch {}
   }
 
   #notifyCredentialRefresh(
