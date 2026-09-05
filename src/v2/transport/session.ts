@@ -735,6 +735,8 @@ export interface V2TransportRunOptions {
 }
 
 export interface V2TransportSessionOptions {
+  /** Bounded piggybacking of verified receipts on an immediate follow-up flight. */
+  terminalReceiptCoalescing?: boolean;
   binding: ProtocolBinding;
   transportProfile?: V2TransportProfile;
   channel: AwarenessChannel<HostFrame, SidecarFrame>;
@@ -943,6 +945,7 @@ interface LivenessProbe {
 const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5_000;
 const MAX_TERMINAL_RECEIPTS = 4_096;
+const TERMINAL_RECEIPT_COALESCE_MS = 10;
 
 function abortError(message: string): DOMException {
   return new DOMException(message, "AbortError");
@@ -1126,6 +1129,10 @@ export class V2TransportSession {
   readonly #idleWaiters = new Set<() => void>();
   readonly #retiredSidecarInstances = new Set<string>();
   readonly #terminalReceipts = new Map<string, TerminalReceipt>();
+  readonly #terminalReceiptCoalescing: boolean;
+  // Shares the receipt registry's count bound; never holds response content.
+  readonly #deferredTerminalReceipts = new Set<string>();
+  #terminalReceiptTimer: AbortController | null = null;
   readonly #ambiguityTombstones = new Map<string, string>();
   readonly #orphanRecoveryCandidates = new Map<string, OrphanRecoveryCandidate>();
   readonly #startupRecoveryOwnedRequestIds = new Set<string>();
@@ -1294,6 +1301,7 @@ export class V2TransportSession {
     this.#maxBufferedResponseBytes = maxBufferedResponseBytes;
     this.#eventMemoryPool = options.eventMemoryPool;
     this.#onStateChange = options.onStateChange;
+    this.#terminalReceiptCoalescing = options.terminalReceiptCoalescing ?? true;
     this.#transportStallMs = options.transportStallMs ?? DEFAULT_TRANSPORT_STALL_MS;
     if (!Number.isFinite(this.#transportStallMs) || this.#transportStallMs < 1) {
       throw new RangeError("transportStallMs must be positive");
@@ -1763,6 +1771,7 @@ export class V2TransportSession {
       "sidecar_recovery",
     ));
     this.#pacer.close();
+    this.#cancelDeferredTerminalReceipts();
     this.#unsubscribe?.();
     this.#unsubscribe = null;
     if (this.#timer) clearTimeout(this.#timer);
@@ -2254,6 +2263,7 @@ export class V2TransportSession {
       );
     }
     this.#pacer.close();
+    this.#cancelDeferredTerminalReceipts();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
     if (this.#stallTimer) clearTimeout(this.#stallTimer);
@@ -4264,8 +4274,53 @@ export class V2TransportSession {
       this.#quarantined = Math.max(0, this.#quarantined - 1);
       state.quarantineKind = null;
     }
+    if (!wasCancelled && this.#deferTerminalReceipt(state.requestId)) return;
     this.#queueTerminalReceipt(state.requestId, receipt);
     this.#requestPublication(this.#pump());
+  }
+
+  #deferTerminalReceipt(requestId: string): boolean {
+    if (!this.#terminalReceiptCoalescing || this.#binding.protocolRevision !== "r2" || this.#draining || this.#sidecarRecovery ||
+      !this.#connected || this.#closed || this.#flight.active || this.#dataDirty ||
+      this.#scheduler.snapshot().queuedFrames > 0 ||
+      this.#deferredTerminalReceipts.size >= MAX_TERMINAL_RECEIPTS) return false;
+    this.#deferredTerminalReceipts.add(requestId);
+    if (this.#terminalReceiptTimer !== null) return true;
+    const epoch = this.#lifecycleEpoch;
+    const timer = new AbortController();
+    this.#terminalReceiptTimer = timer;
+    void this.#clock.sleep(TERMINAL_RECEIPT_COALESCE_MS, timer.signal).then(() => {
+      if (this.#terminalReceiptTimer !== timer) return;
+      this.#terminalReceiptTimer = null;
+      if (!this.#ownsLifecycle(epoch)) return;
+      try {
+        this.#flushDeferredTerminalReceipts();
+        this.#requestPublication(this.#pump());
+      } catch (cause) {
+        this.#failProtocol(cause);
+      }
+    }, cause => {
+      if (this.#terminalReceiptTimer !== timer) return;
+      this.#terminalReceiptTimer = null;
+      if (!timer.signal.aborted && this.#ownsLifecycle(epoch)) this.#failProtocol(cause);
+    });
+    return true;
+  }
+
+  #flushDeferredTerminalReceipts(): void {
+    this.#terminalReceiptTimer?.abort();
+    this.#terminalReceiptTimer = null;
+    for (const requestId of this.#deferredTerminalReceipts) {
+      this.#deferredTerminalReceipts.delete(requestId);
+      const receipt = this.#terminalReceipts.get(requestId);
+      if (receipt) this.#queueTerminalReceipt(requestId, receipt);
+    }
+  }
+
+  #cancelDeferredTerminalReceipts(): void {
+    this.#terminalReceiptTimer?.abort();
+    this.#terminalReceiptTimer = null;
+    this.#deferredTerminalReceipts.clear();
   }
 
   #queueTerminalReceipt(requestId: string, receipt: TerminalReceipt): void {
@@ -5207,6 +5262,14 @@ export class V2TransportSession {
   #pump(): PublicationUrgency | null {
     if (!this.#connected || this.#closed) return null;
     if (this.#flight.active) return null;
+    // A completed response must not occupy an otherwise empty immutable flight
+    // just before a fast tool result arrives. Piggyback its verified receipt on
+    // that next flight, or send it alone when the bounded timer expires. The
+    // cumulative receive ACK and every request execution fence are unchanged.
+    if (this.#deferredTerminalReceipts.size > 0 &&
+      (this.#draining || this.#scheduler.snapshot().queuedFrames > 0)) {
+      this.#flushDeferredTerminalReceipts();
+    }
     const flightLimits = this.#hostFlightLimits();
     let urgency: PublicationUrgency | null = null;
     for (;;) {

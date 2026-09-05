@@ -11,13 +11,52 @@ import { projectId, type ProjectId } from "../src/sandbox/types";
 import type { RoutableSandboxSnapshot } from "../src/sandbox/registry";
 import type { RunHandle } from "../src/relay/run-handle";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
-import { V2SandboxSupervisor } from "../src/v2/supervisor/controller";
+import { V2SandboxSupervisor, type SupervisorBootstrapMode } from "../src/v2/supervisor/controller";
 import type { V2SupervisorLaunchResult } from "../src/v2/supervisor/host";
 import { V2_R9_RELEASE } from "../src/v2/sidecar/assets";
+import { V2BootstrapController } from "../src/v2/bootstrap/controller";
+import { V2TransportSession } from "../src/v2/transport/session";
 
 const PORT = 18_888;
 const MAX_BODY_BYTES = 256 * 1024;
-const MAX_RESPONSES = 128;
+const MAX_RESPONSES = 256;
+
+/** Isolated-verifier instrumentation. Records codes only, never exception text. */
+export function observeR9RecoveryFailures() {
+  const failures: Array<{ phase: string; causes: Array<Record<string, string | null>> }> = [];
+  const restores: Array<() => void> = [];
+  const label = (value: unknown) => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(value) ? value : null;
+  const record = (phase: string, error: unknown): void => {
+    if (failures.length >= 32) return;
+    const causes: Array<Record<string, string | null>> = [];
+    let current = error;
+    while (current && typeof current === "object" && causes.length < 6) {
+      const value = current as Record<string, unknown>;
+      causes.push({ name: label(value.name), kind: label(value.kind), code: label(value.remoteCode ?? value.code) });
+      current = value.cause;
+    }
+    failures.push({ phase, causes });
+    console.log(JSON.stringify({ event: "r9.live.failure_detail", phase, causes }));
+  };
+  const observe = (target: object, key: string, phase: string): void => {
+    const methods = target as Record<string, unknown>;
+    const original = methods[key];
+    if (typeof original !== "function") throw new Error("Missing recovery instrumentation method");
+    const wrapped = function(this: object, ...args: unknown[]) {
+      try {
+        return Promise.resolve(Reflect.apply(original, this, args)).catch(error => { record(phase, error); throw error; });
+      } catch (error) { record(phase, error); throw error; }
+    };
+    methods[key] = wrapped;
+    restores.push(() => { if (methods[key] === wrapped) methods[key] = original; });
+  };
+  observe(V2BootstrapController.prototype, "ensureReady", "sidecar_bootstrap");
+  observe(V2TransportSession.prototype, "connect", "transport_connect");
+  observe(V2TransportSession.prototype, "adoptRecoveredSidecar", "recovery_barrier");
+  observe(V2SandboxSupervisor.prototype, "launch", "supervisor_launch");
+  observe(V2SandboxSupervisor.prototype, "deliverCredential", "supervisor_credential");
+  return { failures, restore: () => { for (const restore of restores.reverse()) restore(); } };
+}
 
 export function r9RuntimeIsReady(snapshot: Pick<RoutableSandboxSnapshot,
   "state" | "capacity" | "available" | "transportConnected" | "quarantined" | "ambiguousQuarantined"
@@ -33,6 +72,9 @@ export interface R9RecoveryProofOptions {
   readonly model: string;
   readonly cookieFile: string;
   readonly origin: string;
+  readonly bootstrapMode: SupervisorBootstrapMode;
+  readonly benchmarkConcurrency: boolean;
+  readonly recoveryCycles: number;
 }
 
 export function resolveR9RecoveryProofOptions(env: Record<string, string | undefined>): R9RecoveryProofOptions {
@@ -50,8 +92,17 @@ export function resolveR9RecoveryProofOptions(env: Record<string, string | undef
   if (!cookieFile) throw new Error("R9 proof requires PRISM_COOKIE_FILE");
   const model = env.GP_LIVE_MODEL ?? "gpt-5.6-sol";
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/.test(model)) throw new Error("Invalid live model");
+  const bootstrapMode = env.GP_V2_SUPERVISOR_BOOTSTRAP_MODE ?? "direct";
+  if (bootstrapMode !== "direct" && bootstrapMode !== "llm") throw new Error("Invalid supervisor bootstrap mode");
+  const benchmark = env.GP_LIVE_BENCHMARK_CONCURRENCY ?? "0";
+  if (benchmark !== "0" && benchmark !== "1") throw new Error("Concurrency benchmark guard must be 0 or 1");
+  const recoveryCycles = Number(env.GP_LIVE_RECOVERY_CYCLES ?? 1);
+  if (!Number.isSafeInteger(recoveryCycles) || recoveryCycles < 1 || recoveryCycles > 3) {
+    throw new Error("Recovery cycles must be from one through three");
+  }
   return Object.freeze({ target, port: PORT, timeoutMs, model, cookieFile: path.resolve(cookieFile),
-    origin: (env.PRISM_ORIGIN ?? "https://prism.openai.com").replace(/\/+$/, "") });
+    origin: (env.PRISM_ORIGIN ?? "https://prism.openai.com").replace(/\/+$/, ""), bootstrapMode,
+    benchmarkConcurrency: benchmark === "1", recoveryCycles });
 }
 
 function bounded<T>(operation: Promise<T>, timeoutMs: number, phase: string): Promise<T> {
@@ -82,7 +133,7 @@ class ProofLogger implements LoggerLike {
     }
     if (event.event === "sandbox.liveness") {
       const transition = { worker: event.worker_index, signal: event.liveness_signal, outcome: event.liveness_outcome,
-        kind: event.error_kind, durationMs: event.duration_ms, sidecarAgeMs: event.sidecar_peer_age_ms,
+        kind: event.error_kind, errorName: event.error_name, durationMs: event.duration_ms, sidecarAgeMs: event.sidecar_peer_age_ms,
         connected: event.transport_connected, reliableStall: event.reliable_stall, lane: event.awareness_lane };
       if (this.transitions.length === 128) this.transitions.shift();
       this.transitions.push(transition);
@@ -100,6 +151,8 @@ interface TrackedSupervisor {
   launches: number;
   discoveryTurns: number;
   launchTurns: number;
+  directExecs: number;
+  bootstrapMs: number | null;
   latest: (V2SupervisorLaunchResult & { nonce: string }) | null;
 }
 
@@ -168,9 +221,16 @@ export async function main(env: Record<string, string | undefined> = process.env
   const deleted = new Set<ProjectId>();
   const titles = new Map(intended.map((id, index) => [id, `GhostProv R9 Recovery ${path.basename(directory)} ${index + 1}`]));
   const tracked = new Map<ProjectId, TrackedSupervisor>();
+  const retiredGenerations: Array<Record<string, number | null>> = [];
+  const recoveryFailures = observeR9RecoveryFailures();
   const responseIds = new Set<string>();
   const waves: Array<{ phase: string; count: number; durationMs: number }> = [];
   const requestTimings: Array<{ lane: string; durationMs: number }> = [];
+  const concurrencyBenchmarks: Array<Record<string, number>> = [];
+  const recoveryTimings: Array<{ cycle: number; durationMs: number }> = [];
+  let directExecRequests = 0;
+  let llmBootstrapEndpointRequests = 0;
+  let llmBootstrapStarts = 0;
   const apiKey = `r9-proof-${crypto.randomUUID()}`;
   let session: PrismSessionManager | null = null;
   let system: BrowserlessSystem | null = null;
@@ -261,6 +321,23 @@ export async function main(env: Record<string, string | undefined> = process.env
   try {
     session = await PrismSessionManager.create({ origin: options.origin, mode: "authenticated", allowAnonymous: false, cookieFile });
     const identity = await session.resolve(AbortSignal.timeout(60_000));
+    const originalRequest = identity.account.request.bind(identity.account);
+    identity.account.request = async (url, init) => {
+      const pathname = new URL(url, options.origin).pathname;
+      if (pathname.startsWith("/api/llm/")) {
+        llmBootstrapEndpointRequests++;
+        if (options.bootstrapMode === "direct") throw new Error("Direct proof forbids LLM bootstrap endpoints");
+        if (pathname === "/api/llm/response_with_tools_start") llmBootstrapStarts++;
+      }
+      if (pathname.endsWith("/codex/codex_exec_async")) {
+        const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+        if (!body || typeof body !== "object" || Array.isArray(body) ||
+          (body as Record<string, unknown>).codex_path !== "/bin/sh" ||
+          (body as Record<string, unknown>).prompt !== "Hiii") throw new Error("Unexpected direct execution request");
+        directExecRequests++;
+      }
+      return originalRequest(url, init);
+    };
     projects = new PrismProjectsClient(identity.account);
     const preexisting = new Set((await projects.list(AbortSignal.timeout(60_000))).map(item => item.projectId));
     for (const id of intended) {
@@ -278,6 +355,7 @@ export async function main(env: Record<string, string | undefined> = process.env
       GP_GUEST_MAX_PROJECTS: "1", GP_FLEET_MANIFEST_FILE: path.join(directory, "fleet.json"),
       GP_PROVISION_CONCURRENCY: "4", GP_COLD_START_CONCURRENCY: String(Math.min(2, options.target)),
       GP_V2_SIDECAR_REVISION: "r9", GP_V2_SIDECAR_PROJECT_REVISIONS: "", GP_V2_BOOTSTRAP_LAUNCH_MODE: "relay",
+      GP_V2_SUPERVISOR_BOOTSTRAP_MODE: options.bootstrapMode,
     }, {
       sessionManager: session, projects, logger,
       manifest: new FleetManifestStore({ file: path.join(directory, "fleet.json"), identityFingerprint: identity.fingerprint }),
@@ -285,15 +363,30 @@ export async function main(env: Record<string, string | undefined> = process.env
         const id = projectId(input.binding.projectId);
         if (!intended.includes(id) || (!tracked.has(id) && tracked.size >= options.target)) throw new Error("Unexpected supervisor project");
         const generation = (tracked.get(id)?.generation ?? 0) + 1;
+        const previous = tracked.get(id);
+        if (previous && retiredGenerations.length < options.target * 2) {
+          retiredGenerations.push({ worker: intended.indexOf(id) + 1, generation: previous.generation,
+            launches: previous.launches, directExecs: previous.directExecs, bootstrapMs: previous.bootstrapMs });
+        }
         if (generation > 2) throw new Error("Live supervisor generation bound exceeded");
         const supervisor = new V2SandboxSupervisor(input);
-        const state: TrackedSupervisor = { supervisor, generation, launches: 0, discoveryTurns: 0, launchTurns: 0, latest: null };
+        const state: TrackedSupervisor = { supervisor, generation, launches: 0, discoveryTurns: 0, launchTurns: 0,
+          directExecs: 0, bootstrapMs: null, latest: null };
         tracked.set(id, state);
         const prepare = input.gateway.prepareRelayExecSession?.bind(input.gateway);
         const exec = input.gateway.runRelayExec?.bind(input.gateway);
         if (!prepare || !exec) throw new Error("Live gateway lacks supervisor bootstrap");
         input.gateway.prepareRelayExecSession = signal => { state.discoveryTurns++; return prepare(signal); };
         input.gateway.runRelayExec = (request, continuation, signal) => { state.launchTurns++; return exec(request, continuation, signal); };
+        const direct = input.gateway.startSupervisorExec?.bind(input.gateway);
+        if (!direct) throw new Error("Live gateway lacks direct supervisor bootstrap");
+        input.gateway.startSupervisorExec = (request, signal) => { state.directExecs++; return direct(request, signal); };
+        const ensureReady = supervisor.ensureReady.bind(supervisor);
+        supervisor.ensureReady = async signal => {
+          const startedAt = performance.now();
+          await ensureReady(signal);
+          state.bootstrapMs ??= Math.round(performance.now() - startedAt);
+        };
         const launch = supervisor.launch.bind(supervisor);
         supervisor.launch = async (request, signal) => {
           const result = await launch(request, signal);
@@ -311,38 +404,44 @@ export async function main(env: Record<string, string | undefined> = process.env
     reportPhase("requests_before_recovery");
     await everySandbox("before_each");
     await publicWave("before_http");
-    const root = await post("/v1/responses", nativeBody("Remember codeword R9_AMBER_409 and reply with exactly ROOT_OK."), "ROOT_OK");
-    reportPhase("stop_sidecars");
-    const recoveryStarted = performance.now();
-    if (system.registry.readyRuntimes().some(runtime => {
-      const state = runtime.snapshot();
-      return state.active !== 0 || state.quarantined !== 0 || state.queueDepth !== 0;
-    })) throw new Error("Controlled recovery requires idle, unambiguous runtimes");
-    const before = new Map([...tracked].map(([id, state]) => [id, { state, latest: state.latest, instance: state.supervisor.instanceId }]));
-    const stops = await Promise.allSettled([...before.values()].map(async value => {
-      if (!value.latest || value.state.launches !== 1 || value.state.generation !== 1) throw new Error("Startup did not have one exact sidecar launch");
-      const stopped = await value.state.supervisor.stop({ launchNonces: [value.latest.nonce], reason: "dedicated_live_recovery" }, AbortSignal.timeout(45_000));
-      if (stopped !== value.latest.nonce) throw new Error("Controlled stop returned the wrong launch proof");
-    }));
-    const stopFailure = stops.find(result => result.status === "rejected");
-    if (stopFailure?.status === "rejected") throw stopFailure.reason;
-    reportPhase("recover_same_supervisors");
-    await waitFor(() => [...before].every(([id, previous]) => {
-      const current = tracked.get(id);
-      if (current !== previous.state || current?.generation !== 1 || current.launches > 2) throw new Error("Recovery replaced or relaunched the supervisor");
-      return current.launches === 2 && current.latest?.nonce !== previous.latest?.nonce;
-    }) && readyRuntimes().length === options.target, 180_000);
-    for (const [id, previous] of before) {
-      const state = tracked.get(id)!;
-      if (state.supervisor.instanceId !== previous.instance || state.discoveryTurns !== 1 || state.launchTurns !== 1 ||
-        state.latest?.process.pid === previous.latest?.process.pid) throw new Error("Recovery did not retain its original supervisor");
-      recovered++;
+    for (let cycle = 1; cycle <= options.recoveryCycles; cycle++) {
+      const root = await post("/v1/responses", nativeBody("Remember codeword R9_AMBER_409 and reply with exactly ROOT_OK."), "ROOT_OK");
+      reportPhase(`stop_sidecars_${cycle}`);
+      const recoveryStarted = performance.now();
+      if (system.registry.readyRuntimes().some(runtime => {
+        const state = runtime.snapshot();
+        return state.active !== 0 || state.quarantined !== 0 || state.queueDepth !== 0;
+      })) throw new Error("Controlled recovery requires idle, unambiguous runtimes");
+      const before = new Map([...tracked].map(([id, state]) => [id, { state, latest: state.latest, instance: state.supervisor.instanceId }]));
+      const stops = await Promise.allSettled([...before.values()].map(async value => {
+        if (!value.latest || value.state.launches !== cycle || value.state.generation !== 1) throw new Error("Startup did not have one exact sidecar launch");
+        const stopped = await value.state.supervisor.stop({ launchNonces: [value.latest.nonce], reason: "dedicated_live_recovery" }, AbortSignal.timeout(45_000));
+        if (stopped !== value.latest.nonce) throw new Error("Controlled stop returned the wrong launch proof");
+      }));
+      const stopFailure = stops.find(result => result.status === "rejected");
+      if (stopFailure?.status === "rejected") throw stopFailure.reason;
+      reportPhase(`recover_same_supervisors_${cycle}`);
+      await waitFor(() => [...before].every(([id, previous]) => {
+        const current = tracked.get(id);
+        if (current !== previous.state || current?.generation !== 1 || current.launches > cycle + 1) throw new Error("Recovery replaced or relaunched the supervisor");
+        return current.launches === cycle + 1 && current.latest?.nonce !== previous.latest?.nonce;
+      }) && readyRuntimes().length === options.target, 180_000);
+      for (const [id, previous] of before) {
+        const state = tracked.get(id)!;
+        const llm = options.bootstrapMode === "llm" ? 1 : 0;
+        const direct = options.bootstrapMode === "direct" ? 1 : 0;
+        if (state.supervisor.instanceId !== previous.instance || state.discoveryTurns !== llm || state.launchTurns !== llm || state.directExecs !== direct ||
+          state.latest?.process.pid === previous.latest?.process.pid) throw new Error("Recovery did not retain its original supervisor");
+        recovered++;
+      }
+      const cycleMs = Math.round(performance.now() - recoveryStarted);
+      recoveryTimings.push({ cycle, durationMs: cycleMs });
+      recoveryMs = (recoveryMs ?? 0) + cycleMs;
+      reportPhase(`requests_after_recovery_${cycle}`);
+      await post("/v1/responses", { ...nativeBody("Reply with only the codeword I asked you to remember."), previous_response_id: root }, "R9_AMBER_409");
+      await everySandbox(`after_each_${cycle}`);
+      await publicWave(`after_http_${cycle}`);
     }
-    recoveryMs = Math.round(performance.now() - recoveryStarted);
-    reportPhase("requests_after_recovery");
-    await post("/v1/responses", { ...nativeBody("Reply with only the codeword I asked you to remember."), previous_response_id: root }, "R9_AMBER_409");
-    await everySandbox("after_each");
-    await publicWave("after_http");
     reportPhase("concurrency_soak");
     const soakDeadline = Date.now() + (options.target === 8 ? 90_000 : 30_000);
     for (let wave = 0; wave < (options.target === 8 ? 3 : 1); wave++) await publicWave(`soak_${wave}`);
@@ -351,6 +450,35 @@ export async function main(env: Record<string, string | undefined> = process.env
       stabilitySamples++;
       await Bun.sleep(1_000);
     }
+    if (options.benchmarkConcurrency) {
+      for (const concurrency of options.target === 8 ? [1, 8, 16, 32] : [1, 4, 8, 16]) {
+        reportPhase(`concurrency_${concurrency}`);
+        const beforeTimings = requestTimings.length;
+        const startedAt = performance.now();
+        const outcomes = await Promise.allSettled(Array.from({ length: concurrency }, (_, index) => {
+          const marker = `R9_LOAD_${concurrency}_${index}`;
+          return index % 2 === 0
+            ? post("/v1/responses", nativeBody(`Reply with exactly ${marker}`), marker)
+            : post("/v1/messages", { model: options.model, stream: false, max_tokens: 256,
+                messages: [{ role: "user", content: `Reply with exactly ${marker}` }] }, marker);
+        }));
+        const rejected = outcomes.find(value => value.status === "rejected");
+        if (rejected?.status === "rejected") throw rejected.reason;
+        const elapsedMs = performance.now() - startedAt;
+        const timings = requestTimings.slice(beforeTimings).map(value => value.durationMs).sort((a, b) => a - b);
+        if (timings.length !== concurrency || readyRuntimes().length !== options.target) throw new Error("Concurrency proof lost capacity or responses");
+        const result = { concurrency, completed: timings.length, durationMs: Math.round(elapsedMs),
+          p50Ms: Math.round(timings[Math.ceil(timings.length * 0.5) - 1]!),
+          p95Ms: Math.round(timings[Math.ceil(timings.length * 0.95) - 1]!),
+          maxMs: Math.round(timings[timings.length - 1]!),
+          requestsPerSecond: Math.round(concurrency / elapsedMs * 1_000_000) / 1000 };
+        concurrencyBenchmarks.push(result);
+        console.log(JSON.stringify({ event: "r9.live.concurrency", ...result }));
+      }
+    }
+    if (options.bootstrapMode === "direct"
+      ? directExecRequests !== options.target || llmBootstrapEndpointRequests !== 0
+      : directExecRequests !== 0 || llmBootstrapStarts !== options.target * 2) throw new Error("Unexpected bootstrap execution count");
     if (logger.invalidEvents !== 0) throw new Error("Live observability validation failed");
     reportPhase("complete");
   } catch (error) {
@@ -392,6 +520,7 @@ export async function main(env: Record<string, string | undefined> = process.env
       assertContained(directory, file);
       await rm(file, { force: true, recursive: file.endsWith(".lock") }).catch(error => { failure ??= error; });
     }
+    recoveryFailures.restore();
   }
   if (deleted.size !== cleanupEligible.size) failure ??= new Error("Dedicated projects were not fully deleted");
   const safeName = (value: unknown) => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_:.-]{0,63}$/.test(value) ? value : null;
@@ -403,6 +532,11 @@ export async function main(env: Record<string, string | undefined> = process.env
     cause = value.cause;
   }
   const report = { live: true, success: failure === null, phase, candidatePort: PORT,
+    bootstrapMode: options.bootstrapMode, directExecRequests, llmBootstrapEndpointRequests, llmBootstrapStarts,
+    terminalReceiptCoalescing: system?.config.v2TerminalReceiptCoalescing ?? null,
+    recoveryFailures: recoveryFailures.failures, retiredGenerations,
+    supervisorBootstrapMs: [...tracked.values()].map(value => value.bootstrapMs), concurrencyBenchmarks,
+    recoveryCycles: options.recoveryCycles, recoveryTimings,
     target: options.target, buildHash: V2_R9_RELEASE.buildHash, bundleSha256: V2_R9_RELEASE.bundleSha256,
     completedResponses: responseIds.size, recoveredSameSupervisor: recovered, startupMs, recoveryMs, stabilitySamples, waves,
     latencyMs: Object.fromEntries(["responses", "anthropic", "runtime"].map(lane => {

@@ -32,6 +32,7 @@
     "verify:codex-rate-limit-retry": "bun --no-env-file scripts/verify_codex_rate_limit_retry.ts",
     "verify:persisted-continuation": "bun scripts/verify_persisted_continuation.ts",
     "verify:browserless": "bun scripts/probe_browserless_prism.ts",
+    "verify:tool-latency": "bun scripts/live_tool_latency.ts",
     "create:test-projects": "bun scripts/create_test_projects.ts",
     "create:projects": "bun scripts/create_projects.ts",
     "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",

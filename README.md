@@ -42,7 +42,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
 
-R9 stages immutable assets through Yjs and starts a persistent supervisor in a resumed Prism Codex session. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
+R9 stages immutable assets through Yjs and starts a persistent supervisor through Prism's direct execution API by default. The original resumed Codex-session bootstrap remains selectable with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
 
 The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, sidecar capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
 
@@ -359,7 +359,11 @@ bun run check:v2-sidecar-deno-r9
 
 The release checks build source twice and compare the bytes, build hash, bundle hash, and R2 `bulk-v1` schema-profile hash with the registered R8 and R9 identities. The Deno checks validate both offline bundles with pinned Deno 2.9.5. These checks are read-only and fail closed. Maintainers create an R9 artifact through `bun run build:v2-sidecar-release-r9` after explicitly preparing its immutable identity; ordinary checks never overwrite artifacts.
 
-R9 creates one project conversation and discovers one reusable Codex session. Its session-bound encrypted bootstrap carries supervisor credentials without putting secrets in agent commands. Signed readiness gates ciphertext deletion. The supervisor keeps the exact Deno child resource and verifies its wrapper identity, canonical PID record, held owner lock, and static configuration before delivering credentials or stopping it. Recovery replaces the child within the same supervisor. Shutdown allows the full child cleanup budget and records exact retirement proof; missing proof blocks replacement. Control queues retain at most four host operations and one active plus one pending notification. A failed platform bootstrap is retained as a failed attempt, and cannot silently launch another agent turn.
+R9 defaults to `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=direct`. It submits one authenticated `codex/codex_exec_async` request with `codex_path: "/bin/sh"`, `prompt: "Hiii"`, and the service-required `gpt-5.6-sol` label. The shell runs the staged supervisor installer without invoking a model. A private host-generated execution session seals the bootstrap credential; the returned execution session and workspace must match exactly, and signed supervisor readiness remains authoritative. The temporary `exec` file, installer, and encrypted credential are removed from the project after readiness. An existing user `exec` file is preserved and causes a closed failure.
+
+The original LLM bootstrap remains available through `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`. It creates one project conversation, discovers one reusable Codex session, and runs the installer through the existing resumed model turn. Mode selection applies on process startup. Direct execution never silently falls back to the LLM path, and a failed or ambiguous launch never authorizes another submission.
+
+Both modes keep the same immutable R9 bundle and session-bound encrypted credential delivery. The supervisor keeps the exact Deno child resource and verifies its wrapper identity, canonical PID record, held owner lock, and static configuration before delivering credentials or stopping it. Recovery replaces the child within the same supervisor. Shutdown allows the full child cleanup budget and records exact retirement proof; missing proof blocks replacement. Control queues retain at most four host operations and one active plus one pending notification.
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
@@ -395,6 +399,8 @@ Only manifest records with `managed:true` can be deleted. Legacy imported user p
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
 | `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
 | `GP_V2_SIDECAR_REVISION` | `r9` | Global sidecar release; R9 uses R2 `bulk-v1` with a host-configured credential window, R8 is the immediate immutable rollback, and R4 is the standard-profile rollback |
+| `GP_V2_SUPERVISOR_BOOTSTRAP_MODE` | `direct` | `direct` starts the R9 supervisor without model inference; `llm` explicitly selects the retained Codex conversation bootstrap. No automatic fallback |
+| `GP_V2_TERMINAL_RECEIPT_COALESCING` | `1` | Combines a verified response receipt with an immediate next request using a maximum 10 ms hold; `0` restores eager receipts. Receive ACKs, immutable flights, and execution fences stay authoritative |
 | `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact persisted `project-id=r1|r2|r3|r4|r5|r6|r7|r8` overrides; no wildcard or fallback |
 | `GP_TARGET_SANDBOXES` | `8` | Desired identity-scoped managed fleet size |
 | `GP_MAX_PROJECTS` | `32` | Safety ceiling, not a fixed fleet size |
@@ -511,6 +517,8 @@ The isolated suite includes:
 - `tests/persisted-continuation-live.test.ts`
 - `tests/preparation-scheduler.test.ts`
 - `tests/prism-protocol.test.ts`
+- `tests/prism-direct-exec.test.ts`
+- `tests/tool-latency-guards.test.ts`
 - `tests/project-inspector.test.ts`
 - `tests/provisioning-client.test.ts`
 - `tests/projects-client.test.ts`
@@ -613,6 +621,7 @@ The isolated suite includes:
 - `tests/v2-r9-recovery-guards.test.ts`
 - `tests/v2-supervisor-channel.test.ts`
 - `tests/v2-supervisor-controller.test.ts`
+- `tests/v2-supervisor-direct.test.ts`
 - `tests/v2-supervisor-launcher.test.ts`
 - `tests/v2-supervisor-mailbox.test.ts`
 - `tests/v2-supervisor-process.test.ts`
@@ -633,7 +642,7 @@ The deterministic integration test fills 120 lanes as `30 + 30 + 30 + 30`, verif
 
 ## Live proof
 
-The R9 supervisor release has a dedicated one- or eight-project stability proof. It creates only fresh UUIDs, copies account cookies to an isolated directory, binds `18888`, checks mixed Responses/Anthropic requests and provider continuation, stops each idle sidecar through its authenticated supervisor, and verifies recovery without another agent bootstrap. It records bounded diagnostics and deletes every project in its own ledger during cleanup:
+The R9 supervisor release has a dedicated one- or eight-project stability proof. It creates only fresh UUIDs, copies account cookies to an isolated directory, binds `18888`, checks mixed Responses/Anthropic requests and provider continuation, stops each idle sidecar through its authenticated supervisor, and verifies recovery without another bootstrap. Direct mode blocks the LLM bootstrap endpoints and checks the exact `Hiii` execution request; explicit `llm` mode verifies the retained two-turn path. Set `GP_LIVE_BENCHMARK_CONCURRENCY=1` to add bounded request bursts up to 32 concurrent requests on eight sandboxes, with latency and throughput measurements. It records bounded diagnostics and deletes every project in its own ledger during cleanup:
 
 ```powershell
 $env:GP_LIVE_R9_SUPERVISOR_RECOVERY = "1"
@@ -674,6 +683,19 @@ $env:GP_LIVE_CREATE_TEST_PROJECTS = "1"
 $env:GP_LIVE_PROJECT_COUNT = "4"
 bun run create:test-projects
 ```
+
+The tool-latency verifier traces relay arrival and client delivery for HTTP Responses, WebSocket Responses, and Anthropic streams. It records every observed event's relative timestamp and character counts, provider timing diagnostics, final token-usage counts, and tool-result round trips with small and 32 KiB results. It does not save prompts, output text, arguments, response IDs, or credentials. These are observed stream-event times, not model-internal per-token timestamps. The verifier creates and deletes one dedicated project, binds only `18888`, and writes its bounded report under `.ghostprov/tool-latency`:
+
+```powershell
+$env:GP_LIVE_TOOL_LATENCY_TRACE = "1"
+$env:GP_LIVE_ALLOW_TEST_PROJECT_MUTATION = "1"
+$env:PORT = "18888"
+bun run verify:tool-latency
+```
+
+For paired comparisons, set `GP_V2_TERMINAL_RECEIPT_COALESCING=0` to test eager receipts, or `GP_TRACE_BATCHING=0` to test without sidecar event batching. These are independent controls; compare the recorded diagnostics and latency distributions before changing a production setting. The separate R9 recovery verifier accepts `GP_LIVE_RECOVERY_CYCLES=1` through `3` for repeated stop/recovery checks within the same supervisor instances and reports bounded, content-free failure-phase diagnostics.
+
+The [2026-09-05 validation report](docs/validation/2026-09-05-direct-exec-and-tool-latency.md) records the direct-bootstrap comparison, paired tool-result latencies, repeated eight-sandbox recoveries, concurrency measurements, and failed attempts with their limits.
 
 Run direct browserless provisioning/Yjs/heartbeat proof:
 

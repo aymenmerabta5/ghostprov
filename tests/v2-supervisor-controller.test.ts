@@ -84,6 +84,7 @@ class FakeHost implements V2BootstrapSupervisor {
 function bootstrapFixture(gateway: Pick<V2BootstrapGateway, "prepareRelayExecSession" | "runRelayExec">, host = new FakeHost()) {
   const ydoc = new FakeYDoc();
   const supervisor = new V2SandboxSupervisor({
+    bootstrapMode: "llm",
     binding: BINDING,
     ySweet: parseYSweetEnvelope({ url: "wss://y.test/socket", baseUrl: "https://y.test",
       docId: BINDING.projectId, token: "offline-token", authorization: "full" }),
@@ -146,6 +147,7 @@ describe("V2 sandbox supervisor bootstrap", () => {
       authorization: "full",
     });
     const supervisor = new V2SandboxSupervisor({
+      bootstrapMode: "llm",
       binding: BINDING,
       ySweet,
       ydoc,

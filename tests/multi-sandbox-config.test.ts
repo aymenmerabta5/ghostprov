@@ -29,6 +29,18 @@ const MACHINE: MachineSample = {
 };
 
 describe("multi-sandbox configuration", () => {
+  it("selects direct supervisor bootstrap by default and retains explicit LLM selection", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1" };
+    expect(resolveMultiSandboxConfig(env, MACHINE).v2SupervisorBootstrapMode).toBe("direct");
+    expect(resolveMultiSandboxConfig(env, MACHINE).v2TerminalReceiptCoalescing).toBe(true);
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_TERMINAL_RECEIPT_COALESCING: "0" }, MACHINE).v2TerminalReceiptCoalescing).toBe(false);
+    expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_TERMINAL_RECEIPT_COALESCING: "true" }, MACHINE)).toThrow();
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm" }, MACHINE).v2SupervisorBootstrapMode).toBe("llm");
+    for (const value of ["auto", "fallback", "render", "unknown"]) {
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: value }, MACHINE)).toThrow("GP_V2_SUPERVISOR_BOOTSTRAP_MODE");
+    }
+  });
+
   it("publishes one protected-service and candidate port policy", () => {
     expect(PROTECTED_SERVICE_PORT).toBe(18_787);
     expect(DEFAULT_CANDIDATE_PORT).toBe(18_888);

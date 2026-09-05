@@ -617,6 +617,7 @@ function defaultRuntimeFactory(options: {
             ydoc: supervisor.ydoc as SandboxYDoc,
             gateway: supervisor.gateway as SandboxGateway,
             assets: supervisor.assets,
+            bootstrapMode: config.v2SupervisorBootstrapMode,
           })
         : null,
       createBootstrap: bootstrap => new V2BootstrapController({
@@ -636,8 +637,7 @@ function defaultRuntimeFactory(options: {
         // observable backoff. One bounded bootstrap attempt prevents three
         // opaque 45-second tries from exceeding its 120-second child budget.
         attempts: 1,
-        // Relay hello acquisition runs a platform agent turn (tens of seconds),
-        // so relay attempts use the full child budget instead of 45 seconds.
+        // Both explicit R9 bootstrap modes retain the established child budget.
         timeoutMs: config.v2BootstrapLaunchMode === "relay" ? 120_000 : 45_000,
         bootstrapTimeoutMs: config.v2BootstrapTimeoutMs,
         launchMode: config.v2BootstrapLaunchMode,
@@ -653,6 +653,7 @@ function defaultRuntimeFactory(options: {
         binding: transport.binding,
         transportProfile: transport.transportProfile,
         channel: transport.channel,
+        terminalReceiptCoalescing: config.v2TerminalReceiptCoalescing,
         maxResponseBytes: transport.maxResponseBytes,
         gzip: transport.gzip,
         expectedSidecarInstanceId: transport.expectedSidecarInstanceId,

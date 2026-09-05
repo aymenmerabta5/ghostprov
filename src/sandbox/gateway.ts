@@ -9,6 +9,14 @@ import {
 } from "../prism/codex-exec";
 import { createProjectConversation } from "../prism/conversation-client";
 import {
+  DIRECT_SUPERVISOR_EXEC_PATH,
+  DIRECT_SUPERVISOR_EXEC_RESPONSE_BYTES,
+  directSupervisorExecBody,
+  parseDirectSupervisorExecStarted,
+  type DirectSupervisorExecRequest,
+  type DirectSupervisorExecStarted,
+} from "../prism/direct-exec";
+import {
   supervisorInstallCommand,
   type SupervisorExecRequest,
 } from "../v2/supervisor/launcher";
@@ -224,6 +232,29 @@ export class SandboxGateway {
     }
   }
 
+  /** One command submission; errors and ambiguous sends never start another job. */
+  async startSupervisorExec(
+    request: DirectSupervisorExecRequest,
+    signal?: AbortSignal,
+  ): Promise<DirectSupervisorExecStarted> {
+    const body = directSupervisorExecBody(request);
+    const response = await this.#request(DIRECT_SUPERVISOR_EXEC_PATH, {
+      method: "POST",
+      signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }, true, Math.min(this.#responseBodyLimitBytes, DIRECT_SUPERVISOR_EXEC_RESPONSE_BYTES));
+    if (response.status !== 200) {
+      throw new SandboxGatewayError("Direct supervisor execution was rejected", response.status, "supervisor-exec");
+    }
+    try {
+      const value: unknown = await response.json();
+      return parseDirectSupervisorExecStarted(value, body.session_id);
+    } catch {
+      throw new SandboxGatewayError("Direct supervisor execution identity is invalid", 502, "supervisor-exec");
+    }
+  }
+
   /**
    * Relay-mode hello acquisition: executes the staged relay launcher inside
    * the sandbox container through one platform Codex turn and returns the
@@ -311,6 +342,7 @@ export class SandboxGateway {
     suffix: string,
     init: RequestInit,
     bufferResponseBody = true,
+    responseBodyLimitBytes = this.#responseBodyLimitBytes,
   ): Promise<Response> {
     // A request owns one immutable credential snapshot. Rotation may happen
     // while the request is in flight, but can only affect later requests.
@@ -330,7 +362,7 @@ export class SandboxGateway {
       path,
       init: { ...init, headers },
       timeoutMs: this.#requestTimeoutMs,
-      responseBodyLimitBytes: this.#responseBodyLimitBytes,
+      responseBodyLimitBytes,
       bodyAdmissionKey: [
         "sandbox",
         sandbox.sessionId ?? sandbox.sandboxId ?? this.projectId,

@@ -38,6 +38,7 @@ import { V2_TERMINAL_SPOOL_CAPACITY } from "../sidecar/capacity";
 import type { V2BootstrapSupervisor } from "../supervisor/host";
 import type { SupervisorExecRequest } from "../supervisor/launcher";
 import type { CodexExecContinuation } from "../../prism/codex-exec";
+import type { DirectSupervisorExecRequest, DirectSupervisorExecStarted } from "../../prism/direct-exec";
 
 const STATIC_PATH = ".ghostprov-v2/static.json";
 const WORKER_PATH = ".ghostprov-v2/worker.json";
@@ -494,6 +495,11 @@ export interface V2BootstrapGateway {
     suffix: string,
     init?: RequestInit,
   ): Promise<{ status: number; text: string; headers: Headers }>;
+  /** Direct R9 bootstrap. Readiness still requires the authenticated supervisor. */
+  startSupervisorExec?(
+    request: DirectSupervisorExecRequest,
+    signal?: AbortSignal,
+  ): Promise<DirectSupervisorExecStarted>;
   /**
    * Relay-mode hello acquisition: runs the staged relay launcher inside the
    * sandbox container and returns its printed transcript. Optional so render

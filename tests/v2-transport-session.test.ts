@@ -45,6 +45,7 @@ import { FakeAwarenessNetwork } from "./support/fake-awareness";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import { releaseAtomicBytePermit } from "../src/v2/memory/permit-carrier";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
+import type { Clock } from "../src/core/ports";
 import { createExactSizedV2Request } from "./support/v2-performance-harness";
 import { HostRequestDiagnosticsObserver } from "../src/v2/diagnostics/host-observer";
 import {
@@ -70,6 +71,25 @@ const R2_BINDING: ProtocolBinding = {
 };
 const HOST_INSTANCE_ID = "host-instance-1";
 const BODY = { model: "gpt-5.6-sol", input: "hello", stream: true };
+
+class ReceiptClock implements Clock {
+  value = 10_000;
+  readonly waits = new Map<object, { delay: number; finish: () => void }>();
+  now(): number { return this.value; }
+  sleep(delay: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+    return new Promise((resolve, reject) => {
+      const key = {};
+      const cleanup = () => { this.waits.delete(key); signal?.removeEventListener("abort", abort); };
+      const abort = () => { cleanup(); reject(new DOMException("Aborted", "AbortError")); };
+      this.waits.set(key, { delay, finish: () => { cleanup(); resolve(); } });
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+  waitUntil(deadline: number, signal?: AbortSignal): Promise<void> { return this.sleep(Math.max(0, deadline - this.value), signal); }
+  pendingDelays(): number[] { return [...this.waits.values()].map(wait => wait.delay); }
+  elapse(): void { for (const wait of [...this.waits.values()]) { this.value += wait.delay; wait.finish(); } }
+}
 
 async function promiseState(value: Promise<unknown>): Promise<"pending" | "settled"> {
   return Promise.race([
@@ -187,6 +207,8 @@ class TransportHarness {
     transportStallMs?: number;
     binding?: ProtocolBinding;
     transportProfile?: V2TransportProfile;
+    clock?: Clock;
+    terminalReceiptCoalescing?: boolean;
   } = {}) {
     this.publicationIntervalMs = options.publicationIntervalMs ?? 1;
     this.autoPong = options.autoPong ?? false;
@@ -234,6 +256,8 @@ class TransportHarness {
       binding: this.binding,
       transportProfile: options.transportProfile,
       channel: this.host,
+      clock: options.clock,
+      terminalReceiptCoalescing: options.terminalReceiptCoalescing,
       maxResponseBytes: options.maxResponseBytes ?? 2 * 1024 * 1024,
       maxBufferedResponseBytes: options.maxBufferedResponseBytes,
       gzip: options.gzip,
@@ -2210,6 +2234,72 @@ describe("V2TransportSession", () => {
       requestId: harness.requestIdentity().requestId,
     }));
     await harness.close();
+  });
+
+  it("coalesces a verified R2 receipt with an immediate next request without changing an active flight", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    await harness.start();
+    const first = await commitR2(harness, harness.session.run(BODY));
+    const firstId = harness.requestIdentity().requestId;
+    harness.publish(await harness.completedFrames());
+    await harness.settle();
+    await first.final;
+    await Array.fromAsync(first.events());
+    expect(clock.pendingDelays()).toEqual([10]);
+    expect([...harness.hostFrames.values()].some(frame => frame.kind === "response_ack")).toBe(false);
+    const second = harness.session.run({ ...BODY, input: "immediate next request" });
+    void second.catch(() => undefined);
+    try {
+      await harness.settle();
+      expect(harness.hostEnvelopes.some(envelope => envelope.frames.some(frame => frame.kind === "response_ack" && frame.requestId === firstId) &&
+        envelope.frames.some(frame => frame.kind === "request_open" && frame.requestId !== firstId))).toBe(true);
+      expect(clock.pendingDelays()).toEqual([]);
+      expect(await promiseState(second)).toBe("pending");
+    } finally { await harness.close(); await Promise.allSettled([second]); }
+  });
+
+  it("flushes an isolated R2 terminal receipt at the fixed deadline", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    harness.publish(await harness.completedFrames());
+    await harness.settle(); await handle.final; await Array.fromAsync(handle.events());
+    expect(clock.pendingDelays()).toEqual([10]);
+    expect([...harness.hostFrames.values()].filter(frame => frame.kind === "response_ack")).toHaveLength(0);
+    clock.elapse();
+    await harness.settle();
+    expect([...harness.hostFrames.values()].filter(frame => frame.kind === "response_ack")).toHaveLength(1);
+    expect(clock.pendingDelays()).toEqual([]);
+    await harness.close();
+  });
+
+  it("retains immediate R2 receipt publication when coalescing is explicitly disabled", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock, terminalReceiptCoalescing: false });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    harness.publish(await harness.completedFrames());
+    await harness.settle(); await handle.final; await Array.fromAsync(handle.events());
+    expect(clock.pendingDelays()).toEqual([]);
+    expect([...harness.hostFrames.values()].filter(frame => frame.kind === "response_ack")).toHaveLength(1);
+    await harness.close();
+  });
+
+  it("cancels a deferred receipt during close without publishing after teardown", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    await harness.start();
+    const handle = await commitR2(harness, harness.session.run(BODY));
+    harness.publish(await harness.completedFrames());
+    await harness.settle(); await handle.final; await Array.fromAsync(handle.events());
+    expect(clock.pendingDelays()).toEqual([10]);
+    await harness.close();
+    const publications = harness.hostEnvelopes.length;
+    expect(clock.pendingDelays()).toEqual([]);
+    clock.elapse(); await harness.network.flushAll();
+    expect(harness.hostEnvelopes).toHaveLength(publications);
   });
 
   it("holds an early priority terminal until all logical events arrive", async () => {

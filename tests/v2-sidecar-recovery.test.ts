@@ -15,6 +15,7 @@ import {
 import { TranscriptProof } from "../src/v2/protocol/transcript";
 import { V2TransportSession } from "../src/v2/transport/session";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
+import type { Clock } from "../src/core/ports";
 
 const PROJECT = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 
@@ -55,6 +56,7 @@ class RecoveryLink {
     readonly sidecarInstanceId: string,
     readonly hostInstanceId: string,
     eventMemoryPool?: AtomicBytePermitPool,
+    clock?: Clock,
   ) {
     this.host = this.network.connectHost(hostInstanceId, PROJECT);
     this.sidecar = this.network.connectSidecar(sidecarInstanceId, PROJECT);
@@ -82,6 +84,7 @@ class RecoveryLink {
       publicationIntervalMs: 1,
       retransmitMs: 60_000,
       eventMemoryPool,
+      clock,
     });
   }
 
@@ -563,6 +566,52 @@ describe("R2 same-sandbox sidecar recovery", () => {
     await target.settle();
     await expect(within(barrier, "terminal receipt barrier")).resolves.toBeUndefined();
     await target.session.close();
+  });
+
+  it("carries an unpublished coalesced receipt across recovery and cancels its old timer", async () => {
+    let pendingSleeps = 0;
+    const clock: Clock = {
+      now: () => performance.timeOrigin + performance.now(),
+      sleep: async (ms, signal) => {
+        expect(ms).toBe(10);
+        pendingSleeps++;
+        return new Promise<void>((_resolve, reject) => {
+          const abort = () => { pendingSleeps--; reject(new DOMException("Aborted", "AbortError")); };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
+      async waitUntil() { throw new Error("Unexpected recovery clock wait"); },
+    };
+    const source = new RecoveryLink(binding("deferred-old"), "deferred-sidecar-old", "deferred-host-old", undefined, clock);
+    await source.connect();
+    const request = await committedRequest(source);
+    const completed = { event: "response.completed", data: JSON.stringify({ type: "response.completed",
+      response: { id: "resp_deferred", status: "completed", output: [] } }) };
+    const transcript = new TranscriptProof(request.requestId, request.requestDigest);
+    transcript.append(completed);
+    const terminal = await transcript.createTerminal();
+    source.publish([{ kind: "response_batch", requestId: request.requestId, firstEventIndex: 0,
+      items: [{ event: completed.event, dataBase64Url: base64UrlEncode(utf8Bytes(completed.data)) }] }, terminal]);
+    await source.settle();
+    await request.handle.final;
+    await Array.fromAsync(request.handle.events());
+    expect(pendingSleeps).toBe(1);
+    expect(source.hostFrames.some(frame => frame.kind === "response_ack")).toBe(false);
+    const capsule = await source.session.suspendSidecarRecovery("deferred-receipt");
+    expect(pendingSleeps).toBe(0);
+    const target = new RecoveryLink(binding("deferred-new"), "deferred-sidecar-new", "deferred-host-new");
+    const barrier = target.session.adoptRecoveredSidecar(capsule);
+    await target.connect();
+    target.publish([terminal, { kind: "recovery_complete" }]);
+    await target.settle();
+    await target.hostFrame("response_ack");
+    expect(target.hostFrames.some(frame => frame.kind === "request_start")).toBe(false);
+    target.publish([], "control");
+    await target.settle();
+    await expect(within(barrier, "deferred receipt recovery")).resolves.toBeUndefined();
+    await target.session.close();
+    await source.sidecar.close();
   });
 
   it("preserves FETCH_STARTING ambiguity without issuing another request_start", async () => {

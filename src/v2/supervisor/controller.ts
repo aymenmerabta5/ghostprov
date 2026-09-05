@@ -21,6 +21,13 @@ import {
   supervisorStaticConfig,
 } from "./launcher";
 import { sealSupervisorSessionBootstrap } from "./session-bootstrap";
+import {
+  DIRECT_SUPERVISOR_INSTALL_PATH,
+  DIRECT_SUPERVISOR_LAUNCH_PATH,
+  directSupervisorLaunchFiles,
+} from "./direct-launcher";
+
+export type SupervisorBootstrapMode = "direct" | "llm";
 
 export class V2SupervisorBootstrapError extends Error {
   readonly name = "V2SupervisorBootstrapError";
@@ -43,6 +50,8 @@ export interface V2SandboxSupervisorOptions {
   readonly ydoc: V2BootstrapYDoc;
   readonly gateway: V2BootstrapGateway;
   readonly assets: V2SidecarAssets;
+  /** Explicit selection; an ambiguous direct launch never falls back to an LLM. */
+  readonly bootstrapMode?: SupervisorBootstrapMode;
   readonly connectTimeoutMs?: number;
   readonly commandTimeoutMs?: number;
   readonly hostFactory?: (options: V2SupervisorHostOptions) => V2BootstrapSupervisor;
@@ -60,6 +69,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly #ydoc: V2BootstrapYDoc;
   readonly #gateway: V2BootstrapGateway;
   readonly #assets: V2SidecarAssets;
+  readonly #bootstrapMode: SupervisorBootstrapMode;
   readonly #connectTimeoutMs: number;
   readonly #commandTimeoutMs: number;
   readonly #hostFactory: NonNullable<V2SandboxSupervisorOptions["hostFactory"]>;
@@ -80,6 +90,10 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#ydoc = options.ydoc;
     this.#gateway = options.gateway;
     this.#assets = options.assets;
+    this.#bootstrapMode = options.bootstrapMode ?? "direct";
+    if (this.#bootstrapMode !== "direct" && this.#bootstrapMode !== "llm") {
+      throw new TypeError("Supervisor bootstrap mode must be direct or llm");
+    }
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 90_000;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
     this.#hostFactory = options.hostFactory ?? (input => new V2SupervisorHost(input));
@@ -110,6 +124,101 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   }
 
   async #ensure(signal?: AbortSignal): Promise<void> {
+    if (this.#bootstrapMode === "direct") return this.#ensureDirect(signal);
+    return this.#ensureLlm(signal);
+  }
+
+  async #ensureDirect(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const start = this.#gateway.startSupervisorExec?.bind(this.#gateway);
+    if (!start) throw new V2SupervisorBootstrapError("Direct supervisor execution is unavailable", "exec");
+    const sessionId = crypto.randomUUID();
+    const instanceId = crypto.randomUUID();
+    const rotationKey = createCredentialRotationKey();
+    const files = directSupervisorLaunchFiles({ entrypointPath: this.#assets.entrypointPath, supervisorNonce: this.binding.nonce });
+    const staticConfig = supervisorStaticConfig({ binding: this.binding, entrypointPath: this.#assets.entrypointPath,
+      connectTimeoutMs: this.#connectTimeoutMs });
+    const sealedJson = JSON.stringify(await sealSupervisorSessionBootstrap({
+      sessionId, binding: this.binding,
+      payload: { instanceId, credential: { url: this.#ySweet.url, baseUrl: this.#ySweet.baseUrl, docId: this.#ySweet.docId,
+        token: this.#ySweet.token.reveal(), authorization: this.#ySweet.authorization, rotationKey } },
+    }));
+    const transients = [
+      { path: DIRECT_SUPERVISOR_LAUNCH_PATH, content: files.launcher },
+      { path: DIRECT_SUPERVISOR_INSTALL_PATH, content: files.installer },
+      { path: SUPERVISOR_CREDENTIAL_PATH, content: sealedJson },
+    ] as const;
+    let host: V2BootstrapSupervisor | null = null;
+    let ready = false;
+    let staged = false;
+    let phase: "deploy" | "exec" | "readiness" = "deploy";
+    try {
+      const [currentStatic, currentCredential] = await Promise.all([
+        this.#ydoc.readPath(SUPERVISOR_STATIC_PATH),
+        this.#ydoc.readPath(SUPERVISOR_CREDENTIAL_PATH),
+      ]);
+      signal?.throwIfAborted();
+      const applied = await this.#ydoc.compareAndMutatePaths({
+        guards: [
+          { path: DIRECT_SUPERVISOR_LAUNCH_PATH, equals: null },
+          { path: DIRECT_SUPERVISOR_INSTALL_PATH, equals: null },
+          { path: SUPERVISOR_STATIC_PATH, equals: currentStatic },
+          { path: SUPERVISOR_CREDENTIAL_PATH, equals: currentCredential },
+        ],
+        mutations: [
+          { kind: "write", path: SUPERVISOR_STATIC_PATH, content: staticConfig },
+          ...transients.map(file => ({ kind: "write" as const, ...file })),
+        ],
+      });
+      if (!applied) throw new Error("Supervisor workspace authority changed");
+      staged = true;
+      await this.#gateway.syncWorkspace(signal);
+      signal?.throwIfAborted();
+      host = this.#hostFactory({ binding: this.binding, instanceId, rotationKey, credential: this.#ySweet,
+        connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs });
+      phase = "exec";
+      // One immutable submission. No job-status polling, replay, or LLM fallback.
+      await start(Object.freeze({ sessionId }), signal);
+      signal?.throwIfAborted();
+      phase = "readiness";
+      await host.connect(signal);
+      ready = true;
+      signal?.throwIfAborted();
+      phase = "deploy";
+      const cleaned = await this.#ydoc.compareAndMutatePaths({
+        guards: [{ path: SUPERVISOR_STATIC_PATH, equals: staticConfig },
+          ...transients.map(file => ({ path: file.path, equals: file.content }))],
+        mutations: transients.map(file => ({ kind: "tombstone" as const, path: file.path })),
+      });
+      if (!cleaned) throw new Error("Supervisor bootstrap authority changed during cleanup");
+      await this.#gateway.syncWorkspace(signal);
+      signal?.throwIfAborted();
+      if (this.#closed || this.#stopping) throw new DOMException("Supervisor closed during bootstrap", "AbortError");
+      this.#instanceId = instanceId;
+      this.#host = host;
+    } catch (cause) {
+      // Only a signed, exact supervisor can authorize shutdown. Failed or
+      // ambiguous launches never authorize a PID signal or another submission.
+      if (host && ready) {
+        await host.shutdown("direct_bootstrap_failed", AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+      }
+      await host?.close().catch(() => undefined);
+      if (staged) {
+        for (const file of transients) {
+          await this.#ydoc.compareAndMutatePaths({
+            guards: [{ path: file.path, equals: file.content }],
+            mutations: [{ kind: "tombstone", path: file.path }],
+          }).catch(() => false);
+        }
+        await this.#gateway.syncWorkspace(AbortSignal.timeout(Math.min(15_000, this.#commandTimeoutMs))).catch(() => undefined);
+      }
+      if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+      throw new V2SupervisorBootstrapError("Direct sandbox supervisor bootstrap failed", phase, { cause });
+    }
+  }
+
+  /** Retained implementation selected only by bootstrapMode=llm. */
+  async #ensureLlm(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     const prepareRelayExecSession = this.#gateway.prepareRelayExecSession?.bind(this.#gateway);
     const runRelayExec = this.#gateway.runRelayExec?.bind(this.#gateway);

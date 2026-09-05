@@ -8,6 +8,18 @@ const enabled = {
 };
 
 describe("R9 supervisor live recovery guards", () => {
+  it("requires explicit LLM selection and a valid concurrency benchmark opt-in", () => {
+    expect(resolveR9RecoveryProofOptions(enabled)).toMatchObject({ bootstrapMode: "direct", benchmarkConcurrency: false });
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm", GP_LIVE_BENCHMARK_CONCURRENCY: "1" }))
+      .toMatchObject({ bootstrapMode: "llm", benchmarkConcurrency: true });
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "auto" })).toThrow();
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_BENCHMARK_CONCURRENCY: "true" })).toThrow();
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_RECOVERY_CYCLES: "3" }).recoveryCycles).toBe(3);
+    for (const cycles of ["0", "4", "1.5", "NaN"]) {
+      expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_RECOVERY_CYCLES: cycles })).toThrow();
+    }
+  });
+
   it("requires usable live capacity instead of treating a recovering ready-state runtime as ready", () => {
     const ready = { state: "ready", capacity: 8, available: 8, transportConnected: true, quarantined: 0, ambiguousQuarantined: 0 };
     expect(r9RuntimeIsReady(ready)).toBe(true);

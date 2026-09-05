@@ -57,10 +57,13 @@ export interface MultiSandboxConfig {
   v2DiagnosticsEnabled: boolean;
   v2DiagnosticsIntervalMs: number;
   v2BatchingEnabled: boolean;
+  v2TerminalReceiptCoalescing: boolean;
   /** Process-wide immutable sidecar release. R9 is normal operation; prior releases are rollback. */
   v2SidecarRevision: V2SidecarRevision;
   /** Bootstrap launch transport. Relay stages a sandbox-container launcher; render forks from the render VM. */
   v2BootstrapLaunchMode: "render" | "relay";
+  /** R9 cold bootstrap only; direct and LLM modes share the same supervisor. */
+  v2SupervisorBootstrapMode: "direct" | "llm";
   /** Phase-zero credential wait published into the sidecar static config. */
   v2BootstrapTimeoutMs: number;
   /** Exact persisted-project overrides only; no prefix, cohort, or fallback matching. */
@@ -328,6 +331,9 @@ export function resolveMultiSandboxConfig(
   const v2BatchingEnabled = env.GP_V2_BATCHING === undefined
     ? true
     : binaryFlag(env.GP_V2_BATCHING, "GP_V2_BATCHING");
+  const v2TerminalReceiptCoalescing = env.GP_V2_TERMINAL_RECEIPT_COALESCING === undefined
+    ? true
+    : binaryFlag(env.GP_V2_TERMINAL_RECEIPT_COALESCING, "GP_V2_TERMINAL_RECEIPT_COALESCING");
   const v2SidecarRevision = resolveV2SidecarRevision(
     env.GP_V2_SIDECAR_REVISION?.trim() || DEFAULT_V2_SIDECAR_REVISION,
   );
@@ -342,6 +348,12 @@ export function resolveMultiSandboxConfig(
   );
   const v2BootstrapTimeoutMs = boundedPositiveInteger(
     env.GP_V2_BOOTSTRAP_TIMEOUT_MS, 300_000, "GP_V2_BOOTSTRAP_TIMEOUT_MS", 30_000, 600_000,
+  );
+  const v2SupervisorBootstrapMode = enumValue(
+    env.GP_V2_SUPERVISOR_BOOTSTRAP_MODE,
+    "direct",
+    ["direct", "llm"] as const,
+    "GP_V2_SUPERVISOR_BOOTSTRAP_MODE",
   );
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
@@ -393,9 +405,11 @@ export function resolveMultiSandboxConfig(
     v2DiagnosticsEnabled,
     v2DiagnosticsIntervalMs,
     v2BatchingEnabled,
+    v2TerminalReceiptCoalescing,
     v2SidecarRevision,
     v2SidecarProjectRevisions: v2SidecarRevisionOverrides,
     v2BootstrapLaunchMode,
+    v2SupervisorBootstrapMode,
     v2BootstrapTimeoutMs,
     sandboxStartupTimeoutMs,
     desiredSandboxes,
