@@ -11,6 +11,7 @@ import {
   V2_R7,
   V2_R8,
   V2_R9,
+  V2_R10,
   type V2SidecarAssets,
   type V2SidecarRevision,
 } from "./assets";
@@ -217,6 +218,7 @@ export function createBundledV2SidecarRevisionSelector(
     [V2_R7, () => loadV2SidecarAssets({ revision: V2_R7 })],
     [V2_R8, () => loadV2SidecarAssets({ revision: V2_R8 })],
     [V2_R9, () => loadV2SidecarAssets({ revision: V2_R9 })],
+    [V2_R10, () => loadV2SidecarAssets({ revision: V2_R10 })],
   ]);
   return new V2SidecarRevisionSelector({
     projectIds: options.projectIds,

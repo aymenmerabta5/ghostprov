@@ -114,6 +114,7 @@ export interface GhostProvAppOptions {
   keepAliveMs?: number;
   /** Fixed-contract Codex standalone search executor; never a generic HTTP forwarder. */
   standaloneSearch?: StandaloneSearchHandler;
+  sandboxLogs?: Pick<import("../v2/diagnostics/sandbox-log-service").SandboxLogService, "read">;
 }
 
 const CODEX_BASE_INSTRUCTIONS =
@@ -1009,6 +1010,18 @@ const CODEX_MODELS = Object.freeze([
     priority: 3,
   }),
   codexModel({
+    slug: "gpt-6-astra",
+    displayName: "GPT-6-Astra",
+    description: "GPT-6 Astra through GhostProv.",
+    // https://developers.openai.com/api/docs/models/gpt-6-astra
+    defaultReasoning: "medium",
+    reasoning: ["low", "medium", "high", "xhigh", "max"],
+    priority: 4,
+    maxContextWindow: 1_050_000,
+    useResponsesLite: false,
+    multiAgentVersion: "v2",
+  }),
+  codexModel({
     slug: "gpt-5.5",
     displayName: "GPT-5.5",
     description: "Frontier model for complex coding, research, and real-world work.",
@@ -1102,6 +1115,11 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     });
   }
 
+  app.get("/v1/diagnostics/sandboxes/:projectId/logs/:file", async c => {
+    if (!options.apiKey || !options.sandboxLogs) return apiErrorResponse(new ApiError(404, "Sandbox diagnostics are unavailable", { code: "sandbox_log_not_found" }));
+    return options.sandboxLogs.read(c.req.param("projectId"), c.req.param("file"), c.req.raw.signal);
+  });
+
   app.get("/health", c => {
     const snapshot = options.router.snapshot();
     const fleet = publicFleetState(options.fleetSnapshot?.(), snapshot.runtimes.length);
@@ -1146,6 +1164,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       { id: "gpt-5.6-sol", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-5.6-terra", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-5.6-luna", object: "model", created: 0, owned_by: "ghostprov" },
+      { id: "gpt-6-astra", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-5.5", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-image-2", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-image-2-2026-04-21", object: "model", created: 0, owned_by: "ghostprov" },

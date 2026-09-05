@@ -19,7 +19,8 @@ export const V2_R6 = "r6" as const;
 export const V2_R7 = "r7" as const;
 export const V2_R8 = "r8" as const;
 export const V2_R9 = "r9" as const;
-export const DEFAULT_V2_SIDECAR_REVISION = V2_R9;
+export const V2_R10 = "r10" as const;
+export const DEFAULT_V2_SIDECAR_REVISION = V2_R10;
 export const V2_SIDECAR_REVISIONS = Object.freeze([
   V2_R1,
   V2_R2,
@@ -30,6 +31,7 @@ export const V2_SIDECAR_REVISIONS = Object.freeze([
   V2_R7,
   V2_R8,
   V2_R9,
+  V2_R10,
 ] as const);
 
 export type V2SidecarRevision = (typeof V2_SIDECAR_REVISIONS)[number];
@@ -48,7 +50,7 @@ export function protocolRevisionForV2SidecarRevision(
 export function transportProfileForV2SidecarRevision(
   revision: V2SidecarRevision,
 ): V2TransportProfile {
-  return revision === V2_R5 || revision === V2_R6 || revision === V2_R7 || revision === V2_R8 || revision === V2_R9
+  return revision === V2_R5 || revision === V2_R6 || revision === V2_R7 || revision === V2_R8 || revision === V2_R9 || revision === V2_R10
     ? "bulk-v1"
     : DEFAULT_V2_TRANSPORT_PROFILE;
 }
@@ -161,6 +163,9 @@ export const V2_R9_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
   bundleSha256: "032ce82a6104ab513c8efa7a8dd9a7d67fefb8ca41ee73cf47c9f4399d90012d",
 });
 
+/** Immutable R10 diagnostics release; validation scope is recorded in docs/validation. */
+export const V2_R10_RELEASE: V2SidecarReleaseIdentity = Object.freeze({"revision":"r10","protocolRevision":"r2","transportProfile":"bulk-v1","buildHash":"ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a","schemaHash":"51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f","bundleSha256":"a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776"});
+
 /**
  * The first R2 artifact was declared frozen before the later selectable R2
  * replacement was published. It is retained only so bootstrap can safely
@@ -188,6 +193,7 @@ export const V2_SELECTABLE_RELEASE_IDENTITIES = Object.freeze([
   V2_R7_RELEASE,
   V2_R8_RELEASE,
   V2_R9_RELEASE,
+  V2_R10_RELEASE,
 ] as const);
 
 /** Exact immutable entrypoints bootstrap is authorized to retire. */
@@ -202,6 +208,7 @@ export const V2_RETIREMENT_RELEASE_IDENTITIES = Object.freeze([
   V2_R7_RELEASE,
   V2_R8_RELEASE,
   V2_R9_RELEASE,
+  V2_R10_RELEASE,
 ] as const);
 
 export interface V2SidecarAsset {
@@ -239,7 +246,7 @@ export interface V2SidecarAssets {
 }
 
 export interface LoadV2SidecarAssetsOptions {
-  /** Explicit selection; omitted production callers select R9 (sandbox-relay). */
+  /** Explicit selection; omitted production callers select R10 with persistent sandbox diagnostics. */
   readonly revision?: V2SidecarRevision | string;
 }
 
@@ -289,6 +296,7 @@ const RELEASES: Readonly<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
     ...V2_R8_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r8/sidecar.bundle.js"),
   }),
+  r10: Object.freeze({ ...V2_R10_RELEASE, bundlePath: path.resolve(import.meta.dir, "releases/r10/sidecar.bundle.js") }),
   r9: Object.freeze({
     ...V2_R9_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r9/sidecar.bundle.js"),

@@ -36,6 +36,8 @@ import type {
   SandboxLivenessErrorName,
   SandboxLivenessOutcome,
   SandboxLivenessSignal,
+  SandboxReconnectPhase,
+  SandboxSupervisorPhase,
 } from "../observability/events";
 import type {
   V2GzipOptions,
@@ -69,17 +71,29 @@ function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
 }
 
 function shouldQuarantineSandboxSession(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const value = error as { name?: unknown; kind?: unknown };
-  if (value.name === "V2BootstrapError") {
-    return value.kind === "render" || value.kind === "hello" ||
-      value.kind === "readiness" || value.kind === "timeout";
+  let current = error;
+  // R9 supervisor readiness is wrapped as deployment failure by the sidecar
+  // bootstrap. Preserve that execution-risk evidence without classifying an
+  // ordinary workspace/sync error as a repeatedly failed sandbox session.
+  for (let depth = 0; depth < 6; depth++) {
+    if (!current || typeof current !== "object") return false;
+    try {
+      const value = current as { name?: unknown; kind?: unknown; cause?: unknown };
+      if (value.name === "V2BootstrapError" && (
+        value.kind === "render" || value.kind === "hello" ||
+        value.kind === "readiness" || value.kind === "timeout"
+      )) return true;
+      if (value.name === "V2SupervisorBootstrapError") return value.kind === "readiness";
+      if (value.name === "V2TransportLivenessError") return true;
+      if (value.name === "V2RuntimeLifecycleFailure") {
+        return value.kind === "heartbeat_unreachable" ||
+          value.kind === "sidecar_unreachable" ||
+          value.kind === "ambiguity_exhausted";
+      }
+      current = value.cause;
+    } catch { return false; }
   }
-  if (value.name === "V2TransportLivenessError") return true;
-  if (value.name !== "V2RuntimeLifecycleFailure") return false;
-  return value.kind === "heartbeat_unreachable" ||
-    value.kind === "sidecar_unreachable" ||
-    value.kind === "ambiguity_exhausted";
+  return false;
 }
 
 function reliableTransportStalled(
@@ -127,12 +141,23 @@ function livenessErrorName(error: unknown): SandboxLivenessErrorName {
     case "SidecarCredentialRotationError":
     case "SplitAwarenessChannelError":
     case "V2SidecarRecoveryPreflightUnavailableError":
+    case "V2SupervisorError":
     case "V2TransportLivenessError":
     case "YDocSessionError":
       return name;
     default:
       return "Error";
   }
+}
+
+function supervisorErrorPhase(error: unknown): SandboxSupervisorPhase | null {
+  try {
+    if (!error || typeof error !== "object" || !("phase" in error)) return null;
+    switch (error.phase) {
+      case "transport": case "bootstrap": case "sequence": case "challenge": case "command": return error.phase;
+      default: return null;
+    }
+  } catch { return null; }
 }
 
 function livenessErrorKind(
@@ -274,6 +299,8 @@ export interface V2RuntimeLivenessDiagnostic {
   readonly reliableStall?: boolean;
   readonly awarenessLane?: SandboxAwarenessLane;
   readonly connectionCode?: number | null;
+  readonly reconnectPhase?: SandboxReconnectPhase | null;
+  readonly supervisorPhase?: SandboxSupervisorPhase | null;
 }
 
 export type V2RuntimeLifecycleFailureKind =
@@ -1197,6 +1224,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           consecutiveFailures,
           errorName: livenessErrorName(relaunchError),
           errorKind: livenessErrorKind(relaunchError),
+          supervisorPhase: supervisorErrorPhase(relaunchError),
           durationMs: Math.max(0, this.#clock.now() - startedAtMs),
           reliableStall: consecutiveReliableStalls > 0,
         });
@@ -1392,6 +1420,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       cleanupDeadline: null,
     };
     this.#sidecarRelaunchContext = context;
+    const reconnectingSource = this.#ySweetReconnectPending;
     try {
       await this.#proveSameSandboxSession(generation, binding.sessionId, gateway, signal);
       this.#assertSidecarRelaunchCurrent(context, signal);
@@ -1404,7 +1433,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#assertSidecarRelaunchCurrent(context, signal);
 
       if (
-        recheckSourceBeforeRelaunch &&
+        (recheckSourceBeforeRelaunch || reconnectingSource) &&
         await this.#sourceTransportRecovered(sourceTransport, signal)
       ) {
         this.#assertSidecarRelaunchCurrent(context, signal);
@@ -1774,6 +1803,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       }
       const reconnectAttempt = this.#ySweetReconnectPending;
       const reconnectStartedAtMs = this.#clock.now();
+      let reconnectPhase: SandboxReconnectPhase = "mint_credential";
       if (reconnectAttempt) {
         this.#notifyLiveness({
           signal: "awareness",
@@ -1782,8 +1812,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         });
       }
       try {
-          const rotation = (async () => {
-            const rotationId = `rotation-${crypto.randomUUID()}`;
+        const rotation = (async () => {
+          const rotationId = `rotation-${crypto.randomUUID()}`;
           const ySweet = await this.#options.provisioning.mintYSweet!(
             this.projectId,
             {
@@ -1804,6 +1834,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             awareness !== this.#awareness
           ) return false;
           if (supervisor) {
+            reconnectPhase = "supervisor_rotation";
             await supervisor.rotateCredential(
               ySweet,
               `supervisor-${rotationId}`,
@@ -1817,6 +1848,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             // Awareness lane. Reconnect the host with the reminted credential
             // first, then deliver the sealed credential to the still-running
             // sidecar over the restored reliable transport.
+            reconnectPhase = "host_reconnect";
             await awareness.rotateCredential?.(ySweet);
             await transport.resumeAwareness?.(signal);
           }
@@ -1828,8 +1860,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
               supervisor !== this.#supervisor ||
               awarenessFailureVersion !== this.#awarenessFailureVersion
           ) return false;
+          reconnectPhase = "sidecar_rotation";
           await transport.rotateCredential!(rotationId, sealedJson, signal);
           if (!reconnectFirst) {
+            reconnectPhase = "host_reconnect";
             await awareness.rotateCredential?.(ySweet);
             await transport.resumeAwareness?.(signal);
           }
@@ -1866,16 +1900,16 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           : this.#clock.now();
       } catch (error) {
         if (signal.aborted) return;
-        if (reconnectAttempt) {
-          this.#notifyLiveness({
-            signal: "awareness",
-            outcome: "failed",
-            attempt: this.#awarenessFailureVersion,
-            errorName: livenessErrorName(error),
-            errorKind: livenessErrorKind(error),
-            durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
-          });
-        }
+        this.#notifyLiveness({
+          signal: "awareness",
+          outcome: "failed",
+          attempt: this.#awarenessFailureVersion,
+          errorName: livenessErrorName(error),
+          errorKind: livenessErrorKind(error),
+          reconnectPhase,
+          supervisorPhase: supervisorErrorPhase(error),
+          durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
+        });
         this.#runtimeHealth.record("unhealthy");
         await this.#clock.sleep(30_000, signal);
         deadline = this.#clock.now();

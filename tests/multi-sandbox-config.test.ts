@@ -184,10 +184,15 @@ describe("multi-sandbox configuration", () => {
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
       PRISM_PROJECT_IDS: A,
       GP_V2_BOOTSTRAP_LAUNCH_MODE: "render",
+      GP_V2_SIDECAR_REVISION: "r8",
       GP_V2_BOOTSTRAP_TIMEOUT_MS: "60000",
     }, MACHINE);
     expect(render.v2BootstrapLaunchMode).toBe("render");
     expect(render.v2BootstrapTimeoutMs).toBe(60_000);
+    expect(() => resolveMultiSandboxConfig({ ...BASE_ENV, PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json", PRISM_PROJECT_IDS: A,
+      GP_V2_SIDECAR_REVISION: "r10", GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow("R10 requires");
+    expect(() => resolveMultiSandboxConfig({ ...BASE_ENV, PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json", PRISM_PROJECT_IDS: A,
+      GP_V2_SIDECAR_REVISION: "r8", GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10`, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow("R10 requires");
     for (const env of [
       { GP_V2_BOOTSTRAP_LAUNCH_MODE: "exec" },
       { GP_V2_BOOTSTRAP_TIMEOUT_MS: "29999" },
@@ -231,7 +236,7 @@ describe("multi-sandbox configuration", () => {
     }
   });
 
-  it("supports immutable R1/R2/R3/R4/R5/R6/R7/R8/R9 releases and exact known-project overrides", () => {
+  it("supports immutable R1 through R10 releases and exact known-project overrides", () => {
     const config = resolveMultiSandboxConfig({
       ...BASE_ENV,
       PRISM_COOKIE_FILE: "D:/secrets/prism-cookies.json",
@@ -244,7 +249,7 @@ describe("multi-sandbox configuration", () => {
     expect(Object.isFrozen(config.v2SidecarProjectRevisions)).toBe(true);
 
     for (const revisions of [
-      `${B}=r10`,
+      `${B}=r11`,
       `${B}=r1,${B}=r2`,
       "*=r1",
       "not-an-assignment",

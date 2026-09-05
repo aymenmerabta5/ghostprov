@@ -87,7 +87,7 @@ describe("project documentation", () => {
     expect(readme).toContain("two true bulk transfers remain forbidden");
     expect(envExample).toContain("GP_V2_INITIAL_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=8");
-    expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r9");
+    expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r10");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
     expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=30000");
     expect(envExample).toContain("GP_TARGET_SANDBOXES=8");
@@ -276,7 +276,9 @@ describe("project documentation", () => {
       "check:v2-sidecar-deno": "bun --no-env-file x --no-install deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r8/sidecar.bundle.js",
       "test:v2-deno-fs": "bun --no-env-file x --no-install deno@2.9.5 test --no-check --unstable-sloppy-imports --allow-read --allow-write --allow-env tests/deno/v2-journal-storage.deno.ts",
       "check:v2-sidecar-deno-r9": "bun --no-env-file x --no-install deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r9/sidecar.bundle.js",
-      "check:v2-sidecar": "bun run check:v2-sidecar-release && bun run check:v2-sidecar-release-r9 && bun run check:v2-sidecar-deno && bun run check:v2-sidecar-deno-r9 && bun run test:v2-deno-upstream && bun run test:v2-deno-fs",
+      "check:v2-sidecar-release-r10": "bun --no-env-file scripts/build_v2_sidecar_r10.ts --check",
+      "check:v2-sidecar-deno-r10": "bun --no-env-file x --no-install deno@2.9.5 check --no-config --no-remote --no-npm --no-lock src/v2/sidecar/releases/r10/sidecar.bundle.js",
+      "check:v2-sidecar": "bun run check:v2-sidecar-release && bun run check:v2-sidecar-release-r9 && bun run check:v2-sidecar-release-r10 && bun run check:v2-sidecar-deno && bun run check:v2-sidecar-deno-r9 && bun run check:v2-sidecar-deno-r10 && bun run test:v2-deno-upstream && bun run test:v2-deno-fs",
     });
     expect(pkg.scripts).not.toHaveProperty("test:daemon");
     expect(pkg.dependencies).not.toHaveProperty("playwright");

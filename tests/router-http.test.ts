@@ -344,7 +344,7 @@ describe("router HTTP composition", () => {
     });
   }
 
-  it("forces upstream persistence and streaming without changing the public nonstream contract", async () => {
+  it.each(["gpt-5.6-sol", "gpt-6-astra"])("forces upstream persistence and streaming while preserving %s and the public nonstream contract", async model => {
     const router = new FakeRouter();
     const authorizationScope = createAuthenticatedTenantScope();
     router.authorizationScope = authorizationScope;
@@ -354,7 +354,7 @@ describe("router HTTP composition", () => {
     });
 
     const publicBody = {
-      model: "gpt-5.6-sol",
+      model,
       input: "persist this upstream",
       stream: false,
       store: false,
@@ -376,7 +376,7 @@ describe("router HTTP composition", () => {
     expect(await response.json()).toMatchObject({ status: "completed" });
     expect(router.workloads[0]!.authorizationScope).toBe(authorizationScope);
     const expectedUpstreamBody = {
-      model: "gpt-5.6-sol",
+      model,
       input: "persist this upstream",
       stream: true,
       store: true,
@@ -1787,6 +1787,7 @@ describe("router HTTP composition", () => {
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
+      "gpt-6-astra",
       "gpt-5.5",
       "gpt-image-2",
     ]));
@@ -1794,8 +1795,17 @@ describe("router HTTP composition", () => {
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
+      "gpt-6-astra",
       "gpt-5.5",
     ]);
+    const astra = body.models.find((model: any) => model.slug === "gpt-6-astra");
+    expect(astra.supported_reasoning_levels.map((level: any) => level.effort))
+      .toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(astra).toMatchObject({
+      default_reasoning_level: "medium",
+      max_context_window: 1_050_000,
+      use_responses_lite: false,
+    });
     expect(body.models.every((model: any) => (
       typeof model.base_instructions === "string" &&
       model.base_instructions.length > 0 &&

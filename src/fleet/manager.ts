@@ -675,7 +675,7 @@ export class ProjectFleetManager {
   }
 
   #replacementEligible(worker: FleetWorkerRecord, manifest: FleetManifest): boolean {
-    if (this.#config.v2SidecarRevision !== "r9" ||
+    if ((this.#config.v2SidecarRevision !== "r9" && this.#config.v2SidecarRevision !== "r10") ||
       Object.hasOwn(this.#config.v2SidecarProjectRevisions, worker.projectId)) {
       return this.#blockMutation(worker, "replace", "release_policy");
     }
@@ -707,7 +707,7 @@ export class ProjectFleetManager {
       value.projectId !== worker.projectId &&
       selected.has(value.projectId) &&
       isRuntimeHealthy(value) &&
-      value.releaseRevision === "r9"
+      value.releaseRevision === this.#config.v2SidecarRevision
     ).length;
     if (healthyPeers < Math.floor(this.#desiredSandboxes / 2) + 1) {
       return this.#blockMutation(worker, "replace", "healthy_majority");
@@ -988,7 +988,7 @@ export class ProjectFleetManager {
   ): boolean {
     if (!worker.managed) return true;
     if (
-      this.#config.v2SidecarRevision !== "r9" ||
+      (this.#config.v2SidecarRevision !== "r9" && this.#config.v2SidecarRevision !== "r10") ||
       Object.hasOwn(this.#config.v2SidecarProjectRevisions, worker.projectId) ||
       evidence.managedMissingClaimed ||
       !this.#mutationsAllowed()
@@ -1001,7 +1001,7 @@ export class ProjectFleetManager {
     const healthyPeers = this.#registry.snapshots().filter(snapshot =>
       snapshot.projectId !== worker.projectId &&
       isRuntimeHealthy(snapshot) &&
-      snapshot.releaseRevision === "r9"
+      snapshot.releaseRevision === this.#config.v2SidecarRevision
     ).length;
     if (healthyPeers < Math.floor(this.#desiredSandboxes / 2) + 1) return false;
     evidence.managedMissingClaimed = true;

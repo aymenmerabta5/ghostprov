@@ -15,6 +15,8 @@ import {
   SANDBOX_LIVENESS_ERROR_NAMES,
   SANDBOX_LIVENESS_OUTCOMES,
   SANDBOX_LIVENESS_SIGNALS,
+  SANDBOX_RECONNECT_PHASES,
+  SANDBOX_SUPERVISOR_PHASES,
   ROUTER_QUEUE_CLASSES,
   SANDBOX_RECOVERY_CAUSES,
   SANDBOX_RECOVERY_ERROR_KINDS,
@@ -123,6 +125,8 @@ const LIVENESS_FIELDS = new Set([
   "reliable_stall",
   "awareness_lane",
   "connection_code",
+  "reconnect_phase",
+  "supervisor_phase",
 ]);
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release"]),
@@ -211,6 +215,8 @@ const LIVENESS_SIGNAL_SET = new Set<string>(SANDBOX_LIVENESS_SIGNALS);
 const LIVENESS_OUTCOME_SET = new Set<string>(SANDBOX_LIVENESS_OUTCOMES);
 const LIVENESS_ERROR_NAME_SET = new Set<string>(SANDBOX_LIVENESS_ERROR_NAMES);
 const LIVENESS_ERROR_KIND_SET = new Set<string>(SANDBOX_LIVENESS_ERROR_KINDS);
+const RECONNECT_PHASE_SET = new Set<string>(SANDBOX_RECONNECT_PHASES);
+const SUPERVISOR_PHASE_SET = new Set<string>(SANDBOX_SUPERVISOR_PHASES);
 const AWARENESS_LANE_SET = new Set<string>(SANDBOX_AWARENESS_LANES);
 const LIVENESS_TRANSPORT_SET = new Set<string>(SANDBOX_RECOVERY_TRANSPORTS);
 const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
@@ -449,6 +455,12 @@ function assertSafeLivenessFields(event: ObservabilityEvent): void {
         !Number.isSafeInteger(event.connection_code) ||
         event.connection_code < 0 || event.connection_code > 65_535)) {
     throw new TypeError("Liveness observability connection_code is invalid");
+  }
+  for (const [key, allowed] of [["reconnect_phase", RECONNECT_PHASE_SET], ["supervisor_phase", SUPERVISOR_PHASE_SET]] as const) {
+    const value = event[key];
+    if (value !== undefined && value !== null && (typeof value !== "string" || !allowed.has(value))) {
+      throw new TypeError(`Liveness observability ${key} is invalid`);
+    }
   }
 }
 

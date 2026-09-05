@@ -646,8 +646,10 @@ describe("V2BootstrapController", () => {
   });
 
   it("rejects an unregistered sidecar revision before generating a launcher", () => {
+    expect(() => bootstrapHarness("none", "r11", 8, R8_ASSETS))
+      .toThrow("Unsupported V2 sidecar revision: r11");
     expect(() => bootstrapHarness("none", "r10", 8, R8_ASSETS))
-      .toThrow("Unsupported V2 sidecar revision: r10");
+      .toThrow("Selected V2 revision r10 does not match supplied assets r8");
   });
 
   it("deploys non-secret assets, seals credentials, and accepts only bound readiness", async () => {

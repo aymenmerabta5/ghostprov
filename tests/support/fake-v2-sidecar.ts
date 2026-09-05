@@ -24,6 +24,7 @@ import {
   type SidecarAdmission,
   type SidecarUpstream,
 } from "../../src/v2/sidecar/engine";
+import type { SidecarEngine as R10SidecarEngine } from "../../src/v2/sidecar/r10-engine";
 import {
   UpstreamExecutionError,
   type DirectResponsesExecution,
@@ -260,6 +261,7 @@ export async function completedUpstream(
 }
 
 export interface SidecarHarnessOptions {
+  engineClass?: typeof SidecarEngine | typeof R10SidecarEngine;
   behavior?: (input: DirectResponsesExecution) => Promise<UpstreamTerminal>;
   records?: JournalRecord[];
   terminals?: Map<string, Uint8Array>;
@@ -293,7 +295,7 @@ export class SidecarHarness {
   readonly journal: ClaimJournal;
   readonly admission: FakeAdmission;
   readonly upstream: FakeUpstream;
-  readonly engine: SidecarEngine;
+  readonly engine: Pick<SidecarEngine, keyof SidecarEngine>;
   readonly binding: ProtocolBinding;
   requestId = "req-engine-1";
   requestDigest = "";
@@ -321,7 +323,7 @@ export class SidecarHarness {
       this.timeline,
       options.behavior ?? (input => completedUpstream(input)),
     );
-    this.engine = new SidecarEngine({
+    this.engine = new (options.engineClass ?? SidecarEngine)({
       binding: this.binding,
       assembler: new RequestAssembler({
         atomicBytePermits: options.atomicBytePermits,

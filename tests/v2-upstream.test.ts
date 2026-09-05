@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { SseFrame } from "../src/relay/sse";
 import {
-  DirectResponsesClient,
+  DirectResponsesClient as BaseDirectResponsesClient,
   UpstreamExecutionError,
 } from "../src/v2/sidecar/upstream";
+import { DirectResponsesClient as R10DirectResponsesClient } from "../src/v2/sidecar/r10-upstream";
 
 const FINAL = {
   id: "resp_1",
@@ -81,7 +82,7 @@ function nonSettlingCancelStream(chunks: Uint8Array[] = []): {
   };
 }
 
-describe("DirectResponsesClient", () => {
+describe.each([["base", BaseDirectResponsesClient], ["R10", R10DirectResponsesClient]] as const)("%s DirectResponsesClient", (_revision, DirectResponsesClient) => {
   it("marks FETCH_STARTING before fetch and streams complete SSE events", async () => {
     const order: string[] = [];
     const bodies: any[] = [];

@@ -15,15 +15,21 @@ import {
   type UpstreamTerminal,
 } from "../src/v2/sidecar/upstream";
 import {
-  SidecarHarness,
+  SidecarHarness as BaseSidecarHarness,
   TEST_BINDING,
   TEST_R2_BINDING,
   completedUpstream,
 } from "./support/fake-v2-sidecar";
+import { SidecarEngine as R10SidecarEngine } from "../src/v2/sidecar/r10-engine";
+type SidecarHarness = BaseSidecarHarness;
+
+class R10SidecarHarness extends BaseSidecarHarness {
+  constructor(options: ConstructorParameters<typeof BaseSidecarHarness>[0] = {}) { super({ ...options, engineClass: R10SidecarEngine }); }
+}
 
 const BODY = { model: "gpt-5.6-sol", input: "engine", stream: true };
 
-describe("SidecarEngine", () => {
+describe.each([["base", BaseSidecarHarness], ["R10", R10SidecarHarness]] as const)("%s SidecarEngine", (_revision, SidecarHarness) => {
   it("releases transferred request memory after upstream completion", async () => {
     const pool = new AtomicBytePermitPool({
       ordinaryBytes: 10 * 1024 * 1024,

@@ -21,6 +21,10 @@ import {
   supervisorStaticConfig,
 } from "./launcher";
 import { sealSupervisorSessionBootstrap } from "./session-bootstrap";
+import { supervisorStaticConfig as r10SupervisorStaticConfig } from "./r10-launcher";
+import { directSupervisorLaunchFiles as r10DirectSupervisorLaunchFiles, isRegisteredR10Entrypoint } from "./r10-direct-launcher";
+import { decodeSandboxLogResponse } from "../diagnostics/read-sandbox-log";
+import type { SandboxLogFile } from "../diagnostics/sandbox-log-schema";
 import {
   DIRECT_SUPERVISOR_INSTALL_PATH,
   DIRECT_SUPERVISOR_LAUNCH_PATH,
@@ -55,6 +59,8 @@ export interface V2SandboxSupervisorOptions {
   readonly connectTimeoutMs?: number;
   readonly commandTimeoutMs?: number;
   readonly hostFactory?: (options: V2SupervisorHostOptions) => V2BootstrapSupervisor;
+  /** Releases the bounded diagnostic lookup when this exact supervisor closes. */
+  readonly onClosed?: () => void;
 }
 
 function safeReason(value: string): string {
@@ -65,6 +71,8 @@ function safeReason(value: string): string {
 export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly binding: BootstrapBinding;
   #instanceId = "pending";
+  #executionSessionId: string | null = null;
+  readonly #onClosed?: () => void;
   #ySweet: YSweetEnvelope;
   readonly #ydoc: V2BootstrapYDoc;
   readonly #gateway: V2BootstrapGateway;
@@ -82,9 +90,10 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   #closed = false;
 
   constructor(options: V2SandboxSupervisorOptions) {
-    if (options.assets.revision !== "r9" || options.assets.protocolRevision !== "r2") {
-      throw new TypeError("Sandbox supervisor requires the R9 R2 release");
+    if ((options.assets.revision !== "r9" && options.assets.revision !== "r10") || options.assets.protocolRevision !== "r2") {
+      throw new TypeError("Sandbox supervisor requires an R9 or R10 R2 release");
     }
+    if (options.assets.revision === "r10" && !isRegisteredR10Entrypoint(options.assets.entrypointPath)) throw new TypeError("Sandbox supervisor requires the registered R10 entrypoint");
     this.binding = Object.freeze({ ...options.binding });
     this.#ySweet = options.ySweet;
     this.#ydoc = options.ydoc;
@@ -97,6 +106,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 90_000;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
     this.#hostFactory = options.hostFactory ?? (input => new V2SupervisorHost(input));
+    this.#onClosed = options.onClosed;
   }
 
   get instanceId(): string {
@@ -133,10 +143,11 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     const start = this.#gateway.startSupervisorExec?.bind(this.#gateway);
     if (!start) throw new V2SupervisorBootstrapError("Direct supervisor execution is unavailable", "exec");
     const sessionId = crypto.randomUUID();
+    this.#executionSessionId = sessionId;
     const instanceId = crypto.randomUUID();
     const rotationKey = createCredentialRotationKey();
-    const files = directSupervisorLaunchFiles({ entrypointPath: this.#assets.entrypointPath, supervisorNonce: this.binding.nonce });
-    const staticConfig = supervisorStaticConfig({ binding: this.binding, entrypointPath: this.#assets.entrypointPath,
+    const files = (this.#assets.revision === "r10" ? r10DirectSupervisorLaunchFiles : directSupervisorLaunchFiles)({ entrypointPath: this.#assets.entrypointPath, supervisorNonce: this.binding.nonce });
+    const staticConfig = (this.#assets.revision === "r10" ? r10SupervisorStaticConfig : supervisorStaticConfig)({ binding: this.binding, entrypointPath: this.#assets.entrypointPath,
       connectTimeoutMs: this.#connectTimeoutMs });
     const sealedJson = JSON.stringify(await sealSupervisorSessionBootstrap({
       sessionId, binding: this.binding,
@@ -235,8 +246,9 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     signal?.throwIfAborted();
 
     const instanceId = crypto.randomUUID();
+    this.#executionSessionId = continuation.codexSessionId;
     const rotationKey = createCredentialRotationKey();
-    const staticConfig = supervisorStaticConfig({
+    const staticConfig = (this.#assets.revision === "r10" ? r10SupervisorStaticConfig : supervisorStaticConfig)({
       binding: this.binding,
       entrypointPath: this.#assets.entrypointPath,
       connectTimeoutMs: this.#connectTimeoutMs,
@@ -379,9 +391,24 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     return this.#shutdown;
   }
 
+  async readDiagnosticLog(file: SandboxLogFile, signal?: AbortSignal): Promise<string | null> {
+    const sessionId = this.#executionSessionId;
+    if (this.#assets.revision !== "r10" || !sessionId || !this.#gateway.readDiagnosticFile || this.#closed) {
+      throw new Error("Sandbox diagnostics are unavailable for this supervisor");
+    }
+    const result = await this.#gateway.readDiagnosticFile(sessionId, file, AbortSignal.any([
+      this.#lifecycle.signal, ...(signal ? [signal] : []),
+    ]));
+    if (this.#closed || signal?.aborted) throw new DOMException("Sandbox diagnostic read aborted", "AbortError");
+    if (result.status === 404) return null;
+    if (result.status !== 200) throw new Error("Sandbox diagnostic file service failed");
+    return decodeSandboxLogResponse(result.value, { sessionId, file });
+  }
+
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closed = true;
+    try { this.#onClosed?.(); } catch { /* Diagnostic cleanup does not own lifecycle success. */ }
     this.#lifecycle.abort(new DOMException("Supervisor closed", "AbortError"));
     this.#closing = (async () => {
       await this.#ensuring?.catch(() => undefined);

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { BootstrapBinding } from "../src/v2/bootstrap/crypto";
-import {
+import * as R9Process from "../sandbox/v2/supervisor-process";
+import * as R10Process from "../sandbox/v2/r10-supervisor-process";
+
+for (const [revision, processApi] of [["r9", R9Process], ["r10", R10Process]] as const) {
+const {
   canonicalSidecarEntrypoint,
   parseLinuxProcessStat,
   parseSidecarIdentityRecord,
@@ -10,10 +14,11 @@ import {
   SupervisorProcessManager,
   SIDECAR_OWNER_PATH,
   SIDECAR_PID_PATH,
-} from "../sandbox/v2/supervisor-process";
+} = processApi;
+type RetainedSidecarChild = InstanceType<typeof RetainedSidecarChild>;
 
 const workspaceRoot = "/codex_workspace/11111111-1111-4111-8111-111111111111";
-const entrypoint = `.ghostprov-v2/revisions/r9/${"b".repeat(64)}/${"a".repeat(64)}/sidecar.bundle.js`;
+const entrypoint = `.ghostprov-v2/revisions/${revision}/${"b".repeat(64)}/${"a".repeat(64)}/sidecar.bundle.js`;
 const binding: BootstrapBinding = Object.freeze({
   projectId: "11111111-1111-4111-8111-111111111111",
   sandboxSessionId: "sandbox-session-1",
@@ -164,7 +169,7 @@ function stat(pid: number, options: { pgrp?: number; session?: number; start?: s
   return `${pid} (deno sidecar) ${fields.join(" ")}\n`;
 }
 
-describe("V2 supervisor process policy", () => {
+describe(`V2 ${revision} supervisor process policy`, () => {
   it("resolves sidecar identity against the canonical sandbox workspace root", () => {
     expect(canonicalSidecarEntrypoint(workspaceRoot, entrypoint)).toBe(`${workspaceRoot}/${entrypoint}`);
     expect(canonicalSidecarEntrypoint("/workspace", entrypoint)).toBeNull();
@@ -359,3 +364,5 @@ describe("V2 supervisor process policy", () => {
     await fixture.manager.handle({ kind: "shutdown", reason: "test" });
   });
 });
+
+}

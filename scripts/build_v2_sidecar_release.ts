@@ -74,7 +74,7 @@ export function canonicalV2SidecarBundle(value: string): string {
   return `${value.replace(/\r\n?/g, "\n").replace(/\n+$/g, "")}\n`;
 }
 
-function assertReleaseBundle(content: string, label = "V2-R8"): void {
+export function assertReleaseBundle(content: string, label = "V2-R8"): void {
   if (!content.endsWith("\n") || content.endsWith("\n\n") || content.includes("\r")) {
     throw new Error(`${label} sidecar bundle must use LF and end in exactly one LF`);
   }

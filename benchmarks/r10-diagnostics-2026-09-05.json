@@ -1,0 +1,1415 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-05",
+  "baseCommit": "942b99f605e421911e1cce2a3209b6b266ddeceb",
+  "release": {
+    "revision": "r10",
+    "protocolRevision": "r2",
+    "transportProfile": "bulk-v1",
+    "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+    "schemaHash": "51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f",
+    "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776"
+  },
+  "bundleBytes": 600744,
+  "priorReleaseBundlesUnchanged": true,
+  "publication": {
+    "requestedBeforeCompleteFleetGate": true,
+    "productionListenerModified": false,
+    "modelConfigurationModified": false
+  },
+  "offline": {
+    "scope": "R10 diagnostics and reconnect implementation before the final Astra catalog and adapter addition",
+    "passed": 2335,
+    "failed": 0,
+    "files": 178,
+    "seconds": 130.25,
+    "capacityAnd64MiBOptIns": true,
+    "runtimeTypecheck": true,
+    "scriptsTypecheck": true,
+    "deterministicReleases": [
+      "r8",
+      "r9",
+      "r10"
+    ],
+    "denoVersion": "2.9.5",
+    "denoUpstream": {
+      "passed": 1,
+      "failed": 0
+    },
+    "denoJournal": {
+      "passed": 13,
+      "failed": 0,
+      "platformSkips": 2,
+      "includes64MiB": true
+    }
+  },
+  "finalPublicationChecks": {
+    "model": "gpt-6-astra",
+    "modelDiscovery": true,
+    "nativeResponsesPreservesModel": true,
+    "anthropicStableAndBetaToolTurnsPreserveModel": true,
+    "validation": "offline",
+    "focusedPassed": 147,
+    "focusedFailed": 0,
+    "focusedFiles": 5,
+    "runtimeTypecheck": true,
+    "scriptsTypecheck": true,
+    "deterministicR10": true,
+    "additionalLiveRun": false
+  },
+  "integratedOneProject": {
+    "modelScope": "Requested model; this run predates registered Astra passthrough in the Messages adapter",
+    "sourceSha256": "b88dd3c9440db8142c9998473f8afa1e0bb32a2ef8fa11e72e2bcc9721782547",
+    "success": true,
+    "model": "gpt-6-astra",
+    "candidatePort": 18888,
+    "directBootstrapCalls": 1,
+    "llmBootstrapCalls": 0,
+    "failureCapture": true,
+    "fatalReadBack": true,
+    "recoveryCycles": 1,
+    "recoveries": [
+      {
+        "cycle": 1,
+        "durationMs": 35213.445199999995,
+        "sameSupervisor": true,
+        "freshChild": true
+      }
+    ],
+    "projectCreated": true,
+    "projectDeleted": true,
+    "logger": {
+      "queuedEvents": 0,
+      "queuedBytes": 0,
+      "droppedSamples": 0,
+      "droppedProgress": 0,
+      "droppedTerminals": 0,
+      "sinkErrors": 0
+    },
+    "completedRequests": 11,
+    "requests": [
+      {
+        "case": "text",
+        "headers_ms": 1737.360099999998,
+        "first_event_ms": 1737.5560000000005,
+        "first_text_ms": 1938.7780999999995,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2143.332699999999,
+        "events": 11,
+        "bytes": 6147,
+        "max_event_gap_ms": 204.4940999999999,
+        "expected_text": true
+      },
+      {
+        "case": "tool",
+        "headers_ms": 1055.922599999998,
+        "first_event_ms": 1055.9725999999973,
+        "first_text_ms": null,
+        "first_tool_ms": 1384.7314000000006,
+        "tool_ready_ms": 1582.1771999999983,
+        "total_ms": 1784.5224999999991,
+        "events": 12,
+        "bytes": 7191,
+        "max_event_gap_ms": 328.56730000000243,
+        "expected_text": null
+      },
+      {
+        "case": "tool_followup",
+        "headers_ms": 3487.065399999996,
+        "first_event_ms": 3487.100699999999,
+        "first_text_ms": 3487.1628999999994,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 3487.187799999996,
+        "events": 10,
+        "bytes": 6783,
+        "max_event_gap_ms": 0.046999999998661224,
+        "expected_text": true
+      },
+      {
+        "case": "anthropic_text",
+        "headers_ms": 1040.3796000000002,
+        "first_event_ms": 1040.4121000000014,
+        "first_text_ms": 1521.5224000000017,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 1919.0020000000004,
+        "events": 8,
+        "bytes": 1542,
+        "max_event_gap_ms": 481.1035999999949,
+        "expected_text": true
+      },
+      {
+        "case": "medium_input",
+        "headers_ms": 1421.9654999999984,
+        "first_event_ms": 1422.0067999999956,
+        "first_text_ms": 1757.2232000000004,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2154.0829999999987,
+        "events": 10,
+        "bytes": 5893,
+        "max_event_gap_ms": 334.7528999999995,
+        "expected_text": true
+      },
+      {
+        "case": "concurrent_1",
+        "headers_ms": 1184.9861999999994,
+        "first_event_ms": 1185.0230999999985,
+        "first_text_ms": 1427.9708000000028,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 1874.8722000000053,
+        "events": 11,
+        "bytes": 6147,
+        "max_event_gap_ms": 246.3191999999981,
+        "expected_text": true
+      },
+      {
+        "case": "concurrent_2",
+        "headers_ms": 1427.7065000000002,
+        "first_event_ms": 1427.7558999999965,
+        "first_text_ms": 1875.2364000000016,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2086.3865000000005,
+        "events": 11,
+        "bytes": 6147,
+        "max_event_gap_ms": 446.9516000000003,
+        "expected_text": true
+      },
+      {
+        "case": "concurrent_4",
+        "headers_ms": 1427.7417999999961,
+        "first_event_ms": 1427.7502999999997,
+        "first_text_ms": 1875.2329000000027,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2086.434300000001,
+        "events": 11,
+        "bytes": 6147,
+        "max_event_gap_ms": 446.95880000000034,
+        "expected_text": true
+      },
+      {
+        "case": "concurrent_3",
+        "headers_ms": 1427.7782999999981,
+        "first_event_ms": 1427.7851999999984,
+        "first_text_ms": 2087.199499999995,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2574.0910000000003,
+        "events": 11,
+        "bytes": 6147,
+        "max_event_gap_ms": 246.32790000000386,
+        "expected_text": true
+      },
+      {
+        "case": "recovery_1_continuation",
+        "headers_ms": 1245.3240000000078,
+        "first_event_ms": 1245.3714000000036,
+        "first_text_ms": 1560.4070000000065,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 2038.6686999999947,
+        "events": 11,
+        "bytes": 6306,
+        "max_event_gap_ms": 314.91960000000836,
+        "expected_text": true
+      },
+      {
+        "case": "recovery_1_anthropic",
+        "headers_ms": 950.9834000000119,
+        "first_event_ms": 951.0168000000122,
+        "first_text_ms": 1433.5599000000075,
+        "first_tool_ms": null,
+        "tool_ready_ms": null,
+        "total_ms": 1671.9897000000055,
+        "events": 8,
+        "bytes": 1542,
+        "max_event_gap_ms": 482.53439999998955,
+        "expected_text": true
+      }
+    ]
+  },
+  "reconnectLoss": {
+    "sourceSha256": "74dc70b56365b837fd4027b0007c85228094e5688e1f0365615d9ad3fe0b1fc7",
+    "success": true,
+    "directBootstrapCalls": 1,
+    "llmBootstrapCalls": 0,
+    "reconnects": [
+      {
+        "worker": 1,
+        "generation": 1,
+        "initialDisconnects": 0,
+        "forcedDisconnects": 2,
+        "naturalDisconnects": 0,
+        "challenges": 2,
+        "authenticatedRestores": 2,
+        "failures": 0,
+        "challengePublications": 4,
+        "injectedChallengeDrops": 1,
+        "injectedReplyDrops": 1,
+        "restoreMs": [
+          1819.956,
+          1825.577
+        ]
+      }
+    ],
+    "projectDeleted": true,
+    "logger": {
+      "queuedEvents": 0,
+      "queuedBytes": 0,
+      "droppedSamples": 0,
+      "droppedProgress": 0,
+      "droppedTerminals": 0,
+      "sinkErrors": 0
+    },
+    "providerRequests": 0
+  },
+  "sustainedStreaming": {
+    "sourceSha256": "3a0d16397559583d6068fbc4811b7138a118431a41b491afa88ef6d6d8800ca7",
+    "success": true,
+    "model": "gpt-5.6-sol",
+    "requests": 3,
+    "expectedCharsPerRequest": 8416,
+    "directStarts": 1,
+    "llmAttempts": 0,
+    "projectDeleted": true,
+    "lanes": [
+      {
+        "lane": "responses",
+        "textChars": 8416,
+        "textDeltaEvents": 1682,
+        "deliveryBursts": 29,
+        "clientFirstTextMs": 7272.819,
+        "totalMs": 14395.706,
+        "visiblePauseP50Ms": 240.722,
+        "visiblePauseP95Ms": 379.708,
+        "clientTextSpanMs": 6874.331999999999,
+        "approxVisibleTokensPerSecond": 245.55113136810968,
+        "forwardingP50Ms": 1.239,
+        "forwardingP95Ms": 3.541,
+        "hostRttMs": 216.23894119262695,
+        "upstream": {
+          "durationMs": 13267.480847,
+          "firstTextMs": 6587.2103879999995,
+          "fetchToTerminalMs": 13257.843335000001,
+          "eventDeliveryTotalMs": 42.99003500003437,
+          "eventDeliveryMaxMs": 0.6353829999998197,
+          "maxEventGapMs": 1492.1372659999997
+        }
+      },
+      {
+        "lane": "websocket",
+        "textChars": 8416,
+        "textDeltaEvents": 1682,
+        "deliveryBursts": 44,
+        "clientFirstTextMs": 5740.194,
+        "totalMs": 16294.59,
+        "visiblePauseP50Ms": 238.043,
+        "visiblePauseP95Ms": 336.58,
+        "clientTextSpanMs": 10319.428,
+        "approxVisibleTokensPerSecond": 163.57495783681034,
+        "forwardingP50Ms": 1.575,
+        "forwardingP95Ms": 11.174,
+        "hostRttMs": 221.76851208228618,
+        "upstream": {
+          "durationMs": 15511.899424,
+          "firstTextMs": 5200.882827999998,
+          "fetchToTerminalMs": 15505.973459,
+          "eventDeliveryTotalMs": 41.66587999984404,
+          "eventDeliveryMaxMs": 1.9238580000019283,
+          "maxEventGapMs": 1399.8989000000001
+        }
+      },
+      {
+        "lane": "anthropic",
+        "textChars": 8416,
+        "textDeltaEvents": 1682,
+        "deliveryBursts": 31,
+        "clientFirstTextMs": 2237.269,
+        "totalMs": 9762.435,
+        "visiblePauseP50Ms": 243.564,
+        "visiblePauseP95Ms": 364.671,
+        "clientTextSpanMs": 7525.092000000001,
+        "approxVisibleTokensPerSecond": 224.31619440665972,
+        "forwardingP50Ms": null,
+        "forwardingP95Ms": null,
+        "hostRttMs": 219.92731285090417,
+        "upstream": {
+          "durationMs": 9243.074134999995,
+          "firstTextMs": 1754.0578019999957,
+          "fetchToTerminalMs": 9236.217728000003,
+          "eventDeliveryTotalMs": 26.690804000158096,
+          "eventDeliveryMaxMs": 0.3137010000064038,
+          "maxEventGapMs": 785.1239340000029
+        }
+      }
+    ],
+    "timers": [
+      {
+        "revision": "r8",
+        "publicationMs": 25,
+        "batchMs": 25,
+        "pacerSha256": "caf0b619fefea9840cd42bbb52d444fc51ae469b4b7392e99ac9ecc46f0f31de"
+      },
+      {
+        "revision": "r9",
+        "publicationMs": 25,
+        "batchMs": 25,
+        "pacerSha256": "caf0b619fefea9840cd42bbb52d444fc51ae469b4b7392e99ac9ecc46f0f31de"
+      },
+      {
+        "revision": "r10",
+        "publicationMs": 25,
+        "batchMs": 25,
+        "pacerSha256": "caf0b619fefea9840cd42bbb52d444fc51ae469b4b7392e99ac9ecc46f0f31de"
+      }
+    ],
+    "clockPolicy": "Only within-process durations and same-host source/client clocks compared."
+  },
+  "fleetAttempts": [
+    {
+      "source": "recovery-oEtTTF",
+      "sourceSha256": "f7545e19f3bf86f9a7f7206a0c0eb44f133fec3efcbb3cc200dae29e88dbd1ff",
+      "success": false,
+      "phase": "supervisor_reconnect_2",
+      "target": 8,
+      "sidecarRevision": "r10",
+      "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+      "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776",
+      "completedResponses": 24,
+      "startupMs": 108605,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "directExecRequests": 8,
+      "llmBootstrapEndpointRequests": 0,
+      "connectionDropRounds": 2,
+      "recoveryCycles": 1,
+      "recoveryTimings": [],
+      "stabilitySamples": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "causes": [
+        {
+          "name": "TimeoutError",
+          "kind": null,
+          "code": null
+        }
+      ],
+      "retiredGenerations": [],
+      "supervisorReconnects": [
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 1,
+          "failures": 1,
+          "restoreMs": [
+            843.246
+          ]
+        },
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            847.338,
+            971.005
+          ]
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            853.713,
+            823.562
+          ]
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            848.277,
+            857.05
+          ]
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            827.172,
+            862.834
+          ]
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": 1,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            846.832,
+            856.872
+          ]
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            813.881,
+            820.831
+          ]
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            818.648,
+            920.171
+          ]
+        }
+      ],
+      "recoveryFailures": [],
+      "concurrencyBenchmarks": [],
+      "latencyMs": {
+        "responses": {
+          "count": 8,
+          "p50": 1611,
+          "p95": 1924,
+          "max": 1924
+        },
+        "anthropic": {
+          "count": 8,
+          "p50": 1673,
+          "p95": 2364,
+          "max": 2364
+        },
+        "runtime": {
+          "count": 8,
+          "p50": 1689,
+          "p95": 1781,
+          "max": 1781
+        }
+      },
+      "sandboxLogs": [
+        {
+          "worker": 1,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2609,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.jsonl",
+          "records": 103,
+          "bytes": 38791,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2608,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.jsonl",
+          "records": 99,
+          "bytes": 35352,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2609,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "sidecar.jsonl",
+          "records": 101,
+          "bytes": 37026,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2615,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "sidecar.jsonl",
+          "records": 103,
+          "bytes": 38806,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2606,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.jsonl",
+          "records": 101,
+          "bytes": 37220,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2620,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.jsonl",
+          "records": 99,
+          "bytes": 35300,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2622,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "sidecar.jsonl",
+          "records": 101,
+          "bytes": 37081,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 8,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2641,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 8,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 8,
+          "file": "sidecar.jsonl",
+          "records": 99,
+          "bytes": 35233,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 8,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        }
+      ],
+      "unopenedConnections": []
+    },
+    {
+      "source": "recovery-yexnGt",
+      "sourceSha256": "0284ad69b746dad8a05c45adaf0adb05a8444d209ac75132e05d3ce6fdb8afbe",
+      "success": false,
+      "phase": "supervisor_reconnect_1",
+      "target": 8,
+      "sidecarRevision": "r10",
+      "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+      "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776",
+      "completedResponses": 16,
+      "startupMs": 151189,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "directExecRequests": 9,
+      "llmBootstrapEndpointRequests": 0,
+      "connectionDropRounds": 2,
+      "dropChallenge": true,
+      "dropReply": true,
+      "recoveryCycles": 1,
+      "recoveryTimings": [],
+      "stabilitySamples": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "causes": [
+        {
+          "name": "Error",
+          "kind": null,
+          "code": null
+        }
+      ],
+      "retiredGenerations": [
+        {
+          "worker": 4,
+          "generation": 1,
+          "launches": 0,
+          "directExecs": 1,
+          "bootstrapMs": 3404
+        }
+      ],
+      "supervisorReconnects": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 2,
+          "initialDisconnects": 1,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "challengePublications": 0,
+          "injectedChallengeDrops": 0,
+          "injectedReplyDrops": 0,
+          "restoreMs": []
+        }
+      ],
+      "recoveryFailures": [
+        {
+          "phase": "sidecar_bootstrap",
+          "causes": [
+            {
+              "name": "V2BootstrapError",
+              "kind": "deploy",
+              "code": null
+            },
+            {
+              "name": "AwarenessChannelError",
+              "kind": "timeout",
+              "code": null
+            }
+          ]
+        }
+      ],
+      "concurrencyBenchmarks": [],
+      "latencyMs": {
+        "responses": {
+          "count": 4,
+          "p50": 1584,
+          "p95": 2120,
+          "max": 2120
+        },
+        "anthropic": {
+          "count": 4,
+          "p50": 1596,
+          "p95": 2362,
+          "max": 2362
+        },
+        "runtime": {
+          "count": 8,
+          "p50": 1619,
+          "p95": 1871,
+          "max": 1871
+        }
+      },
+      "sandboxLogs": [
+        {
+          "worker": 1,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2614,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.jsonl",
+          "records": 11,
+          "bytes": 3341,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2608,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.jsonl",
+          "records": 11,
+          "bytes": 3296,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.jsonl",
+          "records": 5,
+          "bytes": 1025,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2623,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.jsonl",
+          "records": 11,
+          "bytes": 3337,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2623,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.jsonl",
+          "records": 13,
+          "bytes": 4918,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2621,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "sidecar.jsonl",
+          "records": 11,
+          "bytes": 3348,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2614,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.jsonl",
+          "records": 71,
+          "bytes": 25816,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 1,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2608,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.jsonl",
+          "records": 71,
+          "bytes": 25759,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 2,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2600,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "sidecar.jsonl",
+          "records": 71,
+          "bytes": 25814,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 3,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2629,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "sidecar.jsonl",
+          "records": 73,
+          "bytes": 27339,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 4,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2623,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.jsonl",
+          "records": 71,
+          "bytes": 25922,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 5,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2623,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.jsonl",
+          "records": 73,
+          "bytes": 27530,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 6,
+          "file": "sidecar.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.jsonl",
+          "records": 13,
+          "bytes": 2621,
+          "dropped": 0,
+          "fatals": 0
+        },
+        {
+          "worker": 7,
+          "file": "supervisor.1.jsonl",
+          "records": 0,
+          "bytes": 0,
+          "dropped": 0,
+          "fatals": 0
+        }
+      ],
+      "unopenedConnections": [
+        {
+          "worker": 4,
+          "role": "project",
+          "dials": 1,
+          "opens": 0,
+          "syncs": 0,
+          "closes": 1,
+          "errors": 0,
+          "firstSyncMs": null,
+          "closeCode": null,
+          "errorCode": null
+        }
+      ]
+    }
+  ],
+  "incompleteGates": [
+    "Complete R10 eight-project recovery and concurrency-through-32 sequence",
+    "130-minute natural reconnect soak"
+  ],
+  "limits": [
+    "No matched historical R8 live latency comparison",
+    "Earlier intermittent missing-child-readiness failure remains unclassified",
+    "Reported streaming bursts are not a per-token rate limit",
+    "Host and sandbox wall clocks are not subtracted"
+  ]
+}

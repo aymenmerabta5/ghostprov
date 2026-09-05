@@ -495,6 +495,11 @@ export interface V2BootstrapGateway {
     suffix: string,
     init?: RequestInit,
   ): Promise<{ status: number; text: string; headers: Headers }>;
+  readDiagnosticFile?(
+    sessionId: string,
+    file: import("../diagnostics/sandbox-log-schema").SandboxLogFile,
+    signal?: AbortSignal,
+  ): Promise<{ status: number; value: unknown }>;
   /** Direct R9 bootstrap. Readiness still requires the authenticated supervisor. */
   startSupervisorExec?(
     request: DirectSupervisorExecRequest,

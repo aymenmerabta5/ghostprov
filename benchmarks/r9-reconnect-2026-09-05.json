@@ -1,0 +1,4291 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-05",
+  "baseCommit": "942b99f605e421911e1cce2a3209b6b266ddeceb",
+  "evidenceScope": "Historical R9 reconnect and isolated logger prototype results. Integrated R10 logging, final offline checks, and remaining fleet limits are recorded in r10-diagnostics-2026-09-05.json.",
+  "environment": {
+    "host": "Windows",
+    "bun": "1.4.0",
+    "deno": "2.9.5",
+    "model": "gpt-6-astra",
+    "candidatePort": 18888
+  },
+  "methodology": {
+    "production": "Fixed snapshots of the supplied content-free logs; no production listener access.",
+    "canary": "Small synthetic Responses/Anthropic requests with the existing verifier settings. Not a matching workload benchmark of production response times.",
+    "reconnect": "Forced control-socket restoration requires a fresh signed rotation challenge. Natural close-to-next-proof can include idle time and is not a request latency measurement.",
+    "failures": "All attempts are retained. An unsuccessful fleet or a soak that did not start is not a passed gate.",
+    "connectionControls": "Same y-websocket/ws dependencies under Bun and Node, without GhostProv supervisor, bootstrap or model-execution code."
+  },
+  "production": {
+    "sourceSha256": "13109c15358c9f5e45f0bbd0a1cd74fff11878e6cb6f781bfffb954d5ec50e1c",
+    "logSnapshots": [
+      {
+        "label": "rotated",
+        "bytes": 67079422,
+        "records": 14567,
+        "sha256": "4f0484b14a9a2266536f5462980ba4c16dacd111841d340dcfd95c1c45c03bd0"
+      },
+      {
+        "label": "current",
+        "bytes": 27893236,
+        "records": 4720,
+        "sha256": "d5951179a98da6c6714bccf4187907b5f9e9c166a26abe4659b88be96ce93158"
+      }
+    ],
+    "records": 19287,
+    "windowUtc": {
+      "start": "2026-09-05T07:33:07.513Z",
+      "end": "2026-09-05T11:17:14.843Z"
+    },
+    "accepted": 2324,
+    "completed": 2072,
+    "metricMs": {
+      "total_ms": {
+        "count": 2072,
+        "min": 2012.469,
+        "p50": 9462.557,
+        "p90": 30365.648,
+        "p95": 42828.746,
+        "p99": 69812.961,
+        "max": 113302.775,
+        "mean": 14391.556
+      },
+      "admission_wait_ms": {
+        "count": 2072,
+        "min": 0.157,
+        "p50": 0.343,
+        "p90": 1.471,
+        "p95": 2.134,
+        "p99": 3.313,
+        "max": 1996.073,
+        "mean": 1.563
+      },
+      "queue_wait_ms": {
+        "count": 2072,
+        "min": 0.123,
+        "p50": 0.286,
+        "p90": 0.602,
+        "p95": 0.72,
+        "p99": 1.641,
+        "max": 15003.451,
+        "mean": 31.606
+      },
+      "commit_ack_ms": {
+        "count": 2072,
+        "min": 381.81,
+        "p50": 540.479,
+        "p90": 1459.871,
+        "p95": 2425.928,
+        "p99": 5666.806,
+        "max": 15301.08,
+        "mean": 871.228
+      },
+      "first_event_ms": {
+        "count": 2032,
+        "min": 1033.072,
+        "p50": 2920.51,
+        "p90": 5234.097,
+        "p95": 7416.887,
+        "p99": 13890.546,
+        "max": 25821.273,
+        "mean": 3358.709
+      },
+      "upstream_first_event_ms": {
+        "count": 2032,
+        "min": 380.345,
+        "p50": 1838.441,
+        "p90": 3495.374,
+        "p95": 4405.645,
+        "p99": 5614.622,
+        "max": 10366.892,
+        "mean": 2018.607
+      },
+      "host_assembly_to_delivery_ms": {
+        "count": 2032,
+        "min": 0.003,
+        "p50": 0.01,
+        "p90": 0.022,
+        "p95": 0.029,
+        "p99": 0.042,
+        "max": 0.763,
+        "mean": 0.014
+      },
+      "first_event_to_terminal_ms": {
+        "count": 2032,
+        "min": 643.266,
+        "p50": 6038.631,
+        "p90": 26835.728,
+        "p95": 37219.298,
+        "p99": 65107.24,
+        "max": 102565.533,
+        "mean": 11154.628
+      }
+    }
+  },
+  "offline": {
+    "testsPassed": 2213,
+    "testsFailed": 0,
+    "files": 174,
+    "elapsedSeconds": 127.49,
+    "capacityAnd64MiBOptIns": true,
+    "runtimeTypecheck": true,
+    "scriptsTypecheck": true,
+    "denoUpstream": {
+      "passed": 1,
+      "failed": 0
+    },
+    "denoJournal": {
+      "passed": 13,
+      "failed": 0,
+      "platformSkips": 2,
+      "include64MiB": true
+    }
+  },
+  "bundles": [
+    {
+      "revision": "r1",
+      "bytes": 299691,
+      "sha256": "61aab2480cb9d18b89b11bf45dd0da24ca1f7ae9f4767eee80e8c93d0554de07",
+      "unchanged": true
+    },
+    {
+      "revision": "r2",
+      "bytes": 503192,
+      "sha256": "1cf5c8ab2a065dbb9b292a623d18cda07dda54602a3a14540ef7ba8cae84c723",
+      "unchanged": true
+    },
+    {
+      "revision": "r3",
+      "bytes": 507594,
+      "sha256": "8ab5a5622922037fdb1df421613333bb4f32780116ce980bb1233f3444a23a32",
+      "unchanged": true
+    },
+    {
+      "revision": "r4",
+      "bytes": 516215,
+      "sha256": "600ca19f9f26087f65e059e7fdef1a59f5b7749761c18a6f4dab06304ad3421d",
+      "unchanged": true
+    },
+    {
+      "revision": "r5",
+      "bytes": 519470,
+      "sha256": "9c156409a556fb706e1a30f5d5e358bfb23e7333508600870ac763e791a7f197",
+      "unchanged": true
+    },
+    {
+      "revision": "r6",
+      "bytes": 519508,
+      "sha256": "5f8ea017853f50f6d1c69294c434c5ffd9ec4b5936249848d922e5d6ba0c5b3c",
+      "unchanged": true
+    },
+    {
+      "revision": "r7",
+      "bytes": 519955,
+      "sha256": "b92e6839f70e9741116825f77d01d0dd1cdf425e4bcc5e0d3f837293e02ffd9d",
+      "unchanged": true
+    },
+    {
+      "revision": "r8",
+      "bytes": 521367,
+      "sha256": "0ef602190dcbd4befbb0cf158dbc9825112193992dd486a2a32d416b37b1835f",
+      "unchanged": true
+    },
+    {
+      "revision": "r9",
+      "bytes": 581730,
+      "sha256": "032ce82a6104ab513c8efa7a8dd9a7d67fefb8ca41ee73cf47c9f4399d90012d",
+      "unchanged": true
+    }
+  ],
+  "connectionControls": [
+    {
+      "name": "empty_project",
+      "reportSha256": "11dab9791c97978da7a3a6e549ef8783bb71c958a44c81ce04c19cba9357637f",
+      "runtimes": [
+        {
+          "runtime": "bun",
+          "attempted": 12,
+          "connected": 12,
+          "unopened": 0,
+          "syncMs": [
+            792,
+            1945,
+            1883,
+            596,
+            586,
+            598,
+            601,
+            610,
+            613,
+            619,
+            727,
+            1858
+          ],
+          "timeoutMs": 15000
+        },
+        {
+          "runtime": "node",
+          "attempted": 12,
+          "connected": 12,
+          "unopened": 0,
+          "syncMs": [
+            2490,
+            1871,
+            549,
+            1130,
+            593,
+            599,
+            605,
+            617,
+            627,
+            630,
+            631,
+            1853
+          ],
+          "timeoutMs": 15000
+        }
+      ]
+    },
+    {
+      "name": "affected_project",
+      "reportSha256": "5ec0e68a317cc06e4c83745782623552c5e3f7410517ac70f2dab5dee35f4768",
+      "runtimes": [
+        {
+          "runtime": "bun",
+          "attempted": 12,
+          "connected": 11,
+          "unopened": 1,
+          "syncMs": [
+            1141,
+            1200,
+            1189,
+            1028,
+            1189,
+            1201,
+            1205,
+            1212,
+            1219,
+            3094,
+            3139,
+            null
+          ],
+          "timeoutMs": 15000
+        },
+        {
+          "runtime": "node",
+          "attempted": 12,
+          "connected": 9,
+          "unopened": 3,
+          "syncMs": [
+            null,
+            1340,
+            null,
+            1711,
+            1008,
+            1014,
+            1238,
+            1241,
+            1274,
+            3324,
+            3807,
+            null
+          ],
+          "timeoutMs": 15000
+        }
+      ]
+    }
+  ],
+  "live": [
+    {
+      "name": "initial_fleet",
+      "reportSha256": "f7db1154a8f342ff5b3cba330c83027190b0692d713f8492fe83d399e52879a9",
+      "success": false,
+      "phase": "startup",
+      "target": 8,
+      "completedResponses": 0,
+      "directExecRequests": 14,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": null,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": null,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "supervisorBootstrapMs": [
+        null,
+        2902,
+        2986,
+        2910,
+        2947,
+        2681,
+        2925,
+        2713
+      ],
+      "recoveryFailureCount": 8,
+      "retiredGenerationCount": 16,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "readiness",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "connect"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "connect"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "timeout"
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 0,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "runtime": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "initial_single",
+      "reportSha256": "2e7095b58010da9c276a6ff38b83cf8c85b377426fe4eb66510bae858ae019b0",
+      "success": false,
+      "phase": "recover_same_supervisors_1",
+      "target": 1,
+      "completedResponses": 4,
+      "directExecRequests": 1,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 19950,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": null,
+      "reconnectSoakMs": 0,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        null
+      ],
+      "recoveryFailureCount": 2,
+      "retiredGenerationCount": 1,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "AbortError",
+            "kind": null,
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 0,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 2,
+          "min": null,
+          "p50": 1865,
+          "p90": null,
+          "p95": 2057,
+          "p99": null,
+          "max": 2057,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 1,
+          "min": null,
+          "p50": 2112,
+          "p90": null,
+          "p95": 2112,
+          "p99": null,
+          "max": 2112,
+          "mean": null
+        },
+        "runtime": {
+          "count": 1,
+          "min": null,
+          "p50": 2183,
+          "p90": null,
+          "p95": 2183,
+          "p99": null,
+          "max": 2183,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "early_single_canary",
+      "reportSha256": "a4d89c9a7497ce57cd16d70ba55837409655486a1cb4270f5b9098fa6083093e",
+      "success": true,
+      "phase": "complete",
+      "target": 1,
+      "completedResponses": 14,
+      "directExecRequests": 1,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 17043,
+      "recoveryMs": 34603,
+      "recoveredSameSupervisor": 1,
+      "stabilitySamples": 28,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": null,
+      "reconnectSoakMs": 0,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        2953
+      ],
+      "recoveryFailureCount": 0,
+      "retiredGenerationCount": 0,
+      "failureKinds": [],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            784.675,
+            841.359
+          ]
+        }
+      ],
+      "connections": {
+        "count": 6,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 7,
+          "min": null,
+          "p50": 1791,
+          "p90": null,
+          "p95": 2416,
+          "p99": null,
+          "max": 2416,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 5,
+          "min": null,
+          "p50": 2032,
+          "p90": null,
+          "p95": 2182,
+          "p99": null,
+          "max": 2182,
+          "mean": null
+        },
+        "runtime": {
+          "count": 2,
+          "min": null,
+          "p50": 1736,
+          "p90": null,
+          "p95": 1892,
+          "p99": null,
+          "max": 1892,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "second_fleet",
+      "reportSha256": "f720888c4e0aea29478354a24687a3b3d7caa4d4e272f161c795ee342daa4f04",
+      "success": false,
+      "phase": "startup",
+      "target": 8,
+      "completedResponses": 0,
+      "directExecRequests": 10,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": null,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": null,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "supervisorBootstrapMs": [
+        3090,
+        2631,
+        2576,
+        2832,
+        2800,
+        null,
+        3065,
+        4967
+      ],
+      "recoveryFailureCount": 3,
+      "retiredGenerationCount": 2,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "timeout"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "connect"
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 40,
+        "neverOpened": 1,
+        "neverSynced": 1
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "runtime": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "serial_fleet",
+      "reportSha256": "f3a81d5069850319138011677ce3397153c46a510b2fb05c6166a3ff2427aadd",
+      "success": false,
+      "phase": "startup",
+      "target": 8,
+      "completedResponses": 0,
+      "directExecRequests": 10,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": null,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "supervisorBootstrapMs": [
+        2805,
+        3675,
+        3174,
+        2787,
+        2928,
+        3129,
+        2758,
+        3054
+      ],
+      "recoveryFailureCount": 4,
+      "retiredGenerationCount": 2,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "connect"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 45,
+        "neverOpened": 6,
+        "neverSynced": 6
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        },
+        "runtime": {
+          "count": 0,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "final_code_fleet",
+      "reportSha256": "71335317aa4adda862acec586eb73450d779383b43f29c63c11d27f59338d1e9",
+      "success": false,
+      "phase": "supervisor_reconnect_1",
+      "target": 8,
+      "completedResponses": 16,
+      "directExecRequests": 12,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 243378,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 2,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "supervisorBootstrapMs": [
+        5160,
+        2707,
+        5090,
+        3054,
+        23913,
+        4939,
+        2855,
+        48067
+      ],
+      "recoveryFailureCount": 4,
+      "retiredGenerationCount": 4,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "timeout"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "timeout"
+          }
+        ],
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "AwarenessChannelError",
+            "kind": "timeout",
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 1,
+          "failures": 0,
+          "restoreMs": [
+            6080.133
+          ]
+        },
+        {
+          "worker": 8,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 1,
+          "failures": 0,
+          "restoreMs": [
+            3636.156
+          ]
+        },
+        {
+          "worker": 2,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 4,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 6,
+          "generation": 2,
+          "initialDisconnects": null,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 45,
+        "neverOpened": 3,
+        "neverSynced": 3
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 4,
+          "min": null,
+          "p50": 1716,
+          "p90": null,
+          "p95": 4627,
+          "p99": null,
+          "max": 4627,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 4,
+          "min": null,
+          "p50": 1996,
+          "p90": null,
+          "p95": 2191,
+          "p99": null,
+          "max": 2191,
+          "mean": null
+        },
+        "runtime": {
+          "count": 8,
+          "min": null,
+          "p50": 2749,
+          "p90": null,
+          "p95": 3476,
+          "p99": null,
+          "max": 3476,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "first_hourly_canary",
+      "reportSha256": "492403c3c5f0a59f68dcc16594c482f24b8cf3d5592aff2e15c87d0d659da7f2",
+      "success": false,
+      "phase": "supervisor_reconnect_1",
+      "target": 1,
+      "completedResponses": 3,
+      "directExecRequests": 2,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 146651,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        5646
+      ],
+      "recoveryFailureCount": 1,
+      "retiredGenerationCount": 1,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "deploy",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorBootstrapError",
+            "kind": "readiness",
+            "code": null
+          },
+          {
+            "name": "V2SupervisorError",
+            "kind": null,
+            "code": "timeout"
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 1,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 1,
+          "generation": 2,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 6,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 1,
+          "min": null,
+          "p50": 2962,
+          "p90": null,
+          "p95": 2962,
+          "p99": null,
+          "max": 2962,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 1,
+          "min": null,
+          "p50": 2772,
+          "p90": null,
+          "p95": 2772,
+          "p99": null,
+          "max": 2772,
+          "mean": null
+        },
+        "runtime": {
+          "count": 1,
+          "min": null,
+          "p50": 1861,
+          "p90": null,
+          "p95": 1861,
+          "p99": null,
+          "max": 1861,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "child_readiness_failure",
+      "reportSha256": "ffb05def6eca572d96835d035f3533aa769a7372178d8d0f4586fae1543059be",
+      "success": false,
+      "phase": "recover_same_supervisors_1",
+      "target": 1,
+      "completedResponses": 8,
+      "directExecRequests": 1,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 19520,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        null
+      ],
+      "recoveryFailureCount": 1,
+      "retiredGenerationCount": 1,
+      "failureKinds": [
+        [
+          {
+            "name": "AbortError",
+            "kind": null,
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            838.332,
+            848.359
+          ]
+        }
+      ],
+      "connections": {
+        "count": 5,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 4,
+          "min": null,
+          "p50": 2070,
+          "p90": null,
+          "p95": 2266,
+          "p99": null,
+          "max": 2266,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 3,
+          "min": null,
+          "p50": 2202,
+          "p90": null,
+          "p95": 2266,
+          "p99": null,
+          "max": 2266,
+          "mean": null
+        },
+        "runtime": {
+          "count": 1,
+          "min": null,
+          "p50": 1973,
+          "p90": null,
+          "p95": 1973,
+          "p99": null,
+          "max": 1973,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "opening_socket_timeout",
+      "reportSha256": "bd66f03956d845629a9769baa1c0635bc2918769fc02d932787ee46e48004bef",
+      "success": false,
+      "phase": "supervisor_reconnect_2",
+      "target": 1,
+      "completedResponses": 5,
+      "directExecRequests": 1,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 17094,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 7800000,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        3155
+      ],
+      "recoveryFailureCount": 0,
+      "retiredGenerationCount": 0,
+      "failureKinds": [],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 1,
+          "authenticatedRestores": 1,
+          "failures": 1,
+          "restoreMs": [
+            862.245
+          ]
+        }
+      ],
+      "connections": {
+        "count": 4,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 2,
+          "min": null,
+          "p50": 1946,
+          "p90": null,
+          "p95": 3969,
+          "p99": null,
+          "max": 3969,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 2,
+          "min": null,
+          "p50": 2117,
+          "p90": null,
+          "p95": 3405,
+          "p99": null,
+          "max": 3405,
+          "mean": null
+        },
+        "runtime": {
+          "count": 1,
+          "min": null,
+          "p50": 1937,
+          "p90": null,
+          "p95": 1937,
+          "p99": null,
+          "max": 1937,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "post_router_instrumented_single",
+      "reportSha256": "00aa1cd5907dd79e9b6a555ea2eb2ff7496099694671d8c1e46a0eda95d803dc",
+      "success": false,
+      "phase": "supervisor_reconnect_1",
+      "target": 1,
+      "completedResponses": 3,
+      "directExecRequests": 2,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 154638,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 0,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        3243
+      ],
+      "recoveryFailureCount": 1,
+      "retiredGenerationCount": 1,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "readiness",
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        },
+        {
+          "worker": 1,
+          "generation": 2,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 0,
+          "naturalDisconnects": 0,
+          "challenges": 0,
+          "authenticatedRestores": 0,
+          "failures": 0,
+          "restoreMs": []
+        }
+      ],
+      "connections": {
+        "count": 8,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 1,
+          "min": null,
+          "p50": 2442,
+          "p90": null,
+          "p95": 2442,
+          "p99": null,
+          "max": 2442,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 1,
+          "min": null,
+          "p50": 2442,
+          "p90": null,
+          "p95": 2442,
+          "p99": null,
+          "max": 2442,
+          "mean": null
+        },
+        "runtime": {
+          "count": 1,
+          "min": null,
+          "p50": 1697,
+          "p90": null,
+          "p95": 1697,
+          "p99": null,
+          "max": 1697,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "post_router_standard_single",
+      "reportSha256": "9fb7addd72f5a3d04fa0615f8de6009ac86e6583f75e4ad24f99524ac0b370ad",
+      "success": true,
+      "phase": "complete",
+      "target": 1,
+      "completedResponses": 43,
+      "directExecRequests": 1,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 17145,
+      "recoveryMs": 31879,
+      "recoveredSameSupervisor": 1,
+      "stabilitySamples": 28,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 1,
+      "reconnectSoakMs": 0,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 1,
+      "projectsDeleted": 1,
+      "supervisorBootstrapMs": [
+        2936
+      ],
+      "recoveryFailureCount": 0,
+      "retiredGenerationCount": 0,
+      "failureKinds": [],
+      "supervisors": [
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 2,
+          "authenticatedRestores": 2,
+          "failures": 0,
+          "restoreMs": [
+            784,
+            779.434
+          ]
+        }
+      ],
+      "connections": {
+        "count": 6,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [
+        {
+          "concurrency": 1,
+          "completed": 1,
+          "durationMs": 1752,
+          "p50Ms": 1752,
+          "p95Ms": 1752,
+          "maxMs": 1752,
+          "requestsPerSecond": 0.571
+        },
+        {
+          "concurrency": 4,
+          "completed": 4,
+          "durationMs": 2299,
+          "p50Ms": 2082,
+          "p95Ms": 2299,
+          "maxMs": 2299,
+          "requestsPerSecond": 1.74
+        },
+        {
+          "concurrency": 8,
+          "completed": 8,
+          "durationMs": 3744,
+          "p50Ms": 2211,
+          "p95Ms": 3744,
+          "maxMs": 3744,
+          "requestsPerSecond": 2.137
+        },
+        {
+          "concurrency": 16,
+          "completed": 16,
+          "durationMs": 6383,
+          "p50Ms": 3644,
+          "p95Ms": 6383,
+          "maxMs": 6383,
+          "requestsPerSecond": 2.507
+        }
+      ],
+      "latencyMs": {
+        "responses": {
+          "count": 22,
+          "min": null,
+          "p50": 2084,
+          "p90": null,
+          "p95": 4102,
+          "p99": null,
+          "max": 4531,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 19,
+          "min": null,
+          "p50": 2739,
+          "p90": null,
+          "p95": 6383,
+          "p99": null,
+          "max": 6383,
+          "mean": null
+        },
+        "runtime": {
+          "count": 2,
+          "min": null,
+          "p50": 1696,
+          "p90": null,
+          "p95": 2229,
+          "p99": null,
+          "max": 2229,
+          "mean": null
+        }
+      }
+    },
+    {
+      "name": "post_router_fleet_with_full_reconnect",
+      "reportSha256": "f4edcb4f2a2219467e66337a0956a91db1701a8730d15746fcedf1bb80d5dc1c",
+      "success": false,
+      "phase": "recover_same_supervisors_1",
+      "target": 8,
+      "completedResponses": 33,
+      "directExecRequests": 8,
+      "llmBootstrapEndpointRequests": 0,
+      "startupMs": 74442,
+      "recoveryMs": null,
+      "recoveredSameSupervisor": 0,
+      "stabilitySamples": 0,
+      "connectionDropRounds": 2,
+      "coldStartConcurrency": 2,
+      "reconnectSoakMs": 0,
+      "longSoakElapsedMs": 0,
+      "longSoakMaxUnavailableMs": 0,
+      "longSoakProbeCount": 0,
+      "projectsCreatedOrAttempted": 8,
+      "projectsDeleted": 8,
+      "supervisorBootstrapMs": [
+        3045,
+        2944,
+        3634,
+        3204,
+        3251,
+        null,
+        3391,
+        2902
+      ],
+      "recoveryFailureCount": 2,
+      "retiredGenerationCount": 1,
+      "failureKinds": [
+        [
+          {
+            "name": "V2BootstrapError",
+            "kind": "readiness",
+            "code": null
+          }
+        ],
+        [
+          {
+            "name": "AbortError",
+            "kind": null,
+            "code": null
+          }
+        ]
+      ],
+      "supervisors": [
+        {
+          "worker": 3,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            747.503,
+            718.051,
+            824.783
+          ]
+        },
+        {
+          "worker": 1,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            723.933,
+            730.219,
+            849.987
+          ]
+        },
+        {
+          "worker": 2,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            832.584,
+            704.098,
+            928.018
+          ]
+        },
+        {
+          "worker": 8,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            769.371,
+            703.703,
+            793.629
+          ]
+        },
+        {
+          "worker": 6,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            758.082,
+            722.805,
+            815.382
+          ]
+        },
+        {
+          "worker": 7,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            861.714,
+            718.211,
+            905.365
+          ]
+        },
+        {
+          "worker": 4,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            804.727,
+            718.403,
+            896.089
+          ]
+        },
+        {
+          "worker": 5,
+          "generation": 1,
+          "initialDisconnects": 0,
+          "forcedDisconnects": 2,
+          "naturalDisconnects": 0,
+          "challenges": 3,
+          "authenticatedRestores": 3,
+          "failures": 0,
+          "restoreMs": [
+            783.171,
+            745.721,
+            805.046
+          ]
+        }
+      ],
+      "connections": {
+        "count": 49,
+        "neverOpened": 0,
+        "neverSynced": 0
+      },
+      "concurrency": [],
+      "latencyMs": {
+        "responses": {
+          "count": 13,
+          "min": null,
+          "p50": 1756,
+          "p90": null,
+          "p95": 2638,
+          "p99": null,
+          "max": 2638,
+          "mean": null
+        },
+        "anthropic": {
+          "count": 12,
+          "min": null,
+          "p50": 1676,
+          "p90": null,
+          "p95": 2033,
+          "p99": null,
+          "max": 2033,
+          "mean": null
+        },
+        "runtime": {
+          "count": 8,
+          "min": null,
+          "p50": 1824,
+          "p90": null,
+          "p95": 2974,
+          "p99": null,
+          "max": 2974,
+          "mean": null
+        }
+      }
+    }
+  ],
+  "fullReconnectProof": {
+    "fullReconnects": [
+      {
+        "target": 8,
+        "socketsClosed": 24,
+        "restored": 8,
+        "capacityRestoreMs": [
+          2050,
+          2105,
+          2146,
+          2188,
+          2188,
+          2317,
+          2621,
+          3338
+        ],
+        "supervisorProofs": [
+          {
+            "worker": 3,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              824.783
+            ]
+          },
+          {
+            "worker": 1,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              849.987
+            ]
+          },
+          {
+            "worker": 2,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              928.018
+            ]
+          },
+          {
+            "worker": 8,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              793.629
+            ]
+          },
+          {
+            "worker": 6,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              815.382
+            ]
+          },
+          {
+            "worker": 7,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              905.365
+            ]
+          },
+          {
+            "worker": 4,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              896.089
+            ]
+          },
+          {
+            "worker": 5,
+            "additionalChallenges": 1,
+            "additionalProofs": 1,
+            "newProofMs": [
+              805.046
+            ]
+          }
+        ]
+      }
+    ],
+    "truncated": false
+  },
+  "productionAfterRouterReset": {
+    "snapshot": {
+      "bytes": 27861505,
+      "sha256": "ef6cb6d6159053e91c3d5e15116ab7f467155c594a57b9d9cd117a2df7b094e5",
+      "records": 1533,
+      "first": "2026-09-05T13:31:21.014Z",
+      "last": "2026-09-05T14:45:47.260Z"
+    },
+    "overall": {
+      "events": {
+        "sandbox.recovery.started": 11,
+        "fleet.startup_permits.changed": 22,
+        "fleet.sample": 893,
+        "sandbox.recovery.completed": 11,
+        "server.started": 1,
+        "request.accepted": 74,
+        "admission.acquired": 74,
+        "request.queued": 74,
+        "route.selected": 74,
+        "transport.committed": 74,
+        "response.first_event": 74,
+        "request.completed": 72,
+        "request.failed": 2,
+        "sandbox.liveness": 75,
+        "prism.circuit.changed": 2
+      },
+      "latency": {
+        "total_ms": {
+          "count": 72,
+          "min": 6391.838134765625,
+          "p50": 44201.090087890625,
+          "p95": 156187.58569335938,
+          "max": 220092.04711914062
+        },
+        "queue_wait_ms": {
+          "count": 72,
+          "min": 0.236083984375,
+          "p50": 0.4677734375,
+          "p95": 0.782470703125,
+          "max": 1.90966796875
+        },
+        "commit_ack_ms": {
+          "count": 72,
+          "min": 416.27685546875,
+          "p50": 1032.382080078125,
+          "p95": 2512.447265625,
+          "max": 5239.67529296875
+        },
+        "first_event_ms": {
+          "count": 72,
+          "min": 1325.8564453125,
+          "p50": 4099.166748046875,
+          "p95": 5118.18603515625,
+          "max": 11301.329833984375
+        },
+        "response_bytes": {
+          "count": 72,
+          "min": 217438,
+          "p50": 314120,
+          "p95": 986058,
+          "max": 1566251
+        },
+        "frames": {
+          "count": 72,
+          "min": 101,
+          "p50": 274,
+          "p95": 2994,
+          "max": 5002
+        }
+      }
+    },
+    "afterHourlyBoundary": {
+      "events": {
+        "fleet.sample": 178,
+        "sandbox.liveness": 16,
+        "request.completed": 15,
+        "request.accepted": 14,
+        "admission.acquired": 14,
+        "request.queued": 14,
+        "route.selected": 14,
+        "transport.committed": 14,
+        "response.first_event": 14
+      },
+      "latency": {
+        "total_ms": {
+          "count": 15,
+          "min": 6652.83935546875,
+          "p50": 27302.353515625,
+          "p95": 172160.30395507812,
+          "max": 172160.30395507812
+        },
+        "queue_wait_ms": {
+          "count": 15,
+          "min": 0.236083984375,
+          "p50": 0.533447265625,
+          "p95": 0.782470703125,
+          "max": 0.782470703125
+        },
+        "commit_ack_ms": {
+          "count": 15,
+          "min": 457.001953125,
+          "p50": 557.352783203125,
+          "p95": 5239.67529296875,
+          "max": 5239.67529296875
+        },
+        "first_event_ms": {
+          "count": 15,
+          "min": 1325.8564453125,
+          "p50": 3649.11181640625,
+          "p95": 11301.329833984375,
+          "max": 11301.329833984375
+        },
+        "response_bytes": {
+          "count": 15,
+          "min": 248294,
+          "p50": 360279,
+          "p95": 1128983,
+          "max": 1128983
+        },
+        "frames": {
+          "count": 15,
+          "min": 121,
+          "p50": 406,
+          "p95": 3790,
+          "max": 3790
+        }
+      }
+    },
+    "nonStartupRecoveries": [
+      {
+        "event": "sandbox.recovery.started",
+        "ts": "2026-09-05T14:16:13.619Z",
+        "worker_index": 4,
+        "cause": "runtime",
+        "attempt": 0,
+        "incarnation": 1,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 0,
+        "duration_ms": 0.008056640625,
+        "status": null,
+        "error_name": "V2RuntimeLifecycleFailure",
+        "error_kind": "sidecar_unreachable",
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": "sidecar_liveness"
+      },
+      {
+        "event": "sandbox.recovery.started",
+        "ts": "2026-09-05T14:16:14.375Z",
+        "worker_index": 2,
+        "cause": "runtime",
+        "attempt": 0,
+        "incarnation": 1,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 0,
+        "duration_ms": 0.00341796875,
+        "status": null,
+        "error_name": "V2RuntimeLifecycleFailure",
+        "error_kind": "sidecar_unreachable",
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": "sidecar_liveness"
+      },
+      {
+        "event": "sandbox.recovery.completed",
+        "ts": "2026-09-05T14:16:47.075Z",
+        "worker_index": 4,
+        "cause": "runtime",
+        "attempt": 1,
+        "incarnation": 2,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 33455.365234375,
+        "duration_ms": 33455.716552734375,
+        "status": null,
+        "error_name": null,
+        "error_kind": null,
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": null
+      },
+      {
+        "event": "sandbox.recovery.completed",
+        "ts": "2026-09-05T14:16:50.950Z",
+        "worker_index": 2,
+        "cause": "runtime",
+        "attempt": 1,
+        "incarnation": 2,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 36574.511962890625,
+        "duration_ms": 36574.7021484375,
+        "status": null,
+        "error_name": null,
+        "error_kind": null,
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": null
+      },
+      {
+        "event": "sandbox.recovery.started",
+        "ts": "2026-09-05T14:24:11.355Z",
+        "worker_index": 3,
+        "cause": "runtime",
+        "attempt": 0,
+        "incarnation": 1,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 0,
+        "duration_ms": 0.0078125,
+        "status": null,
+        "error_name": "V2RuntimeLifecycleFailure",
+        "error_kind": "sidecar_unreachable",
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": "sidecar_liveness"
+      },
+      {
+        "event": "sandbox.recovery.completed",
+        "ts": "2026-09-05T14:25:48.652Z",
+        "worker_index": 3,
+        "cause": "runtime",
+        "attempt": 1,
+        "incarnation": 2,
+        "consecutive_failures": 0,
+        "attempt_duration_ms": 97296.72509765625,
+        "duration_ms": 97296.9287109375,
+        "status": null,
+        "error_name": null,
+        "error_kind": null,
+        "sidecar_error_name": null,
+        "sidecar_error_code": null,
+        "sidecar_cause_name": null,
+        "sidecar_phase": null,
+        "sidecar_permission": null,
+        "operation": null
+      }
+    ],
+    "liveness": [
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:14:03.006Z",
+        "worker_index": 1,
+        "attempt": 257,
+        "consecutive_failures": 1,
+        "duration_ms": 169.589111328125,
+        "status": 503,
+        "error_name": "Error",
+        "error_kind": "http",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 9696.019775390625,
+        "sidecar_peer_age_ms": 4014.859375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:14:13.327Z",
+        "worker_index": 1,
+        "attempt": 258,
+        "consecutive_failures": 0,
+        "duration_ms": 489.525146484375,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.19873046875,
+        "sidecar_peer_age_ms": 4344.072998046875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.019Z",
+        "worker_index": 5,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3123.124267578125,
+        "sidecar_peer_age_ms": 188.306396484375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.020Z",
+        "worker_index": 5,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 3123.689208984375,
+        "sidecar_peer_age_ms": 188.8603515625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.026Z",
+        "worker_index": 1,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 1631.954833984375,
+        "sidecar_peer_age_ms": 6037.365966796875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.026Z",
+        "worker_index": 1,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 1632.063232421875,
+        "sidecar_peer_age_ms": 6037.473876953125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.028Z",
+        "worker_index": 1,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 1633.96923828125,
+        "sidecar_peer_age_ms": 6039.3798828125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.046Z",
+        "worker_index": 3,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 2441.694091796875,
+        "sidecar_peer_age_ms": 29.481201171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.046Z",
+        "worker_index": 3,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 2441.88671875,
+        "sidecar_peer_age_ms": 29.67333984375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.195Z",
+        "worker_index": 3,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 2590.265869140625,
+        "sidecar_peer_age_ms": 12.326171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.546Z",
+        "worker_index": 4,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 4845.68212890625,
+        "sidecar_peer_age_ms": 6102.278076171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.546Z",
+        "worker_index": 4,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 4845.795654296875,
+        "sidecar_peer_age_ms": 6102.39111328125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.611Z",
+        "worker_index": 2,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 6836.666259765625,
+        "sidecar_peer_age_ms": 5701.955078125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.611Z",
+        "worker_index": 2,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 6836.8076171875,
+        "sidecar_peer_age_ms": 5702.095703125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.887Z",
+        "worker_index": 5,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3991.104248046875,
+        "sidecar_peer_age_ms": 1056.27490234375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.922Z",
+        "worker_index": 8,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 932.5146484375,
+        "sidecar_peer_age_ms": 9800.235595703125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.922Z",
+        "worker_index": 8,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 932.628173828125,
+        "sidecar_peer_age_ms": 9800.348388671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:05.983Z",
+        "worker_index": 4,
+        "attempt": 1,
+        "duration_ms": 437.261474609375,
+        "error_name": "V2SupervisorError",
+        "error_kind": "connect",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 5283.061279296875,
+        "sidecar_peer_age_ms": 6539.65771484375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:06.050Z",
+        "worker_index": 2,
+        "attempt": 1,
+        "duration_ms": 439.34423828125,
+        "error_name": "V2SupervisorError",
+        "error_kind": "connect",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 7276.15771484375,
+        "sidecar_peer_age_ms": 6141.44677734375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:06.793Z",
+        "worker_index": 8,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 1803.54248046875,
+        "sidecar_peer_age_ms": 10671.263671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:07.311Z",
+        "worker_index": 4,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 6610.60009765625,
+        "sidecar_peer_age_ms": 7867.196533203125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:07.522Z",
+        "worker_index": 2,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 8747.5205078125,
+        "sidecar_peer_age_ms": 7612.809326171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:07.621Z",
+        "worker_index": 3,
+        "attempt": 2,
+        "duration_ms": 2574.345947265625,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 5016.234130859375,
+        "sidecar_peer_age_ms": 0.35107421875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.168Z",
+        "worker_index": 1,
+        "attempt": 2,
+        "duration_ms": 3142.083740234375,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 4774.144775390625,
+        "sidecar_peer_age_ms": 0.273193359375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.213Z",
+        "worker_index": 5,
+        "attempt": 2,
+        "duration_ms": 3193.09326171875,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 6316.78125,
+        "sidecar_peer_age_ms": 0.227294921875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.251Z",
+        "worker_index": 6,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 9791.93603515625,
+        "sidecar_peer_age_ms": 9204.75634765625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.251Z",
+        "worker_index": 6,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 9792.083251953125,
+        "sidecar_peer_age_ms": 9204.9033203125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.262Z",
+        "worker_index": 6,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 9802.475830078125,
+        "sidecar_peer_age_ms": 9215.296142578125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.430Z",
+        "worker_index": 7,
+        "attempt": 1,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3311.39111328125,
+        "sidecar_peer_age_ms": 4882.919677734375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.430Z",
+        "worker_index": 7,
+        "attempt": 1,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 3311.483642578125,
+        "sidecar_peer_age_ms": 4883.01171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.432Z",
+        "worker_index": 7,
+        "attempt": 2,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3313.720703125,
+        "sidecar_peer_age_ms": 4885.248779296875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.867Z",
+        "worker_index": 6,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 0.3798828125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 507.8447265625,
+        "sidecar_peer_age_ms": 9820.6884765625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:08.958Z",
+        "worker_index": 8,
+        "attempt": 2,
+        "duration_ms": 3035.82470703125,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 3968.453369140625,
+        "sidecar_peer_age_ms": 0.15869140625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:09.249Z",
+        "worker_index": 4,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 0.23486328125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 8548.962646484375,
+        "sidecar_peer_age_ms": 9805.55908203125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:09.698Z",
+        "worker_index": 2,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 0.138916015625,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 689.37109375,
+        "sidecar_peer_age_ms": 9788.952880859375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:10.406Z",
+        "worker_index": 7,
+        "attempt": 2,
+        "duration_ms": 1975.542724609375,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 5287.052490234375,
+        "sidecar_peer_age_ms": 0.21484375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:11.250Z",
+        "worker_index": 4,
+        "attempt": 2,
+        "consecutive_failures": 2,
+        "duration_ms": 0.132080078125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 827.248779296875,
+        "sidecar_peer_age_ms": 11806.334228515625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:11.488Z",
+        "worker_index": 6,
+        "attempt": 2,
+        "consecutive_failures": 0,
+        "duration_ms": 621.234375,
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 3128.502685546875,
+        "sidecar_peer_age_ms": 0.232666015625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:11.490Z",
+        "worker_index": 6,
+        "attempt": 2,
+        "duration_ms": 3239.177001953125,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "succeeded",
+        "heartbeat_age_ms": 3131.23876953125,
+        "sidecar_peer_age_ms": 0.186279296875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:11.697Z",
+        "worker_index": 2,
+        "attempt": 2,
+        "consecutive_failures": 2,
+        "duration_ms": 0.09423828125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 2688.75439453125,
+        "sidecar_peer_age_ms": 11788.32275390625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:13.249Z",
+        "worker_index": 4,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 0.116455078125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 2826.814208984375,
+        "sidecar_peer_age_ms": 13805.899658203125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:13.250Z",
+        "worker_index": 4,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 2827.2587890625,
+        "sidecar_peer_age_ms": 13806.34423828125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:13.618Z",
+        "worker_index": 4,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 368.51416015625,
+        "error_name": "V2SupervisorError",
+        "error_kind": "connect",
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3195.772705078125,
+        "sidecar_peer_age_ms": 14174.85888671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:13.698Z",
+        "worker_index": 2,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 0.107177734375,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 4689.43310546875,
+        "sidecar_peer_age_ms": 13789.001708984375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:13.698Z",
+        "worker_index": 2,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 4689.817138671875,
+        "sidecar_peer_age_ms": 13789.3857421875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:14.375Z",
+        "worker_index": 2,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 676.496826171875,
+        "error_name": "V2SupervisorError",
+        "error_kind": "connect",
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 5366.31494140625,
+        "sidecar_peer_age_ms": 14465.884521484375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:39.546Z",
+        "worker_index": 7,
+        "attempt": 270,
+        "consecutive_failures": 1,
+        "duration_ms": 5000.191650390625,
+        "status": null,
+        "error_name": "Error",
+        "error_kind": "timeout",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 14537.65576171875,
+        "sidecar_peer_age_ms": 5978.762451171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:16:45.339Z",
+        "worker_index": 7,
+        "attempt": 271,
+        "consecutive_failures": 0,
+        "duration_ms": 792.964111328125,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.124267578125,
+        "sidecar_peer_age_ms": 1745.856689453125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:33.960Z",
+        "worker_index": 3,
+        "attempt": 3,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 1272.71044921875,
+        "sidecar_peer_age_ms": 2656.945068359375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:33.960Z",
+        "worker_index": 3,
+        "attempt": 3,
+        "liveness_signal": "awareness",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 1272.965576171875,
+        "sidecar_peer_age_ms": 2657.1923828125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:33.963Z",
+        "worker_index": 3,
+        "attempt": 4,
+        "error_name": "SplitAwarenessChannelError",
+        "error_kind": "disconnected",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 1275.48583984375,
+        "sidecar_peer_age_ms": 2659.708251953125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:34.911Z",
+        "worker_index": 3,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 0.15673828125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 2224.212890625,
+        "sidecar_peer_age_ms": 3608.435302734375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:36.912Z",
+        "worker_index": 3,
+        "attempt": 2,
+        "consecutive_failures": 2,
+        "duration_ms": 0.231689453125,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 4224.785400390625,
+        "sidecar_peer_age_ms": 5609.008056640625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:38.912Z",
+        "worker_index": 3,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 0.114013671875,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "publish",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 6225.17919921875,
+        "sidecar_peer_age_ms": 7609.401611328125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:23:38.912Z",
+        "worker_index": 3,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "started",
+        "heartbeat_age_ms": 6225.323974609375,
+        "sidecar_peer_age_ms": 7609.546142578125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:24:11.354Z",
+        "worker_index": 3,
+        "attempt": 4,
+        "duration_ms": 37393.6748046875,
+        "error_name": "Error",
+        "error_kind": "other",
+        "liveness_signal": "awareness",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 8664.954833984375,
+        "sidecar_peer_age_ms": 27815.45849609375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:24:11.354Z",
+        "worker_index": 3,
+        "attempt": 3,
+        "consecutive_failures": 3,
+        "duration_ms": 32441.75537109375,
+        "error_name": "Error",
+        "error_kind": "other",
+        "liveness_signal": "sidecar_recovery",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 8665.404296875,
+        "sidecar_peer_age_ms": 27815.907470703125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:30:01.943Z",
+        "worker_index": 5,
+        "attempt": 352,
+        "consecutive_failures": 1,
+        "duration_ms": 565.503173828125,
+        "status": 500,
+        "error_name": "Error",
+        "error_kind": "http",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 10037.9521484375,
+        "sidecar_peer_age_ms": 7146.69140625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:30:11.815Z",
+        "worker_index": 5,
+        "attempt": 353,
+        "consecutive_failures": 0,
+        "duration_ms": 437.5634765625,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.131103515625,
+        "sidecar_peer_age_ms": 7017.01513671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:29.594Z",
+        "worker_index": 5,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 5001.859130859375,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "timeout",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 7612.197265625,
+        "sidecar_peer_age_ms": 14797.21484375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:31.796Z",
+        "worker_index": 5,
+        "attempt": 2,
+        "consecutive_failures": 0,
+        "duration_ms": 201.16162109375,
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 9813.448974609375,
+        "sidecar_peer_age_ms": 0.28173828125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:33.795Z",
+        "worker_index": 1,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 5000.52490234375,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "timeout",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 457.740478515625,
+        "sidecar_peer_age_ms": 14800.99462890625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:36.000Z",
+        "worker_index": 1,
+        "attempt": 2,
+        "consecutive_failures": 0,
+        "duration_ms": 204.701171875,
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 2662.794677734375,
+        "sidecar_peer_age_ms": 0.194580078125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:48.372Z",
+        "worker_index": 7,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 5001.5859375,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "timeout",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 3380.791259765625,
+        "sidecar_peer_age_ms": 14804.83447265625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:50.571Z",
+        "worker_index": 7,
+        "attempt": 2,
+        "consecutive_failures": 0,
+        "duration_ms": 199.68359375,
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 5579.70751953125,
+        "sidecar_peer_age_ms": 0.197509765625,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:55.868Z",
+        "worker_index": 6,
+        "attempt": 1,
+        "consecutive_failures": 1,
+        "duration_ms": 5000.8935546875,
+        "error_name": "V2TransportLivenessError",
+        "error_kind": "timeout",
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 7464.4501953125,
+        "sidecar_peer_age_ms": 14807.981201171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:31:58.063Z",
+        "worker_index": 6,
+        "attempt": 2,
+        "consecutive_failures": 0,
+        "duration_ms": 194.548828125,
+        "liveness_signal": "sidecar_probe",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 9659.409423828125,
+        "sidecar_peer_age_ms": 0.204345703125,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:33:07.522Z",
+        "worker_index": 8,
+        "attempt": 371,
+        "consecutive_failures": 1,
+        "duration_ms": 5000.607421875,
+        "status": null,
+        "error_name": "Error",
+        "error_kind": "timeout",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 13994.21240234375,
+        "sidecar_peer_age_ms": 1434.905029296875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:33:12.904Z",
+        "worker_index": 6,
+        "attempt": 369,
+        "consecutive_failures": 1,
+        "duration_ms": 5000.073974609375,
+        "status": null,
+        "error_name": "Error",
+        "error_kind": "timeout",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 14481.297119140625,
+        "sidecar_peer_age_ms": 4837.73388671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:33:13.079Z",
+        "worker_index": 8,
+        "attempt": 372,
+        "consecutive_failures": 0,
+        "duration_ms": 556.736572265625,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.184814453125,
+        "sidecar_peer_age_ms": 17.941162109375,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:33:19.249Z",
+        "worker_index": 6,
+        "attempt": 370,
+        "consecutive_failures": 0,
+        "duration_ms": 1344.699951171875,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.1015625,
+        "sidecar_peer_age_ms": 1183.388671875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:39:09.752Z",
+        "worker_index": 6,
+        "attempt": 405,
+        "consecutive_failures": 1,
+        "duration_ms": 1846.986572265625,
+        "status": 500,
+        "error_name": "Error",
+        "error_kind": "http",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 11226.496826171875,
+        "sidecar_peer_age_ms": 1686.076171875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:39:18.476Z",
+        "worker_index": 6,
+        "attempt": 406,
+        "consecutive_failures": 0,
+        "duration_ms": 572.03125,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.1416015625,
+        "sidecar_peer_age_ms": 411.35498046875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:40:31.922Z",
+        "worker_index": 5,
+        "attempt": 415,
+        "consecutive_failures": 1,
+        "duration_ms": 544.255615234375,
+        "status": 500,
+        "error_name": "Error",
+        "error_kind": "http",
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "failed",
+        "heartbeat_age_ms": 9884.64306640625,
+        "sidecar_peer_age_ms": 130.76123046875,
+        "transport_connected": true
+      },
+      {
+        "event": "sandbox.liveness",
+        "ts": "2026-09-05T14:40:42.095Z",
+        "worker_index": 5,
+        "attempt": 416,
+        "consecutive_failures": 0,
+        "duration_ms": 716.542236328125,
+        "status": 200,
+        "error_name": null,
+        "error_kind": null,
+        "liveness_signal": "heartbeat",
+        "liveness_outcome": "recovered",
+        "heartbeat_age_ms": 0.1357421875,
+        "sidecar_peer_age_ms": 302.203125,
+        "transport_connected": true
+      }
+    ],
+    "failures": [
+      {
+        "event": "request.failed",
+        "ts": "2026-09-05T13:43:40.377Z",
+        "status": null,
+        "error_name": "V2CommittedError",
+        "error_kind": "cancelled",
+        "stage": "terminal",
+        "committed": true,
+        "quarantined": true,
+        "retry_count": 0,
+        "total_ms": 25518.81640625
+      },
+      {
+        "event": "request.failed",
+        "ts": "2026-09-05T14:24:11.356Z",
+        "status": null,
+        "error_name": "V2CommittedError",
+        "error_kind": "sandbox_recovery",
+        "stage": "terminal",
+        "committed": true,
+        "quarantined": true,
+        "retry_count": 0,
+        "total_ms": 53679.292724609375
+      }
+    ],
+    "fleetKeys": [
+      "schema",
+      "event",
+      "ts",
+      "mono_ms",
+      "capacity",
+      "active",
+      "available",
+      "queued",
+      "queued_bytes",
+      "desired",
+      "ready",
+      "routable",
+      "unavailable",
+      "unavailable_projects",
+      "unavailable_projects_truncated",
+      "pending_retirements",
+      "project_mutation_state",
+      "project_mutation_failures",
+      "project_mutation_retry_ms",
+      "rss_bytes",
+      "heap_bytes",
+      "external_bytes",
+      "array_buffer_bytes",
+      "system_total_bytes",
+      "system_free_bytes",
+      "event_loop_p50_ms",
+      "event_loop_p95_ms",
+      "event_loop_max_ms",
+      "cpu_percent",
+      "resources",
+      "logger",
+      "runtimes",
+      "provisioning_circuit",
+      "traffic",
+      "websocket",
+      "release"
+    ],
+    "lastFleet": {
+      "ts": "2026-09-05T14:45:46.518Z",
+      "capacity": 64,
+      "active": 1,
+      "available": 32,
+      "queued": 0,
+      "ready": 8,
+      "routable": 8,
+      "runtimeStates": [
+        {
+          "state": "ready",
+          "incarnation": 1,
+          "active": 1,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 2,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 1,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 1,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 1,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 2,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 1,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        },
+        {
+          "state": "ready",
+          "incarnation": 2,
+          "active": 0,
+          "available": 4,
+          "quarantined": 0,
+          "transport_connected": true
+        }
+      ]
+    }
+  },
+  "sidecarLoggingExperiment": {
+    "status": "diagnostic_only_not_registered_in_production",
+    "failureCaptureAndProfiling": {
+      "diagnosticOnly": true,
+      "buildHash": "fcae154b759d417807766f949c46f4a9cc2f333901846389ea6af4f252c82003",
+      "bundleSha256": "6c177f9e611ae7958c092852d040e86989bc3deba2fa7613bab12ede81ce3331",
+      "liveRequests": 9,
+      "expectedOutputs": true,
+      "directBootstrapCalls": 1,
+      "llmBootstrapCalls": 0,
+      "logRecords": 559,
+      "logBytes": 165081,
+      "segments": 2,
+      "requestsWithStart": 9,
+      "requestsWithTerminal": 9,
+      "logger": {
+        "records": 549,
+        "retainedBytes": 160207,
+        "rotations": 1,
+        "dropped": 0,
+        "writeMs": 6.576005000022775,
+        "formatMs": 12.739693000011101,
+        "combinedMeasuredMs": 19.315698000033876
+      },
+      "timingsMs": {
+        "providerHeaders": {
+          "count": 9,
+          "min": 353.59140899999875,
+          "p50": 456.7008999999998,
+          "p95": 790.8144840000004,
+          "max": 790.8144840000004
+        },
+        "providerTotal": {
+          "count": 9,
+          "min": 936.3668120000002,
+          "p50": 1228.2517090000001,
+          "p95": 1569.1903819999989,
+          "max": 1569.1903819999989
+        },
+        "sidecarEventDelivery": {
+          "count": 89,
+          "min": 0.017426999998860992,
+          "p50": 0.07610600000043632,
+          "p95": 0.24345900000025722,
+          "max": 0.8447240000004967
+        },
+        "upstreamInterEventGap": {
+          "count": 89,
+          "min": 0.18694400000094902,
+          "p50": 17.60669400000006,
+          "p95": 391.3817769999987,
+          "max": 568.6423190000005
+        },
+        "sidecarCommitProcessing": {
+          "count": 9,
+          "min": 202.3581950000007,
+          "p50": 247.45254099999875,
+          "p95": 440.02538599999934,
+          "max": 440.02538599999934
+        },
+        "sidecarClaimSync": {
+          "count": 9,
+          "min": 2.3998759999994945,
+          "p50": 4.198159999999916,
+          "p95": 8.69315800000004,
+          "max": 8.69315800000004
+        },
+        "preparedToFetchStart": {
+          "count": 9,
+          "min": 193.96029,
+          "p50": 241.50154399999974,
+          "p95": 428.19624699999986,
+          "max": 428.19624699999986
+        }
+      },
+      "tokens": {
+        "input": 17475,
+        "output": 74,
+        "cached": 17266
+      },
+      "memoryBytes": {
+        "count": 13,
+        "min": 41410560,
+        "p50": 64499712,
+        "p95": 68984832,
+        "max": 68984832
+      },
+      "cpuSamplesAvailable": 12,
+      "fatalRecords": [
+        {
+          "phase": "awareness_connect",
+          "error_name": "SidecarLifecycleError",
+          "error_code": "diagnostic_injected_failure"
+        }
+      ],
+      "supervisorObservedFatal": true,
+      "clientCases": [
+        {
+          "case": "text",
+          "headers_ms": 1161.2498000000014,
+          "first_event_ms": 1161.4360000000015,
+          "first_text_ms": 1364.4532,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1761.8254000000015,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 202.90400000000227,
+          "expected_text": true
+        },
+        {
+          "case": "tool",
+          "headers_ms": 1104.4396000000015,
+          "first_event_ms": 1104.4883999999984,
+          "first_text_ms": null,
+          "first_tool_ms": 1442.6912000000011,
+          "tool_ready_ms": 1640.5675999999985,
+          "total_ms": 1881.3260999999984,
+          "events": 12,
+          "bytes": 7191,
+          "max_event_gap_ms": 338.1195000000007,
+          "expected_text": null
+        },
+        {
+          "case": "tool_followup",
+          "headers_ms": 1062.7666000000027,
+          "first_event_ms": 1062.796400000003,
+          "first_text_ms": 1259.804,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1652.6699000000008,
+          "events": 10,
+          "bytes": 6783,
+          "max_event_gap_ms": 197.5010000000002,
+          "expected_text": true
+        },
+        {
+          "case": "anthropic_text",
+          "headers_ms": 795.1238000000012,
+          "first_event_ms": 795.1602000000021,
+          "first_text_ms": 1283.1298000000024,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1522.2530000000006,
+          "events": 8,
+          "bytes": 1542,
+          "max_event_gap_ms": 487.9586999999992,
+          "expected_text": true
+        },
+        {
+          "case": "medium_input",
+          "headers_ms": 1673.5622999999978,
+          "first_event_ms": 1673.6026999999995,
+          "first_text_ms": 1896.0553999999975,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2355.5328999999983,
+          "events": 10,
+          "bytes": 5893,
+          "max_event_gap_ms": 250.75,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_1",
+          "headers_ms": 813.8402999999998,
+          "first_event_ms": 813.8833999999988,
+          "first_text_ms": 1254.5580999999984,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1658.681099999998,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 224.4314000000013,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_3",
+          "headers_ms": 1453.9604,
+          "first_event_ms": 1453.9782999999989,
+          "first_text_ms": 1849.8462999999974,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2092.1268999999993,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 395.818299999999,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_2",
+          "headers_ms": 1454.0131000000001,
+          "first_event_ms": 1454.0218000000023,
+          "first_text_ms": 1849.8405999999995,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2291.2016000000003,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 395.5649000000012,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_4",
+          "headers_ms": 1658.627199999999,
+          "first_event_ms": 1658.6447999999982,
+          "first_text_ms": 2092.4035000000003,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2291.222099999999,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 432.9892,
+          "expected_text": true
+        }
+      ],
+      "projectDeleted": true,
+      "hostLogger": {
+        "queuedEvents": 0,
+        "queuedBytes": 0,
+        "droppedSamples": 0,
+        "droppedProgress": 0,
+        "droppedTerminals": 0,
+        "sinkErrors": 0
+      },
+      "files": [
+        "sidecar.4297.1.jsonl",
+        "sidecar.4297.jsonl",
+        "sidecar.4524.1.jsonl",
+        "sidecar.4524.jsonl",
+        "supervisor.1.jsonl",
+        "supervisor.jsonl"
+      ]
+    },
+    "normalRecovery": {
+      "diagnosticOnly": true,
+      "success": true,
+      "reportSha256": "cc6947deacc02df6707feaf7052517b7ad81c3c6c062bebb0ab0b59960cc5a60",
+      "buildHash": "fcae154b759d417807766f949c46f4a9cc2f333901846389ea6af4f252c82003",
+      "bundleSha256": "6c177f9e611ae7958c092852d040e86989bc3deba2fa7613bab12ede81ce3331",
+      "liveRequests": 15,
+      "expectedOutputs": true,
+      "directBootstrapCalls": 1,
+      "llmBootstrapCalls": 0,
+      "recoveries": [
+        {
+          "cycle": 1,
+          "durationMs": 31354.1328,
+          "sameSupervisor": true,
+          "freshChild": true
+        },
+        {
+          "cycle": 2,
+          "durationMs": 34502.3777,
+          "sameSupervisor": true,
+          "freshChild": true
+        },
+        {
+          "cycle": 3,
+          "durationMs": 26712.573700000008,
+          "sameSupervisor": true,
+          "freshChild": true
+        }
+      ],
+      "childProcesses": 4,
+      "retainedSupervisors": 1,
+      "uniqueSidecarRecords": 964,
+      "copiedCheckpointBytes": 855675,
+      "requestsWithStart": 15,
+      "requestsWithTerminal": 15,
+      "fatalRecords": [],
+      "droppedSamples": 0,
+      "loggerMeasuredMs": 30.52289000003561,
+      "timingsMs": {
+        "eventDelivery": {
+          "count": 149,
+          "min": 0.013600000002043089,
+          "p50": 0.06560700000045472,
+          "p95": 0.3290839999999662,
+          "max": 1.085254999999961
+        },
+        "providerHeaders": {
+          "count": 15,
+          "min": 363.69131100000004,
+          "p50": 406.1263519999993,
+          "p95": 638.4714440000025,
+          "max": 638.4714440000025
+        },
+        "providerTotal": {
+          "count": 15,
+          "min": 893.6737199999998,
+          "p50": 1112.597467,
+          "p95": 1478.5215759999992,
+          "max": 1478.5215759999992
+        },
+        "claimSync": {
+          "count": 15,
+          "min": 1.230197999999291,
+          "p50": 3.5350560000006226,
+          "p95": 6.506214000000909,
+          "max": 6.506214000000909
+        },
+        "clientTotal": {
+          "count": 15,
+          "min": 1440.929999999993,
+          "p50": 1817.5816999999988,
+          "p95": 2550.7662000000055,
+          "max": 2550.7662000000055
+        }
+      },
+      "clientCases": [
+        {
+          "case": "text",
+          "headers_ms": 1113.3729999999996,
+          "first_event_ms": 1113.5492999999988,
+          "first_text_ms": 1393.7049000000006,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1817.5816999999988,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 279.59340000000157,
+          "expected_text": true
+        },
+        {
+          "case": "tool",
+          "headers_ms": 1113.7191999999995,
+          "first_event_ms": 1113.783199999998,
+          "first_text_ms": null,
+          "first_tool_ms": 1545.0907999999981,
+          "tool_ready_ms": 1773.2636999999995,
+          "total_ms": 1958.2212999999974,
+          "events": 12,
+          "bytes": 7191,
+          "max_event_gap_ms": 431.09609999999884,
+          "expected_text": null
+        },
+        {
+          "case": "tool_followup",
+          "headers_ms": 1110.1260000000002,
+          "first_event_ms": 1110.1699000000008,
+          "first_text_ms": 1374.4876000000004,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1746.5204999999987,
+          "events": 10,
+          "bytes": 6783,
+          "max_event_gap_ms": 263.9956999999995,
+          "expected_text": true
+        },
+        {
+          "case": "anthropic_text",
+          "headers_ms": 934.5162000000018,
+          "first_event_ms": 934.5532000000021,
+          "first_text_ms": 1346.2079000000012,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1761.3323999999993,
+          "events": 8,
+          "bytes": 1542,
+          "max_event_gap_ms": 411.6418999999987,
+          "expected_text": true
+        },
+        {
+          "case": "medium_input",
+          "headers_ms": 1386.3171000000002,
+          "first_event_ms": 1386.3490999999995,
+          "first_text_ms": 1578.1843000000008,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2002.6979999999967,
+          "events": 10,
+          "bytes": 5893,
+          "max_event_gap_ms": 227.74399999999878,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_1",
+          "headers_ms": 1175.9892000000036,
+          "first_event_ms": 1176.0319999999992,
+          "first_text_ms": 1632.3257000000012,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1895.6993000000002,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 456.1941999999981,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_3",
+          "headers_ms": 1403.274900000004,
+          "first_event_ms": 1403.2896000000037,
+          "first_text_ms": 1895.7314000000042,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2353.1428000000014,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 263.8297999999995,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_2",
+          "headers_ms": 1403.2525999999998,
+          "first_event_ms": 1403.2796999999991,
+          "first_text_ms": 2121.2136000000028,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2353.222800000003,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 717.7968000000037,
+          "expected_text": true
+        },
+        {
+          "case": "concurrent_4",
+          "headers_ms": 1631.8866000000053,
+          "first_event_ms": 1631.9059000000052,
+          "first_text_ms": 2121.1572000000015,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 2550.7662000000055,
+          "events": 11,
+          "bytes": 6147,
+          "max_event_gap_ms": 488.9525999999969,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_1_continuation",
+          "headers_ms": 995.602899999998,
+          "first_event_ms": 995.6483000000007,
+          "first_text_ms": 1259.0026999999973,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1440.929999999993,
+          "events": 11,
+          "bytes": 6306,
+          "max_event_gap_ms": 262.9850000000006,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_1_anthropic",
+          "headers_ms": 857.5362999999925,
+          "first_event_ms": 857.5653999999922,
+          "first_text_ms": 1229.1736999999994,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1600.506699999998,
+          "events": 8,
+          "bytes": 1542,
+          "max_event_gap_ms": 371.6006000000052,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_2_continuation",
+          "headers_ms": 1076.1959999999963,
+          "first_event_ms": 1076.2446999999956,
+          "first_text_ms": 1444.0550999999978,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1892.1353999999992,
+          "events": 11,
+          "bytes": 6306,
+          "max_event_gap_ms": 367.6972000000096,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_2_anthropic",
+          "headers_ms": 890.931500000006,
+          "first_event_ms": 890.9649999999965,
+          "first_text_ms": 1288.9722000000038,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1465.7553999999946,
+          "events": 8,
+          "bytes": 1542,
+          "max_event_gap_ms": 397.9997000000003,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_3_continuation",
+          "headers_ms": 1008.179999999993,
+          "first_event_ms": 1008.2411999999895,
+          "first_text_ms": 1325.7134999999835,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1720.5580999999947,
+          "events": 11,
+          "bytes": 6306,
+          "max_event_gap_ms": 316.65869999999995,
+          "expected_text": true
+        },
+        {
+          "case": "recovery_3_anthropic",
+          "headers_ms": 908.2788,
+          "first_event_ms": 908.3244000000122,
+          "first_text_ms": 1125.7835999999952,
+          "first_tool_ms": null,
+          "tool_ready_ms": null,
+          "total_ms": 1522.011200000008,
+          "events": 8,
+          "bytes": 1542,
+          "max_event_gap_ms": 219.8963999999978,
+          "expected_text": true
+        }
+      ],
+      "projectDeleted": true,
+      "hostLogger": {
+        "queuedEvents": 0,
+        "queuedBytes": 0,
+        "droppedSamples": 0,
+        "droppedProgress": 0,
+        "droppedTerminals": 0,
+        "sinkErrors": 0
+      }
+    }
+  },
+  "incompleteGates": [
+    "Complete eight-project recovery on the final tree",
+    "130-minute natural reconnect soak"
+  ]
+}

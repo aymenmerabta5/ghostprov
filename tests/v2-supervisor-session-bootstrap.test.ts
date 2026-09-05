@@ -61,10 +61,14 @@ describe("V2 supervisor Codex-session bootstrap", () => {
       binding,
       payload,
     });
+    // The first base64 sextet carries real ciphertext bits. Replacing the
+    // final character with a constant could leave the ciphertext unchanged.
+    const corrupted = `${sealed.ciphertext[0] === "A" ? "B" : "A"}${sealed.ciphertext.slice(1)}`;
+    expect(corrupted).not.toBe(sealed.ciphertext);
     await expect(openSupervisorSessionBootstrap({
       sessionId: "codex-session-1111111111111111",
       expectedBinding: binding,
-      sealed: { ...sealed, ciphertext: `${sealed.ciphertext.slice(0, -1)}A` },
+      sealed: { ...sealed, ciphertext: corrupted },
     })).rejects.toMatchObject({ code: "ciphertext" });
   });
 });

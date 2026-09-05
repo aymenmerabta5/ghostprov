@@ -16,6 +16,7 @@ import {
   V2_R7_RELEASE,
   V2_R8_RELEASE,
   V2_R9_RELEASE,
+  V2_R10_RELEASE,
   V2_RETIREMENT_RELEASE_IDENTITIES,
   V2_SELECTABLE_RELEASE_IDENTITIES,
 } from "../src/v2/sidecar/assets";
@@ -28,7 +29,7 @@ describe("V2 sidecar assets", () => {
 
     expect(first).toEqual(second);
     expect(first.revision).toBe("r1");
-    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r9");
+    expect(DEFAULT_V2_SIDECAR_REVISION).toBe("r10");
     expect(first.buildHash).toBe(V2_R1_RELEASE.buildHash);
     expect(first.schemaHash).toBe(V2_R1_RELEASE.schemaHash);
     expect(first.files[0]!.sha256).toBe(V2_R1_RELEASE.bundleSha256);
@@ -61,15 +62,16 @@ describe("V2 sidecar assets", () => {
     await expect(assertV2SidecarAssets(first, "r1")).resolves.toBeUndefined();
   });
 
-  it("selects sandbox-relay R9 bulk transport while preserving prior releases", async () => {
+  it("selects R10 sandbox diagnostics while preserving prior releases", async () => {
     const assets = await loadV2SidecarAssets();
-    expect(assets.revision).toBe("r9");
+    expect(assets.revision).toBe("r10");
     expect(assets.protocolRevision).toBe("r2");
     expect(assets.transportProfile).toBe("bulk-v1");
-    expect(assets.buildHash).toBe(V2_R9_RELEASE.buildHash);
-    expect(assets.schemaHash).toBe(V2_R9_RELEASE.schemaHash);
-    expect(assets.files[0]!.sha256).toBe(V2_R9_RELEASE.bundleSha256);
-    await expect(assertV2SidecarAssets(assets, "r9")).resolves.toBeUndefined();
+    expect(assets.buildHash).toBe(V2_R10_RELEASE.buildHash);
+    expect(assets.schemaHash).toBe(V2_R10_RELEASE.schemaHash);
+    expect(assets.files[0]!.sha256).toBe(V2_R10_RELEASE.bundleSha256);
+    await expect(assertV2SidecarAssets(assets, "r10")).resolves.toBeUndefined();
+    await expect(loadV2SidecarAssets({ revision: "r9" })).resolves.toMatchObject({ revision: "r9", buildHash: V2_R9_RELEASE.buildHash });
     await expect(loadV2SidecarAssets({ revision: "r8" }))
       .resolves.toMatchObject({
         revision: "r8",
@@ -228,7 +230,7 @@ describe("V2 sidecar assets", () => {
   });
 
   it("fails closed on unsupported or mismatched revision selection", async () => {
-    expect(resolveV2SidecarRevision()).toBe("r9");
+    expect(resolveV2SidecarRevision()).toBe("r10");
     expect(resolveV2SidecarRevision("r2")).toBe("r2");
     expect(resolveV2SidecarRevision("r3")).toBe("r3");
     expect(resolveV2SidecarRevision("r4")).toBe("r4");
@@ -237,7 +239,8 @@ describe("V2 sidecar assets", () => {
     expect(resolveV2SidecarRevision("r7")).toBe("r7");
     expect(resolveV2SidecarRevision("r8")).toBe("r8");
     expect(resolveV2SidecarRevision("r9")).toBe("r9");
-    expect(() => resolveV2SidecarRevision("r10")).toThrow(/unsupported.*r10/i);
+    expect(resolveV2SidecarRevision("r10")).toBe("r10");
+    expect(() => resolveV2SidecarRevision("r11")).toThrow(/unsupported.*r11/i);
     await expect(loadV2SidecarAssets({ revision: "r2" }))
       .resolves.toMatchObject({ revision: "r2", buildHash: V2_R2_RELEASE.buildHash });
 

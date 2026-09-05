@@ -94,6 +94,7 @@ export const SANDBOX_LIVENESS_ERROR_NAMES = [
   "SidecarCredentialRotationError",
   "SplitAwarenessChannelError",
   "V2SidecarRecoveryPreflightUnavailableError",
+  "V2SupervisorError",
   "V2TransportLivenessError",
   "YDocSessionError",
 ] as const;
@@ -123,6 +124,11 @@ export const SANDBOX_LIVENESS_ERROR_KINDS = [
   "unavailable",
 ] as const;
 export type SandboxLivenessErrorKind = typeof SANDBOX_LIVENESS_ERROR_KINDS[number];
+
+export const SANDBOX_RECONNECT_PHASES = ["mint_credential", "supervisor_rotation", "host_reconnect", "sidecar_rotation"] as const;
+export type SandboxReconnectPhase = typeof SANDBOX_RECONNECT_PHASES[number];
+export const SANDBOX_SUPERVISOR_PHASES = ["transport", "bootstrap", "sequence", "challenge", "command"] as const;
+export type SandboxSupervisorPhase = typeof SANDBOX_SUPERVISOR_PHASES[number];
 
 export const SANDBOX_AWARENESS_LANES = ["data", "control", "unknown"] as const;
 export type SandboxAwarenessLane = typeof SANDBOX_AWARENESS_LANES[number];
@@ -404,6 +410,8 @@ export interface SandboxLivenessObservabilityFields {
   reliable_stall?: boolean;
   awareness_lane?: SandboxAwarenessLane;
   connection_code?: number | null;
+  reconnect_phase?: SandboxReconnectPhase | null;
+  supervisor_phase?: SandboxSupervisorPhase | null;
 }
 
 /** Fixed, content-free fields accepted by fleet lifecycle events. */

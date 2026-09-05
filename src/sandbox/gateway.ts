@@ -20,6 +20,10 @@ import {
   supervisorInstallCommand,
   type SupervisorExecRequest,
 } from "../v2/supervisor/launcher";
+import { supervisorInstallCommand as r10SupervisorInstallCommand } from "../v2/supervisor/r10-launcher";
+import { isRegisteredR10Entrypoint } from "../v2/supervisor/r10-direct-launcher";
+import { sandboxLogRelativePath, SANDBOX_LOG_RESPONSE_BYTES } from "../v2/diagnostics/read-sandbox-log";
+import type { SandboxLogFile } from "../v2/diagnostics/sandbox-log-schema";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { ProjectId } from "./types";
@@ -199,6 +203,14 @@ export class SandboxGateway {
     return { status: response.status, text: await response.text(), headers: response.headers };
   }
 
+  async readDiagnosticFile(sessionId: string, file: SandboxLogFile, signal?: AbortSignal): Promise<{ status: number; value: unknown }> {
+    const relative = sandboxLogRelativePath(sessionId, file);
+    const response = await this.#request(`codex/read_codex_workspace_file?path=${encodeURIComponent(relative)}&session_id=${encodeURIComponent(sessionId)}`,
+      { method: "GET", signal }, true, Math.min(this.#responseBodyLimitBytes, SANDBOX_LOG_RESPONSE_BYTES));
+    if (response.status !== 200) { await response.body?.cancel(); return { status: response.status, value: null }; }
+    return { status: response.status, value: await response.json() };
+  }
+
   async fetchBytes(
     suffix: string,
     init: RequestInit = {},
@@ -276,7 +288,7 @@ export class SandboxGateway {
         conversationId: continuation.conversationId,
         previousResponseId: continuation.previousResponseId,
         listenSnapshot: continuation.listenSnapshot,
-        command: `Execute exactly this shell command and reply with ONLY its complete stdout verbatim: ${supervisorInstallCommand(request)}`,
+        command: `Execute exactly this shell command and reply with ONLY its complete stdout verbatim: ${(isRegisteredR10Entrypoint(request.entrypointPath) ? r10SupervisorInstallCommand : supervisorInstallCommand)(request)}`,
         maxPolls: this.#relayExecMaxPolls,
         pollIntervalMs: this.#relayExecPollIntervalMs,
         maxStartAttempts: 1,

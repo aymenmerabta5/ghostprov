@@ -47,6 +47,7 @@ import {
 import type { V2SidecarAssets } from "../v2/sidecar/assets";
 import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
 import { V2SandboxSupervisor, type V2SandboxSupervisorOptions } from "../v2/supervisor/controller";
+import { SandboxLogService } from "../v2/diagnostics/sandbox-log-service";
 import type { V2BootstrapSupervisor } from "../v2/supervisor/host";
 import { V2TransportSession, type V2GzipOptions } from "../v2/transport/session";
 import { createGhostProvApp } from "./app";
@@ -470,6 +471,7 @@ function defaultRuntimeFactory(options: {
   recoveryCoordinator: FleetRecoveryCoordinator;
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
+  sandboxLogs: SandboxLogService;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
   sandboxSupervisorFactory?: BrowserlessSystemDependencies["sandboxSupervisorFactory"];
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
@@ -486,6 +488,7 @@ function defaultRuntimeFactory(options: {
     recoveryCoordinator,
     revalidateAccount,
     logger,
+    sandboxLogs,
     heartbeatFactory,
     sandboxSupervisorFactory,
     onRecoveryEvent,
@@ -547,6 +550,8 @@ function defaultRuntimeFactory(options: {
           reliable_stall: diagnostic.reliableStall,
           awareness_lane: diagnostic.awarenessLane,
           connection_code: diagnostic.connectionCode,
+          reconnect_phase: diagnostic.reconnectPhase,
+          supervisor_phase: diagnostic.supervisorPhase,
         }), "terminal");
       },
       gzip,
@@ -607,8 +612,10 @@ function defaultRuntimeFactory(options: {
           control: createLane("control", "ghostprovV2Control"),
         });
       },
-      createSupervisor: supervisor => config.v2BootstrapLaunchMode === "relay"
-        ? (sandboxSupervisorFactory ?? (input => new V2SandboxSupervisor(input)))({
+      createSupervisor: supervisor => {
+        if (config.v2BootstrapLaunchMode !== "relay") return null;
+        let unregister = () => {};
+        const created = (sandboxSupervisorFactory ?? (input => new V2SandboxSupervisor(input)))({
             binding: bootstrapBindingFromProtocol(
               supervisor.binding,
               `supervisor-${supervisor.binding.launchNonce}`,
@@ -618,8 +625,13 @@ function defaultRuntimeFactory(options: {
             gateway: supervisor.gateway as SandboxGateway,
             assets: supervisor.assets,
             bootstrapMode: config.v2SupervisorBootstrapMode,
-          })
-        : null,
+            onClosed: () => unregister(),
+          });
+        if (supervisor.assets.revision === "r10" && created.readDiagnosticLog) {
+          unregister = sandboxLogs.register(projectId, { readDiagnosticLog: created.readDiagnosticLog.bind(created) });
+        }
+        return created;
+      },
       createBootstrap: bootstrap => new V2BootstrapController({
         projectId,
         workerIndex,
@@ -987,6 +999,7 @@ export async function createBrowserlessSystem(
       transport: "v2",
     },
   });
+  const sandboxLogs = new SandboxLogService({ governor, maxSources: Math.min(256, config.maxProjects) });
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
     identity,
@@ -1007,6 +1020,7 @@ export async function createBrowserlessSystem(
     heartbeatFactory: dependencies.heartbeatFactory,
     sandboxSupervisorFactory: dependencies.sandboxSupervisorFactory,
     onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
+    sandboxLogs,
   });
   fleet = new ProjectFleetManager({
     config,
@@ -1054,6 +1068,7 @@ export async function createBrowserlessSystem(
     anthropicContinuationIndex,
     anthropicModels: anthropicModelsFromEnv(env),
     standaloneSearch,
+    sandboxLogs,
   });
   const server = dependencies.server ?? createGhostProvServer({
     app,
@@ -1216,6 +1231,7 @@ export async function createBrowserlessSystem(
         responsesContinuationIndex.beginShutdown();
         anthropicContinuationIndex.beginShutdown();
         standaloneSearch.beginShutdown();
+        sandboxLogs.close();
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
         try {
@@ -1247,7 +1263,8 @@ export async function createBrowserlessSystem(
         // own a carrier. A failed force-close intentionally leaves its fixed or
         // elastic backing intact rather than making live socket memory uncharged.
         if (serverClose.closed) {
-          let memoryBackingClosed = true;
+          let memoryBackingClosed = sandboxLogs.snapshot().activeReads === 0;
+          if (!memoryBackingClosed) firstError ??= new Error("Sandbox diagnostic reads did not drain");
           try { webSocketIngressMemory.close(); } catch (error) {
             memoryBackingClosed = false;
             firstError ??= error;

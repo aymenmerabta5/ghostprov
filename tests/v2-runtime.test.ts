@@ -17,6 +17,7 @@ import { projectId } from "../src/sandbox/types";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
 import { SplitAwarenessChannelError } from "../src/v2/awareness/split-channel";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
+import { V2SupervisorError } from "../src/v2/supervisor/host";
 import type { V2ReadyDescriptor } from "../src/v2/bootstrap/controller";
 import type {
   AwarenessEnvelope,
@@ -701,6 +702,34 @@ describe("V2SandboxRuntime", () => {
       "sandbox-session-1",
     ]);
     await harness.runtime.stop();
+  });
+
+  it("reports a supervisor readiness failure hidden inside a deployment error against its exact session", async () => {
+    const harness = runtimeHarness();
+    const inner = Object.assign(new Error("offline supervisor readiness failure"), {
+      name: "V2SupervisorBootstrapError", kind: "readiness",
+    });
+    const outer = Object.assign(new Error("offline deployment wrapper", { cause: inner }), {
+      name: "V2BootstrapError", kind: "deploy",
+    });
+    harness.bootstrap.ensureReadyWait = async () => { throw outer; };
+    await expect(harness.runtime.start()).rejects.toBe(outer);
+    expect(harness.sandboxFailures.map(sandbox => String(sandbox.sessionId))).toEqual(["sandbox-session-1"]);
+    await harness.runtime.stop();
+  });
+
+  it("does not fence a sandbox for unrelated deployment failures or cyclic cause metadata", async () => {
+    const deployment = Object.assign(new Error("offline deployment"), { name: "V2BootstrapError", kind: "deploy" });
+    const cyclic = Object.assign(new Error("offline cyclic wrapper"), { name: "V2BootstrapError", kind: "deploy" });
+    cyclic.cause = cyclic;
+    const collision = Object.assign(new Error("offline file collision"), { name: "V2SupervisorBootstrapError", kind: "deploy" });
+    for (const failure of [deployment, cyclic, collision]) {
+      const harness = runtimeHarness();
+      harness.bootstrap.ensureReadyWait = async () => { throw failure; };
+      await expect(harness.runtime.start()).rejects.toBe(failure);
+      expect(harness.sandboxFailures).toHaveLength(0);
+      await harness.runtime.stop();
+    }
   });
 
   it("forwards exact admission and execution-risk callbacks to transport", async () => {
@@ -1948,6 +1977,51 @@ describe("V2SandboxRuntime", () => {
         connectionCode: undefined,
       },
     ]);
+    await harness.runtime.stop();
+  });
+
+  it("keeps the original child when a reconnect completes while sidecar recovery is waiting", async () => {
+    const failure = new Error("connection unavailable");
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
+      initialRotationPending: true, resourceExpiresInMs: 1_200_000,
+      livenessOutcomes: [null, failure, failure, failure, null] });
+    await harness.runtime.start();
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 300 && harness.transport.rotations !== 1; turn++) await Promise.resolve();
+      expect(harness.transport.rotations).toBe(1);
+      await harness.clock.advanceBy(10_000);
+      await harness.clock.advanceBy(2_000);
+      await harness.clock.advanceBy(2_000);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(harness.livenessDiagnostics.some(event => event.signal === "sidecar_recovery" && event.outcome === "started")).toBe(true);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      harness.releaseInitialRotation();
+      const recovered = () => harness.livenessDiagnostics.some(event => event.signal === "sidecar_recovery" && event.outcome === "succeeded");
+      for (let turn = 0; turn < 500 && !recovered(); turn++) await Promise.resolve();
+      expect(recovered()).toBe(true);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", transportConnected: true });
+    } finally { harness.releaseInitialRotation(); await harness.runtime.stop(); }
+  });
+
+  it("retains the supervisor failure name and exact bounded reconnect phase", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000, enableSupervisor: true });
+    await harness.runtime.start();
+    harness.supervisor.rotateCredential = async () => {
+      throw new V2SupervisorError("private failure detail", "timeout", undefined, "challenge");
+    };
+    harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+    for (let i = 0; i < 300 && !harness.livenessDiagnostics.some(event => event.supervisorPhase === "challenge"); i++) {
+      await Promise.resolve();
+    }
+    expect(harness.livenessDiagnostics.at(-1)).toMatchObject({
+      signal: "awareness", outcome: "failed", errorName: "V2SupervisorError", errorKind: "timeout",
+      reconnectPhase: "supervisor_rotation", supervisorPhase: "challenge",
+    });
+    expect(JSON.stringify(harness.livenessDiagnostics)).not.toContain("private failure detail");
     await harness.runtime.stop();
   });
 

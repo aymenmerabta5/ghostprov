@@ -193,6 +193,45 @@ function nodeRequest(options: {
 }
 
 describe("Anthropic HTTP routes", () => {
+  it.each(["/v1/messages", "/v1/messages?beta=true"])("preserves gpt-6-astra on tool-result turns through %s", async path => {
+    const router = new FakeRouter(body => relayHandle({
+      ...completed("resp_astra"),
+      model: body.model,
+    }));
+    const app = createGhostProvApp({
+      router,
+      anthropicModels: anthropicModelsFromEnv({ GP_ANTHROPIC_DEFAULT_MODEL: "custom-fallback" }),
+    });
+    const response = await app.request(path, {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify(messageRequest({
+        model: "gpt-6-astra",
+        tools: [{ name: "Read", input_schema: { type: "object", properties: {} } }],
+        messages: [
+          { role: "user", content: "Read the fixture" },
+          { role: "assistant", content: [{ type: "tool_use", id: "call_astra", name: "Read", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_astra", content: "fixture contents" }] },
+        ],
+      })),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ model: "gpt-6-astra", stop_reason: "end_turn" });
+    expect(router.calls).toHaveLength(1);
+    expect(router.calls[0]!.body).toMatchObject({
+      model: "gpt-6-astra",
+      stream: true,
+      store: true,
+      tools: [{ type: "function", name: "Read", parameters: { type: "object", properties: {} } }],
+      input: expect.arrayContaining([{
+        type: "function_call_output",
+        call_id: "call_astra",
+        output: "fixture contents",
+      }]),
+    });
+  });
+
   it("serves stable and beta JSON through one Anthropic router job with tolerant headers", async () => {
     const models = anthropicModelsFromEnv({
       GP_ANTHROPIC_OPUS_MODEL: "custom-opus",

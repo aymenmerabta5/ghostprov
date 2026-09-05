@@ -35,7 +35,8 @@ import {
   PublicationPacer,
   type PublicationReason,
 } from "../../src/v2/protocol/publication-pacer.ts";
-import type { SidecarEngine } from "../../src/v2/sidecar/engine.ts";
+import type { SidecarEngine as SidecarEngineImplementation } from "../../src/v2/sidecar/engine.ts";
+type SidecarEngine = Pick<SidecarEngineImplementation, keyof SidecarEngineImplementation>;
 import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";

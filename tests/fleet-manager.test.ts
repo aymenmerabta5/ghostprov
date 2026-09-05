@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
+import { DEFAULT_V2_SIDECAR_REVISION } from "../src/v2/sidecar/assets";
 import type { Clock, MachineSample } from "../src/core/ports";
 import { ProjectFleetManager } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
@@ -266,7 +267,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   snapshot(): RoutableSandboxSnapshot {
     return {
       projectId: this.projectId,
-      releaseRevision: "r9",
+      releaseRevision: DEFAULT_V2_SIDECAR_REVISION,
       state: this.state,
       capacity: this.state === "ready" ? 128 : 0,
       active: 0,

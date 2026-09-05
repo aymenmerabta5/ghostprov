@@ -8,6 +8,35 @@ const enabled = {
 };
 
 describe("R9 supervisor live recovery guards", () => {
+  it("requires a separate explicit guard before selecting R10", () => {
+    expect(resolveR9RecoveryProofOptions(enabled).sidecarRevision).toBe("r9");
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_SIDECAR_REVISION: "r10" })).toThrow();
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_SIDECAR_REVISION: "r10", GP_LIVE_R10_DIAGNOSTICS: "1" }).sidecarRevision).toBe("r10");
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_SIDECAR_REVISION: "r11" })).toThrow();
+  });
+  it("requires explicit bounded reconnect rounds for controlled challenge and reply loss", () => {
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_SUPERVISOR_DROP_CHALLENGE: "1" })).toThrow();
+    expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_CONNECTION_DROP_ROUNDS: "2", GP_LIVE_SUPERVISOR_DROP_REPLY: "yes" })).toThrow();
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_CONNECTION_DROP_ROUNDS: "2", GP_LIVE_SUPERVISOR_DROP_CHALLENGE: "1", GP_LIVE_SUPERVISOR_DROP_REPLY: "1" }))
+      .toMatchObject({ dropChallenge: true, dropReply: true });
+  });
+  it("bounds forced connection drops and long reconnect verification independently of startup", () => {
+    expect(resolveR9RecoveryProofOptions(enabled)).toMatchObject({ connectionDropRounds: 0, reconnectSoakMs: 0 });
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_CONNECTION_DROP_ROUNDS: "2", GP_LIVE_RECONNECT_SOAK_MS: "7800000" }))
+      .toMatchObject({ connectionDropRounds: 2, reconnectSoakMs: 7_800_000 });
+    for (const value of ["-1", "3", "1.5", "Infinity"]) {
+      expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_CONNECTION_DROP_ROUNDS: value })).toThrow();
+    }
+    for (const value of ["-1", "59999", "9000001", "Infinity"]) {
+      expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_RECONNECT_SOAK_MS: value })).toThrow();
+    }
+    expect(resolveR9RecoveryProofOptions(enabled).coldStartConcurrency).toBe(1);
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_PROJECT_COUNT: "8" }).coldStartConcurrency).toBe(2);
+    expect(resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_PROJECT_COUNT: "8", GP_LIVE_COLD_START_CONCURRENCY: "1" }).coldStartConcurrency).toBe(1);
+    for (const value of ["0", "3", "1.5"]) {
+      expect(() => resolveR9RecoveryProofOptions({ ...enabled, GP_LIVE_COLD_START_CONCURRENCY: value })).toThrow();
+    }
+  });
   it("requires explicit LLM selection and a valid concurrency benchmark opt-in", () => {
     expect(resolveR9RecoveryProofOptions(enabled)).toMatchObject({ bootstrapMode: "direct", benchmarkConcurrency: false });
     expect(resolveR9RecoveryProofOptions({ ...enabled, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm", GP_LIVE_BENCHMARK_CONCURRENCY: "1" }))

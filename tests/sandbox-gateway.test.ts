@@ -52,6 +52,20 @@ class FakeClock implements Clock {
 }
 
 describe("SandboxGateway", () => {
+  it("reads only an allowlisted log file with a bounded response body", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const account = new FakeAccount(() => Response.json({ ok: true }));
+    const gateway = new SandboxGateway({ projectId: PROJECT, account, sandbox: SANDBOX });
+    await expect(gateway.readDiagnosticFile(sessionId, "sidecar.jsonl")).resolves.toMatchObject({ status: 200, value: { ok: true } });
+    expect(account.calls).toHaveLength(1);
+    expect(account.calls[0]!.path).toEndWith("/codex/read_codex_workspace_file");
+    await expect(gateway.readDiagnosticFile(sessionId, "../static.json" as "sidecar.jsonl")).rejects.toThrow();
+    await expect(gateway.readDiagnosticFile(`${sessionId}\n`, "sidecar.jsonl")).rejects.toThrow();
+    expect(account.calls).toHaveLength(1);
+    const huge = new SandboxGateway({ projectId: PROJECT, sandbox: SANDBOX,
+      account: new FakeAccount(() => new Response("x".repeat(192 * 1024 + 1))) });
+    await expect(huge.readDiagnosticFile(sessionId, "sidecar.jsonl")).rejects.toThrow();
+  });
   it("sends the runtime-specific sandbox token on direct requests", async () => {
     const account = new FakeAccount(() => Response.json({ ok: true }, {
       headers: { "x-session-id": "session-1" },

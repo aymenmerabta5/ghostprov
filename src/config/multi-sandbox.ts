@@ -58,11 +58,11 @@ export interface MultiSandboxConfig {
   v2DiagnosticsIntervalMs: number;
   v2BatchingEnabled: boolean;
   v2TerminalReceiptCoalescing: boolean;
-  /** Process-wide immutable sidecar release. R9 is normal operation; prior releases are rollback. */
+  /** Process-wide immutable sidecar release. R10 is normal operation; prior releases are rollback. */
   v2SidecarRevision: V2SidecarRevision;
   /** Bootstrap launch transport. Relay stages a sandbox-container launcher; render forks from the render VM. */
   v2BootstrapLaunchMode: "render" | "relay";
-  /** R9 cold bootstrap only; direct and LLM modes share the same supervisor. */
+  /** R9/R10 cold bootstrap only; direct and LLM modes share the same supervisor. */
   v2SupervisorBootstrapMode: "direct" | "llm";
   /** Phase-zero credential wait published into the sidecar static config. */
   v2BootstrapTimeoutMs: number;
@@ -131,7 +131,7 @@ function v2SidecarProjectRevisions(
       separator === entry.length - 1
     ) {
       throw new TypeError(
-        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3|r4|r5|r6|r7|r8|r9 entries",
+        "GP_V2_SIDECAR_PROJECT_REVISIONS must be project-id=r1|r2|r3|r4|r5|r6|r7|r8|r9|r10 entries",
       );
     }
     const rawProjectId = entry.slice(0, separator).trim();
@@ -346,6 +346,10 @@ export function resolveMultiSandboxConfig(
     ["render", "relay"] as const,
     "GP_V2_BOOTSTRAP_LAUNCH_MODE",
   );
+  if (v2BootstrapLaunchMode !== "relay" &&
+    (v2SidecarRevision === "r10" || Object.values(v2SidecarRevisionOverrides).includes("r10"))) {
+    throw new TypeError("R10 requires GP_V2_BOOTSTRAP_LAUNCH_MODE=relay and its persistent supervisor");
+  }
   const v2BootstrapTimeoutMs = boundedPositiveInteger(
     env.GP_V2_BOOTSTRAP_TIMEOUT_MS, 300_000, "GP_V2_BOOTSTRAP_TIMEOUT_MS", 30_000, 600_000,
   );

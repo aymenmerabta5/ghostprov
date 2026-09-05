@@ -143,6 +143,8 @@ describe("observability privacy", () => {
       reliable_stall: false,
       awareness_lane: "control",
       connection_code: 1006,
+      reconnect_phase: "supervisor_rotation",
+      supervisor_phase: "challenge",
     });
     expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
 
@@ -152,6 +154,8 @@ describe("observability privacy", () => {
       { error_name: "SUPER_SECRET_CANARY" },
       { error_kind: "private failure text" },
       { awareness_lane: "secret-lane" },
+      { reconnect_phase: "private credential contents" },
+      { supervisor_phase: "private command contents" },
       { connection_code: 65_536 },
       { worker_index: undefined },
       { duration_ms: Number.POSITIVE_INFINITY },
