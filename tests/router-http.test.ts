@@ -321,7 +321,8 @@ describe("router HTTP composition", () => {
       });
       expect(seeded.status).toBe(200);
       await seeded.json();
-      expect(continuationIndex.snapshot().records).toBe(1);
+      // Original provider output and its lossless completed-status omission.
+      expect(continuationIndex.snapshot().records).toBe(2);
 
       const rejected = await app.request("/v1/responses", {
         method: "POST",

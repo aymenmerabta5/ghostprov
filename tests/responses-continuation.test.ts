@@ -96,6 +96,95 @@ describe("native Responses full-history continuation", () => {
     });
   });
 
+  for (const sizeMiB of [18, 55]) it(`reuses an exact ${sizeMiB} MiB history without retaining its content in the index`, async () => {
+    const index = new ResponsesHttpContinuationIndex({ key: KEY });
+    const controller = new AbortController();
+    const root = user("large-history-".padEnd(sizeMiB * 1024 * 1024, "x"));
+    const cost = (2 * sizeMiB + 1) * 1024 * 1024;
+    const first = await index.prepare(body([root]), SCOPE, controller.signal, cost);
+    const answer = assistant("large-answer");
+    expect(await index.commit(first?.token ?? null, SCOPE, final("resp_large", [answer])))
+      .toBeTrue();
+    const suffix = user("next");
+    const next = await index.prepare(
+      body([root, answer, suffix]), SCOPE, controller.signal, cost,
+    );
+    expect(next?.token.decision).toBe("hit");
+    expect(next?.relayBody).toEqual(body([suffix], { previous_response_id: "resp_large" }));
+    expect(next?.fullRelayBody.input).toEqual([root, answer, suffix]);
+    expect(index.snapshot()).toMatchObject({ records: 2, logicalMetadataBytes: 3_072 });
+    index.beginShutdown();
+    index.clear();
+  });
+
+  it("matches Codex replay while forwarding new tracing labels and every model setting", async () => {
+    const index = new ResponsesHttpContinuationIndex({ key: KEY });
+    const signal = new AbortController().signal;
+    const root = user("root");
+    const firstMetadata = { session_id: "same", turn_id: "first", "x-codex-turn-metadata": "trace-first" };
+    const first = await index.prepare(body([root], { client_metadata: firstMetadata }), SCOPE, signal, 1_024);
+    const answer = assistant("answer");
+    expect(await index.commit(first!.token, SCOPE, final("resp_codex", [answer]))).toBeTrue();
+    const replay = { type: "message", id: answer.id, role: "assistant", content: [{ type: "output_text", text: "answer" }] };
+    const metadata = { session_id: "same", turn_id: "second", "x-codex-turn-metadata": "trace-second" };
+    const nextBody = body([root, replay, user("next")], { client_metadata: metadata });
+    const next = await index.prepare(nextBody, SCOPE, signal, 2_048);
+    expect(next?.token.decision).toBe("hit");
+    expect(next?.relayBody).toEqual(body([user("next")], { previous_response_id: "resp_codex", client_metadata: metadata }));
+    expect(next?.fullRelayBody).toEqual(nextBody);
+    expect(next?.relayBody.client_metadata).not.toBe(metadata);
+    expect(answer).toHaveProperty("status", "completed");
+    expect(answer.content[0]).toHaveProperty("annotations", []);
+    const changed = await index.prepare({ ...nextBody, temperature: 0.5 }, SCOPE, signal, 2_048);
+    expect(changed?.token.decision).toBe("miss");
+    index.beginShutdown();
+    index.clear();
+  });
+
+  it("requires exact unknown metadata and never strips meaningful replay fields", async () => {
+    const index = new ResponsesHttpContinuationIndex({ key: KEY });
+    const signal = new AbortController().signal;
+    const root = user("root");
+    const settings = { client_metadata: { turn_id: "one", future_setting: "strict" } };
+    const first = await index.prepare(body([root], settings), SCOPE, signal, 1_024);
+    const answer = {
+      ...assistant("answer"), future_output: true,
+      content: [{ type: "output_text", text: "answer", annotations: [{ type: "citation" }], logprobs: [] }],
+    };
+    expect(await index.commit(first!.token, SCOPE, final("resp_exact", [answer]))).toBeTrue();
+    const changed = await index.prepare(body([root, answer, user("next")], {
+      client_metadata: { ...settings.client_metadata, turn_id: "two" },
+    }), SCOPE, signal, 2_048);
+    expect(changed?.token.decision).toBe("miss");
+    const lossy = { type: "message", id: answer.id, role: "assistant", content: [{ type: "output_text", text: "answer" }] };
+    const omitted = await index.prepare(body([root, lossy, user("next")], settings), SCOPE, signal, 2_048);
+    expect(omitted?.token.decision).toBe("miss");
+    index.beginShutdown();
+    index.clear();
+  });
+
+  it("keeps the tracing byte bound exact and treats unsupported values as settings", async () => {
+    for (const [value, expected] of [
+      ["x".repeat(32 * 1024 - "turn_id".length), "hit"],
+      ["x".repeat(32 * 1024 - "turn_id".length + 1), "miss"],
+      [null, "miss"],
+      [{ nested: "value" }, "miss"],
+    ] as const) {
+      const index = new ResponsesHttpContinuationIndex({ key: KEY });
+      const signal = new AbortController().signal;
+      const root = user("root");
+      const prepared = await index.prepare(body([root], { client_metadata: { turn_id: value } }), SCOPE, signal, 100_000);
+      const answer = assistant("answer");
+      expect(await index.commit(prepared!.token, SCOPE, final("resp_trace_bound", [answer]))).toBeTrue();
+      const next = await index.prepare(body([root, answer, user("next")], {
+        client_metadata: { turn_id: "new" },
+      }), SCOPE, signal, 100_000);
+      expect(next?.token.decision).toBe(expected);
+      index.beginShutdown();
+      index.clear();
+    }
+  });
+
   it("matches a complete reasoning and message output sequence without reordering", async () => {
     const index = new ResponsesHttpContinuationIndex({ key: KEY });
     const controller = new AbortController();

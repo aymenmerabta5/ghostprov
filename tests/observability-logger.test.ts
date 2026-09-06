@@ -36,6 +36,21 @@ class MemorySink implements ObservabilitySink {
 }
 
 describe("ObservabilityLogger", () => {
+  it("keeps WebSocket payload rejection and HTTP fallback visible at error level", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink] });
+    logger.emit(observabilityEvent("websocket.payload_rejected", {
+      limit_bytes: 16 * 1024 ** 2, http_fallback_available: true,
+    }), "terminal");
+    logger.emit(observabilityEvent("websocket.http_fallback", {
+      limit_bytes: 16 * 1024 ** 2, status: 426,
+    }), "terminal");
+    await logger.close();
+    expect(sink.events().map(event => event.event)).toEqual([
+      "websocket.payload_rejected", "websocket.http_fallback",
+    ]);
+  });
+
   it("keeps console fleet samples fixed-size while preserving full JSONL elsewhere", () => {
     const full = `${JSON.stringify(observabilityEvent("fleet.sample", {
       capacity: 1_280,

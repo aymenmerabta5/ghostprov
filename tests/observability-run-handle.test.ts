@@ -30,6 +30,40 @@ class MemoryLogger implements LoggerLike {
 }
 
 describe("traceRunHandle", () => {
+  it("separates metadata, text, and tool timing without inspecting payload contents", async () => {
+    const clock = new FakeClock();
+    const logger = new MemoryLogger();
+    const final = deferred<any>();
+    const traced = traceRunHandle({
+      async *events() {
+        clock.value = 110;
+        yield { event: "response.created", data: "private metadata" };
+        clock.value = 140;
+        yield { event: "response.function_call_arguments.delta", data: "private arguments" };
+        clock.value = 150;
+        yield { event: "response.output_text.delta", data: "private text" };
+        clock.value = 160;
+        yield { event: "response.output_text.delta", data: "more private text" };
+      },
+      final: final.promise,
+      stats: { bytes: 10, firstByteMs: 20, frames: 4 },
+    }, {
+      logger, clock, traceId: "trace-payload", projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90, committedAtMs: 100, queueWaitMs: 1, commitAckMs: 9,
+      retryCount: 0, slowRequestMs: 1_000,
+    });
+    for await (const _frame of traced.events()) {}
+    clock.value = 190;
+    final.resolve({ status: "completed" });
+    await traced.final;
+    expect(logger.events[0]).toMatchObject({ first_event_ms: 20 });
+    expect(logger.events[1]).toMatchObject({
+      total_ms: 100, first_text_ms: 60, first_tool_ms: 50, upstream_total_ms: null,
+    });
+    expect(JSON.stringify(logger.events)).not.toContain("private");
+    for (const event of logger.events) expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+  });
+
   it("dynamically forwards prelude and late rate metadata from a real V2 handle", async () => {
     const original = new V2RunHandle({
       maxBufferedBytes: 4_096,

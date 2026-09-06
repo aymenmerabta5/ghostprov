@@ -354,6 +354,89 @@ async function flush(turns = 20): Promise<void> {
 }
 
 describe("MultiSandboxRouter", () => {
+  it("returns a preparation timeout once without rerouting the same CPU work", async () => {
+    const system = createSystem(2, 4, 5_000);
+    for (const runtime of system.runtimes) {
+      runtime.failStarts = 1;
+      runtime.failError = new V2PreCommitError(
+        "V2 request preparation timed out before admission",
+        "request_preparation_timeout",
+      );
+    }
+    const pending = system.router.startRelay({ model: "gpt-6-astra", input: "prepare once" });
+    try {
+      await expect(pending).rejects.toMatchObject({
+        committed: false, code: "request_preparation_timeout",
+      });
+      expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+      expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
+    } finally {
+      for (const runtime of system.runtimes) while (runtime.finals.length) runtime.completeOne();
+      await system.router.close();
+    }
+  });
+
+  it("keeps medium requests moving beside a large upload and an aged large waiter", async () => {
+    let now = performance.timeOrigin + performance.now();
+    const clock: Clock = {
+      now: () => now,
+      sleep: async ms => { now += ms; },
+      waitUntil: async deadline => { now = Math.max(now, deadline); },
+    };
+    const system = createSystem(4, 8, 30_000, undefined, undefined, clock, 20_000);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.reflectExecutionRisk = false;
+      runtime.waitForPostAdmissionAbort = true;
+      runtime.notify();
+    }
+    const controllers: AbortController[] = [];
+    const outcomes: Promise<unknown>[] = [];
+    const launch = (label: string, bytes: number) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      const pending = system.router.startRelay({ model: "gpt-6-astra", input: label, stream: true }, {
+        clientId: label, signal: controller.signal,
+        encodedBodyBytes: bytes, structuralBodyBytes: bytes,
+      });
+      outcomes.push(pending.catch(() => undefined));
+    };
+    const count = (label: string) => system.runtimes.reduce((sum, runtime) =>
+      sum + runtime.bodies.filter(body => String(body.input).startsWith(label)).length, 0);
+    try {
+      launch("large-first", 55 * 1024 ** 2);
+      await flush(100);
+      launch("large-waiter", 55 * 1024 ** 2);
+      await flush(100);
+      now += 5_000;
+      for (const runtime of system.runtimes) runtime.notify();
+      launch("medium-one", 1024 ** 2);
+      await flush(100);
+      now += 500;
+      for (const runtime of system.runtimes) runtime.notify();
+      launch("medium-two", 1024 ** 2);
+      await flush(100);
+      expect(count("large-")).toBe(1);
+      expect(count("medium-")).toBe(2);
+      expect(system.router.snapshot()).toMatchObject({ queued: 1, fleetTransferReserved: 6 });
+      launch("medium-three", 1024 ** 2);
+      now += 500;
+      for (const runtime of system.runtimes) runtime.notify();
+      await flush(100);
+      expect(count("medium-")).toBe(2);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(6);
+      controllers[0]!.abort();
+      await flush(100);
+      expect(count("large-")).toBe(2);
+      expect(system.router.snapshot().fleetTransferReserved).toBe(6);
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await Promise.allSettled(outcomes);
+      await system.router.close();
+    }
+    expect(system.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
+  });
+
   it("uses four regular credits for tiny work and six prefetch credits for medium work", async () => {
     const tiny = createSystem(1, 6, 1_000);
     tiny.runtimes[0]!.transportProfile = "bulk-v1";
@@ -461,7 +544,7 @@ describe("MultiSandboxRouter", () => {
     expect(system.router.snapshot()).toMatchObject({
       queued: 6,
       fleetTransferReserved: 4,
-      fleetTransferBudget: 4,
+      fleetTransferBudget: 6,
     });
 
     const tiny = system.router.startRelay(

@@ -33,6 +33,7 @@
     "verify:standalone-search": "bun scripts/probe_standalone_search.ts",
     "verify:claude-code": "bun scripts/verify_claude_code.ts",
     "verify:codex-rate-limit-retry": "bun --no-env-file scripts/verify_codex_rate_limit_retry.ts",
+    "verify:codex-ws-fallback": "bun --no-env-file scripts/verify_codex_ws_fallback.ts",
     "verify:persisted-continuation": "bun scripts/verify_persisted_continuation.ts",
     "verify:browserless": "bun scripts/probe_browserless_prism.ts",
     "verify:tool-latency": "bun scripts/live_tool_latency.ts",

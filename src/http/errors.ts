@@ -258,11 +258,13 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
       },
     };
   }
+  const preparationTimedOut = structured?.name === "V2PreCommitError" &&
+    structured.code === "request_preparation_timeout";
   if (
     structured?.name === "CpuTransformQueueFullError" ||
-    structured?.name === "CpuTransformTimeoutError"
+    structured?.name === "CpuTransformTimeoutError" || preparationTimedOut
   ) {
-    const timedOut = structured.name === "CpuTransformTimeoutError";
+    const timedOut = structured?.name === "CpuTransformTimeoutError" || preparationTimedOut;
     return {
       status: 503,
       error: {
@@ -271,7 +273,8 @@ export function normalizeApiError(error: unknown): NormalizedApiError {
           : "GhostProv request preparation is temporarily overloaded",
         type: timedOut ? "service_unavailable_error" : "overloaded_error",
         param: null,
-        code: timedOut ? "cpu_transform_timeout" : "cpu_transform_overloaded",
+        code: preparationTimedOut ? "request_preparation_timeout"
+          : timedOut ? "cpu_transform_timeout" : "cpu_transform_overloaded",
       },
     };
   }

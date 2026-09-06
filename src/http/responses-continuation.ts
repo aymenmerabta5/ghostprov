@@ -15,6 +15,82 @@ const PREPARE_MAX_QUEUED = 64;
 const PREPARE_MAX_QUEUED_BYTES = 256 * 1024 * 1024;
 const MAX_PROVIDER_RESPONSE_ID_BYTES = 256;
 const MAX_REPLAY_ITEMS = 4_096;
+// Codex changes these tracing labels between otherwise identical turns. They
+// are forwarded unchanged, but do not describe model execution settings.
+const TRACE_METADATA_KEYS = new Set([
+  "session_id", "thread_id", "turn_id", "root_turn_id", "x-codex-window-id",
+  "x-codex-installation-id", "x-codex-turn-metadata",
+]);
+const MAX_TRACE_METADATA_BYTES = 32 * 1024;
+
+function tracingMetadata(value: unknown): Readonly<Record<string, string>> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const snapshot: Record<string, string> = Object.create(null);
+  let bytes = 0;
+  let count = 0;
+  let enumerated = 0;
+  for (const key in value) {
+    if (++enumerated > TRACE_METADATA_KEYS.size) return null;
+    if (!Object.hasOwn(value, key)) continue;
+    if (!TRACE_METADATA_KEYS.has(key) || ++count > TRACE_METADATA_KEYS.size) return null;
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property || !("value" in property) || typeof property.value !== "string" ||
+        property.value.length > MAX_TRACE_METADATA_BYTES) return null;
+    bytes += Buffer.byteLength(key) + Buffer.byteLength(property.value);
+    if (bytes > MAX_TRACE_METADATA_BYTES) return null;
+    snapshot[key] = property.value;
+  }
+  return count > 0 ? Object.freeze(snapshot) : null;
+}
+
+/** An additional lossless replay spelling used by the installed Codex client. */
+function compactReplay(items: readonly ResponsesInputItem[]): ResponsesInputItem[] | null {
+  let changed = false;
+  let visited = 0;
+  const projected: ResponsesInputItem[] = [];
+  for (const value of items) {
+    if (++visited > 8_192) return null;
+    const item = value as unknown as Record<string, unknown>;
+    let copy = item;
+    let itemChanged = false;
+    if ((item.type === "message" || item.type === "reasoning" || item.type === "function_call") &&
+        item.status === "completed") {
+      copy = { ...item };
+      delete copy.status;
+      itemChanged = true;
+    }
+    if (item.type === "message" && item.role === "assistant" && Array.isArray(item.content)) {
+      if (item.content.length > MAX_REPLAY_ITEMS) return null;
+      let content: unknown[] | null = null;
+      for (let index = 0; index < item.content.length; index++) {
+        if (++visited > 8_192) return null;
+        const part = item.content[index];
+        if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+        const block = part as Record<string, unknown>;
+        if (block.type !== "output_text") continue;
+        let next = block;
+        for (const key of ["annotations", "logprobs"] as const) {
+          if (Array.isArray(block[key]) && block[key].length === 0) {
+            if (next === block) next = { ...block };
+            delete next[key];
+          }
+        }
+        if (next !== block) {
+          content ??= item.content.slice();
+          content[index] = next;
+        }
+      }
+      if (content) {
+        if (copy === item) copy = { ...item };
+        copy.content = content;
+        itemChanged = true;
+      }
+    }
+    changed ||= itemChanged;
+    projected.push((itemChanged ? copy : item) as unknown as ResponsesInputItem);
+  }
+  return changed ? projected : null;
+}
 
 export function responsesContinuationPreparationCostBytes(
   retainedBytes: number,
@@ -111,11 +187,20 @@ export class ResponsesHttpContinuationIndex {
     this.#shutdown.signal.addEventListener("abort", abortFromShutdown, { once: true });
 
     const preparation = this.#scheduler.prepare(async () => {
+      const metadata = tracingMetadata(body.client_metadata);
+      const matchingBody = metadata === null ? body : { ...body };
+      if (metadata !== null) delete matchingBody.client_metadata;
       const prepared = await this.#index.prepareAsync(
-        body as ResponsesRequestBody,
+        matchingBody as ResponsesRequestBody,
         scope,
         linked.signal,
       );
+      const fullRelayBody = metadata === null ? prepared.fullRelayBody : {
+        ...prepared.fullRelayBody, client_metadata: metadata,
+      };
+      const relayBody = prepared.relayBody === prepared.fullRelayBody
+        ? fullRelayBody
+        : metadata === null ? prepared.relayBody : { ...prepared.relayBody, client_metadata: metadata };
       return {
         token: {
           decision: prepared.decision,
@@ -126,8 +211,8 @@ export class ResponsesHttpContinuationIndex {
           settingsCanonicalNodes: prepared.settingsCanonicalNodes,
           scopeDigest: prepared.scopeDigest,
         },
-        fullRelayBody: prepared.fullRelayBody,
-        relayBody: prepared.relayBody,
+        fullRelayBody,
+        relayBody,
       };
     }, retainedBytes, linked.signal);
     return preparation.finally(() => {
@@ -154,13 +239,22 @@ export class ResponsesHttpContinuationIndex {
     try {
       const replay = replayItems(finalValue);
       if (!replay) return false;
-      return await this.#index.commitAsync(
+      const committed = await this.#index.commitAsync(
         token,
         scope,
         replay.responseId,
         replay.items,
         linked.signal,
       );
+      if (committed) {
+        const compact = compactReplay(replay.items);
+        if (compact) {
+          // Both spellings share the existing record/byte/TTL budget. Await the
+          // alternate commit before a public terminal can expose this lineage.
+          await this.#index.commitAsync(token, scope, replay.responseId, compact, linked.signal);
+        }
+      }
+      return committed;
     } catch {
       // Metadata reuse is optional and cannot replace a valid provider response.
       return false;

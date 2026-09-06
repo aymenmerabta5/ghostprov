@@ -11,6 +11,28 @@ import {
 import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 
 describe("observability privacy", () => {
+  it("accepts only numeric timing and structural counts with boolean lineage presence", () => {
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("request.accepted", {
+      input_items: 3, has_previous_response_id: true,
+    }))).not.toThrow();
+    const invalidFields: Array<Record<string, string | number>> = [
+      { input_items: "private input" }, { input_items: -1 },
+      { has_previous_response_id: "private provider id" },
+    ];
+    for (const fields of invalidFields) {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.accepted", fields)))
+        .toThrow(TypeError);
+    }
+    for (const value of ["private output", -1, Number.NaN, Infinity]) {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.completed", {
+        first_text_ms: value,
+      }))).toThrow(TypeError);
+    }
+    expect(() => assertSafeObservabilityEvent(observabilityEvent("request.completed", {
+      first_text_ms: 2, first_tool_ms: null, upstream_total_ms: 5,
+    }))).not.toThrow();
+  });
+
   it("redacts credential-shaped values and control characters", () => {
     const authorization = sanitizeDiagnosticMessage(
       "Authorization: Bearer sk-bootstrap-secret-123456789012345678901234\0",

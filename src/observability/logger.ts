@@ -169,6 +169,8 @@ const CONSOLE_ALWAYS = new Set<ObservabilityEventName>([
   "server.stopping",
   "request.completed",
   "request.failed",
+  "websocket.payload_rejected",
+  "websocket.http_fallback",
   "monitor.error",
   "logger.dropped",
   "logger.error",
@@ -452,6 +454,8 @@ export class ObservabilityLogger implements LoggerLike {
     }
     if (this.#config.level === "error" && ![
       "request.failed",
+      "websocket.payload_rejected",
+      "websocket.http_fallback",
       "monitor.error",
       "logger.error",
       "sandbox.recovery.started",

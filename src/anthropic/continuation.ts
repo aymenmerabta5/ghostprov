@@ -158,7 +158,10 @@ type ContinuationPreparationState = {
 const CANONICAL_BYTES_PER_YIELD = 64 * 1024;
 const CANONICAL_NODES_PER_YIELD = 256;
 const CANONICAL_STRING_CHUNK_UNITS = 16 * 1024;
-const MAX_ADVISORY_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+// Snapshot containers are node-bounded and strings are shared immutable
+// primitives. An 8 MiB text cap silently disabled reuse for legal long-context
+// requests; use the same content-byte bound as the subsequent digest pass.
+const MAX_ADVISORY_SNAPSHOT_BYTES = ANTHROPIC_CONTINUATION_MAX_CANONICAL_BYTES;
 const MAX_ADVISORY_SNAPSHOT_NODES = 65_536;
 const MAX_CANONICAL_OBJECT_KEYS = 8_192;
 const MAX_SHUTDOWN_HOOKS = 4;

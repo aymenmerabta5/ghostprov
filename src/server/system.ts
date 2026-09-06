@@ -1077,6 +1077,7 @@ export async function createBrowserlessSystem(
     port: config.port,
     candidate: config.candidate,
     webSocketTelemetry,
+    logger,
     webSocketProcessBudget: webSocketIngressMemory.budget,
     authorizationScope,
     allowedHosts,

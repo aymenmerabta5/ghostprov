@@ -28,6 +28,17 @@ import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 
 describe("OpenAI-compatible HTTP errors", () => {
+  it("returns one sanitized preparation-timeout error with a distinct code", () => {
+    expect(normalizeApiError(new V2PreCommitError("private preparation details", "request_preparation_timeout")))
+      .toEqual({
+        status: 503,
+        error: {
+          message: "GhostProv request preparation timed out", type: "service_unavailable_error",
+          param: null, code: "request_preparation_timeout",
+        },
+      });
+  });
+
   it("maps deterministic V2 request overflow to an immediate 413", () => {
     expect(normalizeApiError(new V2PreCommitError(
       "V2 request exceeds the 64 MiB limit",

@@ -343,6 +343,8 @@ export type ObservabilityEventName =
   | "response.first_event"
   | "request.completed"
   | "request.failed"
+  | "websocket.payload_rejected"
+  | "websocket.http_fallback"
   | "fleet.sample"
   | "monitor.sample"
   | "monitor.error"

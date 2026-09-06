@@ -274,6 +274,8 @@ export class FleetSampler {
         transform_queued: transforms?.queued ?? 0,
         fleet_transfer_reserved: router.fleetTransferReserved,
         fleet_transfer_budget: router.fleetTransferBudget,
+        fleet_bulk_transfer_reserved: router.fleetBulkTransferReserved,
+        fleet_ordinary_transfer_budget: router.fleetOrdinaryTransferBudget,
         event_memory: this.#hostEventMemorySnapshot
           ? (() => {
               const value = this.#hostEventMemorySnapshot!();

@@ -98,6 +98,8 @@ describe("FleetSampler", () => {
         queuedBytes: 1_234,
         fleetTransferReserved: 4,
         fleetTransferBudget: 4,
+        fleetBulkTransferReserved: 0,
+        fleetOrdinaryTransferBudget: 4,
         resources: {
           totalBytes: 32 * 1024 ** 3,
           startupFreeBytes: 20 * 1024 ** 3,

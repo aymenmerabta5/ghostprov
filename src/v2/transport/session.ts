@@ -751,6 +751,8 @@ export interface V2TransportSessionOptions {
   /** Primarily injectable for deterministic component tests. */
   publicationTimer?: PublicationTimer;
   unadmittedTimeoutMs?: number;
+  /** CPU preparation has a separate bounded deadline from waiting for credits. */
+  preparationTimeoutMs?: number;
   /** Sidecar instance proven by the bootstrap handshake. Required for liveness probes. */
   expectedSidecarInstanceId?: string;
   /** Deterministic tests may inject this; production uses a fresh UUID. */
@@ -1102,6 +1104,7 @@ export class V2TransportSession {
   #hostCeiling: number;
   readonly #rotationTimeoutMs: number;
   readonly #unadmittedTimeoutMs: number;
+  readonly #preparationTimeoutMs: number;
   readonly #expectedSidecarInstanceId: string | null;
   readonly #livenessTimeoutMs: number;
   readonly #hostInstanceId: string;
@@ -1260,6 +1263,11 @@ export class V2TransportSession {
     if (!Number.isSafeInteger(unadmittedTimeoutMs) || unadmittedTimeoutMs < 1) {
       throw new RangeError("unadmittedTimeoutMs must be a positive safe integer");
     }
+    const preparationTimeoutMs = options.preparationTimeoutMs ?? 15_000;
+    if (!Number.isSafeInteger(preparationTimeoutMs) ||
+        preparationTimeoutMs < 1 || preparationTimeoutMs > 60_000) {
+      throw new RangeError("preparationTimeoutMs must be between 1 and 60000ms");
+    }
     if (
       options.expectedSidecarInstanceId !== undefined &&
       !SAFE_INSTANCE_ID.test(options.expectedSidecarInstanceId)
@@ -1311,6 +1319,7 @@ export class V2TransportSession {
     this.#hostCeiling = hostCeiling;
     this.#rotationTimeoutMs = rotationTimeoutMs;
     this.#unadmittedTimeoutMs = unadmittedTimeoutMs;
+    this.#preparationTimeoutMs = preparationTimeoutMs;
     this.#expectedSidecarInstanceId = options.expectedSidecarInstanceId ?? null;
     this.#hostInstanceId = options.hostInstanceId ?? `host-${crypto.randomUUID()}`;
     this.#livenessTimeoutMs = livenessTimeoutMs;
@@ -1497,7 +1506,7 @@ export class V2TransportSession {
     signal?.addEventListener("abort", abortPreparation, { once: true });
     const preparationTimeoutError = new V2PreCommitError(
       "V2 request preparation timed out before admission",
-      "capacity_changed",
+      "request_preparation_timeout",
     );
     let preparationWorkSettled = false;
     let preparationCancellationFence: ReturnType<typeof setTimeout> | undefined;
@@ -1512,7 +1521,7 @@ export class V2TransportSession {
         }
       }, PREPARATION_CANCELLATION_FENCE_MS);
       preparationCancellationFence.unref?.();
-    }, this.#unadmittedTimeoutMs);
+    }, this.#preparationTimeoutMs);
     preparationTimer.unref?.();
     let rejectPreparationAbort!: (error: unknown) => void;
     const preparationAborted = new Promise<never>((_resolve, reject) => {
@@ -4268,6 +4277,7 @@ export class V2TransportSession {
       cursor: null,
     };
     this.#terminalReceipts.set(state.requestId, receipt);
+    state.diagnostics.terminal(terminal.diagnostics);
     this.#removeState(state);
     if (!wasCancelled) state.handle.settle(final, terminal.rateLimit);
     if (wasQuarantined) {

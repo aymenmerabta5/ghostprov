@@ -195,6 +195,7 @@ class TransportHarness {
     rotationTimeoutMs?: number;
     publicationIntervalMs?: number;
     unadmittedTimeoutMs?: number;
+    preparationTimeoutMs?: number;
     livenessTimeoutMs?: number;
     autoPong?: boolean;
     throwOnDataPublish?: boolean;
@@ -265,6 +266,7 @@ class TransportHarness {
       retransmitMs: options.retransmitMs ?? 250,
       publicationIntervalMs: this.publicationIntervalMs,
       unadmittedTimeoutMs: options.unadmittedTimeoutMs,
+      preparationTimeoutMs: options.preparationTimeoutMs,
       ...(options.expectedSidecarInstanceId === null
         ? {}
         : { expectedSidecarInstanceId: options.expectedSidecarInstanceId ?? "sidecar-instance-1" }),
@@ -1748,11 +1750,56 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  it("lets bounded preparation finish after the capacity-wait timeout", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      unadmittedTimeoutMs: 10,
+      preparationTimeoutMs: 1_000,
+      gzip: async bytes => { entered(); await gate; return gzipSync(bytes); },
+    });
+    await harness.start();
+    const pending = harness.session.run({
+      ...BODY,
+      previous_response_id: "resp_exact_parent",
+      input: "bounded-preparation-".padEnd(2 * 1024 * 1024, "x"),
+    });
+    void pending.catch(() => undefined);
+    try {
+      await preparing;
+      await Bun.sleep(30);
+      expect(await promiseState(pending)).toBe("pending");
+      expect(harness.hostFrames.size).toBe(0);
+      release();
+      await harness.settleUntil(() => [...harness.hostFrames.values()]
+        .some(frame => frame.kind === "request_commit"));
+      const handle = await commitR2(harness, pending);
+      expect([...harness.hostFrames.values()].filter(frame => frame.kind === "request_open"))
+        .toHaveLength(1);
+      const completed = (await harness.completedFrames()).map(frame => frame.kind === "response_terminal"
+        ? { ...frame, diagnostics: { upstreamTotalMs: 5, schedulerPeakFrames: 0, schedulerPeakBytes: 0, ackProgressAgePeakMs: 0 } }
+        : frame);
+      harness.publish(completed);
+      await harness.settle();
+      await expect(handle.final).resolves.toMatchObject({ status: "completed" });
+      expect(handle.stats.diagnostics?.upstreamTotalMs).toBe(5);
+    } finally {
+      release();
+      await harness.close();
+      await Promise.allSettled([pending]);
+    }
+    expect(harness.session.snapshot()).toMatchObject({ active: 0, queued: 0, preparing: 0 });
+  });
+
   it("times out a noncooperative active preparation without hanging its caller", async () => {
     const harness = new TransportHarness({
       binding: R2_BINDING,
       transportProfile: "bulk-v1",
-      unadmittedTimeoutMs: 20,
+      preparationTimeoutMs: 20,
       gzip: async () => new Promise<Uint8Array>(() => undefined),
     });
     await harness.start();
@@ -1760,7 +1807,7 @@ describe("V2TransportSession", () => {
     await expect(harness.session.run({
       model: "gpt-5.6-sol",
       input: "noncooperative-preparation-".padEnd(2 * 1024 * 1024, "x"),
-    })).rejects.toMatchObject({ committed: false, code: "capacity_changed" });
+    })).rejects.toMatchObject({ committed: false, code: "request_preparation_timeout" });
     expect(performance.now() - started).toBeLessThan(100);
     await harness.close();
     expect(harness.session.snapshot().queued).toBe(0);
@@ -1773,7 +1820,7 @@ describe("V2TransportSession", () => {
     const harness = new TransportHarness({
       binding: R2_BINDING,
       transportProfile: "bulk-v1",
-      unadmittedTimeoutMs: 20,
+      preparationTimeoutMs: 20,
       gzip: async bytes => {
         gzipCalls++;
         if (gzipCalls === 1) return sample;
@@ -1785,7 +1832,7 @@ describe("V2TransportSession", () => {
       model: "gpt-5.6-sol",
       input: "late-sample-".padEnd(2 * 1024 * 1024, "x"),
     });
-    await expect(pending).rejects.toMatchObject({ code: "capacity_changed" });
+    await expect(pending).rejects.toMatchObject({ code: "request_preparation_timeout" });
     resolveSample(new Uint8Array(1));
     await Bun.sleep(20);
     expect(gzipCalls).toBe(1);

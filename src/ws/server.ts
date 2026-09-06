@@ -10,6 +10,9 @@ import {
 } from "./session";
 import type { ResponseGraph } from "./response-graph";
 import type { WebSocketCloseCause } from "./telemetry";
+import { WebSocketHttpFallbackIndex } from "./http-fallback";
+import { observabilityEvent } from "../observability/events";
+import type { LoggerLike } from "../observability/logger";
 import {
   apiKeyAuthorized,
   isAuthenticatedTenantScope,
@@ -89,6 +92,7 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   apiKey?: string;
   /** Additional public Host/Origin authorities accepted before authentication. */
   allowedHosts?: readonly string[];
+  logger?: Pick<LoggerLike, "emit">;
   /** Application limit; Bun's node:http shim may assemble up to 16 MiB before this check. */
   maxPayloadBytes?: number;
   /** Normal-path threshold before automatic per-message memory promotion. */
@@ -102,7 +106,10 @@ export interface AttachResponsesWebSocketOptions extends Omit<
   idleTimeoutMs?: number;
 }
 
-const attachedServers = new WeakMap<Server, readonly WebSocketServer[]>();
+const attachedServers = new WeakMap<Server, {
+  servers: readonly WebSocketServer[];
+  httpFallback: WebSocketHttpFallbackIndex;
+}>();
 // One weak entry per process-budget-bounded accepted socket; no peer metadata.
 const socketCloseCauses = new WeakMap<WebSocket, WebSocketCloseCause>();
 const socketCloseHandlers = new WeakMap<
@@ -220,14 +227,20 @@ export function attachResponsesWebSocket(
   publicRequestAuthorityFailure({ host: "localhost" }, allowedHosts);
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
   const jumboWss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
-  const pendingLeases = new WeakMap<object, WebSocketProcessLease>();
+  const httpFallback = new WebSocketHttpFallbackIndex(authorizationScope);
+  server.once("close", () => httpFallback.close());
+  const pendingLeases = new WeakMap<object, {
+    lease: WebSocketProcessLease;
+    fallbackKey: string | null;
+  }>();
   const acceptConnection = (
     socket: WebSocket,
     parserLimitBytes: number,
     baseReservationBytes: number,
     automaticPromotion: boolean,
   ) => {
-    const processLease = pendingLeases.get(socket);
+    const admission = pendingLeases.get(socket);
+    const processLease = admission?.lease;
     pendingLeases.delete(socket);
     if (!processLease) {
       firstSocketCloseCause(socket, "ingress_capacity");
@@ -327,6 +340,19 @@ export function attachResponsesWebSocket(
       if (parserRejectionRecorded) return;
       parserRejectionRecorded = true;
       options.telemetry?.ingressParserRejected();
+      const limitBytes = process.versions.bun
+        ? Math.min(parserLimitBytes, parserAssemblyLimitBytes)
+        : parserLimitBytes;
+      // The oversized event never reached receive/startRelay. Only an idle
+      // connection proves that redirecting this task cannot replay active work.
+      const fallbackAvailable = !cleaned && limitBytes < MAX_WS_PAYLOAD_BYTES && session.isIdle() && httpFallback.remember(
+        authorizationScope,
+        admission?.fallbackKey ?? null,
+      );
+      options.logger?.emit(observabilityEvent("websocket.payload_rejected", {
+        limit_bytes: limitBytes,
+        http_fallback_available: fallbackAvailable,
+      }), "terminal");
     };
     socket.on("message", data => {
       if (cleaned) return;
@@ -436,6 +462,31 @@ export function attachResponsesWebSocket(
         );
         return;
       }
+      // This header is only a transport hint after normal host/origin and
+      // credential checks. It never constructs or changes tenant authority.
+      const fallbackKey = options.apiKey
+        ? httpFallback.key(authorizationScope, request.headers["thread-id"])
+        : null;
+      if (httpFallback.requiresHttp(authorizationScope, fallbackKey)) {
+        const body = JSON.stringify({ error: {
+          message: "This task exceeds the WebSocket message limit. Continue with HTTP/SSE.",
+          type: "invalid_request_error",
+          code: "websocket_request_too_large",
+        } });
+        // Codex recognizes 426 during upgrade and immediately retries over
+        // HTTP/SSE. No relay, request body, or provider execution exists here.
+        socket.end(
+          "HTTP/1.1 426 Upgrade Required\r\n" +
+          "Connection: close\r\n" +
+          "Content-Type: application/json\r\n" +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        );
+        options.logger?.emit(observabilityEvent("websocket.http_fallback", {
+          status: 426,
+          limit_bytes: automaticPayloadLimitBytes,
+        }), "terminal");
+        return;
+      }
       const jumboHeader = request.headers["x-ghostprov-ws-jumbo"];
       const requestedJumbo = jumboHeader === "1" || (
         Array.isArray(jumboHeader) && jumboHeader.length === 1 && jumboHeader[0] === "1"
@@ -474,7 +525,7 @@ export function attachResponsesWebSocket(
         selectedWss.handleUpgrade(request, socket, head, websocket => {
           handedOff = true;
           socket.off("close", releasePending);
-          pendingLeases.set(websocket, processLease);
+          pendingLeases.set(websocket, { lease: processLease, fallbackKey });
           selectedWss.emit("connection", websocket, request);
         });
       } catch (error) {
@@ -487,7 +538,7 @@ export function attachResponsesWebSocket(
       socket.destroy();
     }
   });
-  attachedServers.set(server, [wss, jumboWss]);
+  attachedServers.set(server, { servers: [wss, jumboWss], httpFallback });
   return wss;
 }
 
@@ -532,9 +583,11 @@ export async function closeResponsesWebSockets(
   server: Server,
   options: { timeoutMs?: number; code?: number; reason?: string } = {},
 ): Promise<void> {
-  const servers = attachedServers.get(server);
-  if (!servers) return;
+  const attached = attachedServers.get(server);
+  if (!attached) return;
   attachedServers.delete(server);
+  attached.httpFallback.close();
+  const servers = attached.servers;
   const timeoutMs = options.timeoutMs ?? 5_000;
   const code = options.code ?? 1012;
   const reason = (options.reason ?? "GhostProv service restart").slice(0, 120);

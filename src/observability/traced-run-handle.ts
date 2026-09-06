@@ -63,6 +63,8 @@ export function traceRunHandle(
   context: RunTraceContext,
 ): RunHandle {
   let firstEventAtMs: number | null = null;
+  let firstTextMs: number | null = null;
+  let firstToolMs: number | null = null;
   let terminalLogged = false;
   let preludeRequestId: string | null = null;
   try {
@@ -97,6 +99,9 @@ export function traceRunHandle(
           first_event_ms: firstEventAtMs === null
             ? null
             : Math.max(0, firstEventAtMs - context.acceptedAtMs),
+          first_text_ms: firstTextMs,
+          first_tool_ms: firstToolMs,
+          upstream_total_ms: handle.stats.diagnostics?.upstreamTotalMs ?? null,
           response_bytes: handle.stats.bytes,
           frames: handle.stats.frames,
           terminal_status: typeof value?.status === "string" ? value.status : "completed",
@@ -114,6 +119,8 @@ export function traceRunHandle(
           project_id: context.projectId,
           total_ms: Math.max(0, context.clock.now() - context.acceptedAtMs),
           stage: "terminal",
+          first_text_ms: firstTextMs,
+          first_tool_ms: firstToolMs,
           ...errorFields(error, preludeRequestId),
           committed: true,
           quarantined: (error as any)?.ambiguous === true ||
@@ -129,6 +136,16 @@ export function traceRunHandle(
   return {
     async *events() {
       for await (const frame of handle.events()) {
+        // Event names suffice; never parse or retain text or tool arguments for
+        // telemetry. A metadata event must not masquerade as visible output.
+        if (firstTextMs === null && (frame.event === "response.output_text.delta" ||
+            frame.event === "response.refusal.delta")) {
+          firstTextMs = Math.max(0, context.clock.now() - context.acceptedAtMs);
+        }
+        if (firstToolMs === null && (frame.event === "response.function_call_arguments.delta" ||
+            frame.event === "response.custom_tool_call_input.delta")) {
+          firstToolMs = Math.max(0, context.clock.now() - context.acceptedAtMs);
+        }
         if (firstEventAtMs === null) {
           firstEventAtMs = context.clock.now();
           context.logger.emit(observabilityEvent("response.first_event", {

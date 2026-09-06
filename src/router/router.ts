@@ -95,7 +95,11 @@ const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
 const MEDIUM_PROGRESS_PROBE_MIN_BYTES = 256 * KiB;
 const FLEET_TRANSFER_EXEMPT_BYTES = 256 * KiB;
 const FLEET_TRANSFER_PACED_MAX_BYTES = 3 * MiB;
-const FLEET_TRANSFER_BUDGET = 4;
+const FLEET_ORDINARY_TRANSFER_BUDGET = 4;
+// One bulk body retains four units. Reserve two further units for smaller
+// requests so its upload cannot stall every otherwise idle runtime.
+const FLEET_TRANSFER_HEADROOM = 2;
+const FLEET_TRANSFER_BUDGET = V2_BULK_TRANSFER_COST + FLEET_TRANSFER_HEADROOM;
 const FLEET_TRANSFER_PACER_BURST = 2;
 const FLEET_TRANSFER_PACER_REFILL_TOKENS = 2;
 const FLEET_TRANSFER_PACER_INTERVAL_MS = 500;
@@ -449,6 +453,8 @@ export interface MultiSandboxRouterSnapshot {
   queuedBytes?: number;
   fleetTransferReserved: number;
   fleetTransferBudget: number;
+  fleetBulkTransferReserved: number;
+  fleetOrdinaryTransferBudget: number;
   provenance?: ResponseProvenanceSnapshot;
   runtimes: ReturnType<SandboxRegistry["snapshots"]>;
   resources: ReturnType<ResourceGovernor["snapshot"]>;
@@ -723,6 +729,9 @@ function shallowPolicyStructuralBytes(
 
 function isLocalCpuTransformFailure(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
+  if (error instanceof V2PreCommitError && error.code === "request_preparation_timeout") {
+    return true;
+  }
   const value = error as { name?: unknown; code?: unknown };
   return value.name === "CpuTransformQueueFullError" ||
     value.name === "CpuTransformTimeoutError" ||
@@ -878,6 +887,7 @@ export class MultiSandboxRouter {
   #queueCapacityJobs = 0;
   #queueCapacityBytes = 0;
   #fleetTransferReserved = 0;
+  #fleetBulkTransferReserved = 0;
   #fleetTransferProtection: WeightedTransferProtection | null = null;
   readonly #runtimeTransferProtections = new Map<ProjectId, WeightedTransferProtection>();
   /** Subset of queue-capacity-held jobs; count and lifetime share the queue bound. */
@@ -1140,6 +1150,8 @@ export class MultiSandboxRouter {
       stream: workload.stream,
       workload_class: schedulingWorkload.class,
       request_bytes: schedulingWorkload.requestBytes,
+      input_items: Array.isArray(relayBody.input) ? relayBody.input.length : null,
+      has_previous_response_id: Object.hasOwn(relayBody, "previous_response_id"),
       transfer_admission_cost: standardAdmissionCost,
       reserved_bytes: admissionWorkload.reservedBytes,
       capacity: acceptedSnapshot.capacity,
@@ -1775,12 +1787,21 @@ export class MultiSandboxRouter {
     if (jobs.size === 0) this.#reserved.delete(projectId);
   }
 
+  #fleetTransferFits(cost: number): boolean {
+    if (cost <= 0) return true;
+    const budget = cost === V2_BULK_TRANSFER_COST || this.#fleetBulkTransferReserved > 0
+      ? FLEET_TRANSFER_BUDGET
+      : FLEET_ORDINARY_TRANSFER_BUDGET;
+    return this.#fleetTransferReserved + cost <= budget;
+  }
+
   #reserveFleetTransfer(cost: number): FleetTransferLease | null {
     if (cost <= 0) return null;
-    if (this.#fleetTransferReserved + cost > FLEET_TRANSFER_BUDGET) {
+    if (!this.#fleetTransferFits(cost)) {
       throw new Error("Fleet transfer budget was oversubscribed after route selection");
     }
     this.#fleetTransferReserved += cost;
+    if (cost === V2_BULK_TRANSFER_COST) this.#fleetBulkTransferReserved += cost;
     return { cost, released: false };
   }
 
@@ -1788,12 +1809,18 @@ export class MultiSandboxRouter {
     if (!lease || lease.released) return false;
     lease.released = true;
     this.#fleetTransferReserved = Math.max(0, this.#fleetTransferReserved - lease.cost);
+    if (lease.cost === V2_BULK_TRANSFER_COST) {
+      this.#fleetBulkTransferReserved -= lease.cost;
+    }
     return true;
   }
 
   #downgradeFleetTransferToControl(lease: FleetTransferLease | null): boolean {
     if (!lease || lease.released || lease.cost <= 1) return false;
     const releasedCost = lease.cost - 1;
+    if (lease.cost === V2_BULK_TRANSFER_COST) {
+      this.#fleetBulkTransferReserved -= lease.cost;
+    }
     lease.cost = 1;
     this.#fleetTransferReserved = Math.max(
       0,
@@ -1860,7 +1887,14 @@ export class MultiSandboxRouter {
     // authoritative inside V2.
     if (job.decodedRequestBytes <= FLEET_TRANSFER_EXEMPT_BYTES) return false;
     const fleet = this.#fleetTransferProtection;
-    if (fleetTransferCost > 0 && fleet && fleet.job !== job) return true;
+    if (fleetTransferCost > 0 && fleet && fleet.job !== job) {
+      // A waiting bulk body needs four units, not the two units reserved for
+      // interactive traffic. Discount the current bulk body when protecting
+      // its successor; otherwise an aged waiter reintroduces fleet-wide stalls.
+      const ordinaryReserved = this.#fleetTransferReserved - this.#fleetBulkTransferReserved;
+      if (fleetTransferCost === V2_BULK_TRANSFER_COST ||
+          ordinaryReserved + fleetTransferCost > FLEET_TRANSFER_HEADROOM) return true;
+    }
     const runtime = this.#runtimeTransferProtections.get(candidate.projectId);
     return admissionCost > 0 && !!runtime && runtime.job !== job;
   }
@@ -2042,6 +2076,8 @@ export class MultiSandboxRouter {
       queuedBytes: this.#queuedBytes,
       fleetTransferReserved: this.#fleetTransferReserved,
       fleetTransferBudget: FLEET_TRANSFER_BUDGET,
+      fleetBulkTransferReserved: this.#fleetBulkTransferReserved,
+      fleetOrdinaryTransferBudget: FLEET_ORDINARY_TRANSFER_BUDGET,
       provenance: this.#responseProvenance.snapshot(),
       runtimes,
       resources: this.#governor.snapshot(),
@@ -2249,6 +2285,7 @@ export class MultiSandboxRouter {
   #takeFromClass(
     state: FairClassQueue,
     maximumFairCost = Number.POSITIVE_INFINITY,
+    scanned?: ReadonlySet<QueuedJob>,
   ): QueuedJob | null {
     if (!state.cursor || state.lanes < 1) return null;
     // A charged job is at most four client quanta. The bounded rounds avoid an
@@ -2264,7 +2301,7 @@ export class MultiSandboxRouter {
         lane.deficitBytes + CLIENT_QUANTUM_BYTES,
       );
       const job = lane.head;
-      if (!job) continue;
+      if (!job || scanned?.has(job)) continue;
       if (
         lane.deficitBytes < job.fairCostBytes ||
         job.fairCostBytes > maximumFairCost
@@ -2276,14 +2313,14 @@ export class MultiSandboxRouter {
     return null;
   }
 
-  #nextJob(): QueuedJob | null {
+  #nextJob(scanned: ReadonlySet<QueuedJob>): QueuedJob | null {
     if (this.#queuedJobs < 1) return null;
     const latency = this.#fairClasses.latency;
     const bulk = this.#fairClasses.bulk;
     const activeClasses = Number(latency.lanes > 0) + Number(bulk.lanes > 0);
     if (activeClasses === 1) {
       const state = latency.lanes > 0 ? latency : bulk;
-      return this.#takeFromClass(state);
+      return this.#takeFromClass(state, Number.POSITIVE_INFINITY, scanned);
     }
 
     const maximumVisits = 2 *
@@ -2302,7 +2339,7 @@ export class MultiSandboxRouter {
         );
         state.turnActive = true;
       }
-      const job = this.#takeFromClass(state, state.deficitBytes);
+      const job = this.#takeFromClass(state, state.deficitBytes, scanned);
       if (!job) {
         state.turnActive = false;
         this.#classCursor = this.#classCursor === "latency" ? "bulk" : "latency";
@@ -2482,14 +2519,19 @@ export class MultiSandboxRouter {
     // stop unrelated clients which can still use a non-excluded runtime.
     this.#pruneWeightedTransferProtections();
     let remainingScan = this.#queuedJobs;
+    // At most the queue's existing count bound, retained only for this drain.
+    // A re-enqueued, high-credit blocked head must not consume every visit and
+    // prevent a newly queued medium request from accruing enough DRR credit.
+    const scanned = new Set<QueuedJob>();
     const candidates = [...this.#runtimeCache.values()]
       .map(cached => this.#candidateWithReservations(this.#agedCandidate(cached)))
       .filter(candidate => this.#candidateCredits(candidate) > 0);
     if (candidates.length === 0) return;
     this.#refreshAgedWeightedTransferProtection(candidates);
     while (remainingScan-- > 0) {
-      const job = this.#nextJob();
+      const job = this.#nextJob(scanned);
       if (!job) return;
+      scanned.add(job);
       if (this.#clock.now() >= job.queueDeadlineMs) {
         this.#expireJob(job);
         continue;
@@ -2841,8 +2883,7 @@ export class MultiSandboxRouter {
           admissionCost,
           fleetTransferCost,
         )) return false;
-        const globalBlocked = fleetTransferCost > 0 &&
-          this.#fleetTransferReserved + fleetTransferCost > FLEET_TRANSFER_BUDGET;
+        const globalBlocked = !this.#fleetTransferFits(fleetTransferCost);
         const runtimeBlocked = runtimeAvailable < admissionCost;
         if (globalBlocked || runtimeBlocked) return false;
         return true;

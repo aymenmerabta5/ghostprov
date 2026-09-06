@@ -3,6 +3,7 @@ import type { RequestEncoding } from "../protocol/shared";
 import type {
   V2FirstEventDiagnostics,
   V2RequestAckDiagnostics,
+  V2TerminalDiagnostics,
   V2TransportDiagnostics,
 } from "./types";
 
@@ -50,6 +51,7 @@ export class HostRequestDiagnosticsObserver {
       sidecarCommitProcessingMs: null,
       transportCommitResidualMs: null,
       upstreamFirstEventMs: null,
+      upstreamTotalMs: null,
       sidecarFirstEventSchedulerMs: null,
       hostAckToFirstFrameMs: null,
       hostAssemblyToDeliveryMs: null,
@@ -115,6 +117,10 @@ export class HostRequestDiagnosticsObserver {
 
   assemblyDelivered(ms: number): void {
     this.#value.hostAssemblyToDeliveryMs = Math.max(0, ms);
+  }
+
+  terminal(sidecar?: V2TerminalDiagnostics): void {
+    this.#value.upstreamTotalMs = sidecar?.upstreamTotalMs ?? null;
   }
 
   peak(value: V2TransportDiagnostics): void {

@@ -23,6 +23,7 @@ import {
   type RouterLike,
 } from "./app";
 import type { WebSocketTelemetry } from "../ws/telemetry";
+import type { LoggerLike } from "../observability/logger";
 import type { WebSocketProcessBudget } from "../ws/session";
 import type { IncomingResourceLease } from "../router/router";
 import type { HttpRequestBindings } from "../http/request-lease";
@@ -44,6 +45,7 @@ export interface GhostProvServerOptions {
   candidate?: boolean;
   maxBodyBytes?: number;
   webSocketTelemetry?: WebSocketTelemetry;
+  logger?: Pick<LoggerLike, "emit">;
   webSocketProcessBudget?: WebSocketProcessBudget;
   /** Shared trusted scope for HTTP, Anthropic, and WebSocket continuations. */
   authorizationScope?: AuthenticatedTenantScope;
@@ -233,6 +235,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     apiKey: options.apiKey,
     allowedHosts,
     telemetry: options.webSocketTelemetry,
+    logger: options.logger,
     processBudget: options.webSocketProcessBudget,
     authorizationScope,
     startRelay: (body, relayOptions) => options.router.startRelay(body, {
