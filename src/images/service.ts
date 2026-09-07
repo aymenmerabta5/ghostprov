@@ -1,5 +1,6 @@
 import { ApiError } from "../http/errors";
 import type { RunHandle } from "../relay/run-handle";
+import { ImageBatchResultMemory } from "./result-memory";
 import {
   releaseAtomicBytePermit,
   transferAtomicBytePermit,
@@ -244,12 +245,26 @@ export async function executeImageBatch(
   bodies: Record<string, unknown>[],
   startRelay: ImageRelayStarter,
   signal?: AbortSignal,
+  resultMemory?: ImageBatchResultMemory,
 ): Promise<ImagesResponse> {
   if (bodies.length === 0) throw invalidUpstream("Image batch contained no relay requests.");
+  const retainedResults = bodies.length > 1
+    ? resultMemory ?? new ImageBatchResultMemory(bodies.length)
+    : undefined;
 
   const settled = await Promise.allSettled(bodies.map(async body => {
     const handle = await startRelay(body, signal);
-    return finalWithDrainedEvents(handle, signal);
+    const final = await finalWithDrainedEvents(handle, signal);
+    try {
+      // A completed sibling cannot keep the shared jumbo event lane while
+      // another image still needs it. Preserve its charge outside that lane
+      // before waiting for the rest of this batch.
+      retainedResults?.retain(final);
+      return final;
+    } catch (error) {
+      releaseAtomicBytePermit(final);
+      throw error;
+    }
   }));
   const rejected = settled.find(
     (result): result is PromiseRejectedResult => result.status === "rejected",
@@ -259,6 +274,7 @@ export async function executeImageBatch(
   );
   if (rejected) {
     for (const result of fulfilled) releaseAtomicBytePermit(result.value);
+    retainedResults?.release();
     throw rejected.reason;
   }
 
@@ -271,6 +287,7 @@ export async function executeImageBatch(
     // release both carrier locations idempotently to cover a mixed batch.
     for (const result of fulfilled) releaseAtomicBytePermit(result.value);
     for (const item of extracted) releaseAtomicBytePermit(item.image);
+    retainedResults?.release();
     throw error;
   }
 }

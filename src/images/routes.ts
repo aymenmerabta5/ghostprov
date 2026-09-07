@@ -12,9 +12,15 @@ import type { IncomingResourceLease } from "../router/router";
 import { resolveHttpClientId, takeIncomingBodyLease } from "../http/request-lease";
 import { permittedJsonResponse } from "../http/permitted-json";
 import { jsonEncodedByteLengthAsync } from "../router/workload";
+import {
+  ImageBatchResultMemory,
+  ImageResultMemoryError,
+  type ImageResultMemoryAllocator,
+} from "./result-memory";
 
 export interface ImageRouteDependencies {
   options: ImageCompatOptions;
+  reserveImageResult?: ImageResultMemoryAllocator;
   startRelay: (
     body: Record<string, unknown>,
     signal: AbortSignal | undefined,
@@ -75,6 +81,16 @@ function unsupported(message: string): Response {
   }));
 }
 
+function imageErrorResponse(error: unknown): Response {
+  const response = apiErrorResponse(error);
+  if (error instanceof ImageResultMemoryError) {
+    // Provider execution already completed; resource pressure must not ask an
+    // SDK to repeat the entire generation batch.
+    response.headers.set("x-should-retry", "false");
+  }
+  return response;
+}
+
 export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependencies): void {
   app.post("/v1/images/generations", async c => {
     try {
@@ -86,6 +102,10 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
       }
       const parsed = parseGenerationRequest(value, dependencies.options);
       const bodies = buildGenerationBodies(parsed);
+      const resultMemory = bodies.length > 1
+        ? new ImageBatchResultMemory(bodies.length, dependencies.reserveImageResult)
+        : undefined;
+      let responseOwnsResults = false;
       let finishBatch!: () => void;
       const batchLifetime = new Promise<void>(resolve => { finishBatch = resolve; });
       try {
@@ -98,13 +118,20 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
             batchLifetime,
           ),
           c.req.raw.signal,
+          resultMemory,
         );
-        return permittedJsonResponse(response, { owners: response.data });
+        const output = permittedJsonResponse(response, {
+          owners: response.data,
+          onRelease: resultMemory ? () => resultMemory.release() : undefined,
+        });
+        responseOwnsResults = true;
+        return output;
       } finally {
+        if (!responseOwnsResults) resultMemory?.release();
         finishBatch();
       }
     } catch (error) {
-      return apiErrorResponse(error);
+      return imageErrorResponse(error);
     }
   });
 
@@ -121,6 +148,10 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
       const parsed = await parseEditRequest(form, dependencies.options);
       if (c.req.raw.signal.aborted) throw c.req.raw.signal.reason;
       const bodies = buildEditBodies(parsed);
+      const resultMemory = bodies.length > 1
+        ? new ImageBatchResultMemory(bodies.length, dependencies.reserveImageResult)
+        : undefined;
+      let responseOwnsResults = false;
       let finishBatch!: () => void;
       const batchLifetime = new Promise<void>(resolve => { finishBatch = resolve; });
       try {
@@ -134,13 +165,20 @@ export function registerImageRoutes(app: Hono, dependencies: ImageRouteDependenc
             incomingLease,
           ),
           c.req.raw.signal,
+          resultMemory,
         );
-        return permittedJsonResponse(response, { owners: response.data });
+        const output = permittedJsonResponse(response, {
+          owners: response.data,
+          onRelease: resultMemory ? () => resultMemory.release() : undefined,
+        });
+        responseOwnsResults = true;
+        return output;
       } finally {
+        if (!responseOwnsResults) resultMemory?.release();
         finishBatch();
       }
     } catch (error) {
-      return apiErrorResponse(error);
+      return imageErrorResponse(error);
     } finally {
       incomingLease?.release();
     }

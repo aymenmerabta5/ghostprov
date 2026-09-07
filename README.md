@@ -537,6 +537,7 @@ The isolated suite includes:
 - `tests/http-body.test.ts`
 - `tests/http-errors.test.ts`
 - `tests/http-streaming.test.ts`
+- `tests/images-batch-memory.test.ts`
 - `tests/images-compat.test.ts`
 - `tests/images-http.test.ts`
 - `tests/images-service.test.ts`

@@ -11,6 +11,7 @@ import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
 import type { ImageCompatOptions } from "../images/compat";
+import type { ImageResultMemoryAllocator } from "../images/result-memory";
 import { registerAnthropicRoutes } from "../anthropic/routes";
 import { AnthropicContinuationIndex } from "../anthropic/continuation";
 import {
@@ -102,6 +103,7 @@ export interface GhostProvAppOptions {
   apiKey?: string;
   fleetSnapshot?: () => FleetSnapshot;
   imageOptions?: ImageCompatOptions;
+  reserveImageResult?: ImageResultMemoryAllocator;
   anthropicModels?: AnthropicModelOptions;
   /** One bounded, content-free native Responses full-history index. */
   responsesContinuationIndex?: ResponsesHttpContinuationIndex;
@@ -1425,6 +1427,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
   });
 
   registerImageRoutes(app, {
+    reserveImageResult: options.reserveImageResult,
     options: options.imageOptions ?? {
       responsesModel: "gpt-5.6-sol",
       maxEditInputBytes: 40 * 1024 ** 2,

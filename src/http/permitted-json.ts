@@ -5,6 +5,8 @@ export interface PermittedJsonResponseOptions {
   headers?: HeadersInit;
   /** Objects carrying every physical allocation used by the translated value. */
   owners?: readonly unknown[];
+  /** Additional charged storage with the same downstream delivery lifetime. */
+  onRelease?: () => void;
 }
 
 /**
@@ -18,6 +20,7 @@ export function permittedJsonResponse(
 ): Response {
   let retainedValue: unknown = value;
   let owners = [...(options.owners ?? [value])];
+  let onRelease = options.onRelease;
   let chunk: Uint8Array | null = null;
   let enqueued = false;
   let closed = false;
@@ -26,6 +29,9 @@ export function permittedJsonResponse(
     owners = [];
     retainedValue = null;
     chunk = null;
+    const releaseAdditionalStorage = onRelease;
+    onRelease = undefined;
+    releaseAdditionalStorage?.();
   };
   const stream = new ReadableStream<Uint8Array>({
     pull(controller) {

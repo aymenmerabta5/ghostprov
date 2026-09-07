@@ -1060,6 +1060,12 @@ export async function createBrowserlessSystem(
   });
   const app = createGhostProvApp({
     router,
+    reserveImageResult: reservedBytes => governor.tryAcquire({
+      class: "image-generation",
+      requestBytes: 0,
+      reservedBytes,
+      stream: false,
+    }),
     apiKey: config.apiKey,
     fleetSnapshot: () => fleet.snapshot(),
     authorizationScope,

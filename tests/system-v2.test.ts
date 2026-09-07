@@ -7,6 +7,7 @@ import { isAuthenticatedTenantScope } from "../src/http/api-key";
 import { FleetManifestStore } from "../src/fleet/manifest";
 import type { ManagedRuntimeFactory } from "../src/fleet/types";
 import type { RunHandle } from "../src/relay/run-handle";
+import { sseFrame } from "../src/relay/sse";
 import { ResourceGovernor } from "../src/router/resource-governor";
 import type {
   RoutableSandboxRuntime,
@@ -24,6 +25,11 @@ import {
 } from "../src/server/system";
 import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import type { PrismProjectSummary } from "../src/prism/projects-client";
+import { V2RunHandle } from "../src/v2/transport/run-handle";
+import {
+  v2EventPhysicalWorkingSetBytes,
+  v2RetainedEventPermitBytes,
+} from "../src/v2/memory/event-memory-sizing";
 
 const IDS = [1, 2, 3, 4].map(index => projectId(
   `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
@@ -320,6 +326,83 @@ async function harness(): Promise<{
 }
 
 describe("V2 browserless system composition", () => {
+  it("backs completed image batches with the system governor while freeing the event lane", async () => {
+    const value = await harness();
+    const bodies: Record<string, unknown>[] = [];
+    const workers: Promise<void>[] = [];
+    const controller = new AbortController();
+    value.dependencies.runtimeFactory = {
+      create: ({ projectId }) => {
+        const runtime = new DeferredRuntime(projectId, false, value.order);
+        runtime.run = async (body, signal) => {
+          const index = bodies.push(body);
+          const handle = new V2RunHandle({ requireTransferredEventMemory: true });
+          signal?.addEventListener("abort", () => {
+            handle.cancel(new DOMException("Image request cancelled", "AbortError"));
+          }, { once: true });
+          const worker = (async () => {
+            const payloadBytes = 700 * 1024;
+            const final = {
+              id: `resp_system_image_${index}`,
+              object: "response",
+              status: "completed",
+              output: [{ type: "image_generation_call", status: "completed", result: "" }],
+            };
+            const event = "response.completed";
+            const data = JSON.stringify({ type: event, response: final });
+            const wireBytes = new TextEncoder().encode(sseFrame(event, data)).byteLength + payloadBytes;
+            const permit = await system.hostEventMemory.permits.acquire(v2EventPhysicalWorkingSetBytes(wireBytes), {
+              region: "jumbo", signal,
+            });
+            try {
+              final.output[0]!.result = "A".repeat(payloadBytes);
+              permit.shrink(v2RetainedEventPermitBytes(wireBytes));
+              await handle.acceptEvent({ event, data: JSON.stringify({ type: event, response: final }) }, wireBytes, permit);
+              handle.settle(final);
+            } catch (error) {
+              permit.release();
+              throw error;
+            }
+          })();
+          workers.push(worker);
+          void worker.catch(() => undefined);
+          return handle;
+        };
+        return runtime;
+      },
+    };
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    let pending: Promise<Response> | undefined;
+    try {
+      await system.start();
+      const baseline = system.governor.snapshot().reservedBytes;
+      pending = Promise.resolve(system.app.request("/v1/images/generations", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${value.env.GHOSTPROV_API_KEY}` },
+        body: JSON.stringify({ model: "gpt-image-2", prompt: "offline image fixture", n: 2 }),
+        signal: controller.signal,
+      }));
+      let response: Response | undefined;
+      void pending.then(result => { response = result; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(response?.status).toBe(200);
+      expect(bodies).toHaveLength(2);
+      expect(bodies.every(body => body.stream === true && body.store === true)).toBe(true);
+      expect(system.hostEventMemory.snapshot()).toMatchObject({ activePermits: 0, waiters: 0, jumboActive: false });
+      expect(system.governor.snapshot().reservedBytes).toBeGreaterThan(baseline);
+      await response!.body!.cancel();
+      expect(system.governor.snapshot().reservedBytes).toBe(baseline);
+    } finally {
+      controller.abort();
+      await Promise.allSettled(workers);
+      if (pending) {
+        const response = await pending;
+        if (!response.bodyUsed) await response.body?.cancel();
+      }
+      await system.close();
+    }
+  });
+
   it("boots a managed fleet without PRISM_PROJECT_IDS and persists created projects", async () => {
     const value = await harness();
     const remote: PrismProjectSummary[] = [];
