@@ -62,8 +62,8 @@ export interface MultiSandboxConfig {
   v2SidecarRevision: V2SidecarRevision;
   /** Bootstrap launch transport. Relay stages a sandbox-container launcher; render forks from the render VM. */
   v2BootstrapLaunchMode: "render" | "relay";
-  /** R9/R10 cold bootstrap only; direct and LLM modes share the same supervisor. */
-  v2SupervisorBootstrapMode: "direct" | "llm";
+  /** Cold bootstrap only. Git fsmonitor requires R10; all modes retain the supervisor. */
+  v2SupervisorBootstrapMode: "direct" | "llm" | "git-fsmonitor";
   /** Phase-zero credential wait published into the sidecar static config. */
   v2BootstrapTimeoutMs: number;
   /** Exact persisted-project overrides only; no prefix, cohort, or fallback matching. */
@@ -356,9 +356,14 @@ export function resolveMultiSandboxConfig(
   const v2SupervisorBootstrapMode = enumValue(
     env.GP_V2_SUPERVISOR_BOOTSTRAP_MODE,
     "direct",
-    ["direct", "llm"] as const,
+    ["direct", "llm", "git-fsmonitor"] as const,
     "GP_V2_SUPERVISOR_BOOTSTRAP_MODE",
   );
+  if (v2SupervisorBootstrapMode === "git-fsmonitor" &&
+    (v2BootstrapLaunchMode !== "relay" || v2SidecarRevision !== "r10" ||
+      Object.values(v2SidecarRevisionOverrides).some(revision => revision !== "r10"))) {
+    throw new TypeError("GP_V2_SUPERVISOR_BOOTSTRAP_MODE=git-fsmonitor requires R10 relay bootstrap for every project");
+  }
   const v2DiagnosticsIntervalMs = boundedPositiveInteger(
     env.GP_V2_DIAGNOSTICS_INTERVAL_MS, 1_000, "GP_V2_DIAGNOSTICS_INTERVAL_MS", 100, 60_000,
   );

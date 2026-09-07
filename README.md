@@ -42,7 +42,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
 
-R10 stages immutable assets through Yjs and starts a persistent supervisor through Prism's direct execution API by default. The original resumed Codex-session bootstrap remains selectable with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
+R10 stages immutable assets through Yjs and starts a persistent supervisor through Prism's direct execution API by default. The original resumed Codex-session bootstrap remains selectable with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`; R10 also supports `git-fsmonitor` through a temporary Git hook. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
 
 The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, sidecar capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
 
@@ -371,6 +371,10 @@ R9 and R10 default to `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=direct`. It submits one a
 
 The original LLM bootstrap remains available through `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`. It creates one project conversation, discovers one reusable Codex session, and runs the installer through the existing resumed model turn. Mode selection applies on process startup. Direct execution never silently falls back to the LLM path, and a failed or ambiguous launch never authorizes another submission.
 
+`GP_V2_SUPERVISOR_BOOTSTRAP_MODE=git-fsmonitor` selects the third method for an all-R10 fleet with relay bootstrap. It stages the same frozen supervisor in a private execution workspace and triggers a temporary Git filesystem-monitor hook during sandbox workspace synchronization. The hook holds Git's configuration lock, preserves the original configuration, restores it before launch, and releases the lock. Foreign configuration or lock changes fail closed. A bounded, one-shot claim prevents replay; an expired hook restores configuration without launching. Cancellation after a trigger may have been submitted remains ambiguous and never authorizes replay. Signed supervisor readiness remains authoritative, and shutdown removes the private workspace only after authenticated child cleanup. This method uses the sandbox's existing Python, Git, and filesystem control APIs and makes no LLM, direct-exec, or Render launch request. It never falls back to another method. Recovery and ordinary Responses/Anthropic traffic use the existing R10 supervisor and transport.
+
+`bun run check:git-fsmonitor-hook` runs the offline Linux hook checks with Python and Git (on Windows it uses the installed `Ubuntu-24.04` WSL distribution). `bun run verify:git-fsmonitor` is an opt-in live verifier: it requires `GP_LIVE_GIT_FSMONITOR=1`, `GP_LIVE_ALLOW_TEST_PROJECT_MUTATION=1`, and `PORT=18888`, creates and deletes one dedicated project, and exercises eight small model requests, concurrent Responses/Anthropic traffic, two reconnect fault injections, one signed sidecar recovery, and a two-minute stability window. A passing offline check is not live Prism proof.
+
 Both modes use the selected immutable bundle and session-bound encrypted credential delivery. The supervisor keeps the exact Deno child resource and verifies its wrapper identity, canonical PID record, held owner lock, and static configuration before delivering credentials or stopping it. Recovery replaces the child within the same supervisor. Shutdown allows the full child cleanup budget and records exact retirement proof; missing proof blocks replacement. Control queues retain at most four host operations and one active plus one pending notification.
 
 After a supervisor connection drops, the host obtains fresh authenticated proof using a new credential-rotation challenge supported by the existing R9/R10 supervisor peer. Cached signed replies can establish the sequence of a previously consumed command, but cannot restore liveness. Commands with an unproven outcome are never replayed. Reconnect waits are bounded and cancellable, and shutdown fences late replies. If reconnect completes while child recovery is waiting, GhostProv checks exact sidecar liveness and reliable-window progress before deciding whether a child restart is still needed.
@@ -435,7 +439,7 @@ Only manifest records with `managed:true` can be deleted. Legacy imported user p
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
 | `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
 | `GP_V2_SIDECAR_REVISION` | `r9` | Global sidecar release; R9 uses R2 `bulk-v1` with a host-configured credential window, R8 is the immediate immutable rollback, and R4 is the standard-profile rollback |
-| `GP_V2_SUPERVISOR_BOOTSTRAP_MODE` | `direct` | `direct` starts the R9 supervisor without model inference; `llm` explicitly selects the retained Codex conversation bootstrap. No automatic fallback |
+| `GP_V2_SUPERVISOR_BOOTSTRAP_MODE` | `direct` | `direct` starts the R9/R10 supervisor without model inference; `llm` selects the retained Codex conversation bootstrap; `git-fsmonitor` selects the temporary Git hook for R10. No automatic fallback |
 | `GP_V2_TERMINAL_RECEIPT_COALESCING` | `1` | Combines a verified response receipt with an immediate next request using a maximum 10 ms hold; `0` restores eager receipts. Receive ACKs, immutable flights, and execution fences stay authoritative |
 | `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact persisted `project-id=r1|r2|r3|r4|r5|r6|r7|r8` overrides; no wildcard or fallback |
 | `GP_TARGET_SANDBOXES` | `8` | Desired identity-scoped managed fleet size |
@@ -663,6 +667,7 @@ The isolated suite includes:
 - `tests/v2-supervisor-channel.test.ts`
 - `tests/v2-supervisor-controller.test.ts`
 - `tests/v2-supervisor-direct.test.ts`
+- `tests/v2-supervisor-git-fsmonitor.test.ts`
 - `tests/v2-supervisor-launcher.test.ts`
 - `tests/v2-supervisor-mailbox.test.ts`
 - `tests/v2-supervisor-process.test.ts`

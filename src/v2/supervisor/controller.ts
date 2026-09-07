@@ -24,6 +24,7 @@ import { sealSupervisorSessionBootstrap } from "./session-bootstrap";
 import { supervisorStaticConfig as r10SupervisorStaticConfig } from "./r10-launcher";
 import { directSupervisorLaunchFiles as r10DirectSupervisorLaunchFiles, isRegisteredR10Entrypoint } from "./r10-direct-launcher";
 import { decodeSandboxLogResponse } from "../diagnostics/read-sandbox-log";
+import { GitFsmonitorBootstrap } from "./git-fsmonitor";
 import type { SandboxLogFile } from "../diagnostics/sandbox-log-schema";
 import {
   DIRECT_SUPERVISOR_INSTALL_PATH,
@@ -31,7 +32,7 @@ import {
   directSupervisorLaunchFiles,
 } from "./direct-launcher";
 
-export type SupervisorBootstrapMode = "direct" | "llm";
+export type SupervisorBootstrapMode = "direct" | "llm" | "git-fsmonitor";
 
 export class V2SupervisorBootstrapError extends Error {
   readonly name = "V2SupervisorBootstrapError";
@@ -54,7 +55,7 @@ export interface V2SandboxSupervisorOptions {
   readonly ydoc: V2BootstrapYDoc;
   readonly gateway: V2BootstrapGateway;
   readonly assets: V2SidecarAssets;
-  /** Explicit selection; an ambiguous direct launch never falls back to an LLM. */
+  /** Explicit selection; failed or ambiguous launches never change methods. */
   readonly bootstrapMode?: SupervisorBootstrapMode;
   readonly connectTimeoutMs?: number;
   readonly commandTimeoutMs?: number;
@@ -78,6 +79,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly #gateway: V2BootstrapGateway;
   readonly #assets: V2SidecarAssets;
   readonly #bootstrapMode: SupervisorBootstrapMode;
+  readonly #gitBootstrap: GitFsmonitorBootstrap | null;
   readonly #connectTimeoutMs: number;
   readonly #commandTimeoutMs: number;
   readonly #hostFactory: NonNullable<V2SandboxSupervisorOptions["hostFactory"]>;
@@ -100,9 +102,13 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#gateway = options.gateway;
     this.#assets = options.assets;
     this.#bootstrapMode = options.bootstrapMode ?? "direct";
-    if (this.#bootstrapMode !== "direct" && this.#bootstrapMode !== "llm") {
-      throw new TypeError("Supervisor bootstrap mode must be direct or llm");
+    if (this.#bootstrapMode !== "direct" && this.#bootstrapMode !== "llm" && this.#bootstrapMode !== "git-fsmonitor") {
+      throw new TypeError("Supervisor bootstrap mode must be direct, llm, or git-fsmonitor");
     }
+    if (this.#bootstrapMode === "git-fsmonitor" && options.assets.revision !== "r10") {
+      throw new TypeError("Git fsmonitor bootstrap requires the registered R10 release");
+    }
+    this.#gitBootstrap = this.#bootstrapMode === "git-fsmonitor" ? new GitFsmonitorBootstrap() : null;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 90_000;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
     this.#hostFactory = options.hostFactory ?? (input => new V2SupervisorHost(input));
@@ -134,14 +140,19 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   }
 
   async #ensure(signal?: AbortSignal): Promise<void> {
-    if (this.#bootstrapMode === "direct") return this.#ensureDirect(signal);
+    if (this.#bootstrapMode !== "llm") return this.#ensureDirect(signal);
     return this.#ensureLlm(signal);
   }
 
   async #ensureDirect(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
-    const start = this.#gateway.startSupervisorExec?.bind(this.#gateway);
-    if (!start) throw new V2SupervisorBootstrapError("Direct supervisor execution is unavailable", "exec");
+    const start = this.#gitBootstrap
+      ? (request: { readonly sessionId: string }, signal?: AbortSignal) => this.#gitBootstrap!.start({
+          binding: this.binding, ySweet: this.#ySweet, ydoc: this.#ydoc,
+          gateway: this.#gateway, assets: this.#assets,
+        }, request.sessionId, signal)
+      : this.#gateway.startSupervisorExec?.bind(this.#gateway);
+    if (!start) throw new V2SupervisorBootstrapError("Selected supervisor execution method is unavailable", "exec");
     const sessionId = crypto.randomUUID();
     this.#executionSessionId = sessionId;
     const instanceId = crypto.randomUUID();
@@ -188,7 +199,8 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       host = this.#hostFactory({ binding: this.binding, instanceId, rotationKey, credential: this.#ySweet,
         connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs });
       phase = "exec";
-      // One immutable submission. No job-status polling, replay, or LLM fallback.
+      // One immutable submission. The selected bootstrap never falls back or
+      // resubmits after a failed or ambiguous trigger.
       await start(Object.freeze({ sessionId }), signal);
       signal?.throwIfAborted();
       phase = "readiness";
@@ -210,8 +222,12 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     } catch (cause) {
       // Only a signed, exact supervisor can authorize shutdown. Failed or
       // ambiguous launches never authorize a PID signal or another submission.
+      let signedShutdown = false;
       if (host && ready) {
-        await host.shutdown("direct_bootstrap_failed", AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+        try {
+          await host.shutdown("direct_bootstrap_failed", AbortSignal.timeout(this.#commandTimeoutMs));
+          signedShutdown = true;
+        } catch { /* Ambiguous child cleanup cannot authorize workspace deletion. */ }
       }
       await host?.close().catch(() => undefined);
       if (staged) {
@@ -223,8 +239,11 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
         }
         await this.#gateway.syncWorkspace(AbortSignal.timeout(Math.min(15_000, this.#commandTimeoutMs))).catch(() => undefined);
       }
+      if (signedShutdown && this.#gitBootstrap) {
+        await this.#gitBootstrap.cleanupAfterSignedShutdown(true, AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+      }
       if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-      throw new V2SupervisorBootstrapError("Direct sandbox supervisor bootstrap failed", phase, { cause });
+      throw new V2SupervisorBootstrapError("Selected sandbox supervisor bootstrap failed", phase, { cause });
     }
   }
 
@@ -386,7 +405,12 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#lifecycle.abort(new DOMException("Supervisor shutdown", "AbortError"));
     this.#shutdown = (async () => {
       await this.#ensuring?.catch(() => undefined);
-      if (this.#host) await this.#host.shutdown(safeReason(reason), signal);
+      if (this.#host) {
+        await this.#host.shutdown(safeReason(reason), signal);
+        if (this.#gitBootstrap) {
+          await this.#gitBootstrap.cleanupAfterSignedShutdown(true, signal ?? AbortSignal.timeout(this.#commandTimeoutMs));
+        }
+      }
     })();
     return this.#shutdown;
   }

@@ -649,7 +649,7 @@ function defaultRuntimeFactory(options: {
         // observable backoff. One bounded bootstrap attempt prevents three
         // opaque 45-second tries from exceeding its 120-second child budget.
         attempts: 1,
-        // Both explicit R9 bootstrap modes retain the established child budget.
+        // Explicit supervisor bootstrap modes retain the established child budget.
         timeoutMs: config.v2BootstrapLaunchMode === "relay" ? 120_000 : 45_000,
         bootstrapTimeoutMs: config.v2BootstrapTimeoutMs,
         launchMode: config.v2BootstrapLaunchMode,

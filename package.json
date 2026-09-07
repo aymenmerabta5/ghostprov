@@ -42,6 +42,8 @@
     "verify:multi-sandbox": "bun scripts/live_multi_sandbox.ts",
     "verify:v2-bootstrap": "bun scripts/probe_v2_bootstrap.ts",
     "verify:v2-r10-diagnostics": "bun scripts/live_r10_diagnostics.ts",
+    "check:git-fsmonitor-hook": "bun --no-env-file scripts/verify_git_fsmonitor_hook.ts",
+    "verify:git-fsmonitor": "bun scripts/live_git_fsmonitor.ts",
     "verify:v2-supervisor-recovery": "bun scripts/live_r9_supervisor_recovery.ts",
     "verify:v2-single": "bun scripts/live_v2_single.ts",
     "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",

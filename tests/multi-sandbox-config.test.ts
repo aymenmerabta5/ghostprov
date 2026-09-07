@@ -36,9 +36,20 @@ describe("multi-sandbox configuration", () => {
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_TERMINAL_RECEIPT_COALESCING: "0" }, MACHINE).v2TerminalReceiptCoalescing).toBe(false);
     expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_TERMINAL_RECEIPT_COALESCING: "true" }, MACHINE)).toThrow();
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm" }, MACHINE).v2SupervisorBootstrapMode).toBe("llm");
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-fsmonitor" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-fsmonitor");
     for (const value of ["auto", "fallback", "render", "unknown"]) {
       expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: value }, MACHINE)).toThrow("GP_V2_SUPERVISOR_BOOTSTRAP_MODE");
     }
+  });
+
+  it("requires R10 throughout the fleet for Git fsmonitor bootstrap", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1", GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-fsmonitor" };
+    for (const revision of ["r8", "r9"]) {
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_REVISION: revision }, MACHINE)).toThrow("git-fsmonitor requires R10");
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=${revision}` }, MACHINE)).toThrow("git-fsmonitor requires R10");
+    }
+    expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-fsmonitor");
   });
 
   it("publishes one protected-service and candidate port policy", () => {

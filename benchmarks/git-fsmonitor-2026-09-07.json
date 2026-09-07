@@ -1,0 +1,50 @@
+{
+  "live": true,
+  "method": "git_fsmonitor_workspace_initialization",
+  "revision": "r10",
+  "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+  "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776",
+  "candidatePort": 18888,
+  "projectCreated": true,
+  "projectDeleted": true,
+  "bridgeStarts": 1,
+  "hookFired": true,
+  "sidecarLaunches": 2,
+  "responseCompleted": true,
+  "responsesCompleted": 6,
+  "anthropicCompleted": 2,
+  "completedReconnects": 2,
+  "reconnects": [
+    {
+      "worker": 1,
+      "generation": 1,
+      "initialDisconnects": 0,
+      "forcedDisconnects": 2,
+      "naturalDisconnects": 0,
+      "challenges": 2,
+      "authenticatedRestores": 2,
+      "failures": 0,
+      "challengePublications": 4,
+      "injectedChallengeDrops": 1,
+      "injectedReplyDrops": 1,
+      "restoreMs": [
+        1845.493,
+        1792.294
+      ]
+    }
+  ],
+  "recoveryProved": true,
+  "recoveryMs": 33924,
+  "configRestored": true,
+  "configLockReleased": true,
+  "stableForMs": 120000,
+  "signedShutdown": true,
+  "remoteArtifactsRemoved": true,
+  "legacyLaunchAttempts": {
+    "llm": 0,
+    "codexExec": 0,
+    "render": 0
+  },
+  "success": true,
+  "failure": null
+}
