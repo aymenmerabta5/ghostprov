@@ -1,0 +1,242 @@
+{
+  "date": "2026-09-08",
+  "mode": "git-clean-filter",
+  "defaultMode": "direct",
+  "revision": "r10",
+  "release": {
+    "revision": "r10",
+    "protocolRevision": "r2",
+    "transportProfile": "bulk-v1",
+    "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+    "schemaHash": "51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f",
+    "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776"
+  },
+  "sourceHashesLfUtf8": {
+    "src/v2/supervisor/git-clean-filter.ts": "4caa6e1d251d72e414e106c4a1e8bd5680c1464f1478a1fea7bb6fd4b9c1f527",
+    "src/v2/supervisor/git-clean-filter-hook.py": "cbaf273695287f5a34f5cac9fb9e359be0d2a4e8ffbb671cd145dd40aec5b555",
+    "scripts/live_git_clean_filter.ts": "bf19cb9515249f61dc28c184dfe453a99e619a82a60af6de1a9b1aaf116417d3"
+  },
+  "offline": {
+    "linuxGitChecks": {
+      "passed": 44,
+      "failed": 0,
+      "uid": 65534,
+      "gitVersion": "2.43.0"
+    },
+    "focusedTests": {
+      "passed": 46,
+      "failed": 0
+    },
+    "existingMethodsAndAdapters": {
+      "passed": 152,
+      "failed": 0
+    },
+    "fullSuite": {
+      "passed": 2435,
+      "failed": 0,
+      "skipped": 0,
+      "files": 185,
+      "seconds": 197.13,
+      "enabledOptIns": [
+        "GP_V2_PERF_LARGE",
+        "GP_V2_PERF_64M",
+        "GP_RUN_V2_CAPACITY_SOAK"
+      ]
+    },
+    "typechecks": [
+      "main",
+      "scripts"
+    ],
+    "deterministicReleases": [
+      "r8",
+      "r9",
+      "r10"
+    ],
+    "pinnedR10Deno": "2.9.5"
+  },
+  "marker": {
+    "run": "clean-marker-8eAXNJ",
+    "success": true,
+    "uid": 5000,
+    "euid": 5000,
+    "renderRequests": 1,
+    "modelRequests": 0,
+    "configRestored": true,
+    "worktreeAndCommittedBytesPreserved": true,
+    "projectDeleted": true,
+    "cookieCopyDeleted": true
+  },
+  "research": [
+    {
+      "run": "clean-r10-OMBWcD",
+      "integrated": false,
+      "success": true,
+      "projectCreated": true,
+      "projectDeleted": true,
+      "credentialDeleted": true,
+      "readyProved": true,
+      "recoveryProved": true,
+      "responseCompleted": true,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "configRestored": true,
+      "configLockReleased": true,
+      "inputVerified": true,
+      "payloadWritten": true,
+      "supervisorBootstraps": 1,
+      "sidecarLaunches": 2,
+      "renderRequests": 1,
+      "nativeResponsesCompleted": 1,
+      "anthropicMessagesCompleted": 0,
+      "modelRequestAttempts": 1,
+      "reconnects": {
+        "ordinaryMs": 850.207,
+        "lostChallengeMs": 1879.288,
+        "lostReplyMs": 3129.566,
+        "authenticatedRestores": 3,
+        "injectedChallengeDrops": 1,
+        "injectedReplyDrops": 1,
+        "failures": 0
+      },
+      "probeDocumentRemoved": null,
+      "stabilityWindowMs": 120000,
+      "timings": {
+        "startupMs": 40050,
+        "recoveryMs": 30644,
+        "requestMs": 1881
+      },
+      "elapsedMs": 209409
+    },
+    {
+      "run": "clean-r10-MttIHc",
+      "integrated": false,
+      "success": true,
+      "projectCreated": true,
+      "projectDeleted": true,
+      "credentialDeleted": true,
+      "readyProved": true,
+      "recoveryProved": true,
+      "responseCompleted": true,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "configRestored": true,
+      "configLockReleased": true,
+      "inputVerified": true,
+      "payloadWritten": true,
+      "supervisorBootstraps": 1,
+      "sidecarLaunches": 2,
+      "renderRequests": 1,
+      "nativeResponsesCompleted": 1,
+      "anthropicMessagesCompleted": 0,
+      "modelRequestAttempts": 1,
+      "reconnects": {
+        "ordinaryMs": 808.515,
+        "lostChallengeMs": 1889.904,
+        "lostReplyMs": 1803.325,
+        "authenticatedRestores": 3,
+        "injectedChallengeDrops": 1,
+        "injectedReplyDrops": 1,
+        "failures": 0
+      },
+      "probeDocumentRemoved": null,
+      "stabilityWindowMs": 120000,
+      "timings": {
+        "startupMs": 44238,
+        "recoveryMs": 36109,
+        "requestMs": 1894
+      },
+      "elapsedMs": 218146
+    }
+  ],
+  "integrated": [
+    {
+      "run": "r10-rwsKnN",
+      "integrated": true,
+      "success": true,
+      "projectCreated": true,
+      "projectDeleted": true,
+      "credentialDeleted": true,
+      "readyProved": true,
+      "recoveryProved": true,
+      "responseCompleted": true,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "configRestored": true,
+      "configLockReleased": true,
+      "inputVerified": true,
+      "payloadWritten": true,
+      "supervisorBootstraps": 1,
+      "sidecarLaunches": 2,
+      "renderRequests": 1,
+      "nativeResponsesCompleted": 1,
+      "anthropicMessagesCompleted": 1,
+      "modelRequestAttempts": 2,
+      "reconnects": {
+        "ordinaryMs": 804.425,
+        "lostChallengeMs": 1858.575,
+        "lostReplyMs": 1880.874,
+        "authenticatedRestores": 3,
+        "injectedChallengeDrops": 1,
+        "injectedReplyDrops": 1,
+        "failures": 0
+      },
+      "probeDocumentRemoved": true,
+      "stabilityWindowMs": 120000,
+      "timings": {
+        "startupMs": 43233,
+        "recoveryMs": 37375,
+        "requestMs": 1969,
+        "anthropicRequestMs": 2140
+      },
+      "elapsedMs": 221835
+    },
+    {
+      "run": "r10-DTlz1p",
+      "integrated": true,
+      "success": true,
+      "projectCreated": true,
+      "projectDeleted": true,
+      "credentialDeleted": true,
+      "readyProved": true,
+      "recoveryProved": true,
+      "responseCompleted": true,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "configRestored": true,
+      "configLockReleased": true,
+      "inputVerified": true,
+      "payloadWritten": true,
+      "supervisorBootstraps": 1,
+      "sidecarLaunches": 2,
+      "renderRequests": 1,
+      "nativeResponsesCompleted": 1,
+      "anthropicMessagesCompleted": 1,
+      "modelRequestAttempts": 2,
+      "reconnects": {
+        "ordinaryMs": 892.454,
+        "lostChallengeMs": 1862.919,
+        "lostReplyMs": 1828.349,
+        "authenticatedRestores": 3,
+        "injectedChallengeDrops": 1,
+        "injectedReplyDrops": 1,
+        "failures": 0
+      },
+      "probeDocumentRemoved": true,
+      "stabilityWindowMs": 120000,
+      "timings": {
+        "startupMs": 43261,
+        "recoveryMs": 39422,
+        "requestMs": 2483,
+        "anthropicRequestMs": 2539
+      },
+      "elapsedMs": 224982
+    }
+  ],
+  "totalModelRequests": 6,
+  "limits": [
+    "Individual disposable projects and 120-second readiness windows",
+    "No multi-project fleet or long-duration soak proof",
+    "Git/filesystem dependency shared with the other Git methods; Render additionally required",
+    "No production listener restart or deployment"
+  ]
+}

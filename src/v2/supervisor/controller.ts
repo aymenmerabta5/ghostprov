@@ -26,6 +26,8 @@ import { directSupervisorLaunchFiles as r10DirectSupervisorLaunchFiles, isRegist
 import { decodeSandboxLogResponse } from "../diagnostics/read-sandbox-log";
 import { GitFsmonitorBootstrap } from "./git-fsmonitor";
 import { GitSshSigningBootstrap } from "./git-ssh-signing";
+import { GitCleanFilterBootstrap } from "./git-clean-filter";
+import { GitTextconvBootstrap } from "./git-textconv";
 import type { SandboxLogFile } from "../diagnostics/sandbox-log-schema";
 import {
   DIRECT_SUPERVISOR_INSTALL_PATH,
@@ -33,7 +35,7 @@ import {
   directSupervisorLaunchFiles,
 } from "./direct-launcher";
 
-export type SupervisorBootstrapMode = "direct" | "llm" | "git-fsmonitor" | "git-ssh-signing";
+export type SupervisorBootstrapMode = "direct" | "llm" | "git-fsmonitor" | "git-ssh-signing" | "git-clean-filter" | "git-textconv";
 
 export class V2SupervisorBootstrapError extends Error {
   readonly name = "V2SupervisorBootstrapError";
@@ -80,7 +82,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly #gateway: V2BootstrapGateway;
   readonly #assets: V2SidecarAssets;
   readonly #bootstrapMode: SupervisorBootstrapMode;
-  readonly #gitBootstrap: GitFsmonitorBootstrap | GitSshSigningBootstrap | null;
+  readonly #gitBootstrap: GitFsmonitorBootstrap | GitSshSigningBootstrap | GitCleanFilterBootstrap | GitTextconvBootstrap | null;
   readonly #connectTimeoutMs: number;
   readonly #commandTimeoutMs: number;
   readonly #hostFactory: NonNullable<V2SandboxSupervisorOptions["hostFactory"]>;
@@ -103,8 +105,8 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#gateway = options.gateway;
     this.#assets = options.assets;
     this.#bootstrapMode = options.bootstrapMode ?? "direct";
-    if (this.#bootstrapMode !== "direct" && this.#bootstrapMode !== "llm" && this.#bootstrapMode !== "git-fsmonitor" && this.#bootstrapMode !== "git-ssh-signing") {
-      throw new TypeError("Supervisor bootstrap mode must be direct, llm, git-fsmonitor, or git-ssh-signing");
+    if (this.#bootstrapMode !== "direct" && this.#bootstrapMode !== "llm" && this.#bootstrapMode !== "git-fsmonitor" && this.#bootstrapMode !== "git-ssh-signing" && this.#bootstrapMode !== "git-clean-filter" && this.#bootstrapMode !== "git-textconv") {
+      throw new TypeError("Supervisor bootstrap mode must be direct, llm, git-fsmonitor, git-ssh-signing, git-clean-filter, or git-textconv");
     }
     if (this.#bootstrapMode === "git-fsmonitor" && options.assets.revision !== "r10") {
       throw new TypeError("Git fsmonitor bootstrap requires the registered R10 release");
@@ -112,8 +114,16 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     if (this.#bootstrapMode === "git-ssh-signing" && options.assets.revision !== "r10") {
       throw new TypeError("Git SSH signing bootstrap requires the registered R10 release");
     }
+    if (this.#bootstrapMode === "git-clean-filter" && options.assets.revision !== "r10") {
+      throw new TypeError("Git clean-filter bootstrap requires the registered R10 release");
+    }
+    if (this.#bootstrapMode === "git-textconv" && options.assets.revision !== "r10") {
+      throw new TypeError("Git textconv bootstrap requires the registered R10 release");
+    }
     this.#gitBootstrap = this.#bootstrapMode === "git-fsmonitor" ? new GitFsmonitorBootstrap()
-      : this.#bootstrapMode === "git-ssh-signing" ? new GitSshSigningBootstrap() : null;
+      : this.#bootstrapMode === "git-ssh-signing" ? new GitSshSigningBootstrap()
+      : this.#bootstrapMode === "git-clean-filter" ? new GitCleanFilterBootstrap()
+      : this.#bootstrapMode === "git-textconv" ? new GitTextconvBootstrap() : null;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 90_000;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
     this.#hostFactory = options.hostFactory ?? (input => new V2SupervisorHost(input));

@@ -690,8 +690,8 @@ describe("V2 browserless system composition", () => {
       GP_TARGET_SANDBOXES: "1",
       GP_ANTHROPIC_OPUS_MODEL: "system-explicit-opus",
     }, value.dependencies);
-    await system.start();
     try {
+      await system.start();
       const response = await system.app.request("/v1/messages", {
         method: "POST",
         headers: {
@@ -716,7 +716,9 @@ describe("V2 browserless system composition", () => {
     } finally {
       await system.close();
     }
-  });
+    // This composition test persists a real manifest. Use the same bounded
+    // setup/cleanup budget as the neighboring fleet composition tests.
+  }, 30_000);
 
   it("shares explicit public host allowlists with the system-composed app", async () => {
     const value = await harness();

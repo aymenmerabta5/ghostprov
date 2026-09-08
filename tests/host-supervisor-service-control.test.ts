@@ -195,8 +195,9 @@ describe("host supervisor service controls", () => {
         ...API_ENV,
         PORT: "0",
         GP_SUPERVISOR_WORKER_ENTRY: path.join(directory, "missing-worker.ts"),
-        GP_SUPERVISOR_READY_TIMEOUT_MS: "100",
-        GP_SUPERVISOR_GRACE_MS: "100",
+        // Exercise the missing-module exit, not a race against process startup.
+        GP_SUPERVISOR_READY_TIMEOUT_MS: "1000",
+        GP_SUPERVISOR_GRACE_MS: "1000",
         GP_SUPERVISOR_REQUEST_WAIT_MS: "100",
         GP_SUPERVISOR_CONTROL_FILE: path.join(directory, "upgrade.request"),
         GP_SUPERVISOR_STOP_FILE: path.join(directory, "stop.request"),

@@ -3945,6 +3945,9 @@ describe("V2TransportSession", () => {
     await queued.settle();
     const abortQueued = new AbortController();
     const pending = queued.session.run(BODY, abortQueued.signal);
+    // Establish queued admission, rather than racing asynchronous preparation.
+    await queued.settleUntil(() => queued.session.snapshot().preparing === 0);
+    expect(queued.session.snapshot()).toMatchObject({ queued: 1, preparing: 0, active: 0, credits: 0 });
     abortQueued.abort();
     await expect(pending).rejects.toMatchObject({
       name: "V2PreCommitError",

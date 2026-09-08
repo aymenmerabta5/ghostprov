@@ -63,7 +63,7 @@ export interface MultiSandboxConfig {
   /** Bootstrap launch transport. Relay stages a sandbox-container launcher; render forks from the render VM. */
   v2BootstrapLaunchMode: "render" | "relay";
   /** Cold bootstrap only. Git callbacks require R10; all modes retain the supervisor. */
-  v2SupervisorBootstrapMode: "direct" | "llm" | "git-fsmonitor" | "git-ssh-signing";
+  v2SupervisorBootstrapMode: "direct" | "llm" | "git-fsmonitor" | "git-ssh-signing" | "git-clean-filter" | "git-textconv";
   /** Phase-zero credential wait published into the sidecar static config. */
   v2BootstrapTimeoutMs: number;
   /** Exact persisted-project overrides only; no prefix, cohort, or fallback matching. */
@@ -356,10 +356,10 @@ export function resolveMultiSandboxConfig(
   const v2SupervisorBootstrapMode = enumValue(
     env.GP_V2_SUPERVISOR_BOOTSTRAP_MODE,
     "direct",
-    ["direct", "llm", "git-fsmonitor", "git-ssh-signing"] as const,
+    ["direct", "llm", "git-fsmonitor", "git-ssh-signing", "git-clean-filter", "git-textconv"] as const,
     "GP_V2_SUPERVISOR_BOOTSTRAP_MODE",
   );
-  if ((v2SupervisorBootstrapMode === "git-fsmonitor" || v2SupervisorBootstrapMode === "git-ssh-signing") &&
+  if ((v2SupervisorBootstrapMode === "git-fsmonitor" || v2SupervisorBootstrapMode === "git-ssh-signing" || v2SupervisorBootstrapMode === "git-clean-filter" || v2SupervisorBootstrapMode === "git-textconv") &&
     (v2BootstrapLaunchMode !== "relay" || v2SidecarRevision !== "r10" ||
       Object.values(v2SidecarRevisionOverrides).some(revision => revision !== "r10"))) {
     throw new TypeError(`GP_V2_SUPERVISOR_BOOTSTRAP_MODE=${v2SupervisorBootstrapMode} requires R10 relay bootstrap for every project`);

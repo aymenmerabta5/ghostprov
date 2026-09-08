@@ -38,6 +38,8 @@ describe("multi-sandbox configuration", () => {
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm" }, MACHINE).v2SupervisorBootstrapMode).toBe("llm");
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-fsmonitor" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-fsmonitor");
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-ssh-signing" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-ssh-signing");
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-clean-filter" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-clean-filter");
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-textconv" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-textconv");
     for (const value of ["auto", "fallback", "render", "unknown"]) {
       expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: value }, MACHINE)).toThrow("GP_V2_SUPERVISOR_BOOTSTRAP_MODE");
     }
@@ -62,6 +64,29 @@ describe("multi-sandbox configuration", () => {
     expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-ssh-signing");
     // This inspects configuration only; it neither binds nor probes the service.
+    expect(resolveMultiSandboxConfig({ ...env, GP_CANDIDATE: "0", PORT: "18787" }, MACHINE).port).toBe(18787);
+  });
+
+  it("requires R10 relay for the clean-filter mode without rejecting normal production configuration", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1", GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-clean-filter" };
+    for (const revision of ["r8", "r9"]) {
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_REVISION: revision }, MACHINE)).toThrow("git-clean-filter requires R10");
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=${revision}` }, MACHINE)).toThrow("git-clean-filter requires R10");
+    }
+    expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-clean-filter");
+    // This checks configuration only and never binds or probes a listener.
+    expect(resolveMultiSandboxConfig({ ...env, GP_CANDIDATE: "0", PORT: "18787" }, MACHINE).port).toBe(18787);
+  });
+
+  it("requires R10 relay for textconv while preserving normal production port semantics", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1", GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-textconv" };
+    for (const revision of ["r8", "r9"]) {
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_REVISION: revision }, MACHINE)).toThrow("git-textconv requires R10");
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=${revision}` }, MACHINE)).toThrow("git-textconv requires R10");
+    }
+    expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-textconv");
     expect(resolveMultiSandboxConfig({ ...env, GP_CANDIDATE: "0", PORT: "18787" }, MACHINE).port).toBe(18787);
   });
 
