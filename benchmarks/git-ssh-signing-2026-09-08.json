@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-08",
+  "baseCommit": "bc3668ee0519aee5f02f7cc9f209feb968e37b2f",
+  "method": "git-ssh-signing",
+  "defaultMode": "direct",
+  "sourceHashes": {
+    "src/config/multi-sandbox.ts": "f4ad83b0742b168054d78865a30387d823f0cec81f038fa05d95ad97455e8146",
+    "src/v2/supervisor/controller.ts": "56db6564b677b3ee65ad77e97b33a5c91818788fdf66fb671276460e3d060d93",
+    "src/v2/supervisor/git-ssh-signing.ts": "5faa81c985918c9cfeeeb2fc434cc9c007335be68884867281fbaea03026d47e",
+    "src/v2/supervisor/git-ssh-signing-hook.py": "55c887e041f792f881ab2e6c14142e1da218a20cc45d1265188070cddc2d2a22",
+    "src/v2/supervisor/git-sshsig.mjs": "492d2fd30686527cef50e65e864ccfc22e299f45ffdbf8e1e8d2c669b5547eff"
+  },
+  "release": {
+    "revision": "r10",
+    "buildHash": "ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a",
+    "bundleSha256": "a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776",
+    "previousReleaseAssetsChanged": false
+  },
+  "offline": {
+    "gitAcceptance": {
+      "passed": 51,
+      "failed": 0,
+      "exitCode": 0
+    },
+    "sshsigInteroperability": {
+      "passed": 43,
+      "failed": 0,
+      "exitCode": 0
+    },
+    "repositorySuite": {
+      "passed": 2407,
+      "skippedOptIns": 3,
+      "failed": 0,
+      "files": 183,
+      "exitCode": 0,
+      "durationSeconds": 151.86
+    },
+    "remainingOptIns": {
+      "passed": 3,
+      "failed": 0,
+      "exitCode": 0,
+      "durationSeconds": 21.45,
+      "checks": [
+        "16 MiB",
+        "64 MiB",
+        "10 x 14-agent modeled capacity waves"
+      ]
+    },
+    "rootTypecheckExitCode": 0,
+    "scriptsTypecheckExitCode": 0,
+    "r8DeterministicExitCode": 0,
+    "r9DeterministicExitCode": 0,
+    "r10DeterministicExitCode": 0,
+    "r10PinnedDenoExitCode": 0,
+    "hookEnvironment": {
+      "git": "2.43.0",
+      "deno": "2.9.5",
+      "platform": "Linux under WSL"
+    }
+  },
+  "live": {
+    "candidatePort": 18888,
+    "protectedListenerAccessed": false,
+    "research": {
+      "run": "webcrypto-r10-NFhGfi",
+      "success": true,
+      "startupMs": 39421,
+      "recoveryMs": 31660,
+      "requestMs": 1562,
+      "reconnectMs": [
+        866.389,
+        1814.137,
+        1822.597
+      ],
+      "authenticatedReconnects": 3,
+      "droppedChallenges": 1,
+      "droppedReplies": 1,
+      "supervisorLaunches": 1,
+      "childLaunches": 2,
+      "modelRequests": 1,
+      "stableForMs": 120000,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true,
+      "originalConfigRestored": true,
+      "configurationLockReleased": true,
+      "elapsedMs": 207030,
+      "exitCode": 0
+    },
+    "existingFsmonitorControl": {
+      "run": "fsmonitor-control-O6bt5C",
+      "success": true,
+      "startupMs": 39109,
+      "recoveryMs": 31383,
+      "requestMs": 1748,
+      "reconnectMs": [
+        833.109,
+        1857.479,
+        1839.081
+      ],
+      "authenticatedReconnects": 3,
+      "droppedChallenges": 1,
+      "droppedReplies": 1,
+      "supervisorLaunches": 1,
+      "childLaunches": 2,
+      "modelRequests": 1,
+      "stableForMs": 120000,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true,
+      "originalConfigRestored": true,
+      "configurationLockReleased": true,
+      "elapsedMs": 205170,
+      "exitCode": 0
+    },
+    "integrated": [
+      {
+        "run": "r10-TmKhED",
+        "success": true,
+        "startupMs": 42985,
+        "recoveryMs": 30889,
+        "requestMs": 2946,
+        "reconnectMs": [
+          844.61,
+          1850.331,
+          1928.835
+        ],
+        "authenticatedReconnects": 3,
+        "droppedChallenges": 1,
+        "droppedReplies": 1,
+        "supervisorLaunches": 1,
+        "childLaunches": 2,
+        "modelRequests": 1,
+        "stableForMs": 120000,
+        "signedShutdown": true,
+        "executionWorkspaceRemoved": true,
+        "projectDeleted": true,
+        "credentialCopyDeleted": true,
+        "originalConfigRestored": true,
+        "configurationLockReleased": true,
+        "elapsedMs": 211885,
+        "exitCode": 0,
+        "signingComplete": true,
+        "signingKeysRemoved": true
+      },
+      {
+        "run": "r10-2UTMWT",
+        "success": true,
+        "startupMs": 41594,
+        "recoveryMs": 30621,
+        "requestMs": 1789,
+        "reconnectMs": [
+          855.851,
+          1842.547,
+          1873.801
+        ],
+        "authenticatedReconnects": 3,
+        "droppedChallenges": 1,
+        "droppedReplies": 1,
+        "supervisorLaunches": 1,
+        "childLaunches": 2,
+        "modelRequests": 1,
+        "stableForMs": 120000,
+        "signedShutdown": true,
+        "executionWorkspaceRemoved": true,
+        "projectDeleted": true,
+        "credentialCopyDeleted": true,
+        "originalConfigRestored": true,
+        "configurationLockReleased": true,
+        "elapsedMs": 208420,
+        "exitCode": 0,
+        "signingComplete": true,
+        "signingKeysRemoved": true
+      }
+    ]
+  },
+  "earlierAttempts": [
+    {
+      "run": "ssh-webcrypto-nuqgf1",
+      "status": "passed_marker",
+      "modelRequests": 0,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true
+    },
+    {
+      "run": "webcrypto-r10-hx7jdH",
+      "status": "failed_workspace_cleanup",
+      "fix": "Restore Prism filesystem mode only after signed shutdown",
+      "modelRequests": 1,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true
+    },
+    {
+      "run": "webcrypto-r10-noPnSM",
+      "status": "failed_reconnect",
+      "classification": "unresolved",
+      "modelRequests": 0,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true
+    },
+    {
+      "run": "webcrypto-r10-meT7cr",
+      "status": "failed_child_recovery",
+      "classification": "unresolved",
+      "modelRequests": 0,
+      "signedShutdown": true,
+      "executionWorkspaceRemoved": true,
+      "projectDeleted": true,
+      "credentialCopyDeleted": true
+    },
+    {
+      "run": "fsmonitor-control-dIfYbK",
+      "status": "failed_account_transport_before_project_creation",
+      "modelRequests": 0,
+      "projectCreated": false,
+      "credentialCopyDeleted": true
+    }
+  ],
+  "limits": [
+    "Individual disposable projects; no multi-project live fleet proof",
+    "Two-minute idle observations; no long-duration soak",
+    "Prism Git/filesystem and connectivity behavior may change",
+    "No claim of protection from arbitrary code running as the same sandbox user",
+    "Failed earlier attempts remain failed and were never replayed as provider requests"
+  ]
+}

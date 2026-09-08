@@ -37,6 +37,7 @@ describe("multi-sandbox configuration", () => {
     expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_TERMINAL_RECEIPT_COALESCING: "true" }, MACHINE)).toThrow();
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "llm" }, MACHINE).v2SupervisorBootstrapMode).toBe("llm");
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-fsmonitor" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-fsmonitor");
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-ssh-signing" }, MACHINE).v2SupervisorBootstrapMode).toBe("git-ssh-signing");
     for (const value of ["auto", "fallback", "render", "unknown"]) {
       expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SUPERVISOR_BOOTSTRAP_MODE: value }, MACHINE)).toThrow("GP_V2_SUPERVISOR_BOOTSTRAP_MODE");
     }
@@ -50,6 +51,18 @@ describe("multi-sandbox configuration", () => {
     }
     expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
     expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-fsmonitor");
+  });
+
+  it("requires R10 relay throughout the fleet for Git SSH signing while allowing normal production configuration", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1", GP_V2_SUPERVISOR_BOOTSTRAP_MODE: "git-ssh-signing" };
+    for (const revision of ["r8", "r9"]) {
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_REVISION: revision }, MACHINE)).toThrow("git-ssh-signing requires R10");
+      expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=${revision}` }, MACHINE)).toThrow("git-ssh-signing requires R10");
+    }
+    expect(() => resolveMultiSandboxConfig({ ...env, GP_V2_BOOTSTRAP_LAUNCH_MODE: "render" }, MACHINE)).toThrow();
+    expect(resolveMultiSandboxConfig({ ...env, GP_V2_SIDECAR_PROJECT_REVISIONS: `${A}=r10` }, MACHINE).v2SupervisorBootstrapMode).toBe("git-ssh-signing");
+    // This inspects configuration only; it neither binds nor probes the service.
+    expect(resolveMultiSandboxConfig({ ...env, GP_CANDIDATE: "0", PORT: "18787" }, MACHINE).port).toBe(18787);
   });
 
   it("publishes one protected-service and candidate port policy", () => {

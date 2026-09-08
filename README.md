@@ -42,7 +42,7 @@ Each V2 project owns an isolated `V2SandboxRuntime`:
 - One independently phased heartbeat on an exact 10-second cadence
 - Live RTT, completion, failure, quarantine, credential, and memory metrics
 
-R10 stages immutable assets through Yjs and starts a persistent supervisor through Prism's direct execution API by default. The original resumed Codex-session bootstrap remains selectable with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`; R10 also supports `git-fsmonitor` through a temporary Git hook. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
+R10 stages immutable assets through Yjs and starts a persistent supervisor through Prism's direct execution API by default. The original resumed Codex-session bootstrap remains selectable with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=llm`; R10 also supports `git-fsmonitor` and `git-ssh-signing` through temporary Git callbacks. The supervisor owns sidecar lifecycle through authenticated control messages. Live requests use ephemeral Awareness frames; they do not request project exports or sandbox ZIP files.
 
 The global router evaluates every healthy runtime and selects the lowest predicted completion time using active work, reservations, sidecar capacity, ACK/completion EWMA, failures, quarantines, heartbeat age, credential horizon, payload size, and memory pressure.
 
@@ -375,6 +375,10 @@ The original LLM bootstrap remains available through `GP_V2_SUPERVISOR_BOOTSTRAP
 
 `bun run check:git-fsmonitor-hook` runs the offline Linux hook checks with Python and Git (on Windows it uses the installed `Ubuntu-24.04` WSL distribution). `bun run verify:git-fsmonitor` is an opt-in live verifier: it requires `GP_LIVE_GIT_FSMONITOR=1`, `GP_LIVE_ALLOW_TEST_PROJECT_MUTATION=1`, and `PORT=18888`, creates and deletes one dedicated project, and exercises eight small model requests, concurrent Responses/Anthropic traffic, two reconnect fault injections, one signed sidecar recovery, and a two-minute stability window. A passing offline check is not live Prism proof.
 
+`GP_V2_SUPERVISOR_BOOTSTRAP_MODE=git-ssh-signing` selects the fourth method for an all-R10 fleet with relay bootstrap. Git's `gpg.ssh.defaultKeyCommand` and `gpg.ssh.program` callbacks restore the original configuration, produce and verify a real Ed25519 SSH signature, and claim one launch of the same frozen supervisor. Signing uses the sandbox's existing Python and Deno WebCrypto; it requires neither root nor `ssh-keygen`. The hook and signer are content-addressed, and signer and launcher bytes are sealed before execution. Key and message input is bounded and passed through stdin; signing keys are removed before launch. A signed Git commit is only submission evidence: authenticated supervisor readiness remains authoritative. Failed or ambiguous launches never switch methods or replay. Private workspace deletion requires signed shutdown and a valid restored-config receipt, then verifies absence. This callback shares the Git initialization and filesystem dependencies of `git-fsmonitor`.
+
+`bun run check:git-ssh-signing-hook` runs the offline Linux Git acceptance and OpenSSH interoperability checks. It requires installed Python, Git, OpenSSH, and Deno 2.9.5; Windows uses `Ubuntu-24.04` WSL and `/tmp/ghostprov-deno/deno`. `GP_GIT_SSH_DENO_PATH` may select `/usr/local/bin/deno` instead. OpenSSH is a verification dependency only. `bun run verify:git-ssh-signing` requires `GP_LIVE_GIT_SSH_SIGNING=1`, `GP_LIVE_ALLOW_TEST_PROJECT_MUTATION=1`, `GP_LIVE_ALLOW_MODEL_REQUEST=1`, `GP_CANDIDATE=1`, `PORT=18888`, and an explicitly supplied `PRISM_COOKIE_FILE`. It disables automatic `.env` loading, creates one disposable project, makes at most one small model request, checks an ordinary reconnect plus lost-challenge and lost-reply recovery, exercises same-supervisor child recovery, observes two minutes of idle readiness, and verifies signed shutdown and cleanup. See the [validation record](docs/validation/2026-09-08-git-ssh-signing.md) for measured results and limits.
+
 Both modes use the selected immutable bundle and session-bound encrypted credential delivery. The supervisor keeps the exact Deno child resource and verifies its wrapper identity, canonical PID record, held owner lock, and static configuration before delivering credentials or stopping it. Recovery replaces the child within the same supervisor. Shutdown allows the full child cleanup budget and records exact retirement proof; missing proof blocks replacement. Control queues retain at most four host operations and one active plus one pending notification.
 
 After a supervisor connection drops, the host obtains fresh authenticated proof using a new credential-rotation challenge supported by the existing R9/R10 supervisor peer. Cached signed replies can establish the sequence of a previously consumed command, but cannot restore liveness. Commands with an unproven outcome are never replayed. Reconnect waits are bounded and cancellable, and shutdown fences late replies. If reconnect completes while child recovery is waiting, GhostProv checks exact sidecar liveness and reliable-window progress before deciding whether a child restart is still needed.
@@ -439,7 +443,7 @@ Only manifest records with `managed:true` can be deleted. Legacy imported user p
 | `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8` | Maximum active request limit backed by eight 64 MiB terminal-spool reservations |
 | `GP_V2_RESPONSE_MAX_BYTES` | `67108864` | Fixed proven response/transcript maximum for this release |
 | `GP_V2_SIDECAR_REVISION` | `r9` | Global sidecar release; R9 uses R2 `bulk-v1` with a host-configured credential window, R8 is the immediate immutable rollback, and R4 is the standard-profile rollback |
-| `GP_V2_SUPERVISOR_BOOTSTRAP_MODE` | `direct` | `direct` starts the R9/R10 supervisor without model inference; `llm` selects the retained Codex conversation bootstrap; `git-fsmonitor` selects the temporary Git hook for R10. No automatic fallback |
+| `GP_V2_SUPERVISOR_BOOTSTRAP_MODE` | `direct` | `direct` starts the R9/R10 supervisor without model inference; `llm` selects the retained Codex conversation bootstrap; `git-fsmonitor` and `git-ssh-signing` select distinct temporary Git callbacks for R10. No automatic fallback |
 | `GP_V2_TERMINAL_RECEIPT_COALESCING` | `1` | Combines a verified response receipt with an immediate next request using a maximum 10 ms hold; `0` restores eager receipts. Receive ACKs, immutable flights, and execution fences stay authoritative |
 | `GP_V2_SIDECAR_PROJECT_REVISIONS` | unset | Exact persisted `project-id=r1|r2|r3|r4|r5|r6|r7|r8` overrides; no wildcard or fallback |
 | `GP_TARGET_SANDBOXES` | `8` | Desired identity-scoped managed fleet size |
@@ -668,6 +672,8 @@ The isolated suite includes:
 - `tests/v2-supervisor-controller.test.ts`
 - `tests/v2-supervisor-direct.test.ts`
 - `tests/v2-supervisor-git-fsmonitor.test.ts`
+- `tests/v2-supervisor-git-ssh-signing.test.ts`
+- `tests/git-ssh-signing-live-guards.test.ts`
 - `tests/v2-supervisor-launcher.test.ts`
 - `tests/v2-supervisor-mailbox.test.ts`
 - `tests/v2-supervisor-process.test.ts`

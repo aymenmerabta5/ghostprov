@@ -44,6 +44,8 @@
     "verify:v2-r10-diagnostics": "bun scripts/live_r10_diagnostics.ts",
     "check:git-fsmonitor-hook": "bun --no-env-file scripts/verify_git_fsmonitor_hook.ts",
     "verify:git-fsmonitor": "bun scripts/live_git_fsmonitor.ts",
+    "check:git-ssh-signing-hook": "bun --no-env-file scripts/verify_git_ssh_signing.ts",
+    "verify:git-ssh-signing": "bun --no-env-file scripts/live_git_ssh_signing.ts",
     "verify:v2-supervisor-recovery": "bun scripts/live_r9_supervisor_recovery.ts",
     "verify:v2-single": "bun scripts/live_v2_single.ts",
     "verify:v2-fleet": "bun scripts/live_v2_fleet.ts",

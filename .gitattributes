@@ -1,1 +1,3 @@
 src/v2/sidecar/releases/*/sidecar.bundle.js text eol=lf
+src/v2/supervisor/git-ssh-signing-hook.py text eol=lf
+src/v2/supervisor/git-sshsig.mjs text eol=lf
