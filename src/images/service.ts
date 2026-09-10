@@ -1,5 +1,6 @@
 import { ApiError } from "../http/errors";
 import type { RunHandle } from "../relay/run-handle";
+import type { ImageQuality } from "./compat";
 import { ImageBatchResultMemory } from "./result-memory";
 import {
   releaseAtomicBytePermit,
@@ -35,7 +36,7 @@ export interface ImagesResponse {
   data: ImagesResponseImage[];
   background?: "transparent" | "opaque" | "auto";
   output_format?: "png" | "jpeg" | "webp";
-  quality?: "low" | "medium" | "high" | "auto";
+  quality?: ImageQuality;
   size?: string;
   usage?: ImagesUsage;
 }
@@ -133,7 +134,7 @@ function extractImage(finalValue: unknown): ExtractedImage {
     image,
     background: enumValue(call.background, ["transparent", "opaque", "auto"] as const),
     outputFormat: enumValue(call.output_format, ["png", "jpeg", "webp"] as const),
-    quality: enumValue(call.quality, ["low", "medium", "high", "auto"] as const),
+    quality: enumValue(call.quality, ["low", "medium", "high", "xhigh", "max", "auto"] as const),
     size: typeof call.size === "string" ? call.size : undefined,
     usage: usageFromFinal(final),
   };

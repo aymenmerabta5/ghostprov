@@ -1359,6 +1359,7 @@ export class V2TransportSession {
   }
 
   async resumeAwareness(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw abortError("V2 Awareness reconnect aborted");
     if (this.#closed || this.#draining || this.#protocolFailed || !this.#connected) {
       throw new V2TransportLivenessError(
         "V2 transport is unavailable for Awareness reconnect",
@@ -1366,6 +1367,7 @@ export class V2TransportSession {
       );
     }
     await this.#channel.connect(signal);
+    if (signal?.aborted) throw abortError("V2 Awareness reconnect aborted");
     if (this.#closed || this.#draining || this.#protocolFailed) {
       throw new V2TransportLivenessError(
         "V2 transport closed during Awareness reconnect",

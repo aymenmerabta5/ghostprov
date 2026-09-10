@@ -10,7 +10,7 @@ import { validateResponsesInputJson } from "../relay/responses-validation";
 import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
 import { registerImageRoutes } from "../images/routes";
-import type { ImageCompatOptions } from "../images/compat";
+import { SUPPORTED_IMAGE_MODELS, type ImageCompatOptions } from "../images/compat";
 import type { ImageResultMemoryAllocator } from "../images/result-memory";
 import { registerAnthropicRoutes } from "../anthropic/routes";
 import { AnthropicContinuationIndex } from "../anthropic/continuation";
@@ -1168,8 +1168,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
       { id: "gpt-5.6-luna", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-6-astra", object: "model", created: 0, owned_by: "ghostprov" },
       { id: "gpt-5.5", object: "model", created: 0, owned_by: "ghostprov" },
-      { id: "gpt-image-2", object: "model", created: 0, owned_by: "ghostprov" },
-      { id: "gpt-image-2-2026-04-21", object: "model", created: 0, owned_by: "ghostprov" },
+      ...SUPPORTED_IMAGE_MODELS.map(id => ({ id, object: "model", created: 0, owned_by: "ghostprov" })),
     ],
     models: CODEX_MODELS,
   }));

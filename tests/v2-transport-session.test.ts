@@ -1150,6 +1150,10 @@ describe("V2TransportSession", () => {
     expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_open"))
       .toBe(false);
 
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(harness.session.resumeAwareness(aborted.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(fault.reconnects).toBe(0);
     await harness.session.resumeAwareness();
     await harness.settle();
     expect(fault.reconnects).toBe(1);
@@ -1160,6 +1164,25 @@ describe("V2TransportSession", () => {
     await harness.settle();
     await expect(handle.final).resolves.toMatchObject({ status: "completed" });
     await harness.close();
+  });
+
+  it("honors reconnect cancellation that arrives while the channel handshake completes", async () => {
+    const harness = new TransportHarness();
+    await harness.start();
+    const controller = new AbortController();
+    const connect = harness.host.connect.bind(harness.host);
+    harness.host.connect = async signal => {
+      await connect(signal);
+      controller.abort();
+    };
+    try {
+      await expect(harness.session.resumeAwareness(controller.signal))
+        .rejects.toMatchObject({ name: "AbortError" });
+      expect(harness.session.snapshot().connected).toBe(true);
+    } finally {
+      harness.host.connect = connect;
+      await harness.close();
+    }
   });
 
   it("rejects only never-admitted work when sandbox capacity changes", async () => {

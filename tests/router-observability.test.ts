@@ -123,6 +123,7 @@ describe("router observability", () => {
     const handle = await router.startRelay({
       model: "PRIVATE PROMPT IN MODEL",
       input: "must never appear in logs",
+      reasoning: { effort: "xhigh", summary: "private reasoning summary" },
       stream: true,
     }, { source: "websocket", clientId: "private-client" });
     for await (const _frame of handle.events()) {}
@@ -140,6 +141,8 @@ describe("router observability", () => {
     ]);
     const serialized = JSON.stringify(logger.events);
     expect(serialized).not.toContain("must never appear");
+    expect(serialized).not.toContain("private reasoning summary");
+    expect(logger.events.find(event => event.event === "request.accepted")?.reasoning_effort).toBe("xhigh");
     expect(serialized).not.toContain("PRIVATE PROMPT IN MODEL");
     expect(serialized).not.toContain("private-client");
     expect(logger.events.find(event => event.event === "request.accepted"))

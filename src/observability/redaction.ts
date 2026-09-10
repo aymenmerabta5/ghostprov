@@ -61,6 +61,9 @@ const ORGANIZATION_VALUE = /\b(in\s+organization\s+)[A-Za-z0-9][A-Za-z0-9_-]{0,1
 const JSON_ORGANIZATION_VALUE = /("organization"\s*:\s*)"(?:[^"\\]|\\.)*"/gi;
 const FORBIDDEN_KEY = /(?:prompt|instructions|output|content|arguments|headers?|cookie|authorization|api.?key|password|token|secret|encrypted|body|url|client.?id|organization)/i;
 const DIAGNOSTIC_SOURCE_MAX_UNITS = 4_096;
+const REASONING_EFFORTS = new Set([
+  "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]);
 const COMMON = new Set(["schema", "event", "ts", "mono_ms"]);
 const RECOVERY_FIELDS = new Set([
   "project_id",
@@ -131,7 +134,7 @@ const LIVENESS_FIELDS = new Set([
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release"]),
   "server.stopping": new Set(["reason", "active", "queued"]),
-  "request.accepted": new Set(["trace_id", "source", "model", "service_tier", "stream", "workload_class", "request_bytes", "input_items", "has_previous_response_id", "transfer_admission_cost", "reserved_bytes", "capacity", "active", "available", "queued"]),
+  "request.accepted": new Set(["trace_id", "source", "model", "service_tier", "reasoning_effort", "stream", "workload_class", "request_bytes", "input_items", "has_previous_response_id", "transfer_admission_cost", "reserved_bytes", "capacity", "active", "available", "queued"]),
   "admission.acquired": new Set(["trace_id", "admission_wait_ms", "reserved_bytes", "reserved_total_bytes", "reservation_capacity_bytes", "memory_paused"]),
   "request.queued": new Set(["trace_id", "queued", "queued_bytes", "client_queue_depth", "queue_class", "active", "available"]),
   "route.selected": new Set(["trace_id", "project_id", "route_ms", "queue_wait_ms", "sandbox_capacity", "sandbox_active", "sandbox_admission_credits", "sandbox_reserved", "sandbox_queued", "sandbox_quarantined", "sandbox_commit_backlog", "sandbox_scheduler_bytes", "sandbox_scheduler_oldest_ms", "sandbox_throughput_bytes_per_sec", "awareness_rtt_ms", "completion_ewma_ms", "recent_failure_rate", "heartbeat_age_ms", "sidecar_peer_age_ms", "credential_expires_in_ms", "memory_pressure", "eligible_candidates", "queue_class", "fair_cost_bytes", "transfer_admission_cost", "fleet_transfer_cost", "fleet_transfer_reserved", "fleet_transfer_budget", "route_attempt", "capacity_reason"]),
@@ -291,6 +294,20 @@ export function safeObservabilityModel(value: unknown): string {
   if (typeof value !== "string" || value.length > 128) return "unknown";
   const normalized = value.trim().toLowerCase();
   return /^[a-z0-9][a-z0-9._:-]{0,127}$/.test(normalized) ? normalized : "unknown";
+}
+
+/** Record only a recognized effort label, never reasoning content or accessors. */
+export function safeObservabilityReasoningEffort(reasoning: unknown): string {
+  if (reasoning === undefined) return "unspecified";
+  if (reasoning === null || typeof reasoning !== "object" || Array.isArray(reasoning)) return "unknown";
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(reasoning, "effort");
+    if (!descriptor) return "unspecified";
+    const effort = "value" in descriptor ? descriptor.value : undefined;
+    return typeof effort === "string" && REASONING_EFFORTS.has(effort) ? effort : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 export function sanitizeDiagnosticMessage(value: unknown): string {
@@ -475,6 +492,11 @@ function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
     }
   }
   if (event.event === "request.accepted") {
+    const effort = event.reasoning_effort;
+    if (effort !== undefined && (typeof effort !== "string" ||
+        (!REASONING_EFFORTS.has(effort) && effort !== "unspecified" && effort !== "unknown"))) {
+      throw new TypeError("Request reasoning effort must be a bounded category");
+    }
     if ("has_previous_response_id" in event && typeof event.has_previous_response_id !== "boolean") {
       throw new TypeError("Request continuation presence must be boolean");
     }

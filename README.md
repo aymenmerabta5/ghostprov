@@ -238,7 +238,17 @@ supports_websockets = true
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
 
-`gpt-image-2` and its pinned snapshot are supported. Native `n=1..10` fans children across independent sandbox runtimes. GPT Image responses return `b64_json`. Image streaming, URL emulation, audio, and DALL-E variation routes return explicit unsupported-capability errors.
+The Images routes and `/v1/models` support these exact model IDs:
+
+| Model IDs | Quality | Transparent background |
+| --- | --- | --- |
+| `gpt-image-2`, `gpt-image-2-2026-04-21` | `low`, `medium`, `high`, `auto` | Not enabled in this compatibility route |
+| `gpt-image-2.5-flare`, `gpt-image-2.5-flare-2026-09-08` | `low`, `medium`, `high`, `xhigh`, `max`, `auto` | PNG or WebP |
+| `gpt-image-2.5-sunburst`, `gpt-image-2.5-sunburst-2026-09-08` | `low`, `medium`, `high`, `xhigh`, `max`, `auto` | PNG or WebP |
+
+Omitting `model` selects `gpt-image-2`. [Flare](https://developers.openai.com/api/docs/models/gpt-image-2.5-flare) is the speed-oriented image option; [Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst) emphasizes editing precision. Both are selected through the existing Responses `image_generation` tool. Image 2.5 custom sizes require edges divisible by 16, at most 3840 pixels per edge, a 1:3 to 3:1 aspect ratio, and 655,360–8,294,400 total pixels. Transparent output uses `background: "transparent"` with PNG (the default format) or WebP. These parameters follow the [official image-generation guide](https://developers.openai.com/api/docs/guides/image-generation).
+
+Native `n=1..10` fans children across independent sandbox runtimes. GPT Image responses return `b64_json`, including the provider's `xhigh`/`max` quality metadata when present. Image streaming, URL emulation, audio, and DALL-E variation routes return explicit unsupported-capability errors. Compatibility validation is offline; availability of a new image model on a particular Prism upstream requires separate authorized live verification.
 
 ## Performance observability
 
@@ -260,6 +270,10 @@ Built-in tracing starts with the upgraded router after the operator's next manua
 Recovery tracing adds `sandbox.recovery.started`, `sandbox.recovery.retry_scheduled`, `sandbox.recovery.completed`, `sandbox.recovery.aborted`, `sandbox.credential_refresh`, and transition-only `prism.circuit.changed`. Retry records are always visible on stdout and expose only normalized bootstrap/YDoc categories. Project replacement additionally emits `fleet.replacement.qualified`, `.started`, `.successor_reserved`, `.successor_created`, `.successor_activated`, `.old_retired`, transition-only `fleet.mutation.blocked`, and `fleet.startup_permits.changed`. Recovery events report `attempt_duration_ms` separately from total `duration_ms`, so retry backoff is never mistaken for a slow provisioning attempt. These events contain only project/worker indexes, bounded categories, counters, durations, and HTTP status codes—never sandbox/session IDs, URLs, cookies, tokens, prompts, or responses. `/__sandboxes` exposes process-local runtime incarnations, bounded recovery counters, sidecar peer age, pending retirements, and the sanitized project-mutation circuit; periodic `fleet.sample` additionally records both provisioning and project-mutation circuit state.
 
 Transition-only `sandbox.liveness` records identify Prism heartbeat HTTP, timeout, and transport failures; exact-sidecar probe timeouts and reliable-window stalls; same-session recovery outcomes; and Y-Sweet Awareness failures by data/control lane. Awareness records retain only a bounded numeric connection code, such as WebSocket close code `1006` or HTTP-style `401`/`403`, while liveness records include current heartbeat/sidecar-peer ages and transport connectivity. Routine successful heartbeats and probes remain silent; only recovery from a prior failure is recorded.
+
+Transient Awareness loss first receives one reconnect attempt using the existing credential, bounded to three seconds and the original scheduled renewal deadline. The host must resynchronize and receive a pong from the exact bootstrap-bound sidecar before restoring routing. Authentication/state failures, unsuccessful proof, or due renewal use the existing credential-rotation path. The transport retains its in-flight requests and reliable windows; reconnection does not submit another provider request. Successful reconnect diagnostics include `reconnect_phase` to distinguish restored host transport from credential rotation.
+
+`request.accepted.reasoning_effort` records only a recognized effort label, `unspecified`, or `unknown`. Join it with terminal `first_text_ms`/`first_tool_ms` and upstream/transport timing to distinguish heavy reasoning from delayed delivery. This telemetry does not change the requested effort or retain reasoning content.
 
 Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous head-index queue preserves terminal events ahead of progress and sample events, validates and serializes only during batched drain, and keeps full records in JSONL. Console output batches terminal/error records and rate-limits progress/sample records to a fixed cadence. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
 

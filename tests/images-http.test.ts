@@ -45,6 +45,40 @@ function testApp(startRelay: (body: Record<string, unknown>, signal?: AbortSigna
 }
 
 describe("Images compatibility HTTP routes", () => {
+  it.each([
+    "gpt-image-2.5-flare", "gpt-image-2.5-flare-2026-09-08",
+    "gpt-image-2.5-sunburst", "gpt-image-2.5-sunburst-2026-09-08",
+  ])("round-trips %s generation and edit quality metadata", async model => {
+    const bodies: Record<string, unknown>[] = [];
+    const app = testApp(async body => {
+      bodies.push(body);
+      const result = imageFinal("OFFLINE_RESULT");
+      const tool = (body.tools as Array<Record<string, unknown>>)[0];
+      return handle(Promise.resolve({ ...result, output: [{
+        ...result.output[0], quality: tool.quality, background: tool.background, output_format: "webp",
+      }] }));
+    });
+    const generation = await app.request("/v1/images/generations", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, prompt: "offline", quality: "xhigh", background: "transparent", output_format: "webp" }),
+    });
+    expect(generation.status).toBe(200);
+    expect(await generation.json()).toMatchObject({ quality: "xhigh", background: "transparent", data: [{ b64_json: "OFFLINE_RESULT" }] });
+    const form = new FormData();
+    form.append("model", model);
+    form.append("prompt", "offline edit");
+    form.append("quality", "max");
+    form.append("background", "transparent");
+    form.append("output_format", "webp");
+    form.append("image", new File([PNG], "input.png", { type: "image/png" }));
+    const edit = await app.request("/v1/images/edits", { method: "POST", body: form });
+    expect(edit.status).toBe(200);
+    expect(await edit.json()).toMatchObject({ quality: "max", background: "transparent", data: [{ b64_json: "OFFLINE_RESULT" }] });
+    expect(bodies).toHaveLength(2);
+    expect(bodies.every(body => body.stream === true && body.store === true)).toBe(true);
+    expect(bodies.map(body => (body.tools as any[])[0].model)).toEqual([model, model]);
+  });
+
   it("returns native Images JSON while fanning n through separate relay calls", async () => {
     const bodies: Record<string, unknown>[] = [];
     const app = testApp(async body => {

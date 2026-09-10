@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   assertSafeObservabilityEvent,
+  safeObservabilityReasoningEffort,
   sanitizeDiagnosticMessage,
 } from "../src/observability/redaction";
 import {
@@ -11,6 +12,29 @@ import {
 import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
 
 describe("observability privacy", () => {
+  it("records only bounded reasoning effort labels without reading reasoning content", () => {
+    for (const effort of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+      expect(safeObservabilityReasoningEffort({ effort, summary: "private reasoning" })).toBe(effort);
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.accepted", {
+        reasoning_effort: effort,
+      }))).not.toThrow();
+    }
+    expect(safeObservabilityReasoningEffort(undefined)).toBe("unspecified");
+    expect(safeObservabilityReasoningEffort({})).toBe("unspecified");
+    for (const reasoning of [null, [], "private reasoning", { effort: "private reasoning" }, { effort: 4 }]) {
+      expect(safeObservabilityReasoningEffort(reasoning)).toBe("unknown");
+    }
+    let reads = 0;
+    const accessor = Object.defineProperty({}, "effort", { get() { reads++; throw new Error("private"); } });
+    expect(safeObservabilityReasoningEffort(accessor)).toBe("unknown");
+    expect(reads).toBe(0);
+    for (const effort of [null, 1, "private reasoning", "high\n", "HIGH"]) {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.accepted", {
+        reasoning_effort: effort,
+      }))).toThrow(TypeError);
+    }
+  });
+
   it("accepts only numeric timing and structural counts with boolean lineage presence", () => {
     expect(() => assertSafeObservabilityEvent(observabilityEvent("request.accepted", {
       input_items: 3, has_previous_response_id: true,

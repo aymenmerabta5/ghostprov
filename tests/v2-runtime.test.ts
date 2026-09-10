@@ -1916,7 +1916,180 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("remints and reconnects Y-Sweet immediately after an Awareness disconnect", async () => {
+  it("reconnects the existing credential and preserves one committed request before reminting", async () => {
+    const harness = runtimeHarness({
+      resourceExpiresInMs: 1_200_000,
+      enableSupervisor: true,
+      livenessOutcomes: [null, null],
+    });
+    await harness.runtime.start();
+    const handle = await harness.runtime.run({
+      model: "gpt-6-astra",
+      input: "offline retained request",
+      previous_response_id: "resp_existing",
+    });
+    try {
+      harness.awareness.fail(new SplitAwarenessChannelError(
+        "data", new AwarenessChannelError("offline disconnect", "disconnected", 1005),
+      ));
+      expect(harness.runtime.snapshot().available).toBe(0);
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) {
+        await Promise.resolve();
+      }
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.transport.awarenessResumes).toBe(1);
+      expect(harness.transport.livenessProbes).toBe(2);
+      expect(harness.transport.rotations).toBe(0);
+      expect(harness.awareness.rotations).toBe(0);
+      expect(harness.supervisor.rotations).toBe(0);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.provisions()).toBe(1);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      expect(harness.transport.bodies).toHaveLength(1);
+      expect(harness.transport.bodies[0]).toMatchObject({ previous_response_id: "resp_existing" });
+      harness.transport.pending[0]!.resolve({ id: "resp_finished", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_finished" });
+    } finally {
+      harness.transport.pending[0]?.resolve({ status: "completed" });
+      await harness.runtime.stop();
+      expect(harness.clock.waiters).toHaveLength(0);
+    }
+  });
+
+  it("bounds an existing-credential reconnect before falling back to one rotation", async () => {
+    const harness = runtimeHarness({
+      resourceExpiresInMs: 1_200_000, enableSupervisor: true, livenessOutcomes: [null],
+    });
+    await harness.runtime.start();
+    let reconnectAborted = false;
+    harness.transport.resumeAwareness = async (signal?: AbortSignal) => {
+      harness.transport.awarenessResumes++;
+      if (harness.transport.awarenessResumes === 1) {
+        try { await harness.clock.sleep(60_000, signal); }
+        finally { reconnectAborted = signal?.aborted === true; }
+      }
+    };
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1006));
+      for (let turn = 0; turn < 300 && harness.transport.awarenessResumes === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(0);
+      await harness.clock.advanceBy(2_999);
+      expect(harness.ySweetMints()).toBe(0);
+      await harness.clock.advanceBy(1);
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) await Promise.resolve();
+      expect(reconnectAborted).toBe(true);
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.transport.rotations).toBe(1);
+      expect(harness.supervisor.rotations).toBe(1);
+      expect(harness.transport.awarenessResumes).toBe(2);
+      expect(harness.runtime.snapshot().available).toBeGreaterThan(0);
+      expect(harness.transports).toHaveLength(1);
+    } finally {
+      await harness.runtime.stop();
+      expect(harness.clock.waiters).toHaveLength(0);
+    }
+  });
+
+  it("does not postpone scheduled credential renewal after a transient reconnect", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    try {
+      await harness.clock.advanceBy(299_000);
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1006));
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(0);
+      await harness.clock.advanceBy(1_000);
+      for (let turn = 0; turn < 300 && harness.transport.rotations === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.transport.rotations).toBe(1);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it("keeps authentication rejection authoritative when another lane also disconnects", async () => {
+    const harness = runtimeHarness({
+      resourceExpiresInMs: 1_200_000, enableSupervisor: true, livenessOutcomes: [null],
+    });
+    await harness.runtime.start();
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline authentication rejection", "auth", 401));
+      harness.awareness.fail(new AwarenessChannelError("offline data disconnect", "disconnected", 1006));
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.supervisor.rotations).toBe(1);
+      expect(harness.transport.rotations).toBe(1);
+      expect(harness.transport.awarenessResumes).toBe(1);
+      expect(harness.transport.livenessProbes).toBe(1);
+      expect(harness.runtime.snapshot().available).toBeGreaterThan(0);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it("falls back to credential rotation when the exact-sidecar reconnect pong fails", async () => {
+    const harness = runtimeHarness({
+      resourceExpiresInMs: 1_200_000, enableSupervisor: true,
+      livenessOutcomes: [null, new V2TransportLivenessError("offline pong timeout", "timeout")],
+    });
+    await harness.runtime.start();
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.transport.awarenessResumes).toBe(2);
+      expect(harness.transport.livenessProbes).toBe(2);
+      expect(harness.transport.rotations).toBe(1);
+      expect(harness.supervisor.rotations).toBe(1);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.bootstrap.forceStops).toBe(0);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it("does not clear a newer authentication failure with a stale reconnect pong", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    let releaseProbe!: () => void;
+    let probing = false;
+    harness.transport.probeLiveness = async () => {
+      probing = true;
+      await new Promise<void>(resolve => { releaseProbe = resolve; });
+      return { rttMs: 1, sentAtMs: harness.clock.now() };
+    };
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 300 && !probing; turn++) await Promise.resolve();
+      expect(probing).toBe(true);
+      expect(harness.ySweetMints()).toBe(0);
+      harness.awareness.fail(new AwarenessChannelError("offline authentication rejection", "auth", 403));
+      releaseProbe();
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().available === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.transport.rotations).toBe(1);
+      expect(harness.awareness.rotationTokens).toEqual(["y-token-1"]);
+      expect(harness.livenessDiagnostics.some(event => event.outcome === "superseded")).toBe(true);
+      expect(harness.runtime.snapshot().available).toBeGreaterThan(0);
+    } finally { releaseProbe?.(); await harness.runtime.stop(); }
+  });
+
+  it("aborts an existing-credential reconnect on shutdown without a late rotation", async () => {
+    const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    let aborted = false;
+    harness.transport.resumeAwareness = async (signal?: AbortSignal) => {
+      harness.transport.awarenessResumes++;
+      try { await harness.clock.sleep(60_000, signal); }
+      finally { aborted = signal?.aborted === true; }
+    };
+    harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1006));
+    for (let turn = 0; turn < 300 && harness.transport.awarenessResumes === 0; turn++) await Promise.resolve();
+    expect(harness.transport.awarenessResumes).toBe(1);
+    await harness.runtime.stop();
+    expect(aborted).toBe(true);
+    expect(harness.clock.waiters).toHaveLength(0);
+    await harness.clock.advanceBy(60_000);
+    expect(harness.ySweetMints()).toBe(0);
+    expect(harness.transport.rotations).toBe(0);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("remints and reconnects Y-Sweet immediately when exact-sidecar reconnect proof is unavailable", async () => {
     const harness = runtimeHarness({ resourceExpiresInMs: 1_200_000, enableSupervisor: true });
     await harness.runtime.start();
     expect(harness.runtime.snapshot().capacity).toBe(128);
@@ -1984,7 +2157,8 @@ describe("V2SandboxRuntime", () => {
     const failure = new Error("connection unavailable");
     const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
       initialRotationPending: true, resourceExpiresInMs: 1_200_000,
-      livenessOutcomes: [null, failure, failure, failure, null] });
+      // One failed fast-reconnect pong, followed by three monitor failures.
+      livenessOutcomes: [null, failure, failure, failure, failure, null] });
     await harness.runtime.start();
     try {
       harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));

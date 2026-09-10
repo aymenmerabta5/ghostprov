@@ -17,7 +17,7 @@ type ImageGenerationTool = {
   size?: string;
   output_format?: ImageOutputFormat;
   output_compression?: number;
-  background?: ImageBackground | "transparent";
+  background?: ImageBackground;
   moderation?: string;
   input_fidelity?: "low" | "high" | string;
   input_image_mask?: { file_id?: string; image_url?: string; [key: string]: unknown };
@@ -29,10 +29,18 @@ export interface ImageCompatOptions {
   maxEditInputBytes: number;
 }
 
-export type SupportedImageModel = "gpt-image-2" | "gpt-image-2-2026-04-21";
-export type ImageQuality = "low" | "medium" | "high" | "auto";
+export const SUPPORTED_IMAGE_MODELS = Object.freeze([
+  "gpt-image-2",
+  "gpt-image-2-2026-04-21",
+  "gpt-image-2.5-flare",
+  "gpt-image-2.5-flare-2026-09-08",
+  "gpt-image-2.5-sunburst",
+  "gpt-image-2.5-sunburst-2026-09-08",
+] as const);
+export type SupportedImageModel = typeof SUPPORTED_IMAGE_MODELS[number];
+export type ImageQuality = "low" | "medium" | "high" | "xhigh" | "max" | "auto";
 export type ImageOutputFormat = "png" | "jpeg" | "webp";
-export type ImageBackground = "opaque" | "auto";
+export type ImageBackground = "opaque" | "transparent" | "auto";
 export type ImageModeration = "low" | "auto";
 
 export interface ParsedGenerationRequest {
@@ -67,13 +75,11 @@ export interface ParsedEditRequest {
   user?: string;
 }
 
-const IMAGE_MODELS = new Set<SupportedImageModel>([
-  "gpt-image-2",
-  "gpt-image-2-2026-04-21",
-]);
+const IMAGE_MODELS = new Set<SupportedImageModel>(SUPPORTED_IMAGE_MODELS);
 const QUALITIES = new Set<ImageQuality>(["low", "medium", "high", "auto"]);
+const IMAGE_25_QUALITIES = new Set<ImageQuality>(["low", "medium", "high", "xhigh", "max", "auto"]);
 const OUTPUT_FORMATS = new Set<ImageOutputFormat>(["png", "jpeg", "webp"]);
-const BACKGROUNDS = new Set<ImageBackground>(["opaque", "auto"]);
+const BACKGROUNDS = new Set<ImageBackground>(["opaque", "transparent", "auto"]);
 const MODERATION = new Set<ImageModeration>(["low", "auto"]);
 const GENERATION_FIELDS = new Set([
   "prompt",
@@ -176,6 +182,30 @@ function parseModel(value: unknown): SupportedImageModel {
   return value as SupportedImageModel;
 }
 
+function isImage25Model(model: SupportedImageModel): boolean {
+  return model !== "gpt-image-2" && model !== "gpt-image-2-2026-04-21";
+}
+
+function parseQuality(value: unknown, model: SupportedImageModel): ImageQuality | undefined {
+  return optionalEnum(value, isImage25Model(model) ? IMAGE_25_QUALITIES : QUALITIES, "quality");
+}
+
+function parseBackground(
+  value: unknown,
+  model: SupportedImageModel,
+  outputFormat: ImageOutputFormat | undefined,
+): ImageBackground | undefined {
+  if (value === "transparent") {
+    if (!isImage25Model(model)) {
+      throw invalid(`Transparent backgrounds are not enabled for '${model}'.`, "background", "unsupported_parameter");
+    }
+    if (outputFormat === "jpeg") {
+      throw invalid("Transparent backgrounds require PNG or WebP output.", "background", "unsupported_parameter");
+    }
+  }
+  return optionalEnum(value, BACKGROUNDS, "background");
+}
+
 function parseCount(value: unknown): number {
   if (value === undefined || value === null) return 1;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 10) {
@@ -190,7 +220,7 @@ function parseFormCount(value: string | undefined): number {
   return parseCount(Number(value));
 }
 
-function parseSize(value: unknown): string | undefined {
+function parseSize(value: unknown, model: SupportedImageModel): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (value === "auto") return value;
   if (typeof value !== "string") throw invalid("'size' must be a string.", "size", "invalid_type");
@@ -205,10 +235,11 @@ function parseSize(value: unknown): string | undefined {
     width % 16 !== 0 || height % 16 !== 0 ||
     width > 3840 || height > 3840 ||
     width * height > maxPixels ||
+    (isImage25Model(model) && width * height < 655_360) ||
     ratio < 1 / 3 || ratio > 3
   ) {
     throw invalid(
-      "'size' dimensions must be divisible by 16, use a 1:3 to 3:1 aspect ratio, and stay within gpt-image-2 limits.",
+      `'size' dimensions must be divisible by 16, use a 1:3 to 3:1 aspect ratio, and stay within ${model} limits.`,
       "size",
     );
   }
@@ -273,25 +304,23 @@ export function parseGenerationRequest(
   rejectUnknownFields(body, GENERATION_FIELDS);
   validateNonStreaming(body);
   validateResponseFormat(body.response_format);
+  const model = parseModel(body.model);
 
   if (body.style !== undefined && body.style !== null) {
-    throw invalid("'style' is a DALL-E-only parameter and is not supported for gpt-image-2.", "style", "unsupported_parameter");
+    throw invalid("'style' is a DALL-E-only parameter and is not supported for GPT Image models.", "style", "unsupported_parameter");
   }
 
-  if (body.background === "transparent") {
-    throw invalid("gpt-image-2 does not support transparent backgrounds.", "background", "unsupported_parameter");
-  }
-  const background = optionalEnum(body.background, BACKGROUNDS, "background");
   const outputFormat = optionalEnum(body.output_format, OUTPUT_FORMATS, "output_format");
+  const background = parseBackground(body.background, model, outputFormat);
 
   return {
     kind: "generation",
     responsesModel: options.responsesModel,
     prompt: requiredPrompt(body.prompt),
-    model: parseModel(body.model),
+    model,
     n: parseCount(body.n),
-    quality: optionalEnum(body.quality, QUALITIES, "quality"),
-    size: parseSize(body.size),
+    quality: parseQuality(body.quality, model),
+    size: parseSize(body.size, model),
     outputFormat,
     outputCompression: parseCompression(body.output_compression, outputFormat),
     background,
@@ -482,17 +511,13 @@ export async function parseEditRequest(
   const masks = formFiles(form, "mask");
   ensureEditBudget(images, masks, options.maxEditInputBytes);
 
-  const backgroundText = formString(form, "background");
-  if (backgroundText === "transparent") {
-    throw invalid("gpt-image-2 does not support transparent backgrounds.", "background", "unsupported_parameter");
-  }
-  const background = optionalEnum(backgroundText, BACKGROUNDS, "background");
   const outputFormat = formEnum(form, "output_format", OUTPUT_FORMATS);
   const prompt = requiredPrompt(formString(form, "prompt"));
   const model = parseModel(formString(form, "model"));
+  const background = parseBackground(formString(form, "background"), model, outputFormat);
   const n = parseFormCount(formString(form, "n"));
-  const quality = formEnum(form, "quality", QUALITIES);
-  const size = parseSize(formString(form, "size"));
+  const quality = parseQuality(formString(form, "quality"), model);
+  const size = parseSize(formString(form, "size"), model);
   const outputCompression = parseFormCompression(formString(form, "output_compression"), outputFormat);
   const inputFidelity = formEnum(form, "input_fidelity", INPUT_FIDELITIES);
   const user = parseUser(formString(form, "user"));

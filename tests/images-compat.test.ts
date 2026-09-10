@@ -13,6 +13,13 @@ const OPTIONS: ImageCompatOptions = {
   maxEditInputBytes: 40 * 1024 * 1024,
 };
 
+const IMAGE_25_MODELS = [
+  "gpt-image-2.5-flare",
+  "gpt-image-2.5-flare-2026-09-08",
+  "gpt-image-2.5-sunburst",
+  "gpt-image-2.5-sunburst-2026-09-08",
+] as const;
+
 function expectApiError(fn: () => unknown, expected: {
   status?: number;
   param?: string;
@@ -59,6 +66,39 @@ const WEBP = new Uint8Array([
 
 describe("Images API compatibility", () => {
   describe("generation requests", () => {
+    it.each([...IMAGE_25_MODELS])("supports %s quality and transparent generation without remapping", model => {
+      for (const quality of ["xhigh", "max"] as const) {
+        const parsed = parseGenerationRequest({
+          model, quality, prompt: "an offline transparent icon", n: 2,
+          background: "transparent", output_format: "webp", output_compression: 80,
+          size: quality === "xhigh" ? "1024x640" : "3840x2160",
+        }, OPTIONS);
+        const bodies = buildGenerationBodies(parsed);
+        expect(bodies).toHaveLength(2);
+        for (const body of bodies) {
+          expect(body).toMatchObject({
+            model: OPTIONS.responsesModel, stream: true, store: true,
+            tools: [{ type: "image_generation", model, quality, background: "transparent", output_format: "webp" }],
+          });
+          expect((body.tools as any[])[0]).not.toHaveProperty("n");
+        }
+      }
+    });
+
+    it.each([
+      [{ model: "gpt-image-2", quality: "xhigh" }, "quality", "invalid_value"],
+      [{ model: "gpt-image-2-2026-04-21", quality: "max" }, "quality", "invalid_value"],
+      [{ model: "gpt-image-2.5-flare", background: "transparent", output_format: "jpeg" }, "background", "unsupported_parameter"],
+      [{ model: "gpt-image-2.5-sunburst", size: "1024x624" }, "size", "invalid_value"],
+      [{ model: "gpt-image-2.5-sunburst", size: "16x16" }, "size", "invalid_value"],
+      [{ model: "gpt-image-2.5-flare-extra" }, "model", "model_not_supported"],
+      [{ model: "gpt-image-2.5-flare-2026-09-09" }, "model", "model_not_supported"],
+      [{ model: "gpt-image-2.5-sunburst\n" }, "model", "model_not_supported"],
+      [{ model: "gpt-image-2.5-flare", stream: true }, "stream", "unsupported_parameter"],
+    ] as const)("enforces model-specific Image 2.5 boundaries %#", (fields, param, code) => {
+      expectApiError(() => parseGenerationRequest({ prompt: "offline", ...fields }, OPTIONS), { param, code });
+    });
+
     it("fans native n out into independent Responses image-tool bodies", () => {
       const parsed = parseGenerationRequest({
         prompt: "a red circle",
@@ -178,6 +218,23 @@ describe("Images API compatibility", () => {
   });
 
   describe("edit requests", () => {
+    it.each([...IMAGE_25_MODELS])("supports %s transparent high-quality edits with exact reference bytes", async model => {
+      const form = new FormData();
+      form.append("prompt", "offline transparent edit");
+      form.append("model", model);
+      form.append("quality", "max");
+      form.append("background", "transparent");
+      form.append("image", new File([PNG], "input.png", { type: "image/png" }));
+      const parsed = await parseEditRequest(form, OPTIONS);
+      const [body] = buildEditBodies(parsed);
+      expect(body).toMatchObject({
+        stream: true, store: true,
+        tools: [{ type: "image_generation", action: "edit", model, quality: "max", background: "transparent" }],
+      });
+      expect((body.input as any[])[0].content[1].image_url)
+        .toBe(`data:image/png;base64,${Buffer.from(PNG).toString("base64")}`);
+    });
+
     it("maps ordered reference images and a PNG mask to Responses edit bodies", async () => {
       const form = new FormData();
       form.append("prompt", "make both references blue");

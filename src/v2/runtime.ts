@@ -57,6 +57,8 @@ import type { V2BootstrapSupervisor } from "./supervisor/host";
 import { isRateLimited, rateLimitHintFromError } from "./rate-limit";
 import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 
+const AWARENESS_RECONNECT_TIMEOUT_MS = 3_000;
+
 function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
   // Successful Responses calls commonly carry budget headers. Those headers
   // are useful evidence, but their mere presence must not make a completed
@@ -531,6 +533,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #ySweetRotation: Promise<void> | null = null;
   #awarenessFailureUnsubscribe: (() => void) | null = null;
   #ySweetReconnectPending = false;
+  #ySweetReconnectNeedsRotation = false;
   #awarenessFailureVersion = 0;
   #ySweetRefreshRequested = false;
   #wakeYSweetRefresh: (() => void) | null = null;
@@ -1725,6 +1728,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#controller?.signal.aborted
       ) return;
       this.#ySweetReconnectPending = true;
+      const kind = livenessErrorKind(error);
+      this.#ySweetReconnectNeedsRotation ||= kind !== "disconnected" &&
+        kind !== "connect" && kind !== "timeout";
       this.#awarenessFailureVersion++;
       this.#ySweetRefreshRequested = true;
       this.#wakeYSweetRefresh?.();
@@ -1770,13 +1776,52 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }
   }
 
+  async #tryReconnectAwareness(
+    transport: V2RuntimeTransport,
+    deadline: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!transport.resumeAwareness || !transport.probeLiveness || this.#clock.now() >= deadline) {
+      return false;
+    }
+    const reconnectController = new AbortController();
+    const timeoutController = new AbortController();
+    const forwardAbort = () => reconnectController.abort(signal.reason);
+    signal.addEventListener("abort", forwardAbort, { once: true });
+    if (signal.aborted) forwardAbort();
+    void this.#clock.waitUntil(deadline, timeoutController.signal).then(() => {
+      reconnectController.abort(new DOMException("Awareness reconnect deadline expired", "TimeoutError"));
+    }, () => undefined);
+    try {
+      await this.#abortable(
+        transport.resumeAwareness(reconnectController.signal),
+        reconnectController.signal,
+      );
+      if (reconnectController.signal.aborted) return false;
+      await this.#abortable(
+        transport.probeLiveness(reconnectController.signal),
+        reconnectController.signal,
+      );
+      return !reconnectController.signal.aborted && this.#clock.now() < deadline &&
+        !reliableTransportStalled(transport.snapshot().diagnostics?.host, this.#sidecarCommitStallMs);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return false;
+    } finally {
+      timeoutController.abort();
+      reconnectController.abort();
+      signal.removeEventListener("abort", forwardAbort);
+    }
+  }
+
   async #refreshYSweet(generation: number, signal: AbortSignal): Promise<void> {
     if (
       !this.#options.provisioning.mintYSweet ||
       !this.#bootstrap?.sealCredentialRotation ||
       !this.#transport?.rotateCredential
     ) return;
-    let deadline = this.#clock.now() + this.#ySweetRefreshMs;
+    let credentialRefreshDeadline = this.#clock.now() + this.#ySweetRefreshMs;
+    let deadline = credentialRefreshDeadline;
     while (!signal.aborted && generation === this.#generation) {
       await this.#waitForYSweetRefresh(deadline, signal);
       if (signal.aborted || generation !== this.#generation) return;
@@ -1812,7 +1857,36 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         });
       }
       try {
+        let reusedCredential = false;
         const rotation = (async () => {
+          if (reconnectAttempt && !this.#ySweetReconnectNeedsRotation &&
+              this.#clock.now() < credentialRefreshDeadline) {
+            const failureVersion = this.#awarenessFailureVersion;
+            reconnectPhase = "host_reconnect";
+            const reconnected = await this.#tryReconnectAwareness(
+              transport,
+              Math.min(credentialRefreshDeadline, reconnectStartedAtMs + AWARENESS_RECONNECT_TIMEOUT_MS),
+              signal,
+            );
+            if (
+              signal.aborted || generation !== this.#generation ||
+              bootstrap !== this.#bootstrap || transport !== this.#transport ||
+              awareness !== this.#awareness || supervisor !== this.#supervisor ||
+              credentials.ySweet !== this.#credentials?.ySweet ||
+              failureVersion !== this.#awarenessFailureVersion
+            ) return false;
+            if (reconnected) {
+              // Keep the exact transport, sidecar and reliable flight. A new
+              // socket handshake plus an instance-bound pong is sufficient
+              // for transient loss; the original credential renewal stays due.
+              this.#ySweetReconnectPending = false;
+              this.#ySweetRefreshRequested = false;
+              reusedCredential = true;
+              return true;
+            }
+          }
+          if (signal.aborted) throw signal.reason;
+          reconnectPhase = "mint_credential";
           const rotationId = `rotation-${crypto.randomUUID()}`;
           const ySweet = await this.#options.provisioning.mintYSweet!(
             this.projectId,
@@ -1876,6 +1950,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           ) return false;
           this.#credentials = { ...this.#credentials!, ySweet };
           this.#ySweetReconnectPending = false;
+          this.#ySweetReconnectNeedsRotation = false;
           this.#ySweetRefreshRequested = false;
           return true;
         })();
@@ -1892,12 +1967,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             signal: "awareness",
             outcome: applied ? "succeeded" : "superseded",
             attempt: this.#awarenessFailureVersion,
+            reconnectPhase,
             durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
           });
         }
-        deadline = applied
-          ? this.#clock.now() + this.#ySweetRefreshMs
-          : this.#clock.now();
+        if (applied && !reusedCredential) {
+          credentialRefreshDeadline = this.#clock.now() + this.#ySweetRefreshMs;
+        }
+        deadline = applied ? credentialRefreshDeadline : this.#clock.now();
       } catch (error) {
         if (signal.aborted) return;
         this.#notifyLiveness({
@@ -2243,6 +2320,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#sidecarSuspect = false;
     this.#credentialRefreshPending = false;
     this.#ySweetReconnectPending = false;
+    this.#ySweetReconnectNeedsRotation = false;
     this.#awarenessFailureVersion = 0;
     this.#ySweetRefreshRequested = false;
     await Promise.allSettled([

@@ -1791,7 +1791,13 @@ describe("router HTTP composition", () => {
       "gpt-6-astra",
       "gpt-5.5",
       "gpt-image-2",
+      "gpt-image-2-2026-04-21",
+      "gpt-image-2.5-flare",
+      "gpt-image-2.5-flare-2026-09-08",
+      "gpt-image-2.5-sunburst",
+      "gpt-image-2.5-sunburst-2026-09-08",
     ]));
+    expect(new Set(body.data.map((model: any) => model.id)).size).toBe(body.data.length);
     expect(body.models.map((model: any) => model.slug)).toEqual([
       "gpt-5.6-sol",
       "gpt-5.6-terra",

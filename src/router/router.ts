@@ -27,7 +27,11 @@ import {
 } from "./workload";
 import type { LoggerLike } from "../observability/logger";
 import { observabilityEvent, type JsonValue } from "../observability/events";
-import { safeObservabilityModel, sanitizeDiagnosticMessage } from "../observability/redaction";
+import {
+  safeObservabilityModel,
+  safeObservabilityReasoningEffort,
+  sanitizeDiagnosticMessage,
+} from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
 import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
@@ -1147,6 +1151,7 @@ export class MultiSandboxRouter {
       source: options.source ?? "internal",
       model: safeObservabilityModel(workload.model),
       service_tier: typeof relayBody.service_tier === "string" ? relayBody.service_tier : "unknown",
+      reasoning_effort: safeObservabilityReasoningEffort(relayBody.reasoning),
       stream: workload.stream,
       workload_class: schedulingWorkload.class,
       request_bytes: schedulingWorkload.requestBytes,
