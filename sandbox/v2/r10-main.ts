@@ -14,7 +14,7 @@ import {
   phaseZeroBootstrap,
   resolveSidecarBootstrapHelloPath,
 } from "./bootstrap.ts";
-import { DenoAwarenessPeer } from "./awareness-peer.ts";
+import { DenoAwarenessPeer } from "./r10-awareness-peer.ts";
 import { DenoJournalStorage } from "./journal-storage.ts";
 import { SidecarResourceSampler } from "../../src/v2/diagnostics/sidecar-sampler.ts";
 import { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/r10-sidecar-observer.ts";
@@ -34,6 +34,7 @@ import {
   runR10SupervisorInstaller,
 } from "./r10-supervisor.ts";
 import { canonicalSandboxWorkspacePath } from "./workspace-root.ts";
+import { finishR10SupervisorProcess } from "./r10-supervisor-receipt.ts";
 import {
   V2_TERMINAL_SPOOL_CAPACITY,
   V2_TERMINAL_SPOOL_RESERVATION_BYTES,
@@ -450,8 +451,11 @@ const supervisorMode = Deno.args.length === 2 &&
 const runtimeMode = installerNonce ? "supervisor_install" : supervisorMode ? "supervisor" : "sidecar";
 
 try {
-  if (installerNonce) await runR10SupervisorInstaller(installerNonce);
-  else if (supervisorMode) await runR10Supervisor();
+  if (installerNonce || supervisorMode) await finishR10SupervisorProcess(
+    () => installerNonce ? runR10SupervisorInstaller(installerNonce) : runR10Supervisor(),
+    () => diagnosticLog("supervisor").close(),
+    () => Deno.exit(0),
+  );
   else await run();
 } catch (error) {
   const wrapper = error instanceof Error ? error : new Error("Unknown sidecar failure");

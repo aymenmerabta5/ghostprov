@@ -13,7 +13,8 @@ import type {
   ProvisioningHooks,
 } from "../src/prism/provisioning-client";
 import type { SandboxRunOptions } from "../src/sandbox/registry";
-import { projectId } from "../src/sandbox/types";
+import { projectId, type ProjectId } from "../src/sandbox/types";
+import { SupervisedSandboxRuntime, type SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
 import type { AwarenessChannel } from "../src/v2/awareness/channel";
 import { SplitAwarenessChannelError } from "../src/v2/awareness/split-channel";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
@@ -112,10 +113,11 @@ class ManualClock implements Clock {
 class FakeHeartbeat implements V2RuntimeHeartbeat {
   started = false;
   stops = 0;
+  lastSuccessAtMs: number | undefined;
   constructor(readonly order: string[], readonly clock: ManualClock) {}
   start(): void { this.started = true; this.order.push("heartbeat"); }
   async stop(): Promise<void> { this.stops++; this.started = false; }
-  snapshot() { return { lastSuccessAtMs: this.clock.now() }; }
+  snapshot() { return { lastSuccessAtMs: this.lastSuccessAtMs ?? this.clock.now() }; }
 }
 
 class FakeYDoc implements V2RuntimeYDoc {
@@ -125,7 +127,7 @@ class FakeYDoc implements V2RuntimeYDoc {
 }
 
 class FakeAwareness implements AwarenessChannel<HostFrame, SidecarFrame> {
-  readonly projectId = PROJECT;
+  constructor(readonly projectId: ProjectId = PROJECT) {}
   readonly localPeerId = "host";
   rotations = 0;
   readonly rotationTokens: string[] = [];
@@ -351,14 +353,14 @@ class FakeGovernor implements V2RuntimeGovernor {
   }
 }
 
-function credentials(clock: ManualClock, expiresInMs = 600_000): ProvisionedRuntimeCredentials {
+function credentials(clock: ManualClock, expiresInMs = 600_000, selectedProject = PROJECT): ProvisionedRuntimeCredentials {
   const sandbox = parseProvisionedSandbox({
     url: "https://prism.test/s/sandboxes/proxy",
     token: "sandbox-token",
     sandbox_session_id: "sandbox-session-1",
   });
   return {
-    projectId: PROJECT,
+    projectId: selectedProject,
     sandbox,
     resource: parseResourceCredential({
       access_token: "resource-token",
@@ -367,9 +369,9 @@ function credentials(clock: ManualClock, expiresInMs = 600_000): ProvisionedRunt
       resources_base_url: "https://prism.test/s/sandbox-resources",
     }, clock.now()),
     ySweet: parseYSweetEnvelope({
-      url: `wss://prism.test/y/d/${PROJECT}/ws`,
-      baseUrl: `https://prism.test/y/d/${PROJECT}`,
-      docId: PROJECT,
+      url: `wss://prism.test/y/d/${selectedProject}/ws`,
+      baseUrl: `https://prism.test/y/d/${selectedProject}`,
+      docId: selectedProject,
       token: "y-token",
       authorization: "full",
     }),
@@ -378,6 +380,7 @@ function credentials(clock: ManualClock, expiresInMs = 600_000): ProvisionedRunt
 }
 
 function runtimeHarness(options: {
+  project?: ProjectId;
   sidecarCapacity?: number;
   credits?: number;
   governorCeiling?: number;
@@ -400,12 +403,14 @@ function runtimeHarness(options: {
   recoveryBootstrapDelayMs?: number;
   recoveryConnectPending?: boolean;
   gatewayHeartbeatOutcomes?: Array<V2RuntimeHeartbeatResult | Error>;
+  gatewayHeartbeat?: () => V2RuntimeHeartbeatResult | Promise<V2RuntimeHeartbeatResult>;
   initialRotationPending?: boolean;
   enableSupervisor?: boolean;
 } = {}) {
   const order: string[] = [];
   const clock = new ManualClock();
-  let current = credentials(clock, options.resourceExpiresInMs ?? 600_000);
+  const selectedProject = options.project ?? PROJECT;
+  let current = credentials(clock, options.resourceExpiresInMs ?? 600_000, selectedProject);
   let refreshes = 0;
   let ySweetMints = 0;
   let acquisitions = 0;
@@ -471,9 +476,9 @@ function runtimeHarness(options: {
     async mintYSweet() {
       ySweetMints++;
       return parseYSweetEnvelope({
-        url: `wss://prism.test/y/d/${PROJECT}/ws`,
-        baseUrl: `https://prism.test/y/d/${PROJECT}`,
-        docId: PROJECT,
+        url: `wss://prism.test/y/d/${selectedProject}/ws`,
+        baseUrl: `https://prism.test/y/d/${selectedProject}`,
+        docId: selectedProject,
         token: `y-token-${ySweetMints}`,
         authorization: "full",
       });
@@ -487,7 +492,7 @@ function runtimeHarness(options: {
   };
   const heartbeat = new FakeHeartbeat(order, clock);
   const ydoc = new FakeYDoc(order);
-  const awareness = new FakeAwareness();
+  const awareness = new FakeAwareness(selectedProject);
   const awarenesses = [awareness];
   let awarenessCalls = 0;
   const assets = options.enableR2Recovery
@@ -522,7 +527,7 @@ function runtimeHarness(options: {
   }
   const governor = options.governor ?? new FakeGovernor(options.governorCeiling ?? 128);
   const runtime = new V2SandboxRuntime({
-    projectId: PROJECT,
+    projectId: selectedProject,
     workerIndex: 1,
     leaderGeneration: 4,
     provisioning: provisioner,
@@ -542,6 +547,7 @@ function runtimeHarness(options: {
     createGateway: (_sandbox: ProvisionedSandbox) => ({
       heartbeat: async () => {
         gatewayHeartbeats++;
+        if (options.gatewayHeartbeat) return options.gatewayHeartbeat();
         const outcome = heartbeatOutcomes.shift();
         if (outcome instanceof Error) throw outcome;
         return outcome ?? {
@@ -567,7 +573,7 @@ function runtimeHarness(options: {
         ySweetToken: runtimeCredentials.ySweet.token.reveal(),
       });
       if (awarenessCalls++ === 0) return awareness;
-      const next = new FakeAwareness();
+      const next = new FakeAwareness(selectedProject);
       awarenesses.push(next);
       return next;
     },
@@ -671,6 +677,91 @@ function runtimeHarness(options: {
 }
 
 describe("V2SandboxRuntime", () => {
+  it.each([30_000, 60_000, 90_000])("preserves a supervised eight-worker fleet through %i ms of shared transport loss", async outageMs => {
+    let outage = false;
+    let replacements = 0;
+    const fleet = Array.from({ length: 8 }, (_, index) => {
+      const events: SandboxSupervisorEvent[] = [];
+      const harness = runtimeHarness({
+        project: projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
+        enableR2Recovery: true,
+        gatewayHeartbeat: () => {
+          if (outage) throw new Error("shared heartbeat transport unavailable");
+          return { ok: true, status: 200, durationMs: 1, sessionId: "sandbox-session-1" };
+        },
+      });
+      let lastPeerAt = harness.clock.now();
+      const snapshot = harness.transport.snapshot.bind(harness.transport);
+      harness.transport.snapshot = () => ({
+        ...snapshot(),
+        sidecarPeerAgeMs: harness.clock.now() - lastPeerAt,
+      });
+      harness.transport.probeLiveness = async () => {
+        harness.transport.livenessProbes++;
+        if (outage) throw new Error("shared sidecar transport unavailable");
+        lastPeerAt = harness.clock.now();
+        return { rttMs: 1, sentAtMs: lastPeerAt };
+      };
+      const supervised = new SupervisedSandboxRuntime({
+        projectId: harness.runtime.projectId,
+        initialChild: harness.runtime,
+        createChild: () => {
+          replacements++;
+          throw new Error("a temporary outage must retain its existing runtime");
+        },
+        clock: harness.clock,
+        random: { next: () => 0 },
+        onRecoveryEvent: event => events.push(event),
+      });
+      return { harness, supervised, events };
+    });
+    const handles: RunHandle[] = [];
+    try {
+      for (const { harness, supervised } of fleet) {
+        await supervised.start();
+        const handle = await supervised.run({ model: "gpt-5.6-sol", input: "one execution" });
+        void handle.final.catch(() => undefined);
+        handles.push(handle);
+        harness.heartbeat.lastSuccessAtMs = harness.clock.now();
+      }
+      outage = true;
+      for (let elapsed = 0; elapsed < outageMs; elapsed += 1_000) {
+        await Promise.all(fleet.map(({ harness }) => harness.clock.advanceBy(1_000)));
+        if (elapsed === 29_000) for (const { harness } of fleet) harness.heartbeatUnreachable();
+        for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      }
+      expect(replacements).toBe(0);
+      for (const { harness, supervised } of fleet) {
+        expect(supervised.snapshot()).toMatchObject({ state: "ready", incarnation: 1, capacity: 0, available: 0 });
+        expect(harness.transport.pending).toHaveLength(1);
+        expect(harness.transport.recoverySuspends).toBe(0);
+        expect(harness.heartbeat.stops).toBe(0);
+      }
+      outage = false;
+      for (const { harness } of fleet) harness.heartbeat.lastSuccessAtMs = harness.clock.now();
+      for (let elapsed = 0; elapsed < 20_000 && fleet.some(({ supervised }) => supervised.snapshot().available === 0); elapsed += 1_000) {
+        await Promise.all(fleet.map(({ harness }) => harness.clock.advanceBy(1_000)));
+        for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      }
+      for (const [index, { harness, supervised, events }] of fleet.entries()) {
+        expect(supervised.snapshot()).toMatchObject({ state: "ready", incarnation: 1, capacity: 128, available: 127, active: 1 });
+        expect(harness.transports).toHaveLength(1);
+        expect(harness.bootstraps).toHaveLength(1);
+        expect(harness.provisions()).toBe(1);
+        expect(events.filter(event => event.type === "started")).toHaveLength(1);
+        harness.transport.pending[0]!.resolve({ id: `resp_outage_${index}`, status: "completed" });
+        await expect(handles[index]!.final).resolves.toMatchObject({ status: "completed" });
+      }
+      expect(replacements).toBe(0);
+    } finally {
+      outage = false;
+      for (const { harness } of fleet) {
+        for (const pending of harness.transport.pending) pending.resolve({ status: "completed" });
+      }
+      await Promise.all(fleet.map(({ supervised }) => supervised.stop()));
+    }
+  });
+
   it("reports ready and repeatedly unhealthy sandbox identities to provisioning", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();
@@ -683,6 +774,133 @@ describe("V2SandboxRuntime", () => {
       "sandbox-session-1",
     ]);
     await harness.runtime.stop();
+  });
+
+  it("does not extend a transport recovery episode after repeated preflight failures", async () => {
+    let outage = false;
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      gatewayHeartbeat: () => {
+        if (outage) throw new Error("persistent transport outage");
+        return { ok: true, status: 200, durationMs: 1, sessionId: "sandbox-session-1" };
+      },
+    });
+    harness.transport.probeLiveness = async () => {
+      if (outage) throw new Error("no sidecar proof");
+      return { rttMs: 1, sentAtMs: harness.clock.now() };
+    };
+    try {
+      await harness.runtime.start();
+      outage = true;
+      harness.heartbeat.lastSuccessAtMs = 0;
+      await harness.clock.advanceBy(10_000);
+      const episode = harness.runtime.snapshot().livenessRecovery;
+      expect(episode).toEqual({ startedAtMs: 10_000, deadlineAtMs: 160_000 });
+      for (let elapsed = 10_000; elapsed < 159_000; elapsed += 1_000) {
+        await harness.clock.advanceBy(1_000);
+        for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+        expect(harness.runtime.snapshot().livenessRecovery).toBe(episode);
+      }
+      expect(harness.runtime.snapshot().state).toBe("ready");
+      await harness.clock.advanceBy(1_000);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "failed", livenessRecovery: null });
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "waiting_for_transport_recovery")).toHaveLength(1);
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(1);
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.bootstraps).toHaveLength(1);
+    } finally {
+      await harness.runtime.stop();
+    }
+  });
+
+  it.each([401, 403, 409, 410])("keeps definitive heartbeat status %i authoritative during transport recovery", async status => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null, new Error("missed pong")] });
+    try {
+      await harness.runtime.start();
+      await harness.clock.advanceBy(10_000);
+      expect(harness.runtime.snapshot().livenessRecovery).not.toBeNull();
+      harness.heartbeatExpired(status);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "failed", livenessRecovery: null });
+    } finally {
+      await harness.runtime.stop();
+    }
+  });
+
+  it.each(["monitor", "reconnect"] as const)("shares exact-sidecar proof when %s owns the probe first", async first => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    let releaseProbe!: () => void;
+    let probes = 0;
+    let activeProbe = false;
+    harness.transport.probeLiveness = async () => {
+      probes++;
+      if (activeProbe) throw new V2TransportLivenessError("probe already owned", "probe_in_flight");
+      activeProbe = true;
+      await new Promise<void>(resolve => { releaseProbe = resolve; });
+      activeProbe = false;
+      return { rttMs: 1, sentAtMs: harness.clock.now() };
+    };
+    const handle = await harness.runtime.run({ model: "gpt-6-astra", input: "retained", previous_response_id: "resp_exact", stream: true, store: true });
+    void handle.final.catch(() => undefined);
+    try {
+      await harness.clock.advanceBy(first === "monitor" ? 10_000 : 9_000);
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      if (first === "reconnect") await harness.clock.advanceBy(1_000);
+      expect(probes).toBe(1);
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.livenessDiagnostics.some(event => event.errorKind === "probe_in_flight")).toBe(false);
+      releaseProbe();
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", livenessRecovery: null });
+      expect(harness.runtime.snapshot().available).toBeGreaterThan(0);
+      expect(harness.transport.bodies).toHaveLength(1);
+      expect(harness.transport.bodies[0]).toMatchObject({ previous_response_id: "resp_exact", stream: true, store: true });
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.bootstraps).toHaveLength(1);
+      harness.transport.pending[0]!.resolve({ id: "resp_once", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_once" });
+    } finally {
+      releaseProbe?.();
+      harness.transport.pending[0]?.resolve({ status: "completed" });
+      await harness.runtime.stop();
+      expect(harness.clock.waiters).toHaveLength(0);
+    }
+  });
+
+  it("expires the fixed recovery episode while an exact-sidecar probe remains pending", async () => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null, new V2TransportLivenessError("first missed proof", "timeout")],
+    });
+    await harness.runtime.start();
+    let releaseProbe!: () => void;
+    let probing = false;
+    try {
+      await harness.clock.advanceBy(10_000);
+      expect(harness.runtime.snapshot().livenessRecovery?.deadlineAtMs).toBe(160_000);
+      harness.transport.probeLiveness = async () => {
+        probing = true;
+        await new Promise<void>(resolve => { releaseProbe = resolve; });
+        return { rttMs: 1, sentAtMs: harness.clock.now() };
+      };
+      await harness.clock.advanceBy(2_000);
+      expect(probing).toBe(true);
+      await harness.clock.advanceBy(147_999);
+      expect(harness.runtime.snapshot().state).toBe("ready");
+      await harness.clock.advanceBy(1);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "failed", livenessRecovery: null });
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(1);
+      releaseProbe();
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(harness.runtime.snapshot().state).toBe("failed");
+      expect(harness.livenessDiagnostics.some(event => event.outcome === "recovered")).toBe(false);
+      expect(harness.transport.recoverySuspends).toBe(0);
+    } finally {
+      releaseProbe?.();
+      await harness.runtime.stop();
+      expect(harness.clock.waiters).toHaveLength(0);
+    }
   });
 
   it("reports a bootstrap timeout against the acquired sandbox session", async () => {
@@ -1697,6 +1915,12 @@ describe("V2SandboxRuntime", () => {
         reliableStall: true,
       },
       {
+        signal: "sidecar_recovery",
+        outcome: "waiting_for_transport_recovery",
+        errorKind: undefined,
+        reliableStall: undefined,
+      },
+      {
         signal: "sidecar_probe",
         outcome: "failed",
         errorKind: "reliable_stall",
@@ -2088,6 +2312,38 @@ describe("V2SandboxRuntime", () => {
     expect(harness.ySweetMints()).toBe(0);
     expect(harness.transport.rotations).toBe(0);
     expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it.each(["supervisor", "sidecar"] as const)("fences a late %s credential rotation before host reconnection", async phase => {
+    const harness = runtimeHarness({ enableSupervisor: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    let releaseRotation!: () => void;
+    let rotating = false;
+    const pendingRotation = async () => {
+      rotating = true;
+      await new Promise<void>(resolve => { releaseRotation = resolve; });
+    };
+    if (phase === "supervisor") harness.supervisor.rotateCredential = pendingRotation;
+    else harness.transport.rotateCredential = pendingRotation;
+    try {
+      if (phase === "supervisor") {
+        harness.awareness.fail(new AwarenessChannelError("offline credential rejection", "auth", 401));
+      } else {
+        await harness.clock.advanceBy(300_000);
+      }
+      for (let turn = 0; turn < 100 && !rotating; turn++) await Promise.resolve();
+      expect(rotating).toBe(true);
+      const stopping = harness.runtime.stop();
+      releaseRotation();
+      await stopping;
+      expect(harness.awareness.rotations).toBe(0);
+      expect(harness.transport.awarenessResumes).toBe(0);
+      expect(harness.runtime.snapshot().state).toBe("stopped");
+      expect(harness.clock.waiters).toHaveLength(0);
+    } finally {
+      releaseRotation?.();
+      await harness.runtime.stop();
+    }
   });
 
   it("remints and reconnects Y-Sweet immediately when exact-sidecar reconnect proof is unavailable", async () => {

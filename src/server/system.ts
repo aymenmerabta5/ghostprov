@@ -1,6 +1,7 @@
 import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
+import { FileBootstrapHoldMigration } from "../fleet/bootstrap-migration";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
 import { FileSupervisorBootstrapJournal } from "../v2/supervisor/bootstrap-journal";
 import { SupervisorLifecycle } from "../v2/supervisor/lifecycle";
@@ -34,7 +35,8 @@ import {
   type SandboxSupervisorEvent,
 } from "../sandbox/supervised-runtime";
 import { SandboxYDoc } from "../sandbox/ydoc";
-import { YSweetAwarenessChannel } from "../v2/awareness/y-sweet-channel";
+import { YSweetAwarenessChannel, type YSweetAwarenessChannelOptions } from "../v2/awareness/y-sweet-channel";
+import type { AwarenessChannel } from "../v2/awareness/channel";
 import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
 import { V2BootstrapController } from "../v2/bootstrap/controller";
 import { bootstrapBindingFromProtocol } from "../v2/bootstrap/binding";
@@ -331,6 +333,8 @@ export interface BrowserlessSystemDependencies {
   }) => V2RuntimeHeartbeat;
   /** Integration seam for observing and exercising the authenticated R9 lifecycle. */
   sandboxSupervisorFactory?: (options: V2SandboxSupervisorOptions) => V2BootstrapSupervisor;
+  /** Integration seam for bounded loss on dedicated test transport lanes. */
+  awarenessChannelFactory?: (options: YSweetAwarenessChannelOptions<SidecarFrame>) => AwarenessChannel<HostFrame, SidecarFrame>;
 }
 
 export interface BrowserlessSystem {
@@ -477,6 +481,7 @@ function defaultRuntimeFactory(options: {
   supervisorLifecycle: SupervisorLifecycle;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
   sandboxSupervisorFactory?: BrowserlessSystemDependencies["sandboxSupervisorFactory"];
+  awarenessChannelFactory?: BrowserlessSystemDependencies["awarenessChannelFactory"];
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
 }): ManagedRuntimeFactory {
   const {
@@ -495,6 +500,7 @@ function defaultRuntimeFactory(options: {
     supervisorLifecycle,
     heartbeatFactory,
     sandboxSupervisorFactory,
+    awarenessChannelFactory,
     onRecoveryEvent,
   } = options;
   const gzip = createV2CpuGzip(cpuPool);
@@ -600,7 +606,7 @@ function defaultRuntimeFactory(options: {
         const createLane = (
           lane: "data" | "control",
           field: "ghostprovV2Data" | "ghostprovV2Control",
-        ) => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+        ) => (awarenessChannelFactory ?? (options => new YSweetAwarenessChannel<HostFrame, SidecarFrame>(options)))({
           envelope: credentials.ySweet,
           localPeerId: `host-${workerIndex}:${lane}`,
           field,
@@ -1000,8 +1006,9 @@ export async function createBrowserlessSystem(
     },
   });
   const projects = dependencies.projects ?? new PrismProjectsClient(identity.account);
+  const fleetManifestFile = config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint);
   const manifest = dependencies.manifest ?? new FleetManifestStore({
-    file: config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint),
+    file: fleetManifestFile,
     identityFingerprint: identity.fingerprint,
     ...(config.fleetManifestFile === null
       ? { legacyFile: ".ghostprov/fleet.json" }
@@ -1040,6 +1047,7 @@ export async function createBrowserlessSystem(
     logger,
     heartbeatFactory: dependencies.heartbeatFactory,
     sandboxSupervisorFactory: dependencies.sandboxSupervisorFactory,
+    awarenessChannelFactory: dependencies.awarenessChannelFactory,
     onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
     sandboxLogs,
     supervisorLifecycle,
@@ -1051,6 +1059,11 @@ export async function createBrowserlessSystem(
     manifest,
     registry,
     runtimeFactory,
+    // Only the constructed production manifest has this exact trusted path.
+    // Injected test manifests must not read another manifest's private ledger.
+    ...(!dependencies.manifest ? {
+      bootstrapMigration: new FileBootstrapHoldMigration({ manifestFile: fleetManifestFile, identityFingerprint: identity.fingerprint }),
+    } : {}),
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
     canRetireProject: project => router.responseProvenanceBindingsForProject(project) === 0,
     onLifecycleEvent: event => emitFleetLifecycle(logger, event),

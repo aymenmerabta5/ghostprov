@@ -1,4 +1,22 @@
 export const SANDBOX_LIVENESS_MAX_AGE_MS = 20_000;
+export const SANDBOX_LIVENESS_RECOVERY_MAX_MS = 150_000;
+
+/** One runtime-owned episode; failed retries must never extend its deadline. */
+export interface SandboxLivenessRecovery {
+  readonly startedAtMs: number;
+  readonly deadlineAtMs: number;
+}
+
+export function isActiveSandboxLivenessRecovery(
+  recovery: SandboxLivenessRecovery | null | undefined,
+  now: number,
+): boolean {
+  if (!recovery || !Number.isFinite(now)) return false;
+  const { startedAtMs, deadlineAtMs } = recovery;
+  return Number.isFinite(startedAtMs) && Number.isFinite(deadlineAtMs) &&
+    startedAtMs >= 0 && startedAtMs <= now && deadlineAtMs > now &&
+    deadlineAtMs - startedAtMs <= SANDBOX_LIVENESS_RECOVERY_MAX_MS;
+}
 
 export interface SandboxLivenessSignals {
   readonly heartbeatAgeMs: number | null;

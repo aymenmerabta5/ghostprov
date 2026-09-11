@@ -1,12 +1,13 @@
 import { diagnosticLog } from "./diagnostic-log.ts";
-import { DenoSidecarOwnershipLease } from "./ownership-lease.ts";
+import { DenoSidecarOwnershipLease, SidecarOwnershipError } from "./ownership-lease.ts";
 import {
   SupervisorProcessManager,
   SUPERVISOR_RUNTIME_ROOT,
   parseLinuxProcessStat,
   readLinuxProcFile,
 } from "./r10-supervisor-process.ts";
-import { DenoSupervisorPeer } from "./supervisor-peer.ts";
+import { DenoSupervisorPeer, createR10SupervisorProvider } from "./r10-supervisor-peer.ts";
+import { finalizeR10SupervisorRetirement, waitForR10SupervisorChildCleanup } from "./r10-supervisor-receipt.ts";
 import { retireVerifiedSupervisor } from "./supervisor-retirement.ts";
 import {
   createBootstrapKeyPair,
@@ -30,6 +31,9 @@ import {
   canonicalSandboxWorkspacePath,
   isCanonicalSandboxWorkspaceRoot,
 } from "./workspace-root.ts";
+import {
+  GP_V2_SUPERVISOR_PROTOCOL, GP_V2_SUPERVISOR_VERSION, signSupervisorSandboxMessage,
+} from "../../src/v2/supervisor/protocol.ts";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
 const SAFE_ENTRYPOINT = /^\.ghostprov-v2\/revisions\/r10\/[a-f0-9]{64}\/[a-f0-9]{64}\/sidecar\.bundle\.js$(?![\s\S])/;
@@ -38,6 +42,7 @@ const SUPERVISOR_OWNER_PATH = `${SUPERVISOR_RUNTIME_ROOT}/sidecar.owner.lock`;
 const SUPERVISOR_WRAPPER_PATH = `${SUPERVISOR_RUNTIME_ROOT}/supervisor-wrapper.sh`;
 const SUPERVISOR_LIFECYCLE_PATH = `${SUPERVISOR_RUNTIME_ROOT}/lifecycle.state`;
 const SUPERVISOR_RETIREMENT_PATH = `${SUPERVISOR_RUNTIME_ROOT}/retired.pid`;
+const SUPERVISOR_RETIREMENT_PUBLICATION_ROOT = `${SUPERVISOR_RUNTIME_ROOT}/retirement-publication`;
 const SUPERVISOR_ENV_ALLOWLIST = "OPENAI_BASE_URL,OPENAI_API_KEY,PROXY_CA_CERT_PATH,NODE_ENV,PRODUCTION,FORCE_COLOR,NO_COLOR,COLORTERM,TERM,GHOSTPROV_WORKSPACE_ROOT,CODEX_THREAD_ID";
 const SUPERVISOR_READ_SUFFIX = "/tmp/ghostprov-v2,/proc,/usr/bin/setsid,/bin/sh,/usr/local/bin/deno,/usr/bin/deno,/root/.deno/bin/deno";
 const SUPERVISOR_WRITE_SUFFIX = "/tmp/ghostprov-v2";
@@ -126,6 +131,38 @@ async function atomicWrite(file: string, content: string, mode = 0o600): Promise
   }
   await Deno.rename(temporary, file);
   await Deno.chmod(file, mode);
+}
+
+async function acquireRetirementPublicationLease(instanceId: string): Promise<DenoSidecarOwnershipLease> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      return await DenoSidecarOwnershipLease.acquire({ instanceId, root: SUPERVISOR_RETIREMENT_PUBLICATION_ROOT });
+    } catch (error) {
+      if (!(error instanceof SidecarOwnershipError) || error.code !== "contended" || Date.now() >= deadline) throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, Math.min(50, deadline - Date.now())));
+    }
+  }
+}
+
+async function retireExactSupervisorPid(record: string): Promise<void> {
+  let current: string | null = null;
+  try {
+    const stat = await Deno.lstat(SUPERVISOR_PID_PATH);
+    if (!stat.isFile || stat.isSymlink || stat.size < 1 || stat.size > 4096) throw new SupervisorLifecycleError("retirement_pid_invalid");
+    current = await Deno.readTextFile(SUPERVISOR_PID_PATH);
+    if (current !== record) throw new SupervisorLifecycleError("retirement_pid_conflict");
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+  await atomicWrite(SUPERVISOR_RETIREMENT_PATH, record);
+  if (current === record) await Deno.remove(SUPERVISOR_PID_PATH);
+  try {
+    await Deno.lstat(SUPERVISOR_PID_PATH);
+    throw new SupervisorLifecycleError("retirement_pid_remaining");
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
 }
 
 function parseStaticConfig(value: string): SupervisorStaticConfig {
@@ -459,17 +496,39 @@ export async function runR10Supervisor(): Promise<void> {
       }),
     ]);
   } finally {
-    let cleanupProved = true;
-    if (manager) {
-      await manager.handle({ kind: "shutdown", reason: "supervisor_exit" }).catch(() => { cleanupProved = false; });
+    let credential = bootstrap.credential;
+    try {
+      await finalizeR10SupervisorRetirement({
+        cleanupChild: () => waitForR10SupervisorChildCleanup(async () => {
+          if (!manager) return;
+          const terminal = await manager.handle({ kind: "shutdown", reason: "supervisor_exit" });
+          if (terminal.kind !== "shutdown") throw new SupervisorLifecycleError("retirement_child_unproven");
+        }),
+        closePeer: async () => { await peer?.close(); },
+        ownership,
+        // Acquired while normal ownership is held, released after readback.
+        acquirePublicationLease: () => acquireRetirementPublicationLease(instanceId),
+        retireIdentity: async () => {
+          await retireExactSupervisorPid(record);
+          await Deno.remove(helloPath(args.nonce, Deno.pid)).catch(error => {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          });
+        },
+        receipt: async () => {
+          // closePeer has joined an already accepted rotation. Snapshot its
+          // final credential only now, before either fresh provider is built.
+          credential = peer?.currentCredential() ?? bootstrap.credential;
+          return { credential, signed: peer ? await peer.retirementReceipt() :
+            await signSupervisorSandboxMessage(credential.rotationKey, {
+              protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox",
+              binding: config.binding, supervisorInstanceId: instanceId, sequence: 0, message: { kind: "shutdown" },
+            }) };
+        },
+        createProvider: doc => createR10SupervisorProvider(doc, () => credential),
+      });
+    } finally {
+      Deno.removeSignalListener("SIGTERM", onTerm);
+      Deno.removeSignalListener("SIGINT", onInt);
     }
-    await peer?.close().catch(() => { cleanupProved = false; });
-    await ownership.release().catch(() => { cleanupProved = false; });
-    if (cleanupProved) await atomicWrite(SUPERVISOR_RETIREMENT_PATH, record);
-    await Deno.remove(helloPath(args.nonce, Deno.pid)).catch(() => undefined);
-    const current = await readBounded(SUPERVISOR_PID_PATH, 4096).catch(() => null);
-    if (current === record) await Deno.remove(SUPERVISOR_PID_PATH).catch(() => undefined);
-    Deno.removeSignalListener("SIGTERM", onTerm);
-    Deno.removeSignalListener("SIGINT", onInt);
   }
 }

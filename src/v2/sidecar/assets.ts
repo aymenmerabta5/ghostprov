@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { ARCHIVED_R10_RELEASE_IDENTITIES } from "./retirement-identities";
+export { V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY, V2_R10_C1091742_RETIREMENT_IDENTITY } from "./retirement-identities";
 import {
   DEFAULT_V2_TRANSPORT_PROFILE,
   canonicalJson,
@@ -164,7 +166,7 @@ export const V2_R9_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
 });
 
 /** Immutable R10 diagnostics release; validation scope is recorded in docs/validation. */
-export const V2_R10_RELEASE: V2SidecarReleaseIdentity = Object.freeze({"revision":"r10","protocolRevision":"r2","transportProfile":"bulk-v1","buildHash":"ce9f48171863bdaa0adcd1a6344ec175502dd1ef9d1b9fae9e4a512a1474c32a","schemaHash":"51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f","bundleSha256":"a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776"});
+export const V2_R10_RELEASE: V2SidecarReleaseIdentity = Object.freeze({"revision":"r10","protocolRevision":"r2","transportProfile":"bulk-v1","buildHash":"9d2aa8b7aecefcad429dff4a1f7fb0707b95dec9abe0beac4fb6d77ad70e5b7b","schemaHash":"51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f","bundleSha256":"21c83c16d210b3208a1cb097df2363f4690fac705ae6d1ccc71e143805854121"});
 
 /**
  * The first R2 artifact was declared frozen before the later selectable R2
@@ -208,6 +210,8 @@ export const V2_RETIREMENT_RELEASE_IDENTITIES = Object.freeze([
   V2_R7_RELEASE,
   V2_R8_RELEASE,
   V2_R9_RELEASE,
+  ...ARCHIVED_R10_RELEASE_IDENTITIES.filter(release =>
+    release.buildHash !== V2_R10_RELEASE.buildHash || release.schemaHash !== V2_R10_RELEASE.schemaHash),
   V2_R10_RELEASE,
 ] as const);
 
@@ -261,9 +265,20 @@ const OBSOLETE_PATHS = Object.freeze([
   `${ASSET_PREFIX}/sidecar.bundle.js`,
   `${ASSET_PREFIX}/src`,
 ]);
-const RELEASES: Readonly<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
+interface RegisteredV2SidecarRelease extends V2SidecarReleaseIdentity {
   readonly bundlePath: string;
-}>> = Object.freeze({
+}
+
+/** Immutable local artifact address; only exact registered identities reach I/O. */
+export function r10SidecarArtifactPath(identity: Pick<V2SidecarReleaseIdentity, "buildHash" | "schemaHash"> = V2_R10_RELEASE): string {
+  if (![V2_R10_RELEASE, ...ARCHIVED_R10_RELEASE_IDENTITIES].some(release =>
+    release.buildHash === identity.buildHash && release.schemaHash === identity.schemaHash)) {
+    throw new Error("Unregistered R10 artifact identity");
+  }
+  return path.resolve(import.meta.dir, "releases/r10", identity.schemaHash, identity.buildHash, BUNDLE_NAME);
+}
+
+const RELEASES: Readonly<Record<V2SidecarRevision, RegisteredV2SidecarRelease>> = Object.freeze({
   r1: Object.freeze({
     ...V2_R1_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r1/sidecar.bundle.js"),
@@ -296,7 +311,7 @@ const RELEASES: Readonly<Record<V2SidecarRevision, V2SidecarReleaseIdentity & {
     ...V2_R8_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r8/sidecar.bundle.js"),
   }),
-  r10: Object.freeze({ ...V2_R10_RELEASE, bundlePath: path.resolve(import.meta.dir, "releases/r10/sidecar.bundle.js") }),
+  r10: Object.freeze({ ...V2_R10_RELEASE, bundlePath: r10SidecarArtifactPath() }),
   r9: Object.freeze({
     ...V2_R9_RELEASE,
     bundlePath: path.resolve(import.meta.dir, "releases/r9/sidecar.bundle.js"),
@@ -371,11 +386,8 @@ export function assertV2SidecarReleaseSchema(
   }
 }
 
-async function loadFrozenBundle(revision: V2SidecarRevision): Promise<string> {
-  const release = RELEASES[revision];
-  if (!release) {
-    throw new Error(`No frozen V2-${revision.toUpperCase()} sidecar release is registered`);
-  }
+async function loadFrozenBundle(release: RegisteredV2SidecarRelease): Promise<string> {
+  const revision = release.revision;
   let content: string;
   try {
     content = await readFile(release.bundlePath, "utf8");
@@ -563,6 +575,23 @@ export async function loadV2SidecarAssets(
   if (!release) {
     throw new Error(`No frozen V2-${revision.toUpperCase()} sidecar release is registered`);
   }
+  return loadRegisteredSidecarAssets(release);
+}
+
+/** Cleanup-only loader; ordinary release selection never selects an archived tuple. */
+export async function loadV2SidecarRecoveryAssets(identity: Pick<V2SidecarReleaseIdentity, "revision" | "buildHash" | "schemaHash">): Promise<V2SidecarAssets> {
+  const current = RELEASES[identity.revision];
+  if (current && current.buildHash === identity.buildHash && current.schemaHash === identity.schemaHash) {
+    return loadRegisteredSidecarAssets(current);
+  }
+  const archived = identity.revision === "r10" ? ARCHIVED_R10_RELEASE_IDENTITIES.find(release =>
+    release.buildHash === identity.buildHash && release.schemaHash === identity.schemaHash) : undefined;
+  if (!archived) throw new Error("Unregistered supervisor recovery release identity");
+  return loadRegisteredSidecarAssets({ ...archived, bundlePath: r10SidecarArtifactPath(archived) });
+}
+
+async function loadRegisteredSidecarAssets(release: RegisteredV2SidecarRelease): Promise<V2SidecarAssets> {
+  const revision = release.revision;
   const protocolRevision = protocolRevisionForV2SidecarRevision(revision);
   const transportProfile = transportProfileForV2SidecarRevision(revision);
   if (release.protocolRevision !== protocolRevision) {
@@ -580,7 +609,7 @@ export async function loadV2SidecarAssets(
     await protocolSchemaHash(protocolRevision, transportProfile),
   );
   const schemaHash = release.schemaHash;
-  const content = await loadFrozenBundle(revision);
+  const content = await loadFrozenBundle(release);
   const logicalFiles = [{
     path: BUNDLE_NAME,
     logicalPath: BUNDLE_NAME,

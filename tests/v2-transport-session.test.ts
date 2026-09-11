@@ -34,6 +34,7 @@ import {
   V2_LATENCY_CRITICAL_REQUEST_BYTES,
   V2_R2_REQUEST_PART_BYTES,
   V2TransportSession,
+  V2_LIVENESS_PROBE_MAX_PUBLICATIONS,
   validateHostTerminalFinalStructure,
   type V2GzipOptions,
 } from "../src/v2/transport/session";
@@ -96,6 +97,34 @@ async function promiseState(value: Promise<unknown>): Promise<"pending" | "settl
     value.then(() => "settled" as const, () => "settled" as const),
     new Promise<"pending">(resolve => queueMicrotask(() => resolve("pending"))),
   ]);
+}
+
+function livenessTimers(clock: ReceiptClock) {
+  const pending = new Map<object, { dueAtMs: number; callback(): void }>();
+  const set = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void, delay = 0, ...args: unknown[]
+  ) => {
+    const handle = { unref() { return handle; } };
+    pending.set(handle, { dueAtMs: clock.now() + delay, callback: () => callback(...args) });
+    return handle;
+  }) as typeof setTimeout);
+  const clear = spyOn(globalThis, "clearTimeout").mockImplementation((handle => {
+    pending.delete(handle as object);
+  }) as typeof clearTimeout);
+  return {
+    pending,
+    advance(ms: number) {
+      clock.value += ms;
+      for (;;) {
+        const next = [...pending].filter(([, timer]) => timer.dueAtMs <= clock.now())
+          .sort((left, right) => left[1].dueAtMs - right[1].dueAtMs)[0];
+        if (!next) return;
+        pending.delete(next[0]);
+        next[1].callback();
+      }
+    },
+    restore() { set.mockRestore(); clear.mockRestore(); },
+  };
 }
 
 function throwOnSelectedPublish(
@@ -905,6 +934,142 @@ describe("V2TransportSession", () => {
     expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
       .toBe(ackAfterFailure);
     await harness.close();
+  });
+
+  it("bounds probe-owned ping retransmissions inside one unchanged deadline", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ clock, livenessTimeoutMs: 600, binding: R2_BINDING });
+    await harness.start();
+    const timers = livenessTimers(clock);
+    const controller = new AbortController();
+    try {
+      const pending = harness.session.probeLiveness(controller.signal).catch(error => error);
+      await harness.network.flushAll();
+      const initial = harness.lastHostPing();
+      expect(timers.pending.size).toBe(2);
+      timers.advance(200);
+      await harness.network.flushAll();
+      timers.advance(200);
+      await harness.network.flushAll();
+      const pings = harness.hostEnvelopes.filter(envelope => envelope.liveness?.kind === "ping");
+      expect(pings).toHaveLength(V2_LIVENESS_PROBE_MAX_PUBLICATIONS);
+      for (const ping of pings) expect(ping).toMatchObject({
+        lane: "control", frames: [], targetInstanceId: harness.sidecarInstanceId,
+        liveness: initial,
+      });
+      expect(timers.pending.size).toBe(1);
+      timers.advance(200);
+      await expect(pending).resolves.toMatchObject({ code: "timeout" });
+      expect(clock.now()).toBe(10_600);
+      expect(timers.pending.size).toBe(0);
+      timers.advance(6_000);
+      await harness.network.flushAll();
+      expect(harness.hostEnvelopes.filter(envelope => envelope.liveness?.kind === "ping"))
+        .toHaveLength(V2_LIVENESS_PROBE_MAX_PUBLICATIONS);
+      expect(harness.hostFrames.size).toBe(0);
+    } finally {
+      controller.abort();
+      timers.restore();
+      await harness.close();
+    }
+  });
+
+  it.each(["success", "abort", "close", "recovery", "publish_failure", "deadline_jump"] as const)(
+    "clears every probe timer on %s without a later ping", async outcome => {
+      const clock = new ReceiptClock();
+      const harness = new TransportHarness({ clock, livenessTimeoutMs: 600, binding: R2_BINDING });
+      await harness.start();
+      const timers = livenessTimers(clock);
+      const controller = new AbortController();
+      try {
+        const pending = harness.session.probeLiveness(controller.signal).catch(error => error);
+        await harness.network.flushAll();
+        const ping = harness.lastHostPing();
+        expect(timers.pending.size).toBe(2);
+        if (outcome === "success") {
+          harness.publish([], { lane: "control", liveness: { kind: "pong", sentAtMs: ping.sentAtMs } });
+          await harness.network.flushAll();
+          await expect(pending).resolves.toMatchObject({ sentAtMs: ping.sentAtMs });
+        } else if (outcome === "abort") {
+          controller.abort();
+          await expect(pending).resolves.toMatchObject({ name: "AbortError" });
+        } else if (outcome === "close") {
+          await harness.session.close();
+          await expect(pending).resolves.toMatchObject({ code: "unavailable" });
+        } else if (outcome === "recovery") {
+          await harness.session.suspendSidecarRecovery("probe-timer-test");
+          await expect(pending).resolves.toMatchObject({ code: "instance_changed" });
+        } else if (outcome === "publish_failure") {
+          const publish = harness.host.publish.bind(harness.host);
+          harness.host.publish = (envelope, lane) => {
+            if (envelope.liveness?.kind === "ping") throw new Error("offline resend failure");
+            publish(envelope, lane);
+          };
+          timers.advance(200);
+          await expect(pending).resolves.toMatchObject({ code: "publish" });
+        } else {
+          timers.advance(600);
+          await expect(pending).resolves.toMatchObject({ code: "timeout" });
+        }
+        expect(timers.pending.size).toBe(0);
+        timers.advance(6_000);
+        await harness.network.flushAll();
+        expect(harness.hostEnvelopes.filter(envelope => envelope.liveness?.kind === "ping"))
+          .toHaveLength(1);
+        expect(harness.hostFrames.size).toBe(0);
+      } finally {
+        controller.abort();
+        timers.restore();
+        await harness.close();
+      }
+    },
+  );
+
+  it("keeps the same pending probe and deadline across Awareness reconnect", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ clock, livenessTimeoutMs: 600, binding: R2_BINDING });
+    await harness.start();
+    const timers = livenessTimers(clock);
+    const controller = new AbortController();
+    try {
+      const pending = harness.session.probeLiveness(controller.signal).catch(error => error);
+      await harness.network.flushAll();
+      const ping = harness.lastHostPing();
+      timers.advance(100);
+      await harness.session.resumeAwareness();
+      await harness.network.flushAll();
+      expect([...timers.pending.values()].map(timer => timer.dueAtMs).sort()).toEqual([10_200, 10_600]);
+      expect(harness.lastHostPing()).toEqual(ping);
+      controller.abort();
+      await expect(pending).resolves.toMatchObject({ name: "AbortError" });
+      expect(timers.pending.size).toBe(0);
+    } finally {
+      controller.abort();
+      timers.restore();
+      await harness.close();
+    }
+  });
+
+  it("rejects a matching pong at the original deadline before delayed timers run", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ clock, livenessTimeoutMs: 600, binding: R2_BINDING });
+    await harness.start();
+    const timers = livenessTimers(clock);
+    const controller = new AbortController();
+    try {
+      const pending = harness.session.probeLiveness(controller.signal).catch(error => error);
+      await harness.network.flushAll();
+      const ping = harness.lastHostPing();
+      clock.value += 600;
+      harness.publish([], { lane: "control", liveness: { kind: "pong", sentAtMs: ping.sentAtMs } });
+      await harness.network.flushAll();
+      await expect(pending).resolves.toMatchObject({ code: "timeout" });
+      expect(timers.pending.size).toBe(0);
+    } finally {
+      controller.abort();
+      timers.restore();
+      await harness.close();
+    }
   });
 
   it("accepts only an exact pong from the bootstrap-bound sidecar instance", async () => {

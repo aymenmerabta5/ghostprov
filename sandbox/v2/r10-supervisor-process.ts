@@ -518,7 +518,14 @@ export class SupervisorProcessManager {
   handle(command: SupervisorCommand): Promise<SupervisorStatus> {
     if (command.kind === "shutdown") {
       this.#closing = true;
-      return this.#shutdown ??= this.#shutdownChild();
+      if (this.#shutdown) return this.#shutdown;
+      const shutdown = this.#shutdownChild().catch(error => {
+        // Retain the exact child and closing fence; only cleanup may retry.
+        if (this.#shutdown === shutdown) this.#shutdown = null;
+        throw error;
+      });
+      this.#shutdown = shutdown;
+      return shutdown;
     }
     if (this.#closing || this.#operation) return Promise.reject(new SupervisorCommandError("not_ready"));
     const operation = (command.kind === "launch" ? this.#launch(command)

@@ -3,6 +3,7 @@ import type { ProvisionedSandbox } from "../prism/protocol";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import type { V2TransportSnapshot } from "../v2/transport/session";
 import type { RateLimitHint, RateLimitProblem } from "../v2/rate-limit";
+import type { SandboxLivenessRecovery } from "./liveness";
 
 export type SandboxAvailabilityReason =
   | "available"
@@ -54,6 +55,8 @@ export interface RoutableSandboxSnapshot {
   sidecarPeerAgeMs?: number | null;
   /** Exact V2 transport connection state used with sidecar-peer liveness proof. */
   transportConnected?: boolean;
+  /** Internal ownership of bounded liveness recovery, never a readiness proof. */
+  livenessRecovery?: SandboxLivenessRecovery | null;
   credentialExpiresInMs: number | null;
   ackEwmaMs: number;
   completionEwmaMs: number;

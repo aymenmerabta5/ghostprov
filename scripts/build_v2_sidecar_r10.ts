@@ -2,9 +2,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { assertReleaseBundle, canonicalV2SidecarBundle, V2_R8_SIDECAR_BUILD_RECIPE } from "./build_v2_sidecar_release";
 import { protocolSchemaHash, sha256Hex, utf8Bytes } from "../src/v2/protocol/shared";
+import { loadV2SidecarAssets, r10SidecarArtifactPath } from "../src/v2/sidecar/assets";
 
 const ROOT = path.resolve(import.meta.dir, "..");
-export const R10_ARTIFACT = path.join(ROOT, "src/v2/sidecar/releases/r10/sidecar.bundle.js");
+export const R10_ARTIFACT = r10SidecarArtifactPath();
 
 /** Build without writing or changing any immutable release registration. */
 export async function buildR10Sidecar() {
@@ -50,7 +51,13 @@ export async function checkR10Sidecar(options: { write?: boolean; artifactPath?:
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  if (args.length > 1 || (args.length === 1 && args[0] !== "--write" && args[0] !== "--check")) throw new Error("Usage: bun scripts/build_v2_sidecar_r10.ts [--check|--write]");
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--write" && args[0] !== "--check" && args[0] !== "--check-deno")) throw new Error("Usage: bun scripts/build_v2_sidecar_r10.ts [--check|--write|--check-deno]");
+  if (args[0] === "--check-deno") {
+    await loadV2SidecarAssets({ revision: "r10" });
+    const check = Bun.spawn([process.execPath, "--no-env-file", "x", "--no-install", "deno@2.9.5", "check",
+      "--no-config", "--no-remote", "--no-npm", "--no-lock", R10_ARTIFACT], { cwd: ROOT, stdout: "inherit", stderr: "inherit" });
+    process.exit(await check.exited);
+  }
   const built = await checkR10Sidecar({ write: args[0] === "--write" });
   console.log(JSON.stringify({ ...built.identity, bytes: built.bytes.length, mode: args[0] === "--write" ? "write" : "check" }, null, 2));
 }

@@ -332,6 +332,9 @@ export class FleetSampler {
         heartbeat_age_ms: runtime.heartbeatAgeMs,
         sidecar_peer_age_ms: runtime.sidecarPeerAgeMs ?? null,
         transport_connected: runtime.transportConnected ?? null,
+        liveness_recovery_remaining_ms: runtime.livenessRecovery
+          ? Math.max(0, runtime.livenessRecovery.deadlineAtMs - this.#clock.now())
+          : null,
         credential_expires_in_ms: runtime.credentialExpiresInMs,
         memory_pressure: runtime.memoryPressure,
         error_kind: runtime.failure?.kind ?? null,

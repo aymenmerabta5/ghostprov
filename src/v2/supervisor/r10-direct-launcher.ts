@@ -1,4 +1,4 @@
-import { V2_R10_RELEASE } from "../sidecar/assets";
+import { V2_R10_RELEASE, V2_RETIREMENT_RELEASE_IDENTITIES } from "../sidecar/assets";
 import { supervisorInstallScript, type SupervisorExecRequest } from "./r10-launcher";
 
 export const DIRECT_SUPERVISOR_LAUNCH_PATH = "exec";
@@ -6,6 +6,8 @@ export const DIRECT_SUPERVISOR_INSTALL_PATH = ".ghostprov-v2/direct-exec/install
 const MAX_LAUNCH_BYTES = 12 * 1024;
 const LEGACY_WORKSPACE_LINE = "WORKSPACE=$(readlink -f /workspace)";
 const R10_ENTRYPOINT = `.ghostprov-v2/revisions/r10/${V2_R10_RELEASE.schemaHash}/${V2_R10_RELEASE.buildHash}/sidecar.bundle.js`;
+const RETIREMENT_ENTRYPOINTS = new Set(V2_RETIREMENT_RELEASE_IDENTITIES.filter(release => release.revision === "r10")
+  .map(release => `.ghostprov-v2/revisions/r10/${release.schemaHash}/${release.buildHash}/sidecar.bundle.js`));
 
 export function isRegisteredR10Entrypoint(value: string): boolean { return value === R10_ENTRYPOINT; }
 
@@ -17,6 +19,16 @@ export interface DirectSupervisorLaunchFiles {
 /** Host-only adaptation; the registered R10 installer and bundle stay frozen. */
 export function directSupervisorLaunchFiles(input: SupervisorExecRequest): DirectSupervisorLaunchFiles {
   if (input.entrypointPath !== R10_ENTRYPOINT) throw new TypeError("Direct supervisor requires the registered R10 entrypoint");
+  return launchFiles(input);
+}
+
+/** Reconstruct only exact registered prior files for compare-and-delete cleanup. */
+export function supervisorCleanupFiles(input: SupervisorExecRequest): DirectSupervisorLaunchFiles {
+  if (!RETIREMENT_ENTRYPOINTS.has(input.entrypointPath)) throw new TypeError("Supervisor cleanup requires an exact registered R10 entrypoint");
+  return launchFiles(input);
+}
+
+function launchFiles(input: SupervisorExecRequest): DirectSupervisorLaunchFiles {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/.test(input.supervisorNonce)) {
     throw new TypeError("Direct supervisor nonce is invalid");
   }

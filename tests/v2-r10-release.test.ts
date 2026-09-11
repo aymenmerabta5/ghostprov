@@ -3,8 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildR10Sidecar, checkR10Sidecar } from "../scripts/build_v2_sidecar_r10";
-import { V2_R9_RELEASE, V2_R10_RELEASE, loadV2SidecarAssets } from "../src/v2/sidecar/assets";
-import { isRegisteredR10Entrypoint, directSupervisorLaunchFiles } from "../src/v2/supervisor/r10-direct-launcher";
+import { V2_R9_RELEASE, V2_R10_RELEASE, V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY, V2_R10_C1091742_RETIREMENT_IDENTITY, loadV2SidecarAssets, loadV2SidecarRecoveryAssets } from "../src/v2/sidecar/assets";
+import { isRegisteredR10Entrypoint, directSupervisorLaunchFiles, supervisorCleanupFiles } from "../src/v2/supervisor/r10-direct-launcher";
 import { safeV2ReleaseIdentity } from "../src/v2/release-observability";
 
 const roots: string[] = [];
@@ -51,5 +51,22 @@ describe("R10 immutable release", () => {
     const identity = { releaseRevision: "r10", protocolRevision: "r2", buildHash: assets.buildHash, schemaHash: assets.schemaHash } as const;
     expect(safeV2ReleaseIdentity(identity)).toEqual(identity);
     expect(safeV2ReleaseIdentity({ ...identity, buildHash: V2_R9_RELEASE.buildHash })).toBeNull();
+  });
+
+  it.each([
+    ["initial", V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY],
+    ["c1091742", V2_R10_C1091742_RETIREMENT_IDENTITY],
+  ] as const)("allows archived R10 %s files only for exact cleanup reconstruction", async (_name, identity) => {
+    const old = await loadV2SidecarRecoveryAssets(identity);
+    const input = { entrypointPath: old.entrypointPath, supervisorNonce: "prior-nonce" };
+    expect(supervisorCleanupFiles(input).installer).toContain(old.entrypointPath);
+    if (old.buildHash !== V2_R10_RELEASE.buildHash) {
+      expect(isRegisteredR10Entrypoint(old.entrypointPath)).toBe(false);
+      expect(() => directSupervisorLaunchFiles(input)).toThrow();
+    }
+    for (const invalid of [old.entrypointPath + "\n", old.entrypointPath + ".old", "prefix" + old.entrypointPath,
+      old.entrypointPath.replace(old.buildHash, "0".repeat(64)), old.entrypointPath.replace(old.schemaHash, V2_R9_RELEASE.buildHash)]) {
+      expect(() => supervisorCleanupFiles({ ...input, entrypointPath: invalid })).toThrow();
+    }
   });
 });

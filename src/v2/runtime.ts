@@ -19,7 +19,12 @@ import type {
 } from "../sandbox/registry";
 import { describeSandboxFailure } from "../sandbox/failure";
 import type { SandboxHeartbeatAttemptDiagnostic } from "../sandbox/heartbeat";
-import { hasFreshExactSidecarLiveness } from "../sandbox/liveness";
+import {
+  hasFreshExactSidecarLiveness,
+  isActiveSandboxLivenessRecovery,
+  SANDBOX_LIVENESS_RECOVERY_MAX_MS,
+  type SandboxLivenessRecovery,
+} from "../sandbox/liveness";
 import type { ProjectId } from "../sandbox/types";
 import type { AwarenessChannel } from "./awareness/channel";
 import type { V2ReadyDescriptor } from "./bootstrap/controller";
@@ -513,6 +518,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #ySweetLoop: Promise<void> | null = null;
   #sidecarLoop: Promise<void> | null = null;
   #sidecarSuspect = false;
+  #sidecarProbe: {
+    readonly transport: V2RuntimeTransport;
+    readonly promise: Promise<{ rttMs: number; sentAtMs: number }>;
+  } | null = null;
+  #livenessRecovery: SandboxLivenessRecovery | null = null;
+  #livenessRecoveryTimer: AbortController | null = null;
   #gateway: V2RuntimeGateway | null = null;
   #heartbeat: V2RuntimeHeartbeat | null = null;
   #ydoc: V2RuntimeYDoc | null = null;
@@ -820,6 +831,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       heartbeatAgeMs: heartbeatAt === null ? null : Math.max(0, this.#clock.now() - heartbeatAt),
       sidecarPeerAgeMs: transport?.sidecarPeerAgeMs ?? null,
       transportConnected: transport?.connected ?? false,
+      livenessRecovery: this.#livenessRecovery,
       credentialExpiresInMs: this.#credentials
         ? Math.max(0, this.#credentials.resource.expiresAtMs - this.#clock.now())
         : null,
@@ -970,9 +982,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           }
           if (
             this.#state === "ready" &&
-            transport?.connected === true &&
-            this.#sidecarSuspect &&
-            this.#sidecarLoop !== null
+            this.#sidecarLoop !== null &&
+            isActiveSandboxLivenessRecovery(this.#livenessRecovery, this.#clock.now())
           ) {
             // The exact-sidecar monitor has already removed this runtime from
             // routing and owns a bounded same-session recovery. Do not let a
@@ -1182,10 +1193,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           signal,
           recheckSourceBeforeRelaunch,
         );
+        if (signal.aborted || generation !== this.#generation) return false;
         recheckSourceBeforeRelaunch = false;
         consecutiveFailures = 0;
         consecutiveReliableStalls = 0;
         this.#sidecarSuspect = false;
+        this.#finishLivenessRecovery();
         this.#emit();
         this.#notifyLiveness({
           signal: "sidecar_recovery",
@@ -1266,6 +1279,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           });
           if (!this.#sidecarSuspect) {
             this.#sidecarSuspect = true;
+            this.#beginLivenessRecovery();
             this.#emit();
           }
           if (consecutiveReliableStalls >= this.#sidecarStallSampleThreshold) {
@@ -1281,11 +1295,12 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           consecutiveReliableStalls = 0;
           const priorFailures = consecutiveFailures;
           const wasSuspect = this.#sidecarSuspect;
-          await monitoredTransport.probeLiveness!(signal);
+          await this.#probeSidecarLiveness(monitoredTransport, signal);
           if (generation !== this.#generation) return;
           consecutiveFailures = 0;
           if (this.#sidecarSuspect) {
             this.#sidecarSuspect = false;
+            this.#finishLivenessRecovery();
             this.#emit();
           }
           if (priorFailures > 0 || wasSuspect) {
@@ -1318,6 +1333,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         }
         if (!this.#sidecarSuspect) {
           this.#sidecarSuspect = true;
+          this.#beginLivenessRecovery();
           this.#emit();
         }
         if (
@@ -1363,6 +1379,31 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     });
   }
 
+  #probeSidecarLiveness(
+    transport: V2RuntimeTransport,
+    signal: AbortSignal,
+  ): Promise<{ rttMs: number; sentAtMs: number }> {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    const existing = this.#sidecarProbe;
+    if (existing) {
+      if (existing.transport !== transport) {
+        return Promise.reject(new Error("V2 liveness probe belongs to a retiring transport"));
+      }
+      return this.#abortable(existing.promise, signal);
+    }
+    // Reconnect and periodic monitoring prove the same bootstrap-bound peer.
+    // Share its one bounded probe; a caller's shorter deadline must not cancel
+    // proof still owned by the current runtime generation.
+    const generationSignal = this.#controller?.signal ?? signal;
+    const source = Promise.resolve().then(() => transport.probeLiveness!(generationSignal));
+    const promise = this.#abortable(source, generationSignal).finally(() => {
+      if (this.#sidecarProbe === probe) this.#sidecarProbe = null;
+    });
+    const probe = { transport, promise };
+    this.#sidecarProbe = probe;
+    return this.#abortable(promise, signal);
+  }
+
   #relaunchSidecar(
     generation: number,
     sourceTransport: V2RuntimeTransport,
@@ -1375,7 +1416,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     parentSignal.addEventListener("abort", forwardAbort, { once: true });
     if (parentSignal.aborted) forwardAbort();
     const timeoutController = new AbortController();
-    void this.#clock.sleep(this.#sidecarRecoveryTimeoutMs, timeoutController.signal).then(() => {
+    const recoveryDeadline = Math.min(
+      this.#clock.now() + this.#sidecarRecoveryTimeoutMs,
+      this.#livenessRecovery?.deadlineAtMs ?? Number.POSITIVE_INFINITY,
+    );
+    void this.#clock.waitUntil(recoveryDeadline, timeoutController.signal).then(() => {
       controller.abort(new DOMException(
         "V2 in-place sidecar recovery deadline expired",
         "TimeoutError",
@@ -1728,6 +1773,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#controller?.signal.aborted
       ) return;
       this.#ySweetReconnectPending = true;
+      this.#beginLivenessRecovery();
       const kind = livenessErrorKind(error);
       this.#ySweetReconnectNeedsRotation ||= kind !== "disconnected" &&
         kind !== "connect" && kind !== "timeout";
@@ -1799,7 +1845,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       );
       if (reconnectController.signal.aborted) return false;
       await this.#abortable(
-        transport.probeLiveness(reconnectController.signal),
+        this.#probeSidecarLiveness(transport, reconnectController.signal),
         reconnectController.signal,
       );
       return !reconnectController.signal.aborted && this.#clock.now() < deadline &&
@@ -1846,6 +1892,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       ) {
         return;
       }
+      const rotationIsCurrent = () => !signal.aborted && generation === this.#generation &&
+        bootstrap === this.#bootstrap && transport === this.#transport &&
+        awareness === this.#awareness && supervisor === this.#supervisor &&
+        credentials.ySweet === this.#credentials?.ySweet;
       const reconnectAttempt = this.#ySweetReconnectPending;
       const reconnectStartedAtMs = this.#clock.now();
       let reconnectPhase: SandboxReconnectPhase = "mint_credential";
@@ -1869,10 +1919,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
               signal,
             );
             if (
-              signal.aborted || generation !== this.#generation ||
-              bootstrap !== this.#bootstrap || transport !== this.#transport ||
-              awareness !== this.#awareness || supervisor !== this.#supervisor ||
-              credentials.ySweet !== this.#credentials?.ySweet ||
+              !rotationIsCurrent() ||
               failureVersion !== this.#awarenessFailureVersion
             ) return false;
             if (reconnected) {
@@ -1880,6 +1927,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
               // socket handshake plus an instance-bound pong is sufficient
               // for transient loss; the original credential renewal stays due.
               this.#ySweetReconnectPending = false;
+              this.#finishLivenessRecovery();
               this.#ySweetRefreshRequested = false;
               reusedCredential = true;
               return true;
@@ -1900,13 +1948,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             },
             signal,
           );
+          if (!rotationIsCurrent()) return false;
           const sealedJson = await bootstrap.sealCredentialRotation!(ySweet, rotationId);
-          if (
-            generation !== this.#generation ||
-            bootstrap !== this.#bootstrap ||
-            transport !== this.#transport ||
-            awareness !== this.#awareness
-          ) return false;
+          if (!rotationIsCurrent()) return false;
           if (supervisor) {
             reconnectPhase = "supervisor_rotation";
             await supervisor.rotateCredential(
@@ -1914,6 +1958,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
               `supervisor-${rotationId}`,
               signal,
             );
+            if (!rotationIsCurrent()) return false;
           }
           const awarenessFailureVersion = this.#awarenessFailureVersion;
           const reconnectFirst = this.#ySweetReconnectPending;
@@ -1924,32 +1969,29 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             // sidecar over the restored reliable transport.
             reconnectPhase = "host_reconnect";
             await awareness.rotateCredential?.(ySweet);
+            if (!rotationIsCurrent()) return false;
             await transport.resumeAwareness?.(signal);
           }
           if (
-            generation !== this.#generation ||
-              bootstrap !== this.#bootstrap ||
-              transport !== this.#transport ||
-              awareness !== this.#awareness ||
-              supervisor !== this.#supervisor ||
-              awarenessFailureVersion !== this.#awarenessFailureVersion
+            !rotationIsCurrent() ||
+            awarenessFailureVersion !== this.#awarenessFailureVersion
           ) return false;
           reconnectPhase = "sidecar_rotation";
           await transport.rotateCredential!(rotationId, sealedJson, signal);
+          if (!rotationIsCurrent()) return false;
           if (!reconnectFirst) {
             reconnectPhase = "host_reconnect";
             await awareness.rotateCredential?.(ySweet);
+            if (!rotationIsCurrent()) return false;
             await transport.resumeAwareness?.(signal);
           }
           if (
-            generation !== this.#generation ||
-            bootstrap !== this.#bootstrap ||
-            transport !== this.#transport ||
-            awareness !== this.#awareness ||
+            !rotationIsCurrent() ||
             awarenessFailureVersion !== this.#awarenessFailureVersion
           ) return false;
           this.#credentials = { ...this.#credentials!, ySweet };
           this.#ySweetReconnectPending = false;
+          this.#finishLivenessRecovery();
           this.#ySweetReconnectNeedsRotation = false;
           this.#ySweetRefreshRequested = false;
           return true;
@@ -2266,7 +2308,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #abortable<T>(source: Promise<T>, signal: AbortSignal): Promise<T> {
-    if (signal.aborted) return Promise.reject(signal.reason);
+    if (signal.aborted) {
+      void source.catch(() => undefined);
+      return Promise.reject(signal.reason);
+    }
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       const finish = (operation: () => void) => {
@@ -2318,6 +2363,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#sidecarRelaunchContext = null;
     this.#controller = null;
     this.#sidecarSuspect = false;
+    this.#sidecarProbe = null;
+    this.#clearLivenessRecovery();
     this.#credentialRefreshPending = false;
     this.#ySweetReconnectPending = false;
     this.#ySweetReconnectNeedsRotation = false;
@@ -2346,12 +2393,43 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #setState(state: RuntimeState): void {
+    if (state !== "ready") this.#clearLivenessRecovery();
     this.#state = state;
     this.#emit();
   }
 
   #emit(): void {
     for (const listener of this.#listeners) listener();
+  }
+
+  #beginLivenessRecovery(): void {
+    if (this.#livenessRecovery || this.#state !== "ready" ||
+      this.#binding?.protocolRevision !== "r2" || !this.#transport?.probeLiveness) return;
+    const startedAtMs = this.#clock.now();
+    const recovery = Object.freeze({
+      startedAtMs,
+      deadlineAtMs: startedAtMs + SANDBOX_LIVENESS_RECOVERY_MAX_MS,
+    });
+    this.#livenessRecovery = recovery;
+    const generation = this.#generation;
+    const timer = new AbortController();
+    this.#livenessRecoveryTimer = timer;
+    void this.#clock.waitUntil(recovery.deadlineAtMs, timer.signal).then(() => {
+      if (this.#livenessRecovery !== recovery || generation !== this.#generation) return;
+      this.#notifyLiveness({ signal: "sidecar_recovery", outcome: "recovery_deadline_expired" });
+      this.#failGeneration(generation, new V2RuntimeLifecycleFailure("sidecar_unreachable", null));
+    }, () => undefined);
+    this.#notifyLiveness({ signal: "sidecar_recovery", outcome: "waiting_for_transport_recovery" });
+  }
+
+  #finishLivenessRecovery(): void {
+    if (!this.#sidecarSuspect && !this.#ySweetReconnectPending) this.#clearLivenessRecovery();
+  }
+
+  #clearLivenessRecovery(): void {
+    this.#livenessRecoveryTimer?.abort();
+    this.#livenessRecoveryTimer = null;
+    this.#livenessRecovery = null;
   }
 
   #notifyLiveness(diagnostic: V2RuntimeLivenessDiagnostic): void {

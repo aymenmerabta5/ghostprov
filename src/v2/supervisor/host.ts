@@ -25,12 +25,14 @@ import {
 } from "./protocol";
 import type { SupervisorAwarenessProviderLike } from "./provider";
 import { SupervisorMailbox } from "./mailbox";
+import { SUPERVISOR_RETIREMENT_MAP, parseSupervisorRetirementReceipt, readSupervisorRetirementReceipt } from "./retirement-receipt";
 
 export const SUPERVISOR_MAX_PENDING_OPERATIONS = 4;
 const SUPERVISOR_MAX_SCANNED_PEERS = 128;
 const SUPERVISOR_CHALLENGE_MAX_PUBLICATIONS = 4;
 const SUPERVISOR_PUBLICATION_FIELD = "ghostprovV2SupervisorPublication";
 export type V2SupervisorPhase = "transport" | "bootstrap" | "sequence" | "challenge" | "command";
+type SupervisorConnectionProof = "live" | "shutdown";
 
 export class V2SupervisorError extends Error {
   readonly name = "V2SupervisorError";
@@ -162,10 +164,11 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   #connected = false;
   #transportSynced = false;
   #bootstrapProven = false;
+  #shutdownProven = false;
   #connectionVersion = 0;
   #closed = false;
-  #connecting: Promise<void> | null = null;
-  #connectResolve: (() => void) | null = null;
+  #connecting: Promise<SupervisorConnectionProof> | null = null;
+  #connectResolve: ((proof?: SupervisorConnectionProof) => void) | null = null;
   #connectReject: ((error: unknown) => void) | null = null;
   #connectContinue: (() => void) | null = null;
   #connectPhase: V2SupervisorPhase | null = null;
@@ -194,6 +197,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     this.#provider.on("connection-error", this.#onConnectionError);
     this.#provider.on("connection-close", this.#onConnectionError);
     this.#provider.on("sync", this.#onSync);
+    if (this.#recoverExisting) this.#doc.getMap(SUPERVISOR_RETIREMENT_MAP).observe(this.#onRetirementReceiptChange);
   }
 
   ensureReady(signal?: AbortSignal): Promise<void> {
@@ -201,12 +205,19 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   }
 
   connect(signal?: AbortSignal): Promise<void> {
+    return this.#connect(signal).then(proof => {
+      if (proof === "shutdown") throw new V2SupervisorError("V2 supervisor has already shut down", "closed");
+    });
+  }
+
+  #connect(signal?: AbortSignal): Promise<SupervisorConnectionProof> {
     if (this.#closed) return Promise.reject(new V2SupervisorError("V2 supervisor host is closed", "closed"));
     if (signal?.aborted) return Promise.reject(abortError(signal));
-    if (this.#connected) return Promise.resolve();
+    if (this.#shutdownProven) return Promise.resolve("shutdown");
+    if (this.#connected) return Promise.resolve("live");
     if (this.#connecting) return this.#connecting;
     const deadlineMs = this.#clock.now() + this.#connectTimeoutMs;
-    const connecting = new Promise<void>((resolve, reject) => {
+    const connecting = new Promise<SupervisorConnectionProof>((resolve, reject) => {
       const timeout = new AbortController();
       const operation = new AbortController();
       let settled = false;
@@ -225,15 +236,16 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       };
       const onAbort = () => finish(() => reject(abortError(signal)));
       const fail = (error: unknown) => finish(() => reject(error));
-      const succeed = () => {
+      const succeed = (proof: SupervisorConnectionProof = "live") => {
         if (this.#clock.now() >= deadlineMs) {
           fail(new V2SupervisorError("Supervisor readiness arrived after its deadline", "timeout", undefined, this.#connectPhase ?? "transport"));
           return;
         }
         finish(() => {
-          this.#connected = true;
+          this.#connected = proof === "live";
+          this.#shutdownProven = proof === "shutdown";
           this.#bootstrapProven = true;
-          resolve();
+          resolve(proof);
         });
       };
       this.#connectResolve = succeed;
@@ -241,6 +253,12 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       this.#connectPhase = "transport";
       this.#connectContinue = () => {
         if (settled || probing || !this.#transportSynced) return;
+        const retired = this.#boundRetirementReceipt();
+        if (retired) {
+          this.#connectPhase = "bootstrap";
+          this.#acceptStatus(retired);
+          return;
+        }
         if (!this.#bootstrapProven) { this.#connectPhase = "bootstrap"; return; }
         // A signed retained reply can establish which command was consumed,
         // but only a new challenge reply can establish current peer liveness.
@@ -375,10 +393,16 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   shutdown(reason: string, signal?: AbortSignal): Promise<void> {
     const command = parseSupervisorCommand({ kind: "shutdown", reason });
     return this.#enqueue(async () => {
-      const status = await this.#send(command, signal);
+      // An authenticated terminal from this exact journal-authorized instance
+      // proves child cleanup, even when that retired peer cannot answer a fresh
+      // liveness challenge. It never makes connect/launch succeed.
+      if (await this.#connect(signal) === "shutdown") return;
+      const status = await this.#publishCommand(command, signal);
       if (status.kind !== "shutdown") {
         throw new V2SupervisorError("Supervisor returned mismatched shutdown proof", "protocol");
       }
+      this.#shutdownProven = true;
+      this.#connected = false;
     });
   }
 
@@ -395,6 +419,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     this.#provider.off("connection-error", this.#onConnectionError);
     this.#provider.off("connection-close", this.#onConnectionError);
     this.#provider.off("sync", this.#onSync);
+    if (this.#recoverExisting) this.#doc.getMap(SUPERVISOR_RETIREMENT_MAP).unobserve(this.#onRetirementReceiptChange);
     this.#provider.awareness.setLocalState(null);
     this.#provider.disconnect();
     this.#provider.destroy();
@@ -520,7 +545,10 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   #acceptStatus(value: unknown): void {
     let parsed: SignedSupervisorSandboxMessage;
     try {
-      parsed = parseSupervisorSandboxMessage(value);
+      // A retained ready/status publication can arrive after the document's
+      // terminal. Keep that exact terminal in the one bounded verification
+      // slot instead of letting stale liveness overtake irreversible cleanup.
+      parsed = this.#boundRetirementReceipt() ?? parseSupervisorSandboxMessage(value);
     } catch {
       return;
     }
@@ -529,9 +557,10 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       !sameSupervisorBinding(parsed.binding, this.binding) ||
       parsed.supervisorInstanceId !== this.instanceId ||
       (parsed.sequence !== this.#pending?.sequence &&
+        !(this.#recoverExisting && this.#connectResolve && parsed.message.kind === "shutdown") &&
         !(parsed.sequence === 0 && parsed.message.kind === "ready" && !this.#bootstrapProven && this.#connectResolve) &&
         !(this.#recoverExisting && !this.#bootstrapProven && this.#sequence === 0 && this.#connectResolve &&
-          parsed.sequence > 0 && parsed.message.kind !== "ready" && parsed.message.kind !== "shutdown") &&
+          (parsed.message.kind === "shutdown" || parsed.sequence > 0 && parsed.message.kind !== "ready")) &&
         !(this.#connectResolve && this.#sequence > this.#confirmedSequence && parsed.sequence === this.#sequence))
     ) return;
     this.#mailbox.offer(parsed);
@@ -541,12 +570,17 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     const connectionVersion = this.#connectionVersion;
     if (!await verifySupervisorSandboxMessage(this.#rotationKey, parsed)) return;
     if (this.#closed) return;
+    if (this.#recoverExisting && this.#connectResolve && parsed.message.kind === "shutdown" &&
+      this.#transportSynced && connectionVersion === this.#connectionVersion) {
+      this.#connectResolve("shutdown");
+      return;
+    }
     if (this.#recoverExisting && !this.#bootstrapProven && this.#connectResolve &&
       this.#transportSynced && connectionVersion === this.#connectionVersion && !this.#pending &&
       (parsed.sequence === 0 && parsed.message.kind === "ready" ||
-        parsed.sequence > 0 && parsed.message.kind !== "ready" && parsed.message.kind !== "shutdown")) {
+        parsed.message.kind === "shutdown" || parsed.sequence > 0 && parsed.message.kind !== "ready")) {
       // The MAC authenticates exact journal authority and the consumed sequence.
-      // A fresh challenge must still prove liveness before any shutdown/launch.
+      // Nonterminal status still requires a fresh challenge before commands.
       this.#sequence = parsed.sequence;
       this.#confirmedSequence = parsed.sequence;
       this.#bootstrapProven = true;
@@ -583,7 +617,25 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       if (++scanned > SUPERVISOR_MAX_SCANNED_PEERS) break;
       if (clientId !== this.#doc.clientID) this.#acceptStatus(state[GP_V2_SUPERVISOR_FIELD]);
     }
+    this.#scanRetirementReceipt();
   }
+
+  #scanRetirementReceipt(): void {
+    const terminal = this.#boundRetirementReceipt();
+    // This feeds the existing bounded mailbox and exact HMAC/identity checks.
+    // A persisted terminal never bypasses verification or proves live readiness.
+    if (terminal) this.#acceptStatus(terminal);
+  }
+
+  #boundRetirementReceipt(): SignedSupervisorSandboxMessage | null {
+    if (!this.#recoverExisting || this.#closed || !this.#transportSynced || !this.#connectResolve) return null;
+    const raw = readSupervisorRetirementReceipt(this.#doc);
+    const terminal = raw === null ? null : parseSupervisorRetirementReceipt(raw);
+    return terminal && sameSupervisorBinding(terminal.binding, this.binding) && terminal.supervisorInstanceId === this.instanceId
+      ? terminal : null;
+  }
+
+  readonly #onRetirementReceiptChange = (): void => { this.#scanRetirementReceipt(); };
 
   readonly #onSync = (synced: boolean): void => {
     if (this.#closed) return;

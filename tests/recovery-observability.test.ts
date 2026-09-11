@@ -210,7 +210,8 @@ describe("recovery observability schema", () => {
 
   it("normalizes dynamic reasons and errors without retaining free-form text", () => {
     expect(normalizeSandboxRecoveryCause("state:auth_required")).toBe("credentials");
-    expect(normalizeSandboxRecoveryCause("heartbeat-stale")).toBe("heartbeat");
+    expect(normalizeSandboxRecoveryCause("heartbeat-stale")).toBe("heartbeat_stale");
+    expect(normalizeSandboxRecoveryCause("heartbeat-missing")).toBe("heartbeat_missing");
     expect(normalizeSandboxRecoveryCause("SUPER_SECRET_CANARY")).toBe("unknown");
     expect(normalizeSandboxRecoveryOperation("wait-for-sync")).toBe("wait_for_sync");
     expect(normalizeSandboxRecoveryOperation("sidecar_liveness")).toBe("sidecar_liveness");

@@ -300,6 +300,9 @@ export function classifyFleetRecoveryFailure(value: unknown): FleetRecoveryClass
     if (
       name === "accounttransporterror" ||
       kind === "heartbeat_unreachable" ||
+      kind === "heartbeat_stale" || kind === "heartbeat_missing" ||
+      reason === "heartbeat_unreachable" ||
+      reason === "heartbeat_stale" || reason === "heartbeat_missing" ||
       kind === "account_transport" ||
       reason === "account_transport" ||
       operation === "account_transport"

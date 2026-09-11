@@ -16,7 +16,7 @@ import type {
   SandboxRunOptions,
 } from "./registry";
 import { describeSandboxFailure } from "./failure";
-import { hasFreshExactSidecarLiveness } from "./liveness";
+import { hasFreshExactSidecarLiveness, isActiveSandboxLivenessRecovery } from "./liveness";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import { V2PreCommitError } from "../v2/transport/run-handle";
 
@@ -400,6 +400,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       state,
       capacity: 0,
       available: 0,
+      livenessRecovery: null,
       ...(this.#recovery ? {
         recovery: {
           attempt: this.#recovery.attempt,
@@ -857,6 +858,10 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       return "credentials-expiring";
     }
     if (snapshot.state === "ready") {
+      // The child owns recovery until its fixed deadline. It remains unroutable;
+      // a stale heartbeat must not retire it while that exact owner reconnects.
+      if (snapshot.capacity === 0 && snapshot.available === 0 &&
+        isActiveSandboxLivenessRecovery(snapshot.livenessRecovery, this.#clock.now())) return null;
       const exactSidecarFresh = hasFreshExactSidecarLiveness(snapshot);
       if (
         snapshot.heartbeatAgeMs !== null &&

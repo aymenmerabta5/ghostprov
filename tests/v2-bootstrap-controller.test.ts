@@ -28,6 +28,9 @@ import {
 } from "../src/v2/protocol/shared";
 import {
   loadV2SidecarAssets,
+  V2_R10_RELEASE,
+  V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY,
+  V2_R10_C1091742_RETIREMENT_IDENTITY,
   type V2SidecarRevision,
 } from "../src/v2/sidecar/assets";
 import type { V2BootstrapSupervisor } from "../src/v2/supervisor/host";
@@ -570,7 +573,7 @@ describe("V2BootstrapController", () => {
       .toThrow(/relay.*R2|R2.*relay/i);
   });
 
-  it("matches only exact registered R1-R9 sidecar entrypoints", async () => {
+  it("matches only exact registered sidecar entrypoints including archived R10", async () => {
     const harness = bootstrapHarness("none", "r8", 8, R8_ASSETS);
     await harness.controller.ensureReady();
     const launcher = harness.gateway.launchers[0]!;
@@ -643,6 +646,16 @@ describe("V2BootstrapController", () => {
     const initialR2Entrypoint = `/workspace/.ghostprov-v2/revisions/r2/${INITIAL_R2_RETIREMENT_IDENTITY.schemaHash}/${INITIAL_R2_RETIREMENT_IDENTITY.buildHash}/sidecar.bundle.js`;
     expect(allReleases.regex.test(initialR2Entrypoint)).toBe(true);
     expect(r2Releases.regex.test(initialR2Entrypoint)).toBe(true);
+    for (const identity of [V2_R10_RELEASE, V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY, V2_R10_C1091742_RETIREMENT_IDENTITY]) {
+      const exact = `/workspace/.ghostprov-v2/revisions/r10/${identity.schemaHash}/${identity.buildHash}/sidecar.bundle.js`;
+      expect(allReleases.regex.test(exact)).toBe(true);
+      expect(r2Releases.regex.test(exact)).toBe(true);
+      for (const invalid of [exact + "\n", exact + ".old", "prefix" + exact,
+        exact.replace(identity.buildHash, identity.schemaHash), exact.replace(identity.schemaHash, R2_ASSETS.schemaHash)]) {
+        expect(allReleases.regex.test(invalid)).toBe(false);
+        expect(r2Releases.regex.test(invalid)).toBe(false);
+      }
+    }
   });
 
   it("rejects an unregistered sidecar revision before generating a launcher", () => {

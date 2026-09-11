@@ -5,6 +5,8 @@ import {
   DEFAULT_V2_SIDECAR_REVISION,
   hashV2SidecarFiles,
   loadV2SidecarAssets,
+  loadV2SidecarRecoveryAssets,
+  r10SidecarArtifactPath,
   resolveV2SidecarRevision,
   V2_R1_RELEASE,
   V2_R2_INITIAL_RELEASE_RETIREMENT_IDENTITY,
@@ -17,12 +19,50 @@ import {
   V2_R8_RELEASE,
   V2_R9_RELEASE,
   V2_R10_RELEASE,
+  V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY,
+  V2_R10_C1091742_RETIREMENT_IDENTITY,
   V2_RETIREMENT_RELEASE_IDENTITIES,
   V2_SELECTABLE_RELEASE_IDENTITIES,
 } from "../src/v2/sidecar/assets";
 import { protocolSchemaHash } from "../src/v2/protocol/shared";
 
 describe("V2 sidecar assets", () => {
+  it("preserves the original R10 bytes at its exact content address for recovery", async () => {
+    const archived = await loadV2SidecarRecoveryAssets(V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY);
+    const original = await Bun.file(`${import.meta.dir}/../src/v2/sidecar/releases/r10/sidecar.bundle.js`).text();
+    expect(archived.files[0]!.content).toBe(original);
+    expect(archived.files[0]!.sha256).toBe("a808969a1e89db0ec9636915a667613246c17fe5829b877aab0e8f192adc9776");
+    expect(await Bun.file(r10SidecarArtifactPath(V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY)).text()).toBe(original);
+    expect(V2_RETIREMENT_RELEASE_IDENTITIES.filter(release => release.revision === "r10" &&
+      release.buildHash === archived.buildHash && release.schemaHash === archived.schemaHash)).toHaveLength(1);
+    expect(V2_SELECTABLE_RELEASE_IDENTITIES.filter(release => release.revision === "r10")).toEqual([V2_R10_RELEASE]);
+  });
+
+  it("rejects unregistered recovery tuples before loading any artifact", async () => {
+    const original = V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY;
+    for (const identity of [
+      { ...original, buildHash: "a".repeat(64) },
+      { ...original, schemaHash: V2_R1_RELEASE.schemaHash },
+      { ...original, schemaHash: original.buildHash, buildHash: original.schemaHash },
+      { ...original, buildHash: `${original.buildHash}\n` },
+      { ...original, revision: "r9" as const },
+    ]) {
+      await expect(loadV2SidecarRecoveryAssets(identity)).rejects.toThrow(/unregistered/i);
+    }
+    expect(() => r10SidecarArtifactPath({ ...original, buildHash: `${original.buildHash}/suffix` })).toThrow(/unregistered/i);
+  });
+
+  it("retains every previously generated R10 candidate as exact cleanup-only bytes", async () => {
+    for (const identity of [V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY, V2_R10_C1091742_RETIREMENT_IDENTITY]) {
+      const archived = await loadV2SidecarRecoveryAssets(identity);
+      expect(archived.buildHash).toBe(identity.buildHash);
+      expect(archived.files[0]!.sha256).toBe(identity.bundleSha256);
+      expect(await Bun.file(r10SidecarArtifactPath(identity)).text()).toBe(archived.files[0]!.content);
+      expect(V2_RETIREMENT_RELEASE_IDENTITIES.filter(release => release.revision === "r10" &&
+        release.buildHash === identity.buildHash && release.schemaHash === identity.schemaHash)).toHaveLength(1);
+    }
+  });
+
   it("produces a stable sorted build with the frozen R1 identity", async () => {
     const first = await loadV2SidecarAssets({ revision: "r1" });
     const second = await loadV2SidecarAssets({ revision: "r1" });

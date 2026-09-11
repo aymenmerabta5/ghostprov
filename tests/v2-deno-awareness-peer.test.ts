@@ -6,6 +6,10 @@ import {
   encodeAwarenessUpdate,
 } from "y-protocols/awareness";
 import { DenoAwarenessPeer } from "../sandbox/v2/awareness-peer";
+import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../sandbox/v2/r10-awareness-peer";
+import type { AwarenessChannel, AwarenessPeerUpdate } from "../src/v2/awareness/channel";
+import { V2TransportSession } from "../src/v2/transport/session";
+import { projectId } from "../src/sandbox/types";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import { SidecarDiagnosticsObserver } from "../src/v2/diagnostics/sidecar-observer";
 import { SidecarResourceSampler } from "../src/v2/diagnostics/sidecar-sampler";
@@ -32,6 +36,234 @@ const BINDING: ProtocolBinding = {
   buildHash: "a".repeat(64),
   schemaHash: "b".repeat(64),
 };
+
+function r10LivenessHarness() {
+  const binding: ProtocolBinding = {
+    ...BINDING,
+    protocolRevision: "r2",
+    launchNonce: "r10-liveness-launch",
+  };
+  const providers = new Map<"data" | "control", FakeProvider>();
+  const hostDocs = { data: new Y.Doc(), control: new Y.Doc() };
+  const hostAwareness = {
+    data: new Awareness(hostDocs.data),
+    control: new Awareness(hostDocs.control),
+  };
+  const hostCeilings: number[] = [];
+  const accepted: HostFrame[] = [];
+  const peer = new R10DenoAwarenessPeer({
+    binding,
+    instanceId: "sidecar-instance-1",
+    credential: {
+      url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`,
+      docId: PROJECT,
+      token: "y-secret",
+      authorization: "full",
+      rotationKey: createCredentialRotationKey(),
+    },
+    engine: {
+      snapshot: () => ({ ready: true, credits: 8, active: 0, queued: 0, draining: false }),
+      setHostCeiling: (credits: number) => { hostCeilings.push(credits); },
+      accept: async (frame: HostFrame) => { accepted.push(frame); },
+    } as any,
+    providerFactory: (doc, _credential, lane) => {
+      const provider = new FakeProvider(doc);
+      providers.set(lane, provider);
+      return provider;
+    },
+    publicationIntervalMs: 60_000,
+    retransmitMs: 60_000,
+    connectTimeoutMs: 100,
+  });
+  const publish = (envelope: AwarenessEnvelope<HostFrame>, lane: "data" | "control" = "data") => {
+    hostAwareness[lane].setLocalStateField(
+      lane === "data" ? "ghostprovV2Data" : "ghostprovV2Control",
+      envelope,
+    );
+    applyAwarenessUpdate(
+      providers.get(lane)!.awareness,
+      encodeAwarenessUpdate(hostAwareness[lane], [hostDocs[lane].clientID]),
+      "r10-host",
+    );
+  };
+  let revision = 0;
+  return {
+    binding, peer, providers, hostCeilings, accepted, publish, hostDocs, hostAwareness,
+    control: () => providers.get("control")!.awareness.getLocalState()
+      ?.ghostprovV2Control as AwarenessEnvelope<SidecarFrame>,
+    sendControl(overrides: Record<string, unknown> = {}) {
+      publish({
+        ...hostEnvelope(-1, revision++),
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        launchNonce: binding.launchNonce,
+        targetInstanceId: "sidecar-instance-1",
+        lane: "control",
+        ...overrides,
+      } as AwarenessEnvelope<HostFrame>, "control");
+    },
+    async close() {
+      await peer.close();
+      for (const awareness of Object.values(hostAwareness)) awareness.destroy();
+      for (const doc of Object.values(hostDocs)) doc.destroy();
+    },
+  };
+}
+
+describe("R10 Awareness liveness state", () => {
+  it.each([1, 2])("recovers an idle host probe after %i isolated pong losses", async lostPongs => {
+    const harness = r10LivenessHarness();
+    const pings: AwarenessEnvelope<HostFrame>[] = [];
+    let listener: ((update: AwarenessPeerUpdate<SidecarFrame>) => void) | null = null;
+    const channel: AwarenessChannel<HostFrame, SidecarFrame> = {
+      projectId: projectId(PROJECT), localPeerId: "host",
+      connect: async () => undefined,
+      publish(envelope, lane) {
+        harness.publish(envelope, lane);
+        if (envelope.liveness?.kind !== "ping") return;
+        pings.push(envelope);
+        // The peer is otherwise idle. No periodic engine update, host ACK,
+        // reconnect, or synthetic publication may rescue the dropped pong.
+        if (pings.length <= lostPongs) return;
+        listener!({ peerClientId: "sidecar-control", envelope: harness.control() });
+      },
+      clear() {},
+      subscribe(next) { listener = next; return () => { listener = null; }; },
+      peerIds: () => ["sidecar"], close: async () => undefined,
+    };
+    const session = new V2TransportSession({
+      binding: harness.binding, channel, maxResponseBytes: 2 * 1024 * 1024,
+      hostInstanceId: "host-instance-1", expectedSidecarInstanceId: "sidecar-instance-1",
+      livenessTimeoutMs: 300, publicationIntervalMs: 60_000, retransmitMs: 60_000,
+    });
+    try {
+      await harness.peer.connect();
+      await session.connect();
+      await expect(session.probeLiveness()).resolves.toMatchObject({
+        sentAtMs: pings[0]!.liveness!.sentAtMs,
+      });
+      expect(pings).toHaveLength(lostPongs + 1);
+      for (const envelope of pings) {
+        expect(envelope).toMatchObject({
+          lane: "control", frames: [], targetInstanceId: "sidecar-instance-1",
+          liveness: pings[0]!.liveness,
+        });
+      }
+      expect(harness.accepted).toEqual([]);
+      expect(session.snapshot()).toMatchObject({ connected: true, active: 0 });
+    } finally {
+      await session.close();
+      await harness.close();
+    }
+  });
+
+  it("settles a host probe when its first pong is superseded before replication", async () => {
+    const harness = r10LivenessHarness();
+    let listener: ((update: AwarenessPeerUpdate<SidecarFrame>) => void) | null = null;
+    const channel: AwarenessChannel<HostFrame, SidecarFrame> = {
+      projectId: projectId(PROJECT),
+      localPeerId: "host",
+      connect: async () => undefined,
+      publish: harness.publish,
+      clear() {},
+      subscribe(next) { listener = next; return () => { listener = null; }; },
+      peerIds: () => ["sidecar"],
+      close: async () => undefined,
+    };
+    const session = new V2TransportSession({
+      binding: harness.binding,
+      channel,
+      maxResponseBytes: 2 * 1024 * 1024,
+      hostInstanceId: "host-instance-1",
+      expectedSidecarInstanceId: "sidecar-instance-1",
+      livenessTimeoutMs: 1_000,
+      publicationIntervalMs: 60_000,
+      retransmitMs: 60_000,
+    });
+    try {
+      await harness.peer.connect();
+      await session.connect();
+      const pending = session.probeLiveness();
+      void pending.catch(() => undefined);
+      const firstPong = harness.control().liveness;
+      expect(firstPong?.kind).toBe("pong");
+      // Awareness replicates current state; an intermediate publication need
+      // not reach a receiver before a later engine/credit update replaces it.
+      harness.peer.publishEngineState();
+      expect(harness.control().liveness).toEqual(firstPong);
+      listener!({ peerClientId: "sidecar-control", envelope: harness.control() });
+      await expect(pending).resolves.toMatchObject({ sentAtMs: firstPong!.sentAtMs });
+      // The exact host clears its persistent ping after accepting the pong.
+      harness.peer.publishEngineState();
+      expect(harness.control().liveness).toBeUndefined();
+      expect(harness.accepted).toEqual([]);
+    } finally {
+      await session.close();
+      await harness.close();
+    }
+  });
+
+  it("processes a bound ping's ACK and credits without admitting a reliable ping", async () => {
+    const harness = r10LivenessHarness();
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.peer.enqueue({ kind: "pong", sentAtMs: 7 }, "control", "first");
+      harness.peer.publishEngineState();
+      const first = harness.providers.get("data")!.awareness.getLocalState()!.ghostprovV2Data;
+      expect(first.frames).toHaveLength(1);
+      harness.peer.enqueue({ kind: "pong", sentAtMs: 8 }, "control", "second");
+      harness.sendControl({
+        credits: 3,
+        ack: { epoch: 1, sequence: first.frames[0].sequence },
+        liveness: { kind: "ping", sentAtMs: 123 },
+      });
+      harness.peer.publishEngineState();
+      expect(harness.hostCeilings.at(-1)).toBe(3);
+      const next = harness.providers.get("data")!.awareness.getLocalState()!.ghostprovV2Data;
+      expect(next.frames).toEqual([expect.objectContaining({ kind: "pong", sentAtMs: 8 })]);
+      expect(harness.control().liveness).toEqual({ kind: "pong", sentAtMs: 123 });
+      expect(harness.accepted).toEqual([]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each(["clear", "remove", "disconnect", "malformed", "wrong-target", "wrong-instance", "stale"])(
+    "clears retained probe state when the bound host control becomes %s",
+    async reason => {
+      const harness = r10LivenessHarness();
+      try {
+        await harness.peer.connect();
+        harness.sendControl({ liveness: { kind: "ping", sentAtMs: 123 } });
+        harness.sendControl({ liveness: { kind: "ping", sentAtMs: 124 } });
+        harness.peer.publishEngineState();
+        expect(harness.control().liveness).toEqual({ kind: "pong", sentAtMs: 124 });
+        if (reason === "clear") harness.sendControl();
+        else if (reason === "disconnect") harness.providers.get("control")!.emit("connection-close");
+        else if (reason === "remove") {
+          harness.hostAwareness.control.setLocalState(null);
+          applyAwarenessUpdate(
+            harness.providers.get("control")!.awareness,
+            encodeAwarenessUpdate(harness.hostAwareness.control, [harness.hostDocs.control.clientID]),
+            "r10-remove-host",
+          );
+        } else {
+          harness.sendControl(reason === "malformed"
+            ? { liveness: { kind: "ping", sentAtMs: -1 } }
+            : reason === "wrong-target" ? { targetInstanceId: "other-sidecar" }
+            : reason === "wrong-instance" ? { instanceId: "other-host" }
+            : { revision: 0, liveness: { kind: "ping", sentAtMs: 123 } });
+        }
+        harness.peer.publishEngineState();
+        expect(harness.control().liveness).toBeUndefined();
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+});
 
 class FakeProvider {
   readonly awareness: Awareness;

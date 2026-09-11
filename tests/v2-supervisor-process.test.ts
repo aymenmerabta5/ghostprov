@@ -249,6 +249,22 @@ describe(`V2 ${revision} supervisor process policy`, () => {
     await fixture.manager.handle({ kind: "shutdown", reason: "test" });
   });
 
+  if (revision === "r10") it("retries only exact retained-child cleanup after shutdown fails without reopening launch", async () => {
+    const fixture = processFixture({ ignoreTerm: true });
+    await fixture.launch();
+    const signal = spyOn(RetainedSidecarChild.prototype, "signal").mockImplementation(() => { throw new Error("child signal unavailable"); });
+    const wait = spyOn(RetainedSidecarChild.prototype, "waitForExit").mockResolvedValue(false);
+    await expect(fixture.manager.handle({ kind: "shutdown", reason: "first" })).rejects.toMatchObject({ code: "stop_failed" });
+    await expect(fixture.launch("forbidden-successor")).rejects.toMatchObject({ code: "not_ready" });
+    expect(fixture.children).toHaveLength(1);
+    signal.mockRestore(); wait.mockRestore();
+    fixture.children[0]!.exit();
+    await expect(fixture.manager.handle({ kind: "shutdown", reason: "exact-cleanup-retry" })).resolves.toEqual({ kind: "shutdown" });
+    expect(fixture.children).toHaveLength(1);
+    expect(fixture.files.has(SIDECAR_PID_PATH)).toBe(false);
+    await expect(fixture.launch("still-forbidden")).rejects.toMatchObject({ code: "not_ready" });
+  });
+
   it("keeps an ambiguous live child and refuses a replacement when identity or static authority changes", async () => {
     for (const path of [sidecarIdentityRecordPath(binding.nonce, 123), `${workspaceRoot}/.ghostprov-v2/static.json`]) {
       const fixture = processFixture();

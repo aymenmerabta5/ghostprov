@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { V2SandboxSupervisor } from "../src/v2/supervisor/controller";
 import { FileSupervisorBootstrapJournal, type BootstrapJournalEntry, type SupervisorBootstrapAttempt, type SupervisorBootstrapJournal } from "../src/v2/supervisor/bootstrap-journal";
-import { directSupervisorLaunchFiles } from "../src/v2/supervisor/r10-direct-launcher";
+import { supervisorCleanupFiles } from "../src/v2/supervisor/r10-direct-launcher";
 import { supervisorStaticConfig } from "../src/v2/supervisor/r10-launcher";
-import { loadV2SidecarAssets } from "../src/v2/sidecar/assets";
+import { loadV2SidecarAssets, loadV2SidecarRecoveryAssets, V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY, V2_R10_C1091742_RETIREMENT_IDENTITY, type V2SidecarAssets } from "../src/v2/sidecar/assets";
 import { parseYSweetEnvelope } from "../src/prism/protocol";
 import { sealSupervisorSessionBootstrap } from "../src/v2/supervisor/session-bootstrap";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
@@ -24,7 +24,7 @@ afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { rec
 class Journal implements SupervisorBootstrapJournal, BootstrapJournalEntry {
   attempt: SupervisorBootstrapAttempt | null = null;
   readonly phases: string[] = [];
-  async withLease<T>(_signal: AbortSignal | undefined, run: (entry: BootstrapJournalEntry) => Promise<T>) { return run(this); }
+  async withLease<T>(signal: AbortSignal | undefined, run: (entry: BootstrapJournalEntry) => Promise<T>) { signal?.throwIfAborted(); return run(this); }
   async load() { return this.attempt; }
   async save(attempt: SupervisorBootstrapAttempt) { this.attempt = structuredClone(attempt); this.phases.push(attempt.phase); }
   async clear() { this.attempt = null; this.phases.push("cleared"); }
@@ -45,23 +45,24 @@ class Files {
   async renderSyncState() { return { clientStateVector: "", clientDeleteSetUpdate: "" }; }
 }
 
-async function prior(journal: Journal, files: Files, phase: SupervisorBootstrapAttempt["phase"]) {
-  const sealed = await sealSupervisorSessionBootstrap({ sessionId: crypto.randomUUID(), binding,
+async function prior(journal: Journal, files: Files, phase: SupervisorBootstrapAttempt["phase"], priorAssets: V2SidecarAssets = assets) {
+  const priorBinding = { ...binding, buildHash: priorAssets.buildHash, schemaHash: priorAssets.schemaHash };
+  const sealed = await sealSupervisorSessionBootstrap({ sessionId: crypto.randomUUID(), binding: priorBinding,
     payload: { instanceId: "old-instance", credential: { url: credential.url, baseUrl: credential.baseUrl, docId: project,
       token: "offline-token", authorization: "full", rotationKey: createCredentialRotationKey() } } });
-  await journal.save({ version: 1, phase, sessionId: crypto.randomUUID(), binding, connectTimeoutMs: 1000, sealed });
+  await journal.save({ version: 1, phase, sessionId: crypto.randomUUID(), binding: priorBinding, connectTimeoutMs: 1000, sealed });
   // Seal against the same private execution identity stored in the journal.
   const attempt = journal.attempt!;
-  await journal.save({ ...attempt, sealed: await sealSupervisorSessionBootstrap({ sessionId: attempt.sessionId, binding,
+  await journal.save({ ...attempt, sealed: await sealSupervisorSessionBootstrap({ sessionId: attempt.sessionId, binding: priorBinding,
     payload: { instanceId: "old-instance", credential: { url: credential.url, baseUrl: credential.baseUrl, docId: project,
       token: "offline-token", authorization: "full", rotationKey: createCredentialRotationKey() } } }) });
-  const generated = directSupervisorLaunchFiles({ entrypointPath: assets.entrypointPath, supervisorNonce: binding.nonce });
+  const generated = supervisorCleanupFiles({ entrypointPath: priorAssets.entrypointPath, supervisorNonce: priorBinding.nonce });
   files.data.set("exec", generated.launcher); files.data.set(install, generated.installer);
-  files.data.set(staticPath, supervisorStaticConfig({ binding, entrypointPath: assets.entrypointPath, connectTimeoutMs: 1000 }));
+  files.data.set(staticPath, supervisorStaticConfig({ binding: priorBinding, entrypointPath: priorAssets.entrypointPath, connectTimeoutMs: 1000 }));
   files.data.set(sealedPath, JSON.stringify(journal.attempt!.sealed));
 }
 
-function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; rejectShutdown?: boolean; failSubmission?: boolean; failSync?: boolean; loseStage?: boolean; generation?: number; sync?: (count: number) => void } = {}) {
+function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; rejectShutdown?: boolean; failSubmission?: boolean; failSync?: boolean; loseStage?: boolean; generation?: number; sync?: (count: number) => void; onShutdown?: () => void } = {}) {
   let syncs = 0;
   return new V2SandboxSupervisor({ binding: { ...binding, leaderGeneration: 2, nonce: "new-bootstrap" }, assets,
     ...(options.generation ? { binding: { ...binding, leaderGeneration: options.generation, nonce: `bootstrap-${options.generation}` } } : {}),
@@ -73,11 +74,48 @@ function controller(journal: SupervisorBootstrapJournal, files: Files, events: s
     hostFactory: input => ({ binding: input.binding, instanceId: input.instanceId,
       async connect() { events.push(`connect:${input.binding.leaderGeneration}`); if (options.rejectOld && input.binding.leaderGeneration === 1) throw new Error("offline unknown supervisor"); },
       async ensureReady() {}, async launch() { throw new Error("unexpected launch"); }, async deliverCredential() {}, async stop() { return null; },
-      async rotateCredential() {}, async shutdown() { events.push(`shutdown:${input.binding.leaderGeneration}`); if (options.rejectShutdown) throw new Error("offline ambiguous shutdown"); }, async close() {} }),
+      async rotateCredential() {}, async shutdown() { if (input.recoverExisting) await this.connect(); events.push(`shutdown:${input.binding.leaderGeneration}`); if (options.rejectShutdown) throw new Error("offline ambiguous shutdown"); options.onShutdown?.(); }, async close() {} }),
   });
 }
 
 describe("interrupted supervisor bootstrap recovery", () => {
+  it.each([
+    ["initial", V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY],
+    ["c1091742", V2_R10_C1091742_RETIREMENT_IDENTITY],
+  ] as const)("cleans the exact archived R10 %s files before submitting the selected current release", async (_name, identity) => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const previousAssets = await loadV2SidecarRecoveryAssets(identity);
+    await prior(journal, files, "submitted", previousAssets);
+    expect(files.data.get(install)).toContain(previousAssets.entrypointPath);
+    const sup = controller(journal, files, events);
+    try {
+      await sup.ensureReady();
+      expect(events).toEqual(["connect:1", "shutdown:1", "submit", "connect:2"]);
+      expect(journal.attempt?.binding.buildHash).toBe(assets.buildHash);
+      expect(files.data.get(staticPath)).toContain(assets.entrypointPath);
+      expect(files.data.has(install)).toBe(false);
+    } finally { await sup.shutdown("offline_done"); await sup.close(); }
+  });
+
+  it("rejects an unregistered or cross-paired prior release without connecting or changing files", async () => {
+    for (const hashes of [
+      { buildHash: "a".repeat(64), schemaHash: assets.schemaHash },
+      { buildHash: assets.schemaHash, schemaHash: assets.buildHash },
+    ]) {
+      const journal = new Journal(), files = new Files(), events: string[] = [];
+      await prior(journal, files, "submitted");
+      const before = [...files.data];
+      journal.attempt = { ...journal.attempt!, binding: { ...journal.attempt!.binding, ...hashes } };
+      const sup = controller(journal, files, events);
+      try {
+        await expect(sup.ensureReady()).rejects.toMatchObject({ remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch" });
+        expect(events).toEqual([]);
+        expect([...files.data]).toEqual(before);
+        expect(journal.attempt?.phase).toBe("submitted");
+      } finally { await sup.close(); }
+    }
+  });
+
   it("does not submit when synchronization replaces the staged document with older state", async () => {
     const journal = new Journal(), files = new Files(), events: string[] = [];
     const first = controller(journal, files, events, { loseStage: true });
@@ -134,6 +172,24 @@ describe("interrupted supervisor bootstrap recovery", () => {
     try {
       await next.ensureReady();
       expect(events.filter(event => event === "shutdown:2")).toHaveLength(1);
+    } finally { await next.shutdown("offline_done"); await next.close(); }
+  });
+
+  it("persists signed cleanup before honoring cancellation after supervisor shutdown", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const cancellation = new AbortController();
+    const sup = controller(journal, files, events, {
+      onShutdown: () => cancellation.abort(new DOMException("offline shutdown deadline", "AbortError")),
+    });
+    try {
+      await sup.ensureReady();
+      await expect(sup.shutdown("offline_done", cancellation.signal)).rejects.toMatchObject({ name: "AbortError" });
+      expect(journal.attempt?.phase).toBe("cleanup_proven");
+    } finally { await sup.close(); }
+    const next = controller(journal, files, events, { generation: 3 });
+    try {
+      await next.ensureReady();
+      expect(events).toEqual(["submit", "connect:2", "shutdown:2", "submit", "connect:3"]);
     } finally { await next.shutdown("offline_done"); await next.close(); }
   });
 

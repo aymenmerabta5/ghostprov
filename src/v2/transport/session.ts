@@ -935,17 +935,23 @@ interface PreparationWaiter {
 }
 
 interface LivenessProbe {
-  sentAtMs: number;
-  startedAtMs: number;
+  readonly sentAtMs: number;
+  readonly startedAtMs: number;
+  readonly deadlineAtMs: number;
+  readonly lifecycleEpoch: number;
+  publications: number;
   resolve: (result: V2TransportLivenessResult) => void;
   reject: (error: unknown) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
   timer?: ReturnType<typeof setTimeout>;
+  retransmitTimer?: ReturnType<typeof setTimeout>;
 }
 
 const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5_000;
+/** Initial ping plus two frame-free retransmissions inside its original deadline. */
+export const V2_LIVENESS_PROBE_MAX_PUBLICATIONS = 3;
 const MAX_TERMINAL_RECEIPTS = 4_096;
 const TERMINAL_RECEIPT_COALESCE_MS = 10;
 
@@ -1435,6 +1441,9 @@ export class V2TransportSession {
     const probe: LivenessProbe = {
       sentAtMs,
       startedAtMs,
+      deadlineAtMs: startedAtMs + this.#livenessTimeoutMs,
+      lifecycleEpoch: this.#lifecycleEpoch,
+      publications: 1,
       resolve,
       reject,
       signal,
@@ -1460,6 +1469,7 @@ export class V2TransportSession {
 
     try {
       this.#publishLane("control", [], "urgent");
+      this.#scheduleLivenessRetransmission(probe);
     } catch (cause) {
       this.#rejectLivenessProbe(
         probe,
@@ -2591,6 +2601,19 @@ export class V2TransportSession {
     const pong = envelope.liveness;
     const probe = this.#livenessProbe;
     if (!probe || pong?.kind !== "pong" || pong.sentAtMs !== probe.sentAtMs) return;
+    if (probe.lifecycleEpoch !== this.#lifecycleEpoch) {
+      this.#rejectLivenessProbe(probe, new V2TransportLivenessError(
+        "V2 transport is unavailable for a liveness probe", "unavailable",
+      ), false);
+      return;
+    }
+    if (this.#clock.now() >= probe.deadlineAtMs) {
+      // A delayed timeout callback cannot extend the original proof deadline.
+      this.#rejectLivenessProbe(probe, new V2TransportLivenessError(
+        "V2 sidecar liveness probe timed out", "timeout",
+      ));
+      return;
+    }
     this.#resolveLivenessProbe(probe, {
       rttMs: Math.max(0, this.#clock.now() - probe.startedAtMs),
       sentAtMs: probe.sentAtMs,
@@ -2609,6 +2632,46 @@ export class V2TransportSession {
     probe.resolve(result);
   }
 
+  #scheduleLivenessRetransmission(probe: LivenessProbe): void {
+    if (this.#livenessProbe !== probe ||
+      probe.publications >= V2_LIVENESS_PROBE_MAX_PUBLICATIONS) return;
+    const now = this.#clock.now();
+    if (now >= probe.deadlineAtMs) return;
+    const nextAtMs = probe.startedAtMs +
+      this.#livenessTimeoutMs * probe.publications / V2_LIVENESS_PROBE_MAX_PUBLICATIONS;
+    probe.retransmitTimer = setTimeout(() => {
+      probe.retransmitTimer = undefined;
+      if (this.#livenessProbe !== probe) return;
+      if (!this.#connected || this.#closed || this.#draining || this.#protocolFailed ||
+        probe.lifecycleEpoch !== this.#lifecycleEpoch) {
+        this.#rejectLivenessProbe(probe, new V2TransportLivenessError(
+          "V2 transport is unavailable for a liveness probe", "unavailable",
+        ), false);
+        return;
+      }
+      if (this.#clock.now() >= probe.deadlineAtMs) {
+        this.#rejectLivenessProbe(probe, new V2TransportLivenessError(
+          "V2 sidecar liveness probe timed out", "timeout",
+        ));
+        return;
+      }
+      probe.publications++;
+      try {
+        // Only the control envelope revision/ACK metadata changes. The exact
+        // challenge, target instance and deadline remain fixed; no reliable
+        // frame or provider request is replayed. Ordinary ACK piggybacking is
+        // independent of this bounded probe-owned publication budget.
+        this.#publishLane("control", [], "urgent");
+        this.#scheduleLivenessRetransmission(probe);
+      } catch (cause) {
+        this.#rejectLivenessProbe(probe, new V2TransportLivenessError(
+          "V2 sidecar liveness probe could not be published", "publish", { cause },
+        ));
+      }
+    }, Math.max(1, Math.ceil(nextAtMs - now)));
+    probe.retransmitTimer.unref?.();
+  }
+
   #rejectLivenessProbe(
     probe: LivenessProbe,
     error: unknown,
@@ -2622,6 +2685,7 @@ export class V2TransportSession {
     if (this.#livenessProbe !== probe) return false;
     this.#livenessProbe = null;
     if (probe.timer) clearTimeout(probe.timer);
+    if (probe.retransmitTimer) clearTimeout(probe.retransmitTimer);
     probe.signal?.removeEventListener("abort", probe.onAbort!);
     if (clearState && this.#connected && !this.#closed) {
       try {

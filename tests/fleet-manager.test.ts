@@ -5,8 +5,13 @@ import * as path from "node:path";
 import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
 import { DEFAULT_V2_SIDECAR_REVISION } from "../src/v2/sidecar/assets";
 import type { Clock, MachineSample } from "../src/core/ports";
-import { ProjectFleetManager } from "../src/fleet/manager";
+import { MAX_PENDING_FLEET_RECOVERY_EVENTS, ProjectFleetManager } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
+import { FileBootstrapHoldMigration, prepareBootstrapHoldMigrationLedger } from "../src/fleet/bootstrap-migration";
+import { FileSupervisorBootstrapJournal } from "../src/v2/supervisor/bootstrap-journal";
+import { sealSupervisorSessionBootstrap } from "../src/v2/supervisor/session-bootstrap";
+import { V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY } from "../src/v2/sidecar/retirement-identities";
+import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../src/fleet/types";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
@@ -660,6 +665,7 @@ function manager(input: {
   randomUuid?: () => string;
   recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
   canRetireProject?: (projectId: ProjectId) => boolean;
+  bootstrapMigration?: FileBootstrapHoldMigration;
   onLifecycleEvent?: (event: FleetLifecycleEvent) => void;
 }) {
   const factory = input.factory ?? new FakeFactory();
@@ -683,6 +689,7 @@ function manager(input: {
       runtimeCleanupTimeoutMs: input.runtimeCleanupTimeoutMs,
       recoveryCircuitSnapshot: input.recoveryCircuitSnapshot,
       canRetireProject: input.canRetireProject,
+      bootstrapMigration: input.bootstrapMigration,
       onLifecycleEvent: input.onLifecycleEvent,
     }),
   };
@@ -721,6 +728,362 @@ async function waitForCondition(
 }
 
 describe("ProjectFleetManager", () => {
+  it("releases migration journal leases before cleaning a failed hold persistence attempt", async () => {
+    const files = await state();
+    const manifestFile = path.join(files.root, "fleet.json");
+    const migration = new FileBootstrapHoldMigration({ manifestFile, identityFingerprint: FINGERPRINT });
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects: new FakeProjects([]), clock: new BlockingClock(),
+      bootstrapMigration: migration, randomUuid: uuidSequence(A, B, C, D), runtimeCleanupTimeoutMs: 500 });
+    await harness.value.reconcile();
+    const release = V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY;
+    const binding = { projectId: A, sandboxSessionId: "offline-old-sandbox", leaderGeneration: 1,
+      buildHash: release.buildHash, schemaHash: release.schemaHash, nonce: "offline-old-bootstrap",
+      protocolRevision: "r2" as const, schemaVersion: 2 as const };
+    const sessionId = crypto.randomUUID();
+    const sealed = await sealSupervisorSessionBootstrap({ sessionId, binding, payload: {
+      instanceId: "offline-old-instance", credential: { url: "wss://offline.invalid/ws", baseUrl: "https://offline.invalid/",
+        docId: A, token: "offline-token", authorization: "full", rotationKey: createCredentialRotationKey() },
+    } });
+    const journal = new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, A);
+    await journal.withLease(undefined, entry => entry.save({ version: 1, phase: "submitted", sessionId, binding, connectTimeoutMs: 1_000, sealed }));
+    await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: [A] });
+    const runtime = harness.factory.runtimes.get(A)!;
+    runtime.state = "recovering";
+    let stopping: Promise<void> | undefined;
+    runtime.stop = () => {
+      runtime.state = "stopped";
+      return stopping ??= journal.withLease(undefined, async () => undefined);
+    };
+    const markDraining = files.manifest.markDraining.bind(files.manifest);
+    files.manifest.markDraining = async () => { throw new Error("offline hold persistence failure"); };
+    try {
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+      await expect(harness.value.reconcile()).rejects.toThrow("offline hold persistence failure");
+      expect(harness.registry.get(A)).toBeUndefined();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)?.retirementReason).toBeNull();
+    } finally {
+      files.manifest.markDraining = markDraining;
+      await stopping;
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("restores two exact legacy migration projects beyond four holds and never refills their grants", async () => {
+    const files = await state();
+    const manifestFile = path.join(files.root, "fleet.json");
+    const ids = Array.from({ length: 14 }, (_, index) =>
+      projectId(`00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (let index = 0; index < 12; index++) {
+      const id = ids[index]!;
+      await files.manifest.reserveWorker({ index: index + 1, projectId: id, title: `fixture ${index}`, nowMs: 1 });
+      await files.manifest.markCreated(id, 2);
+      if (index < 4) await files.manifest.markDraining(id, "bootstrap_hold", 3);
+    }
+    for (const id of ids.slice(10, 12)) {
+      const identity = V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY;
+      const binding = { projectId: id, sandboxSessionId: "offline-old-sandbox", leaderGeneration: 1,
+        buildHash: identity.buildHash, schemaHash: identity.schemaHash, nonce: "offline-old-bootstrap",
+        protocolRevision: "r2" as const, schemaVersion: 2 as const };
+      const sessionId = crypto.randomUUID();
+      const sealed = await sealSupervisorSessionBootstrap({ sessionId, binding, payload: {
+        instanceId: "offline-old-instance", credential: { url: "wss://offline.invalid/ws", baseUrl: "https://offline.invalid/",
+          docId: id, token: "offline-token", authorization: "full", rotationKey: createCredentialRotationKey() },
+      } });
+      await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, id).withLease(undefined, entry =>
+        entry.save({ version: 1, phase: "submitted", sessionId, binding, connectTimeoutMs: 1_000, sealed }));
+    }
+    await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: ids.slice(10, 12) });
+    const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
+    const migration = new FileBootstrapHoldMigration({ manifestFile, identityFingerprint: FINGERPRINT });
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, clock: new BlockingClock(), bootstrapMigration: migration,
+      randomUuid: uuidSequence(ids[12]!, ids[13]!), canRetireProject: () => false });
+    try {
+      const firstJournal = new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, ids[10]!);
+      const original = await firstJournal.withLease(undefined, entry => entry.load());
+      await firstJournal.withLease(undefined, entry => entry.save({ ...original!, connectTimeoutMs: 2_000 }));
+      // A stale grant denies extra holds, but must not prevent ordinary workers
+      // from starting or reconciling after that project recovers independently.
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 8 });
+      await firstJournal.withLease(undefined, entry => entry.save(original!));
+      for (const id of ids.slice(10, 12)) {
+        harness.factory.runtimes.get(id)!.state = "recovering";
+        for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      }
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 7 });
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
+      expect(harness.value.snapshot().heldProjects).toHaveLength(6);
+      expect(projects.created.map(worker => worker.projectId)).toEqual(ids.slice(12));
+      expect(projects.deleted).toEqual([]);
+      for (const id of [ids[4]!, ids[12]!]) {
+        harness.factory.runtimes.get(id)!.state = "recovering";
+        for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      }
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(2);
+      expect(harness.value.snapshot().heldProjects).toHaveLength(6);
+    } finally { await harness.value.shutdown("migration-restart"); }
+    for (const id of ids.slice(10, 12)) {
+      await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, id).withLease(undefined, entry => entry.clear());
+    }
+    const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, clock: new BlockingClock(), bootstrapMigration: migration,
+      randomUuid: () => { throw new Error("consumed migration grants must not create projects"); } });
+    try {
+      await expect(restarted.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
+      await restarted.value.reconcile();
+      expect(restarted.value.snapshot().heldProjects).toHaveLength(6);
+      expect(projects.created).toHaveLength(2);
+      expect(projects.deleted).toEqual([]);
+    } finally { await restarted.value.shutdown("test-complete"); }
+  });
+
+  it("processes another worker's recovery evidence while an unrelated startup remains pending", async () => {
+    const files = await state();
+    const factory = new BlockingStartFactory();
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const projects = new FakeProjects([A, B, C, D, E].map(id => project(id)));
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B, C, D, E], provisionConcurrency: 5 }),
+      manifest: files.manifest,
+      projects,
+      factory,
+      clock: new BlockingClock(),
+      randomUuid: uuidSequence(F),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    const reconciling = harness.value.reconcile().catch(error => error);
+    try {
+      await Promise.all([factory.blocked.started, waitForRegistryReady(harness.registry, 4)]);
+      factory.runtimes.get(B)!.state = "recovering";
+      for (let count = 1; count <= 3; count++) {
+        harness.value.observeRecoveryEvent(recoveryRetry(B, count));
+      }
+      await waitForCondition(() => lifecycle.some(event =>
+        event.type === "replacement_qualified" && event.projectId === B),
+      "recovery qualification while another startup is pending", 1_000);
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === B)
+        ?.replacementEvidence?.count).toBe(3);
+      await harness.value.reconcile();
+      expect(projects.created.map(worker => worker.projectId)).toEqual([F]);
+      expect(factory.runtimes.get(F)?.state).toBe("ready");
+      expect(factory.blocked.starts).toBe(1);
+      expect(factory.blocked.state).toBe("provisioning");
+      expect(factory.created.filter(worker => worker.projectId === A)).toHaveLength(1);
+    } finally {
+      await harness.value.shutdown("test-complete");
+      await reconciling;
+    }
+  });
+
+  it("invalidates replacement evidence across a bounded recovery-event overflow", async () => {
+    const files = await state();
+    const projects = new FakeProjects([A, B, C, D].map(id => project(id)));
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B, C, D] }),
+      manifest: files.manifest,
+      projects,
+      clock: new BlockingClock(),
+    });
+    try {
+      await harness.value.reconcile();
+      harness.factory.runtimes.get(A)!.state = "recovering";
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 1));
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 2));
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)
+        ?.replacementEvidence?.count).toBe(2);
+      for (let index = 0; index <= MAX_PENDING_FLEET_RECOVERY_EVENTS; index++) {
+        harness.value.observeRecoveryEvent(recoveryRetry(A, 3));
+      }
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)
+        ?.replacementEvidence?.count).toBe(1);
+      expect(projects.created).toEqual([]);
+      expect(projects.deleted).toEqual([]);
+    } finally {
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("keeps startup permits and exact starts across yielded reconciliations", async () => {
+    const files = await state();
+    const factory = new TrackingStartFactory();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A, B, C], provisionConcurrency: 1 }),
+      manifest: files.manifest,
+      projects: new FakeProjects([A, B, C].map(id => project(id))),
+      factory,
+      clock: new BlockingClock(),
+    });
+    const reconciling = harness.value.reconcile();
+    try {
+      await waitForCondition(() => factory.started.length === 1, "first pending start");
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 1, "deploy"));
+      await reconciling;
+      await harness.value.reconcile();
+      expect(factory.created).toHaveLength(3);
+      expect(factory.started).toHaveLength(1);
+      expect(factory.peak).toBe(1);
+      factory.release(factory.started[0]!);
+      await waitForCondition(() => factory.started.length === 2, "second pending start");
+      expect(factory.peak).toBe(1);
+    } finally {
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("invalidates replacement evidence when a completed recovery reset cannot be read durably", async () => {
+    const files = await state();
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      clock: new BlockingClock(),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      await harness.value.reconcile();
+      harness.factory.runtimes.get(A)!.state = "recovering";
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 1));
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 2));
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers[0]?.replacementEvidence?.count).toBe(2);
+      const load = files.manifest.load.bind(files.manifest);
+      let readFailed = false;
+      files.manifest.load = () => {
+        if (!readFailed) {
+          readFailed = true;
+          return Promise.reject(new Error("temporary manifest read failure"));
+        }
+        return load();
+      };
+      harness.value.observeRecoveryEvent(recoveryCompleted(A));
+      await harness.value.reconcile();
+      harness.value.observeRecoveryEvent(recoveryRetry(A, 3));
+      await harness.value.reconcile();
+      expect(readFailed).toBe(true);
+      expect((await files.manifest.load()).workers[0]?.replacementEvidence?.count).toBe(1);
+      expect(lifecycle.some(event => event.type === "replacement_qualified")).toBe(false);
+    } finally {
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("never reactivates a bootstrap hold when its old startup completes late", async () => {
+    const files = await state();
+    const factory = new LateThenHealthyFactory();
+    const projects = new FakeProjects([]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest,
+      projects,
+      factory,
+      clock: new BlockingClock(),
+      randomUuid: uuidSequence(A, B, C, D, E),
+    });
+    const reconciling = harness.value.reconcile();
+    try {
+      await Promise.all([factory.old.started, waitForRegistryReady(harness.registry, 3)]);
+      for (let count = 1; count <= 3; count++) {
+        harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+      }
+      await reconciling;
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, heldProjects: [A] });
+      factory.old.releaseLateStart();
+      await waitForCondition(() => factory.old.state === "stopped", "late held-start cleanup");
+      await harness.value.reconcile();
+      expect(harness.registry.get(A)).toBeUndefined();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A))
+        .toMatchObject({ state: "draining", retirementReason: "bootstrap_hold" });
+      expect(projects.deleted).toEqual([]);
+    } finally {
+      factory.old.releaseLateStart();
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("waits for stop completion before restarting a failed runtime already reporting stopped", async () => {
+    const files = await state();
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      clock: new BlockingClock(),
+      runtimeCleanupTimeoutMs: 5,
+    });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)!;
+    let finishStop!: () => void;
+    let stopCalls = 0;
+    const stopping = new Promise<void>(resolve => { finishStop = resolve; });
+    old.state = "failed";
+    old.stop = () => { stopCalls++; old.state = "stopped"; return stopping; };
+    try {
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(harness.registry.get(A)).toBe(old);
+      expect(harness.factory.created).toHaveLength(1);
+      expect(stopCalls).toBe(1);
+      finishStop();
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 1 });
+      expect(harness.registry.get(A)).not.toBe(old);
+      expect(harness.factory.created).toHaveLength(2);
+    } finally {
+      finishStop();
+      await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("restarts an empty failed runtime on its exact project and worker generation", async () => {
+    const files = await state();
+    const projects = new FakeProjects([project(A)]);
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects,
+      canRetireProject: () => false,
+    });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)!;
+    old.state = "failed";
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 1 });
+    expect(old.state).toBe("stopped");
+    expect(harness.factory.created.map(worker => [worker.projectId, worker.workerIndex, worker.leaderGeneration]))
+      .toEqual([[A, 1, 1], [A, 1, 2]]);
+    expect(harness.factory.created[1]?.previouslyReady).toBe(true);
+    expect(projects.created).toEqual([]);
+    expect(projects.deleted).toEqual([]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it.each(["active", "quarantined", "ambiguousQuarantined"] as const)(
+    "retains a failed runtime that still owns %s work", async field => {
+      const files = await state();
+      const harness = manager({
+        config: config(files.cookieFile, { explicit: [A] }),
+        manifest: files.manifest,
+        projects: new FakeProjects([project(A)]),
+        clock: new BlockingClock(),
+      });
+      await harness.value.reconcile();
+      const old = harness.factory.runtimes.get(A)!;
+      old.state = "failed";
+      const snapshot = old.snapshot.bind(old);
+      old.snapshot = () => ({ ...snapshot(), [field]: 1 });
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 0, failed: 1 });
+      expect(old.state).toBe("failed");
+      expect(harness.registry.get(A)).toBe(old);
+      expect(harness.factory.created).toHaveLength(1);
+      old.snapshot = snapshot;
+      await harness.value.shutdown("test-complete");
+    },
+  );
+
   it("does not let a completed recovery wake cancel its own active reconciliation", async () => {
     const files = await state();
     const projects = new TransportMissingProjects([]);

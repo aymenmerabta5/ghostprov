@@ -105,6 +105,28 @@ function outage(status = 503, retryAfterMs?: number): Record<string, unknown> {
 }
 
 describe("FleetRecoveryCoordinator classification", () => {
+  it.each(["heartbeat-stale", "heartbeat-missing"])("coordinates simultaneous %s recoveries with one outage probe", async reason => {
+    const coordinator = new FleetRecoveryCoordinator({ clock: new ManualClock(), random: { next: () => 0 } });
+    const attempts = Array.from({ length: 8 }, (_, index) => coordinator.enter({
+      projectId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      reason,
+      failure: null,
+    }));
+    const observed = attempts.map(observe);
+    try {
+      const first = await attempts[0]!;
+      expect(first.probe).toBe(true);
+      expect(coordinator.snapshot()).toMatchObject({ state: "half_open", scope: "outage", queued: 7 });
+      expect(observed.slice(1).every(value => !value.settled)).toBe(true);
+      first.succeed();
+      const remaining = await Promise.all(attempts.slice(1));
+      expect(remaining.every(lease => !lease.probe)).toBe(true);
+      for (const lease of remaining) lease.cancel();
+    } finally {
+      coordinator.close();
+    }
+  });
+
   it("classifies only known fleet-wide failures and gives local statuses priority", () => {
     expect(classifyFleetRecoveryFailure({ status: 404, kind: "transport" })).toEqual({
       kind: "local",

@@ -80,6 +80,8 @@ export const SANDBOX_LIVENESS_OUTCOMES = [
   "started",
   "succeeded",
   "preflight_unavailable",
+  "waiting_for_transport_recovery",
+  "recovery_deadline_expired",
   "superseded",
 ] as const;
 export type SandboxLivenessOutcome = typeof SANDBOX_LIVENESS_OUTCOMES[number];
@@ -143,6 +145,8 @@ export type SandboxAwarenessLane = typeof SANDBOX_AWARENESS_LANES[number];
 export const SANDBOX_RECOVERY_CAUSES = [
   "startup",
   "heartbeat",
+  "heartbeat_stale",
+  "heartbeat_missing",
   "sidecar",
   "credentials",
   "runtime",
@@ -457,6 +461,8 @@ export function normalizeSandboxRecoveryCause(value: unknown): SandboxRecoveryCa
   if (typeof value !== "string") return "unknown";
   const normalized = value.trim().toLowerCase();
   if (RECOVERY_CAUSE_SET.has(normalized)) return normalized as SandboxRecoveryCause;
+  if (normalized === "heartbeat-stale") return "heartbeat_stale";
+  if (normalized === "heartbeat-missing") return "heartbeat_missing";
   if (normalized.includes("heartbeat")) return "heartbeat";
   if (
     normalized.includes("sidecar") ||

@@ -8,10 +8,11 @@ import { V2SupervisorHost } from "../src/v2/supervisor/host";
 import { DenoSupervisorPeer } from "../sandbox/v2/supervisor-peer";
 import { SidecarCredentialRotator } from "../src/v2/bootstrap/rotation";
 import {
-  GP_V2_SUPERVISOR_FIELD, signSupervisorSandboxMessage,
+  GP_V2_SUPERVISOR_FIELD, GP_V2_SUPERVISOR_PROTOCOL, GP_V2_SUPERVISOR_VERSION, signSupervisorSandboxMessage,
   type SignedSupervisorHostMessage, type SignedSupervisorSandboxMessage,
 } from "../src/v2/supervisor/protocol";
 import type { SupervisorAwarenessChangeListener, SupervisorAwarenessProviderLike } from "../src/v2/supervisor/provider";
+import { encodeSupervisorRetirementReceipt, SUPERVISOR_RETIREMENT_KEY, SUPERVISOR_RETIREMENT_MAP } from "../src/v2/supervisor/retirement-receipt";
 
 const BINDING: BootstrapBinding = Object.freeze({
   projectId: "11111111-1111-4111-8111-111111111111", sandboxSessionId: "offline-reconnect",
@@ -118,7 +119,9 @@ class Provider implements SupervisorAwarenessProviderLike {
 async function until(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 100; i++) {
     if (predicate()) return;
-    await new Promise<void>(resolve => setImmediate(resolve));
+    // Native WebCrypto completion needs an I/O turn under concurrent tests;
+    // 100 immediate callbacks can finish before one native signature returns.
+    await new Promise<void>(resolve => setTimeout(resolve, 1));
   }
   throw new Error("Fixture did not reach its expected state");
 }
@@ -129,7 +132,7 @@ async function fixture(initialReady = true) {
   const peer = new DenoSupervisorPeer({ binding: BINDING, instanceId: "offline-instance", credential: {
     ...CREDENTIAL, token: CREDENTIAL.token.reveal(), rotationKey: key,
   }, providerFactory: (doc, credential) => (peerProvider = bus.make(doc, "peer", () => credential().token)),
-  handle: async () => { handled++; return { kind: "stopped", launchNonce: "known-child" }; } });
+  handle: async command => { handled++; return command.kind === "shutdown" ? { kind: "shutdown" } : { kind: "stopped", launchNonce: "known-child" }; } });
   const host = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: key, credential: CREDENTIAL,
     connectTimeoutMs: 100, commandTimeoutMs: 100, clock,
     providerFactory: (doc, credential) => (hostProvider = bus.make(doc, "host", () => credential().token.reveal())) });
@@ -140,6 +143,144 @@ async function fixture(initialReady = true) {
 }
 
 describe("R9 authenticated supervisor reconnect", () => {
+  it.each([0, 3])("recovers exact durable shutdown sequence %d after every supervisor Awareness state disappeared", async sequence => {
+    const f = await fixture(false);
+    let replacement: V2SupervisorHost | null = null;
+    const terminal = await signSupervisorSandboxMessage(f.key, {
+      protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox", binding: BINDING,
+      supervisorInstanceId: "offline-instance", sequence, message: { kind: "shutdown" },
+    });
+    try {
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => {
+          doc.getMap(SUPERVISOR_RETIREMENT_MAP).set(SUPERVISOR_RETIREMENT_KEY, encodeSupervisorRetirementReceipt(terminal));
+          return f.bus.make(doc, "host", () => credential().token.reveal());
+        } });
+      await replacement.shutdown("durable_terminal");
+      await expect(replacement.connect()).rejects.toMatchObject({ code: "closed" });
+      expect(f.bus.commands).toHaveLength(0);
+      expect(f.handled()).toBe(0);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("prefers durable terminal proof over a concurrently retained startup-ready status", async () => {
+    const f = await fixture(false);
+    let replacement: V2SupervisorHost | null = null;
+    const base = { protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox" as const,
+      binding: BINDING, supervisorInstanceId: "offline-instance", sequence: 0 };
+    const [ready, terminal] = await Promise.all([
+      signSupervisorSandboxMessage(f.key, { ...base, message: { kind: "ready" } }),
+      signSupervisorSandboxMessage(f.key, { ...base, message: { kind: "shutdown" } }),
+    ]);
+    try {
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => {
+          doc.getMap(SUPERVISOR_RETIREMENT_MAP).set(SUPERVISOR_RETIREMENT_KEY, encodeSupervisorRetirementReceipt(terminal));
+          const provider = f.bus.make(doc, "host", () => credential().token.reveal());
+          provider.inject(ready);
+          return provider;
+        } });
+      let settled = false;
+      const shutdown = replacement.shutdown("durable_before_ready").then(() => { settled = true; }, error => { settled = true; return error; });
+      await until(() => settled || f.bus.commands.length > 0);
+      f.clock.advance(100);
+      expect(await shutdown).toBeUndefined();
+      expect(f.bus.commands).toHaveLength(0);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("uses an exact retained shutdown only as cleanup proof without publishing another command", async () => {
+    const f = await fixture();
+    let replacement: V2SupervisorHost | null = null;
+    try {
+      await f.host.shutdown("offline_done");
+      const retired = f.status();
+      await f.host.close(); await f.peer.close();
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => {
+          const provider = f.bus.make(doc, "host", () => credential().token.reveal());
+          provider.inject(retired);
+          return provider;
+        } });
+      let settled = false;
+      const shutdown = replacement.shutdown("recover_terminal").then(() => { settled = true; }, error => { settled = true; return error; });
+      await until(() => settled);
+      expect(await shutdown).toBeUndefined();
+      await expect(replacement.connect()).rejects.toMatchObject({ code: "closed" });
+      await expect(replacement.stop({ launchNonces: ["known-child"], reason: "retired" })).rejects.toMatchObject({ code: "closed" });
+      await replacement.shutdown("already_done");
+      expect(f.bus.commands.map(command => command.message.kind)).toEqual(["shutdown"]);
+      expect(f.handled()).toBe(1);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it.each([
+    ["key", "awareness"], ["binding", "awareness"], ["instance", "awareness"], ["ordinary_host", "awareness"],
+    ["key", "document"], ["ordinary_host", "document"],
+  ] as const)("rejects retained shutdown with invalid %s authority from %s", async (invalid, surface) => {
+    const f = await fixture(false);
+    let replacement: V2SupervisorHost | null = null;
+    let provider!: Provider;
+    const terminal = await signSupervisorSandboxMessage(invalid === "key" ? createCredentialRotationKey() : f.key, {
+      protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox",
+      binding: invalid === "binding" ? { ...BINDING, nonce: "different-supervisor" } : BINDING,
+      supervisorInstanceId: invalid === "instance" ? "different-instance" : "offline-instance",
+      sequence: 1, message: { kind: "shutdown" },
+    });
+    try {
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: invalid !== "ordinary_host", connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => {
+          provider = f.bus.make(doc, "host", () => credential().token.reveal());
+          if (surface === "document") doc.getMap(SUPERVISOR_RETIREMENT_MAP).set(SUPERVISOR_RETIREMENT_KEY, encodeSupervisorRetirementReceipt(terminal));
+          else provider.inject(terminal);
+          return provider;
+        } });
+      const shutdown = replacement.shutdown("invalid_terminal").catch(error => error);
+      await until(() => provider.syncs === 1);
+      f.clock.advance(100);
+      expect(await shutdown).toMatchObject({ code: "timeout", phase: "bootstrap" });
+      expect(f.bus.commands).toHaveLength(0);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("requires synchronized transport before consuming retained shutdown proof", async () => {
+    const f = await fixture(false);
+    let replacement: V2SupervisorHost | null = null;
+    let provider!: Provider;
+    const terminal = await signSupervisorSandboxMessage(f.key, {
+      protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox", binding: BINDING,
+      supervisorInstanceId: "offline-instance", sequence: 1, message: { kind: "shutdown" },
+    });
+    let verified = 0;
+    const verify = crypto.subtle.verify.bind(crypto.subtle);
+    const observer = spyOn(crypto.subtle, "verify").mockImplementation(async (...args) => {
+      const result = await verify(...args); verified++; return result;
+    });
+    try {
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => {
+          provider = f.bus.make(doc, "host", () => credential().token.reveal());
+          provider.autoSync = false;
+          provider.inject(terminal);
+          return provider;
+        } });
+      let settled = false;
+      const shutdown = replacement.shutdown("retained_terminal").then(() => { settled = true; });
+      await until(() => verified > 0);
+      expect(settled).toBe(false);
+      expect(f.bus.commands).toHaveLength(0);
+      provider.emit("sync", true);
+      await shutdown;
+      expect(settled).toBe(true);
+      expect(f.bus.commands).toHaveLength(0);
+    } finally { observer.mockRestore(); await replacement?.close(); await f.close(); }
+  });
+
   it("recovers a journal-authorized new host from the exact peer's retained sequence using a fresh challenge", async () => {
     const f = await fixture();
     let replacement: V2SupervisorHost | null = null;

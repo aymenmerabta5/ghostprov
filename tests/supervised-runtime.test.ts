@@ -622,6 +622,51 @@ describe("SupervisedSandboxRuntime", () => {
     await Promise.all(supervisors.map(runtime => runtime.stop()));
   });
 
+  it("defers stale-heartbeat replacement only until the unroutable child's recovery deadline", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    const replacement = new FakeRuntime();
+    let creates = 0;
+    const runtime = supervisor({ clock, initial, create: () => { creates++; return replacement; } });
+    await runtime.start();
+    const snapshot = initial.snapshot.bind(initial);
+    const recovery = { startedAtMs: clock.now(), deadlineAtMs: clock.now() + 150_000 };
+    initial.snapshot = () => ({ ...snapshot(), capacity: 0, available: 0, livenessRecovery: recovery });
+    initial.heartbeatAgeMs = 40_001;
+    initial.transportConnected = false;
+    initial.emit();
+    await flush();
+    clock.advanceBy(149_999);
+    await flush();
+    expect(creates).toBe(0);
+    expect(runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+    clock.advanceBy(1);
+    initial.emit();
+    await waitFor(() => creates === 1);
+    await waitFor(() => runtime.snapshot().available === 128);
+    expect(initial.stops).toBe(1);
+    await runtime.stop();
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("does not let a recovery episode suppress credential expiry", async () => {
+    const clock = new ManualClock();
+    const initial = new FakeRuntime();
+    let creates = 0;
+    const runtime = supervisor({ clock, initial, create: () => { creates++; return new FakeRuntime(); } });
+    await runtime.start();
+    const snapshot = initial.snapshot.bind(initial);
+    initial.snapshot = () => ({
+      ...snapshot(), capacity: 0, available: 0, credentialExpiresInMs: 0,
+      livenessRecovery: { startedAtMs: clock.now(), deadlineAtMs: clock.now() + 150_000 },
+    });
+    initial.emit();
+    await waitFor(() => creates === 1);
+    await waitFor(() => runtime.snapshot().available === 128);
+    await runtime.stop();
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
   it("reprovisions auth-required and expired-credential generations", async () => {
     const clock = new ManualClock();
     const initial = new FakeRuntime();

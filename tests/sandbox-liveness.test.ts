@@ -3,10 +3,29 @@ import {
   hasFreshExactSidecarLiveness,
   hasFreshSandboxLiveness,
   isFreshSandboxLivenessAge,
+  isActiveSandboxLivenessRecovery,
+  SANDBOX_LIVENESS_RECOVERY_MAX_MS,
   SANDBOX_LIVENESS_MAX_AGE_MS,
 } from "../src/sandbox/liveness";
 
 describe("sandbox liveness", () => {
+  it("accepts only a finite bounded recovery episode before its exact deadline", () => {
+    const recovery = { startedAtMs: 1_000, deadlineAtMs: 1_000 + SANDBOX_LIVENESS_RECOVERY_MAX_MS };
+    expect(isActiveSandboxLivenessRecovery(recovery, 1_000)).toBe(true);
+    expect(isActiveSandboxLivenessRecovery(recovery, recovery.deadlineAtMs - 1)).toBe(true);
+    expect(isActiveSandboxLivenessRecovery(recovery, recovery.deadlineAtMs)).toBe(false);
+    expect(isActiveSandboxLivenessRecovery(recovery, 999)).toBe(false);
+    for (const invalid of [
+      { ...recovery, startedAtMs: -1 },
+      { ...recovery, startedAtMs: Number.NaN },
+      { ...recovery, deadlineAtMs: Number.POSITIVE_INFINITY },
+      { ...recovery, deadlineAtMs: recovery.deadlineAtMs + 1 },
+      { ...recovery, deadlineAtMs: recovery.startedAtMs },
+    ]) expect(isActiveSandboxLivenessRecovery(invalid, 1_000)).toBe(false);
+    expect(isActiveSandboxLivenessRecovery(recovery, Number.NaN)).toBe(false);
+    expect(isActiveSandboxLivenessRecovery(null, 1_000)).toBe(false);
+  });
+
   it("accepts only finite non-negative ages inside the exact freshness bound", () => {
     expect(isFreshSandboxLivenessAge(0)).toBe(true);
     expect(isFreshSandboxLivenessAge(SANDBOX_LIVENESS_MAX_AGE_MS)).toBe(true);

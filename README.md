@@ -60,7 +60,7 @@ Failure rules:
 - Client cancellations and definitive upstream errors are routing-neutral; only transport-attributable failures feed a sixty-second decaying sandbox health score.
 - ACK-stall age starts with the active reliable flight; idle time never suppresses credits, and a fully drained transport restores credits immediately. A reliable stall first sampled at ten seconds removes capacity, then a second independent sample two seconds later starts same-session R2 recovery; one slow sample never relaunches, and fresh ACK progress restores the normal ten-second cadence.
 - Every project runtime is supervised. A dead child first receives fresh sandbox sessions for the **same Prism project and worker index**. Only repeated identical project-local R9/R10 bootstrap failures can nominate the project itself for replacement. The content-free failure signature, observation identity, count, timestamps, duration, and durable leader generation are persisted, duplicate callbacks do not advance the threshold, and any verified readiness clears the evidence.
-- R10 ownership conflicts and unproven bootstrap cleanup use an automatic capacity-restoration path after the configured identical-failure threshold. The runtime fences the failed project, persists `bootstrap_hold`, and creates a fresh managed successor through normal fleet reconciliation. Its old project, journal, and continuation hints are retained; no old request is replayed and no held project is automatically deleted or reactivated. Holds survive restarts and are limited to `min(4, GP_MAX_PROJECTS)`, within the 128-record manifest bound. Healthy-majority, zero active/quarantined request work, and closed outage/mutation circuits are required. `GP_MAX_PROJECTS` continues to bound active projects; held records use the existing retirement allowance. `/__sandboxes.heldProjects` and `fleet.sample.held_project_count` expose retained projects. This runs automatically in normal `bun dev`; it does not depend on a repair script.
+- R10 ownership conflicts and unproven bootstrap cleanup use an automatic capacity-restoration path after the configured identical-failure threshold. The runtime fences the failed project, persists `bootstrap_hold`, and creates a fresh managed successor through normal fleet reconciliation. Its old project, journal, and continuation hints are retained; no old request is replayed and no held project is automatically deleted or reactivated. Ordinary holds survive restarts and are limited to `min(4, GP_MAX_PROJECTS)`, within the 128-record manifest bound. The explicitly prepared legacy migration ledger described below can grant at most two additional exact project holds, with a hard total of six. Healthy-majority, zero active/quarantined request work, and closed outage/mutation circuits are required. `GP_MAX_PROJECTS` continues to bound active projects; held records use the existing retirement allowance. `/__sandboxes.heldProjects` and `fleet.sample.held_project_count` expose retained projects. This runs automatically in normal `bun dev`; it does not depend on a repair script.
 - One isolated sidecar failure recovers immediately. A second distinct project failing within five seconds activates the existing fleet single-probe circuit, preventing an account outage from reprovisioning every sandbox at once.
 - Replacement-intent admission is serialized and fail-closed: a healthy majority running the configured supervisor release, closed fleet and project-mutation circuits, zero active/quarantined/ambiguous work, and zero retained continuation bindings are required. A verified successor may unblock the next failed minority even while an older remote deletion is pending, so stale retirement records cannot deadlock recovery. GhostProv persists replacement intent, creates and verifies the successor, drains the old runtime, and then deletes only an automatically managed old project. Imported projects are retired locally but never remotely deleted. Common-mode internet, account, rate-limit, timeout, or Prism failures freeze create/delete with bounded jittered backoff.
 - Projects that have never reached verified readiness use a separate two-start permit pool before entering the general four-start pool. Persisted `hasReachedReady` proof survives later failed states and restarts, so ordinary warm recovery keeps the full general headroom without allowing a cold Y-Sweet/render wave to start all projects simultaneously.
@@ -274,6 +274,10 @@ Transition-only `sandbox.liveness` records identify Prism heartbeat HTTP, timeou
 
 Transient Awareness loss first receives one reconnect attempt using the existing credential, bounded to three seconds and the original scheduled renewal deadline. The host must resynchronize and receive a pong from the exact bootstrap-bound sidecar before restoring routing. Authentication/state failures, unsuccessful proof, or due renewal use the existing credential-rotation path. The transport retains its in-flight requests and reliable windows; reconnection does not submit another provider request. Successful reconnect diagnostics include `reconnect_phase` to distinguish restored host transport from credential rotation.
 
+An R2 runtime owns one liveness-recovery episode for at most 150 seconds from its first failed probe or Awareness disconnect. Repeated preflight failures cannot extend that deadline. The outer supervisor respects this ownership while capacity is zero; definitive lifecycle failures and expiring credentials still take precedence. Expired recovery returns to the existing recovery path, and both `heartbeat_stale` and `heartbeat_missing` use the shared outage circuit. Liveness events distinguish `waiting_for_transport_recovery` and `recovery_deadline_expired`; full fleet samples include `liveness_recovery_remaining_ms`. This coordination does not reclaim unproven bootstrap journals or erase held projects.
+
+The dedicated `scripts/live_transport_outage_recovery.ts` verifier requires `GP_LIVE_TRANSPORT_OUTAGE_RECOVERY=1`, `GP_LIVE_ALLOW_TEST_PROJECT_MUTATION=1`, and an explicit `PRISM_COOKIE_FILE`. It is fenced to port `18888`, creates eight disposable projects with an isolated manifest and cookie copy, and applies bounded heartbeat/control/data loss only to their host transport lanes. Real provider requests exercise 30-, 60-, and 90-second interruptions. It verifies retained generations, successful terminals, public Responses/Messages routes, readiness after recovery, supervisor shutdown, and dedicated-project cleanup. Run it with `bun --no-env-file scripts/live_transport_outage_recovery.ts` only for an authorized live task.
+
 `request.accepted.reasoning_effort` records only a recognized effort label, `unspecified`, or `unknown`. Join it with terminal `first_text_ms`/`first_tool_ms` and upstream/transport timing to distinguish heavy reasoning from delayed delivery. This telemetry does not change the requested effort or retain reasoning content.
 
 Logs default to `.ghostprov/logs`, rotate at 64 MiB, and retain five rotated files per process and prefix. The bounded asynchronous head-index queue preserves terminal events ahead of progress and sample events, validates and serializes only during batched drain, and keeps full records in JSONL. Console output batches terminal/error records and rate-limits progress/sample records to a fixed cadence. Observability never logs prompts, responses, tool arguments, request bodies, headers, cookies, tokens, URLs, or client identifiers. No monitoring endpoint returns cookies, sandbox tokens, resource tokens, or Y-Sweet tokens.
@@ -438,6 +442,14 @@ Supervisor bootstrap readiness failures also reach the existing failed-session t
 
 For the long soak test, retain the application JSONL logs, `supervisor.jsonl`, `supervisor.json`, and monitor output. These contain only bounded counters/categories and no prompts, responses, cookies, API keys, or sandbox credentials.
 
+For an explicitly reviewed stranded legacy R10 bootstrap, the offline migration command can stage at most two exact managed project grants beside the manifest. It verifies the account, worker identity, archived release, and private submitted journal, then writes an immutable `0600` `<manifest>.bootstrap-migration.json` containing only identities and digests. It does not clear journals, delete projects, replay work, or restart a service:
+
+```powershell
+bun --no-env-file scripts/prepare_bootstrap_migration.ts --manifest <fleet.json> --identity-fingerprint <sha256> --project <legacy-project-uuid> --project <second-legacy-project-uuid> --confirm-legacy-bootstrap-migration
+```
+
+The new fleet code retains the ordinary four-hold budget plus at most these two exact migration holds, with a hard total of six. Existing majority, outage, and zero-work gates still apply. A granted held project consumes its slot permanently; successor IDs inherit nothing, and its continuation metadata remains retained. Older running code ignores the ledger. Busy journal leases temporarily withhold an unused grant without blocking reconciliation for more than 250 ms per grant.
+
 General project deletion remains a manual operation. The sole automatic case is cleanup of an old `managed:true` project after its fully verified replacement is active and every retirement fence passes. To decommission any other managed target, preview it first:
 
 ```powershell
@@ -563,6 +575,7 @@ The isolated suite includes:
 - `tests/documentation.test.ts`
 - `tests/file-lease.test.ts`
 - `tests/final-object-permit.test.ts`
+- `tests/bootstrap-migration.test.ts`
 - `tests/fleet-manifest.test.ts`
 - `tests/fleet-manager.test.ts`
 - `tests/graceful-shutdown.test.ts`
@@ -598,6 +611,10 @@ The isolated suite includes:
 - `tests/recovery-chaos.test.ts`
 - `tests/recovery-coordinator.test.ts`
 - `tests/recovery-observability.test.ts`
+- `tests/live-transport-outage-guard.test.ts`
+- `tests/live-retired-supervisor-guard.test.ts`
+- `tests/live-retirement-preflight.test.ts`
+- `tests/inspect-existing-retirement.test.ts`
 - `tests/response-graph.test.ts`
 - `tests/response-graph-governor.test.ts`
 - `tests/responses-continuation.test.ts`
@@ -714,6 +731,7 @@ The isolated suite includes:
 - `tests/v2-supervisor-protocol.test.ts`
 - `tests/v2-supervisor-reconnect.test.ts`
 - `tests/v2-supervisor-retirement.test.ts`
+- `tests/v2-supervisor-retirement-receipt.test.ts`
 - `tests/v2-supervisor-session-bootstrap.test.ts`
 - `tests/v2-transcript.test.ts`
 - `tests/v2-transport-session.test.ts`
