@@ -140,6 +140,56 @@ async function fixture(initialReady = true) {
 }
 
 describe("R9 authenticated supervisor reconnect", () => {
+  it("recovers a journal-authorized new host from the exact peer's retained sequence using a fresh challenge", async () => {
+    const f = await fixture();
+    let replacement: V2SupervisorHost | null = null;
+    try {
+      await f.host.stop({ launchNonces: ["known-child"], reason: "offline" });
+      expect(f.status().sequence).toBe(1);
+      await f.host.close();
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => f.bus.make(doc, "host", () => credential().token.reveal()) });
+      await replacement.connect();
+      expect(f.bus.commands.map(command => [command.sequence, command.message.kind])).toEqual([[1, "stop"], [2, "rotate"]]);
+      expect(f.handled()).toBe(1);
+      await replacement.stop({ launchNonces: ["known-child"], reason: "offline" });
+      expect(f.bus.commands.at(-1)?.sequence).toBe(3);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("does not treat an authenticated retained reply as fresh recovery liveness", async () => {
+    const f = await fixture();
+    let replacement: V2SupervisorHost | null = null;
+    try {
+      await f.host.stop({ launchNonces: ["known-child"], reason: "offline" });
+      await f.host.close(); f.bus.dropHost = true;
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => f.bus.make(doc, "host", () => credential().token.reveal()) });
+      const recovery = replacement.connect().catch(error => error);
+      await until(() => f.bus.commands.length === 2);
+      f.clock.advance(100);
+      expect(await recovery).toMatchObject({ code: "timeout", phase: "challenge" });
+      expect(f.handled()).toBe(1);
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("does not let ordinary new hosts adopt an existing peer's command sequence", async () => {
+    const f = await fixture();
+    let replacement: V2SupervisorHost | null = null;
+    try {
+      await f.host.stop({ launchNonces: ["known-child"], reason: "offline" });
+      await f.host.close();
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => f.bus.make(doc, "host", () => credential().token.reveal()) });
+      const recovery = replacement.connect().catch(error => error);
+      await new Promise<void>(resolve => setImmediate(resolve)); f.clock.advance(100);
+      expect(await recovery).toMatchObject({ code: "timeout", phase: "bootstrap" });
+      expect(f.bus.commands).toHaveLength(1);
+    } finally { await replacement?.close(); await f.close(); }
+  });
   it("recovers a missed fresh challenge notification using the same signed command", async () => {
     const f = await fixture();
     try {

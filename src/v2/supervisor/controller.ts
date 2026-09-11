@@ -1,4 +1,5 @@
 import type { YSweetEnvelope } from "../../prism/protocol";
+import { BOOTSTRAP_FAILURE_REASONS, type SandboxFailureSnapshot } from "../../sandbox/types";
 import type {
   BootstrapBinding,
   SealedBootstrapCredential,
@@ -24,6 +25,7 @@ import { sealSupervisorSessionBootstrap } from "./session-bootstrap";
 import { supervisorStaticConfig as r10SupervisorStaticConfig } from "./r10-launcher";
 import { directSupervisorLaunchFiles as r10DirectSupervisorLaunchFiles, isRegisteredR10Entrypoint } from "./r10-direct-launcher";
 import { decodeSandboxLogResponse } from "../diagnostics/read-sandbox-log";
+import { canonicalJson } from "../protocol/shared";
 import { GitFsmonitorBootstrap } from "./git-fsmonitor";
 import { GitSshSigningBootstrap } from "./git-ssh-signing";
 import { GitCleanFilterBootstrap } from "./git-clean-filter";
@@ -45,13 +47,15 @@ export class V2SupervisorBootstrapError extends Error {
   constructor(
     message: string,
     readonly kind: "deploy" | "exec" | "hello" | "readiness" | "shutdown",
-    options?: ErrorOptions & { remoteCode?: string },
+    options?: ErrorOptions & { remoteCode?: string; reason?: SandboxFailureSnapshot["bootstrapReason"] },
   ) {
     super(message, options);
     this.remoteCode = options?.remoteCode ?? null;
+    this.reason = options?.reason ?? null;
   }
 
   readonly remoteCode: string | null;
+  readonly reason: SandboxFailureSnapshot["bootstrapReason"] | null;
 }
 
 export interface V2SandboxSupervisorOptions {
@@ -91,6 +95,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly #commandTimeoutMs: number;
   readonly #hostFactory: NonNullable<V2SandboxSupervisorOptions["hostFactory"]>;
   #host: V2BootstrapSupervisor | null = null;
+  #activeAttempt: SupervisorBootstrapAttempt | null = null;
   #ensuring: Promise<void> | null = null;
   readonly #lifecycle = new AbortController();
   #shutdown: Promise<void> | null = null;
@@ -173,7 +178,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   async #cleanupBootstrapAttempt(attempt: SupervisorBootstrapAttempt, signal?: AbortSignal): Promise<void> {
     if (attempt.binding.projectId !== this.binding.projectId ||
       attempt.binding.buildHash !== this.#assets.buildHash || attempt.binding.schemaHash !== this.#assets.schemaHash) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap release does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+      throw new V2SupervisorBootstrapError("Previous bootstrap release does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch" });
     }
     const files = (this.#assets.revision === "r10" ? r10DirectSupervisorLaunchFiles : directSupervisorLaunchFiles)({
       entrypointPath: this.#assets.entrypointPath, supervisorNonce: attempt.binding.nonce,
@@ -190,18 +195,32 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     const observed = await Promise.all(expected.map(async file => ({ ...file, current: await this.#ydoc.readPath(file.path) })));
     if (observed.every(file => file.current === null)) {
       await this.#gateway.syncWorkspace(signal);
+      await this.#assertBootstrapPaths(expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
       return;
     }
     if (currentStatic !== staticConfig || observed.some(file => file.current !== null && file.current !== file.content)) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap files have another owner", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+      throw new V2SupervisorBootstrapError("Previous bootstrap files have another owner", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "file_mismatch" });
     }
     signal?.throwIfAborted();
     const applied = await this.#ydoc.compareAndMutatePaths({
       guards: [{ path: SUPERVISOR_STATIC_PATH, equals: currentStatic }, ...observed.map(file => ({ path: file.path, equals: file.current }))],
       mutations: observed.filter(file => file.current !== null).map(file => ({ kind: "tombstone", path: file.path })),
     });
-    if (!applied) throw new V2SupervisorBootstrapError("Previous bootstrap files changed during cleanup", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+    if (!applied) throw new V2SupervisorBootstrapError("Previous bootstrap files changed during cleanup", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "ownership_changed" });
     await this.#gateway.syncWorkspace(signal);
+    await this.#assertBootstrapPaths(expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
+  }
+
+  async #assertBootstrapPaths(
+    files: readonly { readonly path: string; readonly content: string | null }[],
+    remoteCode: "bootstrap_stage_lost" | "bootstrap_cleanup_not_persisted",
+  ): Promise<void> {
+    // A reconnect can replace the Y.Doc after a successful local transaction.
+    // Workspace readiness alone does not prove that this generation survived.
+    const observed = await Promise.all(files.map(file => this.#ydoc.readPath(file.path)));
+    if (files.some((file, index) => observed[index] !== file.content)) {
+      throw new V2SupervisorBootstrapError("Bootstrap synchronization did not preserve the expected files", "deploy", { remoteCode });
+    }
   }
 
   async #recoverBootstrap(journal: BootstrapJournalEntry, signal?: AbortSignal): Promise<void> {
@@ -209,22 +228,29 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     if (!previous) return;
     if (previous.binding.projectId !== this.binding.projectId || previous.binding.leaderGeneration >= this.binding.leaderGeneration ||
       previous.binding.buildHash !== this.#assets.buildHash || previous.binding.schemaHash !== this.#assets.schemaHash) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap identity cannot be retired by this generation", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+      throw new V2SupervisorBootstrapError("Previous bootstrap identity cannot be retired by this generation", "deploy", {
+        remoteCode: "bootstrap_ownership_conflict", reason: previous.binding.leaderGeneration >= this.binding.leaderGeneration ? "generation_conflict" : "release_mismatch",
+      });
     }
     if (previous.phase === "submitted") {
       // A durable submission is never replayed. Reconnect only to its exact
       // authenticated supervisor and obtain child-cleanup proof before reuse.
       const payload = await openSupervisorSessionBootstrap({ sessionId: previous.sessionId, expectedBinding: previous.binding, sealed: previous.sealed });
+      this.#executionSessionId = previous.sessionId;
       const host = this.#hostFactory({ binding: previous.binding, instanceId: payload.instanceId,
         rotationKey: payload.credential.rotationKey, credential: this.#ySweet,
-        connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs });
+        connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs,
+        recoverExisting: true });
       try {
         await host.connect(signal);
         await host.shutdown("interrupted_bootstrap_recovery", signal);
         previous = { ...previous, phase: "cleanup_proven" };
         await journal.save(previous);
       } catch (cause) {
-        throw new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", { cause, remoteCode: "bootstrap_cleanup_unproven" });
+        const phase = cause instanceof Error ? Object.getOwnPropertyDescriptor(cause, "phase")?.value : undefined;
+        throw new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", {
+          cause, remoteCode: "bootstrap_cleanup_unproven", ...(BOOTSTRAP_FAILURE_REASONS.includes(phase) ? { reason: phase } : {}),
+        });
       } finally { await host.close(); }
     }
     await this.#cleanupBootstrapAttempt(previous, signal);
@@ -266,6 +292,12 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     let submissionStarted = false;
     let phase: "deploy" | "exec" | "readiness" = "deploy";
     try {
+      if (journal && (await this.#ydoc.readPath(DIRECT_SUPERVISOR_LAUNCH_PATH) !== null ||
+        await this.#ydoc.readPath(DIRECT_SUPERVISOR_INSTALL_PATH) !== null)) {
+        throw new V2SupervisorBootstrapError("Existing bootstrap files have no recovery receipt", "deploy", {
+          remoteCode: "bootstrap_ownership_conflict", reason: "missing_receipt",
+        });
+      }
       await journal?.save(attempt);
       const [currentStatic, currentCredential] = await Promise.all([
         this.#ydoc.readPath(SUPERVISOR_STATIC_PATH),
@@ -284,15 +316,19 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
           ...transients.map(file => ({ kind: "write" as const, ...file })),
         ],
       });
-      if (!applied) throw new V2SupervisorBootstrapError("Supervisor workspace authority changed", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+      if (!applied) throw new V2SupervisorBootstrapError("Supervisor workspace authority changed", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "ownership_changed" });
       staged = true;
       await this.#gateway.syncWorkspace(signal);
       signal?.throwIfAborted();
+      const stagedFiles = [{ path: SUPERVISOR_STATIC_PATH, content: staticConfig }, ...transients];
+      await this.#assertBootstrapPaths(stagedFiles, "bootstrap_stage_lost");
       host = this.#hostFactory({ binding: this.binding, instanceId, rotationKey, credential: this.#ySweet,
         connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs });
       phase = "exec";
       attempt = { ...attempt, phase: "submitted" };
       await journal?.save(attempt);
+      signal?.throwIfAborted();
+      await this.#assertBootstrapPaths(stagedFiles, "bootstrap_stage_lost");
       signal?.throwIfAborted();
       // One immutable submission. The selected bootstrap never falls back or
       // resubmits after a failed or ambiguous trigger.
@@ -312,8 +348,11 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       if (!cleaned) throw new Error("Supervisor bootstrap authority changed during cleanup");
       await this.#gateway.syncWorkspace(signal);
       signal?.throwIfAborted();
+      await this.#assertBootstrapPaths(transients.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
       if (this.#closed || this.#stopping) throw new DOMException("Supervisor closed during bootstrap", "AbortError");
-      await journal?.clear();
+      // Keep exact authority through the entire supervisor lifetime, including
+      // crashes after readiness and failures during later child recovery.
+      this.#activeAttempt = journal ? attempt : null;
       this.#instanceId = instanceId;
       this.#host = host;
     } catch (cause) {
@@ -527,6 +566,20 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       await this.#ensuring?.catch(() => undefined);
       if (this.#host) {
         await this.#host.shutdown(safeReason(reason), signal);
+        const attempt = this.#activeAttempt;
+        if (attempt && this.#bootstrapJournal) {
+          await this.#bootstrapJournal.withLease(signal, async journal => {
+            const current = await journal.load();
+            if (!current || canonicalJson(current) !== canonicalJson(attempt)) {
+              throw new V2SupervisorBootstrapError("Supervisor shutdown receipt authority changed", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+            }
+            const proven = { ...current, phase: "cleanup_proven" as const };
+            await journal.save(proven);
+            await this.#cleanupBootstrapAttempt(proven, signal);
+            await journal.clear();
+            this.#activeAttempt = null;
+          });
+        }
         if (this.#gitBootstrap) {
           await this.#gitBootstrap.cleanupAfterSignedShutdown(true, signal ?? AbortSignal.timeout(this.#commandTimeoutMs));
         }
@@ -552,13 +605,15 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closed = true;
-    try { this.#onClosed?.(); } catch { /* Diagnostic cleanup does not own lifecycle success. */ }
     this.#lifecycle.abort(new DOMException("Supervisor closed", "AbortError"));
     this.#closing = (async () => {
       await this.#ensuring?.catch(() => undefined);
       const host = this.#host;
       this.#host = null;
-      if (host) await host.close();
+      try { if (host) await host.close(); }
+      finally {
+        try { this.#onClosed?.(); } catch { /* Observer cleanup does not own lifecycle success. */ }
+      }
     })();
     return this.#closing;
   }

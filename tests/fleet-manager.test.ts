@@ -101,6 +101,11 @@ function recoveryCompleted(projectId: ProjectId): SandboxSupervisorEvent {
   };
 }
 
+function blockedBootstrap(id: ProjectId, count: number): SandboxSupervisorEvent {
+  const event = recoveryRetry(id, count, "deploy");
+  return { ...event, failure: { ...event.failure!, bootstrapPhase: "deploy", bootstrapCode: "bootstrap_cleanup_unproven" } };
+}
+
 function recoveryCircuit(
   state: FleetRecoverySnapshot["state"],
   scope: FleetRecoverySnapshot["scope"],
@@ -843,6 +848,82 @@ describe("ProjectFleetManager", () => {
       "successor_activated",
       "old_retired",
     ]);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("automatically restores blocked bootstrap capacity while preserving the old project and continuation bindings", async () => {
+    const files = await state(), projects = new FakeProjects([]);
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, randomUuid: uuidSequence(A, B, C, D, E), canRetireProject: () => false });
+    await harness.value.reconcile(); harness.factory.runtimes.get(A)!.state = "recovering";
+    const markDraining = files.manifest.markDraining.bind(files.manifest);
+    files.manifest.markDraining = async (id, reason, now) => {
+      if (reason === "bootstrap_hold") expect(harness.factory.runtimes.get(id)!.state).toBe("stopped");
+      return markDraining(id, reason, now);
+    };
+    for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, unavailable: 0, heldProjects: [A], pendingRetirements: 1 });
+    expect(harness.registry.get(A)).toBeUndefined(); expect(projects.deleted).toEqual([]);
+    expect(projects.created.map(value => value.projectId)).toEqual([A, B, C, D, E]);
+    expect((await files.manifest.load()).workers.find(worker => worker.projectId === A))
+      .toMatchObject({ state: "draining", retirementReason: "bootstrap_hold" });
+    harness.value.observeRecoveryEvent(recoveryCompleted(A));
+    await harness.value.reconcile(); expect(projects.deleted).toEqual([]); expect(projects.created).toHaveLength(5);
+    await harness.value.shutdown("restart");
+    const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, randomUuid: () => { throw new Error("must not allocate again"); } });
+    await expect(restarted.value.reconcile()).resolves.toMatchObject({ ready: 4, heldProjects: [A] });
+    expect(restarted.registry.get(A)).toBeUndefined(); expect(projects.deleted).toEqual([]);
+    await restarted.value.shutdown("test-complete");
+  });
+
+  it("does not hold generic deployment errors or turn duplicate observations into replacement proof", async () => {
+    const files = await state(), projects = new FakeProjects([]);
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4 }), manifest: files.manifest,
+      projects, randomUuid: uuidSequence(A, B, C, D, E) });
+    await harness.value.reconcile(); harness.factory.runtimes.get(A)!.state = "recovering";
+    for (let count = 1; count <= 4; count++) harness.value.observeRecoveryEvent(recoveryRetry(A, count, "deploy"));
+    await harness.value.reconcile(); expect(projects.created).toHaveLength(4);
+    for (let count = 1; count <= 4; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, 1));
+    await harness.value.reconcile(); expect(projects.created).toHaveLength(4);
+    expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)?.replacementEvidence?.count).toBe(1);
+    await harness.value.shutdown("test-complete");
+  });
+
+  it("freezes bootstrap holds during a common-mode outage and while requests are active", async () => {
+    const files = await state(), projects = new FakeProjects([]);
+    let circuit = recoveryCircuit("closed", null);
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4 }), manifest: files.manifest,
+      projects, randomUuid: uuidSequence(A, B, C, D, E), recoveryCircuitSnapshot: () => circuit });
+    await harness.value.reconcile(); const failed = harness.factory.runtimes.get(A)!; failed.state = "recovering";
+    for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+    circuit = recoveryCircuit("open", "outage"); await harness.value.reconcile();
+    expect(projects.created).toHaveLength(4);
+    circuit = recoveryCircuit("closed", null);
+    const snapshot = failed.snapshot.bind(failed);
+    failed.snapshot = () => ({ ...snapshot(), active: 1 });
+    await harness.value.reconcile(); expect(projects.created).toHaveLength(4);
+    failed.snapshot = snapshot;
+    await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, heldProjects: [A] });
+    expect(projects.deleted).toEqual([]); await harness.value.shutdown("test-complete");
+  });
+
+  it("caps retained bootstrap projects instead of growing the account fleet indefinitely", async () => {
+    const files = await state(), projects = new FakeProjects([]);
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4 }), manifest: files.manifest,
+      projects, randomUuid: uuidSequence(A, B, C, D, E, F, G, H), onLifecycleEvent: event => lifecycle.push(event) });
+    await harness.value.reconcile();
+    for (const id of [A, B, C, D]) {
+      harness.factory.runtimes.get(id)!.state = "recovering";
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      await harness.value.reconcile();
+    }
+    expect(harness.value.snapshot().heldProjects).toEqual([A, B, C, D]);
+    harness.factory.runtimes.get(E)!.state = "recovering";
+    for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(E, count));
+    await harness.value.reconcile(); expect(projects.created).toHaveLength(8); expect(projects.deleted).toEqual([]);
+    expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", reason: "bootstrap_hold_limit" }));
     await harness.value.shutdown("test-complete");
   });
 

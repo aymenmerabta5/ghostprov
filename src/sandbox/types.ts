@@ -60,7 +60,8 @@ export type YSweetToken = SecretValue<"YSweetToken">;
 export type ResourceToken = SecretValue<"ResourceToken">;
 
 export const BOOTSTRAP_FAILURE_PHASES = ["deploy", "exec", "hello", "readiness", "shutdown"] as const;
-export const BOOTSTRAP_FAILURE_CODES = ["bootstrap_ownership_conflict", "bootstrap_cleanup_unproven"] as const;
+export const BOOTSTRAP_FAILURE_CODES = ["bootstrap_ownership_conflict", "bootstrap_cleanup_unproven", "bootstrap_stage_lost", "bootstrap_cleanup_not_persisted"] as const;
+export const BOOTSTRAP_FAILURE_REASONS = ["missing_receipt", "release_mismatch", "generation_conflict", "file_mismatch", "ownership_changed", "transport", "bootstrap", "sequence", "challenge", "command"] as const;
 
 export interface SandboxFailureSnapshot {
   name: string;
@@ -70,6 +71,7 @@ export interface SandboxFailureSnapshot {
   message: string;
   bootstrapPhase?: typeof BOOTSTRAP_FAILURE_PHASES[number];
   bootstrapCode?: typeof BOOTSTRAP_FAILURE_CODES[number];
+  bootstrapReason?: typeof BOOTSTRAP_FAILURE_REASONS[number];
   /** Bounded atoms emitted by the trusted sidecar fatal record, when present. */
   sidecarErrorName?: string;
   sidecarErrorCode?: string;

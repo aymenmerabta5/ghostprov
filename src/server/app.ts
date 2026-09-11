@@ -191,6 +191,7 @@ function publicFailure(value: unknown): Record<string, unknown> | null {
     message: sanitizeDiagnosticMessage(raw.message),
     bootstrapPhase: publicAtom(raw.bootstrapPhase),
     bootstrapCode: publicAtom(raw.bootstrapCode),
+    bootstrapReason: publicAtom(raw.bootstrapReason),
     sidecarErrorName: publicAtom(raw.sidecarErrorName),
     sidecarErrorCode: publicAtom(raw.sidecarErrorCode),
     sidecarCauseName: raw.sidecarCauseName === null ? null : publicAtom(raw.sidecarCauseName),
@@ -361,6 +362,7 @@ function publicFleetState(
   unavailableProjects: string[];
   unavailableProjectsTruncated: boolean;
   pendingRetirements: number;
+  heldProjects: string[];
   projectMutation: {
     state: "closed" | "open";
     consecutiveFailures: number;
@@ -375,6 +377,7 @@ function publicFleetState(
       unavailableProjects: [],
       unavailableProjectsTruncated: false,
       pendingRetirements: 0,
+      heldProjects: [],
       projectMutation: { state: "closed", consecutiveFailures: 0, retryInMs: null },
     };
   }
@@ -389,6 +392,8 @@ function publicFleetState(
       value.unavailableProjects.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS ||
       all.length > MAX_PUBLIC_UNAVAILABLE_PROJECTS,
     pendingRetirements: publicInteger(value.pendingRetirements) ?? 0,
+    heldProjects: (value.heldProjects ?? []).slice(0, MAX_PUBLIC_UNAVAILABLE_PROJECTS)
+      .filter(id => PUBLIC_PROJECT_ID.test(id)),
     projectMutation: {
       state: value.projectMutation?.state === "open" ? "open" : "closed",
       consecutiveFailures: publicInteger(value.projectMutation?.consecutiveFailures) ?? 0,

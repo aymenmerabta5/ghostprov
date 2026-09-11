@@ -18,7 +18,7 @@ export type FleetLifecycleObservabilityEventName =
   typeof FLEET_LIFECYCLE_EVENT_NAMES[number];
 
 export const FLEET_REPLACEMENT_FAILURE_KINDS = [
-  "hello", "readiness", "render", "timeout",
+  "hello", "readiness", "render", "timeout", "bootstrap_blocked",
 ] as const;
 export const FLEET_RETIREMENT_REASONS = ["replacement", "missing"] as const;
 export const FLEET_MUTATION_OPERATIONS = ["replace", "create", "delete"] as const;
@@ -33,6 +33,8 @@ export const FLEET_MUTATION_BLOCK_REASONS = [
   "healthy_majority",
   "project_client",
   "control_plane",
+  "bootstrap_hold_limit",
+  "bootstrap_cleanup",
 ] as const;
 export const FLEET_STARTUP_PERMIT_ACTIONS = ["acquired", "released"] as const;
 
@@ -379,6 +381,7 @@ export interface RecoveryObservabilityFields {
   error_name?: SandboxRecoveryErrorName | null;
   error_kind?: SandboxRecoveryErrorKind | null;
   bootstrap_phase?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapPhase"] | null;
+  bootstrap_reason?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapReason"] | null;
   bootstrap_code?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapCode"] | null;
   sidecar_error_name?: V2SidecarFatalErrorName | null;
   sidecar_error_code?: V2SidecarFatalErrorCode | null;

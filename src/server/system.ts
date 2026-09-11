@@ -3,6 +3,7 @@ import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
 import { FileSupervisorBootstrapJournal } from "../v2/supervisor/bootstrap-journal";
+import { SupervisorLifecycle } from "../v2/supervisor/lifecycle";
 import { FleetStartupPermitPool } from "../fleet/startup-permits";
 import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
@@ -473,6 +474,7 @@ function defaultRuntimeFactory(options: {
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
   sandboxLogs: SandboxLogService;
+  supervisorLifecycle: SupervisorLifecycle;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
   sandboxSupervisorFactory?: BrowserlessSystemDependencies["sandboxSupervisorFactory"];
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
@@ -490,6 +492,7 @@ function defaultRuntimeFactory(options: {
     revalidateAccount,
     logger,
     sandboxLogs,
+    supervisorLifecycle,
     heartbeatFactory,
     sandboxSupervisorFactory,
     onRecoveryEvent,
@@ -615,7 +618,9 @@ function defaultRuntimeFactory(options: {
       },
       createSupervisor: supervisor => {
         if (config.v2BootstrapLaunchMode !== "relay") return null;
+        supervisorLifecycle.assertAvailable();
         let unregister = () => {};
+        let releaseLifecycle = () => {};
         const created = (sandboxSupervisorFactory ?? (input => new V2SandboxSupervisor(input)))({
             binding: bootstrapBindingFromProtocol(
               supervisor.binding,
@@ -631,12 +636,18 @@ function defaultRuntimeFactory(options: {
                   `${config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint)}.bootstrap`, projectId,
                 ) }
               : {}),
-            onClosed: () => unregister(),
+            onClosed: () => { try { unregister(); } finally { releaseLifecycle(); } },
           });
-        if (supervisor.assets.revision === "r10" && created.readDiagnosticLog) {
-          unregister = sandboxLogs.register(projectId, { readDiagnosticLog: created.readDiagnosticLog.bind(created) });
+        try {
+          releaseLifecycle = supervisorLifecycle.register(created);
+          if (supervisor.assets.revision === "r10" && created.readDiagnosticLog) {
+            unregister = sandboxLogs.register(projectId, { readDiagnosticLog: created.readDiagnosticLog.bind(created) });
+          }
+          return created;
+        } catch (error) {
+          void created.close().finally(releaseLifecycle).catch(() => undefined);
+          throw error;
         }
-        return created;
       },
       createBootstrap: bootstrap => new V2BootstrapController({
         projectId,
@@ -772,6 +783,7 @@ function defaultRuntimeFactory(options: {
             status: failure?.status ?? null,
             bootstrap_phase: failure?.bootstrapPhase ?? null,
             bootstrap_code: failure?.bootstrapCode ?? null,
+            bootstrap_reason: failure?.bootstrapReason ?? null,
             error_name: failure
               ? normalizeSandboxRecoveryErrorName(failure.name)
               : null,
@@ -1008,6 +1020,7 @@ export async function createBrowserlessSystem(
     },
   });
   const sandboxLogs = new SandboxLogService({ governor, maxSources: Math.min(256, config.maxProjects) });
+  const supervisorLifecycle = new SupervisorLifecycle(Math.min(256, config.maxProjects * 2 + config.provisionConcurrency));
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
     identity,
@@ -1029,6 +1042,7 @@ export async function createBrowserlessSystem(
     sandboxSupervisorFactory: dependencies.sandboxSupervisorFactory,
     onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
     sandboxLogs,
+    supervisorLifecycle,
   });
   fleet = new ProjectFleetManager({
     config,
@@ -1229,6 +1243,7 @@ export async function createBrowserlessSystem(
         unlinkExternalStartup();
         startupController.abort();
         const shutdownDeadlineMs = Date.now() + config.shutdownDrainMs;
+        supervisorLifecycle.beginShutdown();
         const before = router.snapshot();
         logger.emit(observabilityEvent("server.stopping", {
           reason: "system-shutdown",
@@ -1263,6 +1278,10 @@ export async function createBrowserlessSystem(
         } catch (error) {
           firstError ??= error;
         }
+        // Runtime stop waiters are bounded independently. Their exact supervisor
+        // cleanup still needs the account and project connections until it settles.
+        await supervisorLifecycle.shutdown(AbortSignal.timeout(Math.max(1, shutdownDeadlineMs - Date.now())))
+          .catch(error => { firstError ??= error; });
         await router.close().catch(error => { firstError ??= error; });
         const serverClose = await settleServerClose(server, serverClosing, shutdownDeadlineMs);
         if (serverClose.error !== undefined) firstError ??= serverClose.error;

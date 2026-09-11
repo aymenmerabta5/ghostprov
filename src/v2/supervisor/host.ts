@@ -86,6 +86,8 @@ export interface V2SupervisorHostOptions {
   readonly credential: YSweetEnvelope;
   readonly connectTimeoutMs?: number;
   readonly commandTimeoutMs?: number;
+  /** Only journal-authorized recovery may attach to a previously used supervisor. */
+  readonly recoverExisting?: boolean;
   readonly clock?: Clock;
   readonly providerFactory?: (
     doc: Y.Doc,
@@ -152,6 +154,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   readonly #rotationKey: string;
   readonly #connectTimeoutMs: number;
   readonly #commandTimeoutMs: number;
+  readonly #recoverExisting: boolean;
   readonly #clock: Clock;
   readonly #doc: Y.Doc;
   readonly #provider: SupervisorAwarenessProviderLike;
@@ -180,6 +183,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     this.#credential = options.credential;
     this.#connectTimeoutMs = boundedPositive(options.connectTimeoutMs, 20_000, "connectTimeoutMs");
     this.#commandTimeoutMs = boundedPositive(options.commandTimeoutMs, 45_000, "commandTimeoutMs");
+    this.#recoverExisting = options.recoverExisting ?? false;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#doc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:supervisor:host` });
     const credential = () => this.#credential;
@@ -526,6 +530,8 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       parsed.supervisorInstanceId !== this.instanceId ||
       (parsed.sequence !== this.#pending?.sequence &&
         !(parsed.sequence === 0 && parsed.message.kind === "ready" && !this.#bootstrapProven && this.#connectResolve) &&
+        !(this.#recoverExisting && !this.#bootstrapProven && this.#sequence === 0 && this.#connectResolve &&
+          parsed.sequence > 0 && parsed.message.kind !== "ready" && parsed.message.kind !== "shutdown") &&
         !(this.#connectResolve && this.#sequence > this.#confirmedSequence && parsed.sequence === this.#sequence))
     ) return;
     this.#mailbox.offer(parsed);
@@ -535,6 +541,18 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     const connectionVersion = this.#connectionVersion;
     if (!await verifySupervisorSandboxMessage(this.#rotationKey, parsed)) return;
     if (this.#closed) return;
+    if (this.#recoverExisting && !this.#bootstrapProven && this.#connectResolve &&
+      this.#transportSynced && connectionVersion === this.#connectionVersion && !this.#pending &&
+      (parsed.sequence === 0 && parsed.message.kind === "ready" ||
+        parsed.sequence > 0 && parsed.message.kind !== "ready" && parsed.message.kind !== "shutdown")) {
+      // The MAC authenticates exact journal authority and the consumed sequence.
+      // A fresh challenge must still prove liveness before any shutdown/launch.
+      this.#sequence = parsed.sequence;
+      this.#confirmedSequence = parsed.sequence;
+      this.#bootstrapProven = true;
+      this.#connectContinue?.();
+      return;
+    }
     if (parsed.sequence === 0 && parsed.message.kind === "ready") {
       if (!this.#bootstrapProven && this.#transportSynced && connectionVersion === this.#connectionVersion) {
         this.#connectResolve?.();

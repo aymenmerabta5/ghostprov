@@ -1,4 +1,4 @@
-import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES } from "../sandbox/types";
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES, BOOTSTRAP_FAILURE_REASONS } from "../sandbox/types";
 import {
   CREDENTIAL_REFRESH_OUTCOMES,
   FLEET_LIFECYCLE_EVENT_NAMES,
@@ -67,7 +67,7 @@ const REASONING_EFFORTS = new Set([
 ]);
 const COMMON = new Set(["schema", "event", "ts", "mono_ms"]);
 const RECOVERY_FIELDS = new Set([
-  "bootstrap_phase", "bootstrap_code",
+  "bootstrap_phase", "bootstrap_code", "bootstrap_reason",
   "project_id",
   "worker_index",
   "transport",
@@ -147,7 +147,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "first_text_ms", "first_tool_ms", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id", "committed", "quarantined", "retry_count"]),
   "websocket.payload_rejected": new Set(["limit_bytes", "http_fallback_available"]),
   "websocket.http_fallback": new Set(["status", "limit_bytes"]),
-  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
+  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "held_project_count", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
   "monitor.sample": new Set(["poll_ms", "health_status", "sandboxes_status", "capacity", "active", "available", "queued", "resources", "runtimes"]),
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
@@ -175,6 +175,7 @@ const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const RECOVERY_ENUM_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
   bootstrap_phase: new Set(BOOTSTRAP_FAILURE_PHASES),
   bootstrap_code: new Set(BOOTSTRAP_FAILURE_CODES),
+  bootstrap_reason: new Set(BOOTSTRAP_FAILURE_REASONS),
   transport: new Set(SANDBOX_RECOVERY_TRANSPORTS),
   cause: new Set(SANDBOX_RECOVERY_CAUSES),
   error_name: new Set(SANDBOX_RECOVERY_ERROR_NAMES),
@@ -229,7 +230,7 @@ const SUPERVISOR_PHASE_SET = new Set<string>(SANDBOX_SUPERVISOR_PHASES);
 const AWARENESS_LANE_SET = new Set<string>(SANDBOX_AWARENESS_LANES);
 const LIVENESS_TRANSPORT_SET = new Set<string>(SANDBOX_RECOVERY_TRANSPORTS);
 const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
-  "bootstrap_phase", "bootstrap_code",
+  "bootstrap_phase", "bootstrap_code", "bootstrap_reason",
   "error_name",
   "error_kind",
   "sidecar_error_name",
@@ -599,7 +600,7 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
     "unavailable_projects_truncated" in event &&
     typeof event.unavailable_projects_truncated !== "boolean"
   ) throw new TypeError("Fleet unavailable project truncation flag is invalid");
-  for (const key of ["pending_retirements", "project_mutation_failures"] as const) {
+  for (const key of ["pending_retirements", "project_mutation_failures", "held_project_count"] as const) {
     if (!(key in event)) continue;
     const value = event[key];
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {

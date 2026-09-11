@@ -35,7 +35,7 @@ export class FleetManifestError extends Error {
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
-const MAX_MANIFEST_WORKERS = 128;
+export const MAX_MANIFEST_WORKERS = 128;
 
 export function defaultFleetManifestFile(
   identityFingerprint: string,
@@ -67,12 +67,14 @@ const RETIREMENT_REASONS = new Set<FleetRetirementReason>([
   "replacement",
   "missing",
   "surplus",
+  "bootstrap_hold",
 ]);
 const REPLACEMENT_FAILURE_KINDS = new Set<FleetReplacementFailureKind>([
   "hello",
   "readiness",
   "render",
   "timeout",
+  "bootstrap_blocked",
 ]);
 
 function isNodeError(error: unknown, code: string): boolean {
@@ -413,6 +415,9 @@ export class FleetManifestStore {
       const workers = current.workers.map(worker => {
         if (worker.projectId !== id) return worker;
         found = true;
+        if (worker.retirementReason === "bootstrap_hold" && state !== "draining") {
+          throw new FleetManifestError("A held bootstrap project cannot be reactivated without cleanup proof", "conflict");
+        }
         if (nowMs < worker.updatedAtMs) {
           throw new FleetManifestError("Worker update time cannot move backwards", "conflict");
         }
@@ -448,6 +453,9 @@ export class FleetManifestStore {
       const workers = current.workers.map(worker => {
         if (worker.projectId !== id) return worker;
         found = true;
+        if (worker.retirementReason === "bootstrap_hold" && reason !== "bootstrap_hold") {
+          throw new FleetManifestError("A held bootstrap project cannot be retired without cleanup proof", "conflict");
+        }
         if (nowMs < worker.updatedAtMs) {
           throw new FleetManifestError("Worker update time cannot move backwards", "conflict");
         }
@@ -558,6 +566,9 @@ export class FleetManifestStore {
       const workers = current.workers.map(worker => {
         if (worker.projectId !== id) return worker;
         found = true;
+        if (worker.retirementReason === "bootstrap_hold") {
+          throw new FleetManifestError("A held bootstrap project cannot launch another generation", "conflict");
+        }
         generation = worker.leaderGeneration + 1;
         return updatedWorker(worker, {
           leaderGeneration: generation,
@@ -578,6 +589,7 @@ export class FleetManifestStore {
   removeImported(id: ProjectId): Promise<FleetManifest> {
     return this.#mutate(current => {
       const selected = current.workers.find(worker => worker.projectId === id);
+      if (selected?.retirementReason === "bootstrap_hold") throw new FleetManifestError("Bootstrap cleanup is unproven", "conflict");
       if (selected?.managed) {
         throw new FleetManifestError(
           "Managed project requires confirmed remote deletion",
@@ -601,6 +613,7 @@ export class FleetManifestStore {
   removeManaged(id: ProjectId): Promise<FleetManifest> {
     return this.#mutate(current => {
       const selected = current.workers.find(worker => worker.projectId === id);
+      if (selected?.retirementReason === "bootstrap_hold") throw new FleetManifestError("Bootstrap cleanup is unproven", "conflict");
       if (selected && !selected.managed) {
         throw new FleetManifestError(
           "Explicit project is not eligible for managed deletion",

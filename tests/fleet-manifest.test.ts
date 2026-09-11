@@ -27,6 +27,20 @@ async function manifestPath(): Promise<string> {
 }
 
 describe("FleetManifestStore", () => {
+  it("persists a bootstrap hold and rejects activation, generation changes, or retirement without proof", async () => {
+    const file = await manifestPath();
+    const store = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await store.initialize("authenticated");
+    await store.reserveWorker({ index: 1, projectId: A, title: "worker", nowMs: 1 });
+    await store.markDraining(A, "bootstrap_hold", 2);
+    const restored = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    expect((await restored.load()).workers[0]).toMatchObject({ state: "draining", retirementReason: "bootstrap_hold" });
+    await expect(restored.markState(A, "ready", 3)).rejects.toThrow("cleanup proof");
+    await expect(restored.nextLeaderGeneration(A, 3)).rejects.toThrow("another generation");
+    await expect(restored.markDraining(A, "replacement", 3)).rejects.toThrow("cleanup proof");
+    await expect(restored.removeManaged(A)).rejects.toThrow("unproven");
+    await expect(restored.removeImported(A)).rejects.toThrow("unproven");
+  });
   it("places default fleet state under an identity-scoped home directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-home-"));
     roots.push(root);

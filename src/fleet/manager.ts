@@ -12,7 +12,7 @@ import {
 } from "../sandbox/registry";
 import type { SandboxSupervisorEvent } from "../sandbox/supervised-runtime";
 import { projectId, type ProjectId } from "../sandbox/types";
-import { FleetManifestStore } from "./manifest";
+import { FleetManifestStore, MAX_MANIFEST_WORKERS } from "./manifest";
 import type {
   FleetLifecycleEvent,
   FleetManifest,
@@ -64,6 +64,7 @@ const DEFAULT_RETRY_MAX_DELAY_MS = 30_000;
 const DEFAULT_METADATA_ATTEMPT_TIMEOUT_MS = 15_000;
 const DEFAULT_MUTATION_MAX_BACKOFF_MS = 300_000;
 const RETRY_JITTER_RATIO = 0.2;
+export const MAX_BOOTSTRAP_HELD_PROJECTS = 4;
 const REPLACEABLE_BOOTSTRAP_KINDS = new Set([
   "hello",
   "readiness",
@@ -167,7 +168,9 @@ function replacementFailureSignature(
   failure: SandboxSupervisorEvent["failure"],
 ): { signatureHash: string; kind: FleetReplacementFailureKind } | null {
   if (!failure || failure.name !== "V2BootstrapError") return null;
-  if (!failure.kind || !REPLACEABLE_BOOTSTRAP_KINDS.has(failure.kind)) return null;
+  const bootstrapBlocked = failure.kind === "deploy" &&
+    (failure.bootstrapCode === "bootstrap_cleanup_unproven" || failure.bootstrapCode === "bootstrap_ownership_conflict");
+  if (!bootstrapBlocked && (!failure.kind || !REPLACEABLE_BOOTSTRAP_KINDS.has(failure.kind))) return null;
   if (failure.operation !== "bootstrap" && failure.operation !== "render") return null;
   const signature = [
     failure.name,
@@ -179,10 +182,11 @@ function replacementFailureSignature(
     failure.sidecarCauseName ?? "",
     failure.sidecarPhase ?? "",
     failure.sidecarPermission ?? "",
+    ...(bootstrapBlocked ? [failure.bootstrapPhase ?? "", failure.bootstrapCode!, failure.bootstrapReason ?? ""] : []),
   ].join("|");
   return Object.freeze({
     signatureHash: createHash("sha256").update(signature).digest("hex"),
-    kind: failure.kind as FleetReplacementFailureKind,
+    kind: bootstrapBlocked ? "bootstrap_blocked" : failure.kind as FleetReplacementFailureKind,
   });
 }
 
@@ -256,6 +260,7 @@ export class ProjectFleetManager {
   readonly #replacementSuccessors = new Map<ProjectId, { created: boolean }>();
   readonly #mutationBlocks = new Map<string, FleetMutationBlockReason>();
   #selectedProjects: readonly ProjectId[] = Object.freeze([]);
+  #heldProjects: readonly ProjectId[] = Object.freeze([]);
   #pendingRetirements = 0;
   #pendingMaintenance = false;
   #mutationFailureCount = 0;
@@ -332,6 +337,7 @@ export class ProjectFleetManager {
     const current = await this.#manifest.load().catch(() => null);
     const currentWorker = current?.workers.find(worker => worker.projectId === event.projectId);
     if (!currentWorker) return;
+    if (currentWorker.retirementReason === "bootstrap_hold") return;
     if (event.type === "completed" || event.type === "aborted") {
       await this.#manifest.clearReplacementFailure(event.projectId, this.#clock.now());
       this.#replacementCandidates.delete(event.projectId);
@@ -404,7 +410,7 @@ export class ProjectFleetManager {
   #hydrateReplacementSuccessors(manifest: FleetManifest): void {
     const retirements = manifest.workers
       .filter(worker => worker.state === "draining" &&
-        (worker.retirementReason === "replacement" || worker.retirementReason === "missing"))
+        (worker.retirementReason === "replacement" || worker.retirementReason === "missing" || worker.retirementReason === "bootstrap_hold"))
       .sort((left, right) => left.updatedAtMs - right.updatedAtMs || left.index - right.index);
     if (retirements.length === 0) return;
     const firstRetirementAtMs = retirements[0]!.updatedAtMs;
@@ -535,6 +541,7 @@ export class ProjectFleetManager {
     this.#hydrateReplacementCandidates(manifest);
     this.#hydrateReplacementSuccessors(manifest);
     manifest = await this.#applyReplacementCandidates(manifest, signal);
+    await this.#fenceHeldProjects(manifest, signal);
     manifest = await this.#retireSurplusIntents(manifest, signal);
     this.#throwIfAborted(signal);
 
@@ -653,7 +660,18 @@ export class ProjectFleetManager {
       }
       if (!this.#replacementEligible(worker, current)) continue;
       const evidence = worker.replacementEvidence;
-      current = await this.#manifest.markDraining(id, "replacement", this.#clock.now());
+      const hold = evidence?.kind === "bootstrap_blocked";
+      const runtime = hold ? this.#registry.get(id) : undefined;
+      // Fence admission synchronously after the zero-work check. A recovered
+      // heartbeat must not make the old project routable while the hold is saved.
+      if (runtime) void runtime.stop().catch(() => undefined);
+      try {
+        current = await this.#manifest.markDraining(id,
+          hold ? "bootstrap_hold" : "replacement", this.#clock.now());
+      } catch (error) {
+        if (runtime) await this.#stopAndRemoveRuntime(runtime);
+        throw error;
+      }
       this.#replacementCandidates.delete(id);
       this.#clearMutationBlock(id, "replace");
       if (evidence) {
@@ -691,12 +709,24 @@ export class ProjectFleetManager {
       (snapshot.ambiguousQuarantined ?? 0) !== 0) {
       return this.#blockMutation(worker, "replace", "work_in_flight");
     }
-    try {
-      if (!this.#canRetireProject(worker.projectId)) {
+    const hold = worker.replacementEvidence?.kind === "bootstrap_blocked";
+    if (hold && (!worker.managed || this.#config.v2SidecarRevision !== "r10")) {
+      return this.#blockMutation(worker, "replace", "release_policy");
+    }
+    if (hold && (manifest.workers.filter(value => value.retirementReason === "bootstrap_hold").length >=
+      Math.min(MAX_BOOTSTRAP_HELD_PROJECTS, this.#config.maxProjects) || manifest.workers.length >= MAX_MANIFEST_WORKERS)) {
+      return this.#blockMutation(worker, "replace", "bootstrap_hold_limit");
+    }
+    // A hold never retires the project or its continuation metadata. Destructive
+    // replacement retains the stricter continuation-retirement gate.
+    if (!hold) {
+      try {
+        if (!this.#canRetireProject(worker.projectId)) {
+          return this.#blockMutation(worker, "replace", "continuation_binding");
+        }
+      } catch {
         return this.#blockMutation(worker, "replace", "continuation_binding");
       }
-    } catch {
-      return this.#blockMutation(worker, "replace", "continuation_binding");
     }
     const selected = new Set(
       manifest.workers
@@ -714,6 +744,22 @@ export class ProjectFleetManager {
     }
     this.#clearMutationBlock(worker.projectId, "replace");
     return true;
+  }
+
+  async #fenceHeldProjects(manifest: FleetManifest, signal: AbortSignal): Promise<void> {
+    const held = manifest.workers.filter(worker => worker.retirementReason === "bootstrap_hold");
+    this.#heldProjects = Object.freeze(held.map(worker => worker.projectId));
+    for (const worker of held) {
+      this.#throwIfAborted(signal);
+      this.#unavailableProjects.delete(worker.projectId);
+      // Stop only local routing/recovery ownership. The original project and
+      // private bootstrap receipt remain intact even when remote cleanup fails.
+      const runtime = this.#registry.get(worker.projectId);
+      if (runtime && !await this.#stopAndRemoveRuntime(runtime)) {
+        throw new FleetReconciliationError("Held project could not be fenced locally", "runtime");
+      }
+      this.#blockMutation(worker, "delete", "bootstrap_cleanup");
+    }
   }
 
   async #retireSurplusIntents(
@@ -767,7 +813,7 @@ export class ProjectFleetManager {
       const id = this.#newProjectId(current.workers);
       const automaticRetirements = current.workers.filter(worker =>
         worker.state === "draining" &&
-        (worker.retirementReason === "replacement" || worker.retirementReason === "missing")
+        (worker.retirementReason === "replacement" || worker.retirementReason === "missing" || worker.retirementReason === "bootstrap_hold")
       ).length;
       const trackedSuccessors = [...this.#replacementSuccessors.keys()].filter(project =>
         current.workers.some(worker => worker.projectId === project && worker.state !== "draining")
@@ -1468,6 +1514,7 @@ export class ProjectFleetManager {
       unavailableProjects: Object.freeze([...unavailableProjects]),
       projects: Object.freeze([...this.#selectedProjects]),
       pendingRetirements: this.#pendingRetirements,
+      ...(this.#heldProjects.length > 0 ? { heldProjects: this.#heldProjects } : {}),
       projectMutation: Object.freeze({
         state: localRetryInMs === null && !circuitOpen ? "closed" : "open",
         consecutiveFailures: Math.max(

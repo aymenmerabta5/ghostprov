@@ -22,10 +22,24 @@ import { assertSafeObservabilityEvent } from "../src/observability/redaction";
 import { describeSandboxFailure } from "../src/sandbox/failure";
 import { V2BootstrapError } from "../src/v2/bootstrap/controller";
 import { V2SupervisorBootstrapError } from "../src/v2/supervisor/controller";
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_REASONS } from "../src/sandbox/types";
 
 const PROJECT_ID = "e631d12c-d917-4434-b360-41b4715d6679";
 
 describe("recovery observability schema", () => {
+  it("retains only fixed recovery reasons and synchronization outcomes", () => {
+    for (const reason of BOOTSTRAP_FAILURE_REASONS) {
+      const inner = new V2SupervisorBootstrapError("private detail", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason });
+      const failure = describeSandboxFailure(new V2BootstrapError("deployment failed", "deploy", 1, { cause: inner }));
+      expect(failure.bootstrapReason).toBe(reason);
+      const event = recoveryObservabilityEvent("sandbox.recovery.retry_scheduled", { bootstrap_reason: failure.bootstrapReason });
+      expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+      expect(() => assertSafeObservabilityEvent({ ...event, bootstrap_reason: "private-token" })).toThrow();
+    }
+    for (const code of BOOTSTRAP_FAILURE_CODES) {
+      expect(() => assertSafeObservabilityEvent(recoveryObservabilityEvent("sandbox.recovery.retry_scheduled", { bootstrap_code: code }))).not.toThrow();
+    }
+  });
   it("preserves allowlisted bootstrap causes through deployment wrappers", () => {
     const inner = new V2SupervisorBootstrapError("private detail", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
     const failure = describeSandboxFailure(new V2BootstrapError("deployment failed", "deploy", 1, { cause: inner }));

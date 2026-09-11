@@ -9,9 +9,9 @@ export type FleetWorkerState =
   | "draining"
   | "failed";
 
-export type FleetRetirementReason = "replacement" | "missing" | "surplus";
+export type FleetRetirementReason = "replacement" | "missing" | "surplus" | "bootstrap_hold";
 
-export type FleetReplacementFailureKind = "hello" | "readiness" | "render" | "timeout";
+export type FleetReplacementFailureKind = "hello" | "readiness" | "render" | "timeout" | "bootstrap_blocked";
 
 export type FleetMutationOperation = "replace" | "create" | "delete";
 
@@ -25,7 +25,9 @@ export type FleetMutationBlockReason =
   | "continuation_binding"
   | "healthy_majority"
   | "project_client"
-  | "control_plane";
+  | "control_plane"
+  | "bootstrap_hold_limit"
+  | "bootstrap_cleanup";
 
 /** Content-free fleet transitions suitable for bounded observability. */
 export type FleetLifecycleEvent =
@@ -60,7 +62,7 @@ export type FleetLifecycleEvent =
       type: "old_retired";
       projectId: ProjectId;
       workerIndex: number;
-      retirementReason: Exclude<FleetRetirementReason, "surplus">;
+      retirementReason: Exclude<FleetRetirementReason, "surplus" | "bootstrap_hold">;
       managed: boolean;
     }
   | {
@@ -138,6 +140,8 @@ export interface FleetSnapshot {
   unavailableProjects: readonly ProjectId[];
   projects: readonly ProjectId[];
   pendingRetirements?: number;
+  /** Preserved projects excluded from routing and automatic deletion. */
+  heldProjects?: readonly ProjectId[];
   projectMutation?: Readonly<{
     state: "closed" | "open";
     consecutiveFailures: number;

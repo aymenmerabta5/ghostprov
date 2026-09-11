@@ -61,27 +61,99 @@ async function prior(journal: Journal, files: Files, phase: SupervisorBootstrapA
   files.data.set(sealedPath, JSON.stringify(journal.attempt!.sealed));
 }
 
-function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; failSubmission?: boolean; failSync?: boolean } = {}) {
+function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; rejectShutdown?: boolean; failSubmission?: boolean; failSync?: boolean; loseStage?: boolean; generation?: number; sync?: (count: number) => void } = {}) {
+  let syncs = 0;
   return new V2SandboxSupervisor({ binding: { ...binding, leaderGeneration: 2, nonce: "new-bootstrap" }, assets,
+    ...(options.generation ? { binding: { ...binding, leaderGeneration: options.generation, nonce: `bootstrap-${options.generation}` } } : {}),
     ySweet: credential, ydoc: files, bootstrapJournal: journal, connectTimeoutMs: 1000,
-    gateway: { async syncWorkspace() { if (options.failSync) throw new Error("offline sync"); },
+    gateway: { async syncWorkspace() { options.sync?.(++syncs); if (options.failSync) throw new Error("offline sync"); if (options.loseStage) files.data.clear(); },
       async startSupervisorExec({ sessionId }) { events.push("submit"); if (options.failSubmission) throw new Error("offline lost acknowledgement");
         return { sessionId, workspaceRoot: `/codex_workspace/${sessionId}`, jobId: "offline-job" }; },
       async triggerRender() { throw new Error("unexpected render"); }, async fetchText() { throw new Error("unexpected fetch"); } },
     hostFactory: input => ({ binding: input.binding, instanceId: input.instanceId,
       async connect() { events.push(`connect:${input.binding.leaderGeneration}`); if (options.rejectOld && input.binding.leaderGeneration === 1) throw new Error("offline unknown supervisor"); },
       async ensureReady() {}, async launch() { throw new Error("unexpected launch"); }, async deliverCredential() {}, async stop() { return null; },
-      async rotateCredential() {}, async shutdown() { events.push(`shutdown:${input.binding.leaderGeneration}`); }, async close() {} }),
+      async rotateCredential() {}, async shutdown() { events.push(`shutdown:${input.binding.leaderGeneration}`); if (options.rejectShutdown) throw new Error("offline ambiguous shutdown"); }, async close() {} }),
   });
 }
 
 describe("interrupted supervisor bootstrap recovery", () => {
+  it("does not submit when synchronization replaces the staged document with older state", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const first = controller(journal, files, events, { loseStage: true });
+    try { await expect(first.ensureReady()).rejects.toThrow(); expect(events).toEqual([]); expect(journal.attempt).toBeNull(); }
+    finally { await first.close(); }
+    const next = controller(journal, files, events);
+    try { await next.ensureReady(); expect(events).toEqual(["submit", "connect:2"]); }
+    finally { await next.shutdown("offline_done"); await next.close(); }
+  });
+
+  it("retains the exact recovery receipt until signed supervisor shutdown", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const sup = controller(journal, files, events);
+    try {
+      await sup.ensureReady();
+      expect(journal.attempt?.phase).toBe("submitted");
+      expect(files.data.has(install)).toBe(false);
+      await sup.shutdown("offline_done");
+      expect(events).toEqual(["submit", "connect:2", "shutdown:2"]);
+      expect(journal.attempt).toBeNull();
+    } finally { await sup.close(); }
+  });
+
+  it("recovers a crash after successful startup even when all transient files are gone", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const first = controller(journal, files, events);
+    await first.ensureReady(); await first.close();
+    expect(journal.attempt?.phase).toBe("submitted");
+    const next = controller(journal, files, events, { generation: 3 });
+    try {
+      await next.ensureReady();
+      expect(events).toEqual(["submit", "connect:2", "connect:2", "shutdown:2", "submit", "connect:3"]);
+      expect(journal.attempt?.binding.leaderGeneration).toBe(3);
+    } finally { await next.shutdown("offline_done"); await next.close(); }
+  });
+
+  it("keeps submitted authority when later supervisor shutdown is ambiguous", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const sup = controller(journal, files, events, { rejectShutdown: true });
+    try {
+      await sup.ensureReady(); await expect(sup.shutdown("offline_done")).rejects.toThrow();
+      expect(journal.attempt?.phase).toBe("submitted");
+    } finally { await sup.close(); }
+  });
+
+  it("retains signed cleanup proof when cleanup synchronization fails", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const sup = controller(journal, files, events, { sync: count => { if (count === 3) throw new Error("offline cleanup sync"); } });
+    try {
+      await sup.ensureReady(); await expect(sup.shutdown("offline_done")).rejects.toThrow();
+      expect(journal.attempt?.phase).toBe("cleanup_proven");
+    } finally { await sup.close(); }
+    const next = controller(journal, files, events, { generation: 3 });
+    try {
+      await next.ensureReady();
+      expect(events.filter(event => event === "shutdown:2")).toHaveLength(1);
+    } finally { await next.shutdown("offline_done"); await next.close(); }
+  });
+
+  it("does not clear a changed journal after shutting down its own supervisor", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const sup = controller(journal, files, events);
+    try {
+      await sup.ensureReady();
+      const changed = { ...journal.attempt!, connectTimeoutMs: 999 };
+      await journal.save(changed);
+      await expect(sup.shutdown("offline_done")).rejects.toMatchObject({ remoteCode: "bootstrap_ownership_conflict" });
+      expect(journal.attempt?.connectTimeoutMs).toBe(999);
+    } finally { await sup.close(); }
+  });
   it.each(["prepared", "cleanup_proven"] as const)("recovers a %s receipt with partial owned files", async phase => {
     const journal = new Journal(), files = new Files(), events: string[] = [];
     await prior(journal, files, phase); files.data.delete("exec");
     const sup = controller(journal, files, events);
-    try { await sup.ensureReady(); expect(events).toEqual(["submit", "connect:2"]); expect(journal.attempt).toBeNull(); expect(files.data.has(install)).toBe(false); }
-    finally { await sup.close(); }
+    try { await sup.ensureReady(); expect(events).toEqual(["submit", "connect:2"]); expect(journal.attempt?.binding.leaderGeneration).toBe(2); expect(files.data.has(install)).toBe(false); }
+    finally { await sup.shutdown("offline_done"); await sup.close(); }
   });
 
   it("requires signed cleanup of a submitted attempt before another submission", async () => {
