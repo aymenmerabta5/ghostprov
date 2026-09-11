@@ -189,6 +189,8 @@ function publicFailure(value: unknown): Record<string, unknown> | null {
     status: publicInteger(raw.status),
     operation: raw.operation === null ? null : publicAtom(raw.operation),
     message: sanitizeDiagnosticMessage(raw.message),
+    bootstrapPhase: publicAtom(raw.bootstrapPhase),
+    bootstrapCode: publicAtom(raw.bootstrapCode),
     sidecarErrorName: publicAtom(raw.sidecarErrorName),
     sidecarErrorCode: publicAtom(raw.sidecarErrorCode),
     sidecarCauseName: raw.sidecarCauseName === null ? null : publicAtom(raw.sidecarCauseName),

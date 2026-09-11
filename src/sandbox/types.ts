@@ -59,12 +59,17 @@ export type SandboxToken = SecretValue<"SandboxToken">;
 export type YSweetToken = SecretValue<"YSweetToken">;
 export type ResourceToken = SecretValue<"ResourceToken">;
 
+export const BOOTSTRAP_FAILURE_PHASES = ["deploy", "exec", "hello", "readiness", "shutdown"] as const;
+export const BOOTSTRAP_FAILURE_CODES = ["bootstrap_ownership_conflict", "bootstrap_cleanup_unproven"] as const;
+
 export interface SandboxFailureSnapshot {
   name: string;
   kind: string | null;
   status: number | null;
   operation: string | null;
   message: string;
+  bootstrapPhase?: typeof BOOTSTRAP_FAILURE_PHASES[number];
+  bootstrapCode?: typeof BOOTSTRAP_FAILURE_CODES[number];
   /** Bounded atoms emitted by the trusted sidecar fatal record, when present. */
   sidecarErrorName?: string;
   sidecarErrorCode?: string;

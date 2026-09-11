@@ -1,4 +1,4 @@
-import type { SandboxFailureSnapshot } from "./types";
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES, type SandboxFailureSnapshot } from "./types";
 
 const SAFE_DETAIL = /^[a-zA-Z][a-zA-Z0-9._-]{0,63}$/;
 
@@ -43,6 +43,9 @@ function failureRecords(error: unknown): Record<string, unknown>[] {
 export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
   const records = failureRecords(error);
   const record = records[0] ?? {};
+  const supervisor = records.find(value => Object.getOwnPropertyDescriptor(value, "name")?.value === "V2SupervisorBootstrapError");
+  const phase = supervisor && Object.getOwnPropertyDescriptor(supervisor, "kind")?.value;
+  const code = supervisor && Object.getOwnPropertyDescriptor(supervisor, "remoteCode")?.value;
   const rawSidecar = records
     .map(value => Object.getOwnPropertyDescriptor(value, "sidecarDiagnostic")?.value)
     .find(value => value && typeof value === "object" && !Array.isArray(value));
@@ -70,6 +73,8 @@ export function describeSandboxFailure(error: unknown): SandboxFailureSnapshot {
     status,
     operation: safeDetail(record.operation),
     message: redactFailureMessage(rawMessage) || "Sandbox runtime failed",
+    ...(BOOTSTRAP_FAILURE_PHASES.includes(phase) ? { bootstrapPhase: phase } : {}),
+    ...(BOOTSTRAP_FAILURE_CODES.includes(code) ? { bootstrapCode: code } : {}),
     ...(sidecarErrorName && sidecarErrorCode
       ? {
           sidecarErrorName,

@@ -378,6 +378,8 @@ export interface RecoveryObservabilityFields {
   status?: number | null;
   error_name?: SandboxRecoveryErrorName | null;
   error_kind?: SandboxRecoveryErrorKind | null;
+  bootstrap_phase?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapPhase"] | null;
+  bootstrap_code?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapCode"] | null;
   sidecar_error_name?: V2SidecarFatalErrorName | null;
   sidecar_error_code?: V2SidecarFatalErrorCode | null;
   sidecar_cause_name?: V2SidecarFatalCauseName;

@@ -21,10 +21,24 @@ import {
 import { assertSafeObservabilityEvent } from "../src/observability/redaction";
 import { describeSandboxFailure } from "../src/sandbox/failure";
 import { V2BootstrapError } from "../src/v2/bootstrap/controller";
+import { V2SupervisorBootstrapError } from "../src/v2/supervisor/controller";
 
 const PROJECT_ID = "e631d12c-d917-4434-b360-41b4715d6679";
 
 describe("recovery observability schema", () => {
+  it("preserves allowlisted bootstrap causes through deployment wrappers", () => {
+    const inner = new V2SupervisorBootstrapError("private detail", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+    const failure = describeSandboxFailure(new V2BootstrapError("deployment failed", "deploy", 1, { cause: inner }));
+    expect(failure).toMatchObject({ bootstrapPhase: "deploy", bootstrapCode: "bootstrap_ownership_conflict" });
+    const event = recoveryObservabilityEvent("sandbox.recovery.retry_scheduled", {
+      bootstrap_phase: failure.bootstrapPhase, bootstrap_code: failure.bootstrapCode,
+    });
+    expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+    expect(JSON.stringify(event)).not.toContain("private detail");
+    const unknown = new V2SupervisorBootstrapError("private detail", "deploy", { remoteCode: "secret-token-123" });
+    expect(describeSandboxFailure(unknown).bootstrapCode).toBeUndefined();
+    expect(() => assertSafeObservabilityEvent({ ...event, bootstrap_code: "secret-token-123" })).toThrow();
+  });
   it("carries only structured sidecar fatal atoms through the sandbox failure snapshot", () => {
     const failure = describeSandboxFailure(new V2BootstrapError(
       "sidecar failed",

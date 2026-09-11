@@ -1,3 +1,4 @@
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES } from "../sandbox/types";
 import {
   CREDENTIAL_REFRESH_OUTCOMES,
   FLEET_LIFECYCLE_EVENT_NAMES,
@@ -66,6 +67,7 @@ const REASONING_EFFORTS = new Set([
 ]);
 const COMMON = new Set(["schema", "event", "ts", "mono_ms"]);
 const RECOVERY_FIELDS = new Set([
+  "bootstrap_phase", "bootstrap_code",
   "project_id",
   "worker_index",
   "transport",
@@ -171,6 +173,8 @@ const RECOVERY_EVENTS = new Set<string>(RECOVERY_OBSERVABILITY_EVENT_NAMES);
 const FLEET_LIFECYCLE_EVENTS = new Set<string>(FLEET_LIFECYCLE_EVENT_NAMES);
 const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RECOVERY_ENUM_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  bootstrap_phase: new Set(BOOTSTRAP_FAILURE_PHASES),
+  bootstrap_code: new Set(BOOTSTRAP_FAILURE_CODES),
   transport: new Set(SANDBOX_RECOVERY_TRANSPORTS),
   cause: new Set(SANDBOX_RECOVERY_CAUSES),
   error_name: new Set(SANDBOX_RECOVERY_ERROR_NAMES),
@@ -225,6 +229,7 @@ const SUPERVISOR_PHASE_SET = new Set<string>(SANDBOX_SUPERVISOR_PHASES);
 const AWARENESS_LANE_SET = new Set<string>(SANDBOX_AWARENESS_LANES);
 const LIVENESS_TRANSPORT_SET = new Set<string>(SANDBOX_RECOVERY_TRANSPORTS);
 const RECOVERY_NULLABLE_ENUM_FIELDS = new Set([
+  "bootstrap_phase", "bootstrap_code",
   "error_name",
   "error_kind",
   "sidecar_error_name",

@@ -2,6 +2,7 @@ import { resolveMultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type MachineProbe } from "../core/ports";
 import { ProjectFleetManager, type FleetProjectsClient } from "../fleet/manager";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
+import { FileSupervisorBootstrapJournal } from "../v2/supervisor/bootstrap-journal";
 import { FleetStartupPermitPool } from "../fleet/startup-permits";
 import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
@@ -625,6 +626,11 @@ function defaultRuntimeFactory(options: {
             gateway: supervisor.gateway as SandboxGateway,
             assets: supervisor.assets,
             bootstrapMode: config.v2SupervisorBootstrapMode,
+            ...(config.v2SupervisorBootstrapMode === "direct" && supervisor.assets.revision === "r10"
+              ? { bootstrapJournal: new FileSupervisorBootstrapJournal(
+                  `${config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint)}.bootstrap`, projectId,
+                ) }
+              : {}),
             onClosed: () => unregister(),
           });
         if (supervisor.assets.revision === "r10" && created.readDiagnosticLog) {
@@ -764,6 +770,8 @@ function defaultRuntimeFactory(options: {
             attempt_duration_ms: event.attemptDurationMs,
             duration_ms: event.totalDurationMs,
             status: failure?.status ?? null,
+            bootstrap_phase: failure?.bootstrapPhase ?? null,
+            bootstrap_code: failure?.bootstrapCode ?? null,
             error_name: failure
               ? normalizeSandboxRecoveryErrorName(failure.name)
               : null,

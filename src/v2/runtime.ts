@@ -2331,12 +2331,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       sidecarLoop ?? Promise.resolve(),
       closeTransport ? transport?.close() ?? Promise.resolve() : Promise.resolve(),
       awareness?.close() ?? Promise.resolve(),
-      supervisor
-        ? supervisor.shutdown("runtime_dispose").catch(() => undefined)
-          .then(() => supervisor.close())
-        : Promise.resolve(),
+      (async () => {
+        // Bootstrap failure/cancellation cleanup still reads and tombstones
+        // project files. Keep its Yjs connection until that exact owner settles.
+        try {
+          if (supervisor) {
+            try { await supervisor.shutdown("runtime_dispose"); }
+            finally { await supervisor.close(); }
+          }
+        } finally { await ydoc?.destroy(); }
+      })(),
       heartbeat?.stop() ?? Promise.resolve(),
-      ydoc?.destroy() ?? Promise.resolve(),
     ]);
   }
 

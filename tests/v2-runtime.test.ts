@@ -625,6 +625,7 @@ function runtimeHarness(options: {
     order,
     clock,
     heartbeat,
+    ydoc,
     transport,
     awareness,
     governor,
@@ -2528,6 +2529,25 @@ describe("V2SandboxRuntime", () => {
     expect(harness.bootstrap.forceStops).toBe(1);
     expect(harness.transport.closes).toBe(1);
     expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("keeps the project connection alive until supervisor cleanup and close settle", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true });
+    await harness.runtime.start();
+    const events: string[] = [];
+    const shutdown = Promise.withResolvers<void>();
+    const closed = Promise.withResolvers<void>();
+    harness.supervisor.shutdown = async () => { events.push("shutdown"); await shutdown.promise; };
+    harness.supervisor.close = async () => { events.push("close"); await closed.promise; };
+    harness.ydoc.destroy = async () => { events.push("destroy"); };
+    const stopping = harness.runtime.stop();
+    for (let i = 0; i < 100 && !events.length; i++) await Promise.resolve();
+    expect(events).toEqual(["shutdown"]);
+    shutdown.resolve();
+    for (let i = 0; i < 100 && events.length < 2; i++) await Promise.resolve();
+    expect(events).toEqual(["shutdown", "close"]);
+    closed.resolve(); await stopping;
+    expect(events).toEqual(["shutdown", "close", "destroy"]);
   });
 
   it("uses one shutdown budget and locally fences non-cooperative remote retirement", async () => {
