@@ -2132,7 +2132,7 @@ describe("router HTTP composition", () => {
     });
     const app = createGhostProvApp({ router, authorizationScope });
     const requestBody = JSON.stringify({
-      model: "gpt-5.6-sol",
+      model: "gpt-5.6-terra",
       input: "x".repeat(768 * 1024),
       stream: true,
     });

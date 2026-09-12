@@ -8,7 +8,6 @@ import {
 import {
   RESPONSE_PROVENANCE_LIMITS,
   ResponseProvenanceCommitError,
-  ResponseProvenanceObsoleteError,
   ResponseProvenanceRegistry,
   ResponseProvenanceScopeError,
 } from "../src/router/provenance";
@@ -20,7 +19,7 @@ import {
   type SandboxRunOptions,
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
-import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -69,7 +68,9 @@ function detachedIncomingLease(): IncomingResourceLease {
 
 class ProvenanceRuntime implements RoutableSandboxRuntime {
   incarnation = 1;
+  state: "ready" | "failed" | "stopped" = "ready";
   active = 0;
+  transferCredits: number | undefined;
   executions = 0;
   failStarts = 0;
   readonly bodies: Record<string, unknown>[] = [];
@@ -109,10 +110,11 @@ class ProvenanceRuntime implements RoutableSandboxRuntime {
     return {
       projectId: this.projectId,
       incarnation: this.incarnation,
-      state: "ready",
+      state: this.state,
       capacity: this.capacity,
       active: this.active,
       available: this.capacity - this.active,
+      transferCredits: this.transferCredits,
       quarantined: 0,
       heartbeatAgeMs: 0,
       credentialExpiresInMs: 60_000,
@@ -201,8 +203,9 @@ function routerSystem(
   let randomIndex = 0;
   const logged: unknown[] = [];
   const authorizationScope = createAuthenticatedTenantScope();
+  const registry = new SandboxRegistry([first, second]);
   const router = new MultiSandboxRouter({
-    registry: new SandboxRegistry([first, second]),
+    registry,
     governor: governor(),
     authorizationScope,
     queueTimeoutMs,
@@ -224,7 +227,7 @@ function routerSystem(
       uuid: () => `trace-${randomIndex}`,
     },
   });
-  return { router, first, second, logged, authorizationScope };
+  return { router, registry, first, second, logged, authorizationScope };
 }
 
 async function flush(turns = 20): Promise<void> {
@@ -428,7 +431,7 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
-  it("normalizes once, commits provenance before final/terminal exposure, and pins continuations", async () => {
+  it("normalizes once, commits provenance before final/terminal exposure, and prefers an eligible origin", async () => {
     const { router, first, second, logged, authorizationScope } = routerSystem([0, 0.999]);
     const input = Object.freeze({
       model: "gpt-5.6-sol",
@@ -538,7 +541,61 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
-  it("never fails a known continuation over and rejects an obsolete incarnation immediately", async () => {
+  it("routes a known continuation through a healthy peer when its original sandbox is down", async () => {
+    const { router, first, second, authorizationScope } = routerSystem([0]);
+    const controller = new AbortController();
+    let pending: Promise<RunHandle | null> | null = null;
+    try {
+      const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+      const seedFinal = first.completeNext();
+      await seed.final;
+
+      first.state = "stopped";
+      first.notify();
+      const body = Object.freeze({
+        model: "gpt-5.6-sol",
+        input: "continue on a live sandbox",
+        previous_response_id: seedFinal.id,
+        stream: false,
+        store: false,
+      });
+      pending = router.startRelay(body, { signal: controller.signal }).catch(() => null);
+      await flush(50);
+      expect(second.executions).toBe(1);
+      expect(first.executions).toBe(1);
+      expect(second.bodies[0]).toMatchObject({
+        ...body,
+        stream: true,
+        store: true,
+      });
+      expect(body).toMatchObject({ stream: false, store: false });
+      const continuation = await pending;
+      expect(continuation).not.toBeNull();
+      const childFinal = second.completeNext();
+      await continuation!.final;
+      expect(router.lookupResponseProvenance(seedFinal.id, authorizationScope)).toEqual({
+        kind: "known",
+        provenance: { projectId: first.projectId, incarnation: 1 },
+      });
+      expect(router.lookupResponseProvenance(childFinal.id, authorizationScope)).toEqual({
+        kind: "known",
+        provenance: { projectId: second.projectId, incarnation: 1 },
+      });
+      expect(router.snapshot()).toMatchObject({
+        active: 0,
+        queued: 0,
+        provenance: { reservedRecords: 0, reservedBytes: 0 },
+      });
+    } finally {
+      controller.abort();
+      while (first.pending.length > 0) first.completeNext();
+      while (second.pending.length > 0) second.completeNext();
+      await pending;
+      await router.close();
+    }
+  });
+
+  it("reroutes a known continuation after definitive precommit failure with the same immutable body", async () => {
     const { router, first, second } = routerSystem([0, 0.999, 0.999], 300);
     try {
       const original = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
@@ -551,23 +608,22 @@ describe("MultiSandboxRouter response provenance", () => {
         input: "retry safely",
         previous_response_id: originalFinal.id,
       });
-      await flush(50);
-      expect(second.executions).toBe(0);
       const retryHandle = await retrying;
-      expect(first.executions).toBe(3);
-      expect(second.executions).toBe(0);
-      first.completeNext();
-      await retryHandle.final;
-
-      first.replaceIncarnation();
-      const obsoleteStartedAt = performance.now();
-      await expect(router.startRelay({
-        model: "gpt-5.6-sol",
-        input: "old incarnation",
+      expect(first.executions).toBe(2);
+      expect(second.executions).toBe(1);
+      expect(second.bodies[0]).toBe(first.bodies[1]);
+      expect(second.bodies[0]).toMatchObject({
         previous_response_id: originalFinal.id,
-      })).rejects.toBeInstanceOf(ResponseProvenanceObsoleteError);
-      expect(performance.now() - obsoleteStartedAt).toBeLessThan(50);
-      expect(second.executions).toBe(0);
+        stream: true,
+        store: true,
+      });
+      second.completeNext();
+      await retryHandle.final;
+      expect(router.snapshot()).toMatchObject({
+        active: 0,
+        queued: 0,
+        provenance: { reservedRecords: 0, reservedBytes: 0 },
+      });
     } finally {
       while (first.pending.length > 0) first.completeNext();
       while (second.pending.length > 0) second.completeNext();
@@ -575,31 +631,210 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
-  it("rejects a queued continuation as soon as its pinned incarnation is replaced", async () => {
-    const { router, first, second } = routerSystem([0], 1_000);
+  for (const constraint of ["capacity", "transfer", "recovering"] as const) {
+    it(`routes a known continuation to a healthy peer when its origin is ${constraint} constrained`, async () => {
+      const { router, first, second } = routerSystem([0]);
+      try {
+        const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+        const seedFinal = first.completeNext();
+        await seed.final;
+
+        if (constraint === "capacity") first.active = first.capacity;
+        else if (constraint === "transfer") first.transferCredits = 0;
+        else first.state = "failed";
+        first.notify();
+        const continuation = await router.startRelay({
+          model: "gpt-5.6-sol",
+          input: "continue through available capacity",
+          previous_response_id: seedFinal.id,
+        });
+        expect(first.executions).toBe(1);
+        expect(second.executions).toBe(1);
+        expect(second.bodies[0]).toMatchObject({ previous_response_id: seedFinal.id });
+        second.completeNext();
+        await continuation.final;
+        expect(router.snapshot()).toMatchObject({
+          queued: 0,
+          provenance: { reservedRecords: 0, reservedBytes: 0 },
+        });
+      } finally {
+        first.active = 0;
+        while (first.pending.length > 0) first.completeNext();
+        while (second.pending.length > 0) second.completeNext();
+        await router.close();
+      }
+    });
+  }
+
+  for (const transition of ["replaced", "removed"] as const) {
+    it(`routes a known provider ID normally after its original runtime is ${transition}`, async () => {
+      const { router, registry, first, second, authorizationScope } = routerSystem([0, 0.999]);
+      try {
+        const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+        const seedFinal = first.completeNext();
+        await seed.final;
+
+        if (transition === "replaced") first.replaceIncarnation();
+        else {
+          first.state = "stopped";
+          await registry.removeStopped(first.projectId);
+        }
+        const continuation = await router.startRelay({
+          model: "gpt-5.6-sol",
+          input: "provider lineage survives local lifecycle",
+          previous_response_id: seedFinal.id,
+        });
+        expect(first.executions).toBe(1);
+        expect(second.executions).toBe(1);
+        expect(second.bodies[0]).toMatchObject({ previous_response_id: seedFinal.id });
+        const childFinal = second.completeNext();
+        await continuation.final;
+        expect(router.lookupResponseProvenance(seedFinal.id, authorizationScope)).toEqual({
+          kind: "known",
+          provenance: { projectId: first.projectId, incarnation: 1 },
+        });
+        expect(router.lookupResponseProvenance(childFinal.id, authorizationScope)).toEqual({
+          kind: "known",
+          provenance: { projectId: second.projectId, incarnation: 1 },
+        });
+      } finally {
+        while (first.pending.length > 0) first.completeNext();
+        while (second.pending.length > 0) second.completeNext();
+        await router.close();
+      }
+    });
+
+    it(`keeps a queued provider ID routable when its original runtime is ${transition}`, async () => {
+      const { router, registry, first, second } = routerSystem([0]);
+      const controller = new AbortController();
+      let pending: Promise<RunHandle | null> | null = null;
+      try {
+        const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+        const seedFinal = first.completeNext();
+        await seed.final;
+
+        first.active = first.capacity;
+        second.active = second.capacity;
+        first.notify();
+        second.notify();
+        pending = router.startRelay({
+          model: "gpt-5.6-sol",
+          input: "queued continuation",
+          previous_response_id: seedFinal.id,
+        }, { signal: controller.signal }).catch(() => null);
+        await flush();
+        expect(router.snapshot().queued).toBe(1);
+
+        if (transition === "replaced") first.replaceIncarnation();
+        else {
+          first.state = "stopped";
+          await registry.removeStopped(first.projectId);
+        }
+        second.active = 0;
+        second.notify();
+        await flush(50);
+        expect(second.executions).toBe(1);
+        expect(first.executions).toBe(1);
+        const continuation = await pending;
+        expect(continuation).not.toBeNull();
+        expect(second.bodies[0]).toMatchObject({ previous_response_id: seedFinal.id });
+        second.completeNext();
+        await continuation!.final;
+        expect(router.snapshot()).toMatchObject({
+          queued: 0,
+          provenance: { reservedRecords: 0, reservedBytes: 0 },
+        });
+      } finally {
+        controller.abort();
+        first.active = 0;
+        while (first.pending.length > 0) first.completeNext();
+        while (second.pending.length > 0) second.completeNext();
+        await pending;
+        await router.close();
+      }
+    });
+  }
+
+  for (const failure of ["committed", "ambiguous", "unknown", "execution-risk"] as const) {
+    it(`does not replay a known continuation after ${failure} failure`, async () => {
+      const { router, first, second } = routerSystem([0]);
+      try {
+        const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+        const seedFinal = first.completeNext();
+        await seed.final;
+
+        const error = failure === "committed" || failure === "ambiguous"
+          ? new V2CommittedError("synthetic committed failure", "test_committed", failure === "ambiguous")
+          : failure === "execution-risk"
+            ? new V2PreCommitError("failure after execution fence", "test_precommit")
+            : new Error("unclassified runtime failure");
+        first.run = async (body, _signal, options) => {
+          first.executions++;
+          first.bodies.push(body);
+          if (failure === "execution-risk") options?.onExecutionRiskReflected?.();
+          throw error;
+        };
+        const pending = router.startRelay({
+          model: "gpt-5.6-sol",
+          input: "must execute at most once",
+          previous_response_id: seedFinal.id,
+        });
+        if (failure === "execution-risk") {
+          await expect(pending).rejects.toMatchObject({ committed: true, ambiguous: true });
+        } else await expect(pending).rejects.toBe(error);
+        expect(first.executions).toBe(2);
+        expect(second.executions).toBe(0);
+        expect(router.snapshot()).toMatchObject({
+          active: 0,
+          queued: 0,
+          provenance: { reservedRecords: 0, reservedBytes: 0 },
+        });
+      } finally {
+        while (first.pending.length > 0) first.completeNext();
+        while (second.pending.length > 0) second.completeNext();
+        await router.close();
+      }
+    });
+  }
+
+  it("does not reroute an aborted continuation after definitive precommit cancellation", async () => {
+    const { router, first, second } = routerSystem([0]);
+    const controller = new AbortController();
     try {
       const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
       const seedFinal = first.completeNext();
       await seed.final;
 
-      first.active = first.capacity;
-      first.notify();
+      first.run = (body, signal) => {
+        first.executions++;
+        first.bodies.push(body);
+        return new Promise<RunHandle>((_resolve, reject) => {
+          const cancel = () => reject(new V2PreCommitError("safe cancellation", "test_precommit"));
+          if (signal?.aborted) cancel();
+          else signal?.addEventListener("abort", cancel, { once: true });
+        });
+      };
       const pending = router.startRelay({
         model: "gpt-5.6-sol",
-        input: "queued old incarnation",
+        input: "cancel before admission",
         previous_response_id: seedFinal.id,
-      });
-      await flush();
-      expect(router.snapshot().queued).toBe(1);
-
-      const replacedAt = performance.now();
-      first.replaceIncarnation();
-      await expect(pending).rejects.toBeInstanceOf(ResponseProvenanceObsoleteError);
-      expect(performance.now() - replacedAt).toBeLessThan(50);
-      expect(router.snapshot().queued).toBe(0);
+      }, { signal: controller.signal });
+      const outcome = pending.then(
+        handle => ({ kind: "handle" as const, handle }),
+        error => ({ kind: "error" as const, error }),
+      );
+      await flush(50);
+      expect(first.executions).toBe(2);
+      controller.abort();
+      expect(await outcome).toMatchObject({ kind: "error", error: { name: "AbortError" } });
       expect(second.executions).toBe(0);
+      expect(router.snapshot()).toMatchObject({
+        active: 0,
+        queued: 0,
+        provenance: { reservedRecords: 0, reservedBytes: 0 },
+      });
     } finally {
-      first.active = 0;
+      controller.abort();
       while (first.pending.length > 0) first.completeNext();
       while (second.pending.length > 0) second.completeNext();
       await router.close();

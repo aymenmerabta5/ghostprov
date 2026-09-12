@@ -145,6 +145,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "response.first_event": new Set(["trace_id", "project_id", "first_event_ms", "post_commit_first_event_ms", "upstream_first_event_ms", "sidecar_scheduler_ms", "host_ack_to_first_frame_ms", "host_assembly_to_delivery_ms"]),
   "request.completed": new Set(["trace_id", "project_id", "total_ms", "queue_wait_ms", "commit_ack_ms", "first_event_ms", "first_text_ms", "first_tool_ms", "upstream_total_ms", "response_bytes", "frames", "terminal_status", "retry_count", "slow"]),
   "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "first_text_ms", "first_tool_ms", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id", "committed", "quarantined", "retry_count"]),
+  "request.model_fallback": new Set(["trace_id", "parent_trace_id", "requested_model", "fallback_model", "error_kind", "provider_origin", "retry_count"]),
   "websocket.payload_rejected": new Set(["limit_bytes", "http_fallback_available"]),
   "websocket.http_fallback": new Set(["status", "limit_bytes"]),
   "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "held_project_count", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
@@ -489,6 +490,24 @@ function assertSafeLivenessFields(event: ObservabilityEvent): void {
   }
 }
 
+function assertSafeModelFallbackFields(event: ObservabilityEvent): void {
+  for (const key of ["trace_id", "parent_trace_id"] as const) {
+    const value = event[key];
+    if (typeof value !== "string" || value.length < 1 || value.length > 128 ||
+        !/^[A-Za-z0-9]/.test(value) || /[^A-Za-z0-9._:-]/.test(value)) {
+      throw new TypeError(`Model fallback observability ${key} is invalid`);
+    }
+  }
+  if (typeof event.requested_model !== "string" ||
+      safeObservabilityModel(event.requested_model) !== event.requested_model ||
+      event.fallback_model !== "gpt-5.6-terra" ||
+      event.error_kind !== "model_not_found" ||
+      (event.provider_origin !== "http" && event.provider_origin !== "sse") ||
+      event.retry_count !== 1) {
+    throw new TypeError("Model fallback observability fields are invalid");
+  }
+}
+
 function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
   for (const key of ["first_text_ms", "first_tool_ms", "upstream_total_ms"] as const) {
     const value = event[key];
@@ -675,6 +694,7 @@ export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
   if (containsCredential(event)) {
     throw new TypeError("Observability event contains credential-shaped data");
   }
+  if (event.event === "request.model_fallback") assertSafeModelFallbackFields(event);
   if (event.event === "websocket.payload_rejected" || event.event === "websocket.http_fallback") {
     if (
       typeof event.limit_bytes !== "number" ||

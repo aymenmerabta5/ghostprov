@@ -29,6 +29,44 @@ describe("GhostProv host supervisor", () => {
     expect(() => supervisorRestartDelayMs(0)).toThrow("positive integer");
   });
 
+  it("does not certify a stop before any worker audits the fleet", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-early-cleanup-"));
+    temporaryDirectories.push(directory);
+    const supervisor = new GhostProvHostSupervisor({
+      externalPort: 0, apiKey: API_KEY, cwd: directory,
+      controlFile: path.join(directory, "upgrade.request"), stopFile: path.join(directory, "stop.request"),
+      statusFile: path.join(directory, "supervisor.json"), logFile: path.join(directory, "supervisor.jsonl"),
+    });
+    supervisors.push(supervisor);
+    await supervisor.close();
+    expect(supervisor.snapshot()).toMatchObject({ state: "stopped", generation: 0, shutdownClean: false });
+  });
+
+  it.each([
+    ["clean", true], ["missing", false], ["failed", false], ["wrong-pid", false],
+    ["wrong-generation", false], ["malformed", false], ["then-hang", false],
+  ] as const)("requires exact child cleanup proof for %s shutdown", async (mode, expected) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-cleanup-ack-"));
+    temporaryDirectories.push(directory);
+    const reported: boolean[] = [];
+    const supervisor = new GhostProvHostSupervisor({
+      externalPort: 0, apiKey: API_KEY, cwd: process.cwd(),
+      workerEntry: path.resolve("tests/support/fake-supervised-worker.ts"),
+      workerEnv: { GP_TEST_CLEANUP_ACK: mode },
+      readyTimeoutMs: 10_000, gracefulShutdownMs: 500, sampleIntervalMs: 1_000,
+      controlFile: path.join(directory, "upgrade.request"), stopFile: path.join(directory, "stop.request"),
+      statusFile: path.join(directory, "supervisor.json"), logFile: path.join(directory, "supervisor.jsonl"),
+      onClosed: async clean => { reported.push(clean); },
+    });
+    supervisors.push(supervisor);
+    await supervisor.start();
+    await supervisor.close();
+    await supervisor.close();
+    expect(supervisor.snapshot()).toMatchObject({ state: "stopped", shutdownClean: expected });
+    expect(reported).toEqual([expected]);
+    if (mode === "then-hang") expect(supervisor.snapshot().forcedStops).toBeGreaterThan(0);
+  }, 15_000);
+
   it("keeps the public listener alive across graceful upgrades and worker crashes", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-supervisor-"));
     temporaryDirectories.push(directory);

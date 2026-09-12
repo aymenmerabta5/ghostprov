@@ -895,6 +895,20 @@ describe("SupervisedSandboxRuntime", () => {
     await draining;
   });
 
+  it.each(["stop", "drain"] as const)("preserves a child's terminal cleanup rejection through %s and repeated calls", async kind => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    initial.stopBehavior = async () => { throw new Error("offline cleanup unproven"); };
+    initial.drainBehavior = initial.stopBehavior;
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime() });
+    await runtime.start();
+    const stopping = kind === "stop" ? runtime.stop() : runtime.drain("offline_shutdown");
+    await expect(stopping).rejects.toThrow("cleanup was incomplete");
+    expect(runtime.snapshot().state).toBe("stopped");
+    expect(runtime.stop()).toBe(stopping);
+    await expect(runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(initial.stops).toBe(1);
+  });
+
   it("times out a stuck startup and shares a permit only across create plus start", async () => {
     const clock = new ManualClock();
     let releaseStart!: () => void;

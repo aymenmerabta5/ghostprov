@@ -2,6 +2,10 @@ import { describe, expect, it } from "bun:test";
 import type { V2BootstrapSupervisor } from "../src/v2/supervisor/host";
 import { SupervisorLifecycle } from "../src/v2/supervisor/lifecycle";
 
+const binding = { projectId: "11111111-1111-4111-8111-111111111111", sandboxSessionId: "offline-session",
+  leaderGeneration: 1, buildHash: "a".repeat(64), schemaHash: "b".repeat(64), nonce: "offline-nonce",
+  protocolRevision: "r2" as const, schemaVersion: 2 as const };
+
 function owner(shutdown: () => Promise<void>, close: () => Promise<void>): Pick<V2BootstrapSupervisor, "shutdown" | "close"> {
   return { shutdown, close };
 }
@@ -60,5 +64,33 @@ describe("system supervisor cleanup ownership", () => {
   it("does not fail an empty registry after the outer deadline", async () => {
     const lifecycle = new SupervisorLifecycle(1), abort = new AbortController(); abort.abort();
     await expect(lifecycle.shutdown(abort.signal)).resolves.toBeUndefined();
+  });
+
+  it("retains unproven cleanup after local closure and rejects a different binding's proof", async () => {
+    const lifecycle = new SupervisorLifecycle(1);
+    const release = lifecycle.register(owner(async () => {}, async () => {}));
+    lifecycle.requireCleanup(binding);
+    release();
+    lifecycle.confirmCleanup({ ...binding, nonce: "another-supervisor" });
+    await expect(lifecycle.shutdown(new AbortController().signal)).rejects.toThrow("incomplete");
+  });
+
+  it("discharges an old closed owner's obligation after exact recovery proof", async () => {
+    const lifecycle = new SupervisorLifecycle(1);
+    const release = lifecycle.register(owner(async () => {}, async () => {}));
+    lifecycle.requireCleanup(binding);
+    release();
+    lifecycle.requireCleanup({ ...binding });
+    lifecycle.confirmCleanup({ ...binding });
+    await expect(lifecycle.shutdown(new AbortController().signal)).resolves.toBeUndefined();
+  });
+
+  it("bounds distinct cleanup obligations without blocking exact recovery at capacity", () => {
+    const lifecycle = new SupervisorLifecycle(1);
+    lifecycle.requireCleanup(binding);
+    expect(() => lifecycle.requireCleanup({ ...binding })).not.toThrow();
+    expect(() => lifecycle.requireCleanup({ ...binding, nonce: "another-supervisor" })).toThrow("capacity");
+    lifecycle.confirmCleanup(binding);
+    expect(() => lifecycle.requireCleanup({ ...binding, nonce: "another-supervisor" })).not.toThrow();
   });
 });

@@ -680,6 +680,33 @@ describe("V2 browserless system composition", () => {
     });
   }, 30_000);
 
+  it.each([false, true])("audits every manifest journal before certifying shutdown (retained=%s)", async retained => {
+    const value = await harness();
+    const inspected: ProjectId[] = [];
+    value.dependencies.bootstrapJournalFactory = id => ({
+      withLease: async (_signal, operation) => operation({
+        load: async () => {
+          inspected.push(id);
+          value.order.push("journal-check");
+          return retained && id === IDS[3] ? { phase: "submitted" } as never : null;
+        },
+        save: async () => { throw new Error("audit must not mutate journals"); },
+        clear: async () => { throw new Error("audit must not mutate journals"); },
+      }),
+    });
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    expect(system.supportsVerifiedShutdown).toBe(true);
+    await system.start();
+    value.factory.releaseAll();
+    await system.fleet.waitForReady(4);
+    if (retained) await expect(system.close()).rejects.toThrow("bootstrap cleanup was incomplete");
+    else await system.close();
+    expect(inspected).toEqual(IDS);
+    expect(value.order.indexOf("journal-check")).toBeGreaterThan(value.order.indexOf("runtime-stop"));
+    expect(value.order.indexOf("account-close")).toBeGreaterThan(value.order.lastIndexOf("journal-check"));
+    expect(value.sessionCloses()).toBe(1);
+  });
+
   it("uses Anthropic model overrides from the supplied system environment", async () => {
     const value = await harness();
     const runtime = new CapturingRuntime(IDS[0]!, false, value.order);

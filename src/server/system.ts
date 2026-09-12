@@ -5,6 +5,7 @@ import { FileBootstrapHoldMigration } from "../fleet/bootstrap-migration";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
 import { FileSupervisorBootstrapJournal } from "../v2/supervisor/bootstrap-journal";
 import { SupervisorLifecycle } from "../v2/supervisor/lifecycle";
+import { assertBootstrapCleanupComplete, type SupervisorBootstrapJournalFactory } from "../v2/supervisor/bootstrap-cleanup-proof";
 import { FleetStartupPermitPool } from "../fleet/startup-permits";
 import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
@@ -306,6 +307,8 @@ export interface BrowserlessSystemDependencies {
   sessionManager?: BrowserlessSessionManager;
   projects?: FleetProjectsClient;
   manifest?: FleetManifestStore;
+  /** Injected manifests never cause reads of another fleet's private journals. */
+  bootstrapJournalFactory?: SupervisorBootstrapJournalFactory;
   runtimeFactory?: ManagedRuntimeFactory;
   registry?: SandboxRegistry;
   router?: MultiSandboxRouter;
@@ -339,6 +342,7 @@ export interface BrowserlessSystemDependencies {
 
 export interface BrowserlessSystem {
   config: ReturnType<typeof resolveMultiSandboxConfig>;
+  readonly supportsVerifiedShutdown: boolean;
   account: PrismAccountSession;
   registry: SandboxRegistry;
   governor: ResourceGovernor;
@@ -642,6 +646,8 @@ function defaultRuntimeFactory(options: {
                   `${config.fleetManifestFile ?? defaultFleetManifestFile(identity.fingerprint)}.bootstrap`, projectId,
                 ) }
               : {}),
+            onCleanupRequired: binding => supervisorLifecycle.requireCleanup(binding),
+            onCleanupProven: binding => supervisorLifecycle.confirmCleanup(binding),
             onClosed: () => { try { unregister(); } finally { releaseLifecycle(); } },
           });
         try {
@@ -1014,6 +1020,12 @@ export async function createBrowserlessSystem(
       ? { legacyFile: ".ghostprov/fleet.json" }
       : {}),
   });
+  const shutdownJournalFactory = dependencies.bootstrapJournalFactory ??
+    (!dependencies.manifest ? (project: ProjectId) => new FileSupervisorBootstrapJournal(`${fleetManifestFile}.bootstrap`, project) : null);
+  const supportsVerifiedShutdown = config.v2SidecarRevision === "r10" &&
+    config.v2BootstrapLaunchMode === "relay" && config.v2SupervisorBootstrapMode === "direct" &&
+    Object.values(config.v2SidecarProjectRevisions).every(revision => revision === "r10") &&
+    shutdownJournalFactory !== null;
   const registry = dependencies.registry ?? new SandboxRegistry();
   const router = dependencies.router ?? new MultiSandboxRouter({
     registry,
@@ -1190,6 +1202,7 @@ export async function createBrowserlessSystem(
 
   const system: BrowserlessSystem = {
     config,
+    supportsVerifiedShutdown,
     account: identity.account,
     registry,
     governor,
@@ -1295,6 +1308,17 @@ export async function createBrowserlessSystem(
         // cleanup still needs the account and project connections until it settles.
         await supervisorLifecycle.shutdown(AbortSignal.timeout(Math.max(1, shutdownDeadlineMs - Date.now())))
           .catch(error => { firstError ??= error; });
+        if (supportsVerifiedShutdown && shutdownJournalFactory) {
+          try {
+            const proofSignal = AbortSignal.timeout(Math.max(1, shutdownDeadlineMs - Date.now()));
+            const finalManifest = await abortableStartup(manifest.load(), proofSignal);
+            await assertBootstrapCleanupComplete({
+              projectIds: finalManifest.workers.map(worker => worker.projectId),
+              journalFactory: shutdownJournalFactory,
+              signal: proofSignal,
+            });
+          } catch (error) { firstError ??= error; }
+        }
         await router.close().catch(error => { firstError ??= error; });
         const serverClose = await settleServerClose(server, serverClosing, shutdownDeadlineMs);
         if (serverClose.error !== undefined) firstError ??= serverClose.error;

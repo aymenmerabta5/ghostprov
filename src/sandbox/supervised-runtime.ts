@@ -936,9 +936,6 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
 
     const shutdown = this.#shutdown(kind, reason);
     this.#shutdownPromise = shutdown;
-    void shutdown.finally(() => {
-      if (this.#shutdownPromise === shutdown) this.#shutdownPromise = null;
-    }).catch(() => undefined);
     return shutdown;
   }
 
@@ -962,7 +959,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     }
 
     const activeRetirements = [...this.#retirements.values()].map(value => value.promise);
-    await Promise.allSettled(activeRetirements);
+    const retired = await Promise.allSettled(activeRetirements);
     await Promise.allSettled([
       this.#monitorPromise ?? Promise.resolve(),
       this.#recoveryPromise ?? Promise.resolve(),
@@ -970,6 +967,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#phase = "stopped";
     this.#recovery = null;
     this.#emit();
+    if (retired.some(result => result.status === "rejected")) throw new Error("Sandbox shutdown cleanup was incomplete");
   }
 
   #isActive(signal: AbortSignal): boolean {
@@ -996,9 +994,9 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     const completed = await runBounded(Promise.resolve().then(() => (
       graceful ? child.drain(reason) : child.stop()
     )));
-    if (!completed && graceful) {
-      await runBounded(Promise.resolve().then(() => child.stop()));
-    }
+    if (completed) return;
+    if (graceful && await runBounded(Promise.resolve().then(() => child.stop()))) return;
+    throw new Error("Sandbox shutdown cleanup was incomplete");
   }
 
   #assertProject(value: ProjectId): void {

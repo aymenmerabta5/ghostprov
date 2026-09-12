@@ -57,6 +57,39 @@ function recordWarmup(
 }
 
 describe("ResponseGraph persisted generated lane", () => {
+  it("aliases Luna before relay while preserving provider lineage and caller input", () => {
+    const graph = new ResponseGraph();
+    const input = [user("continue with this delta")];
+    const extension = { exact: true };
+    const event = Object.freeze(request(input, {
+      model: "gpt-5.6-luna",
+      stream: false,
+      store: false,
+      previous_response_id: "resp_luna_parent_exact",
+      instructions: "Keep replies concise.",
+      vendor_extension: extension,
+    }));
+
+    const resolved = resolveGraph(graph, event);
+
+    expect(resolved.relayBody).toMatchObject({
+      model: "gpt-5.6-terra",
+      stream: true,
+      store: true,
+      previous_response_id: "resp_luna_parent_exact",
+      instructions: "Keep replies concise.",
+    });
+    expect(resolved.relayBody.input).toBe(input);
+    expect(resolved.relayBody.vendor_extension).toBe(extension);
+    expect(event).toMatchObject({
+      model: "gpt-5.6-luna",
+      stream: false,
+      store: false,
+      previous_response_id: "resp_luna_parent_exact",
+    });
+    expect(graph.stats()).toEqual({ nodes: 0, bytes: 0 });
+  });
+
   it.each([
     { label: "omitted", event: request([user("omitted")]) },
     { label: "false", event: request([user("false")], { store: false }) },
@@ -251,6 +284,36 @@ describe("ResponseGraph persisted generated lane", () => {
 });
 
 describe("ResponseGraph synthetic warmup aliases", () => {
+  it("aliases an inherited Luna warmup model before relay", () => {
+    const graph = new ResponseGraph();
+    const root = alias("luna-model");
+    const warmup = Object.freeze(request([user("warmup")], {
+      generate: false,
+      model: "gpt-5.6-luna",
+      previous_response_id: "resp_warmup_parent_exact",
+    }));
+    recordWarmup(graph, root, warmup);
+
+    const resolved = resolveGraph(graph, request([user("continue")], {
+      model: undefined,
+      previous_response_id: root,
+    }));
+
+    try {
+      expect(resolved.relayBody).toMatchObject({
+        model: "gpt-5.6-terra",
+        stream: true,
+        store: true,
+        previous_response_id: "resp_warmup_parent_exact",
+        input: [user("warmup"), user("continue")],
+      });
+      expect(warmup.model).toBe("gpt-5.6-luna");
+    } finally {
+      releaseResponseGraphResolution(resolved);
+      graph.clear();
+    }
+  });
+
   it("admits only explicit generate:false requests into local state", () => {
     const graph = new ResponseGraph();
     expect(() => recordWarmup(graph, alias("generated"), request("not a warmup")))

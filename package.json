@@ -7,6 +7,8 @@
   },
   "scripts": {
     "dev": "bun src/server.ts",
+    "stop": "bun --no-env-file scripts/stop_ghostprov.ts",
+    "shutdown:pc": "bun --no-env-file scripts/stop_ghostprov.ts --poweroff",
     "start:supervised": "bun scripts/supervise.ts",
     "upgrade": "bun scripts/request_upgrade.ts",
     "stop:supervised": "bun scripts/request_shutdown.ts",

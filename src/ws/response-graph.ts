@@ -1,4 +1,5 @@
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
+import { resolveUpstreamModelAlias } from "../relay/model-policy";
 import {
   isAuthenticatedTenantScope,
   type AuthenticatedTenantScope,
@@ -689,7 +690,7 @@ export class ResponseGraph {
   ): ResolvedRelayRequest {
     // Apply the upstream persistence invariant before deciding whether any
     // connection-local warmup state needs expansion.
-    const upstreamEvent = normalizeUpstreamResponsesRequest(event);
+    const upstreamEvent = prepareHostUpstreamResponsesRequest(event);
     const relayBody: Record<string, unknown> = { ...upstreamEvent };
     delete relayBody.type;
     delete relayBody.stream_id;
@@ -737,7 +738,7 @@ export class ResponseGraph {
           delete relayBody.previous_response_id;
         }
         if (relayBody.model == null && materialization.inheritedModel) {
-          relayBody.model = materialization.inheritedModel;
+          relayBody.model = resolveUpstreamModelAlias(materialization.inheritedModel);
         }
       }
 

@@ -1,5 +1,5 @@
 import { ApiError } from "../http/errors";
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
 
 type InputImage = {
   type: "input_image";
@@ -352,7 +352,7 @@ export function buildGenerationBodies(request: ParsedGenerationRequest): Record<
       tool_choice: { type: "image_generation" },
     };
     if (request.user !== undefined) body.user = request.user;
-    return normalizeUpstreamResponsesRequest(body);
+    return prepareHostUpstreamResponsesRequest(body);
   });
 }
 
@@ -584,6 +584,6 @@ export function buildEditBodies(request: ParsedEditRequest): Record<string, unkn
       tool_choice: { type: "image_generation" },
     };
     if (request.user !== undefined) body.user = request.user;
-    return normalizeUpstreamResponsesRequest(body);
+    return prepareHostUpstreamResponsesRequest(body);
   });
 }

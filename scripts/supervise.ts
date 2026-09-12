@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { GhostProvHostSupervisor } from "../src/host/supervisor";
+import { openGhostProvShutdownControl, type GhostProvShutdownControl } from "../src/host/shutdown-control";
 import {
   assertCandidatePort,
   DEFAULT_CANDIDATE_PORT,
@@ -96,7 +97,14 @@ export async function runSupervisor(env: NodeJS.ProcessEnv = process.env): Promi
   const options = supervisorOptions(env);
   const startedAt = new Date().toISOString();
   const instanceNonce = randomUUID();
-  const supervisor = new GhostProvHostSupervisor({ ...options, startedAt, instanceNonce });
+  let shutdownControl: GhostProvShutdownControl | null = null;
+  let controlRequestedShutdown = false;
+  const supervisor = new GhostProvHostSupervisor({
+    ...options, startedAt, instanceNonce,
+    onClosed: async clean => {
+      if (!controlRequestedShutdown) await shutdownControl?.finish(clean);
+    },
+  });
   let closing: Promise<void> | null = null;
   let terminationRequested = false;
   const close = () => {
@@ -121,6 +129,24 @@ export async function runSupervisor(env: NodeJS.ProcessEnv = process.env): Promi
     void close().finally(() => { process.exitCode = 1; });
   });
   try {
+    shutdownControl = await openGhostProvShutdownControl({
+      cwd: options.cwd,
+      mode: "supervised",
+      timeoutMs: options.gracefulShutdownMs + 30_000,
+      onShutdown: async () => {
+        controlRequestedShutdown = true;
+        terminationRequested = true;
+        await close();
+        if (supervisor.snapshot().shutdownClean !== true) {
+          throw new Error("GhostProv supervisor cleanup was not completed successfully");
+        }
+      },
+    });
+    if (terminationRequested) {
+      await close();
+      await shutdownControl.finish(supervisor.snapshot().shutdownClean === true);
+      return;
+    }
     // Baseline old request files before advertising the live control paths. Any
     // request written after this descriptor is published will therefore be seen
     // by the first control poll rather than mistaken for stale state.

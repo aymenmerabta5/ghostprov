@@ -9,8 +9,13 @@ import {
   observabilityEvent,
   recoveryObservabilityEvent,
   sandboxLivenessObservabilityEvent,
+  type JsonValue,
 } from "../src/observability/events";
 import type { ObservabilityConfig } from "../src/observability/config";
+import {
+  assertSafeObservabilityEvent,
+  safeObservabilityModel,
+} from "../src/observability/redaction";
 
 function config(overrides: Partial<ObservabilityConfig> = {}): ObservabilityConfig {
   return {
@@ -35,7 +40,100 @@ class MemorySink implements ObservabilitySink {
   events(): any[] { return this.lines.map(line => JSON.parse(line)); }
 }
 
+function modelFallbackEvent(fields: Record<string, JsonValue> = {}) {
+  return observabilityEvent("request.model_fallback", {
+    trace_id: "trace-terra",
+    parent_trace_id: "trace-original",
+    requested_model: safeObservabilityModel(" GPT-6-ASTRA "),
+    fallback_model: "gpt-5.6-terra",
+    error_kind: "model_not_found",
+    provider_origin: "http",
+    retry_count: 1,
+    ...fields,
+  });
+}
+
 describe("ObservabilityLogger", () => {
+  it("records bounded model fallback attribution at error level without console sampling", async () => {
+    const sink = new MemorySink();
+    const writes: string[] = [];
+    const consoleSink = new ConsoleSink({ now: () => 0, write: value => writes.push(value) });
+    const logger = new ObservabilityLogger({
+      config: config({ level: "error" }),
+      sinks: [sink, consoleSink],
+    });
+    for (const provider_origin of ["http", "sse"] as const) {
+      const event = modelFallbackEvent({ provider_origin });
+      expect(() => assertSafeObservabilityEvent(event)).not.toThrow();
+      logger.emit(event, "progress");
+    }
+    await logger.close();
+
+    expect(logger.snapshot().sinkErrors).toBe(0);
+    expect(sink.events()).toHaveLength(2);
+    for (const event of sink.events()) {
+      expect(event).toMatchObject({
+        event: "request.model_fallback",
+        trace_id: "trace-terra",
+        parent_trace_id: "trace-original",
+        requested_model: "gpt-6-astra",
+        fallback_model: "gpt-5.6-terra",
+        error_kind: "model_not_found",
+        retry_count: 1,
+      });
+    }
+    expect(sink.events().map(event => event.provider_origin)).toEqual(["http", "sse"]);
+    expect(writes.join("\n").match(/"event":"request.model_fallback"/g)).toHaveLength(2);
+    expect(() => assertSafeObservabilityEvent(modelFallbackEvent({
+      trace_id: "t".repeat(128),
+      parent_trace_id: "p".repeat(128),
+      requested_model: "m".repeat(128),
+    }))).not.toThrow();
+    expect(() => assertSafeObservabilityEvent(modelFallbackEvent({
+      requested_model: safeObservabilityModel("private prompt\n"),
+    }))).not.toThrow();
+  });
+
+  it("rejects malformed or sensitive model fallback fields before sink delivery", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({ config: config(), sinks: [sink] });
+    const invalidFields: Array<Record<string, JsonValue>> = [
+      { trace_id: "" }, { trace_id: "t".repeat(129) }, { trace_id: "trace\n" },
+      { trace_id: "private prompt" }, { trace_id: null },
+      { parent_trace_id: "p".repeat(129) }, { parent_trace_id: "trace\r\n" },
+      { parent_trace_id: ["trace-original"] },
+      { requested_model: "GPT-6-ASTRA" }, { requested_model: "gpt-6-astra\n" },
+      { requested_model: "m".repeat(129) }, { requested_model: "private prompt" },
+      { requested_model: "sk-private-canary-12345678901234567890" },
+      { requested_model: 1 }, { fallback_model: "gpt-6-astra" },
+      { fallback_model: "gpt-5.6-terra\n" }, { error_kind: "rate_limit" },
+      { provider_origin: "local" }, { provider_origin: "HTTP" },
+      { retry_count: 0 }, { retry_count: 2 }, { retry_count: "1" },
+    ];
+    for (const key of ["prompt", "request_body", "headers", "cookie", "token", "url", "client_id", "error_message"]) {
+      invalidFields.push({ [key]: "PRIVATE_CANARY" });
+    }
+    for (const key of ["trace_id", "parent_trace_id", "requested_model"]) {
+      invalidFields.push({ [key]: "Bearer private-credential-canary" });
+      invalidFields.push({ [key]: "https://private.example/prompt" });
+    }
+    for (const fields of invalidFields) {
+      const event = modelFallbackEvent(fields);
+      expect(() => assertSafeObservabilityEvent(event)).toThrow(TypeError);
+      logger.emit(event, "progress");
+    }
+    for (const key of ["trace_id", "parent_trace_id", "requested_model", "fallback_model", "error_kind", "provider_origin", "retry_count"]) {
+      const event = { ...modelFallbackEvent() };
+      delete event[key];
+      expect(() => assertSafeObservabilityEvent(event)).toThrow(TypeError);
+      logger.emit(event, "progress");
+    }
+    await logger.close();
+
+    expect(sink.lines).toHaveLength(0);
+    expect(logger.snapshot().sinkErrors).toBe(invalidFields.length + 7);
+  });
+
   it("keeps WebSocket payload rejection and HTTP fallback visible at error level", async () => {
     const sink = new MemorySink();
     const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink] });

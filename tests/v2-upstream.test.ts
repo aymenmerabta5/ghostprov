@@ -368,6 +368,58 @@ describe.each([["base", BaseDirectResponsesClient], ["R10", R10DirectResponsesCl
     expect(events).toEqual([]);
   });
 
+  it("returns cyber_policy after streamed text once and accepts the next request", async () => {
+    let fetches = 0;
+    const message = "This content was flagged for possible cybersecurity risk.";
+    const client = new DirectResponsesClient({
+      baseUrl: "https://openai.test/v1",
+      apiKey: secret("api-secret"),
+      fetch: async () => {
+        if (++fetches > 1) return completeSse();
+        const response = sseResponse([
+          ["response.output_text.delta", { type: "response.output_text.delta", delta: "partial" }],
+          ["error", { type: "error", code: "cyber_policy", message }],
+        ]);
+        response.headers.set("x-request-id", "req_cyber_policy");
+        return response;
+      },
+    });
+    const events: SseFrame[] = [];
+    const execution = {
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"first"}'),
+      beforeFetch: async () => {},
+      onPrelude: async () => {},
+      onEvent: async (event: SseFrame) => { events.push(event); },
+    };
+
+    await expect(client.execute(execution)).rejects.toMatchObject({
+      name: "UpstreamExecutionError",
+      code: "cyber_policy",
+      message,
+      ambiguous: false,
+      status: 500,
+      providerError: {
+        origin: "sse",
+        status: 500,
+        upstreamRequestId: "req_cyber_policy",
+        error: { code: "cyber_policy", message },
+      },
+    });
+    expect(fetches).toBe(1);
+    expect(events.map(event => event.event)).toEqual(["response.output_text.delta"]);
+
+    events.length = 0;
+    await expect(client.execute({
+      ...execution,
+      body: new TextEncoder().encode('{"model":"gpt-5.6-sol","input":"next"}'),
+    })).resolves.toMatchObject({
+      responseId: "resp_1", status: "completed", final: FINAL,
+      event: { event: "response.completed" },
+    });
+    expect(fetches).toBe(2);
+    expect(events.map(event => event.event)).toEqual(["response.created", "response.output_text.delta"]);
+  });
+
   it("keeps a plain-text streamed rate-limit payload instead of replacing it", async () => {
     const client = new DirectResponsesClient({
       baseUrl: "https://openai.test/v1",

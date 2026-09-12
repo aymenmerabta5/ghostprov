@@ -4,6 +4,10 @@ import {
 } from "./server/system";
 import { sanitizeDiagnosticMessage } from "./observability/redaction";
 import { assertCandidatePort } from "./core/ports";
+import {
+  openGhostProvShutdownControl,
+  type GhostProvShutdownControl,
+} from "./host/shutdown-control";
 
 export { createBrowserlessSystem } from "./server/system";
 export { createGhostProvApp } from "./server/app";
@@ -25,6 +29,9 @@ export interface GhostProvMainHooks {
     env: Record<string, string | undefined>,
     signal: AbortSignal,
   ) => Promise<BrowserlessSystem>;
+  /** Injected processes do not own real control files unless a factory is supplied. */
+  readonly createShutdownControl?: typeof openGhostProvShutdownControl;
+  readonly cwd?: string;
 }
 
 function mergeExitCode(current: number, incoming: number): number {
@@ -53,6 +60,11 @@ export async function runGhostProvMain(
   let systemCreation: Promise<BrowserlessSystem> | null = null;
   let closing: Promise<void> | null = null;
   let systemClose: Promise<void> | null = null;
+  let systemStarting: Promise<void> | null = null;
+  let startSettled = true;
+  let cleanupSucceeded = false;
+  let shutdownControl: GhostProvShutdownControl | null = null;
+  let controlRequestedShutdown = false;
   let requestedExitCode = 0;
   let requestedReason = "shutdown";
   let intentionalDisconnect = false;
@@ -87,8 +99,19 @@ export async function runGhostProvMain(
       } catch (error) {
         reportShutdownFailure(error);
       } finally {
+        // An early stopped notification is not affirmative cleanup proof. A
+        // non-cooperative construction/start can still own resources later.
+        cleanupSucceeded = pendingCreation === null && startSettled &&
+          system !== null && system.supportsVerifiedShutdown === true &&
+          (requestedExitCode === 0 || requestedExitCode === 75);
         for (const [event, listener] of listeners) workerProcess.off(event, listener);
         try {
+          workerProcess.send?.({
+            type: "ghostprov.cleanup",
+            pid: workerProcess.pid,
+            generation: Number(env.GP_SUPERVISOR_GENERATION ?? 0),
+            success: cleanupSucceeded,
+          });
           workerProcess.send?.({
             type: "ghostprov.stopped",
             pid: workerProcess.pid,
@@ -105,6 +128,10 @@ export async function runGhostProvMain(
           }
         }
         workerProcess.exitCode = requestedExitCode;
+        if (!controlRequestedShutdown && shutdownControl) {
+          await shutdownControl.finish(cleanupSucceeded && requestedExitCode === 0)
+            .catch(reportShutdownFailure);
+        }
       }
     })();
     return closing;
@@ -161,6 +188,31 @@ export async function runGhostProvMain(
       await close();
       return;
     }
+    const controlFactory = hooks.createShutdownControl ??
+      (hooks.process ? undefined : openGhostProvShutdownControl);
+    if (env.GP_SUPERVISED_CHILD !== "1" && controlFactory) {
+      const drainMs = Number(env.GP_SHUTDOWN_DRAIN_MS?.trim() || 300_000);
+      if (!Number.isSafeInteger(drainMs) || drainMs < 1_000 || drainMs > 3_600_000) {
+        throw new TypeError("GP_SHUTDOWN_DRAIN_MS must be from 1000 through 3600000");
+      }
+      shutdownControl = await controlFactory({
+        cwd: hooks.cwd ?? process.cwd(),
+        mode: "direct",
+        timeoutMs: drainMs + 30_000,
+        onShutdown: async () => {
+          controlRequestedShutdown = true;
+          await requestClose("shutdown-control");
+          if (!cleanupSucceeded || requestedExitCode !== 0) {
+            throw new Error("GhostProv cleanup was not completed successfully");
+          }
+        },
+      });
+      if (startupController.signal.aborted) {
+        await close();
+        await shutdownControl.finish(cleanupSucceeded && requestedExitCode === 0);
+        return;
+      }
+    }
     systemCreation = Promise.resolve(createSystem(env, startupController.signal));
     let abortCreation!: () => void;
     const creationAborted = new Promise<never>((_resolve, reject) => {
@@ -177,7 +229,9 @@ export async function runGhostProvMain(
       await close();
       return;
     }
-    await system.start();
+    startSettled = false;
+    systemStarting = Promise.resolve().then(() => system!.start()).finally(() => { startSettled = true; });
+    await systemStarting;
     if (startupController.signal.aborted) {
       await close();
       return;

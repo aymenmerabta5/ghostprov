@@ -62,12 +62,20 @@ function close(exitCode: number): void {
   if (listenTimer) clearTimeout(listenTimer);
   listenTimer = null;
   const complete = () => {
+      const cleanupMode = process.env.GP_TEST_CLEANUP_ACK;
+      if (cleanupMode !== "missing") process.send?.({
+        type: "ghostprov.cleanup",
+        pid: cleanupMode === "wrong-pid" ? process.pid + 1 : process.pid,
+        generation: cleanupMode === "wrong-generation" ? generation + 1 : generation,
+        success: cleanupMode === "malformed" ? "true" : cleanupMode !== "failed",
+      });
       process.send?.({ type: "ghostprov.stopped", pid: process.pid, exitCode });
       if (process.connected) {
         intentionalDisconnect = true;
         process.disconnect?.();
       }
       process.exitCode = exitCode;
+      if (cleanupMode === "then-hang") setInterval(() => {}, 1_000);
     };
   const finish = () => {
     if (server.listening) server.close(complete);

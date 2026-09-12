@@ -15,6 +15,7 @@ import {
   writeSupervisorControlDescriptor,
 } from "../scripts/supervisor_control";
 import { GhostProvHostSupervisor } from "../src/host/supervisor";
+import { requestGhostProvShutdown } from "../src/host/shutdown-control";
 
 const workspace = path.resolve(import.meta.dir, "..");
 const API_ENV = Object.freeze({ GHOSTPROV_API_KEY: "test-ghostprov-key-0123456789abcdef" });
@@ -24,6 +25,44 @@ async function source(relativePath: string): Promise<string> {
 }
 
 describe("host supervisor service controls", () => {
+  it.each(["clean", "missing"])("gates the executable supervisor shutdown flow on child cleanup proof (%s)", async acknowledgement => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ghostprov-stop-receipt-e2e-"));
+    const child = spawn(process.execPath, ["--no-env-file", path.join(workspace, "scripts/supervise.ts")], {
+      cwd: directory,
+      env: {
+        ...API_ENV,
+        PATH: process.env.PATH, SystemRoot: process.env.SystemRoot,
+        TEMP: process.env.TEMP, TMP: process.env.TMP,
+        PORT: "0", GP_CANDIDATE: "1",
+        GP_SUPERVISOR_WORKER_ENTRY: path.join(workspace, "tests/support/fake-supervised-worker.ts"),
+        GP_TEST_CLEANUP_ACK: acknowledgement,
+        GP_SUPERVISOR_READY_TIMEOUT_MS: "10000", GP_SUPERVISOR_GRACE_MS: "5000",
+      },
+      stdio: "ignore", windowsHide: true,
+    });
+    const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+    try {
+      let ready = false;
+      for (let attempt = 0; attempt < 500 && !ready; attempt++) {
+        const status = await readFile(path.join(directory, ".ghostprov", "supervisor.json"), "utf8")
+          .then(raw => JSON.parse(raw)).catch(() => null);
+        ready = status?.state === "ready";
+        if (!ready) await Bun.sleep(10);
+      }
+      expect(ready).toBe(true);
+      if (acknowledgement === "clean") {
+        expect((await requestGhostProvShutdown(directory, { timeoutMs: 10_000 })).outcome).toBe("clean");
+      } else {
+        await expect(requestGhostProvShutdown(directory, { timeoutMs: 10_000 })).rejects.toThrow("incomplete cleanup");
+      }
+      expect(await Promise.race([exited, Bun.sleep(5_000).then(() => "timeout")])).toBe(0);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited;
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("uses exact module entrypoint guards for every lifecycle script", async () => {
     for (const file of [
       "scripts/supervise.ts",

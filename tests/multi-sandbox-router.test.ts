@@ -620,6 +620,130 @@ describe("MultiSandboxRouter", () => {
     expect(system.router.snapshot().fleetTransferReserved).toBe(0);
   });
 
+  it("protects an aged bulk continuation on a healthy peer when its origin is down", async () => {
+    let now = performance.timeOrigin + performance.now();
+    const clock: Clock = {
+      now: () => now,
+      sleep: async ms => { now += ms; },
+      waitUntil: async deadline => { now = Math.max(now, deadline); },
+    };
+    const authorizationScope = createAuthenticatedTenantScope();
+    const system = createSystem(2, 4, 20_000, undefined, undefined, clock, undefined, authorizationScope);
+    const controller = new AbortController();
+    const outcomes: Promise<unknown>[] = [];
+    try {
+      for (const runtime of system.runtimes) {
+        runtime.transportProfile = "bulk-v1";
+        runtime.transferCredits = 4;
+        runtime.notify();
+      }
+      const seed = await system.router.startRelay({ model: "gpt-5.6-terra", input: "seed" });
+      const origin = system.runtimes.find(runtime => runtime.finals.length > 0)!;
+      const peer = system.runtimes.find(runtime => runtime !== origin)!;
+      origin.completeOne({ id: "resp_aged_bulk_origin", status: "completed" });
+      await seed.final;
+
+      origin.state = "stopped";
+      origin.notify();
+      peer.transferCredits = 1;
+      peer.holdBeforeExecutionRisk = true;
+      peer.reflectTransferCosts = true;
+      peer.notify();
+      const continuationBody = Object.freeze({
+        model: "gpt-5.6-terra",
+        input: "aged bulk continuation",
+        previous_response_id: "resp_aged_bulk_origin",
+        test_transfer_cost: 4,
+        stream: false,
+        store: false,
+      });
+      const continuation = system.router.startRelay(continuationBody, {
+        source: "websocket",
+        signal: controller.signal,
+        encodedBodyBytes: Math.floor(3.2 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(3.2 * 1024 ** 2),
+      });
+      outcomes.push(continuation.then(handle => handle.final).catch(() => undefined));
+      await flush(100);
+      expect(system.router.snapshot().queued).toBe(1);
+      expect(peer.executions).toBe(0);
+
+      // The aged request must protect the live peer's credits even though its
+      // persisted provenance still names the stopped origin.
+      now += 4_000;
+      peer.transferCredits = 2;
+      peer.notify();
+      await flush(100);
+      const medium = system.router.startRelay({
+        model: "gpt-5.6-terra",
+        input: "younger medium request",
+        test_transfer_cost: 2,
+      }, {
+        signal: controller.signal,
+        encodedBodyBytes: Math.floor(2.5 * 1024 ** 2),
+        structuralBodyBytes: Math.floor(2.5 * 1024 ** 2),
+      });
+      outcomes.push(medium.then(handle => handle.final).catch(() => undefined));
+      await flush(100);
+      expect(peer.executions).toBe(0);
+      expect(system.router.snapshot()).toMatchObject({ queued: 2, fleetTransferReserved: 0 });
+
+      peer.transferCredits = 4;
+      peer.notify();
+      await flush(100);
+      expect(origin.executions).toBe(1);
+      expect(peer.executions).toBe(1);
+      expect(peer.preExecutionHolds).toHaveLength(1);
+      expect(peer.bodies[0]).toMatchObject({ ...continuationBody, stream: true, store: true });
+      expect(continuationBody).toMatchObject({ stream: false, store: false });
+      expect(system.router.snapshot()).toMatchObject({
+        queued: 1,
+        fleetTransferReserved: 4,
+        provenance: { reservedRecords: 1 },
+      });
+
+      // Finishing the body transfer releases the protection and lets the
+      // younger request use the same peer without waiting for the terminal.
+      peer.holdBeforeExecutionRisk = false;
+      peer.preExecutionHolds.shift()!.release();
+      const continuationHandle = await continuation;
+      const mediumHandle = await medium;
+      expect(peer.executions).toBe(2);
+      expect(peer.bodies.filter(body => body.previous_response_id === continuationBody.previous_response_id))
+        .toHaveLength(1);
+      peer.completeOne({ id: "resp_aged_bulk_peer", status: "completed" });
+      peer.completeOne({ id: "resp_after_aged_bulk", status: "completed" });
+      await Promise.all([continuationHandle.final, mediumHandle.final]);
+      expect(system.router.lookupResponseProvenance("resp_aged_bulk_origin", authorizationScope))
+        .toEqual({ kind: "known", provenance: { projectId: origin.projectId, incarnation: 1 } });
+      expect(system.router.lookupResponseProvenance("resp_aged_bulk_peer", authorizationScope))
+        .toEqual({ kind: "known", provenance: { projectId: peer.projectId, incarnation: 1 } });
+      expect(system.router.snapshot()).toMatchObject({
+        active: 0,
+        queued: 0,
+        queuedBytes: 0,
+        fleetTransferReserved: 0,
+        provenance: { reservedRecords: 0, reservedBytes: 0 },
+      });
+      expect(peer.reflectedTransferUsed).toBe(0);
+      expect(system.governor.snapshot().reservedBytes).toBe(0);
+    } finally {
+      controller.abort();
+      for (let round = 0; round < 3; round++) {
+        for (const runtime of system.runtimes) {
+          runtime.holdBeforeExecutionRisk = false;
+          while (runtime.preExecutionHolds.length > 0) runtime.preExecutionHolds.shift()!.release();
+        }
+        await flush(100);
+        for (const runtime of system.runtimes) {
+          while (runtime.finals.length > 0) runtime.completeOne();
+        }
+      }
+      await Promise.allSettled(outcomes);
+      await system.router.close();
+    }
+  });
+
   for (const scenario of [
     { name: "medium", bytes: 1024 ** 2, initialCost: 1 },
     { name: "observed", bytes: Math.floor(2.9 * 1024 ** 2), initialCost: 2 },
@@ -747,7 +871,64 @@ describe("MultiSandboxRouter", () => {
     expect(system.router.snapshot().fleetTransferReserved).toBe(0);
   });
 
-  it("paces medium work pinned by persisted provenance", async () => {
+  it("moves a continuation to a healthy peer when its selected sandbox goes down before execution", async () => {
+    const authorizationScope = createAuthenticatedTenantScope();
+    const system = createSystem(2, 4, 1_000, undefined, undefined, undefined, undefined, authorizationScope);
+    const controller = new AbortController();
+    let pending: Promise<RunHandle> | undefined;
+    try {
+      const seed = await system.router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+      const owner = system.runtimes.find(runtime => runtime.finals.length > 0)!;
+      const peer = system.runtimes.find(runtime => runtime !== owner)!;
+      owner.completeOne({ id: "resp_before_sandbox_down", status: "completed" });
+      await seed.final;
+
+      owner.failStarts = 1;
+      owner.mutateBeforeFailure = () => {
+        owner.state = "stopped";
+        owner.notify();
+      };
+      const body = {
+        model: "gpt-5.6-sol",
+        input: [{ role: "user", content: "continue after sandbox failure" }],
+        previous_response_id: "resp_before_sandbox_down",
+        stream: false,
+        store: false,
+      };
+      pending = system.router.startRelay(body, {
+        source: "websocket",
+        authorizationScope,
+        signal: controller.signal,
+      });
+      void pending.catch(() => undefined);
+      await flush(100);
+
+      expect(owner.state).toBe("stopped");
+      expect(owner.executions).toBe(2);
+      expect(peer.executions).toBe(1);
+      const handle = await pending;
+      expect(peer.bodies[0]).toBe(owner.bodies[1]);
+      expect(peer.bodies[0]).toEqual({ ...body, stream: true, store: true, service_tier: "fast" });
+      expect(body).toMatchObject({ stream: false, store: false });
+      peer.completeOne({ id: "resp_after_sandbox_down", status: "completed" });
+      await handle.final;
+      expect(system.router.lookupResponseProvenance("resp_before_sandbox_down", authorizationScope))
+        .toEqual({ kind: "known", provenance: { projectId: owner.projectId, incarnation: 1 } });
+      expect(system.router.lookupResponseProvenance("resp_after_sandbox_down", authorizationScope))
+        .toEqual({ kind: "known", provenance: { projectId: peer.projectId, incarnation: 1 } });
+      expect(system.router.snapshot()).toMatchObject({ queued: 0, active: 0, fleetTransferReserved: 0 });
+      expect(system.governor.snapshot().reservedBytes).toBe(0);
+    } finally {
+      controller.abort();
+      for (const runtime of system.runtimes) {
+        while (runtime.finals.length > 0) runtime.completeOne();
+      }
+      if (pending) await Promise.allSettled([pending]);
+      await system.router.close();
+    }
+  });
+
+  it("paces medium work with a preferred persisted-provenance sandbox", async () => {
     const authorizationScope = createAuthenticatedTenantScope();
     const system = createSystem(
       2,
@@ -2755,10 +2936,10 @@ describe("MultiSandboxRouter", () => {
     await system.router.close();
   });
 
-  it("downgrades request memory after transport commitment and releases it at terminal", async () => {
+  it("downgrades Terra request memory after commitment without retaining a fallback body", async () => {
     const system = createSystem(1, 1);
     const handle = await system.router.startRelay({
-      model: "gpt-5.6-sol",
+      model: "gpt-5.6-terra",
       input: "committed-memory",
       stream: true,
     });

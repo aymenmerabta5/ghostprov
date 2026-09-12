@@ -1,5 +1,6 @@
 import { AnthropicRequestError } from "./errors";
 import { resolveAnthropicModel, type AnthropicModelOptions } from "./model";
+import { resolveUpstreamModelAlias } from "../relay/model-policy";
 import {
   translateMessages,
   translateSystem,
@@ -235,7 +236,7 @@ export function translateAnthropicRequest(
   }
 
   const relayBody: ResponsesRequestBody = {
-    model: resolveAnthropicModel(requestedModel, options.models),
+    model: resolveUpstreamModelAlias(resolveAnthropicModel(requestedModel, options.models)),
     store: true,
     stream,
     input,

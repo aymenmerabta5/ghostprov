@@ -11,6 +11,7 @@ import { parseYSweetEnvelope } from "../src/prism/protocol";
 import { sealSupervisorSessionBootstrap } from "../src/v2/supervisor/session-bootstrap";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import type { GuardedYDocMutation } from "../src/sandbox/ydoc";
+import { SupervisorLifecycle } from "../src/v2/supervisor/lifecycle";
 
 const assets = await loadV2SidecarAssets({ revision: "r10" });
 const project = "11111111-1111-4111-8111-111111111111";
@@ -23,10 +24,14 @@ afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { rec
 
 class Journal implements SupervisorBootstrapJournal, BootstrapJournalEntry {
   attempt: SupervisorBootstrapAttempt | null = null;
+  failCleanupSave = false;
   readonly phases: string[] = [];
   async withLease<T>(signal: AbortSignal | undefined, run: (entry: BootstrapJournalEntry) => Promise<T>) { signal?.throwIfAborted(); return run(this); }
   async load() { return this.attempt; }
-  async save(attempt: SupervisorBootstrapAttempt) { this.attempt = structuredClone(attempt); this.phases.push(attempt.phase); }
+  async save(attempt: SupervisorBootstrapAttempt) {
+    if (this.failCleanupSave && attempt.phase === "cleanup_proven") throw new Error("offline cleanup receipt persistence failed");
+    this.attempt = structuredClone(attempt); this.phases.push(attempt.phase);
+  }
   async clear() { this.attempt = null; this.phases.push("cleared"); }
 }
 
@@ -62,11 +67,15 @@ async function prior(journal: Journal, files: Files, phase: SupervisorBootstrapA
   files.data.set(sealedPath, JSON.stringify(journal.attempt!.sealed));
 }
 
-function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; rejectShutdown?: boolean; failSubmission?: boolean; failSync?: boolean; loseStage?: boolean; generation?: number; sync?: (count: number) => void; onShutdown?: () => void } = {}) {
+function controller(journal: SupervisorBootstrapJournal, files: Files, events: string[], options: { rejectOld?: boolean; rejectShutdown?: boolean; failSubmission?: boolean; failSync?: boolean; loseStage?: boolean; generation?: number; sync?: (count: number) => void; onShutdown?: () => void; lifecycle?: SupervisorLifecycle } = {}) {
   let syncs = 0;
-  return new V2SandboxSupervisor({ binding: { ...binding, leaderGeneration: 2, nonce: "new-bootstrap" }, assets,
+  let release = () => {};
+  const supervisor = new V2SandboxSupervisor({ binding: { ...binding, leaderGeneration: 2, nonce: "new-bootstrap" }, assets,
     ...(options.generation ? { binding: { ...binding, leaderGeneration: options.generation, nonce: `bootstrap-${options.generation}` } } : {}),
     ySweet: credential, ydoc: files, bootstrapJournal: journal, connectTimeoutMs: 1000,
+    onCleanupRequired: value => options.lifecycle?.requireCleanup(value),
+    onCleanupProven: value => options.lifecycle?.confirmCleanup(value),
+    onClosed: () => release(),
     gateway: { async syncWorkspace() { options.sync?.(++syncs); if (options.failSync) throw new Error("offline sync"); if (options.loseStage) files.data.clear(); },
       async startSupervisorExec({ sessionId }) { events.push("submit"); if (options.failSubmission) throw new Error("offline lost acknowledgement");
         return { sessionId, workspaceRoot: `/codex_workspace/${sessionId}`, jobId: "offline-job" }; },
@@ -76,9 +85,67 @@ function controller(journal: SupervisorBootstrapJournal, files: Files, events: s
       async ensureReady() {}, async launch() { throw new Error("unexpected launch"); }, async deliverCredential() {}, async stop() { return null; },
       async rotateCredential() {}, async shutdown() { if (input.recoverExisting) await this.connect(); events.push(`shutdown:${input.binding.leaderGeneration}`); if (options.rejectShutdown) throw new Error("offline ambiguous shutdown"); options.onShutdown?.(); }, async close() {} }),
   });
+  if (options.lifecycle) release = options.lifecycle.register(supervisor);
+  return supervisor;
 }
 
 describe("interrupted supervisor bootstrap recovery", () => {
+  it.each(["shutdown", "recovery"] as const)("retains cleanup debt when %s cannot persist signed proof", async phase => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const lifecycle = new SupervisorLifecycle(1);
+    if (phase === "recovery") await prior(journal, files, "submitted");
+    const sup = controller(journal, files, events, { lifecycle });
+    if (phase === "shutdown") await sup.ensureReady();
+    journal.failCleanupSave = true;
+    if (phase === "recovery") await expect(sup.ensureReady()).rejects.toMatchObject({ remoteCode: "bootstrap_cleanup_unproven" });
+    else await expect(sup.shutdown("offline_done")).rejects.toThrow("persistence failed");
+    await sup.close();
+    expect(journal.attempt?.phase).toBe("submitted");
+    await expect(lifecycle.shutdown(new AbortController().signal)).rejects.toThrow("incomplete");
+  });
+
+  it("keeps ambiguous launch cleanup owed after close and clears it after exact later recovery", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    const lifecycle = new SupervisorLifecycle(1);
+    const first = controller(journal, files, events, { failSubmission: true, lifecycle });
+    await expect(first.ensureReady()).rejects.toThrow();
+    await expect(first.shutdown("offline_done")).rejects.toMatchObject({ remoteCode: "bootstrap_cleanup_unproven" });
+    await first.close();
+    expect(journal.attempt?.phase).toBe("submitted");
+    const next = controller(journal, files, events, { generation: 3, lifecycle });
+    await next.ensureReady();
+    await next.shutdown("offline_done");
+    await next.close();
+    expect(journal.attempt).toBeNull();
+    await expect(lifecycle.shutdown(new AbortController().signal)).resolves.toBeUndefined();
+    expect(events.filter(event => event === "submit")).toHaveLength(2);
+  });
+
+  it("does not mistake closed recovery transports for old supervisor cleanup", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    await prior(journal, files, "submitted");
+    const lifecycle = new SupervisorLifecycle(1);
+    const sup = controller(journal, files, events, { rejectOld: true, lifecycle });
+    await expect(sup.ensureReady()).rejects.toMatchObject({ remoteCode: "bootstrap_cleanup_unproven" });
+    await expect(sup.shutdown("offline_done")).rejects.toMatchObject({ remoteCode: "bootstrap_cleanup_unproven" });
+    await sup.close();
+    await expect(lifecycle.shutdown(new AbortController().signal)).rejects.toThrow("incomplete");
+    expect(journal.attempt?.phase).toBe("submitted");
+    expect(events).toEqual(["connect:1"]);
+  });
+
+  it("discharges retained debt from a durable cleanup receipt before launching a successor", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    await prior(journal, files, "cleanup_proven");
+    const lifecycle = new SupervisorLifecycle(1);
+    lifecycle.requireCleanup(journal.attempt!.binding);
+    const sup = controller(journal, files, events, { lifecycle });
+    await sup.ensureReady();
+    await sup.shutdown("offline_done");
+    await sup.close();
+    await expect(lifecycle.shutdown(new AbortController().signal)).resolves.toBeUndefined();
+    expect(events).toEqual(["submit", "connect:2", "shutdown:2"]);
+  });
   it.each([
     ["initial", V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY],
     ["c1091742", V2_R10_C1091742_RETIREMENT_IDENTITY],

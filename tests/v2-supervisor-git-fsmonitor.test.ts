@@ -214,7 +214,7 @@ describe("Git fsmonitor supervisor integration", () => {
     } finally { await f.supervisor.close(); }
   });
 
-  it("does not treat failed readiness or no-op shutdown as cleanup authority", async () => {
+  it("reports unproven cleanup after failed readiness without replay or deletion", async () => {
     const f = await fixture({ controller: true });
     const hosts: Host[] = [];
     const supervisor = new V2SandboxSupervisor({ ...f.input, bootstrapMode: "git-fsmonitor", hostFactory: options => {
@@ -225,7 +225,8 @@ describe("Git fsmonitor supervisor integration", () => {
       const calls = f.calls.length;
       await expect(supervisor.ensureReady()).rejects.toMatchObject({ kind: "readiness" });
       expect(f.calls).toHaveLength(calls);
-      await supervisor.shutdown("failed-start");
+      await expect(supervisor.shutdown("failed-start")).rejects.toMatchObject({ kind: "shutdown", remoteCode: "bootstrap_cleanup_unproven" });
+      expect(f.calls).toHaveLength(calls);
       expect(hosts[0]!.shutdowns).toBe(0);
       expect(f.calls.some(call => call.operation === "delete-file")).toBe(false);
       expect(supervisor.instanceId).toBe("pending");

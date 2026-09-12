@@ -71,6 +71,9 @@ export interface V2SandboxSupervisorOptions {
   readonly hostFactory?: (options: V2SupervisorHostOptions) => V2BootstrapSupervisor;
   /** Releases the bounded diagnostic lookup when this exact supervisor closes. */
   readonly onClosed?: () => void;
+  /** Bounded lifecycle accounting, separate from closing the local transport. */
+  readonly onCleanupRequired?: (binding: BootstrapBinding) => void;
+  readonly onCleanupProven?: (binding: BootstrapBinding) => void;
   readonly bootstrapJournal?: SupervisorBootstrapJournal;
 }
 
@@ -84,6 +87,9 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   #instanceId = "pending";
   #executionSessionId: string | null = null;
   readonly #onClosed?: () => void;
+  readonly #onCleanupRequired?: (binding: BootstrapBinding) => void;
+  readonly #onCleanupProven?: (binding: BootstrapBinding) => void;
+  #pendingCleanupBinding: BootstrapBinding | null = null;
   readonly #bootstrapJournal?: SupervisorBootstrapJournal;
   #ySweet: YSweetEnvelope;
   readonly #ydoc: V2BootstrapYDoc;
@@ -137,6 +143,8 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
     this.#hostFactory = options.hostFactory ?? (input => new V2SupervisorHost(input));
     this.#onClosed = options.onClosed;
+    this.#onCleanupRequired = options.onCleanupRequired;
+    this.#onCleanupProven = options.onCleanupProven;
     this.#bootstrapJournal = options.bootstrapJournal;
   }
 
@@ -226,6 +234,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   async #recoverBootstrap(journal: BootstrapJournalEntry, signal?: AbortSignal): Promise<void> {
     let previous = await journal.load();
     if (!previous) return;
+    if (previous.phase === "submitted") this.#requireCleanup(previous.binding);
     if (previous.binding.projectId !== this.binding.projectId || previous.binding.leaderGeneration >= this.binding.leaderGeneration) {
       throw new V2SupervisorBootstrapError("Previous bootstrap identity cannot be retired by this generation", "deploy", {
         remoteCode: "bootstrap_ownership_conflict", reason: previous.binding.leaderGeneration >= this.binding.leaderGeneration ? "generation_conflict" : "release_mismatch",
@@ -249,6 +258,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
         remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch",
       });
     }
+    if (previous.phase === "cleanup_proven") this.#confirmCleanup(previous.binding);
     if (previous.phase === "submitted") {
       // A durable submission is never replayed. Reconnect only to its exact
       // authenticated supervisor and obtain child-cleanup proof before reuse.
@@ -264,6 +274,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
         await host.shutdown("interrupted_bootstrap_recovery", signal);
         previous = { ...previous, phase: "cleanup_proven" };
         await journal.save(previous);
+        this.#confirmCleanup(previous.binding);
       } catch (cause) {
         const phase = cause instanceof Error ? Object.getOwnPropertyDescriptor(cause, "phase")?.value : undefined;
         throw new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", {
@@ -350,6 +361,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       signal?.throwIfAborted();
       // One immutable submission. The selected bootstrap never falls back or
       // resubmits after a failed or ambiguous trigger.
+      this.#requireCleanup(this.binding);
       submissionStarted = true;
       await start(Object.freeze({ sessionId }), signal);
       signal?.throwIfAborted();
@@ -381,6 +393,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
         try {
           await host.shutdown("direct_bootstrap_failed", AbortSignal.timeout(this.#commandTimeoutMs));
           signedShutdown = true;
+          if (!journal) this.#confirmCleanup(this.binding);
         } catch { /* Ambiguous child cleanup cannot authorize workspace deletion. */ }
       }
       await host?.close().catch(() => undefined);
@@ -393,6 +406,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
           if (signedShutdown) {
             attempt = { ...attempt, phase: "cleanup_proven" };
             await journal.save(attempt);
+            this.#confirmCleanup(attempt.binding);
           } else if (attempt.phase !== "prepared") {
             attempt = { ...attempt, phase: "prepared" };
             await journal.save(attempt);
@@ -500,6 +514,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     const execSignal = signal
       ? AbortSignal.any([signal, execAbort.signal])
       : execAbort.signal;
+    this.#requireCleanup(this.binding);
     const exec = runRelayExec({
       entrypointPath: this.#assets.entrypointPath,
       supervisorNonce: this.binding.nonce,
@@ -528,12 +543,14 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       if (!applied) throw new Error("Supervisor bootstrap credential authority changed");
       await this.#gateway.syncWorkspace(signal);
     } catch (cause) {
-      await host.shutdown("bootstrap_cleanup_failed", AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+      await host.shutdown("bootstrap_cleanup_failed", AbortSignal.timeout(this.#commandTimeoutMs))
+        .then(() => this.#confirmCleanup(this.binding), () => undefined);
       await host.close().catch(() => undefined);
       throw new V2SupervisorBootstrapError("Unable to retire supervisor bootstrap credential", "deploy", { cause });
     }
     if (this.#closed || this.#stopping) {
-      await host.shutdown("bootstrap_closed", AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+      await host.shutdown("bootstrap_closed", AbortSignal.timeout(this.#commandTimeoutMs))
+        .then(() => this.#confirmCleanup(this.binding), () => undefined);
       await host.close();
       throw new V2SupervisorBootstrapError("Sandbox supervisor closed during bootstrap", "shutdown");
     }
@@ -597,18 +614,32 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
             }
             const proven = { ...current, phase: "cleanup_proven" as const };
             await journal.save(proven);
+            this.#confirmCleanup(attempt.binding);
             signal?.throwIfAborted();
             await this.#cleanupBootstrapAttempt(proven, signal);
             await journal.clear();
             this.#activeAttempt = null;
           });
-        }
+        } else this.#confirmCleanup(this.binding);
         if (this.#gitBootstrap) {
           await this.#gitBootstrap.cleanupAfterSignedShutdown(true, signal ?? AbortSignal.timeout(this.#commandTimeoutMs));
         }
       }
+      if (this.#pendingCleanupBinding) {
+        throw new V2SupervisorBootstrapError("Supervisor cleanup remains unproven", "shutdown", { remoteCode: "bootstrap_cleanup_unproven" });
+      }
     })();
     return this.#shutdown;
+  }
+
+  #requireCleanup(binding: BootstrapBinding): void {
+    this.#onCleanupRequired?.(binding);
+    this.#pendingCleanupBinding = binding;
+  }
+
+  #confirmCleanup(binding: BootstrapBinding): void {
+    this.#onCleanupProven?.(binding);
+    if (this.#pendingCleanupBinding === binding) this.#pendingCleanupBinding = null;
   }
 
   async readDiagnosticLog(file: SandboxLogFile, signal?: AbortSignal): Promise<string | null> {

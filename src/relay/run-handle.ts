@@ -16,6 +16,8 @@ export interface RunDiagnostics {
 }
 
 export interface RunHandle {
+  /** A definitive model rejection selected a different upstream model. */
+  readonly modelFallback?: { readonly from: string; readonly to: string };
   events(): AsyncGenerator<SseFrame>;
   /** Release buffered events when a committed handle loses a bounded caller race. */
   discardUnconsumedEvents?(): void;

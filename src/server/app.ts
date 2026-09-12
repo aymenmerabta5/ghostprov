@@ -5,7 +5,7 @@ import {
 import { Hono } from "hono";
 import type { RunHandle } from "../relay/run-handle";
 import { definitivePreviousResponseNotFound } from "../relay/continuation-error";
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
 import { validateResponsesInputJson } from "../relay/responses-validation";
 import { sseFrame, SSE_HEADERS, type SseFrame } from "../relay/sse";
 import { ApiError, apiErrorEvent, apiErrorResponse, normalizeApiError } from "../http/errors";
@@ -1013,7 +1013,7 @@ const CODEX_MODELS = Object.freeze([
   codexModel({
     slug: "gpt-5.6-luna",
     displayName: "GPT-5.6-Luna",
-    description: "Fast and affordable agentic coding model.",
+    description: "Compatibility alias for GPT-5.6-Terra.",
     defaultReasoning: "medium",
     reasoning: ["low", "medium", "high", "xhigh", "max"],
     priority: 3,
@@ -1217,7 +1217,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
           Number(incomingLease?.bodyBytes) >= 0
         ? Number(incomingLease!.bodyBytes)
         : null;
-      upstreamBody = normalizeUpstreamResponsesRequest(body);
+      upstreamBody = prepareHostUpstreamResponsesRequest(body);
       upstreamStructuralBytes = await jsonEncodedByteLengthAsync(upstreamBody, {
         signal: relayAbort.signal,
       });
@@ -1333,7 +1333,7 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
             get upstreamPrelude() { return rawHandle!.upstreamPrelude; },
             stats: rawHandle.stats,
             final: rawHandle.final.then(async final => {
-              if (authorizationScope !== null) {
+              if (authorizationScope !== null && !rawHandle!.modelFallback) {
                 await responsesContinuationIndex.commit(
                   continuationToken,
                   authorizationScope,

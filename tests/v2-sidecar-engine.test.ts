@@ -283,6 +283,50 @@ describe.each([["base", BaseSidecarHarness], ["R10", R10SidecarHarness]] as cons
     expect(restarted.journal.status(first.requestId)).toBe("acked");
   });
 
+  it("keeps the sidecar ready after cyber_policy and executes the next request", async () => {
+    const fatals: Error[] = [];
+    const drains: string[] = [];
+    const pool = new AtomicBytePermitPool({ ordinaryBytes: 10 * 1024 * 1024, jumboBytes: 1 });
+    let executions = 0;
+    const harness = new SidecarHarness({
+      binding: TEST_R2_BINDING,
+      atomicBytePermits: pool,
+      onFatalError: error => fatals.push(error),
+      onDrainRequested: reason => drains.push(reason),
+      behavior: async input => {
+        if (++executions > 1) return completedUpstream(input);
+        await input.beforeFetch();
+        throw new UpstreamExecutionError(
+          "This content was flagged for possible cybersecurity risk.", "cyber_policy", false, 500,
+        );
+      },
+    });
+    await harness.sendRequest(BODY);
+    await harness.settle();
+    expect(harness.journal.status(harness.requestId)).toBe("provider_error");
+    expect(harness.journal.canRetry(harness.requestId)).toBe(false);
+    expect(harness.frames.filter(frame => frame.kind === "response_error")).toEqual([
+      expect.objectContaining({ requestId: harness.requestId, code: "cyber_policy", ambiguous: false }),
+    ]);
+    expect(harness.engine.snapshot()).toMatchObject({ ready: true, active: 0, ambiguous: 0, draining: false });
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    expect(executions).toBe(1);
+    expect(fatals).toEqual([]);
+    expect(drains).toEqual([]);
+
+    harness.requestId = "req-after-cyber-policy";
+    await harness.sendRequest({ ...BODY, input: "next" });
+    await harness.settle();
+    expect(executions).toBe(2);
+    expect(harness.frames).toContainEqual(expect.objectContaining({
+      kind: "response_terminal", requestId: harness.requestId, terminalStatus: "completed",
+    }));
+    expect(harness.engine.snapshot()).toMatchObject({ ready: true, active: 0, ambiguous: 0, draining: false });
+    expect(pool.snapshot()).toMatchObject({ activePermits: 0, ordinaryUsedBytes: 0 });
+    expect(fatals).toEqual([]);
+    expect(drains).toEqual([]);
+  });
+
   it("never emits a definitive provider error when its journal transition fails", async () => {
     let appends = 0;
     const fatals: Error[] = [];

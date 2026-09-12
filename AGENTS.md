@@ -39,12 +39,14 @@ The primary product goal is high concurrency for mixed Codex and Claude workload
 
 ## Execution safety and retries
 
-- Never replay a request after committed ACK, `request_start`, `FETCH_STARTING`, a potentially successful upstream write, or any other ambiguous execution-risk signal.
+- Never replay a request after committed ACK, `request_start`, `FETCH_STARTING`, a potentially successful upstream write, or any other ambiguous execution-risk signal, except for the explicitly defined definitive-rejection fallbacks below.
 - Safe rerouting is allowed only before commitment, inside the original admission deadline, and when the implementation can prove no upstream execution began.
 - A timeout, disconnect, cancellation race, or malformed terminal after a request may have been sent is ambiguous, not retry authorization.
 - Preserve immutable request bodies across all admissible pre-commit attempts. A retry must not observe or construct a mutated body.
 - Definitive provider errors are returned once with credential-sensitive details scrubbed. Continuation fallback is allowed only for server-injected lineage: either an auto-inferred Anthropic/native HTTP prefix or standalone-search session receives a definitive HTTP-origin 400/404 `previous_response_not_found` before any relay event or public commitment, or native Responses/standalone search is rejected locally with `ResponseProvenanceObsoleteError` before `startRelay` returns a handle and therefore before provider execution can begin. Compare-delete the exact inferred generation or standalone-session binding, then retry once with the immutable original full history or a rootable current search request and no stale provider ID. An opaque standalone ref instead returns a nonretryable expired-reference error after deletion. Never apply this fallback to an explicit caller or WebSocket provider ID, generic local failures, SSE-origin failures, ambiguous work, or any request that emitted a relay/public event. Standalone-session clear/shutdown must fence late metadata commits.
+- Explicit model-rejection exception to the return-once rule: a definitive `V2CommittedError` with `ambiguous:false` and a validated direct HTTP- or SSE-origin `model_not_found` envelope may select `gpt-5.6-terra` once, before any relay/public event or public commitment. Preserve the exact immutable request and `previous_response_id`, changing only `model`; retain its memory reservation until fallback admission or the first response event ends eligibility. Admit the Terra request through the normal bounded router and log linked original/fallback trace IDs and model names. Never repeat a Terra failure or apply this exception to timeouts, cancellation, ambiguous work, unrelated errors, or mismatched model evidence. Do not commit inferred prefix metadata under the rejected model's settings. The exact `gpt-5.6-luna` identifier is a proactive host-side alias for Terra; keep model alias policy separate from stream/store normalization.
 - GhostProv does not add provider-rate-limit sleeps, probes, synthetic cooldowns, or cross-sandbox retries.
+- Definitive provider rejections, including `cyber_policy`, and client cancellations fail only their request. They must not penalize runtime health, drain or restart the sandbox, or affect other requests. After commitment, cancellation retains bounded request state until durable cancellation or terminal proof releases it; cancellation quarantine does not count toward transport ambiguity exhaustion and never authorizes replay. Independent transport, liveness, ownership, or durable-storage failures retain their existing safety handling.
 - Quarantine ambiguous work and reduce capacity rather than risk duplicate execution.
 - Ordinary recovery replaces only the runtime/sandbox session for the same registered Prism project and worker index. The separate managed-fleet reconciler owns project creation and retirement: its identity-scoped manifest under `~/.ghostprov/fleets/<identity-fingerprint>/fleet.json` is authoritative; legacy environment IDs are one-time unmanaged seeds; arbitrary account projects are never adopted. Project replacement requires repeated identical local R8 bootstrap failures, a healthy R8 majority, closed outage/mutation circuits, and no active, quarantined, ambiguous, or continuation-bound work. It creates and verifies a successor before draining the old runtime and deletes only an automatically managed old project. Common-mode connectivity/account/Prism failures freeze project mutation with bounded backoff.
 
@@ -125,6 +127,12 @@ Live operations are opt-in and are not implied by a request to implement or test
 - Do not use live sandboxes or paid provider calls for ordinary unit, integration, typecheck, or compile validation.
 - Keep credentials out of command lines, diffs, test output, logs, and summaries.
 
+## User-requested unattended PC shutdown
+
+- When the user explicitly asks to power off the PC after work, finish all requested work and validation first, then use `bun run shutdown:pc` from this repository as the final operation. This command requests graceful cleanup from the exact running GhostProv instance and powers off Windows only after a successful cleanup receipt.
+- A failed or timed-out cleanup command means leave the PC on and report the failure. Never follow it with raw OS shutdown, force-kill GhostProv, or move/delete fleet manifests or bootstrap journals to bypass the failure.
+- `bun run stop` performs the same verified graceful stop without powering off. These commands require a process started with the updated code; they must not be run against the protected service during ordinary implementation or testing. A request to build or test this workflow does not authorize a real service stop or PC shutdown.
+
 ## Prohibited scope for the active R10 release
 
 Unless a later task explicitly authorizes them, do not add:
@@ -151,3 +159,4 @@ Before reporting a change complete:
 8. Run focused offline tests and `bun run typecheck`.
 9. Re-inspect `git diff --check` and the final file list.
 10. Report tests actually run and any validation intentionally not run.
+11. Confirm model-rejection fallback is single-attempt, uses authoritative matching provider evidence before any relay/public event, retains bounded request ownership until its decision, and preserves exact provider lineage.

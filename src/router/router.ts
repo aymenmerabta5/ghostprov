@@ -34,7 +34,9 @@ import {
 } from "../observability/redaction";
 import { traceRunHandle } from "../observability/traced-run-handle";
 import { validateResponsesInputJson } from "../relay/responses-validation";
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
+import { canFallbackFromModel, FALLBACK_UPSTREAM_MODEL } from "../relay/model-policy";
+import { isDefinitiveModelNotFound, wrapModelFallbackHandle } from "../relay/model-fallback";
 import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 import {
   releaseAtomicBytePermit,
@@ -46,7 +48,6 @@ import {
 } from "../http/api-key";
 import {
   ResponseProvenanceCommitError,
-  ResponseProvenanceObsoleteError,
   ResponseProvenanceRegistry,
   ResponseProvenanceScopeError,
   type ResponseProvenance,
@@ -350,6 +351,8 @@ export interface IncomingBodyAcquireOptions {
 }
 
 export interface StartRelayOptions {
+  /** Server-owned diagnostic linkage for the single model-rejection fallback. */
+  fallbackFrom?: Readonly<{ traceId: string; model: string; origin: "http" | "sse" }>;
   clientId?: string;
   source?: RelaySource;
   signal?: AbortSignal;
@@ -370,10 +373,12 @@ export interface StartRelayOptions {
 
 interface QueuedJob {
   body: Record<string, unknown>;
+  source: RelaySource;
   workload: WorkloadDescriptor;
   decodedRequestBytes: number;
   clientId: string;
   authorizationScope: AuthenticatedTenantScope | null;
+  /** Preferred origin only; provider lineage is independent of runtime availability. */
   continuationProvenance: ResponseProvenance | null;
   provenanceReservation: ResponseProvenanceReservation | null;
   signal?: AbortSignal;
@@ -971,7 +976,7 @@ export class MultiSandboxRouter {
         this.#clearRuntimeTransferProtection(event.projectId);
         this.#runtimeCache.delete(event.projectId);
         this.#rateLimitObservations.delete(event.projectId);
-        this.#rejectObsoleteContinuations(event.projectId);
+        this.#scheduleDrain();
         return;
       }
       const runtime = this.#registry.get(event.projectId);
@@ -987,7 +992,6 @@ export class MultiSandboxRouter {
         (next.snapshot.incarnation ?? 0) !== previousIncarnation;
       if (incarnationChanged) {
         this.#rateLimitObservations.delete(event.projectId);
-        this.#rejectObsoleteContinuations(event.projectId);
       }
       if (incarnationChanged || !isRuntimeHealthy(next.candidate)) {
         this.#clearRuntimeTransferProtection(event.projectId);
@@ -1050,6 +1054,17 @@ export class MultiSandboxRouter {
     const inheritedDeadlineMs = options.incomingLease?.deadlineMs;
     const traceId = this.#random.uuid();
     const source = options.source ?? "internal";
+    if (options.fallbackFrom) {
+      this.#emit("request.model_fallback", {
+        trace_id: traceId,
+        parent_trace_id: options.fallbackFrom.traceId,
+        requested_model: safeObservabilityModel(options.fallbackFrom.model),
+        fallback_model: FALLBACK_UPSTREAM_MODEL,
+        error_kind: "model_not_found",
+        provider_origin: options.fallbackFrom.origin,
+        retry_count: 1,
+      });
+    }
     const authorizationScope = this.#defaultAuthorizationScope;
     if (
       (options.authorizationScope !== undefined &&
@@ -1065,7 +1080,7 @@ export class MultiSandboxRouter {
     // This is the shared routing choke point. Public and producer-specific
     // callers normalize defensively too, while copy-on-write keeps client-facing
     // stream semantics and caller-owned request objects unchanged.
-    const normalizedBody = normalizeUpstreamResponsesRequest(body);
+    const normalizedBody = prepareHostUpstreamResponsesRequest(body);
     const relayBody: Record<string, unknown> = applyUpstreamServiceTierPolicy(normalizedBody);
     // The caller can retain and mutate its graph while resource admission is
     // pending. Continuation authority is therefore resolved only from the
@@ -1244,7 +1259,7 @@ export class MultiSandboxRouter {
         () => this.#clock.now() >= admissionDeadlineMs,
       );
       const immutableCallerBody = immutableCallerSnapshot.body;
-      const normalizedSnapshot = normalizeUpstreamResponsesRequest(immutableCallerBody);
+      const normalizedSnapshot = prepareHostUpstreamResponsesRequest(immutableCallerBody);
       const policySnapshot = applyUpstreamServiceTierPolicy(normalizedSnapshot);
       immutableBody = Object.isFrozen(policySnapshot)
         ? policySnapshot
@@ -1336,8 +1351,7 @@ export class MultiSandboxRouter {
       this.#failure(
         traceId,
         acceptedAtMs,
-        error instanceof ResponseProvenanceScopeError ||
-            error instanceof ResponseProvenanceObsoleteError
+        error instanceof ResponseProvenanceScopeError
           ? "continuation"
           : "snapshot",
         error,
@@ -1360,6 +1374,7 @@ export class MultiSandboxRouter {
       const enqueuedAtMs = this.#clock.now();
       const job: QueuedJob = {
         body: immutableBody,
+        source,
         workload,
         decodedRequestBytes,
         clientId,
@@ -1677,9 +1692,9 @@ export class MultiSandboxRouter {
     );
     if (lookup.kind === "scope_mismatch") throw new ResponseProvenanceScopeError();
     if (lookup.kind !== "known") return null;
-    if (this.#isContinuationIncarnationObsolete(lookup.provenance)) {
-      throw new ResponseProvenanceObsoleteError();
-    }
+    // The provider owns the stored response. A retired local incarnation only
+    // makes its routing preference stale; it cannot invalidate provider lineage.
+    if (this.#isContinuationHintStale(lookup.provenance)) return null;
     return lookup.provenance;
   }
 
@@ -1747,34 +1762,95 @@ export class MultiSandboxRouter {
     this.#releaseLeaseAfter(job.memoryLease, retainUntil);
   }
 
-  #isContinuationIncarnationObsolete(provenance: ResponseProvenance): boolean {
+  async #releaseCommittedRequestBody(job: QueuedJob): Promise<void> {
+    // Drop the immutable graph before reducing the reservation that owns it.
+    job.body = {};
+    if (
+      !job.retainFullLeaseAfterCommit &&
+      job.memoryLease.reservedBytes > POST_COMMIT_RESERVATION_BYTES
+    ) {
+      const committedLease = job.memoryLease;
+      try {
+        job.memoryLease = await committedLease.replace({
+          ...job.workload,
+          reservedBytes: POST_COMMIT_RESERVATION_BYTES,
+        });
+      } catch {
+        // Accounting optimization failure leaves the original lease authoritative.
+        job.memoryLease = committedLease;
+      }
+    }
+  }
+
+  async #startModelFallback(
+    job: QueuedJob,
+    body: Record<string, unknown>,
+    requestedModel: string,
+    error: V2CommittedError,
+    bodyRetainedUntil: Promise<void>,
+  ): Promise<RunHandle> {
+    if (this.#closed || this.#shuttingDown) throw error;
+    if (job.signal?.aborted) throw sanitizedRouterAbortReason(job.signal);
+    const originalLease = job.memoryLease;
+    const reservationFloor = originalLease.reservedBytes;
+    const originalRetention = job.retainMemoryUntil;
+    const retainMemoryUntil = originalRetention
+      ? Promise.allSettled([originalRetention, bodyRetainedUntil])
+      : bodyRetainedUntil;
+    const retainFloor = (lease: ResourceLease): ResourceLease => ({
+      get reservedBytes() { return lease.reservedBytes; },
+      release: () => lease.release(),
+      replace: async (workload, signal, options) => retainFloor(await lease.replace({
+        ...workload,
+        reservedBytes: Math.max(reservationFloor, workload.reservedBytes),
+      }, signal, options)),
+    });
+    // A rejected parent already owns enough memory for this request. Replace
+    // that lease atomically instead of waiting for a second full allocation.
+    // Its ingress graph may remain live, so preserve the original floor and
+    // lifetime on every child replacement until the fallback is finished.
+    const incomingLease: IncomingResourceLease = {
+      replace: async (workload, signal, options) => {
+        const replacement = await originalLease.replace({
+          ...workload,
+          reservedBytes: Math.max(reservationFloor, workload.reservedBytes),
+        }, signal, options);
+        job.memoryReleaseScheduled = true;
+        job.retainMemoryUntil = null;
+        return retainFloor(replacement);
+      },
+      // Before successful replacement the parent still owns cleanup. After it,
+      // startRelay owns the returned child lease, including failed admission.
+      release() {},
+    };
+    const handle = await this.startRelay({ ...body, model: FALLBACK_UPSTREAM_MODEL }, {
+      clientId: job.clientId,
+      source: job.source,
+      signal: job.signal,
+      authorizationScope: job.authorizationScope ?? undefined,
+      incomingLease,
+      retainMemoryUntil,
+      fallbackFrom: {
+        traceId: job.traceId,
+        model: requestedModel,
+        origin: error.providerError!.origin,
+      },
+    });
+    return {
+      modelFallback: Object.freeze({ from: requestedModel, to: FALLBACK_UPSTREAM_MODEL }),
+      events: () => handle.events(),
+      discardUnconsumedEvents: () => handle.discardUnconsumedEvents?.(),
+      final: handle.final,
+      get rateLimit() { return handle.rateLimit; },
+      get upstreamPrelude() { return handle.upstreamPrelude; },
+      stats: handle.stats,
+    };
+  }
+
+  #isContinuationHintStale(provenance: ResponseProvenance): boolean {
     const current = this.#runtimeCache.get(provenance.projectId);
     return !current ||
       (current.snapshot.incarnation ?? 0) !== provenance.incarnation;
-  }
-
-  #failObsoleteContinuation(job: QueuedJob): boolean {
-    if (job.queueLane && !this.#removeJob(job)) return false;
-    this.#clearRetryWake(job);
-    job.signal?.removeEventListener("abort", job.onAbort!);
-    this.#releaseJobMemory(job);
-    this.#releaseJobProvenance(job);
-    this.#releaseQueueCapacity(job);
-    const error = new ResponseProvenanceObsoleteError();
-    this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
-    this.#failure(job.traceId, job.acceptedAtMs, "continuation", error, job.attempts);
-    job.reject(error);
-    return true;
-  }
-
-  #rejectObsoleteContinuations(projectId: ProjectId): void {
-    for (const job of [...this.#deadlines]) {
-      if (
-        job.continuationProvenance?.projectId !== projectId ||
-        !this.#isContinuationIncarnationObsolete(job.continuationProvenance)
-      ) continue;
-      this.#failObsoleteContinuation(job);
-    }
   }
 
   #reserveRuntime(job: QueuedJob, projectId: ProjectId): void {
@@ -1928,13 +2004,6 @@ export class MultiSandboxRouter {
         continue;
       }
       const eligible = available.flatMap(candidate => {
-        if (
-          job.continuationProvenance &&
-          (
-            candidate.projectId !== job.continuationProvenance.projectId ||
-            (candidate.incarnation ?? 0) !== job.continuationProvenance.incarnation
-          )
-        ) return [];
         const retryBlock = job.excluded.get(runtimeIncarnationKey(candidate));
         if (retryBlock) {
           const retryEpoch = this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0;
@@ -2556,13 +2625,6 @@ export class MultiSandboxRouter {
         job.reject(error);
         continue;
       }
-      if (
-        job.continuationProvenance &&
-        this.#isContinuationIncarnationObsolete(job.continuationProvenance)
-      ) {
-        this.#failObsoleteContinuation(job);
-        continue;
-      }
       const routeStarted = this.#clock.now();
       const selection = this.#choose(job, candidates);
       if (!selection) {
@@ -2856,13 +2918,6 @@ export class MultiSandboxRouter {
     const now = this.#clock.now();
     let candidates = available.filter(
       candidate => {
-        if (
-          job.continuationProvenance &&
-          (
-            candidate.projectId !== job.continuationProvenance.projectId ||
-            (candidate.incarnation ?? 0) !== job.continuationProvenance.incarnation
-          )
-        ) return false;
         const retryBlock = job.excluded.get(runtimeIncarnationKey(candidate));
         if (retryBlock) {
           const retryEpoch = this.#runtimeCache.get(candidate.projectId)?.retryEpoch ?? 0;
@@ -2896,19 +2951,28 @@ export class MultiSandboxRouter {
     );
     if (candidates.length === 0) return null;
     const eligibleCandidates = candidates;
+    // Provenance is a preference among fully admissible runtimes. An unhealthy,
+    // busy, retired, or safely excluded origin must not strand a continuation
+    // while a peer can accept the exact same immutable provider request.
+    const provenance = job.continuationProvenance;
+    const preferred = provenance && candidates.find(candidate => (
+      candidate.projectId === provenance.projectId &&
+      (candidate.incarnation ?? 0) === provenance.incarnation
+    ));
+    if (preferred) candidates = [preferred];
     const fleetTransferPacerCost = job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES
       ? FLEET_TRANSFER_PACER_BURST
       : 1;
     const balanceBulkFleet =
       job.decodedRequestBytes > FLEET_TRANSFER_EXEMPT_BYTES &&
       job.decodedRequestBytes <= FLEET_TRANSFER_PACED_MAX_BYTES &&
-      eligibleCandidates.length > 1 &&
-      eligibleCandidates.every(candidate => candidate.transportProfile === "bulk-v1");
+      candidates.length > 1 &&
+      candidates.every(candidate => candidate.transportProfile === "bulk-v1");
     if (balanceBulkFleet) {
-      const leastActive = Math.min(...eligibleCandidates.map(candidate => (
+      const leastActive = Math.min(...candidates.map(candidate => (
         candidate.active + candidate.reserved
       )));
-      candidates = eligibleCandidates.filter(candidate => (
+      candidates = candidates.filter(candidate => (
         candidate.active + candidate.reserved === leastActive
       ));
     }
@@ -3327,26 +3391,13 @@ export class MultiSandboxRouter {
       clearAdmissionDeadline();
       const committedAtMs = this.#clock.now();
       const commitAckMs = Math.max(0, committedAtMs - started);
-      // The transport now owns canonical request bytes. Drop the router's
-      // payload before reducing its accounting, not one microtask afterward.
-      job.body = {};
-      if (
-        !job.retainFullLeaseAfterCommit &&
-        job.memoryLease.reservedBytes > POST_COMMIT_RESERVATION_BYTES
-      ) {
-        const committedLease = job.memoryLease;
-        try {
-          job.memoryLease = await committedLease.replace({
-            ...job.workload,
-            reservedBytes: POST_COMMIT_RESERVATION_BYTES,
-          });
-        } catch {
-          // Downgrading is an accounting optimization, never part of request
-          // correctness. A failed replacement leaves the original lease fully
-          // active by contract, so retain it and continue the committed run.
-          job.memoryLease = committedLease;
-        }
-      }
+      // A definitive initial model rejection may select Terra once. Retain the
+      // exact immutable request under its original lease until that decision;
+      // any response event ends eligibility without retaining a transcript.
+      let fallbackBody = canFallbackFromModel(job.body.model)
+        ? job.body
+        : null;
+      if (!fallbackBody) await this.#releaseCommittedRequestBody(job);
       // The admission deadline ends at commit, but caller cancellation must
       // continue flowing through the same signal for the request's lifetime.
       this.#refreshRuntimeSafely(runtime);
@@ -3448,10 +3499,33 @@ export class MultiSandboxRouter {
           );
         },
       );
+      let publicHandle = traced;
+      let fallbackDecision = Promise.resolve();
+      if (fallbackBody && typeof requestModel === "string") {
+        let releaseRetainedBody!: () => void;
+        const bodyRetainedUntil = new Promise<void>(resolve => { releaseRetainedBody = resolve; });
+        const fallback = wrapModelFallbackHandle(traced, {
+          requestedModel: requestModel,
+          signal: job.signal,
+          startFallback: error => {
+            if (!fallbackBody || this.#closed || this.#shuttingDown) throw error;
+            return this.#startModelFallback(job, fallbackBody, requestModel, error, bodyRetainedUntil);
+          },
+        });
+        publicHandle = fallback.handle;
+        fallbackDecision = fallback.decision.catch(() => undefined).then(async () => {
+          fallbackBody = null;
+          job.body = {};
+          releaseRetainedBody();
+          await this.#releaseCommittedRequestBody(job);
+        });
+      }
       const terminalCleanup = traced.final.then(
         () => undefined,
         () => undefined,
-      ).finally(() => {
+      ).finally(async () => {
+        // Fallback snapshotting must finish before the original body lease ends.
+        await fallbackDecision;
         job.signal?.removeEventListener("abort", onCallerAbort);
         this.#releaseJobMemory(job);
         this.#refreshRuntimeSafely(runtime);
@@ -3459,11 +3533,30 @@ export class MultiSandboxRouter {
         this.#scheduleDrain();
       });
       void terminalCleanup.catch(() => undefined);
+      this.#deferredMemoryReleases.add(terminalCleanup);
+      void terminalCleanup.finally(() => {
+        this.#deferredMemoryReleases.delete(terminalCleanup);
+      }).catch(() => undefined);
+      const selectedHandle = publicHandle;
+      const publicFinal = selectedHandle.final.then(
+        async value => { await terminalCleanup; return value; },
+        async error => { await terminalCleanup; throw error; },
+      );
+      void publicFinal.catch(() => undefined);
+      publicHandle = {
+        events: () => selectedHandle.events(),
+        discardUnconsumedEvents: () => selectedHandle.discardUnconsumedEvents?.(),
+        final: publicFinal,
+        get modelFallback() { return selectedHandle.modelFallback; },
+        get rateLimit() { return selectedHandle.rateLimit; },
+        get upstreamPrelude() { return selectedHandle.upstreamPrelude; },
+        stats: selectedHandle.stats,
+      };
       // All potentially throwing adoption work is complete. Only now may the
       // committed handle become caller-owned and exempt from late cleanup.
       runtimeHandleClaimed = true;
       lateReturnedHandle = null;
-      job.resolve(traced);
+      job.resolve(publicHandle);
       this.#scheduleDrain();
     } catch (error) {
       let runtimeReservationDeferred = false;
@@ -3512,6 +3605,34 @@ export class MultiSandboxRouter {
       detachAdmission();
       if (!runtimeReservationDeferred) this.#releaseRuntimeReservation(job, runtime.projectId);
       if (!fleetTransferReleaseDeferred) releaseFleetAfterAttempt();
+      if (
+        runtimeRunState.outcome === "rejected" && !runtimeHandleClaimed &&
+        !admissionController.signal.aborted && !job.signal?.aborted &&
+        !this.#closed && !this.#shuttingDown &&
+        typeof requestModel === "string" &&
+        isDefinitiveModelNotFound(error, requestModel)
+      ) {
+        // A durable provider rejection can arrive before its committed ACK.
+        // No handle or response event escaped this still-pending startRelay.
+        this.#releaseJobProvenance(job);
+        this.#releaseQueueCapacity(job);
+        this.#traffic.rejected({ totalMs: Math.max(0, this.#clock.now() - job.acceptedAtMs) });
+        this.#failure(job.traceId, job.acceptedAtMs, "model-rejection", error, job.attempts);
+        let releaseRetainedBody!: () => void;
+        const bodyRetainedUntil = new Promise<void>(resolve => { releaseRetainedBody = resolve; });
+        try {
+          job.resolve(await this.#startModelFallback(job, job.body, requestModel, error, bodyRetainedUntil));
+        } catch (fallbackError) {
+          job.reject(fallbackError);
+        } finally {
+          job.body = {};
+          releaseRetainedBody();
+          this.#releaseJobMemory(job);
+          this.#refreshRuntimeSafely(runtime);
+          this.#scheduleDrain();
+        }
+        return;
+      }
       if (
         executionRiskReflected &&
         !(error && typeof error === "object" &&
@@ -3637,15 +3758,6 @@ export class MultiSandboxRouter {
       }
       const retryablePreCommit = !committed && !ambiguous &&
         isRetryablePreCommitFailure(error);
-      if (
-        retryablePreCommit &&
-        job.continuationProvenance &&
-        this.#isContinuationIncarnationObsolete(job.continuationProvenance)
-      ) {
-        this.#failObsoleteContinuation(job);
-        this.#scheduleDrain();
-        return;
-      }
       if (
         retryablePreCommit &&
         !job.signal?.aborted &&

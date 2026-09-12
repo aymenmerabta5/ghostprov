@@ -2106,7 +2106,6 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #beginShutdown(kind: "drain" | "stop", reason: string): Promise<void> {
-    if (this.#state === "stopped") return Promise.resolve();
     if (this.#shutdownPromise) {
       if (kind === "stop" && this.#shutdownKind === "drain") {
         this.#shutdownKind = "stop";
@@ -2114,6 +2113,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       }
       return this.#shutdownPromise;
     }
+    if (this.#state === "stopped") return Promise.resolve();
     ++this.#generation;
     this.#controller?.abort(new DOMException("V2 runtime is shutting down", "AbortError"));
     this.#setState("draining");
@@ -2139,6 +2139,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     // Startup failure and public shutdown can converge on the same resources.
     // Once either path owns cleanup, the other must not extend its deadline.
     const deadline = this.#runtimeCleanupDeadline ?? this.#stopDeadline();
+    let cleanupComplete = true;
     const starting = this.#starting;
     const relaunching = this.#sidecarRelaunching;
     const relaunchContext = this.#sidecarRelaunchContext;
@@ -2152,9 +2153,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         relaunching ?? Promise.resolve(),
         relaunchActualCleanup ?? Promise.resolve(),
       ]).then(() => undefined);
-      await this.#runBounded(async signal => {
+      if (!await this.#runBounded(async signal => {
         await this.#abortable(relaunchSettled!, signal);
-      }, deadline);
+      }, deadline)) cleanupComplete = false;
     }
     const transport = this.#transport;
     const bootstrap = this.#bootstrap;
@@ -2186,20 +2187,21 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         deadline,
         predecessor,
       );
-      await this.#runBounded(
+      if (!await this.#runBounded(
         signal => this.#abortable(cleanup, signal),
         deadline,
-      );
+      )) cleanupComplete = false;
     } else {
-      await this.#runBounded(() => this.#disposeOnce(true, deadline), deadline);
+      if (!await this.#runBounded(() => this.#disposeOnce(true, deadline), deadline)) cleanupComplete = false;
     }
     if (starting) {
-      await this.#runBounded(async signal => {
+      if (!await this.#runBounded(async signal => {
         await this.#abortable(starting.then(() => undefined, () => undefined), signal);
         if (signal.aborted || this.#clock.now() >= deadline) return;
         await this.#disposeOnce(true, deadline);
-      }, deadline);
+      }, deadline)) cleanupComplete = false;
     }
+    if (!cleanupComplete) throw new Error("V2 runtime shutdown cleanup was incomplete");
   }
 
   #stopDeadline(): number {
@@ -2215,6 +2217,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   ): Promise<void> {
     const existing = this.#runtimeCleanup;
     if (existing) return existing;
+    const supervisorOwnsCleanup = this.#supervisor !== null;
     const cleanupController = new AbortController();
     const timeoutController = new AbortController();
     void this.#clock.waitUntil(deadline, timeoutController.signal).then(() => {
@@ -2244,9 +2247,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           ? bootstrap.forceStop(reason, cleanupController.signal)
           : bootstrap.drainAndStop(reason, cleanupController.signal)
       )));
-      const remoteSettlement = Promise.allSettled(remoteRetirements).then(() => undefined);
-      await this.#runBounded(
-        signal => this.#abortable(remoteSettlement, signal),
+      const remoteSettlement = Promise.allSettled(remoteRetirements);
+      const remoteComplete = await this.#runBounded(
+        signal => this.#abortable(remoteSettlement.then(results => {
+          if (results.some(result => result.status === "rejected")) throw new Error("V2 remote retirement was incomplete");
+        }), signal),
         deadline,
       );
       // Begin every independent local fence even when one close implementation
@@ -2259,14 +2264,26 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           : Promise.resolve(),
         this.#dispose(false),
       ];
-      await this.#runBounded(
+      const localSettlement = Promise.allSettled(localFences);
+      const localComplete = await this.#runBounded(
         signal => this.#abortable(
-          Promise.allSettled(localFences).then(() => undefined),
+          localSettlement.then(results => {
+            if (results.some(result => result.status === "rejected")) throw new Error("V2 local cleanup was incomplete");
+          }),
           signal,
         ),
         deadline,
       );
+      // A signed persistent-supervisor shutdown also proves its exact child's
+      // cleanup when a subordinate transport could not acknowledge retirement.
+      if ((!remoteComplete && !supervisorOwnsCleanup) || !localComplete) {
+        throw new Error("V2 runtime shutdown cleanup was incomplete");
+      }
     })().finally(() => timeoutController.abort());
+    // The bounded public waiter may have expired before this exact owner
+    // finishes. Retain its rejection for joined callers without an unhandled
+    // late rejection escaping into the process.
+    void cleanup.catch(() => undefined);
     this.#runtimeCleanup = cleanup;
     this.#runtimeCleanupDeadline = deadline;
     return cleanup;
@@ -2370,12 +2387,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#ySweetReconnectNeedsRotation = false;
     this.#awarenessFailureVersion = 0;
     this.#ySweetRefreshRequested = false;
-    await Promise.allSettled([
-      refreshLoop ?? Promise.resolve(),
-      ySweetLoop ?? Promise.resolve(),
-      credentialRefreshTask ?? Promise.resolve(),
-      ySweetRotation ?? Promise.resolve(),
-      sidecarLoop ?? Promise.resolve(),
+    const cleanup = await Promise.allSettled([
+      Promise.allSettled([
+        refreshLoop ?? Promise.resolve(),
+        ySweetLoop ?? Promise.resolve(),
+        credentialRefreshTask ?? Promise.resolve(),
+        ySweetRotation ?? Promise.resolve(),
+        sidecarLoop ?? Promise.resolve(),
+      ]),
       closeTransport ? transport?.close() ?? Promise.resolve() : Promise.resolve(),
       awareness?.close() ?? Promise.resolve(),
       (async () => {
@@ -2390,6 +2409,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       })(),
       heartbeat?.stop() ?? Promise.resolve(),
     ]);
+    if (cleanup.some(result => result.status === "rejected")) throw new Error("V2 runtime resource cleanup was incomplete");
   }
 
   #setState(state: RuntimeState): void {

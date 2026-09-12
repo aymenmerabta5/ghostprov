@@ -23,6 +23,7 @@ import {
   type V2TransportProfile,
 } from "../src/v2/protocol/shared";
 import { TranscriptProof } from "../src/v2/protocol/transcript";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { WeightedFrameScheduler } from "../src/v2/protocol/scheduler";
 import {
   V2CommittedError,
@@ -1403,26 +1404,58 @@ describe("V2TransportSession", () => {
   });
 
   it("never hands ownership off when a request fails before admission", async () => {
-    const harness = new TransportHarness({ unadmittedTimeoutMs: 50 });
-    await harness.start();
-    harness.credits = 0;
-    harness.publish([], { lane: "control" });
-    await harness.settle();
+    const clock = new ReceiptClock();
+    const timers = livenessTimers(clock);
+    const harness = new TransportHarness({ unadmittedTimeoutMs: 50, clock });
     const controller = new AbortController();
+    let pending: Promise<RunHandle> | undefined;
     let reflected = 0;
-    const pending = harness.session.run(BODY, controller.signal, {
-      onAdmissionReflected: () => { reflected++; },
-    });
-    await harness.settle();
-    expect(reflected).toBe(0);
-    controller.abort();
-    await expect(pending).rejects.toMatchObject({
-      name: "V2PreCommitError",
-      code: "cancelled_precommit",
-      committed: false,
-    });
-    expect(reflected).toBe(0);
-    await harness.close();
+    let executionRisks = 0;
+    try {
+      await harness.start();
+      harness.credits = 0;
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      pending = harness.session.run(BODY, controller.signal, {
+        onAdmissionReflected: () => { reflected++; },
+        onExecutionRiskReflected: () => { executionRisks++; },
+      });
+      const outcome = pending.then(
+        handle => ({ kind: "handle" as const, handle }),
+        error => ({ kind: "error" as const, error }),
+      );
+      // Network delivery may yield repeatedly, but only this test advances the
+      // unchanged 50 ms admission deadline. Cancellation owns this boundary.
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({
+        queued: 1,
+        preparing: 0,
+        active: 0,
+        admissionCredits: 0,
+      });
+      expect(reflected).toBe(0);
+      expect(executionRisks).toBe(0);
+      controller.abort();
+      expect(await outcome).toMatchObject({
+        kind: "error",
+        error: {
+          name: "V2PreCommitError",
+          code: "cancelled_precommit",
+          committed: false,
+        },
+      });
+      expect(reflected).toBe(0);
+      expect(executionRisks).toBe(0);
+      expect(harness.session.snapshot()).toMatchObject({ queued: 0, active: 0, quarantined: 0 });
+    } finally {
+      controller.abort();
+      try {
+        await harness.close();
+        if (pending) await Promise.allSettled([pending]);
+      } finally {
+        timers.restore();
+      }
+    }
   });
 
   it("never applies the unadmitted timeout after scheduler admission", async () => {
@@ -3429,6 +3462,173 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  for (const ambiguous of [false, true]) {
+    it(`${ambiguous ? "quarantines an unproven" : "keeps the transport reusable after a definitive"} SSE cyber_policy error after streamed text`, async () => {
+      const pool = new AtomicBytePermitPool({
+        ordinaryBytes: 4 * 1024 * 1024,
+        jumboBytes: 2 * 1024 * 1024,
+      });
+      const harness = new TransportHarness({ binding: R2_BINDING, eventMemoryPool: pool });
+      try {
+        await harness.start();
+        const baseline = harness.session.snapshot();
+        const handle = await commitR2(harness, harness.session.run(BODY));
+        const firstId = harness.requestIdentity().requestId;
+        const events = handle.events();
+        const nextText = events.next();
+        const textData = JSON.stringify({ type: "response.output_text.delta", delta: "hello" });
+        harness.publish(segmentedEvent(firstId, textData));
+        await harness.settle();
+        const text = await nextText;
+        expect(text).toMatchObject({
+          done: false,
+          value: { event: "response.output_text.delta", data: textData },
+        });
+        releaseAtomicBytePermit(text.value);
+
+        const providerError = await createProviderErrorEnvelope({
+          origin: "sse",
+          status: 500,
+          model: BODY.model,
+          value: { error: {
+            message: "This content was flagged for possible cybersecurity risk.",
+            type: "server_error",
+            code: "cyber_policy",
+          } },
+        });
+        const refusal: SidecarFrame = {
+          kind: "response_error",
+          requestId: firstId,
+          code: "cyber_policy",
+          message: providerError.error.message,
+          ambiguous,
+          providerError,
+        };
+        let failedTerminals = 0;
+        const finalError = handle.final.catch(error => { failedTerminals++; return error; });
+        const streamEnd = events.next();
+        harness.credits = 128;
+        harness.publish([refusal]);
+        await harness.settle();
+        const error = await finalError;
+        expect(error).toBeInstanceOf(V2CommittedError);
+        expect(error).toMatchObject({
+          committed: true,
+          ambiguous,
+          code: "cyber_policy",
+          providerError: { origin: "sse", status: 500 },
+        });
+        // Transport events finish; final carries the authoritative failure.
+        expect(await streamEnd).toMatchObject({ done: true });
+        expect(await events.next()).toMatchObject({ done: true });
+
+        // A repeated terminal cannot reopen or re-execute the failed request.
+        harness.publish([refusal]);
+        await harness.settle();
+        expect(failedTerminals).toBe(1);
+        expect([...harness.hostFrames.values()].filter(frame => frame.kind === "request_open"))
+          .toHaveLength(1);
+        expect([...harness.hostFrames.values()].filter(frame => frame.kind === "request_start"))
+          .toHaveLength(1);
+        expect(harness.session.snapshot()).toMatchObject({
+          connected: true,
+          active: 0,
+          committed: 0,
+          queued: 0,
+          quarantined: ambiguous ? 1 : 0,
+          ambiguousQuarantined: ambiguous ? 1 : 0,
+          admissionCredits: baseline.admissionCredits! - (ambiguous ? 1 : 0),
+          transferCredits: baseline.transferCredits,
+        });
+        expect(pool.snapshot().activePermits).toBe(0);
+
+        if (!ambiguous) {
+          // Reset only the harness's observation map so existing helpers select
+          // the next request; the same session and sidecar remain connected.
+          harness.hostFrames.clear();
+          const next = await commitR2(harness, harness.session.run({ ...BODY, input: "next request" }));
+          expect(harness.requestIdentity().requestId).not.toBe(firstId);
+          harness.credits = 128;
+          harness.publish(await harness.completedFrames());
+          await harness.settle();
+          const final = await next.final;
+          expect(final).toMatchObject({ id: "resp_1", status: "completed" });
+          releaseAtomicBytePermit(final);
+          const nextEvents = await Array.fromAsync(next.events());
+          expect(nextEvents.map(frame => frame.event)).toEqual([
+            "response.created", "response.output_text.delta", "response.completed",
+          ]);
+          for (const frame of nextEvents) releaseAtomicBytePermit(frame);
+          expect([...harness.hostFrames.values()].filter(frame => frame.kind === "request_start"))
+            .toHaveLength(1);
+          expect(harness.session.snapshot()).toMatchObject({
+            connected: true,
+            active: 0,
+            quarantined: 0,
+            admissionCredits: baseline.admissionCredits,
+            transferCredits: baseline.transferCredits,
+          });
+          expect(pool.snapshot().activePermits).toBe(0);
+        }
+      } finally {
+        await harness.close();
+        pool.close();
+      }
+    });
+  }
+
+  for (const origin of ["http", "sse"] as const) {
+    for (const ambiguous of [false, true]) {
+      it(`${ambiguous ? "quarantines unproven" : "releases all admission capacity for definitive"} ${origin} model-unavailable outcomes`, async () => {
+        const harness = new TransportHarness({ binding: R2_BINDING });
+        try {
+          await harness.start();
+          const baseline = harness.session.snapshot();
+          const handle = await commitR2(harness, harness.session.run(BODY));
+          const providerError = await createProviderErrorEnvelope({
+            origin,
+            status: 404,
+            model: BODY.model,
+            value: { error: {
+              message: "The requested model is unavailable",
+              type: "invalid_request_error",
+              param: "model",
+              code: "model_not_found",
+            } },
+          });
+          harness.credits = 128;
+          harness.publish([{
+            kind: "response_error",
+            requestId: harness.requestIdentity().requestId,
+            code: "model_not_found",
+            message: providerError.error.message,
+            ambiguous,
+            providerError,
+          }]);
+          await harness.settle();
+          await expect(handle.final).rejects.toMatchObject({
+            committed: true,
+            ambiguous,
+            code: "model_not_found",
+            providerError: { origin },
+          });
+          expect(harness.session.snapshot()).toMatchObject({
+            connected: true,
+            active: 0,
+            committed: 0,
+            queued: 0,
+            quarantined: ambiguous ? 1 : 0,
+            ambiguousQuarantined: ambiguous ? 1 : 0,
+            admissionCredits: baseline.admissionCredits! - (ambiguous ? 1 : 0),
+            transferCredits: baseline.transferCredits,
+          });
+        } finally {
+          await harness.close();
+        }
+      });
+    }
+  }
+
   it("fences a replacement sidecar and quarantines work committed to the retired instance", async () => {
     const idle = new TransportHarness({ expectedSidecarInstanceId: null });
     await idle.start();
@@ -3454,12 +3654,12 @@ describe("V2TransportSession", () => {
     await active.close();
   });
 
-  it("digests, accounts, compresses, and frames the exact normalized R8 request bytes", async () => {
+  it.each(["gpt-5.6-sol", "gpt-5.6-luna"])("digests, accounts, compresses, and frames the exact normalized R8 request bytes for %s", async model => {
     const harness = new TransportHarness({ binding: R2_BINDING });
     await harness.start();
     const controller = new AbortController();
     const body = Object.freeze({
-      model: "gpt-5.6-sol",
+      model,
       input: "persisted continuation",
       previous_response_id: "resp_parent_exact",
       stream: false,
@@ -3471,7 +3671,12 @@ describe("V2TransportSession", () => {
         surrogate_pair_across_chunk: `${"x".repeat(64 * 1024 - 1)}😀`,
       },
     });
-    const expectedBody = { ...body, stream: true, store: true };
+    const expectedBody = {
+      ...body,
+      model: model === "gpt-5.6-luna" ? "gpt-5.6-terra" : model,
+      stream: true,
+      store: true,
+    };
     const expectedBytes = utf8Bytes(canonicalJson(expectedBody));
     const pending = harness.session.run(body, controller.signal);
     void pending.catch(() => undefined);
@@ -3513,7 +3718,7 @@ describe("V2TransportSession", () => {
     });
     expect(Buffer.compare(carried, Buffer.from(expectedBytes))).toBe(0);
     expect(JSON.parse(carried.toString("utf8"))).toEqual(JSON.parse(canonicalJson(expectedBody)));
-    expect(body).toMatchObject({ stream: false, store: false });
+    expect(body).toMatchObject({ model, stream: false, store: false });
 
     controller.abort();
     await expect(pending).rejects.toMatchObject({
@@ -4193,6 +4398,123 @@ describe("V2TransportSession", () => {
     await committed.settle();
     expect(committed.session.snapshot().quarantined).toBe(0);
     await committed.close();
+  });
+
+  it("keeps concurrent R2 work alive through client cancellation and reuses its released capacity", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({ binding: R2_BINDING, eventMemoryPool: pool });
+    const controller = new AbortController();
+    try {
+      await harness.start();
+      const baseline = harness.session.snapshot();
+      const cancelled = await commitR2(harness, harness.session.run(BODY, controller.signal));
+      const cancelledId = harness.requestIdentity().requestId;
+      const cancellationOutcome = cancelled.final.catch(error => error);
+      // The reliable sequence/ACK state and envelope history stay intact. Only
+      // reset the helper's request lookup before adding the concurrent request.
+      harness.hostFrames.clear();
+      const surviving = await commitR2(harness, harness.session.run({ ...BODY, input: "concurrent request" }));
+      const survivingId = harness.requestIdentity().requestId;
+      expect(survivingId).not.toBe(cancelledId);
+      const survivingFrames = await harness.completedFrames();
+      const survivingPrefix = survivingFrames.filter(frame =>
+        frame.kind === "response_event" && frame.eventIndex < 2);
+      const survivingTerminal = survivingFrames.filter(frame =>
+        frame.kind !== "response_event" || frame.eventIndex >= 2);
+      harness.credits = 126;
+      harness.publish([
+        ...segmentedEvent(cancelledId, JSON.stringify({ type: "response.output_text.delta", delta: "first" })),
+        ...survivingPrefix,
+      ]);
+      await harness.settle();
+
+      const cancelledEvents = cancelled.events();
+      const survivingEvents = surviving.events();
+      expect(await cancelledEvents.next()).toMatchObject({
+        done: false, value: { event: "response.output_text.delta" },
+      });
+      expect(await survivingEvents.next()).toMatchObject({
+        done: false, value: { event: "response.created" },
+      });
+      expect(await survivingEvents.next()).toMatchObject({
+        done: false, value: { event: "response.output_text.delta" },
+      });
+      const cancelledEnd = cancelledEvents.next();
+      controller.abort();
+      await harness.settle();
+      expect(await cancellationOutcome).toMatchObject({
+        code: "cancelled", committed: true, ambiguous: true,
+      });
+      expect(await cancelledEnd).toMatchObject({ done: true });
+      expect(await promiseState(surviving.final)).toBe("pending");
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true,
+        active: 2,
+        quarantined: 1,
+        ambiguousQuarantined: 0,
+      });
+
+      const remainingEvents = Array.fromAsync(survivingEvents);
+      harness.credits = 127;
+      harness.publish(survivingTerminal);
+      await harness.settle();
+      const survivingFinal = await surviving.final;
+      expect(survivingFinal).toMatchObject({
+        id: "resp_1",
+        status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: "hello" }] }],
+      });
+      releaseAtomicBytePermit(survivingFinal);
+      expect((await remainingEvents).map(frame => frame.event)).toEqual(["response.completed"]);
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true, active: 1, quarantined: 1, ambiguousQuarantined: 0,
+      });
+
+      // The cancelled request keeps its reservation until the exact sidecar
+      // acknowledges durable cleanup, even though the other request completed.
+      harness.credits = 128;
+      harness.publish([{ kind: "request_cancelled", requestId: cancelledId }]);
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true,
+        active: 0,
+        quarantined: 0,
+        ambiguousQuarantined: 0,
+        admissionCredits: baseline.admissionCredits,
+        transferCredits: baseline.transferCredits,
+      });
+      expect(pool.snapshot().activePermits).toBe(0);
+
+      harness.hostFrames.clear();
+      const next = await commitR2(harness, harness.session.run({ ...BODY, input: "after cancellation" }));
+      const nextId = harness.requestIdentity().requestId;
+      expect(nextId).not.toBe(cancelledId);
+      expect(nextId).not.toBe(survivingId);
+      harness.credits = 128;
+      harness.publish(await harness.completedFrames());
+      await harness.settle();
+      const nextFinal = await next.final;
+      expect(nextFinal).toMatchObject({ status: "completed" });
+      releaseAtomicBytePermit(nextFinal);
+      await Array.fromAsync(next.events());
+      const starts = new Map(harness.hostEnvelopes.flatMap(envelope => envelope.frames)
+        .filter(frame => frame.kind === "request_start")
+        .map(frame => [frame.sequence, frame.requestId]));
+      expect([...starts.values()]).toEqual([cancelledId, survivingId, nextId]);
+      const cancellations = new Map(harness.hostEnvelopes.flatMap(envelope => envelope.frames)
+        .filter(frame => frame.kind === "request_cancel")
+        .map(frame => [frame.sequence, frame.requestId]));
+      expect([...cancellations.values()]).toEqual([cancelledId]);
+      expect(harness.session.snapshot()).toMatchObject({ connected: true, active: 0, quarantined: 0 });
+      expect(pool.snapshot().activePermits).toBe(0);
+    } finally {
+      controller.abort();
+      await harness.close();
+      pool.close();
+    }
   });
 
   it("retransmits the unchanged window after a dropped publication", async () => {

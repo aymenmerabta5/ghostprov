@@ -5,7 +5,7 @@ import {
   MAX_RESPONSES_JSON_ITEMS,
   ResponsesInputStructureError,
 } from "../../relay/responses-validation";
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../../relay/host-request-policy";
 import type { SandboxAdmissionProgress } from "../../sandbox/registry";
 import { jsonEncodedByteLength } from "../../router/workload";
 import type { SseFrame } from "../../relay/sse";
@@ -4997,10 +4997,10 @@ export class V2TransportSession {
   ): Promise<PreparedRequestPlan> {
     // The sidecar forwards these proven canonical bytes directly to fetch to
     // avoid a decoded-string + parsed-object + reserialized-string peak. Apply
-    // both upstream policy fields before canonicalization so byte accounting,
+    // model aliases and upstream policy fields before canonicalization so byte accounting,
     // digest, compression, frames, and the immutable R8 fetch body all describe
     // exactly the same bytes. Outer HTTP streaming remains a separate contract.
-    const upstreamBody = normalizeUpstreamResponsesRequest(body);
+    const upstreamBody = prepareHostUpstreamResponsesRequest(body);
     const canonical = await canonicalHostRequestBytes(
       upstreamBody,
       this.#limits.requestMaxBytes,

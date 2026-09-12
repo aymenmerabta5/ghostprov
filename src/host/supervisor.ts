@@ -94,6 +94,8 @@ export interface GhostProvHostSupervisorOptions {
   instanceNonce?: string;
   /** Testable internal-port allocator; production uses an ephemeral loopback bind. */
   allocatePort?: () => Promise<number>;
+  /** Reports the proven worker cleanup outcome after local supervision closes. */
+  onClosed?: (clean: boolean) => Promise<void>;
 }
 
 interface WorkerTarget {
@@ -380,6 +382,7 @@ export class GhostProvHostSupervisor {
   #lastReadyAt: string | null = null;
   #lastExitCode: number | null = null;
   #lastExitSignal: NodeJS.Signals | null = null;
+  #lastCleanupProven = false;
   #shutdownClean: boolean | null = null;
   #forcedStops = 0;
   #statusWritesTotal = 0;
@@ -435,6 +438,7 @@ export class GhostProvHostSupervisor {
       startedAt,
       instanceNonce,
       allocatePort: options.allocatePort ?? freeLoopbackPort,
+      onClosed: options.onClosed ?? (async () => {}),
     };
     for (const [name, value, minimum] of [
       ["readyTimeoutMs", this.#options.readyTimeoutMs, 100],
@@ -629,13 +633,22 @@ export class GhostProvHostSupervisor {
         await new Promise<void>(resolve => this.#server.close(() => resolve()));
       })();
       let runCompleted = this.#runPromise === null;
-      await Promise.race([
-        (this.#runPromise ?? Promise.resolve()).then(
-          () => { runCompleted = true; },
-          () => { runCompleted = true; },
-        ),
-        sleep(this.#options.gracefulShutdownMs + 1_000),
-      ]);
+      let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          (this.#runPromise ?? Promise.resolve()).then(
+            () => { runCompleted = true; },
+            () => { runCompleted = true; },
+          ),
+          new Promise<void>(resolve => {
+            shutdownTimer = setTimeout(resolve, this.#options.gracefulShutdownMs + 1_000);
+          }),
+        ]);
+      } finally {
+        // A successful drain must not keep the executable alive for the unused
+        // graceful timeout after its cleanup receipt has already been written.
+        if (shutdownTimer) clearTimeout(shutdownTimer);
+      }
       const forced = this.#child !== null;
       if (forced) {
         this.#child?.kill();
@@ -644,10 +657,9 @@ export class GhostProvHostSupervisor {
       this.#proxySockets.clear();
       this.#server.closeAllConnections?.();
       await closingServer;
-      this.#shutdownClean = runCompleted && !forced && (
-        this.#generation === 0 ||
-        (this.#lastExitCode === 0 && this.#lastExitSignal === null)
-      );
+      this.#shutdownClean = runCompleted && !forced && this.#forcedStops === 0 &&
+        this.#generation > 0 && this.#lastCleanupProven &&
+        this.#lastExitCode === 0 && this.#lastExitSignal === null;
       this.#state = "stopped";
       this.#log("shutdown_completed", {
         clean: this.#shutdownClean,
@@ -657,6 +669,7 @@ export class GhostProvHostSupervisor {
       this.#writeStatus();
       await this.#flushStatusWrites();
       await this.#logWrite;
+      await this.#options.onClosed(this.#shutdownClean);
     })();
     return this.#closePromise;
   }
@@ -721,9 +734,12 @@ export class GhostProvHostSupervisor {
       windowsHide: true,
     });
     this.#child = child;
+    this.#lastCleanupProven = false;
     this.#log("worker_starting", { generation, pid: child.pid ?? null, internal_port: port });
     this.#writeStatus();
     let ready = false;
+    let cleanupAcknowledged = false;
+    let cleanupRejected = false;
     let readyTimer: ReturnType<typeof setTimeout> | null = null;
     const markReady = () => {
       if (
@@ -753,7 +769,16 @@ export class GhostProvHostSupervisor {
         port?: unknown;
         pid?: unknown;
         generation?: unknown;
+        success?: unknown;
       };
+      if (value.type === "ghostprov.cleanup") {
+        const exact = Object.keys(value).sort().join(",") === "generation,pid,success,type";
+        if (this.#child !== child || !exact || value.pid !== child.pid || value.generation !== generation || value.success !== true) {
+          cleanupRejected = true;
+          cleanupAcknowledged = false;
+        } else if (!cleanupRejected) cleanupAcknowledged = true;
+        return;
+      }
       if (
         value.type === "ghostprov.ready" &&
         value.port === port &&
@@ -792,6 +817,7 @@ export class GhostProvHostSupervisor {
     if (this.#child === child) this.#child = null;
     this.#lastExitCode = exit.code;
     this.#lastExitSignal = exit.signal;
+    this.#lastCleanupProven = cleanupAcknowledged && !cleanupRejected;
     const uptimeMs = Math.max(0, performance.now() - startedAt);
     this.#log("worker_exited", {
       generation,

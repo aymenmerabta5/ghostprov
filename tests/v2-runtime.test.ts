@@ -32,6 +32,7 @@ import {
   type V2TransportSnapshot,
 } from "../src/v2/transport/session";
 import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
+import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import {
   V2CommittedError,
   V2PreCommitError,
@@ -50,6 +51,7 @@ import {
 } from "../src/v2/runtime";
 import type { V2SidecarRecoveryToken } from "../src/v2/transport/session";
 import type { V2BootstrapSupervisor } from "../src/v2/supervisor/host";
+import { SupervisorLifecycle } from "../src/v2/supervisor/lifecycle";
 import { chooseRuntime, type RouteCandidate } from "../src/router/policy";
 import type { WorkloadDescriptor } from "../src/router/workload";
 
@@ -2456,7 +2458,7 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("cleans a created R2 candidate before stop reports the runtime stopped", async () => {
+  it("locally fences a created R2 candidate and reports its unproven remote cleanup", async () => {
     const failure = new Error("sidecar unavailable");
     const harness = runtimeHarness({
       enableR2Recovery: true,
@@ -2483,7 +2485,7 @@ describe("V2SandboxRuntime", () => {
     };
 
     let stopSettled = false;
-    const stopping = harness.runtime.stop().then(() => { stopSettled = true; });
+    const stopping = harness.runtime.stop().then(() => null, error => error).finally(() => { stopSettled = true; });
     for (let turn = 0; turn < 100 && !stopSettled; turn++) await Promise.resolve();
     await harness.clock.advanceBy(25);
     for (let turn = 0; turn < 200 && !stopSettled; turn++) await Promise.resolve();
@@ -2495,7 +2497,7 @@ describe("V2SandboxRuntime", () => {
     expect(harness.bootstraps[1]!.forceStops).toBe(1);
     expect(harness.sandboxFailures).toHaveLength(0);
     expect(harness.runtime.snapshot().state).toBe("stopped");
-    await stopping;
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
   });
 
   it("fails the recovery capsule before fresh-generation fallback when adoption fails", async () => {
@@ -2706,6 +2708,172 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  for (const origin of ["http", "sse"] as const) {
+    for (const boundary of ["start", "final"] as const) {
+      it(`keeps definitive ${origin} model unavailability at ${boundary} health-neutral without replacing the sandbox`, async () => {
+        const harness = runtimeHarness({ enableR2Recovery: true });
+        const recoveryEvents: SandboxSupervisorEvent[] = [];
+        let replacements = 0;
+        const supervised = new SupervisedSandboxRuntime({
+          projectId: harness.runtime.projectId,
+          initialChild: harness.runtime,
+          createChild: () => {
+            replacements++;
+            throw new Error("model rejection must not replace a healthy runtime");
+          },
+          clock: harness.clock,
+          random: { next: () => 0 },
+          onRecoveryEvent: event => recoveryEvents.push(event),
+        });
+        try {
+          await supervised.start();
+          const baseline = supervised.snapshot();
+          const startupEvents = recoveryEvents.length;
+          const providerError = await createProviderErrorEnvelope({
+            origin,
+            status: 404,
+            model: "gpt-6-astra",
+            value: { error: {
+              message: "The requested model is unavailable",
+              type: "invalid_request_error",
+              param: "model",
+              code: "model_not_found",
+            } },
+          });
+          const rejected = new V2CommittedError(
+            providerError.error.message,
+            "model_not_found",
+            false,
+            undefined,
+            providerError,
+          );
+          if (boundary === "start") {
+            harness.transport.run = async () => { throw rejected; };
+            await expect(supervised.run({ model: "gpt-6-astra", input: "unavailable model" }))
+              .rejects.toBe(rejected);
+          } else {
+            const handle = await supervised.run({ model: "gpt-6-astra", input: "unavailable model" });
+            harness.transport.pending.at(-1)!.reject(rejected);
+            await expect(handle.final).rejects.toBe(rejected);
+          }
+          await harness.clock.advanceBy(1_000);
+          expect(supervised.snapshot()).toMatchObject({
+            state: "ready",
+            incarnation: 1,
+            capacity: baseline.capacity,
+            available: baseline.available,
+            active: 0,
+            quarantined: 0,
+            recentFailureRate: 0,
+            completionEwmaMs: baseline.completionEwmaMs,
+            failure: null,
+          });
+          expect(supervised.supervisorSnapshot()).toMatchObject({ phase: "healthy", childGeneration: 1 });
+          expect(replacements).toBe(0);
+          expect(recoveryEvents).toHaveLength(startupEvents);
+          expect(harness.sandboxFailures).toHaveLength(0);
+          expect(harness.transports).toHaveLength(1);
+          expect(harness.transport.recoverySuspends).toBe(0);
+          expect(harness.transport.forceStops).toBe(0);
+        } finally {
+          await supervised.stop();
+        }
+      });
+    }
+  }
+
+  it("keeps repeated cyber_policy refusals neutral while other and later requests succeed", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true });
+    const recoveryEvents: SandboxSupervisorEvent[] = [];
+    let replacements = 0;
+    const supervised = new SupervisedSandboxRuntime({
+      projectId: harness.runtime.projectId,
+      initialChild: harness.runtime,
+      createChild: () => {
+        replacements++;
+        throw new Error("cyber_policy must not replace a healthy runtime");
+      },
+      clock: harness.clock,
+      random: { next: () => 0 },
+      onRecoveryEvent: event => recoveryEvents.push(event),
+    });
+    try {
+      await supervised.start();
+      const baseline = supervised.snapshot();
+      const startupEvents = recoveryEvents.length;
+      const concurrent = await supervised.run({ model: "gpt-5.6-sol", input: "concurrent" });
+      const concurrentOutcome = harness.transport.pending.at(-1)!;
+      const providerError = await createProviderErrorEnvelope({
+        origin: "sse",
+        status: 500,
+        value: { error: {
+          message: "This content was flagged for possible cybersecurity risk.",
+          type: "error",
+          code: "cyber_policy",
+        } },
+      });
+      for (let index = 0; index < 3; index++) {
+        const handle = await supervised.run({ model: "gpt-5.6-sol", input: `refused-${index}` });
+        const rejected = new V2CommittedError(
+          providerError.error.message, "cyber_policy", false, undefined, providerError,
+        );
+        harness.transport.pending.at(-1)!.reject(rejected);
+        await expect(handle.final).rejects.toBe(rejected);
+        await harness.clock.advanceBy(1_000);
+        expect(supervised.snapshot()).toMatchObject({
+          state: "ready",
+          incarnation: baseline.incarnation,
+          capacity: baseline.capacity,
+          available: baseline.available - 1,
+          active: 1,
+          quarantined: 0,
+          recentFailureRate: 0,
+          completionEwmaMs: baseline.completionEwmaMs,
+          failure: null,
+        });
+        expect(harness.transport.bodies).toHaveLength(index + 2);
+      }
+
+      concurrentOutcome.resolve({ id: "resp_concurrent", status: "completed" });
+      await expect(concurrent.final).resolves.toMatchObject({ id: "resp_concurrent" });
+      const next = await supervised.run({ model: "gpt-5.6-sol", input: "next" });
+      harness.transport.pending.at(-1)!.resolve({ id: "resp_next", status: "completed" });
+      await expect(next.final).resolves.toMatchObject({ id: "resp_next" });
+      expect(supervised.snapshot()).toMatchObject({
+        state: "ready", active: 0, available: baseline.available, recentFailureRate: 0,
+      });
+      expect(supervised.supervisorSnapshot()).toMatchObject({ phase: "healthy", childGeneration: 1 });
+      expect(replacements).toBe(0);
+      expect(recoveryEvents).toHaveLength(startupEvents);
+      expect(harness.sandboxFailures).toHaveLength(0);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.transport.bodies).toHaveLength(5);
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.transport.forceStops).toBe(0);
+      expect(harness.transport.drains).toBe(0);
+    } finally {
+      await supervised.stop();
+    }
+  });
+
+  it("still penalizes model-unavailable wording when its execution outcome is ambiguous", async () => {
+    const harness = runtimeHarness();
+    try {
+      await harness.runtime.start();
+      const handle = await harness.runtime.run({ model: "gpt-6-astra", input: "ambiguous model rejection" });
+      harness.transport.pending.at(-1)!.reject(new V2CommittedError(
+        "The requested model is unavailable but terminal proof was lost",
+        "model_not_found",
+        true,
+      ));
+      await expect(handle.final).rejects.toMatchObject({ code: "model_not_found", ambiguous: true });
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready" });
+      expect(harness.runtime.snapshot().recentFailureRate).toBeCloseTo(0.20);
+    } finally {
+      await harness.runtime.stop();
+    }
+  });
+
   it("ignores cancellation quarantine but fails at the capacity-aware ambiguity limit", async () => {
     const harness = runtimeHarness();
     await harness.runtime.start();
@@ -2806,6 +2974,35 @@ describe("V2SandboxRuntime", () => {
     expect(events).toEqual(["shutdown", "close", "destroy"]);
   });
 
+  it.each(["stop", "drain"] as const)("reports rejected supervisor cleanup through %s after releasing local resources", async kind => {
+    const harness = runtimeHarness({ enableSupervisor: true });
+    const lifecycle = new SupervisorLifecycle(1);
+    const release = lifecycle.register(harness.supervisor);
+    lifecycle.requireCleanup(harness.supervisor.binding);
+    harness.supervisor.shutdown = async () => { harness.supervisor.shutdowns++; throw new Error("offline cleanup unproven"); };
+    harness.supervisor.close = async () => { harness.supervisor.closes++; release(); };
+    await harness.runtime.start();
+    const stopping = kind === "stop" ? harness.runtime.stop() : harness.runtime.drain("offline_shutdown");
+    await expect(stopping).rejects.toThrow("cleanup was incomplete");
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(harness.supervisor.closes).toBe(1);
+    expect(harness.runtime.stop()).toBe(stopping);
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    await expect(lifecycle.shutdown(new AbortController().signal)).rejects.toThrow("incomplete");
+    expect(harness.supervisor.shutdowns).toBe(1);
+  });
+
+  it("accepts authoritative supervisor cleanup after subordinate retirement errors", async () => {
+    const harness = runtimeHarness({ enableSupervisor: true });
+    harness.transport.forceStop = async () => { throw new Error("offline transport unavailable"); };
+    harness.bootstrap.forceStop = async () => { throw new Error("offline child acknowledgement unavailable"); };
+    await harness.runtime.start();
+    await expect(harness.runtime.stop()).resolves.toBeUndefined();
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(harness.supervisor.closes).toBe(1);
+  });
+
   it("uses one shutdown budget and locally fences non-cooperative remote retirement", async () => {
     const harness = runtimeHarness({ stopTimeoutMs: 10 });
     await harness.runtime.start();
@@ -2830,7 +3027,7 @@ describe("V2SandboxRuntime", () => {
     };
 
     let stopped = false;
-    const stopping = harness.runtime.stop().then(() => { stopped = true; });
+    const stopping = harness.runtime.stop().then(() => null, error => error).finally(() => { stopped = true; });
     for (let turn = 0; turn < 50 && events.length < 2; turn++) await Promise.resolve();
     expect(events).toEqual(["transport-force-start", "bootstrap-force-start"]);
 
@@ -2860,7 +3057,7 @@ describe("V2SandboxRuntime", () => {
       "transport-force-end",
       "bootstrap-force-end",
     ]);
-    await stopping;
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
   });
 
   it("does not reset the shutdown deadline after graceful drain fails", async () => {
@@ -2887,7 +3084,7 @@ describe("V2SandboxRuntime", () => {
 
     let stopped = false;
     const stopping = harness.runtime.drain("graceful shutdown")
-      .then(() => { stopped = true; });
+      .then(() => null, error => error).finally(() => { stopped = true; });
     await harness.clock.advanceBy(6);
     for (
       let turn = 0;
@@ -2917,7 +3114,7 @@ describe("V2SandboxRuntime", () => {
     }
     expect(bootstrapForceStarted).toBe(true);
     expect(harness.transport.closes).toBe(1);
-    await stopping;
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
   });
 
   it("does not overlap an escalated drain with force-stop or close", async () => {
@@ -2987,13 +3184,13 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.start();
     harness.transport.forceStop = async () => new Promise<void>(() => undefined);
 
-    const stopping = harness.runtime.stop();
+    const stopping = harness.runtime.stop().then(() => null, error => error);
     let stopped = false;
     void stopping.then(() => { stopped = true; });
     for (let index = 0; index < 10 && !stopped; index++) {
       await harness.clock.advanceBy(10);
     }
-    await stopping;
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
 
     expect(harness.bootstrap.forceStops).toBe(1);
     expect(harness.transport.closes).toBe(1);
@@ -3009,13 +3206,13 @@ describe("V2SandboxRuntime", () => {
     const starting = harness.runtime.start();
     for (let index = 0; index < 10 && !resolveReady; index++) await Promise.resolve();
 
-    const stopping = harness.runtime.stop();
+    const stopping = harness.runtime.stop().then(() => null, error => error);
     let stopped = false;
     void stopping.then(() => { stopped = true; });
     for (let index = 0; index < 10 && !stopped; index++) {
       await harness.clock.advanceBy(10);
     }
-    await stopping;
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
     resolveReady({
       instanceId: "late-sidecar",
       releaseRevision: "r1",

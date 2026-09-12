@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import { BoundedPreparationScheduler } from "../relay/preparation-scheduler";
 import type { RunHandle } from "../relay/run-handle";
-import { normalizeHostUpstreamResponsesRequest as normalizeUpstreamResponsesRequest } from "../relay/host-upstream-policy";
+import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
 import type { AuthenticatedTenantScope } from "../http/api-key";
 import {
   AnthropicContinuationIndex,
@@ -542,7 +542,7 @@ export function registerAnthropicRoutes(
 
       for (;;) {
         const attemptLink = linkedAbortController(requestLink.controller.signal);
-        let relayBody: Record<string, unknown> = normalizeUpstreamResponsesRequest(
+        let relayBody: Record<string, unknown> = prepareHostUpstreamResponsesRequest(
           attempt === 0 ? initialRelayBody : fallbackRelayBody!,
         );
         let handle: RunHandle | null = null;
@@ -608,7 +608,7 @@ export function registerAnthropicRoutes(
               response = responseToAnthropic(final, context);
               await commitContinuation(
                 continuationIndex,
-                commitToken,
+                handle.modelFallback ? null : commitToken,
                 scope,
                 final,
                 response,
@@ -638,7 +638,7 @@ export function registerAnthropicRoutes(
               beforeMessageStopAsync: async (final, response, replayProof) => {
                 await commitContinuation(
                   continuationIndex,
-                  commitToken,
+                  handle!.modelFallback ? null : commitToken,
                   scope,
                   final,
                   response,

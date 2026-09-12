@@ -27,6 +27,30 @@ Port `18787` is the normal production listener used by `bun run dev`. Candidate 
 
 V2-only mode defaults to eight managed projects (`GP_TARGET_SANDBOXES=8`, bounded by `GP_MAX_PROJECTS=32`). Create intent is persisted before each idempotent UUID-addressed Prism request, and a restart resumes incomplete creation from the same record. GhostProv never adopts arbitrary account projects. The signed-in session is the production default. Explicit guest mode uses `GP_PRISM_SESSION=anonymous` and remains capped separately by `GP_GUEST_MAX_PROJECTS`; `GP_ALLOW_ANONYMOUS=1` only permits `GP_PRISM_SESSION=auto` to create a guest when no authenticated session is available.
 
+## Stopping GhostProv and unattended PC shutdown
+
+Keep starting GhostProv with `bun dev`. Ctrl+C requests a graceful stop. To let an agent stop it from another terminal in this repository, use:
+
+```text
+bun run stop
+```
+
+For an explicitly requested Windows shutdown after the agent finishes its work, use this as the final command:
+
+```text
+bun run shutdown:pc
+```
+
+The command asks the exact running GhostProv instance to stop, waits for active work to drain and supervisor cleanup to finish, and accepts only that instance's successful cleanup receipt. Only then does it request Windows shutdown. Failed cleanup, a missing receipt, an unexpected process exit, or a timeout leaves the PC on and returns a nonzero exit code. It never force-kills GhostProv or clears fleet journals. Other applications can still prevent Windows from shutting down.
+
+For example, tell an agent: "Finish the work and validation, then run `bun run shutdown:pc` from the GhostProv repository. If it fails, report the failure and leave the PC on." Do not follow a failed command with a separate OS shutdown command. Finishing an agent task alone does not retire GhostProv's remote supervisors.
+
+Verified unattended shutdown supports the default all-R10 fleet with `GP_V2_SUPERVISOR_BOOTSTRAP_MODE=direct`, through either `bun dev` or `bun run start:supervised`. Other bootstrap modes retain ordinary Ctrl+C handling but cannot produce this durable restart proof. Before certifying cleanup, GhostProv checks every project in the authoritative fleet manifest for retained bootstrap journals, including projects that did not start and held projects. A startup gate prevents a replacement process from starting between the receipt and the Windows shutdown call.
+
+The updated process must be started once before these commands can control it; an older running process has no shutdown receipt channel. The default wait is the configured graceful shutdown budget plus 30 seconds. Control uses bounded private files under the repository's `.ghostprov` directory and does not read credentials or probe the production listener.
+
+Abrupt power loss or shutting Windows down directly can still interrupt cleanup. Preserve the fleet manifest and bootstrap journals after an interrupted shutdown; removing them creates a different fleet and does not prove that the old supervisors stopped.
+
 ## Architecture
 
 Each V2 project owns an isolated `V2SandboxRuntime`:
@@ -107,7 +131,9 @@ Request canonicalization, hashing, and compression have a separate 15-second pre
 
 The Anthropic adapter owns one app-scoped, process-local continuation index shared by stable and beta Messages routes. It retains only keyed rolling digests, provider response IDs, counts, and bounded lifecycle metadata: at most 4,096 records, a conservative approximately 6 MiB heap estimate, and a 60-minute absolute TTL. A completed, losslessly round-trippable Claude history can reuse the longest unique prefix and send only its nonempty suffix. Digest preparation charges only memory not already covered by the global ingress lease, so a bounded 16-agent large-history burst does not silently fall back to bulk relay while the count and governor limits remain authoritative. A definitive HTTP `previous_response_not_found` before any public event permits one full-history fallback; ambiguous, streamed, generic, and explicit-ID failures are never replayed.
 
-One opaque authenticated scope is constructed for the application and passed through HTTP, WebSocket, Claude, and router composition. The router reserves bounded concurrent commit capacity, commits completed provider response IDs to their exact project/incarnation before public terminal exposure, and prefers known continuations there. Provenance is a one-hour, content-free routing hint bounded to 4,096 records and 1 MiB; after immutable conflict checks, commit-time oldest-hint eviction prevents metadata pressure from becoming a global request quota. Unknown or expired provider IDs route normally, while missing scope, cross-scope IDs, and conflicting live bindings fail closed.
+One opaque authenticated scope is constructed for the application and passed through HTTP, WebSocket, Claude, and router composition. The router reserves bounded concurrent commit capacity, commits completed provider response IDs to their exact project/incarnation before public terminal exposure, and prefers known continuations there when that runtime has admission and transfer capacity. If the origin is unavailable, replaced, removed, or safely excluded before execution, another eligible sandbox receives the unchanged `previous_response_id`; the provider decides whether that stored response remains valid. Rerouting requires proof that execution has not begun and stays within the original admission deadline. Provenance is a one-hour, content-free routing hint bounded to 4,096 records and 1 MiB; after immutable conflict checks, commit-time oldest-hint eviction prevents metadata pressure from becoming a global request quota. Unknown or expired provider IDs route normally, while missing scope, cross-scope IDs, and conflicting live bindings fail closed.
+
+Client cancellations and definitive provider rejections such as `cyber_policy` fail only the affected request. They do not lower sandbox health, trigger sandbox recovery, or interrupt other requests. A cancellation after execution starts temporarily retains that request's capacity until the sidecar confirms cancellation or a terminal outcome; this does not count toward transport ambiguity exhaustion and never causes replay. Independent transport or sandbox failures still use ordinary recovery.
 
 Per-runtime completion estimates cap extreme model durations and decay halfway toward a neutral ten-second baseline every idle minute. Successful responses update that estimate even when they include rate-limit budget headers. Routing throughput is learned only from uniquely acknowledged request-data flights, never cumulative publications, retransmissions, or idle ACK/control heartbeats; a stale goodput sample returns to neutral after one idle minute so a recovered sandbox cannot remain permanently starved. Host transcript hashing uses exact-sized buffers for ordinary events and a bounded scratch path for jumbo events, while WebSocket reasoning redaction uses copy-on-write so ordinary streaming events are not deep-cloned.
 
@@ -183,7 +209,9 @@ Claude model names are selected by tier, case-insensitively:
 - Opus → `gpt-5.6-sol`
 - Sonnet → `gpt-5.6-terra`
 - Haiku → `gpt-5.6-luna`
-- Native `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, and `gpt-5.5` IDs pass through.
+- Native `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, and `gpt-5.5` IDs pass through. `gpt-5.6-luna` is a compatibility alias forwarded to `gpt-5.6-terra` on every request path, including the default Haiku mapping.
+
+A definitive upstream `model_not_found` rejection selects `gpt-5.6-terra` once when no response event has been received or exposed. This applies to HTTP and SSE provider errors, preserves the exact request history and `previous_response_id`, and uses normal bounded router admission. A definitive model rejection does not lower sandbox health, quarantine capacity, or trigger sandbox recovery. Terra failures, partial responses, timeouts, cancellation, and ambiguous transport failures retain their ordinary error behavior. The original rejection remains in the log; `request.model_fallback` links its trace to the new Terra request with `requested_model`, `fallback_model`, and `provider_origin`. Inferred continuation indexes skip commits under the rejected model's settings.
 - Unknown model names use `gpt-5.6-sol`.
 
 `gpt-6-astra` appears in both the OpenAI-compatible and Codex model lists at `/v1/models`. Select that exact ID for native Responses or Messages requests, including tool-result turns. Its Codex entry uses standard Responses and advertises reasoning efforts `low`, `medium`, `high`, `xhigh`, and `max`, with a maximum context window of 1,050,000 tokens from the [official Astra model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra). The initial Codex context budget remains the existing 272,000-token default.
@@ -547,6 +575,9 @@ bun scripts/v2_performance_research.ts --record benchmarks/v2-performance-baseli
 
 The isolated suite includes:
 
+- `tests/bootstrap-cleanup-proof.test.ts`
+- `tests/shutdown-control.test.ts`
+- `tests/stop-ghostprov.test.ts`
 - `tests/account-session.test.ts`
 - `tests/api-key-auth.test.ts`
 - `tests/anthropic-continuation-http.test.ts`
@@ -590,6 +621,7 @@ The isolated suite includes:
 - `tests/images-http.test.ts`
 - `tests/images-service.test.ts`
 - `tests/multi-sandbox-config.test.ts`
+- `tests/model-fallback.test.ts`
 - `tests/multi-sandbox-integration.test.ts`
 - `tests/multi-sandbox-router.test.ts`
 - `tests/no-playwright.test.ts`
@@ -620,6 +652,7 @@ The isolated suite includes:
 - `tests/responses-continuation.test.ts`
 - `tests/responses-validation.test.ts`
 - `tests/router-http.test.ts`
+- `tests/router-model-fallback.test.ts`
 - `tests/router-observability.test.ts`
 - `tests/router-policy.test.ts`
 - `tests/router-provenance.test.ts`
@@ -638,6 +671,7 @@ The isolated suite includes:
 - `tests/standalone-search-session.test.ts`
 - `tests/system-v2.test.ts`
 - `tests/upstream-policy.test.ts`
+- `tests/upstream-model-policy.test.ts`
 - `tests/v2-awareness-channel.test.ts`
 - `tests/v2-adaptive-capacity.test.ts`
 - `tests/v2-batching-throughput.test.ts`

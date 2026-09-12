@@ -193,6 +193,74 @@ function nodeRequest(options: {
 }
 
 describe("Anthropic HTTP routes", () => {
+  it.each(["gpt-5.6-luna", "claude-haiku-4-5"])(
+    "aliases %s to Terra on stable and beta continuation requests",
+    async model => {
+      const router = new FakeRouter((_body, _options, call) => {
+        const final = completed(
+          call === 1 ? "resp_luna_parent_exact" : "resp_luna_child_exact",
+          call === 1 ? "first answer" : "second answer",
+        );
+        const handle = relayHandle(final);
+        // Continuation replay requires the transport's bounded terminal byte proof.
+        handle.stats.bytes = Buffer.byteLength(JSON.stringify(final), "utf8");
+        return handle;
+      });
+      const app = createGhostProvApp({
+        router,
+        anthropicModels: anthropicModelsFromEnv({}),
+      });
+      const original = messageRequest({
+        model,
+        stream: false,
+        system: "Keep replies concise.",
+        messages: [{ role: "user", content: "first" }],
+      });
+      const first = await app.request("/v1/messages", {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify(original),
+      });
+      expect(first.status).toBe(200);
+      const firstMessage = await first.json() as { model: string; content: unknown[] };
+      expect(firstMessage.model).toBe(model);
+
+      const second = await app.request("/v1/messages?beta=true", {
+        method: "POST",
+        headers: ANTHROPIC_HEADERS,
+        body: JSON.stringify({
+          ...original,
+          messages: [
+            ...original.messages,
+            { role: "assistant", content: firstMessage.content },
+            { role: "user", content: "second" },
+          ],
+        }),
+      });
+      expect(second.status).toBe(200);
+      expect(await second.json()).toMatchObject({ model, stop_reason: "end_turn" });
+      expect(router.calls).toHaveLength(2);
+      for (const { body } of router.calls) {
+        expect(body).toMatchObject({
+          model: "gpt-5.6-terra",
+          stream: true,
+          store: true,
+          max_output_tokens: 64,
+          instructions: "Keep replies concise.",
+        });
+      }
+      expect(router.calls[0]!.body).not.toHaveProperty("previous_response_id");
+      expect(router.calls[1]!.body).toMatchObject({
+        previous_response_id: "resp_luna_parent_exact",
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "second" }],
+        }],
+      });
+    },
+  );
+
   it.each(["/v1/messages", "/v1/messages?beta=true"])("preserves gpt-6-astra on tool-result turns through %s", async path => {
     const router = new FakeRouter(body => relayHandle({
       ...completed("resp_astra"),
