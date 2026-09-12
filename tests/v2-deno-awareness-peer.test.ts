@@ -14,6 +14,7 @@ import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import { SidecarDiagnosticsObserver } from "../src/v2/diagnostics/sidecar-observer";
 import { SidecarResourceSampler } from "../src/v2/diagnostics/sidecar-sampler";
 import { OutputBackpressure } from "../src/v2/sidecar/output-sink";
+import { OutboundFrameWindow } from "../src/v2/protocol/window";
 import type {
   AwarenessEnvelope,
   HostFrame,
@@ -258,6 +259,92 @@ describe("R10 Awareness liveness state", () => {
         }
         harness.peer.publishEngineState();
         expect(harness.control().liveness).toBeUndefined();
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+});
+
+describe("R10 processed host ACK replay", () => {
+  it.each(["request_data", "request_cancel"] as const)(
+    "replays a dropped ACK-only publication for an immutable %s flight",
+    async kind => {
+      const harness = r10LivenessHarness();
+      const outbound = new OutboundFrameWindow<HostFrame>({ epoch: 1 });
+      let revision = 0;
+      const publishFlight = () => harness.publish({
+        ...hostEnvelope(-1, revision++),
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        launchNonce: harness.binding.launchNonce,
+        targetInstanceId: "sidecar-instance-1",
+        lane: "data",
+        frames: outbound.snapshot().frames,
+      });
+      const nextProcessedAck = (sequence: number) => (
+        new Promise<AwarenessEnvelope<SidecarFrame>>(resolve => {
+          const awareness = harness.providers.get("control")!.awareness;
+          const onUpdate = () => {
+            const envelope = harness.control();
+            if (envelope.ack.sequence !== sequence) return;
+            awareness.off("update", onUpdate);
+            resolve(envelope);
+          };
+          awareness.on("update", onUpdate);
+        })
+      );
+      const open: HostFrame = {
+        kind: "request_open",
+        requestId: "req-lost-ack",
+        requestDigest: "a".repeat(64),
+        decodedBytes: 1,
+        encodedBytes: 1,
+        encoding: "identity",
+        partCount: 1,
+      };
+      try {
+        await harness.peer.connect();
+        // R2 data requires the exact host to first establish its live control
+        // binding; connecting the peer alone does not authorize execution.
+        harness.sendControl();
+        outbound.push(open);
+        const opened = nextProcessedAck(0);
+        publishFlight();
+        outbound.acknowledge((await opened).ack);
+
+        const frame = outbound.push(kind === "request_data"
+          ? { kind, requestId: open.requestId, partIndex: 0, offset: 0, dataBase64Url: "eA" }
+          : { kind, requestId: open.requestId, reason: "client aborted" });
+        const immutableFlight = outbound.snapshot().frames;
+        const firstAck = nextProcessedAck(frame.sequence);
+        publishFlight();
+        const dropped = await firstAck;
+        expect(dropped).toMatchObject({ lane: "control", frames: [] });
+        // Drop this ACK before the sender sees it. Nothing else may publish
+        // engine state or release the retained immutable flight.
+        expect(outbound.snapshot().frames).toBe(immutableFlight);
+        expect(harness.accepted.filter(value => value.kind === kind)).toHaveLength(1);
+
+        const replayedAck = nextProcessedAck(frame.sequence);
+        publishFlight();
+        const replayed = await replayedAck;
+        expect(replayed).toMatchObject({ lane: "control", ack: dropped.ack, frames: [] });
+        expect(replayed.revision).toBeGreaterThan(dropped.revision);
+        outbound.acknowledge(replayed.ack);
+        expect(outbound.snapshot()).toMatchObject({ frames: [], encodedBytes: 0 });
+        expect(harness.accepted.filter(value => value.kind === kind)).toHaveLength(1);
+
+        const following = outbound.push({ ...open, requestId: "req-after-lost-ack" });
+        const followingAck = nextProcessedAck(following.sequence);
+        publishFlight();
+        outbound.acknowledge((await followingAck).ack);
+        expect(harness.accepted).toEqual([
+          expect.objectContaining({ kind: "request_open", requestId: open.requestId }),
+          expect.objectContaining({ kind, requestId: open.requestId }),
+          expect.objectContaining({ kind: "request_open", requestId: "req-after-lost-ack" }),
+        ]);
+        expect(outbound.snapshot()).toMatchObject({ frames: [], encodedBytes: 0 });
       } finally {
         await harness.close();
       }

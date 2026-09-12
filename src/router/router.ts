@@ -96,8 +96,8 @@ const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 const QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES = 2 * MiB;
 const ROUTE_PAYLOAD_AWARE_DEADLINE_BYTES = 8 * MiB;
 const PROGRESS_AWARE_MAX_REQUEST_BYTES = 8 * MiB;
-const PROGRESS_AWARE_MIN_REQUEST_BYTES = 2 * MiB;
-const MEDIUM_PROGRESS_PROBE_MIN_BYTES = 256 * KiB;
+const PROGRESS_AWARE_MIN_REQUEST_BYTES = 256 * KiB;
+const MEDIUM_REQUEST_MAX_BYTES = 2 * MiB;
 const FLEET_TRANSFER_EXEMPT_BYTES = 256 * KiB;
 const FLEET_TRANSFER_PACED_MAX_BYTES = 3 * MiB;
 const FLEET_ORDINARY_TRANSFER_BUDGET = 4;
@@ -113,8 +113,6 @@ const MIN_ADMISSION_PROGRESS_FRESHNESS_MS = 5_000;
 const MAX_ADMISSION_PROGRESS_FRESHNESS_MS = 10_000;
 const MIN_PREPARED_PROOF_GRACE_MS = 3_000;
 const MAX_PREPARED_PROOF_GRACE_MS = 5_000;
-const MIN_FIRST_PROGRESS_TIMEOUT_MS = 5_000;
-const MAX_FIRST_PROGRESS_TIMEOUT_MS = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const SHALLOW_UPSTREAM_POLICY_HEADROOM_BYTES = 128;
 const RESPONSE_TERMINAL_EVENTS = new Set([
@@ -141,15 +139,6 @@ export function preparedProofGraceMs(selectedRttMs: number): number {
   );
 }
 
-/** @internal First cumulative-ACK bound for medium bulk-profile transfers. */
-export function mediumFirstProgressTimeoutMs(selectedRttMs: number): number {
-  const finiteRttMs = Number.isFinite(selectedRttMs) ? Math.max(0, selectedRttMs) : 0;
-  return Math.min(
-    MAX_FIRST_PROGRESS_TIMEOUT_MS,
-    Math.max(MIN_FIRST_PROGRESS_TIMEOUT_MS, Math.ceil(8 * finiteRttMs)),
-  );
-}
-
 /** @internal Returns the next bounded progress check, or null when retry is due. */
 export function nextAdmissionProgressCheckAtMs(
   nowMs: number,
@@ -163,7 +152,7 @@ export function nextAdmissionProgressCheckAtMs(
     return Math.min(absoluteDeadlineMs, lastProgressAtMs + freshnessMs);
   }
   if (retainStaleProgress) return absoluteDeadlineMs;
-  // A late-admitted multi-megabyte request may spend most of its global
+  // A late-admitted request may spend most of its global
   // deadline waiting behind the bounded fleet transfer gate. Once less than
   // one RTT-derived freshness window remains, a full retransmit cannot receive
   // stronger liveness evidence before the same hard deadline. Preserve the
@@ -594,7 +583,7 @@ async function immutableRelaySnapshot(
   if (flat) {
     assertActive();
     const immutable = Object.freeze(root);
-    const structuralBytes = flatStringUnits <= PROGRESS_AWARE_MIN_REQUEST_BYTES
+    const structuralBytes = flatStringUnits <= MEDIUM_REQUEST_MAX_BYTES
       ? jsonEncodedByteLength(immutable)
       : await jsonEncodedByteLengthAsync(immutable, { signal, yieldTask });
     assertActive();
@@ -621,7 +610,7 @@ async function immutableRelaySnapshot(
     structuralBytes = next;
   };
   const measureString = async (value: string): Promise<number> => {
-    if (value.length <= PROGRESS_AWARE_MIN_REQUEST_BYTES) {
+    if (value.length <= MEDIUM_REQUEST_MAX_BYTES) {
       return jsonEncodedByteLength(value);
     }
     return await jsonEncodedByteLengthAsync(value, { signal, yieldTask });
@@ -2960,7 +2949,7 @@ export class MultiSandboxRouter {
       (candidate.incarnation ?? 0) === provenance.incarnation
     ));
     if (preferred) candidates = [preferred];
-    const fleetTransferPacerCost = job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES
+    const fleetTransferPacerCost = job.decodedRequestBytes <= MEDIUM_REQUEST_MAX_BYTES
       ? FLEET_TRANSFER_PACER_BURST
       : 1;
     const balanceBulkFleet =
@@ -3046,28 +3035,22 @@ export class MultiSandboxRouter {
     } = { outcome: "pending", handle: null };
     let lateReturnedHandle: RunHandle | null = null;
     let runtimeHandleClaimed = false;
+    // Medium uploads can receive their first exact data ACK after 5-8 seconds.
+    // Give them the normal attempt budget, then retain proven progress under
+    // the same bounded policy as larger uploads and the original hard deadline.
     const progressAwareAttempt = selectedBulkProfile &&
       job.decodedRequestBytes > PROGRESS_AWARE_MIN_REQUEST_BYTES &&
       job.decodedRequestBytes <= PROGRESS_AWARE_MAX_REQUEST_BYTES;
-    const mediumProgressProbe = selectedBulkProfile &&
-      job.decodedRequestBytes > MEDIUM_PROGRESS_PROBE_MIN_BYTES &&
-      job.decodedRequestBytes <= PROGRESS_AWARE_MIN_REQUEST_BYTES;
     // Every fleet-gated body must surface exact preparation proof so its data
     // share can be released independently of the one control unit retained
     // until request_start/commit. Timing probes remain size/profile specific.
-    const observeAdmissionProgress = fleetTransferLease !== null ||
-      progressAwareAttempt || mediumProgressProbe;
+    const observeAdmissionProgress = fleetTransferLease !== null || progressAwareAttempt;
     const progressFreshnessMs = progressAwareAttempt
       ? admissionProgressFreshnessMs(selectedRttMs)
       : 0;
     const preparedProofGrace = progressAwareAttempt
       ? preparedProofGraceMs(selectedRttMs)
       : 0;
-    const firstProgressTimeoutMs = mediumProgressProbe
-      ? mediumFirstProgressTimeoutMs(selectedRttMs)
-      : 0;
-    let initialAttemptDeadlineMs: number | null = null;
-    let firstProgressCheckAtMs: number | null = null;
     let admissionProgressAtMs: number | null = null;
     let admissionProgress: SandboxAdmissionProgress | null = null;
     let rejectAdmissionWait!: (error: unknown) => void;
@@ -3162,21 +3145,6 @@ export class MultiSandboxRouter {
         );
         return;
       }
-      if (mediumProgressProbe && initialAttemptDeadlineMs !== null) {
-        if (
-          admissionProgressAtMs === null && firstProgressCheckAtMs !== null &&
-          now < firstProgressCheckAtMs
-        ) {
-          armAdmissionTimerAt(firstProgressCheckAtMs);
-          return;
-        }
-        if (admissionProgressAtMs !== null && now < initialAttemptDeadlineMs) {
-          // Any exact cumulative data ACK proves this medium transfer is alive.
-          // Preserve its established 15-second attempt after that first proof.
-          armAdmissionTimerAt(initialAttemptDeadlineMs);
-          return;
-        }
-      }
       const completeBodyAwaitingPrepared = admissionProgress?.stage === "request_data" &&
         admissionProgress.acknowledgedEncodedBytes === admissionProgress.totalEncodedBytes &&
         admissionProgressAtMs !== null;
@@ -3231,14 +3199,7 @@ export class MultiSandboxRouter {
         remainingAdmissionMs,
         job.routeAttemptTimeoutMs,
       );
-      initialAttemptDeadlineMs = this.#clock.now() + attemptTimeoutMs;
-      firstProgressCheckAtMs = mediumProgressProbe
-        ? Math.min(
-            initialAttemptDeadlineMs,
-            this.#clock.now() + firstProgressTimeoutMs,
-          )
-        : initialAttemptDeadlineMs;
-      armAdmissionTimerAt(firstProgressCheckAtMs);
+      armAdmissionTimerAt(this.#clock.now() + attemptTimeoutMs);
     }
     const clearAdmissionDeadline = () => {
       if (admissionTimer) clearTimeout(admissionTimer);

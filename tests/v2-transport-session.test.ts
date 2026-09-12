@@ -4400,6 +4400,99 @@ describe("V2TransportSession", () => {
     await committed.close();
   });
 
+  it("releases a cancelled bulk request after delayed data and cancellation ACKs and completes following work", async () => {
+    const pool = new AtomicBytePermitPool({
+      ordinaryBytes: 4 * 1024 * 1024,
+      jumboBytes: 2 * 1024 * 1024,
+    });
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      retransmitMs: 60_000,
+      eventMemoryPool: pool,
+    });
+    const controller = new AbortController();
+    let pending: Promise<RunHandle> | undefined;
+    try {
+      await harness.start();
+      const baseline = harness.session.snapshot();
+      pending = harness.session.run(
+        createExactSizedV2Request(2 * 1024 * 1024, 91, "incompressible"),
+        controller.signal,
+      );
+      const outcome = pending.catch(error => error);
+      await harness.settleUntil(() => harness.hostEnvelopes.some(envelope => (
+        envelope.lane === "data" && envelope.frames.some(frame => frame.kind === "request_data")
+      )));
+      const dataFlight = harness.hostEnvelopes.find(envelope => (
+        envelope.lane === "data" && envelope.frames.some(frame => frame.kind === "request_data")
+      ))!;
+      const cancelledId = harness.requestIdentity().requestId;
+      expect(dataFlight.frames.every(frame => frame.kind !== "request_start")).toBe(true);
+      expect(harness.session.snapshot().diagnostics!.host.windowFrames).toBeGreaterThan(0);
+
+      // Hold the first data ACK until cancellation removes the request's
+      // remaining scheduler frames. Its published flight still owns the wire.
+      controller.abort();
+      expect(await outcome).toMatchObject({
+        name: "V2PreCommitError", code: "cancelled_precommit", committed: false,
+      });
+      expect(harness.session.snapshot()).toMatchObject({ active: 0, quarantined: 0 });
+      expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_cancel"))
+        .toBe(false);
+      harness.publish([], { lane: "control", ackSequence: dataFlight.frames.at(-1)!.sequence });
+      await harness.settleUntil(() => [...harness.hostFrames.values()].some(
+        frame => frame.kind === "request_cancel" && frame.requestId === cancelledId,
+      ));
+      const cancellationFlight = harness.hostEnvelopes.find(envelope => (
+        envelope.lane === "data" && envelope.frames.some(frame => frame.kind === "request_cancel")
+      ))!;
+      expect(cancellationFlight.frames).toEqual([
+        expect.objectContaining({ kind: "request_cancel", requestId: cancelledId }),
+      ]);
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        windowFrames: 1, schedulerFrames: 0, schedulerBytes: 0,
+      });
+
+      harness.publish([], { lane: "control", ackSequence: cancellationFlight.frames[0]!.sequence });
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true, active: 0, queued: 0, preparing: 0, quarantined: 0,
+        admissionCredits: baseline.admissionCredits,
+        transferCredits: baseline.transferCredits,
+        diagnostics: { host: { windowFrames: 0, windowBytes: 0, schedulerFrames: 0, schedulerBytes: 0 } },
+      });
+
+      harness.hostFrames.clear();
+      const following = await commitR2(harness, harness.session.run({ ...BODY, input: "after delayed ACK" }));
+      const followingId = harness.requestIdentity().requestId;
+      expect(followingId).not.toBe(cancelledId);
+      harness.credits = 128;
+      harness.publish(await harness.completedFrames());
+      await harness.settle();
+      const final = await following.final;
+      expect(final).toMatchObject({ status: "completed" });
+      releaseAtomicBytePermit(final);
+      await Array.fromAsync(following.events());
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      const starts = new Map(harness.hostEnvelopes.flatMap(envelope => envelope.frames)
+        .filter(frame => frame.kind === "request_start")
+        .map(frame => [frame.sequence, frame.requestId]));
+      expect([...starts.values()]).toEqual([followingId]);
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: true, active: 0, queued: 0, preparing: 0, quarantined: 0,
+        diagnostics: { host: { windowFrames: 0, windowBytes: 0, schedulerFrames: 0, schedulerBytes: 0 } },
+      });
+      expect(pool.snapshot().activePermits).toBe(0);
+    } finally {
+      controller.abort();
+      await harness.close();
+      if (pending) await Promise.allSettled([pending]);
+      pool.close();
+    }
+  });
+
   it("keeps concurrent R2 work alive through client cancellation and reuses its released capacity", async () => {
     const pool = new AtomicBytePermitPool({
       ordinaryBytes: 4 * 1024 * 1024,
