@@ -467,9 +467,13 @@ function controlledAdmission(runtime: FakeRuntime) {
 function mediumAdmissionFixture(
   requestBytes = 2_012_715,
   profile: "standard" | "bulk-v1" = "bulk-v1",
+  useDefaultTimeouts = false,
 ) {
   const timers = manualRouterTimers();
-  const system = createSystem(2, 1, 30_000, undefined, undefined, timers.clock, 15_000);
+  const system = createSystem(
+    2, 1, useDefaultTimeouts ? undefined : 30_000,
+    undefined, undefined, timers.clock, useDefaultTimeouts ? undefined : 15_000,
+  );
   const controls = system.runtimes.map(runtime => {
     runtime.transportProfile = profile;
     runtime.ackEwmaMs = 600;
@@ -1418,7 +1422,7 @@ describe("MultiSandboxRouter", () => {
       stream: true,
     }, { source: "http", incomingLease });
     expect(replacementRequestBytes).toBe(13 * 1024 ** 2 + 13);
-    expect(replacementDeadlineMs).toBe(acceptedAtMs + 125_000);
+    expect(replacementDeadlineMs).toBe(acceptedAtMs + 500_000);
     system.runtimes[0]!.completeOne();
     await handle.final;
     await system.router.close();
@@ -1429,15 +1433,15 @@ describe("MultiSandboxRouter", () => {
     const declared = await system.router.acquireIncomingBody(13 * 1024 ** 2, undefined, {
       maxBytes: 64 * 1024 ** 2,
     });
-    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(125_000);
+    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(500_000);
     declared.release();
 
     const chunked = await system.router.acquireIncomingBody(0, undefined, {
       maxBytes: 64 * 1024 ** 2,
     });
-    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(30_000);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(120_000);
     await chunked.ensureBytes!(13 * 1024 ** 2);
-    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(125_000);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(500_000);
     chunked.release();
     await system.router.close();
   });
@@ -2346,6 +2350,74 @@ describe("MultiSandboxRouter", () => {
     system.runtimes[0]!.completeOne();
     await outcome.handle.final;
     await system.router.close();
+  });
+
+  it("allows a slow medium upload to commit after 55 seconds with default admission timing", async () => {
+    const fixture = mediumAdmissionFixture(2_013_194, "bulk-v1", true);
+    try {
+      await flush(100);
+      const attempt = fixture.controls[1]!.attempts[0]!;
+      for (const [elapsedMs, acknowledgedEncodedBytes] of [
+        [20_000, 749_700], [45_000, 1_378_000],
+      ]) {
+        await fixture.timers.advanceTo(elapsedMs!);
+        expect(attempt.signal?.aborted).toBe(false);
+        expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+        attempt.progress({
+          stage: "request_data", acknowledgedEncodedBytes: acknowledgedEncodedBytes!,
+          totalEncodedBytes: fixture.requestBytes,
+        });
+      }
+      await fixture.timers.advanceTo(55_000);
+      expect(attempt.signal?.aborted).toBe(false);
+      attempt.progress({
+        stage: "request_prepared", acknowledgedEncodedBytes: fixture.requestBytes,
+        totalEncodedBytes: fixture.requestBytes,
+      });
+      attempt.commit();
+      const handle = await fixture.pending;
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 1]);
+      fixture.runtimes[1]!.completeOne();
+      await handle.final;
+      await fixture.timers.advanceTo(120_001);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      expect(fixture.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("bounds silent default admission to 60 seconds per sandbox and 120 seconds overall", async () => {
+    const fixture = mediumAdmissionFixture(2_013_194, "bulk-v1", true);
+    try {
+      await flush(100);
+      const first = fixture.controls[1]!.attempts[0]!;
+      // Model normal heartbeat snapshots independently of the missing data
+      // ACKs, so advancing a minute does not make every cached runtime stale.
+      for (let elapsedMs = 10_000; elapsedMs <= 50_000; elapsedMs += 10_000) {
+        await fixture.timers.advanceTo(elapsedMs);
+        for (const runtime of fixture.runtimes) runtime.notify();
+        await flush(100);
+      }
+      await fixture.timers.advanceTo(59_999);
+      expect(first.signal?.aborted).toBe(false);
+      await fixture.timers.advanceTo(60_000);
+      expect(first.signal?.aborted).toBe(true);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+      const second = fixture.controls[0]!.attempts[0]!;
+      await fixture.timers.advanceTo(119_999);
+      expect(second.signal?.aborted).toBe(false);
+      await fixture.timers.advanceTo(120_000);
+      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
+      expect(second.signal?.aborted).toBe(true);
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 0]);
+      expect(fixture.controls.map(control => control.safeAborts)).toEqual([1, 1]);
+      expect(fixture.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally {
+      await fixture.close();
+    }
   });
 
   for (const requestBytes of [2_012_715, 2 * 1024 ** 2]) {

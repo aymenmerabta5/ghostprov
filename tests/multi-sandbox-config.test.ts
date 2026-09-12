@@ -199,8 +199,22 @@ describe("multi-sandbox configuration", () => {
     expect(config.projectReplacementFailureThreshold).toBe(3);
     expect(config.coldStartConcurrency).toBe(2);
     expect(config.heartbeatMs).toBe(10_000);
-    expect(config.routerQueueTimeoutMs).toBe(30_000);
+    expect(config.routerQueueTimeoutMs).toBe(120_000);
     expect(config.shutdownDrainMs).toBe(300_000);
+  });
+
+  it("honors explicit admission deadlines within the configured bounds", () => {
+    const env = { ...BASE_ENV, PRISM_COOKIE_FILE: "D:/offline/cookies.json", GP_CANDIDATE: "1" };
+    for (const deadlineMs of [1_000, 30_000, 120_000, 300_000]) {
+      expect(resolveMultiSandboxConfig({
+        ...env, GP_ROUTER_QUEUE_TIMEOUT_MS: String(deadlineMs),
+      }, MACHINE).routerQueueTimeoutMs).toBe(deadlineMs);
+    }
+    for (const deadlineMs of [999, 300_001]) {
+      expect(() => resolveMultiSandboxConfig({
+        ...env, GP_ROUTER_QUEUE_TIMEOUT_MS: String(deadlineMs),
+      }, MACHINE)).toThrow("GP_ROUTER_QUEUE_TIMEOUT_MS");
+    }
   });
 
   it("accepts a configured inbound key and rejects unsafe key text", () => {

@@ -1871,6 +1871,61 @@ describe("V2SandboxRuntime", () => {
     expect(harness.supervisor.closes).toBe(1);
   });
 
+  it.each([
+    { name: "default 60-second", thresholdMs: 60_000, overrideMs: undefined },
+    { name: "explicit 20-second", thresholdMs: 20_000, overrideMs: 20_000 },
+  ])("keeps the $name reliable-stall allowance bounded by two samples", async scenario => {
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      livenessOutcomes: [null],
+      sidecarCommitStallMs: scenario.overrideMs,
+    });
+    await harness.runtime.start();
+    try {
+      for (let elapsedMs = 10_000; elapsedMs < scenario.thresholdMs; elapsedMs += 10_000) {
+        harness.transport.snapshotValue.diagnostics = {
+          host: {
+            ...stalledHostDiagnostics(),
+            ackProgressAgeMs: elapsedMs,
+            oldestQueuedFrameMs: elapsedMs,
+          },
+          sidecar: null,
+        };
+        await harness.clock.advanceBy(10_000);
+        expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128 });
+        expect(harness.transport.recoverySuspends).toBe(0);
+        expect(harness.bootstrap.forceStops).toBe(0);
+      }
+      harness.transport.snapshotValue.diagnostics = {
+        host: {
+          ...stalledHostDiagnostics(),
+          ackProgressAgeMs: scenario.thresholdMs,
+          oldestQueuedFrameMs: scenario.thresholdMs,
+        },
+        sidecar: null,
+      };
+      await harness.clock.advanceBy(10_000);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0 });
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      await harness.clock.advanceBy(1_999);
+      expect(harness.transport.recoverySuspends).toBe(0);
+      await harness.clock.advanceBy(1);
+      for (let turn = 0; turn < 300 && harness.livenessDiagnostics.at(-1)?.outcome !== "succeeded"; turn++) {
+        await Promise.resolve();
+      }
+      expect(harness.transport.recoverySuspends).toBe(1);
+      expect(harness.bootstrap.forceStops).toBe(1);
+      expect(harness.transports).toHaveLength(2);
+      expect(harness.transports[1]!.recoveryAdopts).toBe(1);
+      expect(harness.livenessDiagnostics.filter(event => event.errorKind === "reliable_stall"))
+        .toHaveLength(2);
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128 });
+    } finally {
+      await harness.runtime.stop();
+    }
+  });
+
   it("relaunches an R2 sidecar when reliable host frames stall after request state settles", async () => {
     const harness = runtimeHarness({
       enableR2Recovery: true,

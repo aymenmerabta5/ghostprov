@@ -88,7 +88,7 @@ const DEFAULT_QUEUE_CAPACITY = 4_096;
 const DEFAULT_QUEUE_BYTES = 1024 * MiB;
 const PRECOMMIT_RETRY_BASE_MS = 25;
 const PRECOMMIT_RETRY_MAX_MS = 250;
-const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 15_000;
+const DEFAULT_ROUTE_ATTEMPT_TIMEOUT_MS = 60_000;
 const ROUTE_CANCELLATION_PROOF_GRACE_MS = 25;
 // Real Prism telemetry showed 3.68-3.82 MiB JSON histories compressing to
 // roughly 1.75 MiB and making steady ACK progress at about 50 KiB/s. Scaling
@@ -229,10 +229,9 @@ function scaledRouteAttemptTimeoutMs(requestBytes: number, baseTimeoutMs: number
 
 function scaledQueueTimeoutMs(requestBytes: number, baseTimeoutMs: number): number {
   if (requestBytes <= QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES) return baseTimeoutMs;
-  // Give the observed 2-8 MiB history band up to four base windows, then let
-  // the established 8 MiB large-payload slope take over. This fixes the
-  // measured 3.8 MiB false timeout without turning a legal 64 MiB request into
-  // a sixteen-minute admission lease (its prior proven cap remains 245 s).
+  // Give the observed 2-8 MiB history band up to four configured base windows,
+  // then let the established 8 MiB large-payload slope take over. Every size
+  // retains one bounded deadline measured from its original acceptance.
   const observedHistoryScale = Math.min(
     4,
     requestBytes / QUEUE_PAYLOAD_AWARE_DEADLINE_BYTES,
@@ -250,11 +249,11 @@ function scaledQueueTimeoutMs(requestBytes: number, baseTimeoutMs: number): numb
 }
 
 /**
- * Keep the established global deadline byte-for-byte through 2 MiB. Above it,
+ * Keep the configured base deadline unchanged through 2 MiB. Above it,
  * scale queue/admission time for measured slow-but-progressing transfers up to
  * four base windows; above 8 MiB the established legal-payload slope takes
- * over. The per-runtime no-progress attempt remains 15 seconds through 8 MiB,
- * so the longer global budget does not pin a dead route and permits failover.
+ * over. The initial per-runtime attempt uses its configured base through
+ * 8 MiB (60 seconds by default), capped by the original admission deadline.
  */
 export function requestRoutingTimeouts(
   requestBytes: number,
@@ -929,7 +928,7 @@ export class MultiSandboxRouter {
     this.#logger = options.logger;
     this.#slowRequestMs = options.observability?.slowRequestMs ?? 10_000;
     this.#transport = options.observability?.transport ?? "unknown";
-    this.#queueTimeoutMs = options.queueTimeoutMs ?? 30_000;
+    this.#queueTimeoutMs = options.queueTimeoutMs ?? 120_000;
     if (
       !Number.isSafeInteger(this.#queueTimeoutMs) ||
       this.#queueTimeoutMs < 1 ||

@@ -2213,7 +2213,7 @@ describe("router HTTP composition", () => {
     const ingress = await router.acquireIncomingBody(0, undefined, { maxBytes: 64 * MiB });
     try {
       expect(ingress.reservedBytes).toBe(8 * MiB);
-      expect(ingress.deadlineMs! - ingress.acceptedAtMs!).toBe(30_000);
+      expect(ingress.deadlineMs! - ingress.acceptedAtMs!).toBe(120_000);
       await ingress.ensureBytes!(4 * MiB);
       expect(ingress.reservedBytes).toBe(16 * MiB);
       expect(router.snapshot().resources.reservedBytes).toBe(16 * MiB);

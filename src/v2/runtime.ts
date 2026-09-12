@@ -594,11 +594,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#sidecarProbePeriodMs = options.sidecarProbePeriodMs ?? 10_000;
     this.#sidecarSuspectRecheckMs = options.sidecarSuspectRecheckMs ?? 2_000;
     this.#sidecarFailureThreshold = options.sidecarFailureThreshold ?? 3;
-    // A reliable-window stall is stronger evidence than one missed out-of-band
-    // pong. Observe it twice, but confirm a suspect runtime on the shorter
-    // cadence so the default recovery boundary is 12 seconds without reacting
-    // to a single slow ACK.
-    this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? this.#sidecarProbePeriodMs;
+    // Allow a slow reliable flight one minute without ACK progress before it
+    // counts as stalled. Recovery still requires two independent samples,
+    // with the second checked on the shorter suspect cadence.
+    this.#sidecarCommitStallMs = options.sidecarCommitStallMs ?? 60_000;
     this.#sidecarStallSampleThreshold = options.sidecarStallSampleThreshold ?? 2;
     // Recovery includes authenticated session proof, old-PID retirement, one
     // or more bootstrap attempts, journal replay, and a final liveness proof.

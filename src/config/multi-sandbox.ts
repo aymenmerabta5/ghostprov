@@ -246,7 +246,7 @@ export function resolveMultiSandboxConfig(
   if (heartbeatMs !== 10_000) throw new RangeError("GP_HEARTBEAT_MS must remain exactly 10000");
   const routerQueueTimeoutMs = boundedPositiveInteger(
     env.GP_ROUTER_QUEUE_TIMEOUT_MS,
-    30_000,
+    120_000,
     "GP_ROUTER_QUEUE_TIMEOUT_MS",
     1_000,
     300_000,

@@ -949,7 +949,7 @@ interface LivenessProbe {
 }
 
 const SAFE_INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const DEFAULT_LIVENESS_TIMEOUT_MS = 5_000;
+const DEFAULT_LIVENESS_TIMEOUT_MS = 30_000;
 /** Initial ping plus two frame-free retransmissions inside its original deadline. */
 export const V2_LIVENESS_PROBE_MAX_PUBLICATIONS = 3;
 const MAX_TERMINAL_RECEIPTS = 4_096;
