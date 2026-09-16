@@ -1,6 +1,7 @@
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
+import { withLocalAwarenessPublisher } from "../v2/awareness/local-publisher";
 import type { YSweetEnvelope } from "../prism/protocol";
 import type { ProjectId } from "../sandbox/types";
 import type {
@@ -54,15 +55,17 @@ const DEFAULT_PROVIDER_FACTORY: ProjectInspectorProviderFactory = {
         );
       }
     }
-    return new WebsocketProvider(
+    const provider = withLocalAwarenessPublisher(new WebsocketProvider(
       envelope.url,
       envelope.docId,
       doc,
       {
-        connect: true,
+        connect: false,
         WebSocketPolyfill: AuthenticatedWebSocket,
       } as any,
-    ) as unknown as ProjectInspectorProviderLike;
+    ));
+    provider.connect();
+    return provider as unknown as ProjectInspectorProviderLike;
   },
 };
 

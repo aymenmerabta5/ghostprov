@@ -29,6 +29,7 @@ import type { ProjectId } from "../sandbox/types";
 import type { AwarenessChannel } from "./awareness/channel";
 import type { V2ReadyDescriptor } from "./bootstrap/controller";
 import type {
+  AwarenessLane,
   HostFrame,
   ProtocolBinding,
   SidecarFrame,
@@ -50,7 +51,9 @@ import type {
   V2TransportSession,
   V2TransportSnapshot,
 } from "./transport/session";
+import { V2TransportLivenessError } from "./transport/session";
 import type { V2TransportDiagnostics } from "./diagnostics/types";
+import { V2_RECEIVE_EVIDENCE_MAX_AGE_MS } from "./diagnostics/host-types";
 import { V2PreCommitError } from "./transport/run-handle";
 import {
   DecayingRuntimeFailureScore,
@@ -63,6 +66,7 @@ import { isRateLimited, rateLimitHintFromError } from "./rate-limit";
 import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 
 const AWARENESS_RECONNECT_TIMEOUT_MS = 3_000;
+const SILENT_AWARENESS_RECONNECT_TIMEOUT_MS = 10_000;
 
 function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
   // Successful Responses calls commonly carry budget headers. Those headers
@@ -85,12 +89,15 @@ function shouldQuarantineSandboxSession(error: unknown): boolean {
   for (let depth = 0; depth < 6; depth++) {
     if (!current || typeof current !== "object") return false;
     try {
-      const value = current as { name?: unknown; kind?: unknown; cause?: unknown };
+      const value = current as { name?: unknown; kind?: unknown; remoteCode?: unknown; cause?: unknown };
       if (value.name === "V2BootstrapError" && (
         value.kind === "render" || value.kind === "hello" ||
         value.kind === "readiness" || value.kind === "timeout"
       )) return true;
-      if (value.name === "V2SupervisorBootstrapError") return value.kind === "readiness";
+      if (value.name === "V2SupervisorBootstrapError") {
+        return value.kind === "readiness" ||
+          (value.kind === "deploy" && value.remoteCode === "bootstrap_cleanup_unproven");
+      }
       if (value.name === "V2TransportLivenessError") return true;
       if (value.name === "V2RuntimeLifecycleFailure") {
         return value.kind === "heartbeat_unreachable" ||
@@ -117,6 +124,49 @@ function reliableTransportStalled(
       diagnostics.ackProgressAgeMs >= thresholdMs
     );
   return windowStalled || schedulerStalled;
+}
+
+function receiveTransportStallLane(snapshot: V2TransportSnapshot, thresholdMs: number): AwarenessLane | null {
+  const host = snapshot.diagnostics?.host;
+  const sidecar = snapshot.diagnostics?.sidecar?.transport;
+  if (!host || !sidecar || sidecar.windowFrames <= 0 ||
+      host.inboundProcessingFrames !== 0 ||
+      host.inboundAcceptedEpoch === undefined || host.inboundAcceptedSequence === undefined ||
+      host.inboundAcceptedEpoch !== host.inboundProcessedEpoch ||
+      host.inboundAcceptedSequence !== host.inboundProcessedSequence ||
+      host.sidecarDiagnosticsAgeMs == null || host.sidecarPendingAgeMs == null ||
+      host.controlPeerAgeMs == null || (host.sidecarPendingDataPublications ?? 0) <= 0) return null;
+  const stalled = host.sidecarDiagnosticsAgeMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS &&
+    host.controlPeerAgeMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS &&
+    host.sidecarPendingAgeMs >= thresholdMs &&
+    (host.inboundAcceptedProgressAgeMs == null || host.inboundAcceptedProgressAgeMs >= thresholdMs) &&
+    (host.inboundProcessedProgressAgeMs == null || host.inboundProcessedProgressAgeMs >= thresholdMs);
+  if (!stalled) return null;
+  const revision = host.lastDataRevision;
+  const publications = sidecar.dataPublicationsTotal;
+  // The peer advances both once per DATA publication, from revision zero.
+  // A delayed duplicate of an older flight cannot prove that the currently
+  // pending flight reached DATA. Only fresh native DATA covering the latest
+  // sampled publication count identifies a missing CONTROL return path.
+  const currentDataObserved = host.dataPeerAgeMs != null && Number.isFinite(host.dataPeerAgeMs) &&
+    host.dataPeerAgeMs >= 0 && host.dataPeerAgeMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS &&
+    typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0 &&
+    revision < Number.MAX_SAFE_INTEGER && Number.isSafeInteger(publications) &&
+    publications > 0 && publications < Number.MAX_SAFE_INTEGER && revision + 1 >= publications;
+  return currentDataObserved ? "control" : "data";
+}
+
+function receiveTransportProgressed(before: V2TransportSnapshot, after: V2TransportSnapshot): boolean {
+  const prior = before.diagnostics?.host;
+  const next = after.diagnostics?.host;
+  if (!prior || !next || prior.inboundAcceptedEpoch !== next.inboundAcceptedEpoch) return false;
+  if (prior.inboundAcceptedSequence !== undefined && next.inboundAcceptedSequence !== undefined &&
+      next.inboundAcceptedSequence > prior.inboundAcceptedSequence) return true;
+  const priorCompletions = before.diagnostics?.sidecar?.transport.flightCompletionsTotal;
+  const nextCompletions = after.diagnostics?.sidecar?.transport.flightCompletionsTotal;
+  return priorCompletions !== undefined && nextCompletions !== undefined &&
+    next.sidecarDiagnosticsAgeMs != null && next.sidecarDiagnosticsAgeMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS &&
+    nextCompletions > priorCompletions;
 }
 
 class V2SidecarRecoveryPreflightUnavailableError extends Error {
@@ -361,6 +411,8 @@ export interface V2RuntimeYDoc {
 }
 
 export interface V2RuntimeBootstrap {
+  /** Physical retirement/ensure owners have settled; this is not remote cleanup proof. */
+  retirementSettled?(): boolean;
   ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor>;
   drainAndStop(reason: string, signal?: AbortSignal): Promise<void>;
   forceStop?(reason: string, signal?: AbortSignal): Promise<void>;
@@ -384,6 +436,7 @@ export interface V2RuntimeTransport {
   setHostCeiling?(value: number): void;
   rotateCredential?(rotationId: string, sealedJson: string, signal?: AbortSignal): Promise<void>;
   resumeAwareness?(signal?: AbortSignal): Promise<void>;
+  reconnectAwareness?(lane: AwarenessLane, signal?: AbortSignal): Promise<void>;
   probeLiveness?(signal?: AbortSignal): Promise<{ rttMs: number; sentAtMs: number }>;
 }
 
@@ -427,6 +480,8 @@ export interface V2SandboxRuntimeOptions {
   sidecarStallSampleThreshold?: number;
   sidecarRecoveryTimeoutMs?: number;
   stopTimeoutMs?: number;
+  /** Host-owned system shutdown deadline in this runtime's clock domain. Absent during ordinary recovery. */
+  shutdownDeadlineMs?: () => number | undefined;
   initialSandbox?: ProvisionedSandbox;
   acquireSandboxForAuth?(
     status: number,
@@ -544,6 +599,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #ySweetRotation: Promise<void> | null = null;
   #awarenessFailureUnsubscribe: (() => void) | null = null;
   #ySweetReconnectPending = false;
+  #silentAwarenessReconnectLane: AwarenessLane | null = null;
+  #awarenessReconnectOwner: V2RuntimeTransport | null = null;
   #ySweetReconnectNeedsRotation = false;
   #awarenessFailureVersion = 0;
   #ySweetRefreshRequested = false;
@@ -556,6 +613,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #escalateShutdown: (() => void) | null = null;
   #runtimeCleanup: Promise<void> | null = null;
   #runtimeCleanupDeadline: number | null = null;
+  #localCleanupStarted = false;
+  #localCleanupPending = 0;
+  #localCleanupFailed = false;
+  readonly #bootstrapCleanupOwners = new Set<V2RuntimeBootstrap>();
 
   constructor(options: V2SandboxRuntimeOptions) {
     if (!Number.isSafeInteger(options.workerIndex) || options.workerIndex < 1) {
@@ -663,6 +724,67 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
 
   stop(): Promise<void> {
     return this.#beginShutdown("stop", "runtime-stop");
+  }
+
+  /** Local ownership fence only; a separate signed receipt proves remote cleanup. */
+  localCleanupComplete(): boolean {
+    this.#pruneBootstrapCleanupOwners();
+    return this.#localCleanupStarted && !this.#localCleanupFailed &&
+      this.#localCleanupPending === 0 && this.#bootstrapCleanupOwners.size === 0 &&
+      this.#starting === null && this.#sidecarRelaunching === null &&
+      this.#sidecarRelaunchContext === null && this.#transport === null &&
+      this.#awareness === null && this.#supervisor === null && this.#ydoc === null &&
+      this.#heartbeat === null && this.#sidecarLoop === null &&
+      this.#refreshLoop === null && this.#ySweetLoop === null &&
+      this.#credentialRefreshTask === null && this.#ySweetRotation === null;
+  }
+
+  #pruneBootstrapCleanupOwners(): void {
+    for (const owner of this.#bootstrapCleanupOwners) {
+      try {
+        if (owner.retirementSettled?.() === true) this.#bootstrapCleanupOwners.delete(owner);
+      } catch { this.#localCleanupFailed = true; }
+    }
+  }
+
+  #rememberBootstrapCleanupOwner(owner: V2RuntimeBootstrap): void {
+    if (!owner.retirementSettled || this.#bootstrapCleanupOwners.has(owner)) return;
+    this.#pruneBootstrapCleanupOwners();
+    // One current stack plus a relaunch candidate normally owns at most two.
+    // Unexpected accumulation must fail the witness closed, never grow it.
+    if (this.#bootstrapCleanupOwners.size >= 4) {
+      this.#localCleanupFailed = true;
+      return;
+    }
+    this.#bootstrapCleanupOwners.add(owner);
+  }
+
+  #trackCleanupTask<T>(operation: () => Promise<T>, localClose = false): Promise<T> {
+    this.#localCleanupPending++;
+    let source: Promise<T>;
+    try { source = operation(); }
+    catch (error) { source = Promise.reject(error); }
+    return source.then(value => {
+      this.#localCleanupPending--;
+      return value;
+    }, error => {
+      this.#localCleanupPending--;
+      if (localClose) this.#localCleanupFailed = true;
+      throw error;
+    });
+  }
+
+  #trackBootstrapRetirement(
+    owner: V2RuntimeBootstrap,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    this.#rememberBootstrapCleanupOwner(owner);
+    return this.#trackCleanupTask(operation).catch(error => {
+      // A legacy/injected abortable wrapper may reject before physical work
+      // settles. Without its explicit witness, rejection is not a local fence.
+      if (!owner.retirementSettled) this.#localCleanupFailed = true;
+      throw error;
+    });
   }
 
   async run(
@@ -1260,11 +1382,19 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         if (signal.aborted) return;
       }
       if (signal.aborted || generation !== this.#generation) return;
+      if (this.#awarenessReconnectOwner === monitoredTransport) {
+        // The one reconnect owner must finish its fresh challenge before a
+        // periodic probe can race it or escalate the same half-open lane.
+        deadline = this.#clock.now() + this.#sidecarSuspectRecheckMs;
+        continue;
+      }
       let reliableStallReady = false;
       const probeStartedAtMs = this.#clock.now();
       try {
-        const diagnostics = monitoredTransport.snapshot().diagnostics?.host;
-        if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs)) {
+        const transportSnapshot = monitoredTransport.snapshot();
+        const diagnostics = transportSnapshot.diagnostics?.host;
+        const receiveStallLane = receiveTransportStallLane(transportSnapshot, this.#sidecarCommitStallMs);
+        if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs) || receiveStallLane) {
           consecutiveReliableStalls++;
           this.#notifyLiveness({
             signal: "sidecar_probe",
@@ -1281,13 +1411,18 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             this.#beginLivenessRecovery();
             this.#emit();
           }
-          if (consecutiveReliableStalls >= this.#sidecarStallSampleThreshold) {
+          if ((diagnostics && diagnostics.windowFrames > 0) || receiveStallLane) {
+            this.#requestSilentAwarenessReconnect(monitoredTransport,
+              diagnostics && diagnostics.windowFrames > 0 ? "data" : receiveStallLane!);
+          }
+          if (this.#silentAwarenessReconnectLane === null &&
+              consecutiveReliableStalls >= this.#sidecarStallSampleThreshold) {
             // A definitive prepared-expired outcome removes request-local
             // admission state, but it cannot retract a reliable frame already
             // in the cumulative window. Two independent samples prove that a
             // successful out-of-band pong must not keep it routable.
             reliableStallReady = true;
-            throw new Error("V2 reliable host transport stopped making progress");
+            throw new Error("V2 reliable transport stopped making progress");
           }
           acceleratedRecheck = true;
         } else {
@@ -1296,6 +1431,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           const wasSuspect = this.#sidecarSuspect;
           await this.#probeSidecarLiveness(monitoredTransport, signal);
           if (generation !== this.#generation) return;
+          if (this.#awarenessReconnectOwner === monitoredTransport) {
+            deadline = this.#clock.now() + this.#sidecarSuspectRecheckMs;
+            continue;
+          }
           consecutiveFailures = 0;
           if (this.#sidecarSuspect) {
             this.#sidecarSuspect = false;
@@ -1317,6 +1456,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           return;
         }
         if (generation !== this.#generation) return;
+        if (this.#awarenessReconnectOwner === monitoredTransport) {
+          deadline = this.#clock.now() + this.#sidecarSuspectRecheckMs;
+          continue;
+        }
         if (!reliableStallReady) {
           consecutiveFailures++;
           this.#notifyLiveness({
@@ -1335,9 +1478,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           this.#beginLivenessRecovery();
           this.#emit();
         }
+        this.#requestSilentAwarenessReconnect(monitoredTransport, "control", error);
         if (
-          reliableStallReady ||
-          consecutiveFailures >= this.#sidecarFailureThreshold
+          this.#silentAwarenessReconnectLane === null &&
+          (reliableStallReady || consecutiveFailures >= this.#sidecarFailureThreshold)
         ) {
           if (!await recover()) return;
         } else {
@@ -1480,7 +1624,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#assertSidecarRelaunchCurrent(context, signal);
 
       if (
-        (recheckSourceBeforeRelaunch || reconnectingSource) &&
+        // A scheduled rotation may itself repair this source while recovery
+        // waits for it. Recheck after every joined rotation, not only when the
+        // reconnect flag was already set before that wait began.
+        (rotation !== null || recheckSourceBeforeRelaunch || reconnectingSource) &&
         await this.#sourceTransportRecovered(sourceTransport, signal)
       ) {
         this.#assertSidecarRelaunchCurrent(context, signal);
@@ -1494,7 +1641,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       );
       this.#assertSidecarRelaunchCurrent(context, signal);
       await this.#abortable(
-        oldBootstrap.forceStop("same-session-sidecar-relaunch", signal),
+        this.#trackBootstrapRetirement(oldBootstrap,
+          () => oldBootstrap.forceStop!("same-session-sidecar-relaunch", signal)),
         signal,
       );
       this.#assertSidecarRelaunchCurrent(context, signal);
@@ -1519,7 +1667,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         supervisor: this.#supervisor,
         assets: this.#options.assets,
       });
-      const descriptor = await this.#abortable(context.bootstrap.ensureReady(signal), signal);
+      const candidateBootstrap = context.bootstrap;
+      const descriptor = await this.#abortable(
+        this.#trackCleanupTask(() => candidateBootstrap.ensureReady(signal)), signal,
+      );
       this.#assertSidecarRelaunchCurrent(context, signal);
       if (
         descriptor.releaseRevision !== this.#options.assets.revision ||
@@ -1555,9 +1706,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         throw new Error("Recovered R2 transport cannot adopt active requests");
       }
       this.#assertSidecarRelaunchCurrent(context, signal);
-      const replayBarrier = candidate.adoptRecoveredSidecar(context.capsule);
+      const capsule = context.capsule;
+      const replayBarrier = this.#trackCleanupTask(() => candidate.adoptRecoveredSidecar!(capsule));
       void replayBarrier.catch(() => undefined);
-      await this.#abortable(candidate.connect(signal), signal);
+      await this.#abortable(this.#trackCleanupTask(() => candidate.connect(signal)), signal);
       this.#assertSidecarRelaunchCurrent(context, signal);
       await this.#abortable(replayBarrier, signal);
       if (candidate.probeLiveness) await candidate.probeLiveness(signal);
@@ -1586,15 +1738,75 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   ): Promise<boolean> {
     if (!transport.probeLiveness) return false;
     try {
-      const diagnostics = transport.snapshot().diagnostics?.host;
-      if (reliableTransportStalled(diagnostics, this.#sidecarCommitStallMs)) return false;
+      const snapshot = transport.snapshot();
+      if (reliableTransportStalled(snapshot.diagnostics?.host, this.#sidecarCommitStallMs) ||
+          receiveTransportStallLane(snapshot, this.#sidecarCommitStallMs) !== null) return false;
       await transport.probeLiveness(signal);
-      return true;
+      const afterProbe = transport.snapshot();
+      return !reliableTransportStalled(afterProbe.diagnostics?.host, this.#sidecarCommitStallMs) &&
+        receiveTransportStallLane(afterProbe, this.#sidecarCommitStallMs) === null;
     } catch (error) {
       if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
         throw error;
       }
       return false;
+    }
+  }
+
+  async #repairUnprovedCredentialRotation(
+    transport: V2RuntimeTransport,
+    signal: AbortSignal,
+    isCurrent: () => boolean,
+  ): Promise<boolean> {
+    const binding = this.#binding;
+    const gateway = this.#gateway;
+    const episodeDeadline = this.#livenessRecovery?.deadlineAtMs;
+    const before = transport.snapshot();
+    const prior = before.diagnostics?.host;
+    if (!binding || !gateway || !prior || !transport.reconnectAwareness ||
+        episodeDeadline === undefined || !isCurrent() || signal.aborted) return false;
+    const deadline = episodeDeadline;
+    if (this.#clock.now() >= deadline) return false;
+    const controller = new AbortController();
+    const timer = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    void this.#clock.waitUntil(deadline, timer.signal).then(() => controller.abort(
+      new DOMException("Unproved credential rotation repair deadline expired", "TimeoutError")), () => undefined);
+    try {
+      await this.#proveSameSandboxSession(this.#generation, binding.sessionId, gateway, controller.signal);
+      if (!isCurrent() || controller.signal.aborted || this.#clock.now() >= deadline) return false;
+      const reconnectDeadline = Math.min(deadline, this.#clock.now() + 30_000);
+      await this.#tryReconnectAwareness(transport, reconnectDeadline, controller.signal, "data", {
+        deadline: reconnectDeadline, isCurrent,
+      });
+      const pending = prior.windowFrames > 0 || prior.schedulerFrames > 0 ||
+        (before.diagnostics?.sidecar?.transport.windowFrames ?? 0) > 0 ||
+        (before.diagnostics?.sidecar?.transport.schedulerFrames ?? 0) > 0;
+      while (isCurrent() && !controller.signal.aborted && this.#clock.now() < deadline) {
+        const after = transport.snapshot();
+        const next = after.diagnostics?.host;
+        // CONTROL can prove liveness one RTT before DATA releases its flight.
+        // Keep observing that one repaired source within the original episode;
+        // neither a later ACK nor this loop starts another socket/rotation.
+        const progressed = next && (!pending || receiveTransportProgressed(before, after) ||
+          next.flightCompletionsTotal > prior.flightCompletionsTotal ||
+          (next.uniqueAcknowledgedBytesTotal ?? 0) > (prior.uniqueAcknowledgedBytesTotal ?? 0));
+        if (progressed && await this.#sourceTransportRecovered(transport, controller.signal)) {
+          await this.#proveSameSandboxSession(this.#generation, binding.sessionId, gateway, controller.signal);
+          if (isCurrent() && !controller.signal.aborted && this.#clock.now() < deadline) return true;
+        }
+        await this.#clock.sleep(Math.min(this.#sidecarSuspectRecheckMs, deadline - this.#clock.now()), controller.signal);
+      }
+      return false;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (controller.signal.aborted) return false;
+      throw error;
+    } finally {
+      timer.abort();
+      controller.abort();
+      signal.removeEventListener("abort", abort);
     }
   }
 
@@ -1684,7 +1896,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           "TimeoutError",
         ));
       }, () => undefined);
-      const actualCleanup = (async () => {
+      const actualCleanup = this.#trackCleanupTask(async () => {
         const transport = context.transport;
         const bootstrap = context.bootstrap;
         const awareness = context.awareness;
@@ -1692,30 +1904,30 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         context.bootstrap = null;
         context.awareness = null;
         const remoteOperations: Promise<unknown>[] = [];
-        if (transport) remoteOperations.push(Promise.resolve().then(() => (
+        if (transport) remoteOperations.push(this.#trackCleanupTask(() => (
           transport.forceStop
             ? transport.forceStop(reason, cleanupController.signal)
             : transport.close()
-        )));
-        if (bootstrap) remoteOperations.push(Promise.resolve().then(() => (
+        ), !transport.forceStop));
+        if (bootstrap) remoteOperations.push(this.#trackBootstrapRetirement(bootstrap, () => (
           bootstrap.forceStop
             ? bootstrap.forceStop(reason, cleanupController.signal)
             : bootstrap.drainAndStop(reason, cleanupController.signal)
         )));
-        if (awareness) remoteOperations.push(Promise.resolve().then(() => awareness.close()));
+        if (awareness) remoteOperations.push(this.#trackCleanupTask(() => awareness.close(), true));
         const remoteSettlement = Promise.allSettled(remoteOperations).then(() => undefined);
         await this.#runBounded(
           signal => this.#abortable(remoteSettlement, signal),
           deadline,
         );
         if (transport?.forceStop) {
-          const closing = Promise.resolve().then(() => transport.close()).catch(() => undefined);
+          const closing = this.#trackCleanupTask(() => transport.close(), true).catch(() => undefined);
           await this.#runBounded(
             signal => this.#abortable(closing, signal),
             deadline,
           );
         }
-      })().finally(() => {
+      }).finally(() => {
         timeoutController.abort();
         if (this.#sidecarRelaunchContext === context) this.#sidecarRelaunchContext = null;
       });
@@ -1792,6 +2004,33 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }) ?? null;
   }
 
+  #requestSilentAwarenessReconnect(transport: V2RuntimeTransport, lane: AwarenessLane, error?: unknown): void {
+    const snapshot = transport.snapshot();
+    const diagnostics = lane === "data" ? snapshot.diagnostics?.host : undefined;
+    const receiveLane = receiveTransportStallLane(snapshot, this.#sidecarCommitStallMs);
+    const provenFailure = lane === "control"
+      ? (error instanceof V2TransportLivenessError && error.code === "timeout") || receiveLane === "control"
+      : (diagnostics !== undefined && diagnostics.windowFrames > 0 &&
+        diagnostics.ackProgressAgeMs >= this.#sidecarCommitStallMs) ||
+        receiveLane === "data";
+    if (!provenFailure || this.#binding?.protocolRevision !== "r2" || transport !== this.#transport ||
+        !transport.reconnectAwareness || !this.#options.provisioning.mintYSweet ||
+        !this.#bootstrap?.sealCredentialRotation || !transport.rotateCredential ||
+        this.#ySweetReconnectPending || this.#ySweetReconnectNeedsRotation ||
+        this.#sidecarRelaunching || this.#controller?.signal.aborted) return;
+    // Exact-instance challenges prove control. An aged host flight or freshly
+    // sampled pending incoming work can independently prove data is stalled.
+    this.#silentAwarenessReconnectLane = lane;
+    this.#ySweetReconnectPending = true;
+    this.#awarenessFailureVersion++;
+    this.#ySweetRefreshRequested = true;
+    this.#wakeYSweetRefresh?.();
+    this.#emit();
+    this.#notifyLiveness({ signal: "awareness", outcome: "failed",
+      attempt: this.#awarenessFailureVersion, errorName: "V2TransportLivenessError",
+      errorKind: lane === "control" && receiveLane !== "control" ? "timeout" : "reliable_stall", awarenessLane: lane });
+  }
+
   async #waitForYSweetRefresh(
     deadline: number,
     signal: AbortSignal,
@@ -1825,10 +2064,22 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     transport: V2RuntimeTransport,
     deadline: number,
     signal: AbortSignal,
+    forceLane?: AwarenessLane,
+    controlRepair?: { readonly deadline: number; readonly isCurrent: () => boolean },
   ): Promise<boolean> {
     if (!transport.resumeAwareness || !transport.probeLiveness || this.#clock.now() >= deadline) {
       return false;
     }
+    const prior = transport.snapshot();
+    const requiresReceiveProgress = forceLane !== undefined &&
+      receiveTransportStallLane(prior, this.#sidecarCommitStallMs) !== null;
+    const transportRecovered = () => {
+      const current = transport.snapshot();
+      return !reliableTransportStalled(current.diagnostics?.host, this.#sidecarCommitStallMs) &&
+        receiveTransportStallLane(current, this.#sidecarCommitStallMs) === null &&
+        (!requiresReceiveProgress || receiveTransportProgressed(prior, current));
+    };
+    let controlProof: Promise<{ rttMs: number; sentAtMs: number }> | undefined;
     const reconnectController = new AbortController();
     const timeoutController = new AbortController();
     const forwardAbort = () => reconnectController.abort(signal.reason);
@@ -1839,23 +2090,59 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }, () => undefined);
     try {
       await this.#abortable(
-        transport.resumeAwareness(reconnectController.signal),
+        this.#trackCleanupTask(() => forceLane && transport.reconnectAwareness
+          ? transport.reconnectAwareness(forceLane, reconnectController.signal)
+          : transport.resumeAwareness!(reconnectController.signal)),
         reconnectController.signal,
       );
       if (reconnectController.signal.aborted) return false;
+      // The exact peer's existing probe retains its original source deadline.
+      // A short socket-resume budget may stop waiting, but must not let
+      // credential rotation overtake a still-owned CONTROL proof.
+      controlProof = this.#probeSidecarLiveness(transport, signal);
       await this.#abortable(
-        this.#probeSidecarLiveness(transport, reconnectController.signal),
+        controlProof,
         reconnectController.signal,
       );
-      return !reconnectController.signal.aborted && this.#clock.now() < deadline &&
-        !reliableTransportStalled(transport.snapshot().diagnostics?.host, this.#sidecarCommitStallMs);
+      return !reconnectController.signal.aborted && this.#clock.now() < deadline && transportRecovered();
     } catch (error) {
       if (signal.aborted) throw error;
-      return false;
     } finally {
       timeoutController.abort();
       reconnectController.abort();
       signal.removeEventListener("abort", forwardAbort);
+    }
+    if (!controlProof || !controlRepair || forceLane === "control" ||
+        this.#binding?.protocolRevision !== "r2" || !transport.reconnectAwareness ||
+        !controlRepair.isCurrent() || this.#clock.now() >= controlRepair.deadline) return false;
+    const repairController = new AbortController();
+    const repairTimer = new AbortController();
+    const abortRepair = () => repairController.abort(signal.reason);
+    signal.addEventListener("abort", abortRepair, { once: true });
+    if (signal.aborted) abortRepair();
+    void this.#clock.waitUntil(controlRepair.deadline, repairTimer.signal).then(() => {
+      repairController.abort(new DOMException("Awareness recovery deadline expired", "TimeoutError"));
+    }, () => undefined);
+    try {
+      try {
+        await this.#abortable(controlProof, repairController.signal);
+        return !repairController.signal.aborted && this.#clock.now() < controlRepair.deadline &&
+          controlRepair.isCurrent() && transportRecovered();
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (repairController.signal.aborted || !controlRepair.isCurrent() ||
+            !(error instanceof V2TransportLivenessError) || error.code !== "timeout") return false;
+      }
+      // DATA resumption and its ACK progress cannot prove CONTROL delivery.
+      // Repair that local socket once, then require a new bound pong before
+      // considering reminted credentials or any sidecar lifecycle action.
+      return await this.#tryReconnectAwareness(transport,
+        Math.min(controlRepair.deadline, this.#clock.now() + SILENT_AWARENESS_RECONNECT_TIMEOUT_MS),
+        repairController.signal, "control");
+    } finally {
+      repairTimer.abort();
+      repairController.abort();
+      signal.removeEventListener("abort", abortRepair);
     }
   }
 
@@ -1897,35 +2184,64 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         credentials.ySweet === this.#credentials?.ySweet;
       const reconnectAttempt = this.#ySweetReconnectPending;
       const reconnectStartedAtMs = this.#clock.now();
+      const reconnectLane = this.#silentAwarenessReconnectLane ?? undefined;
       let reconnectPhase: SandboxReconnectPhase = "mint_credential";
       if (reconnectAttempt) {
         this.#notifyLiveness({
           signal: "awareness",
           outcome: "started",
           attempt: this.#awarenessFailureVersion,
+          awarenessLane: reconnectLane,
         });
       }
+      let unprovedRotationRepair = false;
+      // Keep one owner through credential fallback as well as socket repair.
+      // Otherwise periodic publish failures can launch a competing recovery
+      // which turns this same queued rotation timeout into generation failure.
+      if (reconnectAttempt) this.#awarenessReconnectOwner = transport;
       try {
         let reusedCredential = false;
+        let renewalRetryAtMs: number | null = null;
         const rotation = (async () => {
           if (reconnectAttempt && !this.#ySweetReconnectNeedsRotation &&
               this.#clock.now() < credentialRefreshDeadline) {
             const failureVersion = this.#awarenessFailureVersion;
+            const forcedLane = this.#silentAwarenessReconnectLane;
+            const silentReconnect = forcedLane !== null;
             reconnectPhase = "host_reconnect";
-            const reconnected = await this.#tryReconnectAwareness(
-              transport,
-              Math.min(credentialRefreshDeadline, reconnectStartedAtMs + AWARENESS_RECONNECT_TIMEOUT_MS),
-              signal,
-            );
+            let reconnected = false;
+            reconnected = await this.#tryReconnectAwareness(
+                transport,
+                Math.min(credentialRefreshDeadline,
+                  this.#livenessRecovery?.deadlineAtMs ?? Number.POSITIVE_INFINITY,
+                  reconnectStartedAtMs + (silentReconnect ? SILENT_AWARENESS_RECONNECT_TIMEOUT_MS : AWARENESS_RECONNECT_TIMEOUT_MS)),
+                signal,
+                forcedLane ?? undefined,
+                { deadline: Math.min(credentialRefreshDeadline,
+                  this.#livenessRecovery?.deadlineAtMs ?? reconnectStartedAtMs + SANDBOX_LIVENESS_RECOVERY_MAX_MS),
+                  isCurrent: () => rotationIsCurrent() && failureVersion === this.#awarenessFailureVersion },
+              );
             if (
               !rotationIsCurrent() ||
               failureVersion !== this.#awarenessFailureVersion
             ) return false;
+            if (this.#livenessRecovery && this.#clock.now() >= this.#livenessRecovery.deadlineAtMs) {
+              throw new DOMException("Awareness recovery deadline expired", "TimeoutError");
+            }
+            if (silentReconnect && !reconnected) {
+              this.#notifyLiveness({ signal: "awareness", outcome: "failed",
+                attempt: failureVersion, awarenessLane: forcedLane, reconnectPhase: "host_reconnect",
+                errorName: "V2TransportLivenessError", errorKind: "unavailable",
+                durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs) });
+            }
             if (reconnected) {
               // Keep the exact transport, sidecar and reliable flight. A new
-              // socket handshake plus an instance-bound pong is sufficient
-              // for transient loss; the original credential renewal stays due.
+              // socket handshake plus an instance-bound pong proves control;
+              // data repair also requires real reliable progress. The original
+              // credential renewal stays due.
               this.#ySweetReconnectPending = false;
+              this.#silentAwarenessReconnectLane = null;
+              this.#sidecarSuspect = false;
               this.#finishLivenessRecovery();
               this.#ySweetRefreshRequested = false;
               reusedCredential = true;
@@ -1933,6 +2249,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             }
           }
           if (signal.aborted) throw signal.reason;
+          this.#silentAwarenessReconnectLane = null;
           reconnectPhase = "mint_credential";
           const rotationId = `rotation-${crypto.randomUUID()}`;
           const ySweet = await this.#options.provisioning.mintYSweet!(
@@ -1976,7 +2293,48 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             awarenessFailureVersion !== this.#awarenessFailureVersion
           ) return false;
           reconnectPhase = "sidecar_rotation";
-          await transport.rotateCredential!(rotationId, sealedJson, signal);
+          try {
+            await transport.rotateCredential!(rotationId, sealedJson, signal);
+          } catch (error) {
+            if (signal.aborted || !rotationIsCurrent() ||
+                awarenessFailureVersion !== this.#awarenessFailureVersion ||
+                !(error instanceof Error) || error.name !== "Error" ||
+                error.message !== `Credential rotation ACK timed out: ${rotationId}`) throw error;
+            this.#beginLivenessRecovery();
+            this.#awarenessReconnectOwner = transport;
+            reconnectPhase = "host_reconnect";
+            let repaired = false;
+            try {
+              repaired = await this.#repairUnprovedCredentialRotation(transport, signal, () =>
+                rotationIsCurrent() && awarenessFailureVersion === this.#awarenessFailureVersion);
+            } catch (repairError) {
+              if (signal.aborted) throw repairError;
+              if (!(repairError instanceof V2SidecarRecoveryPreflightUnavailableError)) {
+                this.#failGeneration(generation,
+                  new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: repairError }));
+                throw repairError;
+              }
+            }
+            if (!repaired) { unprovedRotationRepair = true; throw error; }
+            // The source is live, but the rotation has no matching ACK. Keep
+            // the original credential record and any future renewal deadline. The
+            // currently configured sockets may legitimately use mixed tokens.
+            this.#ySweetReconnectPending = false;
+            this.#silentAwarenessReconnectLane = null;
+            this.#ySweetReconnectNeedsRotation = false;
+            this.#ySweetRefreshRequested = false;
+            this.#sidecarSuspect = false;
+            this.#finishLivenessRecovery();
+            // A scheduled attempt can still owe renewal. Keep that credential
+            // deadline overdue; fresh source proof does not extend token life.
+            // Use only the existing failed-renewal backoff before its next
+            // ordinary attempt, rather than immediately minting again.
+            if (credentialRefreshDeadline <= this.#clock.now()) {
+              renewalRetryAtMs = this.#clock.now() + 30_000;
+            }
+            reusedCredential = true;
+            return true;
+          }
           if (!rotationIsCurrent()) return false;
           if (!reconnectFirst) {
             reconnectPhase = "host_reconnect";
@@ -1990,6 +2348,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           ) return false;
           this.#credentials = { ...this.#credentials!, ySweet };
           this.#ySweetReconnectPending = false;
+          this.#silentAwarenessReconnectLane = null;
           this.#finishLivenessRecovery();
           this.#ySweetReconnectNeedsRotation = false;
           this.#ySweetRefreshRequested = false;
@@ -2009,13 +2368,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             outcome: applied ? "succeeded" : "superseded",
             attempt: this.#awarenessFailureVersion,
             reconnectPhase,
+            awarenessLane: reconnectLane,
             durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
           });
         }
         if (applied && !reusedCredential) {
           credentialRefreshDeadline = this.#clock.now() + this.#ySweetRefreshMs;
         }
-        deadline = applied ? credentialRefreshDeadline : this.#clock.now();
+        deadline = applied ? renewalRetryAtMs ?? credentialRefreshDeadline : this.#clock.now();
       } catch (error) {
         if (signal.aborted) return;
         this.#notifyLiveness({
@@ -2025,13 +2385,26 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           errorName: livenessErrorName(error),
           errorKind: livenessErrorKind(error),
           reconnectPhase,
+          awarenessLane: reconnectLane,
           supervisorPhase: supervisorErrorPhase(error),
           durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
         });
         this.#runtimeHealth.record("unhealthy");
+        if (unprovedRotationRepair) {
+          // This one repair did not establish authority to resume. Do not
+          // remint/reannounce or replace its source to recover this error.
+          // The already-running episode timer remains the final fail-closed
+          // bound, including when all remaining transport proof is silent.
+          const recoveryDeadline = this.#livenessRecovery?.deadlineAtMs;
+          if (recoveryDeadline !== undefined) await this.#clock.waitUntil(recoveryDeadline, signal);
+          if (!signal.aborted) this.#failGeneration(generation,
+            new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: error }));
+          return;
+        }
         await this.#clock.sleep(30_000, signal);
         deadline = this.#clock.now();
       } finally {
+        if (this.#awarenessReconnectOwner === transport) this.#awarenessReconnectOwner = null;
         this.#ySweetRotation = null;
       }
     }
@@ -2138,6 +2511,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     // Startup failure and public shutdown can converge on the same resources.
     // Once either path owns cleanup, the other must not extend its deadline.
     const deadline = this.#runtimeCleanupDeadline ?? this.#stopDeadline();
+    const drainDeadline = this.#retirementStageDeadline(deadline);
     let cleanupComplete = true;
     const starting = this.#starting;
     const relaunching = this.#sidecarRelaunching;
@@ -2154,7 +2528,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       ]).then(() => undefined);
       if (!await this.#runBounded(async signal => {
         await this.#abortable(relaunchSettled!, signal);
-      }, deadline)) cleanupComplete = false;
+      }, drainDeadline)) cleanupComplete = false;
     }
     const transport = this.#transport;
     const bootstrap = this.#bootstrap;
@@ -2164,12 +2538,14 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       clean = await this.#runBounded(
         signal => {
           const draining = transport
-            ? transport.drain(reason, signal)
-            : bootstrap?.drainAndStop(reason, signal) ?? Promise.resolve();
+            ? this.#trackCleanupTask(() => transport.drain(reason, signal))
+            : bootstrap
+              ? this.#trackBootstrapRetirement(bootstrap, () => bootstrap.drainAndStop(reason, signal))
+              : Promise.resolve();
           drainSettled = draining.then(() => undefined, () => undefined);
           return draining;
         },
-        deadline,
+        drainDeadline,
         escalation,
       );
     }
@@ -2204,7 +2580,23 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #stopDeadline(): number {
+    const systemDeadline = this.#options.shutdownDeadlineMs?.();
+    if (systemDeadline !== undefined) {
+      if (!Number.isFinite(systemDeadline) || systemDeadline < 0) {
+        throw new RangeError("System shutdown deadline must be finite and nonnegative");
+      }
+      return systemDeadline;
+    }
     return Math.min(Number.MAX_SAFE_INTEGER, this.#clock.now() + this.#stopTimeoutMs);
+  }
+
+  #retirementStageDeadline(deadline: number): number {
+    if (!this.#supervisor) return deadline;
+    const remaining = Math.max(0, deadline - this.#clock.now());
+    // A silent subordinate must leave the exact supervisor a cleanup attempt.
+    // Preserve most of a long graceful budget; split only tight budgets. Every
+    // stage still shares the original absolute system/ordinary stop deadline.
+    return deadline - Math.min(this.#stopTimeoutMs, remaining / 2);
   }
 
   #forceStopAndDispose(
@@ -2217,31 +2609,34 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const existing = this.#runtimeCleanup;
     if (existing) return existing;
     const supervisorOwnsCleanup = this.#supervisor !== null;
+    const remoteDeadline = this.#retirementStageDeadline(deadline);
     const cleanupController = new AbortController();
     const timeoutController = new AbortController();
-    void this.#clock.waitUntil(deadline, timeoutController.signal).then(() => {
+    const expire = () => {
       cleanupController.abort(new DOMException(
-        "V2 runtime shutdown deadline expired",
+        "V2 subordinate retirement deadline expired",
         "TimeoutError",
       ));
-    }, () => undefined);
-    const cleanup = (async () => {
+    };
+    if (this.#clock.now() >= remoteDeadline) expire();
+    else void this.#clock.waitUntil(remoteDeadline, timeoutController.signal).then(expire, () => undefined);
+    const cleanup = this.#trackCleanupTask(async () => {
       if (predecessor) {
         await this.#runBounded(
           signal => this.#abortable(predecessor, signal),
-          deadline,
+          remoteDeadline,
         );
       }
       // Transport and bootstrap are independent resources. Start both remote
       // retirement requests together so one non-cooperative implementation
       // cannot prevent the other from being fenced before the shared deadline.
       const remoteRetirements: Promise<unknown>[] = [];
-      if (transport) remoteRetirements.push(Promise.resolve().then(() => (
+      if (transport) remoteRetirements.push(this.#trackCleanupTask(() => (
         transport.forceStop
           ? transport.forceStop(reason, cleanupController.signal)
           : transport.drain(reason, cleanupController.signal)
       )));
-      if (bootstrap) remoteRetirements.push(Promise.resolve().then(() => (
+      if (bootstrap) remoteRetirements.push(this.#trackBootstrapRetirement(bootstrap, () => (
         bootstrap.forceStop
           ? bootstrap.forceStop(reason, cleanupController.signal)
           : bootstrap.drainAndStop(reason, cleanupController.signal)
@@ -2251,7 +2646,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         signal => this.#abortable(remoteSettlement.then(results => {
           if (results.some(result => result.status === "rejected")) throw new Error("V2 remote retirement was incomplete");
         }), signal),
-        deadline,
+        remoteDeadline,
       );
       // Begin every independent local fence even when one close implementation
       // ignores its promise contract. #dispose clears runtime references before
@@ -2259,9 +2654,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       // generation while transport.close or a peripheral stop remains pending.
       const localFences = [
         transport
-          ? Promise.resolve().then(() => transport.close()).catch(() => undefined)
+          ? this.#trackCleanupTask(() => transport.close(), true)
           : Promise.resolve(),
-        this.#dispose(false),
+        this.#trackCleanupTask(() => this.#dispose(false, deadline)),
       ];
       const localSettlement = Promise.allSettled(localFences);
       const localComplete = await this.#runBounded(
@@ -2278,7 +2673,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if ((!remoteComplete && !supervisorOwnsCleanup) || !localComplete) {
         throw new Error("V2 runtime shutdown cleanup was incomplete");
       }
-    })().finally(() => timeoutController.abort());
+    }).finally(() => timeoutController.abort());
     // The bounded public waiter may have expired before this exact owner
     // finishes. Retain its rejection for joined callers without an unhandled
     // late rejection escaping into the process.
@@ -2290,7 +2685,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
 
   #disposeOnce(closeTransport: boolean, deadline: number): Promise<void> {
     if (this.#runtimeCleanup) return this.#runtimeCleanup;
-    const cleanup = Promise.resolve().then(() => this.#dispose(closeTransport));
+    const cleanup = this.#trackCleanupTask(() => this.#dispose(closeTransport, deadline));
     this.#runtimeCleanup = cleanup;
     this.#runtimeCleanupDeadline = deadline;
     return cleanup;
@@ -2315,7 +2710,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       .then(() => false, () => false);
     const candidates: Promise<boolean>[] = [completed, timeout];
     if (escalation) candidates.push(escalation.then(() => false));
-    const result = await Promise.race(candidates);
+    const completedInRace = await Promise.race(candidates);
+    const result = completedInRace && this.#clock.now() < deadline;
     timeoutController.abort();
     if (!result) operationController.abort(
       new DOMException("V2 runtime shutdown deadline expired", "TimeoutError"),
@@ -2345,7 +2741,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     });
   }
 
-  async #dispose(closeTransport: boolean): Promise<void> {
+  async #dispose(closeTransport: boolean, deadline?: number): Promise<void> {
+    // Capture once: ordinary cleanup already in flight keeps its ownership
+    // when the host later starts shutting down.
+    const systemDeadline = deadline ?? this.#options.shutdownDeadlineMs?.();
+    this.#localCleanupStarted = true;
     this.#awarenessFailureUnsubscribe?.();
     this.#awarenessFailureUnsubscribe = null;
     this.#wakeYSweetRefresh?.();
@@ -2383,30 +2783,47 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     this.#clearLivenessRecovery();
     this.#credentialRefreshPending = false;
     this.#ySweetReconnectPending = false;
+    this.#silentAwarenessReconnectLane = null;
+    this.#awarenessReconnectOwner = null;
     this.#ySweetReconnectNeedsRotation = false;
     this.#awarenessFailureVersion = 0;
     this.#ySweetRefreshRequested = false;
     const cleanup = await Promise.allSettled([
-      Promise.allSettled([
+      this.#trackCleanupTask(() => Promise.allSettled([
         refreshLoop ?? Promise.resolve(),
         ySweetLoop ?? Promise.resolve(),
         credentialRefreshTask ?? Promise.resolve(),
         ySweetRotation ?? Promise.resolve(),
         sidecarLoop ?? Promise.resolve(),
-      ]),
-      closeTransport ? transport?.close() ?? Promise.resolve() : Promise.resolve(),
-      awareness?.close() ?? Promise.resolve(),
+      ])),
+      closeTransport && transport ? this.#trackCleanupTask(() => transport.close(), true) : Promise.resolve(),
+      awareness ? this.#trackCleanupTask(() => awareness.close(), true) : Promise.resolve(),
       (async () => {
         // Bootstrap failure/cancellation cleanup still reads and tombstones
         // project files. Keep its Yjs connection until that exact owner settles.
         try {
           if (supervisor) {
-            try { await supervisor.shutdown("runtime_dispose"); }
-            finally { await supervisor.close(); }
+            const shutdownController = systemDeadline === undefined ? undefined : new AbortController();
+            const timeoutController = shutdownController ? new AbortController() : undefined;
+            const expire = () => shutdownController?.abort(new DOMException(
+              "V2 supervisor shutdown deadline expired", "TimeoutError",
+            ));
+            if (systemDeadline !== undefined && timeoutController) {
+              if (this.#clock.now() >= systemDeadline) expire();
+              else void this.#clock.waitUntil(systemDeadline, timeoutController.signal).then(expire, () => undefined);
+            }
+            try {
+              await this.#trackCleanupTask(() => supervisor.shutdown("runtime_dispose", shutdownController?.signal));
+              if (systemDeadline !== undefined && this.#clock.now() >= systemDeadline) expire();
+              shutdownController?.signal.throwIfAborted();
+            } finally {
+              timeoutController?.abort();
+              await this.#trackCleanupTask(() => supervisor.close(), true);
+            }
           }
-        } finally { await ydoc?.destroy(); }
+        } finally { if (ydoc) await this.#trackCleanupTask(() => ydoc.destroy(), true); }
       })(),
-      heartbeat?.stop() ?? Promise.resolve(),
+      heartbeat ? this.#trackCleanupTask(() => heartbeat.stop(), true) : Promise.resolve(),
     ]);
     if (cleanup.some(result => result.status === "rejected")) throw new Error("V2 runtime resource cleanup was incomplete");
   }

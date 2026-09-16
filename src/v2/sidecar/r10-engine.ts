@@ -42,6 +42,7 @@ import {
   type DirectResponsesExecution,
   type UpstreamTerminal,
 } from "./r10-upstream";
+import { normalizeR10ProviderError } from "./r10-provider-error";
 import type { AtomicBytePermitPool } from "../memory/atomic-byte-permits";
 
 const MiB = 1024 * 1024;
@@ -149,7 +150,9 @@ export class V2ExecutionFenceError extends Error {
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
 const DEFAULT_DRAIN_ABORT_SETTLEMENT_MS = 5_000;
-const DEFAULT_PREPARED_TIMEOUT_MS = 60_000;
+// Cover the default host's 180-second admission and 180-second post-risk proof
+// windows without raising any retained request, byte, or admission limit.
+const DEFAULT_PREPARED_TIMEOUT_MS = 360_000;
 
 function positiveDuration(value: number, name: string): number {
   if (!Number.isFinite(value) || value < 1) {
@@ -1418,7 +1421,11 @@ export class SidecarEngine {
         return;
       }
       this.#reportFatalJournalError(error);
-      const upstream = error instanceof UpstreamExecutionError ? error : null;
+      // Optional formatting repair must leave the original journal/ambiguity
+      // path in control if unexpected provider evidence cannot be normalized.
+      const upstream = error instanceof UpstreamExecutionError
+        ? await normalizeR10ProviderError(error).catch(() => error)
+        : null;
       let ambiguous = upstream?.ambiguous ?? true;
       if (upstream && !ambiguous) {
         try {

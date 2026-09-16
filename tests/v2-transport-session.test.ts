@@ -50,6 +50,12 @@ import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import type { Clock } from "../src/core/ports";
 import { createExactSizedV2Request } from "./support/v2-performance-harness";
 import { HostRequestDiagnosticsObserver } from "../src/v2/diagnostics/host-observer";
+import { AdmissionController } from "../src/v2/sidecar/admission";
+import { RequestAssembler } from "../src/v2/sidecar/assembler";
+import { ClaimJournal } from "../src/v2/sidecar/journal";
+import { SidecarEngine as R10SidecarEngine } from "../src/v2/sidecar/r10-engine";
+import { completedUpstream, FakeSidecarStorage } from "./support/fake-v2-sidecar";
+import type { PublicationTimer, PublicationTimerHandle } from "../src/v2/protocol/publication-pacer";
 import {
   MAX_RESPONSES_JSON_DEPTH,
   MAX_RESPONSES_JSON_ITEMS,
@@ -91,6 +97,25 @@ class ReceiptClock implements Clock {
   waitUntil(deadline: number, signal?: AbortSignal): Promise<void> { return this.sleep(Math.max(0, deadline - this.value), signal); }
   pendingDelays(): number[] { return [...this.waits.values()].map(wait => wait.delay); }
   elapse(): void { for (const wait of [...this.waits.values()]) { this.value += wait.delay; wait.finish(); } }
+}
+
+class HeldPublicationTimer implements PublicationTimer {
+  readonly pending = new Map<PublicationTimerHandle, () => void>();
+  constructor(readonly clock: ReceiptClock) {}
+  now(): number { return this.clock.now(); }
+  set(callback: () => void): PublicationTimerHandle {
+    const handle = {};
+    this.pending.set(handle, callback);
+    return handle;
+  }
+  clear(handle: PublicationTimerHandle): void { this.pending.delete(handle); }
+  defer(callback: () => void): void { this.set(callback); }
+  flush(): void {
+    for (const [handle, callback] of [...this.pending]) {
+      this.pending.delete(handle);
+      callback();
+    }
+  }
 }
 
 async function promiseState(value: Promise<unknown>): Promise<"pending" | "settled"> {
@@ -224,6 +249,7 @@ class TransportHarness {
     gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
     rotationTimeoutMs?: number;
     publicationIntervalMs?: number;
+    publicationTimer?: PublicationTimer;
     unadmittedTimeoutMs?: number;
     preparationTimeoutMs?: number;
     livenessTimeoutMs?: number;
@@ -295,6 +321,7 @@ class TransportHarness {
       rotationTimeoutMs: options.rotationTimeoutMs,
       retransmitMs: options.retransmitMs ?? 250,
       publicationIntervalMs: this.publicationIntervalMs,
+      publicationTimer: options.publicationTimer,
       unadmittedTimeoutMs: options.unadmittedTimeoutMs,
       preparationTimeoutMs: options.preparationTimeoutMs,
       ...(options.expectedSidecarInstanceId === null
@@ -320,8 +347,10 @@ class TransportHarness {
     options: {
       lane?: "data" | "control";
       ackSequence?: number;
+      ackEpoch?: number;
       revision?: number;
       instanceId?: string;
+      targetInstanceId?: string;
       liveness?: AwarenessLiveness;
     } = {},
   ): void {
@@ -343,7 +372,7 @@ class TransportHarness {
       leaderGeneration: this.binding.leaderGeneration,
       epoch: this.sidecarEpoch,
       revision: options.revision ?? this.revision++,
-      ack: { epoch: 1, sequence: options.ackSequence ?? this.hostAck },
+      ack: { epoch: options.ackEpoch ?? 1, sequence: options.ackSequence ?? this.hostAck },
       credits: this.credits,
       active: 128 - this.credits,
       queued: 0,
@@ -358,7 +387,7 @@ class TransportHarness {
           schemaVersion: GP_V2_R2_SCHEMA_VERSION,
           protocolRevision: "r2",
           launchNonce: this.binding.launchNonce,
-          targetInstanceId: HOST_INSTANCE_ID,
+          targetInstanceId: options.targetInstanceId ?? HOST_INSTANCE_ID,
         }
       : { ...common, schemaVersion: GP_V2_R1_SCHEMA_VERSION };
     this.sidecar.publish(envelope);
@@ -1891,6 +1920,384 @@ describe("V2TransportSession", () => {
     await harness.close();
   });
 
+  it("tracks exact data/control freshness independently and ignores stale or foreign revisions through reconnect", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    harness.host.reconnect = async () => undefined;
+    try {
+      await harness.start();
+      clock.value += 10;
+      harness.publish([], { lane: "data", revision: 7 });
+      await harness.settle();
+      clock.value += 30;
+      harness.publish([], { lane: "control", revision: 11 });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        lastDataRevision: 7, lastControlRevision: 11, dataPeerAgeMs: 30, controlPeerAgeMs: 0,
+      });
+      clock.value += 20;
+      harness.publish([], { lane: "control", revision: 10 });
+      harness.publish([], { lane: "control", revision: 99, targetInstanceId: "foreign-host" });
+      await harness.settle();
+      await harness.session.reconnectAwareness("control");
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        lastDataRevision: 7, lastControlRevision: 11, dataPeerAgeMs: 50, controlPeerAgeMs: 20,
+      });
+      harness.publish([], { lane: "control", revision: 12 });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        lastDataRevision: 7, lastControlRevision: 12, dataPeerAgeMs: 50, controlPeerAgeMs: 0,
+      });
+    } finally { await harness.close(); }
+  });
+
+  it("requires retained data-flight ACK progress after reconnect even when control pongs succeed", async () => {
+    const harness = new TransportHarness({ binding: R2_BINDING, autoPong: true, retransmitMs: 60_000 });
+    harness.host.reconnect = async () => undefined;
+    await harness.start();
+    const pending = harness.session.run(BODY);
+    void pending.catch(() => undefined);
+    try {
+      await harness.settle();
+      const last = Math.max(...harness.hostFrames.keys());
+      const reconnecting = harness.session.reconnectAwareness("data", AbortSignal.timeout(1_000));
+      expect(harness.session.reconnectAwareness("data")).toBe(reconnecting);
+      const pong = harness.session.probeLiveness();
+      await harness.settle();
+      await expect(pong).resolves.toMatchObject({ rttMs: expect.any(Number) });
+      expect(await promiseState(reconnecting)).toBe("pending");
+      harness.publish([], { lane: "control", ackSequence: last });
+      await harness.settle();
+      await expect(reconnecting).resolves.toBeUndefined();
+      expect(harness.session.snapshot().quarantined).toBe(0);
+    } finally { await harness.close(); await pending.catch(() => undefined); }
+  });
+
+  function receiveEvidence(
+    publicationsTotal: number,
+    overrides: Partial<import("../src/v2/diagnostics/types").V2TransportDiagnostics> = {},
+  ): import("../src/v2/diagnostics/types").V2EnvelopeDiagnostics {
+    return {
+      version: 1, resource: null, malformedCount: 0,
+      transport: {
+        windowFrames: 1, windowBytes: 256, schedulerFrames: 0, schedulerBytes: 0,
+        schedulerStreams: 0, oldestQueuedFrameMs: 0, ackProgressAgeMs: 0,
+        retransmissionAttempt: 0, peakRetransmissionAttempt: 0, retransmissionsTotal: 0,
+        publicationsTotal, publishedBytesTotal: 256, admittedUncommitted: 0,
+        roundTripEwmaMs: null, pacedPublicationsTotal: 0, urgentPublicationsTotal: 0,
+        logicalEventsTotal: 0, responseBatchFramesTotal: 0, batchedEventsTotal: 0,
+        dataPublicationsTotal: 1, controlPublicationsTotal: 1,
+        dataPublishedBytesTotal: 256, controlPublishedBytesTotal: 0,
+        flightCompletionsTotal: 0, adaptiveCapacity: 8, capacityIncreasesTotal: 0,
+        capacityReductionsTotal: 0, unadmittedTimeoutsTotal: 0,
+        ...overrides,
+      },
+    };
+  }
+
+  function attachReceiveEvidence(harness: TransportHarness) {
+    const sample = { value: receiveEvidence(1) };
+    const publish = harness.sidecar.publish.bind(harness.sidecar);
+    harness.sidecar.publish = (envelope, lane) => publish({
+      ...envelope,
+      ...(envelope.lane === "control" ? { diagnostics: sample.value } : {}),
+    }, lane);
+    return sample;
+  }
+
+  it("distinguishes accepted receive progress from processing blocked by client capacity", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({
+      binding: R2_BINDING, clock, maxResponseBytes: 4_096, maxBufferedResponseBytes: 160,
+    });
+    let events: ReturnType<RunHandle["events"]> | undefined;
+    try {
+      await harness.start();
+      const handle = await commitR2(harness, harness.session.run(BODY));
+      void handle.final.catch(() => undefined);
+      const requestId = harness.requestIdentity().requestId;
+      const firstSequence = harness.sidecarSequence;
+      harness.publish([0, 1].map(eventIndex => ({
+        kind: "response_event" as const, requestId, eventIndex,
+        event: "response.output_text.delta", partIndex: 0, partCount: 1, offset: 0,
+        dataBase64Url: base64UrlEncode(utf8Bytes("x".repeat(100))),
+      })), { lane: "data" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        inboundAcceptedEpoch: 1, inboundAcceptedSequence: firstSequence + 1,
+        inboundProcessedEpoch: 1, inboundProcessedSequence: firstSequence,
+        inboundProcessingFrames: 1,
+      });
+      clock.value += 40;
+      attachReceiveEvidence(harness);
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        inboundAcceptedProgressAgeMs: 40, inboundProcessedProgressAgeMs: 40,
+        inboundProcessingFrames: 1, sidecarDiagnosticsAgeMs: 0,
+        sidecarPendingAgeMs: null, sidecarPendingDataPublications: 0,
+      });
+
+      events = handle.events();
+      await expect(events.next()).resolves.toMatchObject({ done: false });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        inboundAcceptedSequence: firstSequence + 1,
+        inboundProcessedSequence: firstSequence + 1,
+        inboundAcceptedProgressAgeMs: 40, inboundProcessedProgressAgeMs: 0,
+        inboundProcessingFrames: 0,
+      });
+      expect(Math.max(...harness.hostEnvelopes.map(envelope => envelope.ack.sequence)))
+        .toBe(firstSequence + 1);
+    } finally {
+      await events?.return(undefined);
+      await harness.close();
+    }
+  });
+
+  it("refreshes receive evidence only for new exact control samples rather than cached or foreign diagnostics", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    try {
+      await harness.start();
+      const sample = attachReceiveEvidence(harness);
+      sample.value = receiveEvidence(100, { dataPublicationsTotal: 10 });
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        sidecarDiagnosticsAgeMs: 0, sidecarPendingAgeMs: 0, sidecarPendingDataPublications: 0,
+      });
+
+      clock.value += 50;
+      sample.value = receiveEvidence(100, { dataPublicationsTotal: 11 });
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      const acceptedRevision = harness.session.snapshot().diagnostics!.host.lastControlRevision!;
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        controlPeerAgeMs: 0, sidecarDiagnosticsAgeMs: 50,
+        sidecarPendingAgeMs: 50, sidecarPendingDataPublications: 0,
+      });
+      expect(harness.session.snapshot().diagnostics!.sidecar!.transport.dataPublicationsTotal).toBe(10);
+
+      clock.value += 25;
+      sample.value = receiveEvidence(200, { dataPublicationsTotal: 99, flightCompletionsTotal: 1 });
+      harness.publish([], { lane: "control", targetInstanceId: "foreign-host" });
+      harness.publish([], { lane: "control", revision: acceptedRevision });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        lastControlRevision: acceptedRevision, controlPeerAgeMs: 25,
+        sidecarDiagnosticsAgeMs: 75, sidecarPendingAgeMs: 75,
+        sidecarPendingDataPublications: 0,
+      });
+
+      clock.value += 25;
+      sample.value = receiveEvidence(101, { dataPublicationsTotal: 12 });
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        sidecarDiagnosticsAgeMs: 0, sidecarPendingAgeMs: 100, sidecarPendingDataPublications: 2,
+      });
+      clock.value += 20;
+      harness.publish([], { lane: "data" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        dataPeerAgeMs: 0, sidecarDiagnosticsAgeMs: 20, sidecarPendingAgeMs: 120,
+      });
+      sample.value = receiveEvidence(102, { windowFrames: 0, windowBytes: 0 });
+      harness.publish([], { lane: "control" });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        sidecarDiagnosticsAgeMs: 0, sidecarPendingAgeMs: null, sidecarPendingDataPublications: 0,
+      });
+    } finally { await harness.close(); }
+  });
+
+  it("requires a new accepted frame for receive-only reconnect even when fresh control pongs succeed", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock, autoPong: true });
+    harness.host.reconnect = async () => undefined;
+    await harness.start();
+    const sample = attachReceiveEvidence(harness);
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    const timers = livenessTimers(clock);
+    const controller = new AbortController();
+    try {
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        windowFrames: 0, inboundAcceptedSequence: -1, inboundProcessingFrames: 0,
+        sidecarPendingAgeMs: 0,
+      });
+      const reconnecting = harness.session.reconnectAwareness("data", controller.signal);
+      void reconnecting.catch(() => undefined);
+      expect(harness.session.reconnectAwareness("data")).toBe(reconnecting);
+      await harness.network.flushAll();
+      sample.value = receiveEvidence(2, { dataPublicationsTotal: 2 });
+      const probing = harness.session.probeLiveness(controller.signal);
+      await harness.network.flushAll();
+      await expect(probing).resolves.toMatchObject({ sentAtMs: clock.now(), rttMs: 0 });
+      timers.advance(25);
+      expect(await promiseState(reconnecting)).toBe("pending");
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        controlPeerAgeMs: 25, inboundAcceptedSequence: -1,
+      });
+
+      harness.publish([{ kind: "pong", sentAtMs: clock.now() }], { lane: "data" });
+      await harness.settle();
+      timers.advance(25);
+      await expect(reconnecting).resolves.toBeUndefined();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        inboundAcceptedSequence: 0, inboundProcessedSequence: 0, inboundProcessingFrames: 0,
+      });
+      expect(timers.pending.size).toBe(0);
+      expect(harness.hostFrames.size).toBe(0);
+      expect(harness.session.snapshot().quarantined).toBe(0);
+    } finally {
+      controller.abort();
+      timers.restore();
+      await harness.close();
+    }
+  });
+
+  it("requires a fresh peer flight completion to prove receive recovery after a lost return ACK", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock, autoPong: true });
+    harness.host.reconnect = async () => undefined;
+    await harness.start();
+    let dropAcknowledgement = true;
+    const publish = harness.host.publish.bind(harness.host);
+    harness.host.publish = (envelope, lane) => {
+      if (dropAcknowledgement && envelope.ack.sequence >= 0) return;
+      publish(envelope, lane);
+    };
+    harness.publish([{ kind: "pong", sentAtMs: clock.now() }], { lane: "data" });
+    await harness.settle();
+    expect(harness.sidecarOutstanding).toHaveLength(1);
+    const sample = attachReceiveEvidence(harness);
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    const timers = livenessTimers(clock);
+    const controller = new AbortController();
+    try {
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        windowFrames: 0, inboundAcceptedSequence: 0, inboundProcessedSequence: 0,
+        inboundProcessingFrames: 0, sidecarPendingAgeMs: 0,
+      });
+      dropAcknowledgement = false;
+      const reconnecting = harness.session.reconnectAwareness("data", controller.signal);
+      void reconnecting.catch(() => undefined);
+      expect(harness.session.reconnectAwareness("data")).toBe(reconnecting);
+      await harness.settle();
+      expect(harness.sidecarOutstanding).toHaveLength(0);
+      expect(harness.hostEnvelopes.at(-1)!.ack).toEqual({ epoch: 1, sequence: 0 });
+      sample.value = receiveEvidence(2, { dataPublicationsTotal: 2 });
+      const probing = harness.session.probeLiveness(controller.signal);
+      await harness.network.flushAll();
+      await expect(probing).resolves.toMatchObject({ rttMs: 0 });
+      timers.advance(25);
+      expect(await promiseState(reconnecting)).toBe("pending");
+
+      // Neither a new control revision carrying an old sample nor a foreign
+      // target can claim that the sidecar consumed the replayed cumulative ACK.
+      sample.value = receiveEvidence(2, { windowFrames: 0, windowBytes: 0, flightCompletionsTotal: 1 });
+      harness.publish([], { lane: "control" });
+      await harness.network.flushAll();
+      timers.advance(25);
+      expect(await promiseState(reconnecting)).toBe("pending");
+      sample.value = receiveEvidence(3, { windowFrames: 0, windowBytes: 0, flightCompletionsTotal: 1 });
+      harness.publish([], { lane: "control", targetInstanceId: "foreign-host" });
+      await harness.network.flushAll();
+      timers.advance(25);
+      expect(await promiseState(reconnecting)).toBe("pending");
+
+      harness.publish([], { lane: "control" });
+      await harness.network.flushAll();
+      timers.advance(25);
+      await expect(reconnecting).resolves.toBeUndefined();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        inboundAcceptedSequence: 0, inboundProcessedSequence: 0,
+        sidecarPendingAgeMs: null,
+      });
+      expect(timers.pending.size).toBe(0);
+      expect(harness.hostFrames.size).toBe(0);
+      expect(harness.session.snapshot().quarantined).toBe(0);
+    } finally {
+      controller.abort();
+      timers.restore();
+      await harness.close();
+    }
+  });
+
+  it("reuses the receive-reconnect promise and clears its timers when aborted", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({ binding: R2_BINDING, clock });
+    harness.host.reconnect = async () => undefined;
+    await harness.start();
+    attachReceiveEvidence(harness);
+    harness.publish([], { lane: "control" });
+    await harness.settle();
+    const timers = livenessTimers(clock);
+    const first = new AbortController();
+    const second = new AbortController();
+    try {
+      const reconnecting = harness.session.reconnectAwareness("data", first.signal);
+      const rejected = reconnecting.catch(error => error);
+      expect(harness.session.reconnectAwareness("data")).toBe(reconnecting);
+      await harness.network.flushAll();
+      expect(timers.pending.size).toBe(2);
+      first.abort(new DOMException("offline reconnect cancelled", "AbortError"));
+      await expect(rejected).resolves.toMatchObject({ name: "AbortError" });
+      expect(timers.pending.size).toBe(0);
+
+      const next = harness.session.reconnectAwareness("data", second.signal);
+      const nextRejected = next.catch(error => error);
+      expect(next).not.toBe(reconnecting);
+      await harness.network.flushAll();
+      expect(timers.pending.size).toBe(2);
+      second.abort();
+      await expect(nextRejected).resolves.toMatchObject({ name: "AbortError" });
+      expect(timers.pending.size).toBe(0);
+      expect(harness.session.snapshot().quarantined).toBe(0);
+      expect(harness.hostFrames.size).toBe(0);
+    } finally {
+      first.abort(); second.abort();
+      timers.restore();
+      await harness.close();
+    }
+  });
+
+  it("spaces host fast retransmission after the timer has already resent the flight", async () => {
+    const clock = new ReceiptClock();
+    const timer = new HeldPublicationTimer(clock);
+    const nativeTimers = livenessTimers(clock);
+    const harness = new TransportHarness({
+      binding: R2_BINDING, clock, publicationTimer: timer, retransmitMs: 1_000,
+    });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await harness.start();
+      pending = harness.session.run(BODY);
+      void pending.catch(() => undefined);
+      await harness.settle();
+      timer.flush();
+      await harness.settle();
+      const original = harness.hostEnvelopes.filter(envelope => envelope.lane === "data").at(-1)!;
+      expect(original.frames.length).toBeGreaterThan(0);
+      nativeTimers.advance(1_600);
+      await harness.settle();
+      const retransmissions = harness.session.snapshot().retransmissions;
+      expect(retransmissions).toBe(1);
+      harness.publish([], { lane: "control", ackSequence: -1 });
+      await harness.settle();
+      expect(harness.session.snapshot().retransmissions).toBe(retransmissions);
+      expect(harness.hostEnvelopes.filter(envelope => envelope.lane === "data").at(-1)!.frames)
+        .toEqual(original.frames);
+    } finally {
+      await harness.close();
+      await pending?.catch(() => undefined);
+      nativeTimers.restore();
+    }
+  });
+
   it("fails admission closed and fast-retransmits when a live peer leaves an ACK stale", async () => {
     const harness = new TransportHarness({
       retransmitMs: 10_000,
@@ -1917,6 +2324,57 @@ describe("V2TransportSession", () => {
 
     await harness.close();
     await expect(pending).rejects.toBeDefined();
+  });
+
+  it("keeps ten A03-like cold flights prefetch-admissible below the sixty-second default", async () => {
+    const clock = new ReceiptClock();
+    const harnesses = Array.from({ length: 8 }, () => new TransportHarness({
+      binding: R2_BINDING,
+      transportProfile: "bulk-v1",
+      clock,
+      retransmitMs: 60_000,
+    }));
+    const controllers = Array.from({ length: 10 }, () => new AbortController());
+    const pending: Promise<unknown>[] = [];
+    try {
+      await Promise.all(harnesses.map(harness => harness.start()));
+      const body = createExactSizedV2Request(1024 * 1024, 211, "incompressible");
+      for (let index = 0; index < controllers.length; index++) {
+        pending.push(harnesses[index % harnesses.length]!.session.run(
+          body,
+          controllers[index]!.signal,
+        ));
+      }
+      await Promise.all(harnesses.map((harness, index) => harness.settleUntil(
+        () => harness.session.snapshot().active === (index < 2 ? 2 : 1),
+      )));
+
+      clock.value += 39_249;
+      for (const harness of harnesses) {
+        harness.publish([], { lane: "control", ackSequence: -1 });
+      }
+      await Promise.all(harnesses.map(harness => harness.settle()));
+
+      expect(harnesses.reduce(
+        (total, harness) => total + harness.session.snapshot().active +
+          (harness.session.snapshot().prefetched ?? 0),
+        0,
+      )).toBe(10);
+      expect(harnesses.every(harness => harness.session.snapshot().prefetchCredits! > 0)).toBe(true);
+      expect(harnesses.every(harness => (
+        harness.session.snapshot().diagnostics!.host.schedulerFrames < 128 &&
+        harness.session.snapshot().diagnostics!.host.schedulerBytes < 256 * 1024 &&
+        harness.session.snapshot().diagnostics!.host.stallEventsTotal === 0
+      ))).toBe(true);
+      const publishedOpens = harnesses.flatMap(harness => [...harness.hostFrames.values()]
+        .filter(frame => frame.kind === "request_open"));
+      expect(publishedOpens).toHaveLength(8);
+      expect(new Set(publishedOpens.map(frame => frame.requestId)).size).toBe(8);
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await Promise.all(harnesses.map(harness => harness.close()));
+      await Promise.allSettled(pending);
+    }
   });
 
   it("rejects over-deep direct transport bodies before recursive canonicalization", async () => {
@@ -2689,6 +3147,27 @@ describe("V2TransportSession", () => {
     expect(harness.session.snapshot().quarantined).toBe(1);
     expect([...harness.hostFrames.values()].some(frame => frame.kind === "response_ack")).toBe(false);
     await harness.close();
+  });
+
+  it("coalesces processed-frame ACKs into one immediate ACK at the flight boundary", async () => {
+    const scheduled = new Map<PublicationTimerHandle, () => void>();
+    const timer: PublicationTimer = {
+      now: () => 0,
+      set(callback) { const handle = {}; scheduled.set(handle, callback); return handle; },
+      clear: handle => { scheduled.delete(handle); },
+      defer: callback => queueMicrotask(callback),
+    };
+    const harness = new TransportHarness({ binding: R2_BINDING, publicationTimer: timer });
+    try {
+      await harness.start();
+      const before = harness.hostEnvelopes.length;
+      harness.publish(Array.from({ length: 32 }, (_, sentAtMs) => ({ kind: "pong" as const, sentAtMs })));
+      await harness.settle();
+      const acknowledgements = harness.hostEnvelopes.slice(before)
+        .filter(envelope => envelope.ack.sequence >= 0);
+      expect(acknowledgements.map(envelope => envelope.ack.sequence)).toEqual([31]);
+      expect(scheduled.size).toBe(0);
+    } finally { await harness.close(); }
   });
 
   it("withholds the cumulative ACK until a full client buffer has space", async () => {
@@ -3646,55 +4125,60 @@ describe("V2TransportSession", () => {
     });
   }
 
-  for (const origin of ["http", "sse"] as const) {
-    for (const ambiguous of [false, true]) {
-      it(`${ambiguous ? "quarantines unproven" : "releases all admission capacity for definitive"} ${origin} model-unavailable outcomes`, async () => {
-        const harness = new TransportHarness({ binding: R2_BINDING });
-        try {
-          await harness.start();
-          const baseline = harness.session.snapshot();
-          const handle = await commitR2(harness, harness.session.run(BODY));
-          const providerError = await createProviderErrorEnvelope({
-            origin,
-            status: 404,
-            model: BODY.model,
-            value: { error: {
-              message: "The requested model is unavailable",
-              type: "invalid_request_error",
-              param: "model",
-              code: "model_not_found",
-            } },
-          });
-          harness.credits = 128;
-          harness.publish([{
-            kind: "response_error",
-            requestId: harness.requestIdentity().requestId,
-            code: "model_not_found",
-            message: providerError.error.message,
-            ambiguous,
-            providerError,
-          }]);
-          await harness.settle();
-          await expect(handle.final).rejects.toMatchObject({
-            committed: true,
-            ambiguous,
-            code: "model_not_found",
-            providerError: { origin },
-          });
-          expect(harness.session.snapshot()).toMatchObject({
-            connected: true,
-            active: 0,
-            committed: 0,
-            queued: 0,
-            quarantined: ambiguous ? 1 : 0,
-            ambiguousQuarantined: ambiguous ? 1 : 0,
-            admissionCredits: baseline.admissionCredits! - (ambiguous ? 1 : 0),
-            transferCredits: baseline.transferCredits,
-          });
-        } finally {
-          await harness.close();
-        }
-      });
+  for (const rejection of [
+    { label: "model-unavailable", status: 404, code: "model_not_found", type: "invalid_request_error", param: "model", message: "The requested model is unavailable" },
+    { label: "long TPM rate-limit", status: 429, code: "rate_limit_exceeded", type: "rate_limit_error", param: null, message: "Rate limit reached on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 609930. Please try again in 914ms. ".repeat(8) },
+  ] as const) {
+    for (const origin of ["http", "sse"] as const) {
+      for (const ambiguous of [false, true]) {
+        it(`${ambiguous ? "quarantines unproven" : "releases all admission capacity for definitive"} ${origin} ${rejection.label} outcomes`, async () => {
+          const harness = new TransportHarness({ binding: R2_BINDING });
+          try {
+            await harness.start();
+            const baseline = harness.session.snapshot();
+            const handle = await commitR2(harness, harness.session.run(BODY));
+            const providerError = await createProviderErrorEnvelope({
+              origin,
+              status: rejection.status,
+              model: BODY.model,
+              value: { error: {
+                message: rejection.message,
+                type: rejection.type,
+                param: rejection.param,
+                code: rejection.code,
+              } },
+            });
+            harness.credits = 128;
+            harness.publish([{
+              kind: "response_error",
+              requestId: harness.requestIdentity().requestId,
+              code: rejection.code,
+              message: providerError.error.message.slice(0, 512),
+              ambiguous,
+              providerError,
+            }]);
+            await harness.settle();
+            await expect(handle.final).rejects.toMatchObject({
+              committed: true,
+              ambiguous,
+              code: rejection.code,
+              providerError: { origin },
+            });
+            expect(harness.session.snapshot()).toMatchObject({
+              connected: true,
+              active: 0,
+              committed: 0,
+              queued: 0,
+              quarantined: ambiguous ? 1 : 0,
+              ambiguousQuarantined: ambiguous ? 1 : 0,
+              admissionCredits: baseline.admissionCredits! - (ambiguous ? 1 : 0),
+              transferCredits: baseline.transferCredits,
+            });
+          } finally {
+            await harness.close();
+          }
+        });
+      }
     }
   }
 
@@ -4415,7 +4899,7 @@ describe("V2TransportSession", () => {
       name: "V2PreCommitError",
       code: "cancelled_precommit",
     });
-    expect(queued.session.snapshot().queued).toBe(0);
+    expect(queued.session.snapshot()).toMatchObject({ queued: 0, retainedPrecommitCancellations: 0 });
     await queued.close();
 
     const published = new TransportHarness();
@@ -4467,6 +4951,417 @@ describe("V2TransportSession", () => {
     await committed.settle();
     expect(committed.session.snapshot().quarantined).toBe(0);
     await committed.close();
+  });
+
+  it("recovers admission during repeated mixed cancellation waves while upstream work stays active", async () => {
+    const clock = new ReceiptClock();
+    const timer = new HeldPublicationTimer(clock);
+    const harness = new TransportHarness({
+      binding: R2_BINDING, transportProfile: "bulk-v1", clock,
+      // Short deterministic override for this stall/cancellation boundary.
+      publicationTimer: timer, retransmitMs: 60_000, transportStallMs: 2_000,
+      terminalReceiptCoalescing: false,
+    });
+    const admission = new AdmissionController({
+      physicalMax: 8, acceptedMax: 128, hostCeiling: 8,
+      memoryBudgetBytes: 64 * 1024 * 1024, clock,
+    });
+    const journal = new ClaimJournal({ storage: new FakeSidecarStorage([]), flushIntervalMs: 0, maxBatch: 64 });
+    const emitted: SidecarFrame[] = [];
+    const executions = new Map<string, number>();
+    const finishUpstream = new Map<string, () => void>();
+    const completed = new Set<string>();
+    const prepared = new Set<string>();
+    const controllers: AbortController[] = [];
+    const runs: Promise<unknown>[] = [];
+    const failures: unknown[] = [];
+    const engine = new R10SidecarEngine({
+      binding: R2_BINDING, assembler: new RequestAssembler(), journal, admission,
+      assertExecutionFence: () => undefined,
+      upstream: { execute: async input => {
+        const label = String(JSON.parse(new TextDecoder().decode(input.body)).metadata.fixture);
+        await input.beforeFetch();
+        await input.onPrelude?.({ status: 200, contentType: "text/event-stream", upstreamRequestId: null });
+        executions.set(label, (executions.get(label) ?? 0) + 1);
+        await new Promise<void>(resolve => { finishUpstream.set(label, resolve); });
+        return completedUpstream({ ...input, beforeFetch: async () => undefined }, label);
+      } },
+      emit: frame => { emitted.push(frame); },
+    });
+    const processedReady = new Set<number>();
+    const acceptTails = new Map<string, Promise<void>>();
+    let acceptedSequence = -1;
+    let processedAck = -1;
+    let deliveredAck = -1;
+    let appliedControlRevision = -1;
+    let anchorMustRemainActive = false;
+    const exchange = async (holdAck = false): Promise<void> => {
+      timer.flush();
+      await harness.settle(2);
+      const control = harness.hostEnvelopes.filter(envelope => envelope.lane === "control").at(-1);
+      if (control && control.revision > appliedControlRevision) {
+        appliedControlRevision = control.revision;
+        engine.setHostCeiling(control.credits);
+      }
+      for (const frame of [...harness.hostFrames.values()].sort((left, right) => left.sequence - right.sequence)) {
+        if (frame.sequence <= acceptedSequence) continue;
+        acceptedSequence = frame.sequence;
+        const key = "requestId" in frame ? frame.requestId : "control";
+        const next = (acceptTails.get(key) ?? Promise.resolve()).then(() => engine.accept(frame)).then(() => {
+          processedReady.add(frame.sequence);
+          while (processedReady.delete(processedAck + 1)) processedAck++;
+        }).catch(error => { failures.push(error); });
+        acceptTails.set(key, next);
+      }
+      await harness.settle(2);
+      const ack = holdAck ? deliveredAck : processedAck;
+      if (!holdAck) deliveredAck = ack;
+      harness.credits = engine.snapshot().credits;
+      const frames = emitted.splice(0);
+      if (frames.length > 0) harness.publish(frames, { lane: "data", ackSequence: ack });
+      harness.publish([], { lane: "control", ackSequence: ack });
+      await harness.settle(2);
+      expect(failures).toEqual([]);
+      if (anchorMustRemainActive) {
+        expect(harness.session.snapshot().active).toBeGreaterThan(0);
+        expect(admission.snapshot().active).toBeGreaterThan(0);
+      }
+      expect(harness.session.snapshot().diagnostics!.host.windowFrames).toBeLessThanOrEqual(128);
+      expect(harness.session.snapshot().retainedPrecommitCancellations!).toBeLessThanOrEqual(6);
+    };
+    const progressUntil = async (predicate: () => boolean, holdAck = false): Promise<void> => {
+      for (let step = 0; step < 120; step++) {
+        await exchange(holdAck);
+        if (predicate()) return;
+      }
+      throw new Error("Controlled mixed-workload exchange exhausted its bounded progress steps");
+    };
+    const start = (label: string, body: Record<string, unknown> = BODY) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      const run = harness.session.run({ ...body, metadata: { fixture: label } }, controller.signal, {
+        onAdmissionProgress: progress => { if (progress.stage === "request_prepared") prepared.add(label); },
+      }).then(async handle => {
+        const [final] = await Promise.all([handle.final, Array.fromAsync(handle.events())]);
+        releaseAtomicBytePermit(final);
+        completed.add(label);
+        return final;
+      }).catch(error => {
+        if (error?.code !== "cancelled_precommit" && error?.code !== "cancelled") failures.push(error);
+        return error;
+      });
+      runs.push(run);
+      return { controller, run };
+    };
+    try {
+      await engine.start();
+      await harness.start();
+      start("anchor");
+      await progressUntil(() => executions.get("anchor") === 1 && harness.session.snapshot().committed === 1);
+      anchorMustRemainActive = true;
+      await progressUntil(() => harness.session.snapshot().diagnostics!.host.windowFrames === 0);
+      for (let wave = 0; wave < 4; wave++) {
+        const cancelled = `cancelled-${wave}`;
+        const tiny = `tiny-${wave}`;
+        const medium = `medium-${wave}`;
+        const cancellation = start(cancelled);
+        start(tiny);
+        start(medium, createExactSizedV2Request(384 * 1024, 100 + wave, "incompressible"));
+        await harness.settleUntil(() => harness.session.snapshot().active === 4);
+        await exchange(true);
+        expect(harness.session.snapshot().diagnostics!.host.windowFrames).toBeGreaterThan(0);
+        await progressUntil(() => prepared.has(tiny), true);
+        expect(executions.has(tiny)).toBe(false);
+        // Preserve the already-running anchor while the new flight's ACK is
+        // delayed. Prepared proofs may arrive before that flight's final ACK.
+        clock.value += 17_636;
+        await exchange(true);
+        expect(harness.session.snapshot().admissionBlockReason).toBe("transport_congested");
+        cancellation.controller.abort();
+        expect(await cancellation.run).toMatchObject({ code: "cancelled_precommit", committed: false });
+        expect(harness.session.snapshot().retainedPrecommitCancellations).toBe(1);
+        await harness.session.resumeAwareness();
+        await exchange(true);
+        expect(harness.session.snapshot().retainedPrecommitCancellations).toBe(1);
+        // An older cumulative ACK cannot release the cancellation or advance
+        // execution. Then resume monotonically advancing processed ACKs.
+        harness.publish([], { lane: "control", ackSequence: Math.max(-1, deliveredAck - 1) });
+        await harness.settle(2);
+        await progressUntil(() => executions.get(tiny) === 1 && executions.get(medium) === 1);
+        expect(executions.has(cancelled)).toBe(false);
+        await progressUntil(() => harness.session.snapshot().retainedPrecommitCancellations === 0);
+        expect(harness.session.snapshot()).toMatchObject({ connected: true, quarantined: 0 });
+        expect(harness.session.snapshot().active).toBeGreaterThanOrEqual(3);
+        expect(harness.session.snapshot().admissionCredits).toBeGreaterThan(0);
+        finishUpstream.get(tiny)!();
+        finishUpstream.get(medium)!();
+        await progressUntil(() => completed.has(tiny) && completed.has(medium));
+        await progressUntil(() => (
+          harness.session.snapshot().active === 1 &&
+          harness.session.snapshot().diagnostics!.host.windowFrames === 0 &&
+          harness.session.snapshot().diagnostics!.host.schedulerFrames === 0
+        ));
+        expect(harness.session.snapshot()).toMatchObject({
+          committed: 1, active: 1, queued: 0, retainedPrecommitCancellations: 0,
+          admissionCredits: 4, transferCredits: v2HostTransferBudget("bulk-v1"),
+        });
+        expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
+        expect(executions.get("anchor")).toBe(1);
+      }
+      anchorMustRemainActive = false;
+      finishUpstream.get("anchor")!();
+      await progressUntil(() => completed.has("anchor"));
+      await progressUntil(() => harness.session.snapshot().diagnostics!.host.windowFrames === 0);
+      expect(executions.size).toBe(9);
+      expect([...executions.values()]).toEqual(Array.from({ length: 9 }, () => 1));
+      expect(harness.session.snapshot()).toMatchObject({
+        active: 0, queued: 0, retainedPrecommitCancellations: 0, quarantined: 0,
+        admissionCredits: 4, diagnostics: { host: { windowFrames: 0, schedulerFrames: 0 } },
+      });
+      expect(admission.snapshot()).toMatchObject({ active: 0, queued: 0, reservedBytes: 0 });
+    } finally {
+      for (const controller of controllers) controller.abort();
+      for (const finish of finishUpstream.values()) finish();
+      admission.setHostCeiling(8);
+      await harness.close();
+      await Promise.all(acceptTails.values());
+      await engine.drain("mixed workload cleanup");
+      await journal.close();
+      await Promise.all(runs);
+    }
+  }, 20_000);
+
+  it("retains each cancelled flight credit once while concurrent live work continues", async () => {
+    const clock = new ReceiptClock();
+    const timer = new HeldPublicationTimer(clock);
+    const harness = new TransportHarness({
+      binding: R2_BINDING, clock, publicationTimer: timer,
+      // Short deterministic override; the selected host default is 60 seconds.
+      retransmitMs: 60_000, transportStallMs: 2_000,
+    });
+    const controllers = Array.from({ length: 4 }, () => new AbortController());
+    const pending: Promise<unknown>[] = [];
+    try {
+      await harness.start();
+      timer.flush();
+      await harness.settle();
+      for (let index = 0; index < 3; index++) {
+        pending.push(harness.session.run({ ...BODY, input: `concurrent-${index}` }, controllers[index]!.signal)
+          .catch(error => error));
+      }
+      await harness.settleUntil(() => harness.session.snapshot().active === 3);
+      timer.flush();
+      await harness.settle();
+      const originalFlight = harness.hostEnvelopes.find(envelope => envelope.frames.length > 0)!;
+      expect(originalFlight.frames.filter(frame => frame.kind === "request_commit")).toHaveLength(3);
+      controllers[0]!.abort();
+      controllers[1]!.abort();
+      const cancelled = await Promise.all(pending.slice(0, 2));
+      const transferSettlements = cancelled.map(value => {
+        expect(value).toBeInstanceOf(V2PreCommitError);
+        const settlement = (value as V2PreCommitError).transportSettlement;
+        expect(settlement).toBeInstanceOf(Promise);
+        return settlement!;
+      });
+      let settledTransfers = 0;
+      for (const settlement of transferSettlements) {
+        void settlement.then(() => { settledTransfers++; });
+      }
+      await harness.settle();
+      expect(settledTransfers).toBe(0);
+      expect(harness.session.snapshot()).toMatchObject({
+        active: 1, retainedPrecommitCancellations: 2, admissionCredits: 1, quarantined: 0,
+        diagnostics: { host: { retainedPrecommitCancellations: 2 } },
+      });
+      await harness.session.resumeAwareness();
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({ active: 1, retainedPrecommitCancellations: 2 });
+      // Retained cancellation credits occupy their original slots. The one
+      // remaining admission slot is usable by independent live work.
+      pending.push(harness.session.run({ ...BODY, input: "following-live" }, controllers[3]!.signal)
+        .catch(error => error));
+      await harness.settleUntil(() => harness.session.snapshot().active === 2);
+      expect(harness.session.snapshot()).toMatchObject({ retainedPrecommitCancellations: 2, admissionCredits: 0 });
+      harness.publish([], { lane: "control", ackSequence: originalFlight.frames.at(-1)!.sequence });
+      await harness.settle();
+      timer.flush();
+      await harness.settle();
+      const cancellations = [...harness.hostFrames.values()].filter(frame => frame.kind === "request_cancel");
+      expect(cancellations).toHaveLength(2);
+      expect(harness.session.snapshot().retainedPrecommitCancellations).toBe(2);
+      const finalCancelSequence = Math.max(...cancellations.map(frame => frame.sequence));
+      harness.publish([], { lane: "control", ackEpoch: 0, ackSequence: finalCancelSequence });
+      await harness.settle();
+      expect(harness.session.snapshot().retainedPrecommitCancellations).toBe(2);
+      const stateChangesBeforeCancellationAck = harness.stateChanges;
+      harness.publish([], { lane: "control", ackSequence: finalCancelSequence });
+      await harness.settle();
+      await Promise.all(transferSettlements);
+      expect(settledTransfers).toBe(2);
+      expect(harness.session.snapshot()).toMatchObject({
+        active: 2, retainedPrecommitCancellations: 0, admissionCredits: 2,
+        diagnostics: { host: { retainedPrecommitCancellations: 0 } },
+      });
+      expect(harness.stateChanges).toBeGreaterThan(stateChangesBeforeCancellationAck);
+      harness.publish([], { lane: "control", ackSequence: finalCancelSequence });
+      await harness.settle();
+      expect(harness.session.snapshot()).toMatchObject({ active: 2, retainedPrecommitCancellations: 0, admissionCredits: 2 });
+      expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_start")).toBe(false);
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await harness.close();
+      await Promise.all(pending);
+      expect(harness.session.snapshot()).toMatchObject({
+        retainedPrecommitCancellations: 0,
+        diagnostics: { host: { retainedPrecommitCancellations: 0, windowFrames: 0, schedulerFrames: 0, oldestOutstandingFrameKind: null, outstandingFlightAgeMs: null } },
+      });
+    }
+  });
+
+  it.each(["close", "sidecar recovery"] as const)("releases cancelled partial-flight ownership on %s", async operation => {
+    const harness = new TransportHarness({ binding: R2_BINDING, transportProfile: "bulk-v1", retransmitMs: 60_000 });
+    const controller = new AbortController();
+    try {
+      await harness.start();
+      const pending = harness.session.run(createExactSizedV2Request(2 * 1024 * 1024, 93, "incompressible"), controller.signal)
+        .catch(error => error);
+      await harness.settleUntil(() => harness.hostEnvelopes.some(envelope => (
+        envelope.frames.some(frame => frame.kind === "request_data")
+      )));
+      expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_commit")).toBe(false);
+      controller.abort();
+      const failure = await pending;
+      expect(failure).toBeInstanceOf(V2PreCommitError);
+      const transportSettlement = (failure as V2PreCommitError).transportSettlement;
+      expect(transportSettlement).toBeInstanceOf(Promise);
+      let settled = false;
+      void transportSettlement!.then(() => { settled = true; });
+      await harness.settle();
+      expect(settled).toBe(false);
+      expect(harness.session.snapshot()).toMatchObject({ active: 0, retainedPrecommitCancellations: 1, quarantined: 0 });
+      if (operation === "close") await harness.close();
+      else await harness.session.suspendSidecarRecovery("cancelled partial-flight test");
+      await transportSettlement;
+      expect(settled).toBe(true);
+      expect(harness.session.snapshot()).toMatchObject({
+        connected: false, retainedPrecommitCancellations: 0,
+        diagnostics: { host: { retainedPrecommitCancellations: 0, windowFrames: 0, schedulerFrames: 0, oldestOutstandingFrameKind: null, outstandingFlightAgeMs: null } },
+      });
+    } finally {
+      controller.abort();
+      await harness.close();
+    }
+  });
+
+  it("keeps a cancelled retained commit admissible when liveness control overtakes its delayed flight", async () => {
+    const clock = new ReceiptClock();
+    const harness = new TransportHarness({
+      binding: R2_BINDING,
+      clock,
+      autoPong: true,
+      retransmitMs: 60_000,
+      // Short deterministic override for the retained-credit boundary.
+      transportStallMs: 2_000,
+    });
+    const admission = new AdmissionController({
+      physicalMax: 8, acceptedMax: 128, hostCeiling: 8,
+      memoryBudgetBytes: 64 * 1024 * 1024,
+      clock,
+    });
+    const journal = new ClaimJournal({
+      storage: new FakeSidecarStorage([]), flushIntervalMs: 0, maxBatch: 64,
+    });
+    const sidecarFrames: SidecarFrame[] = [];
+    let upstreamCalls = 0;
+    const engine = new R10SidecarEngine({
+      binding: R2_BINDING,
+      assembler: new RequestAssembler(),
+      journal,
+      admission,
+      assertExecutionFence: () => undefined,
+      upstream: { execute: async () => { upstreamCalls++; throw new Error("unexpected execution"); } },
+      emit: frame => { sidecarFrames.push(frame); },
+    });
+    const controller = new AbortController();
+    let commit: Promise<void> | undefined;
+    try {
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        retainedPrecommitCancellations: 0, lastPublishedHostCreditCeiling: null,
+        oldestOutstandingFrameKind: null, outstandingFlightAgeMs: null,
+      });
+      await engine.start();
+      await harness.start();
+      const outcome = harness.session.run(BODY, controller.signal).catch(error => error);
+      await harness.settleUntil(() => harness.hostEnvelopes.some(envelope => (
+        envelope.frames.some(frame => frame.kind === "request_commit")
+      )));
+      const delayedFlight = harness.hostEnvelopes.find(envelope => (
+        envelope.frames.some(frame => frame.kind === "request_commit")
+      ))!;
+      // Explicitly advance the injected clock while keeping the original data
+      // flight undelivered, independently of test execution speed.
+      clock.value += 2_001;
+      harness.publish([], { lane: "control", ackSequence: -1 });
+      await harness.settle();
+      expect(harness.session.snapshot().admissionBlockReason).toBe("transport_congested");
+      controller.abort();
+      expect(await outcome).toMatchObject({ code: "cancelled_precommit", committed: false });
+      const probe = harness.session.probeLiveness();
+      await harness.settle();
+      await probe;
+      const control = harness.hostEnvelopes.filter(envelope => envelope.lane === "control").at(-1)!;
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({
+        retainedPrecommitCancellations: 1,
+        lastPublishedHostCreditCeiling: 1,
+        oldestOutstandingFrameKind: "request_open",
+        outstandingFlightAgeMs: 2_001,
+      });
+      for (const envelope of harness.hostEnvelopes) {
+        const serialized = JSON.stringify(envelope);
+        expect(serialized).not.toContain("retainedPrecommitCancellations");
+        expect(serialized).not.toContain("lastPublishedHostCreditCeiling");
+        expect(serialized).not.toContain("oldestOutstandingFrameKind");
+        expect(serialized).not.toContain("outstandingFlightAgeMs");
+      }
+      // R10 applies host credits only from the independent control lane. Its
+      // normal liveness ping can arrive before this original immutable flight.
+      engine.setHostCeiling(control.credits);
+      let commitCompleted = false;
+      for (const frame of delayedFlight.frames) {
+        if (frame.kind === "request_commit") {
+          commit = engine.accept(frame).then(() => { commitCompleted = true; });
+        } else await engine.accept(frame);
+      }
+      await harness.settle();
+      expect({
+        credits: control.credits,
+        commitCompleted,
+        admissionQueued: admission.snapshot().queued,
+        prepared: sidecarFrames.some(frame => frame.kind === "request_prepared"),
+      }).toEqual({ credits: 1, commitCompleted: true, admissionQueued: 0, prepared: true });
+      expect(upstreamCalls).toBe(0);
+      expect([...harness.hostFrames.values()].some(frame => frame.kind === "request_cancel")).toBe(false);
+      // Processed commit ACK is the only event that opens the immutable flight
+      // for its cancellation; no upstream request_start has been published.
+      harness.publish([], { lane: "control", ackSequence: delayedFlight.frames.at(-1)!.sequence });
+      await harness.settleUntil(() => [...harness.hostFrames.values()].some(frame => frame.kind === "request_cancel"));
+      const cancellation = [...harness.hostFrames.values()].find(frame => frame.kind === "request_cancel")!;
+      await engine.accept(cancellation);
+      harness.publish([], { lane: "control", ackSequence: cancellation.sequence });
+      await harness.settle();
+      expect(harness.session.snapshot().diagnostics!.host).toMatchObject({ windowFrames: 0, schedulerFrames: 0 });
+      expect(admission.snapshot()).toMatchObject({ active: 0, queued: 0, reservedBytes: 0 });
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      controller.abort();
+      // The failing baseline still needs to release the deliberately delayed
+      // commit so teardown never turns the regression into a hanging test.
+      admission.setHostCeiling(8);
+      await commit;
+      await engine.drain("test cleanup");
+      await journal.close();
+      await harness.close();
+    }
   });
 
   it("releases a cancelled bulk request after delayed data and cancellation ACKs and completes following work", async () => {

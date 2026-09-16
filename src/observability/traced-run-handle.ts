@@ -4,6 +4,9 @@ import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import { sanitizeDiagnosticMessage } from "./redaction";
 import { providerErrorEnvelopeFrom } from "../v2/provider-error";
+import { createHash } from "node:crypto";
+import { requestFailureFields } from "./request-error";
+import { requestCancellationMetadata } from "../core/cancellation-metadata";
 
 export interface RunTraceContext {
   logger: LoggerLike;
@@ -16,6 +19,7 @@ export interface RunTraceContext {
   committedAtMs: number;
   retryCount: number;
   slowRequestMs: number;
+  callerSignal?: AbortSignal;
 }
 
 const SAFE_PROVIDER_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
@@ -24,37 +28,27 @@ function observableProviderRequestId(value: unknown): string | null {
   const safe = typeof value === "string" && SAFE_PROVIDER_REQUEST_ID.test(value)
     ? value
     : null;
-  return safe !== null && sanitizeDiagnosticMessage(safe) === safe ? safe : null;
+  return safe !== null && sanitizeDiagnosticMessage(safe) === safe
+    ? createHash("sha256").update(safe).digest("hex") : null;
 }
 
 function errorFields(
   error: unknown,
   preludeRequestId: string | null,
 ): Record<string, JsonValue> {
-  const value = error && typeof error === "object"
-    ? error as Record<string, unknown>
-    : {};
-  const providerError = providerErrorEnvelopeFrom(error);
+  let providerError: ReturnType<typeof providerErrorEnvelopeFrom> = null;
+  try { providerError = providerErrorEnvelopeFrom(error); } catch {
+    // Optional metadata must not invoke an untrusted accessor into settlement.
+  }
   const upstreamRequestId = observableProviderRequestId(
     providerError?.upstreamRequestId,
   ) ?? preludeRequestId;
   return {
-    error_name: error instanceof Error ? error.name : "Error",
-    error_kind: typeof value.kind === "string"
-      ? value.kind
-      : typeof value.code === "string"
-        ? value.code
-        : null,
-    status: typeof value.status === "number"
-      ? value.status
-      : providerError?.status ?? null,
-    error_message: sanitizeDiagnosticMessage(
-      error instanceof Error ? error.message : error,
-    ),
+    ...requestFailureFields(error, providerError?.status),
     ...(providerError ? {
       provider_origin: providerError.origin,
     } : {}),
-    ...(upstreamRequestId ? { upstream_request_id: upstreamRequestId } : {}),
+    ...(upstreamRequestId ? { upstream_request_id_sha256: upstreamRequestId } : {}),
   };
 }
 
@@ -114,6 +108,10 @@ export function traceRunHandle(
     error => {
       if (!terminalLogged) {
         terminalLogged = true;
+        const failure = errorFields(error, preludeRequestId);
+        const cancellation = failure.error_name === "AbortError" ||
+            failure.error_kind === "cancelled" || failure.error_kind === "cancelled_precommit"
+          ? requestCancellationMetadata(context.callerSignal) : null;
         context.logger.emit(observabilityEvent("request.failed", {
           trace_id: context.traceId,
           project_id: context.projectId,
@@ -121,10 +119,12 @@ export function traceRunHandle(
           stage: "terminal",
           first_text_ms: firstTextMs,
           first_tool_ms: firstToolMs,
-          ...errorFields(error, preludeRequestId),
+          ...failure,
+          ...(cancellation ? {
+            cancellation_origin: cancellation.origin,
+            ...(cancellation.websocketCloseCode === undefined ? {} : { websocket_close_code: cancellation.websocketCloseCode }),
+          } : {}),
           committed: true,
-          quarantined: (error as any)?.ambiguous === true ||
-            (error as any)?.kind === "ambiguous",
           retry_count: context.retryCount,
         }), "terminal");
       }

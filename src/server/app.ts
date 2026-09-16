@@ -3,6 +3,7 @@ import {
   responsesContinuationPreparationCostBytes,
 } from "../http/responses-continuation";
 import { Hono } from "hono";
+import { requestFailureFields } from "../observability/request-error";
 import type { RunHandle } from "../relay/run-handle";
 import { definitivePreviousResponseNotFound } from "../relay/continuation-error";
 import { prepareHostUpstreamResponsesRequest } from "../relay/host-request-policy";
@@ -969,7 +970,7 @@ function codexModel(input: {
     include_skills_usage_instructions: true,
     include_plugin_usage_instructions: true,
     include_apps_usage_instructions: true,
-    default_reasoning_summary: "none",
+    default_reasoning_summary: "auto",
     support_verbosity: true,
     default_verbosity: "low",
     apply_patch_tool_type: "freeform",
@@ -1418,9 +1419,10 @@ export function createGhostProvApp(options: GhostProvAppOptions): Hono {
     } catch (error) {
       const normalized = normalizeApiError(error);
       if (normalized.status !== 499) {
+        const diagnostic = requestFailureFields(error, normalized.status);
         console.error(
-          `[responses] ${normalized.status} ${publicAtom(normalized.error.type) ?? "error"} ` +
-          `${publicAtom(normalized.error.code) ?? "unknown"}`,
+          `[responses] ${diagnostic.status ?? 500} ${diagnostic.error_name} ` +
+          `${diagnostic.error_kind ?? "unknown"}`,
         );
       }
       return apiErrorResponse(error);

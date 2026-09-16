@@ -18,6 +18,7 @@ import {
 } from "../v2/memory/event-memory-sizing";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../v2/sidecar/capacity";
 import { resolveGhostProvApiKey } from "../http/api-key";
+import { DEFAULT_ROUTER_ADMISSION_TIMEOUT_MS } from "../router/admission-defaults";
 
 export type PrismSessionMode = "authenticated" | "auto" | "anonymous";
 
@@ -246,7 +247,7 @@ export function resolveMultiSandboxConfig(
   if (heartbeatMs !== 10_000) throw new RangeError("GP_HEARTBEAT_MS must remain exactly 10000");
   const routerQueueTimeoutMs = boundedPositiveInteger(
     env.GP_ROUTER_QUEUE_TIMEOUT_MS,
-    120_000,
+    DEFAULT_ROUTER_ADMISSION_TIMEOUT_MS,
     "GP_ROUTER_QUEUE_TIMEOUT_MS",
     1_000,
     300_000,

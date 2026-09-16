@@ -41,6 +41,32 @@ describe("FleetManifestStore", () => {
     await expect(restored.removeManaged(A)).rejects.toThrow("unproven");
     await expect(restored.removeImported(A)).rejects.toThrow("unproven");
   });
+  it("commits exact held cleanup proof as ordinary retirement without reactivating the project", async () => {
+    const store = new FleetManifestStore({ file: await manifestPath(), identityFingerprint: FINGERPRINT });
+    await store.initialize("authenticated");
+    await store.reserveWorker({ index: 1, projectId: A, title: "worker", nowMs: 1 });
+    await store.nextLeaderGeneration(A, 2);
+    await store.markDraining(A, "bootstrap_hold", 3);
+    const held = (await store.load()).workers[0]!;
+    for (const changed of [{ ...held, index: 2 }, { ...held, leaderGeneration: 2 },
+      { ...held, updatedAtMs: 4 }, { ...held, title: "different worker" }, { ...held, hasReachedReady: true }]) {
+      await expect(store.completeBootstrapHoldCleanup(changed, 5)).rejects.toThrow("changed");
+    }
+    expect((await store.completeBootstrapHoldCleanup(held, 5)).workers[0]).toEqual({
+      ...held, retirementReason: "replacement", updatedAtMs: 5,
+    });
+    await expect(store.completeBootstrapHoldCleanup(held, 6)).rejects.toThrow("changed");
+  });
+  it("keeps a held project fenced when its record changes during cleanup", async () => {
+    const store = new FleetManifestStore({ file: await manifestPath(), identityFingerprint: FINGERPRINT });
+    await store.initialize("authenticated");
+    await store.reserveWorker({ index: 1, projectId: A, title: "worker", nowMs: 1 });
+    await store.markDraining(A, "bootstrap_hold", 2);
+    const original = (await store.load()).workers[0]!;
+    await store.markDraining(A, "bootstrap_hold", 3);
+    await expect(store.completeBootstrapHoldCleanup(original, 4)).rejects.toThrow("changed");
+    expect((await store.load()).workers[0]?.retirementReason).toBe("bootstrap_hold");
+  });
   it("places default fleet state under an identity-scoped home directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "ghostprov-home-"));
     roots.push(root);

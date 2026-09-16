@@ -136,13 +136,146 @@ async function fixture(initialReady = true) {
   const host = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: key, credential: CREDENTIAL,
     connectTimeoutMs: 100, commandTimeoutMs: 100, clock,
     providerFactory: (doc, credential) => (hostProvider = bus.make(doc, "host", () => credential().token.reveal())) });
-  if (initialReady) { const initial = host.connect(); await peer.connect(); await initial; }
+  if (initialReady) { await peer.connect(); await host.connect(); }
   return { bus, clock, key, host, peer, hostProvider, peerProvider, handled: () => handled,
     status: () => peerProvider.local[GP_V2_SUPERVISOR_FIELD] as SignedSupervisorSandboxMessage,
     async close() { await host.close(); await peer.close(); expect(clock.waits.size).toBe(0); } };
 }
 
 describe("R9 authenticated supervisor reconnect", () => {
+  it("uses a fresh exact-instance challenge when initial ready state is missing after transport sync", async () => {
+    const f = await fixture(false);
+    try {
+      await f.peer.connect();
+      // The supervisor is live, but its one sequence-zero ready publication is
+      // absent when the new host synchronizes.
+      f.bus.states.delete(f.peerProvider.id);
+
+      await f.host.connect();
+
+      expect(f.bus.commands.map(command => [command.sequence, command.message.kind])).toEqual([[1, "rotate"]]);
+      expect(f.status()).toMatchObject({
+        sequence: 1,
+        message: { kind: "credential_rotated" },
+      });
+      await expect(f.host.stop({ launchNonces: ["known-child"], reason: "after-initial-challenge" }))
+        .resolves.toBe("known-child");
+      expect(f.bus.commands.at(-1)?.sequence).toBe(2);
+    } finally { await f.close(); }
+  });
+
+  it("does not let a late sequence-zero ready strand or overtake the initial challenge", async () => {
+    const f = await fixture(false);
+    try {
+      await f.peer.connect();
+      f.bus.states.delete(f.peerProvider.id);
+      f.bus.dropHost = true;
+      let settled = false;
+      const connecting = f.host.connect().then(() => { settled = true; });
+      await until(() => f.bus.commands.length === 1);
+      const ready = await signSupervisorSandboxMessage(f.key, {
+        protocol: GP_V2_SUPERVISOR_PROTOCOL,
+        version: GP_V2_SUPERVISOR_VERSION,
+        direction: "sandbox",
+        binding: BINDING,
+        supervisorInstanceId: "offline-instance",
+        sequence: 0,
+        message: { kind: "ready" },
+      });
+      f.hostProvider.inject(ready);
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      expect(settled).toBe(false);
+      expect(f.hostProvider.local[GP_V2_SUPERVISOR_FIELD]).toBe(f.bus.commands[0]);
+
+      f.bus.dropHost = false;
+      f.clock.advance(25);
+      await connecting;
+      expect(f.status()).toMatchObject({ sequence: 1, message: { kind: "credential_rotated" } });
+      await expect(f.host.stop({ launchNonces: ["known-child"], reason: "race-complete" }))
+        .resolves.toBe("known-child");
+      expect(f.bus.commands.at(-1)?.sequence).toBe(2);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("bounds a missing-ready challenge at the original initial connection deadline", async () => {
+    const f = await fixture(false);
+    try {
+      await f.peer.connect();
+      f.bus.states.delete(f.peerProvider.id);
+      f.bus.dropHost = true;
+      const connecting = f.host.connect().catch(error => error);
+      await until(() => f.bus.commands.length === 1);
+      for (let attempt = 2; attempt <= 4; attempt++) {
+        f.clock.advance(25);
+        await until(() => f.bus.commands.length === attempt);
+      }
+      f.clock.advance(25);
+      expect(await connecting).toMatchObject({ code: "timeout", phase: "challenge" });
+      expect(f.bus.commands).toHaveLength(4);
+      expect(f.handled()).toBe(0);
+      expect(f.hostProvider.local[GP_V2_SUPERVISOR_FIELD]).toBeUndefined();
+      expect(f.clock.waits.size).toBe(0);
+    } finally { await f.close(); }
+  });
+
+  it("allows only an explicitly unaccepted journal recovery to challenge from sequence zero", async () => {
+    const f = await fixture(false);
+    let replacement: V2SupervisorHost | null = null;
+    try {
+      await f.peer.connect();
+      f.bus.states.delete(f.peerProvider.id);
+      replacement = new V2SupervisorHost({ binding: BINDING, instanceId: "offline-instance", rotationKey: f.key,
+        credential: CREDENTIAL, recoverExisting: true, recoverUnacceptedInitial: true,
+        connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
+        providerFactory: (doc, credential) => f.bus.make(doc, "host", () => credential().token.reveal()) });
+      const connecting = replacement.connect();
+      await until(() => f.bus.commands.length === 1);
+      await connecting;
+      expect(f.bus.commands.map(command => [command.sequence, command.message.kind])).toEqual([[1, "rotate"]]);
+      await replacement.shutdown("cleanup");
+      expect(f.bus.commands.at(-1)).toMatchObject({ sequence: 2, message: { kind: "shutdown" } });
+    } finally { await replacement?.close(); await f.close(); }
+  });
+
+  it("does not let ready verification from an expired connect resolve its successor", async () => {
+    const f = await fixture(false);
+    const verified = Promise.withResolvers<boolean>();
+    const entered = Promise.withResolvers<void>();
+    const verify = crypto.subtle.verify.bind(crypto.subtle);
+    let first = true;
+    const observer = spyOn(crypto.subtle, "verify").mockImplementation(async (...args) => {
+      if (!first) return verify(...args);
+      first = false;
+      entered.resolve();
+      return verified.promise;
+    });
+    try {
+      f.hostProvider.autoSync = false;
+      const initial = f.host.connect().catch(error => error);
+      f.hostProvider.emit("sync", true);
+      const ready = await signSupervisorSandboxMessage(f.key, {
+        protocol: GP_V2_SUPERVISOR_PROTOCOL, version: GP_V2_SUPERVISOR_VERSION, direction: "sandbox",
+        binding: BINDING, supervisorInstanceId: "offline-instance", sequence: 0, message: { kind: "ready" },
+      });
+      f.hostProvider.inject(ready);
+      await entered.promise;
+      f.clock.advance(100);
+      expect(await initial).toMatchObject({ code: "timeout" });
+
+      const cancellation = new AbortController();
+      let successorSettled = false;
+      const successor = f.host.connect(cancellation.signal).then(() => { successorSettled = true; }, error => error);
+      verified.resolve(true);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(successorSettled).toBe(false);
+      cancellation.abort(new DOMException("offline done", "AbortError"));
+      await expect(successor).resolves.toMatchObject({ name: "AbortError" });
+    } finally { observer.mockRestore(); await f.close(); }
+  });
+
   it.each([0, 3])("recovers exact durable shutdown sequence %d after every supervisor Awareness state disappeared", async sequence => {
     const f = await fixture(false);
     let replacement: V2SupervisorHost | null = null;
@@ -242,8 +375,11 @@ describe("R9 authenticated supervisor reconnect", () => {
       const shutdown = replacement.shutdown("invalid_terminal").catch(error => error);
       await until(() => provider.syncs === 1);
       f.clock.advance(100);
-      expect(await shutdown).toMatchObject({ code: "timeout", phase: "bootstrap" });
-      expect(f.bus.commands).toHaveLength(0);
+      expect(await shutdown).toMatchObject({
+        code: "timeout",
+        phase: invalid === "ordinary_host" ? "challenge" : "bootstrap",
+      });
+      expect(f.bus.commands).toHaveLength(invalid === "ordinary_host" ? 1 : 0);
     } finally { await replacement?.close(); await f.close(); }
   });
 
@@ -326,9 +462,10 @@ describe("R9 authenticated supervisor reconnect", () => {
         credential: CREDENTIAL, connectTimeoutMs: 100, commandTimeoutMs: 100, clock: f.clock,
         providerFactory: (doc, credential) => f.bus.make(doc, "host", () => credential().token.reveal()) });
       const recovery = replacement.connect().catch(error => error);
-      await new Promise<void>(resolve => setImmediate(resolve)); f.clock.advance(100);
-      expect(await recovery).toMatchObject({ code: "timeout", phase: "bootstrap" });
-      expect(f.bus.commands).toHaveLength(1);
+      await until(() => f.bus.commands.length === 2);
+      expect(await recovery).toMatchObject({ code: "remote", remoteCode: "command_conflict" });
+      expect(f.bus.commands.map(command => [command.sequence, command.message.kind]))
+        .toEqual([[1, "stop"], [1, "rotate"]]);
     } finally { await replacement?.close(); await f.close(); }
   });
   it("recovers a missed fresh challenge notification using the same signed command", async () => {
@@ -419,9 +556,10 @@ describe("R9 authenticated supervisor reconnect", () => {
   it("keeps one initial handshake across a transient disconnect and rescans ready only after resync", async () => {
     const f = await fixture(false);
     try {
+      f.hostProvider.autoSync = false;
       let settled = false;
       const initial = f.host.connect().then(() => { settled = true; return null; }, error => { settled = true; return error; });
-      await until(() => f.hostProvider.syncs === 1);
+      await new Promise<void>(resolve => setImmediate(resolve));
       f.hostProvider.loseConnection();
       await f.peer.connect();
       f.hostProvider.inject(f.status());
@@ -431,6 +569,7 @@ describe("R9 authenticated supervisor reconnect", () => {
       expect(f.bus.commands).toHaveLength(0);
       // Simulates the existing provider's reconnect; the host never resubmits a job.
       f.hostProvider.connect();
+      f.hostProvider.emit("sync", true);
       expect(await initial).toBeNull();
       expect(f.bus.commands).toHaveLength(0);
     } finally { await f.close(); }

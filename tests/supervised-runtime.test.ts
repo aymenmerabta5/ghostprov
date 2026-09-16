@@ -97,6 +97,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   readonly listeners = new Set<() => void>();
   stopBehavior?: () => void | Promise<void>;
   drainBehavior?: () => void | Promise<void>;
+  localCleanupComplete?: () => boolean;
   replacementSandbox: ProvisionedSandbox | null = null;
   runCalls = 0;
   runFailure: unknown = null;
@@ -196,11 +197,13 @@ function supervisor(input: {
   create: () => RoutableSandboxRuntime | Promise<RoutableSandboxRuntime>;
   heartbeatGraceMs?: number;
   startupTimeoutMs?: number;
+  shutdownDeadlineMs?: () => number | undefined;
+  recoverBootstrapCleanup?: (signal: AbortSignal) => Promise<"not_required" | "proven" | "unproved">;
   acquirePermit?: (signal: AbortSignal) => Promise<() => void>;
   onRecoveryEvent?: (event: SandboxSupervisorEvent) => void;
 }): SupervisedSandboxRuntime {
   return new SupervisedSandboxRuntime({
-    projectId: PROJECT,
+    projectId: input.initial.projectId,
     initialChild: input.initial,
     createChild: input.create,
     clock: input.clock,
@@ -208,6 +211,8 @@ function supervisor(input: {
     checkIntervalMs: 1_000,
     heartbeatGraceMs: input.heartbeatGraceMs ?? 40_000,
     startupTimeoutMs: input.startupTimeoutMs ?? 10_000,
+    shutdownDeadlineMs: input.shutdownDeadlineMs,
+    recoverBootstrapCleanup: input.recoverBootstrapCleanup,
     initialBackoffMs: 1_000,
     maxBackoffMs: 60_000,
     acquirePermit: input.acquirePermit,
@@ -216,6 +221,275 @@ function supervisor(input: {
 }
 
 describe("SupervisedSandboxRuntime", () => {
+  it("retains a failed child's physical cleanup witness beyond the public stop rejection", async () => {
+    const clock = new ManualClock(), child = new FakeRuntime();
+    let physicallyClosed = false;
+    child.localCleanupComplete = () => physicallyClosed;
+    child.stopBehavior = async () => { child.state = "stopped"; throw new Error("offline remote cleanup unproven"); };
+    const runtime = supervisor({ clock, initial: child, create: () => new FakeRuntime() });
+    await runtime.start();
+    await expect(runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(runtime.localCleanupComplete()).toBe(false);
+    physicallyClosed = true;
+    expect(runtime.localCleanupComplete()).toBe(true);
+    expect(child.stops).toBe(1);
+    await expect(runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(child.stops).toBe(1);
+  });
+
+  it("keeps actual pending stop ownership after its public timeout even if the child reports local completion", async () => {
+    const clock = new ManualClock(), child = new FakeRuntime();
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    child.localCleanupComplete = () => true;
+    child.stopBehavior = () => { child.state = "stopped"; return pending; };
+    const runtime = supervisor({ clock, initial: child, create: () => new FakeRuntime(), startupTimeoutMs: 1000 });
+    await runtime.start();
+    const stopped = runtime.stop().then(() => null, error => error as Error);
+    await flush(); clock.advanceBy(1000);
+    expect(await stopped).toBeInstanceOf(Error);
+    expect(runtime.localCleanupComplete()).toBe(false);
+    finish(); await flush();
+    expect(runtime.localCleanupComplete()).toBe(true);
+    expect(child.stops).toBe(1);
+  });
+
+  it("requires cleanup-only proof before constructing another blocked bootstrap generation", async () => {
+    const clock = new ManualClock();
+    const failure = Object.assign(new Error("offline bootstrap cleanup remains unproven"), {
+      name: "V2BootstrapError", kind: "deploy", operation: "bootstrap",
+      cause: Object.assign(new Error("offline original owner"), {
+        name: "V2SupervisorBootstrapError", kind: "deploy", remoteCode: "bootstrap_cleanup_unproven",
+      }),
+    });
+    const events: SandboxSupervisorEvent[] = [];
+    let creates = 0, probes = 0, submitted = false;
+    const runtime = supervisor({ clock, initial: new FakeRuntime(PROJECT, async () => { submitted = true; throw failure; }),
+      create: () => { creates++; return new FakeRuntime(); },
+      recoverBootstrapCleanup: async () => {
+        if (!submitted) return "not_required";
+        probes++;
+        return probes === 3 ? "proven" : "unproved";
+      },
+      onRecoveryEvent: event => events.push(event),
+    });
+    await expect(runtime.start()).rejects.toBe(failure);
+    await flush();
+    for (const [delay, count] of [[1000, 1], [2000, 2]] as const) {
+      clock.advanceBy(delay);
+      await waitFor(() => runtime.supervisorSnapshot().recovery?.consecutiveFailures === count + 1);
+      expect(probes).toBe(count);
+      expect(creates).toBe(0);
+      expect(runtime.snapshot().incarnation).toBe(1);
+      await flush();
+    }
+    clock.advanceBy(4000);
+    await waitFor(() => runtime.snapshot().state === "ready");
+    expect(probes).toBe(3);
+    expect(creates).toBe(1);
+    expect(runtime.snapshot().incarnation).toBe(2);
+    const retries = events.filter(event => event.type === "retry_scheduled");
+    expect(retries.map(event => event.attempt)).toEqual([1, 2, 3]);
+    expect(retries.every(event => event.failure?.bootstrapCode === "bootstrap_cleanup_unproven")).toBe(true);
+    await runtime.stop();
+  });
+
+  it("cancels an owned cleanup-only probe without starting a successor", async () => {
+    const clock = new ManualClock();
+    const failure = Object.assign(new Error("offline bootstrap blocked"), { name: "V2BootstrapError", kind: "deploy", operation: "bootstrap",
+      cause: Object.assign(new Error("offline cleanup"), { name: "V2SupervisorBootstrapError", kind: "deploy", remoteCode: "bootstrap_cleanup_unproven" }) });
+    let probes = 0, creates = 0, aborted = false, submitted = false;
+    const runtime = supervisor({ clock, initial: new FakeRuntime(PROJECT, async () => { submitted = true; throw failure; }),
+      create: () => { creates++; return new FakeRuntime(); },
+      recoverBootstrapCleanup: async signal => {
+        if (!submitted) return "not_required";
+        probes++;
+        return new Promise<"unproved">((_resolve, reject) => {
+          signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true });
+        });
+      },
+    });
+    await expect(runtime.start()).rejects.toBe(failure);
+    await flush(); clock.advanceBy(1000);
+    await waitFor(() => probes === 1);
+    await runtime.stop();
+    expect(aborted).toBe(true);
+    expect(creates).toBe(0);
+    expect(probes).toBe(1);
+  });
+
+  it.each(["absent", "prepared"] as const)("allows %s journals through initial startup and unrelated bootstrap retries", async phase => {
+    const clock = new ManualClock();
+    const failure = Object.assign(new Error("offline bootstrap timeout"), { name: "V2BootstrapError", kind: "timeout", operation: "bootstrap" });
+    let assessments = 0, creates = 0;
+    const journal = phase === "absent" ? null : { phase: "prepared" as const };
+    const runtime = supervisor({ clock, initial: new FakeRuntime(PROJECT, async () => { throw failure; }),
+      create: () => { creates++; return new FakeRuntime(); },
+      recoverBootstrapCleanup: async () => {
+        assessments++;
+        expect(journal?.phase ?? null).toBe(phase === "absent" ? null : "prepared");
+        return "not_required";
+      },
+    });
+    await expect(runtime.start()).rejects.toBe(failure);
+    await flush(); clock.advanceBy(1000);
+    await waitFor(() => runtime.snapshot().state === "ready");
+    expect(assessments).toBe(2);
+    expect(creates).toBe(1);
+    await runtime.stop();
+  });
+
+  it("assesses first readiness cleanup debt before another cold permit or child", async () => {
+    const clock = new ManualClock();
+    const failure = Object.assign(new Error("offline first readiness failure"), {
+      name: "V2BootstrapError", kind: "deploy", operation: "bootstrap",
+      cause: Object.assign(new Error("offline supervisor readiness timed out"), {
+        name: "V2SupervisorBootstrapError", kind: "readiness",
+      }),
+    });
+    let submitted = false, proofAvailable = false, assessments = 0, coldAdmissions = 0, creates = 0;
+    const initial = new FakeRuntime(PROJECT, async () => { submitted = true; throw failure; });
+    initial.localCleanupComplete = () => true;
+    initial.stopBehavior = async () => {
+      initial.state = "stopped";
+      throw new Error("offline submitted supervisor cleanup remains unproven");
+    };
+    const runtime = supervisor({ clock, initial,
+      create: () => { creates++; return new FakeRuntime(); },
+      acquirePermit: async () => { coldAdmissions++; return () => {}; },
+      recoverBootstrapCleanup: async () => {
+        assessments++;
+        return !submitted ? "not_required" : proofAvailable ? "proven" : "unproved";
+      },
+    });
+    try {
+      await expect(runtime.start()).rejects.toBe(failure);
+      await flush();
+      expect(runtime.cleanupProofRequired()).toBe(true);
+      clock.advanceBy(1000);
+      await flush(100);
+      expect(coldAdmissions).toBe(1);
+      expect(creates).toBe(0);
+      expect(assessments).toBe(2);
+      expect(initial.starts).toBe(1);
+      expect(initial.stops).toBe(1);
+
+      proofAvailable = true;
+      const retryAt = runtime.supervisorSnapshot().recovery?.nextRetryAtMs;
+      expect(typeof retryAt).toBe("number");
+      clock.advanceBy(retryAt! - clock.now());
+      await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+      expect(coldAdmissions).toBe(2);
+      expect(creates).toBe(1);
+      expect(assessments).toBe(3);
+      expect(runtime.cleanupProofRequired()).toBe(false);
+    } finally { await runtime.stop().catch(() => undefined); }
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("keeps first-readiness cleanup debts off cold slots while fresh workers start", async () => {
+    const clock = new ManualClock(), permits = new FleetStartupPermitPool(4, 2);
+    const proof = Promise.withResolvers<void>(), prematureStart = Promise.withResolvers<void>();
+    let proofAvailable = false, cleanupProbes = 0;
+    const creates = [0, 0], coldAdmissions = [0, 0];
+    const owners = [0, 1].map(index => {
+      const id = projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`);
+      let submitted = false;
+      const failure = Object.assign(new Error("offline first readiness failure"), {
+        name: "V2BootstrapError", kind: "deploy", operation: "bootstrap",
+        cause: Object.assign(new Error("offline original supervisor readiness"), {
+          name: "V2SupervisorBootstrapError", kind: "readiness",
+        }),
+      });
+      const initial = new FakeRuntime(id, async () => { submitted = true; throw failure; });
+      initial.localCleanupComplete = () => true;
+      initial.stopBehavior = async () => { initial.state = "stopped"; throw new Error("offline signed cleanup missing"); };
+      return supervisor({ clock, initial,
+        create: () => {
+          creates[index]!++;
+          return new FakeRuntime(id, async child => {
+            if (!proofAvailable) await prematureStart.promise;
+            child.setState("ready");
+          });
+        },
+        acquirePermit: signal => { coldAdmissions[index]!++; return permits.acquire(true, signal); },
+        recoverBootstrapCleanup: async signal => {
+          if (!submitted) return "not_required";
+          const release = await permits.acquire(false, signal);
+          cleanupProbes++;
+          try { await proof.promise; signal.throwIfAborted(); return "proven"; }
+          finally { release(); }
+        },
+      });
+    });
+    const fresh = [2, 3].map(index => {
+      const id = projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`);
+      return supervisor({ clock, initial: new FakeRuntime(id), create: () => new FakeRuntime(id),
+        acquirePermit: signal => permits.acquire(true, signal), recoverBootstrapCleanup: async () => "not_required" });
+    });
+    const freshStarts: Promise<unknown>[] = [];
+    try {
+      const started = await Promise.allSettled(owners.map(runtime => runtime.start()));
+      expect(started.every(result => result.status === "rejected")).toBe(true);
+      await flush(); clock.advanceBy(1000); await flush(100);
+      freshStarts.push(...fresh.map(runtime => runtime.start().catch(error => error)));
+      await flush(100);
+      expect(fresh.map(runtime => runtime.supervisorSnapshot().phase)).toEqual(["healthy", "healthy"]);
+      expect(cleanupProbes).toBe(2);
+      expect(creates).toEqual([0, 0]);
+      expect(coldAdmissions).toEqual([1, 1]);
+      expect(permits.snapshot()).toEqual({
+        total: { limit: 4, inUse: 2, queued: 0 }, cold: { limit: 2, inUse: 0, queued: 0 },
+      });
+
+      proofAvailable = true; proof.resolve();
+      await waitFor(() => owners.every(runtime => runtime.supervisorSnapshot().phase === "healthy"));
+      expect(creates).toEqual([1, 1]);
+      expect(coldAdmissions).toEqual([2, 2]);
+      expect(cleanupProbes).toBe(2);
+    } finally {
+      proofAvailable = true; proof.resolve(); prematureStart.resolve();
+      await Promise.allSettled([...owners, ...fresh].map(runtime => runtime.stop()));
+      await Promise.all(freshStarts);
+    }
+    expect(permits.snapshot()).toEqual({
+      total: { limit: 4, inUse: 0, queued: 0 }, cold: { limit: 2, inUse: 0, queued: 0 },
+    });
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("waits for first-readiness local cleanup owners before assessing submitted debt", async () => {
+    const clock = new ManualClock();
+    const failure = Object.assign(new Error("offline first readiness failure"), {
+      name: "V2BootstrapError", kind: "deploy", operation: "bootstrap",
+      cause: Object.assign(new Error("offline supervisor readiness"), { name: "V2SupervisorBootstrapError", kind: "readiness" }),
+    });
+    let submitted = false, localComplete = false, assessments = 0, coldAdmissions = 0, creates = 0;
+    const initial = new FakeRuntime(PROJECT, async () => { submitted = true; throw failure; });
+    initial.localCleanupComplete = () => localComplete;
+    initial.stopBehavior = async () => { initial.state = "stopped"; throw new Error("offline cleanup owner retained"); };
+    const runtime = supervisor({ clock, initial,
+      create: () => { creates++; return new FakeRuntime(); },
+      acquirePermit: async () => { coldAdmissions++; return () => {}; },
+      recoverBootstrapCleanup: async () => { assessments++; return submitted ? "proven" : "not_required"; },
+    });
+    try {
+      await expect(runtime.start()).rejects.toBe(failure);
+      await flush(); clock.advanceBy(1000); await flush(100);
+      expect(assessments).toBe(1);
+      expect(coldAdmissions).toBe(1);
+      expect(creates).toBe(0);
+      localComplete = true;
+      const retryAt = runtime.supervisorSnapshot().recovery?.nextRetryAtMs;
+      expect(typeof retryAt).toBe("number");
+      clock.advanceBy(retryAt! - clock.now());
+      await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+      expect(assessments).toBe(2);
+      expect(creates).toBe(1);
+    } finally { localComplete = true; await runtime.stop().catch(() => undefined); }
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
   it("forwards admission progress and execution-risk ownership to the selected child exactly once", async () => {
     const clock = new ManualClock();
     const initial = new FakeRuntime();
@@ -832,10 +1106,36 @@ describe("SupervisedSandboxRuntime", () => {
     await waitFor(() => creates === 1);
 
     await runtime.stop();
+    expect(runtime.localCleanupComplete()).toBe(false);
     resolveLate(late);
     await waitFor(() => late.stops === 1);
+    await flush();
 
     expect(runtime.snapshot().state).toBe("stopped");
+    expect(runtime.localCleanupComplete()).toBe(true);
+  });
+
+  it("revokes a cached successful stop verdict when a late factory child's remote cleanup fails", async () => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    let resolveLate!: (child: FakeRuntime) => void;
+    const pending = new Promise<FakeRuntime>(resolve => { resolveLate = resolve; });
+    const late = new FakeRuntime();
+    late.localCleanupComplete = () => true;
+    late.stopBehavior = async () => { late.state = "stopped"; throw new Error("offline remote cleanup unproven"); };
+    let creates = 0;
+    const runtime = supervisor({ clock, initial, create: () => { creates++; return pending; } });
+    await runtime.start();
+    initial.setState("failed");
+    await waitFor(() => creates === 1);
+    await expect(runtime.stop()).resolves.toBeUndefined();
+    expect(runtime.localCleanupComplete()).toBe(false);
+    resolveLate(late);
+    await waitFor(() => late.stops === 1);
+    await flush();
+    expect(runtime.localCleanupComplete()).toBe(true);
+    await expect(runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(runtime.cleanupProofRequired()).toBe(true);
+    expect(late.stops).toBe(1);
   });
 
   it("isolates throwing subscribers from startup and cleanup", async () => {
@@ -893,6 +1193,73 @@ describe("SupervisedSandboxRuntime", () => {
     await flush();
     expect(initial.stops).toBe(1);
     await draining;
+  });
+
+  it.each(["stop", "drain"] as const)("waits beyond the recovery cap for a child during system %s", async kind => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    const cleanup = Promise.withResolvers<void>();
+    initial.stopBehavior = () => cleanup.promise;
+    initial.drainBehavior = () => cleanup.promise;
+    let shutdownDeadline: number | undefined;
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime(),
+      startupTimeoutMs: 120_000, shutdownDeadlineMs: () => shutdownDeadline });
+    await runtime.start();
+    shutdownDeadline = clock.now() + 60_000;
+    let settled = false;
+    const stopping = (kind === "stop" ? runtime.stop() : runtime.drain("system-shutdown"))
+      .finally(() => { settled = true; });
+    await flush();
+    clock.advanceBy(35_000);
+    await flush();
+    expect(settled).toBe(false);
+    expect(initial.stops).toBe(kind === "stop" ? 1 : 0);
+    cleanup.resolve();
+    await expect(stopping).resolves.toBeUndefined();
+    expect(runtime.snapshot().state).toBe("stopped");
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("does not renew the shared system deadline when drain falls back to stop", async () => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    const cleanup = Promise.withResolvers<void>();
+    initial.drainBehavior = () => cleanup.promise;
+    // A fallback that completes immediately after expiry is still too late.
+    initial.stopBehavior = async () => {};
+    let shutdownDeadline: number | undefined;
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime(),
+      shutdownDeadlineMs: () => shutdownDeadline });
+    await runtime.start();
+    shutdownDeadline = clock.now() + 60_000;
+    const stopping = runtime.drain("system-shutdown").then(() => null, error => error);
+    await flush();
+    clock.advanceBy(60_000);
+    await flush();
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(initial.drains).toBe(1);
+    expect(initial.stops).toBe(1);
+    cleanup.resolve();
+    await flush();
+    expect(clock.pendingTimers()).toBe(0);
+    await expect(runtime.stop()).rejects.toThrow("cleanup was incomplete");
+  });
+
+  it("rejects a child cleanup that resolves at the deadline before its timer runs", async () => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    const cleanup = Promise.withResolvers<void>();
+    initial.stopBehavior = () => cleanup.promise;
+    let shutdownDeadline: number | undefined;
+    const runtime = supervisor({ clock, initial, create: () => new FakeRuntime(),
+      shutdownDeadlineMs: () => shutdownDeadline });
+    await runtime.start();
+    shutdownDeadline = clock.now() + 60_000;
+    const stopping = runtime.stop().then(() => null, error => error);
+    await flush();
+    // Advance the clock without dispatching timers, as after a stalled event loop.
+    clock.value = shutdownDeadline;
+    cleanup.resolve();
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(initial.stops).toBe(1);
+    expect(clock.pendingTimers()).toBe(0);
   });
 
   it.each(["stop", "drain"] as const)("preserves a child's terminal cleanup rejection through %s and repeated calls", async kind => {
@@ -1008,6 +1375,28 @@ describe("SupervisedSandboxRuntime", () => {
       totalDurationMs: 3_000,
     });
     await runtime.stop();
+  });
+
+  it("bounds retained factory owners when timed-out factories never settle", async () => {
+    const clock = new ManualClock(), initial = new FakeRuntime();
+    let creates = 0;
+    const runtime = supervisor({ clock, initial, startupTimeoutMs: 1000,
+      create: () => { creates++; return new Promise<RoutableSandboxRuntime>(() => undefined); } });
+    await runtime.start();
+    initial.setState("failed");
+    await flush();
+    for (let count = 1; count <= 4; count++) {
+      clock.advanceBy(1000);
+      await waitFor(() => runtime.supervisorSnapshot().recovery?.consecutiveFailures === count);
+      await flush();
+      clock.advanceBy(1000 * 2 ** (count - 1));
+      await flush();
+    }
+    await waitFor(() => runtime.supervisorSnapshot().recovery?.consecutiveFailures === 5);
+    expect(creates).toBe(4);
+    expect(runtime.snapshot().state).toBe("recovering");
+    await runtime.stop();
+    expect(runtime.localCleanupComplete()).toBe(false);
   });
 
   it("continues beyond sixty-five failed generations and eventually recovers", async () => {

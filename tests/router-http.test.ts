@@ -1335,6 +1335,118 @@ describe("router HTTP composition", () => {
     expect(returnCalled).toBe(true);
   });
 
+  it("waits through quiet reasoning and forwards native summary events without rewriting caller settings", async () => {
+    const summaryText = "I am checking the constraints before answering.";
+    const summary = [{ type: "summary_text", text: summaryText }];
+    const reasoningItem = { id: "rs_native_summary", type: "reasoning", summary };
+    const responseFinal = final("resp_native_summary", [reasoningItem]);
+    const frame = (type: string, sequence: number, fields: Record<string, unknown>): SseFrame => ({
+      event: type,
+      data: JSON.stringify({ type, sequence_number: sequence, ...fields }),
+    });
+    const created = frame("response.created", 0, {
+      response: { ...responseFinal, status: "in_progress", output: [] },
+    });
+    const itemFields = { item_id: reasoningItem.id, output_index: 0, summary_index: 0 };
+    const summaries = [
+      frame("response.output_item.added", 1, {
+        output_index: 0,
+        item: { ...reasoningItem, summary: [] },
+      }),
+      frame("response.reasoning_summary_part.added", 2, {
+        ...itemFields,
+        part: { type: "summary_text", text: "" },
+      }),
+      frame("response.reasoning_summary_text.delta", 3, { ...itemFields, delta: summaryText }),
+      frame("response.reasoning_summary_text.done", 4, { ...itemFields, text: summaryText }),
+      frame("response.reasoning_summary_part.done", 5, { ...itemFields, part: summary[0] }),
+      frame("response.output_item.done", 6, { output_index: 0, item: reasoningItem }),
+    ];
+    const completed = frame("response.completed", 7, { response: responseFinal });
+    let resumeReasoning!: () => void;
+    const reasoningReady = new Promise<void>(resolve => { resumeReasoning = resolve; });
+    let settleFinal!: (value: typeof responseFinal) => void;
+    const authoritative = new Promise<typeof responseFinal>(resolve => { settleFinal = resolve; });
+    let relaySignal: AbortSignal | undefined;
+    const calls: Record<string, unknown>[] = [];
+    const router = {
+      snapshot: () => ({ capacity: 1, active: 0, available: 1, queued: 0, runtimes: [], resources: {} }),
+      startRelay: async (
+        body: Record<string, unknown>,
+        options: { signal?: AbortSignal } = {},
+      ): Promise<RunHandle> => {
+        calls.push(body);
+        relaySignal = options.signal;
+        return {
+          async *events() {
+            yield created;
+            await reasoningReady;
+            yield* summaries;
+            yield completed;
+          },
+          final: authoritative,
+          stats: { bytes: 0, firstByteMs: null, frames: 0 },
+        };
+      },
+    };
+    const body = {
+      model: "gpt-5.6-sol",
+      input: "Continue checking the constraints.",
+      previous_response_id: "resp_existing_provider_lineage",
+      reasoning: { effort: "xhigh", summary: "detailed" },
+      stream: true,
+      store: false,
+    };
+    const response = await createGhostProvApp({ router }).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const reader = response.body!.getReader();
+    const decode = (chunk: Awaited<ReturnType<typeof reader.read>>) => (
+      parseFrames(new TextDecoder().decode(chunk.value), 0).frames
+    );
+    try {
+      expect(response.status).toBe(200);
+      expect(calls).toEqual([{ ...body, store: true }]);
+      expect(decode(await reader.read())).toEqual([created]);
+      let reasoningVisible = false;
+      const pendingSummary = reader.read().then(chunk => {
+        reasoningVisible = true;
+        return chunk;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(reasoningVisible).toBe(false);
+      expect(relaySignal?.aborted).toBe(false);
+      expect(calls).toHaveLength(1);
+
+      resumeReasoning();
+      expect(decode(await pendingSummary)).toEqual([summaries[0]!]);
+      for (const expected of summaries.slice(1)) {
+        expect(decode(await reader.read())).toEqual([expected]);
+      }
+      let terminalVisible = false;
+      const pendingTerminal = reader.read().then(chunk => {
+        terminalVisible = true;
+        return chunk;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(terminalVisible).toBe(false);
+      expect(relaySignal?.aborted).toBe(false);
+      settleFinal(responseFinal);
+      expect(decode(await pendingTerminal)).toEqual([completed]);
+      expect((await reader.read()).done).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(relaySignal?.aborted).toBe(false);
+    } finally {
+      resumeReasoning();
+      settleFinal(responseFinal);
+      await reader.cancel();
+    }
+  });
+
   it("bounds SSE pull-ahead and aborts the relay when the response body is cancelled", async () => {
     let produced = 0;
     let iteratorClosed = false;
@@ -1816,6 +1928,7 @@ describe("router HTTP composition", () => {
     expect(body.models.every((model: any) => (
       typeof model.base_instructions === "string" &&
       model.base_instructions.length > 0 &&
+      model.default_reasoning_summary === "auto" &&
       model.service_tiers.some((tier: any) => tier.id === "priority")
     ))).toBe(true);
     expect(router.workloads).toHaveLength(0);
@@ -2192,15 +2305,22 @@ describe("router HTTP composition", () => {
     }
   });
 
-  it("detaches ingress cancellation while retaining byte ownership", async () => {
+  it("retains caller cancellation until ingress byte ownership is released", async () => {
     const caller = new AbortController();
     const router = healthRouter([]);
     const ingress = await router.acquireIncomingBody(1024, caller.signal);
     try {
       ingress.completeAdmission?.();
       caller.abort(new DOMException("late caller abort", "AbortError"));
-      expect(ingress.signal?.aborted).toBe(false);
+      expect(ingress.signal?.aborted).toBe(true);
       expect(ingress.reservedBytes).toBeGreaterThan(0);
+      const releasedCaller = new AbortController();
+      const released = await router.acquireIncomingBody(1024, releasedCaller.signal);
+      released.completeAdmission?.();
+      released.release();
+      releasedCaller.abort(new DOMException("abort after release", "AbortError"));
+      expect(released.signal?.aborted).toBe(false);
+      expect(released.reservedBytes).toBe(0);
     } finally {
       ingress.release();
       await router.close();
@@ -2213,7 +2333,7 @@ describe("router HTTP composition", () => {
     const ingress = await router.acquireIncomingBody(0, undefined, { maxBytes: 64 * MiB });
     try {
       expect(ingress.reservedBytes).toBe(8 * MiB);
-      expect(ingress.deadlineMs! - ingress.acceptedAtMs!).toBe(120_000);
+      expect(ingress.deadlineMs! - ingress.acceptedAtMs!).toBe(180_000);
       await ingress.ensureBytes!(4 * MiB);
       expect(ingress.reservedBytes).toBe(16 * MiB);
       expect(router.snapshot().resources.reservedBytes).toBe(16 * MiB);

@@ -1123,7 +1123,7 @@ export class AnthropicStreamTranslator {
       if (countSuffix) this.#budget.countPayload("reasoning", suffix);
       this.#appendReasoningSummary(block, summaryIndex, suffix);
     }
-    const chunks = summary.scalar.endSegment();
+    const { chunks } = summary.scalar.endSegment();
     if (this.#context.thinkingDisplay !== "omitted") {
       for (const chunk of chunks) this.#appendPending(chunk.owner, chunk.text);
     }
@@ -1162,9 +1162,11 @@ export class AnthropicStreamTranslator {
   }
 
   #endOrdinarySegment(events: AnthropicSseEvent[]): void {
-    for (const chunk of this.#textFilter.endSegment()) {
+    const result = this.#textFilter.endSegment();
+    for (const chunk of result.chunks) {
       this.#appendPending(chunk.owner, chunk.text);
     }
+    if (result.matchedSequence !== null) this.#matchedStop = result.matchedSequence;
     this.#drain(events);
   }
 

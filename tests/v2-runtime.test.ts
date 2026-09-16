@@ -1,4 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as Y from "yjs";
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
+import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../sandbox/v2/r10-awareness-peer";
+import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import type { Clock } from "../src/core/ports";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
@@ -15,7 +19,7 @@ import type {
 import type { SandboxRunOptions } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { SupervisedSandboxRuntime, type SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
-import type { AwarenessChannel } from "../src/v2/awareness/channel";
+import type { AwarenessChannel, AwarenessPeerUpdate } from "../src/v2/awareness/channel";
 import { SplitAwarenessChannelError } from "../src/v2/awareness/split-channel";
 import { AwarenessChannelError } from "../src/v2/awareness/y-sweet-channel";
 import { V2SupervisorError } from "../src/v2/supervisor/host";
@@ -26,12 +30,16 @@ import type {
   ProtocolBinding,
   SidecarFrame,
 } from "../src/v2/protocol/shared";
+import { base64UrlEncode, utf8Bytes, type ReliableFrame } from "../src/v2/protocol/shared";
+import { TranscriptProof } from "../src/v2/protocol/transcript";
 import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
 import {
   V2TransportLivenessError,
+  V2TransportSession,
   type V2TransportSnapshot,
 } from "../src/v2/transport/session";
 import type { V2TransportDiagnostics } from "../src/v2/diagnostics/types";
+import type { V2HostTransportDiagnostics } from "../src/v2/diagnostics/host-types";
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import {
   V2CommittedError,
@@ -48,6 +56,7 @@ import {
   type V2RuntimeLivenessDiagnostic,
   type V2RuntimeTransport,
   type V2RuntimeYDoc,
+  type V2SandboxRuntimeOptions,
 } from "../src/v2/runtime";
 import type { V2SidecarRecoveryToken } from "../src/v2/transport/session";
 import type { V2BootstrapSupervisor } from "../src/v2/supervisor/host";
@@ -138,7 +147,7 @@ class FakeAwareness implements AwarenessChannel<HostFrame, SidecarFrame> {
   async connect(): Promise<void> {}
   publish(_envelope: AwarenessEnvelope<HostFrame>): void {}
   clear(): void {}
-  subscribe(): () => void { return () => {}; }
+  subscribe(_listener: (update: AwarenessPeerUpdate<SidecarFrame>) => void): () => void { return () => {}; }
   peerIds(): readonly string[] { return []; }
   async rotateCredential(ySweet: YSweetEnvelope): Promise<void> {
     this.rotations++;
@@ -342,6 +351,30 @@ function stalledHostDiagnostics(): V2TransportDiagnostics {
   };
 }
 
+function receiveStallDiagnostics(
+  host: Partial<V2HostTransportDiagnostics> = {},
+  sidecar: Partial<V2TransportDiagnostics> = {},
+): NonNullable<V2TransportSnapshot["diagnostics"]> {
+  return {
+    host: {
+      ...stalledHostDiagnostics(), windowFrames: 0, windowBytes: 0,
+      schedulerFrames: 0, schedulerBytes: 0, oldestQueuedFrameMs: 0, ackProgressAgeMs: 0,
+      inboundAcceptedEpoch: 1, inboundAcceptedSequence: 3,
+      inboundProcessedEpoch: 1, inboundProcessedSequence: 3,
+      inboundAcceptedProgressAgeMs: 60_000, inboundProcessedProgressAgeMs: 60_000,
+      inboundProcessingFrames: 0, sidecarDiagnosticsAgeMs: 0,
+      sidecarPendingAgeMs: 60_000, sidecarPendingDataPublications: 4,
+      dataPeerAgeMs: 60_000, controlPeerAgeMs: 0,
+      lastDataRevision: 15,
+      ...host,
+    },
+    sidecar: {
+      version: 1, resource: null, malformedCount: 0,
+      transport: { ...stalledHostDiagnostics(), ...sidecar },
+    },
+  };
+}
+
 class FakeGovernor implements V2RuntimeGovernor {
   capacityHintCalls = 0;
   constructor(public ceiling: number) {}
@@ -394,6 +427,7 @@ function runtimeHarness(options: {
   rotateSameSession?: boolean;
   initialSandbox?: ProvisionedSandbox;
   stopTimeoutMs?: number;
+  shutdownDeadlineMs?: () => number | undefined;
   sidecarRecoveryTimeoutMs?: number;
   sidecarCommitStallMs?: number;
   sidecarStallSampleThreshold?: number;
@@ -408,6 +442,7 @@ function runtimeHarness(options: {
   gatewayHeartbeat?: () => V2RuntimeHeartbeatResult | Promise<V2RuntimeHeartbeatResult>;
   initialRotationPending?: boolean;
   enableSupervisor?: boolean;
+  transportFactory?: (input: Parameters<V2SandboxRuntimeOptions["createTransport"]>[0], clock: ManualClock) => V2RuntimeTransport;
 } = {}) {
   const order: string[] = [];
   const clock = new ManualClock();
@@ -539,6 +574,7 @@ function runtimeHarness(options: {
     transportReservationBytes: 16 * 1024 * 1024,
     ySweetRefreshMs: 300_000,
     stopTimeoutMs: options.stopTimeoutMs,
+    shutdownDeadlineMs: options.shutdownDeadlineMs,
     sidecarRecoveryTimeoutMs: options.sidecarRecoveryTimeoutMs,
     sidecarCommitStallMs: options.sidecarCommitStallMs,
     sidecarStallSampleThreshold: options.sidecarStallSampleThreshold,
@@ -608,7 +644,7 @@ function runtimeHarness(options: {
       if (!transport.binding) {
         transport.binding = input.binding;
         transport.expectedInstanceId = input.expectedSidecarInstanceId;
-        return transport;
+        return options.transportFactory?.(input, clock) ?? transport;
       }
       const next = new FakeTransport(order, { credits: options.credits ?? 128 });
       next.binding = input.binding;
@@ -678,7 +714,585 @@ function runtimeHarness(options: {
   };
 }
 
+function pairedLaneRecoveryHarness(options: { repairDelayMs?: number; repairAvailable?: boolean; gatewayUnavailable?: boolean;
+  receiveStall?: boolean; holdStartAck?: boolean } = {}) {
+  let session!: V2TransportSession;
+  let binding!: ProtocolBinding;
+  let dataConnected = true;
+  let controlConnected = true;
+  let holdPrepared = false;
+  const peerRevision = { data: 0, control: 0 };
+  let peerPublications = 0;
+  let peerDataPublications = 0;
+  let peerFlightCompletions = 0;
+  let peerPendingAtMs: number | null = null;
+  let queuedPrepared: AwarenessEnvelope<SidecarFrame> | undefined;
+  let peerSequence = 0;
+  let hostAck = -1;
+  let heldHostAck: number | null = null;
+  let resumes = 0;
+  let providerExecutions = 0;
+  const repairs: Array<"data" | "control"> = [];
+  const repairSignals: Array<AbortSignal | undefined> = [];
+  const hostFrames = new Map<number, ReliableFrame<HostFrame>>();
+  const outstanding: Array<ReliableFrame<SidecarFrame>> = [];
+  const receivedAcks: number[] = [];
+  const hostPings: number[] = [];
+  const listeners = new Set<(update: AwarenessPeerUpdate<SidecarFrame>) => void>();
+  const harness = runtimeHarness({
+    enableR2Recovery: true, enableSupervisor: true, resourceExpiresInMs: 1_200_000,
+    ...(options.gatewayUnavailable ? { gatewayHeartbeat: () => { throw new Error("offline complete outage"); } } : {}),
+    transportFactory: (input, clock) => {
+      binding = input.binding;
+      session = new V2TransportSession({ ...input, clock, hostInstanceId: "paired-lane-host",
+        publicationIntervalMs: 1, retransmitMs: 1_000_000, livenessTimeoutMs: 30_000,
+        publicationTimer: { now: () => clock.now(), set: (callback, delay) => setTimeout(callback, delay),
+          clear: key => clearTimeout(key as ReturnType<typeof setTimeout>), defer: queueMicrotask } });
+      return session;
+    },
+  });
+  const timers = new Map<object, { at: number; callback(): void }>();
+  const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void,
+    delay = 0, ...args: unknown[]) => {
+    const key = { unref() { return key; } };
+    timers.set(key, { at: harness.clock.now() + delay, callback: () => callback(...args) });
+    return key;
+  }) as typeof setTimeout);
+  const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((key => {
+    timers.delete(key as object);
+  }) as typeof clearTimeout);
+  const send = (lane: "data" | "control", frames: SidecarFrame[] = [], sentAtMs?: number,
+    deliver = true): AwarenessEnvelope<SidecarFrame> => {
+    if (frames.length > 0 && outstanding.length === 0) peerPendingAtMs = harness.clock.now();
+    outstanding.push(...frames.map(frame => ({ ...frame, epoch: 1, sequence: peerSequence++ })));
+    peerPublications++;
+    if (lane === "data") peerDataPublications++;
+    const envelope: AwarenessEnvelope<SidecarFrame> = {
+      protocol: "gp-awareness-v2", schemaVersion: 2, ...binding, protocolRevision: "r2",
+      peerId: "sidecar", instanceId: "sidecar-instance-1", targetInstanceId: "paired-lane-host",
+      epoch: 1, revision: peerRevision[lane]++, lane, ack: { epoch: 1, sequence: heldHostAck ?? hostAck },
+      credits: 128, active: providerExecutions, queued: 0, draining: false,
+      frames: lane === "data" ? [...outstanding] : [],
+      ...(sentAtMs === undefined ? {} : { liveness: { kind: "pong" as const, sentAtMs } }),
+      ...(options.receiveStall && lane === "control" ? { diagnostics: {
+        version: 1 as const, resource: null, malformedCount: 0,
+        transport: { ...stalledHostDiagnostics(), windowFrames: outstanding.length,
+          windowBytes: outstanding.length * 100, schedulerFrames: 0, schedulerBytes: 0,
+          ackProgressAgeMs: peerPendingAtMs === null ? 0 : harness.clock.now() - peerPendingAtMs,
+          publicationsTotal: peerPublications, dataPublicationsTotal: peerDataPublications,
+          controlPublicationsTotal: peerPublications - peerDataPublications,
+          flightCompletionsTotal: peerFlightCompletions },
+      } } : {}),
+    };
+    if (deliver && (lane === "data" ? dataConnected : controlConnected)) {
+      queueMicrotask(() => { for (const listener of listeners) listener({ peerClientId: "paired-sidecar", envelope }); });
+    }
+    return envelope;
+  };
+  harness.awareness.subscribe = listener => { listeners.add(listener); return () => listeners.delete(listener); };
+  harness.awareness.connect = async () => { resumes++; dataConnected = true; if (binding) send("data"); };
+  (harness.awareness as AwarenessChannel<HostFrame, SidecarFrame>).reconnect = async (lane, signal) => {
+    signal?.throwIfAborted(); repairs.push(lane!);
+    repairSignals.push(signal);
+    if (options.repairDelayMs) await harness.clock.sleep(options.repairDelayMs, signal);
+    signal?.throwIfAborted();
+    if (options.repairAvailable === false) return;
+    if (options.holdStartAck) heldHostAck = null;
+    if (lane === "data") dataConnected = true;
+    else controlConnected = true;
+    send(lane!);
+  };
+  harness.awareness.publish = envelope => {
+    queueMicrotask(() => {
+      if (envelope.lane === "control") {
+        if (envelope.liveness?.kind === "ping") hostPings.push(envelope.liveness.sentAtMs);
+        if (!controlConnected) return;
+        receivedAcks.push(envelope.ack.sequence);
+        const priorOutstanding = outstanding.length;
+        for (let i = outstanding.length - 1; i >= 0; i--) {
+          if (outstanding[i]!.sequence <= envelope.ack.sequence) outstanding.splice(i, 1);
+        }
+        if (priorOutstanding > 0 && outstanding.length === 0) {
+          peerFlightCompletions++;
+          peerPendingAtMs = null;
+        }
+        if (envelope.liveness?.kind === "ping") send("control", [], envelope.liveness.sentAtMs);
+      }
+      for (const frame of envelope.frames) {
+        if (hostFrames.has(frame.sequence)) continue;
+        if (options.holdStartAck && frame.kind === "request_start") heldHostAck = hostAck;
+        hostFrames.set(frame.sequence, frame);
+        while (hostFrames.has(hostAck + 1)) hostAck++;
+        if (frame.kind === "request_commit" && "protocolRevision" in frame) {
+          if (holdPrepared) dataConnected = false;
+          send("data", [{ ...frame, kind: "request_prepared" }]);
+          if (options.receiveStall) queuedPrepared = send("data", [], undefined, false);
+        } else if (frame.kind === "request_start") {
+          providerExecutions++;
+          if (options.receiveStall) dataConnected = false;
+          send("data", [{ kind: "request_ack", requestId: frame.requestId,
+            requestDigest: frame.requestDigest, committed: true }]);
+          if (options.receiveStall) send("control");
+        } else send("data");
+      }
+    });
+  };
+  harness.supervisor.rotateCredential = async () => {
+    harness.supervisor.rotations++;
+    if (options.holdStartAck) return;
+    throw new V2SupervisorError("offline supervisor rotation unavailable", "timeout", "challenge");
+  };
+  const settle = async () => {
+    for (let turn = 0; turn < 100; turn++) {
+      for (const [key, timer] of [...timers]) {
+        if (timer.at <= harness.clock.now()) { timers.delete(key); timer.callback(); }
+      }
+      await Promise.resolve();
+    }
+    await Bun.sleep(0);
+    for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+  };
+  return {
+    harness, repairs, repairSignals, outstanding, receivedAcks, hostPings,
+    session: () => session, resumes: () => resumes, providerExecutions: () => providerExecutions,
+    rotationFrames: () => [...hostFrames.values()].filter(frame => frame.kind === "credential_rotate").length,
+    disconnectBoth() { dataConnected = false; controlConnected = false; },
+    async start() { const starting = harness.runtime.start(); await settle(); await starting; },
+    async startHeldStartFlight() {
+      const body = { model: "gpt-6-astra", input: "original stored delta", previous_response_id: "resp_exact_rotation_parent",
+        stream: true, store: true };
+      const running = harness.runtime.run(body);
+      void running.catch(() => undefined);
+      for (let turn = 0; turn < 20 && providerExecutions === 0; turn++) {
+        await harness.clock.advanceBy(1); await settle();
+      }
+      const handle = await running;
+      void handle.final.catch(() => undefined);
+      expect(session.snapshot().diagnostics?.host.windowFrames).toBeGreaterThan(0);
+      return { handle, body };
+    },
+    async startMissingRequestAck() {
+      const body = { model: "gpt-6-astra", input: "retained current delta", previous_response_id: "resp_exact_prior",
+        stream: true, store: true };
+      const running = harness.runtime.run(body);
+      void running.catch(() => undefined);
+      await settle();
+      for (let turn = 0; turn < 20 && providerExecutions === 0; turn++) {
+        await harness.clock.advanceBy(1); await settle();
+      }
+      expect(providerExecutions).toBe(1);
+      expect(outstanding.map(frame => [frame.kind, frame.sequence])).toEqual([["request_ack", 1]]);
+      expect(session.snapshot().diagnostics?.host).toMatchObject({
+        inboundAcceptedSequence: 0, inboundProcessedSequence: 0, inboundProcessingFrames: 0,
+      });
+      return { running, body };
+    },
+    async deliverQueuedPrepared() {
+      if (!queuedPrepared) throw new Error("No retained prepared publication");
+      for (const listener of listeners) listener({ peerClientId: "paired-sidecar", envelope: queuedPrepared });
+      await settle();
+      expect(session.snapshot().diagnostics?.host).toMatchObject({
+        inboundAcceptedSequence: 0, inboundProcessedSequence: 0, inboundProcessingFrames: 0,
+      });
+    },
+    async commitAcrossDisconnect() {
+      holdPrepared = true;
+      const body = { model: "gpt-6-astra", input: "retained current delta", previous_response_id: "resp_exact_prior",
+        stream: true, store: true };
+      const running = harness.runtime.run(body);
+      void running.catch(() => undefined);
+      await settle();
+      for (let turn = 0; turn < 20 && outstanding.length === 0; turn++) {
+        await harness.clock.advanceBy(1); await settle();
+      }
+      expect(outstanding.map(frame => frame.kind)).toEqual(["request_prepared"]);
+      controlConnected = false;
+      await harness.clock.advanceBy(10_000 - harness.clock.now());
+      await settle(); // The periodic 30s CONTROL challenge owns the older probe.
+      harness.awareness.fail(new SplitAwarenessChannelError("data",
+        new AwarenessChannelError("offline data disconnect", "disconnected", 1005)));
+      await settle();
+      for (let turn = 0; turn < 20 && providerExecutions === 0; turn++) {
+        await harness.clock.advanceBy(1); await settle();
+      }
+      expect(providerExecutions).toBe(1);
+      const handle = await running;
+      void handle.final.catch(() => undefined);
+      expect(session.snapshot().diagnostics?.host).toMatchObject({
+        inboundAcceptedSequence: 1, inboundProcessedSequence: 1,
+      });
+      expect(providerExecutions).toBe(1);
+      expect(receivedAcks.at(-1)).toBe(-1);
+      return { handle, body };
+    },
+    async advance(ms: number) {
+      await harness.clock.advanceBy(ms);
+      if (options.receiveStall) { send("data"); send("control"); }
+      await settle();
+    },
+    async complete() {
+      const commit = [...hostFrames.values()].find(frame => frame.kind === "request_commit")!;
+      if (commit.kind !== "request_commit" || !("requestDigest" in commit)) throw new Error("missing request identity");
+      const final = { id: "resp_repaired", object: "response", status: "completed", output: [] };
+      const event = { event: "response.completed", data: JSON.stringify({ type: "response.completed", response: final }) };
+      const proof = new TranscriptProof(commit.requestId, commit.requestDigest);
+      proof.append(event);
+      send("data", [{ kind: "upstream_prelude", requestId: commit.requestId, status: 200,
+        contentType: "text/event-stream", upstreamRequestId: null },
+      { kind: "response_event", requestId: commit.requestId, eventIndex: 0, event: event.event,
+        partIndex: 0, partCount: 1, offset: 0, dataBase64Url: base64UrlEncode(utf8Bytes(event.data)) },
+      await proof.createTerminal()]);
+      await settle();
+    },
+    async close() {
+      try { await session.close(); await harness.runtime.stop(); }
+      finally { setTimer.mockRestore(); clearTimer.mockRestore(); }
+      expect(harness.clock.waiters).toHaveLength(0);
+      expect(timers.size).toBe(0);
+    },
+  };
+}
+
 describe("V2SandboxRuntime", () => {
+  it("unblocks an actual immutable flight after its unsent credential rotation times out", async () => {
+    const test = pairedLaneRecoveryHarness({ holdStartAck: true });
+    try {
+      await test.start();
+      const { handle } = await test.startHeldStartFlight();
+      const session = test.session();
+      const resume = session.resumeAwareness.bind(session);
+      let nativeResumes = 0;
+      session.resumeAwareness = async signal => {
+        if (++nativeResumes === 1) throw new Error("offline first native reconnect failed");
+        await resume(signal);
+      };
+      test.harness.awareness.fail(new SplitAwarenessChannelError("control",
+        new AwarenessChannelError("offline disconnect", "disconnected")));
+      await test.advance(0);
+      expect(session.snapshot().diagnostics?.host).toMatchObject({ schedulerFrames: 1 });
+      expect(test.rotationFrames()).toBe(0);
+      for (let elapsed = 0; elapsed < 30_000; elapsed += 2_000) await test.advance(2_000);
+      for (let elapsed = 0; elapsed < 2_000 && test.harness.runtime.snapshot().available === 0; elapsed += 25) await test.advance(25);
+      expect(test.repairs).toEqual(["data"]);
+      expect(test.rotationFrames()).toBe(0);
+      expect(session.snapshot().diagnostics?.host).toMatchObject({ windowFrames: 0, schedulerFrames: 0 });
+      expect(test.harness.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available" });
+      expect(test.harness.ySweetMints()).toBe(1);
+      expect(test.harness.supervisor.rotations).toBe(1);
+      expect(test.harness.awareness.rotationTokens).toEqual(["y-token-1"]);
+      expect(test.harness.bootstrap.forceStops).toBe(0);
+      expect(test.harness.bootstraps).toHaveLength(1);
+      expect(test.providerExecutions()).toBe(1);
+      await test.complete();
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_repaired" });
+      expect(session.snapshot()).toMatchObject({ active: 0, committed: 0, quarantined: 0 });
+    } finally { await test.close(); }
+  });
+
+  it.each([0, 250, 31_000, "scheduled"] as const)("repairs a queued rotation with delayed flight progress: %s", async scenario => {
+    const scheduled = scenario === "scheduled";
+    const progressDelayMs = typeof scenario === "number" ? scenario : 0;
+    const h = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
+      resourceExpiresInMs: 1_200_000, livenessOutcomes: [null] });
+    await h.runtime.start();
+    let repaired = false;
+    const repairs: string[] = [];
+    h.transport.snapshotValue.diagnostics = receiveStallDiagnostics({ windowFrames: 2, windowBytes: 260,
+      schedulerFrames: 0, schedulerBytes: 0, ackProgressAgeMs: 0,
+      sidecarPendingAgeMs: null, sidecarPendingDataPublications: 0 }, { windowFrames: 0, schedulerFrames: 0 });
+    h.transport.resumeAwareness = async () => {
+      if (++h.transport.awarenessResumes === 1) throw new Error("offline native reconnect unavailable");
+    };
+    h.transport.probeLiveness = async () => {
+      if (!repaired) throw new V2TransportLivenessError("offline control publish failed", "publish");
+      return { rttMs: 1, sentAtMs: h.clock.now() };
+    };
+    (h.transport as V2RuntimeTransport).rotateCredential = async (id, _sealed, signal) => {
+      h.transport.rotations++;
+      await h.clock.sleep(30_000, signal);
+      throw new Error(`Credential rotation ACK timed out: ${id}`);
+    };
+    (h.transport as V2RuntimeTransport).reconnectAwareness = async (lane, signal) => {
+      repairs.push(lane!);
+      repaired = true;
+      const progress = () => {
+        const host = h.transport.snapshotValue.diagnostics!.host;
+        h.transport.snapshotValue.diagnostics = { ...h.transport.snapshotValue.diagnostics!, host: {
+          ...host, windowFrames: 0, windowBytes: 0, flightCompletionsTotal: host.flightCompletionsTotal + 1,
+          uniqueAcknowledgedBytesTotal: host.uniqueAcknowledgedBytesTotal! + 260,
+        } };
+      };
+      if (progressDelayMs) void h.clock.sleep(progressDelayMs).then(progress);
+      else progress();
+    };
+    const body = { model: "gpt-6-astra", input: "current delta", previous_response_id: "resp_exact_rotation_parent",
+      stream: true, store: true, service_tier: "fast" };
+    const handle = await h.runtime.run(body);
+    const flush = async () => { for (let turn = 0; turn < 300; turn++) await Promise.resolve(); };
+    try {
+      if (scheduled) await h.clock.advanceBy(300_000);
+      else h.awareness.fail(new SplitAwarenessChannelError("control", new AwarenessChannelError("offline disconnect", "disconnected")));
+      await flush();
+      for (const step of [10_000, 2_000, 2_000, 16_000]) { await h.clock.advanceBy(step); await flush(); }
+      if (progressDelayMs) {
+        expect(h.runtime.snapshot().state).toBe("ready");
+        expect(h.runtime.snapshot().available).toBe(0);
+        await h.clock.advanceBy(progressDelayMs); await flush();
+        await h.clock.advanceBy(2_000); await flush();
+      }
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available" });
+      expect(repairs).toEqual(["data"]);
+      expect(h.ySweetMints()).toBe(1);
+      expect(h.transport.rotations).toBe(1);
+      expect(h.supervisor.rotations).toBe(1);
+      expect(h.awareness.rotationTokens).toEqual(scheduled ? [] : ["y-token-1"]);
+      expect(h.transport.recoverySuspends).toBe(0);
+      expect(h.bootstrap.forceStops).toBe(0);
+      expect(h.transports).toHaveLength(1);
+      expect(h.transport.bodies).toEqual([body]);
+      h.transport.pending[0]!.resolve({ id: "resp_rotation_repaired", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_rotation_repaired" });
+      await h.clock.advanceBy(scheduled ? 29_999 : 30_000); await flush();
+      expect(h.ySweetMints()).toBe(1);
+      if (scheduled) {
+        await h.clock.advanceBy(1); await flush();
+        expect(h.ySweetMints()).toBe(2);
+        expect(h.transport.rotations).toBe(2);
+      } else if (progressDelayMs === 0) {
+        await h.clock.advanceBy(299_999 - h.clock.now()); await flush();
+        expect(h.ySweetMints()).toBe(1);
+        await h.clock.advanceBy(1); await flush();
+        expect(h.ySweetMints()).toBe(2);
+      }
+    } finally {
+      h.transport.pending[0]?.resolve({ status: "completed" });
+      await h.runtime.stop();
+    }
+  });
+
+  it.each(["no_progress", "unavailable", "repair_deadline", "shutdown", "wrong_session", "original_deadline"] as const)(
+    "keeps an unproved rotation repair bounded and fail-closed: %s", async mode => {
+    const h = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
+      resourceExpiresInMs: 1_200_000, livenessOutcomes: [null],
+      ...(mode === "wrong_session" ? { heartbeatSessionId: "different-session" } : {}) });
+    await h.runtime.start();
+    let repairs = 0;
+    let repairSignal: AbortSignal | undefined;
+    h.transport.snapshotValue.diagnostics = receiveStallDiagnostics({ windowFrames: 2, windowBytes: 260,
+      schedulerFrames: 0, schedulerBytes: 0, ackProgressAgeMs: 0,
+      sidecarPendingAgeMs: null, sidecarPendingDataPublications: 0 }, { windowFrames: 0, schedulerFrames: 0 });
+    h.transport.resumeAwareness = async () => {
+      if (++h.transport.awarenessResumes === 1) throw new Error("offline native reconnect unavailable");
+    };
+    h.transport.probeLiveness = async () => ({ rttMs: 1, sentAtMs: h.clock.now() });
+    const rotationDelay = mode === "original_deadline" ? 145_000 : 30_000;
+    (h.transport as V2RuntimeTransport).rotateCredential = async (id, _sealed, signal) => {
+      h.transport.rotations++;
+      await h.clock.sleep(rotationDelay, signal);
+      throw new Error(`Credential rotation ACK timed out: ${id}`);
+    };
+    (h.transport as V2RuntimeTransport).reconnectAwareness = async (_lane, signal) => {
+      repairs++;
+      repairSignal = signal;
+      if (mode === "unavailable") throw new Error("offline reconnect failed");
+      if (mode === "repair_deadline" || mode === "shutdown" || mode === "original_deadline") {
+        await h.clock.sleep(100_000, signal);
+      }
+    };
+    const flush = async () => { for (let turn = 0; turn < 300; turn++) await Promise.resolve(); };
+    try {
+      h.awareness.fail(new SplitAwarenessChannelError("control", new AwarenessChannelError("offline disconnect", "disconnected")));
+      await flush();
+      await h.clock.advanceBy(rotationDelay); await flush();
+      expect(repairs).toBe(mode === "wrong_session" ? 0 : 1);
+      if (mode === "wrong_session") expect(h.runtime.snapshot().state).toBe("failed");
+      else if (mode === "shutdown") {
+        await h.runtime.stop(); await flush();
+        expect(repairSignal?.aborted).toBe(true);
+        expect(h.runtime.snapshot().state).toBe("stopped");
+        expect(h.clock.waiters).toHaveLength(0);
+      } else {
+        expect(h.runtime.snapshot()).toMatchObject({ state: "ready", available: 0 });
+        if (mode === "repair_deadline") {
+          await h.clock.advanceBy(30_000); await flush();
+          expect(repairSignal?.aborted).toBe(true);
+        }
+        await h.clock.advanceBy(149_999 - h.clock.now()); await flush();
+        expect(h.runtime.snapshot().state).toBe("ready");
+        expect(h.runtime.snapshot().available).toBe(0);
+        await h.clock.advanceBy(1); await flush();
+        expect(h.runtime.snapshot().state).toBe("failed");
+        expect(repairSignal?.aborted).toBe(true);
+      }
+      expect(h.ySweetMints()).toBe(1);
+      expect(h.transport.rotations).toBe(1);
+      expect(h.transports).toHaveLength(1);
+      expect(h.transport.recoverySuspends).toBe(0);
+      expect(h.bootstrap.forceStops).toBe(mode === "shutdown" ? 1 : 0);
+    } finally { await h.runtime.stop(); }
+  });
+
+  it.each([5_000, 45_000])("repairs unseen DATA after a %i ms old prepared duplicate while a newer ACK is pending", async duplicateAgeMs => {
+    const test = pairedLaneRecoveryHarness({ receiveStall: true });
+    try {
+      await test.start();
+      const { running } = await test.startMissingRequestAck();
+      for (let elapsed = 0; elapsed < 60_000; elapsed += 5_000) {
+        if (elapsed === 60_000 - duplicateAgeMs) await test.deliverQueuedPrepared();
+        await test.advance(5_000);
+      }
+      for (let elapsed = 0; elapsed < 10_000 && test.repairs.length === 0; elapsed += 1_000) await test.advance(1_000);
+      expect(test.repairs).toEqual(["data"]);
+      for (let elapsed = 0; elapsed < 2_000 && test.harness.runtime.snapshot().available === 0; elapsed += 25) await test.advance(25);
+      const handle = await running;
+      expect(test.session().snapshot().diagnostics?.host).toMatchObject({ inboundAcceptedSequence: 1,
+        inboundProcessedSequence: 1, inboundProcessingFrames: 0 });
+      expect(test.receivedAcks.at(-1)).toBe(1);
+      expect(test.providerExecutions()).toBe(1);
+      expect(test.harness.ySweetMints()).toBe(0);
+      expect(test.harness.supervisor.rotations).toBe(0);
+      expect(test.harness.runtime.snapshot()).toMatchObject({ availabilityReason: "available", livenessRecovery: null });
+      await test.complete();
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_repaired" });
+    } finally { await test.close(); }
+  });
+
+  it("repairs stale CONTROL after DATA reconnect makes genuine positive ACK progress", async () => {
+    const test = pairedLaneRecoveryHarness();
+    try {
+      await test.start();
+      const { handle } = await test.commitAcrossDisconnect();
+      const episode = test.harness.runtime.snapshot().livenessRecovery;
+      expect(episode).toEqual({ startedAtMs: 10_000, deadlineAtMs: 160_000 });
+      for (let elapsed = 0; elapsed < 120_000 && test.repairs.length === 0; elapsed += 1_000) await test.advance(1_000);
+      expect({ repairs: test.repairs, supervisorRotations: test.harness.supervisor.rotations,
+        state: test.harness.runtime.snapshot().state, providerExecutions: test.providerExecutions() })
+        .toEqual({ repairs: ["control"], supervisorRotations: 0, state: "ready", providerExecutions: 1 });
+      expect(test.harness.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available", livenessRecovery: null });
+      expect(test.receivedAcks.at(-1)).toBe(1);
+      expect(test.harness.supervisor.rotations).toBe(0);
+      expect(test.harness.ySweetMints()).toBe(0);
+      expect(test.harness.bootstrap.forceStops).toBe(0);
+      expect(test.providerExecutions()).toBe(1);
+      expect(new Set(test.hostPings).size).toBe(3); // Initial proof, stale probe, fresh repaired probe.
+      await test.complete();
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_repaired" });
+      await test.advance(10_000);
+      expect(new Set(test.hostPings).size).toBe(4);
+      expect(test.repairs).toEqual(["control"]);
+      expect(test.providerExecutions()).toBe(1);
+    } finally { await test.close(); }
+  });
+
+  it("bounds paired-lane repair and keeps the original recovery deadline during complete outage", async () => {
+    const test = pairedLaneRecoveryHarness({ repairAvailable: false, gatewayUnavailable: true });
+    try {
+      await test.start();
+      await test.commitAcrossDisconnect();
+      const episode = test.harness.runtime.snapshot().livenessRecovery;
+      test.disconnectBoth();
+      test.harness.heartbeat.lastSuccessAtMs = test.harness.clock.now();
+      for (let elapsed = 0; elapsed < 149_000; elapsed += 1_000) {
+        await test.advance(1_000);
+        expect(test.harness.runtime.snapshot().livenessRecovery).toBe(episode);
+        expect(test.providerExecutions()).toBe(1);
+      }
+      expect(test.repairs.length).toBeGreaterThan(0);
+      expect(test.harness.runtime.snapshot().state).toBe("ready");
+      await test.advance(1_000);
+      expect(test.harness.runtime.snapshot()).toMatchObject({ state: "failed", livenessRecovery: null });
+      expect(test.harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(1);
+      expect(test.harness.bootstrap.forceStops).toBe(0);
+      expect(test.providerExecutions()).toBe(1);
+    } finally { await test.close(); }
+  });
+
+  it.each(["shutdown", "session_expired"] as const)("aborts the single paired-lane repair owner on %s", async reason => {
+    const test = pairedLaneRecoveryHarness({ repairDelayMs: 60_000 });
+    let stopping: Promise<unknown> | undefined;
+    try {
+      await test.start();
+      await test.commitAcrossDisconnect();
+      for (let elapsed = 0; elapsed < 35_000 && test.repairs.length === 0; elapsed += 1_000) await test.advance(1_000);
+      expect(test.repairs).toEqual(["control"]);
+      expect(test.repairSignals[0]?.aborted).toBe(false);
+      if (reason === "shutdown") stopping = test.harness.runtime.stop();
+      else test.harness.heartbeatExpired(401);
+      await test.advance(0);
+      expect(test.repairSignals[0]?.aborted).toBe(true);
+      await test.session().close();
+      await stopping;
+      await test.advance(60_000);
+      expect(test.repairs).toEqual(["control"]);
+      expect(test.harness.ySweetMints()).toBe(0);
+      expect(test.providerExecutions()).toBe(1);
+    } finally { await test.close(); }
+  });
+
+  it("retains a matching pending CONTROL proof beyond the fast DATA reconnect deadline", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    const proof = Promise.withResolvers<{ rttMs: number; sentAtMs: number }>();
+    let probes = 0;
+    let repairs = 0;
+    harness.transport.probeLiveness = () => { probes++; return proof.promise; };
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async () => { repairs++; };
+    try {
+      await harness.clock.advanceBy(10_000);
+      harness.awareness.fail(new SplitAwarenessChannelError("data",
+        new AwarenessChannelError("offline data disconnect", "disconnected", 1005)));
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      await harness.clock.advanceBy(3_000);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(probes).toBe(1);
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.runtime.snapshot().livenessRecovery).toEqual({ startedAtMs: 10_000, deadlineAtMs: 160_000 });
+      proof.resolve({ rttMs: 3_000, sentAtMs: 10_000 });
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(harness.runtime.snapshot()).toMatchObject({ availabilityReason: "available", livenessRecovery: null });
+      expect(repairs).toBe(0);
+      expect(harness.ySweetMints()).toBe(0);
+    } finally { proof.resolve({ rttMs: 3_000, sentAtMs: 10_000 }); await harness.runtime.stop(); }
+  });
+
+  it.each(["unavailable", "instance_changed", "publish"] as const)("does not reinterpret %s proof failure as a CONTROL timeout", async code => {
+    const harness = runtimeHarness({ enableR2Recovery: true,
+      livenessOutcomes: [null, new V2TransportLivenessError("offline non-timeout proof failure", code)] });
+    let repairs = 0;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async () => { repairs++; };
+    await harness.runtime.start();
+    try {
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(repairs).toBe(0);
+      expect(harness.ySweetMints()).toBe(1);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it("rejects a late shared CONTROL pong before the original deadline callback runs", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    const proof = Promise.withResolvers<{ rttMs: number; sentAtMs: number }>();
+    harness.transport.probeLiveness = () => proof.promise;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async () => {};
+    try {
+      await harness.clock.advanceBy(10_000);
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1005));
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      await harness.clock.advanceBy(3_000);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      const episode = harness.runtime.snapshot().livenessRecovery;
+      harness.clock.value = 160_000; // Deliver proof before overdue timer callbacks.
+      proof.resolve({ rttMs: 150_000, sentAtMs: 10_000 });
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(harness.runtime.snapshot().livenessRecovery).toBe(episode);
+      expect(harness.runtime.snapshot().available).toBe(0);
+      expect(harness.ySweetMints()).toBe(0);
+      await harness.clock.advanceBy(0);
+      expect(harness.runtime.snapshot().state).toBe("failed");
+    } finally { proof.resolve({ rttMs: 150_000, sentAtMs: 10_000 }); await harness.runtime.stop(); }
+  });
+
   it.each([30_000, 60_000, 90_000])("preserves a supervised eight-worker fleet through %i ms of shared transport loss", async outageMs => {
     let outage = false;
     let replacements = 0;
@@ -931,6 +1545,23 @@ describe("V2SandboxRuntime", () => {
       name: "V2SupervisorBootstrapError", kind: "readiness",
     });
     const outer = Object.assign(new Error("offline deployment wrapper", { cause: inner }), {
+      name: "V2BootstrapError", kind: "deploy",
+    });
+    harness.bootstrap.ensureReadyWait = async () => { throw outer; };
+    await expect(harness.runtime.start()).rejects.toBe(outer);
+    expect(harness.sandboxFailures.map(sandbox => String(sandbox.sessionId))).toEqual(["sandbox-session-1"]);
+    await harness.runtime.stop();
+  });
+
+  it("reports stable submitted-cleanup failure against the execution-risk sandbox session", async () => {
+    const harness = runtimeHarness();
+    const readiness = Object.assign(new Error("offline supervisor readiness failure"), {
+      name: "V2SupervisorBootstrapError", kind: "readiness",
+    });
+    const cleanup = Object.assign(new Error("offline submitted cleanup unproven", { cause: readiness }), {
+      name: "V2SupervisorBootstrapError", kind: "deploy", remoteCode: "bootstrap_cleanup_unproven",
+    });
+    const outer = Object.assign(new Error("offline deployment wrapper", { cause: cleanup }), {
       name: "V2BootstrapError", kind: "deploy",
     });
     harness.bootstrap.ensureReadyWait = async () => { throw outer; };
@@ -2198,6 +2829,233 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
+  it.each(["data", "control"] as const)("repairs receive-only %s loss with fresh reliable proof and preserves committed lineage", async lane => {
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    const body = { model: "gpt-5.6-sol", service_tier: "fast", stream: true, store: true,
+      input: "current delta", previous_response_id: "resp_exact_receive_prior" };
+    const handle = await harness.runtime.run(body);
+    harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics({ dataPeerAgeMs: lane === "data" ? 60_000 : 1 });
+    let reconnects = 0;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async selected => {
+      expect(selected).toBe(lane);
+      reconnects++;
+      harness.transport.snapshotValue.diagnostics = lane === "data"
+        ? receiveStallDiagnostics({ inboundAcceptedSequence: 4, inboundProcessedSequence: 4,
+          inboundAcceptedProgressAgeMs: 0, inboundProcessedProgressAgeMs: 0,
+          dataPeerAgeMs: 0, sidecarPendingAgeMs: null })
+        : receiveStallDiagnostics({ dataPeerAgeMs: 1, sidecarPendingAgeMs: null },
+          { windowFrames: 0, flightCompletionsTotal: 2 });
+    };
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 300 && !harness.livenessDiagnostics.some(event =>
+        event.signal === "awareness" && event.outcome === "succeeded"); turn++) await Promise.resolve();
+      expect(reconnects).toBe(1);
+      expect(harness.runtime.snapshot().availabilityReason).toBe("available");
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      expect(harness.transport.recoverySuspends).toBe(0);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.transport.bodies).toEqual([body]);
+      expect(harness.livenessDiagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ signal: "awareness", outcome: "succeeded", awarenessLane: lane,
+          reconnectPhase: "host_reconnect" }),
+      ]));
+      harness.transport.pending[0]!.resolve({ id: "resp_exact_receive_next", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_exact_receive_next" });
+    } finally {
+      harness.transport.pending[0]?.resolve({ status: "completed" });
+      await harness.runtime.stop();
+    }
+  });
+
+  it.each([
+    { name: "first matching publication", revision: 0, publications: 1, age: 0, lane: "control" },
+    { name: "newer unseen publication", revision: 0, publications: 2, age: 0, lane: "data" },
+    { name: "native DATA ahead of delayed diagnostics", revision: 16, publications: 16, age: 1, lane: "control" },
+    { name: "exact DATA freshness boundary", revision: 15, publications: 16, age: 20_000, lane: "control" },
+    { name: "expired DATA freshness", revision: 15, publications: 16, age: 20_001, lane: "data" },
+    { name: "missing DATA revision", revision: undefined, publications: 16, age: 1, lane: "data" },
+    { name: "null DATA revision", revision: null, publications: 16, age: 1, lane: "data" },
+    { name: "negative DATA revision", revision: -1, publications: 16, age: 1, lane: "data" },
+    { name: "fractional DATA revision", revision: 15.5, publications: 16, age: 1, lane: "data" },
+    { name: "saturated DATA revision", revision: Number.MAX_SAFE_INTEGER, publications: 16, age: 1, lane: "data" },
+    { name: "zero publication count", revision: 15, publications: 0, age: 1, lane: "data" },
+    { name: "negative publication count", revision: 15, publications: -1, age: 1, lane: "data" },
+    { name: "fractional publication count", revision: 15, publications: 1.5, age: 1, lane: "data" },
+    { name: "saturated publication count", revision: 15, publications: Number.MAX_SAFE_INTEGER, age: 1, lane: "data" },
+    { name: "negative DATA age", revision: 15, publications: 16, age: -1, lane: "data" },
+    { name: "non-finite DATA age", revision: 15, publications: 16, age: Number.NaN, lane: "data" },
+    { name: "missing DATA age", revision: 15, publications: 16, age: null, lane: "data" },
+  ] as const)("chooses $lane repair for $name", async scenario => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics({
+      lastDataRevision: scenario.revision, dataPeerAgeMs: scenario.age,
+      sidecarPendingDataPublications: 1,
+    }, { dataPublicationsTotal: scenario.publications });
+    const repairs: string[] = [];
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async lane => {
+      repairs.push(lane);
+      harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics({
+        inboundAcceptedSequence: 4, inboundProcessedSequence: 4,
+        inboundAcceptedProgressAgeMs: 0, inboundProcessedProgressAgeMs: 0,
+        sidecarPendingAgeMs: null,
+      }, { windowFrames: 0 });
+    };
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(repairs).toEqual([scenario.lane]);
+      expect(harness.runtime.snapshot().availabilityReason).toBe("available");
+      expect(harness.ySweetMints()).toBe(0);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it.each([
+    { name: "stale sidecar sample", host: { sidecarDiagnosticsAgeMs: 20_001 } },
+    { name: "stale control lane", host: { controlPeerAgeMs: 20_001 } },
+    { name: "new pending output after provider thinking", host: { sidecarPendingAgeMs: 59_999 } },
+    { name: "no peer data publication progress", host: { sidecarPendingDataPublications: 0 } },
+    { name: "client or memory backpressure", host: { inboundProcessingFrames: 1 } },
+    { name: "accepted but unprocessed data", host: { inboundProcessedSequence: 2 } },
+    { name: "recent accepted progress", host: { inboundAcceptedProgressAgeMs: 59_999 } },
+    { name: "recent processed progress", host: { inboundProcessedProgressAgeMs: 59_999 } },
+    { name: "provider thinking without pending output", host: {}, sidecar: { windowFrames: 0, schedulerFrames: 0 } },
+  ])("does not recover receive transport from $name", async scenario => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics(scenario.host, scenario.sidecar);
+    let reconnects = 0;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async () => { reconnects++; };
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(reconnects).toBe(0);
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      expect(harness.transport.livenessProbes).toBe(2);
+      expect(harness.runtime.snapshot().availabilityReason).toBe("available");
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it.each(["data", "control"] as const)("rejects a pong-only %s repair as receive recovery proof", async lane => {
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics({ dataPeerAgeMs: lane === "data" ? 60_000 : 1 });
+    let reconnects = 0;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async () => { reconnects++; };
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 300 && harness.ySweetMints() === 0; turn++) await Promise.resolve();
+      expect(reconnects).toBe(1);
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.livenessDiagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ signal: "awareness", outcome: "failed", awarenessLane: lane,
+          reconnectPhase: "host_reconnect", errorKind: "unavailable" }),
+      ]));
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "succeeded" &&
+        event.reconnectPhase === "host_reconnect")).toHaveLength(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+    } finally { await harness.runtime.stop(); }
+  });
+
+  it("keeps one receive-reconnect owner and aborts it on shutdown", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.diagnostics = receiveStallDiagnostics();
+    let reconnects = 0;
+    let reconnectSignal: AbortSignal | undefined;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async (_lane, signal) => {
+      reconnects++;
+      reconnectSignal = signal;
+      await harness.clock.sleep(60_000, signal);
+    };
+    await harness.clock.advanceBy(10_000);
+    for (let turn = 0; turn < 100 && reconnects === 0; turn++) await Promise.resolve();
+    await harness.clock.advanceBy(2_000);
+    expect(reconnects).toBe(1);
+    expect(harness.ySweetMints()).toBe(0);
+    await harness.runtime.stop();
+    expect(reconnectSignal?.aborted).toBe(true);
+    expect(harness.clock.waiters).toHaveLength(0);
+  });
+
+  it("repairs a silent control lane after an exact probe timeout while data and heartbeat stay live", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    const body = { model: "gpt-5.6-sol", service_tier: "fast", input: "current turn", previous_response_id: "resp_exact_prior" };
+    const handle = await harness.runtime.run(body);
+    let timedProbe = false;
+    let reconnects = 0;
+    harness.transport.snapshotValue.sidecarPeerAgeMs = 1;
+    harness.transport.probeLiveness = async signal => {
+      timedProbe = true;
+      await harness.clock.sleep(30_000, signal);
+      throw new V2TransportLivenessError("silent control challenge timed out", "timeout");
+    };
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async (lane, signal) => {
+      reconnects++;
+      expect(lane).toBe("control");
+      expect(signal?.aborted).toBe(false);
+      harness.transport.probeLiveness = async () => ({ rttMs: 1, sentAtMs: harness.clock.now() });
+    };
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 100 && !timedProbe; turn++) await Promise.resolve();
+      expect(timedProbe).toBe(true);
+      await harness.clock.advanceBy(30_000);
+      for (let turn = 0; turn < 300 && reconnects === 0; turn++) await Promise.resolve();
+      expect(reconnects).toBe(1);
+      for (let turn = 0; turn < 300 && harness.runtime.snapshot().availabilityReason !== "available"; turn++) await Promise.resolve();
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", transportConnected: true, availabilityReason: "available" });
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.transport.rotations).toBe(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.transport.bodies).toEqual([body]);
+      for (let turn = 0; turn < 100 && !harness.livenessDiagnostics.some(event => event.signal === "awareness" && event.outcome === "succeeded"); turn++) await Promise.resolve();
+      expect(harness.livenessDiagnostics.filter(event => event.signal === "awareness"))
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ outcome: "started", awarenessLane: "control" }),
+          expect.objectContaining({ outcome: "succeeded", awarenessLane: "control", reconnectPhase: "host_reconnect" }),
+        ]));
+      harness.transport.pending[0]!.resolve({ id: "resp_exact_next", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_exact_next" });
+    } finally {
+      harness.transport.pending[0]?.resolve({ id: "resp_exact_next", status: "completed" });
+      await harness.runtime.stop();
+    }
+  });
+
+  it("bounds silent-lane reconnect before credential fallback and logs the failed lane", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
+      livenessOutcomes: [null, new V2TransportLivenessError("silent control", "timeout"), null] });
+    let reconnectSignal: AbortSignal | undefined;
+    (harness.transport as V2RuntimeTransport).reconnectAwareness = async (_lane, signal) => {
+      reconnectSignal = signal;
+      await harness.clock.sleep(60_000, signal);
+    };
+    await harness.runtime.start();
+    try {
+      await harness.clock.advanceBy(10_000);
+      for (let turn = 0; turn < 300 && !reconnectSignal; turn++) await Promise.resolve();
+      expect(reconnectSignal?.aborted).toBe(false);
+      await harness.clock.advanceBy(9_999);
+      expect(harness.ySweetMints()).toBe(0);
+      expect(harness.bootstrap.forceStops).toBe(0);
+      await harness.clock.advanceBy(1);
+      for (let turn = 0; turn < 300 && harness.ySweetMints() === 0; turn++) await Promise.resolve();
+      expect(reconnectSignal?.aborted).toBe(true);
+      expect(harness.ySweetMints()).toBe(1);
+      expect(harness.livenessDiagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ signal: "awareness", outcome: "failed", awarenessLane: "control",
+          reconnectPhase: "host_reconnect", errorKind: "unavailable", durationMs: 10_000 }),
+      ]));
+    } finally { await harness.runtime.stop(); }
+  });
+
   it("reconnects the existing credential and preserves one committed request before reminting", async () => {
     const harness = runtimeHarness({
       resourceExpiresInMs: 1_200_000,
@@ -2467,11 +3325,12 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("keeps the original child when a reconnect completes while sidecar recovery is waiting", async () => {
+  it("keeps one reconnect owner through rotation without starting competing sidecar recovery", async () => {
     const failure = new Error("connection unavailable");
     const harness = runtimeHarness({ enableR2Recovery: true, enableSupervisor: true,
       initialRotationPending: true, resourceExpiresInMs: 1_200_000,
-      // One failed fast-reconnect pong, followed by three monitor failures.
+      // The failed fast-reconnect pong transfers ownership to credential
+      // fallback; periodic probes must not compete with that pending owner.
       livenessOutcomes: [null, failure, failure, failure, failure, null] });
     await harness.runtime.start();
     try {
@@ -2482,10 +3341,11 @@ describe("V2SandboxRuntime", () => {
       await harness.clock.advanceBy(2_000);
       await harness.clock.advanceBy(2_000);
       for (let turn = 0; turn < 100; turn++) await Promise.resolve();
-      expect(harness.livenessDiagnostics.some(event => event.signal === "sidecar_recovery" && event.outcome === "started")).toBe(true);
+      expect(harness.livenessDiagnostics.some(event => event.signal === "sidecar_recovery" && event.outcome === "started")).toBe(false);
       expect(harness.bootstrap.forceStops).toBe(0);
+      harness.transport.probeLiveness = async () => ({ rttMs: 1, sentAtMs: harness.clock.now() });
       harness.releaseInitialRotation();
-      const recovered = () => harness.livenessDiagnostics.some(event => event.signal === "sidecar_recovery" && event.outcome === "succeeded");
+      const recovered = () => harness.livenessDiagnostics.some(event => event.signal === "awareness" && event.outcome === "succeeded");
       for (let turn = 0; turn < 500 && !recovered(); turn++) await Promise.resolve();
       expect(recovered()).toBe(true);
       expect(harness.transports).toHaveLength(1);
@@ -2553,6 +3413,7 @@ describe("V2SandboxRuntime", () => {
     expect(harness.sandboxFailures).toHaveLength(0);
     expect(harness.runtime.snapshot().state).toBe("stopped");
     expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
   });
 
   it("fails the recovery capsule before fresh-generation fallback when adoption fails", async () => {
@@ -2763,77 +3624,82 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  for (const origin of ["http", "sse"] as const) {
-    for (const boundary of ["start", "final"] as const) {
-      it(`keeps definitive ${origin} model unavailability at ${boundary} health-neutral without replacing the sandbox`, async () => {
-        const harness = runtimeHarness({ enableR2Recovery: true });
-        const recoveryEvents: SandboxSupervisorEvent[] = [];
-        let replacements = 0;
-        const supervised = new SupervisedSandboxRuntime({
-          projectId: harness.runtime.projectId,
-          initialChild: harness.runtime,
-          createChild: () => {
-            replacements++;
-            throw new Error("model rejection must not replace a healthy runtime");
-          },
-          clock: harness.clock,
-          random: { next: () => 0 },
-          onRecoveryEvent: event => recoveryEvents.push(event),
-        });
-        try {
-          await supervised.start();
-          const baseline = supervised.snapshot();
-          const startupEvents = recoveryEvents.length;
-          const providerError = await createProviderErrorEnvelope({
-            origin,
-            status: 404,
-            model: "gpt-6-astra",
-            value: { error: {
-              message: "The requested model is unavailable",
-              type: "invalid_request_error",
-              param: "model",
-              code: "model_not_found",
-            } },
+  for (const rejection of [
+    { label: "model unavailability", status: 404, code: "model_not_found", type: "invalid_request_error", param: "model", message: "The requested model is unavailable" },
+    { label: "long TPM rate limit", status: 429, code: "rate_limit_exceeded", type: "rate_limit_error", param: null, message: "Rate limit reached on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 609930. Please try again in 914ms. ".repeat(8) },
+  ] as const) {
+    for (const origin of ["http", "sse"] as const) {
+      for (const boundary of ["start", "final"] as const) {
+        it(`keeps definitive ${origin} ${rejection.label} at ${boundary} health-neutral without replacing the sandbox`, async () => {
+          const harness = runtimeHarness({ enableR2Recovery: true });
+          const recoveryEvents: SandboxSupervisorEvent[] = [];
+          let replacements = 0;
+          const supervised = new SupervisedSandboxRuntime({
+            projectId: harness.runtime.projectId,
+            initialChild: harness.runtime,
+            createChild: () => {
+              replacements++;
+              throw new Error("provider rejection must not replace a healthy runtime");
+            },
+            clock: harness.clock,
+            random: { next: () => 0 },
+            onRecoveryEvent: event => recoveryEvents.push(event),
           });
-          const rejected = new V2CommittedError(
-            providerError.error.message,
-            "model_not_found",
-            false,
-            undefined,
-            providerError,
-          );
-          if (boundary === "start") {
-            harness.transport.run = async () => { throw rejected; };
-            await expect(supervised.run({ model: "gpt-6-astra", input: "unavailable model" }))
-              .rejects.toBe(rejected);
-          } else {
-            const handle = await supervised.run({ model: "gpt-6-astra", input: "unavailable model" });
-            harness.transport.pending.at(-1)!.reject(rejected);
-            await expect(handle.final).rejects.toBe(rejected);
+          try {
+            await supervised.start();
+            const baseline = supervised.snapshot();
+            const startupEvents = recoveryEvents.length;
+            const providerError = await createProviderErrorEnvelope({
+              origin,
+              status: rejection.status,
+              model: "gpt-6-astra",
+              value: { error: {
+                message: rejection.message,
+                type: rejection.type,
+                param: rejection.param,
+                code: rejection.code,
+              } },
+            });
+            const rejected = new V2CommittedError(
+              providerError.error.message,
+              rejection.code,
+              false,
+              undefined,
+              providerError,
+            );
+            if (boundary === "start") {
+              harness.transport.run = async () => { throw rejected; };
+              await expect(supervised.run({ model: "gpt-6-astra", input: "unavailable model" }))
+                .rejects.toBe(rejected);
+            } else {
+              const handle = await supervised.run({ model: "gpt-6-astra", input: "unavailable model" });
+              harness.transport.pending.at(-1)!.reject(rejected);
+              await expect(handle.final).rejects.toBe(rejected);
+            }
+            await harness.clock.advanceBy(1_000);
+            expect(supervised.snapshot()).toMatchObject({
+              state: "ready",
+              incarnation: 1,
+              capacity: baseline.capacity,
+              available: baseline.available,
+              active: 0,
+              quarantined: 0,
+              recentFailureRate: 0,
+              completionEwmaMs: baseline.completionEwmaMs,
+              failure: null,
+            });
+            expect(supervised.supervisorSnapshot()).toMatchObject({ phase: "healthy", childGeneration: 1 });
+            expect(replacements).toBe(0);
+            expect(recoveryEvents).toHaveLength(startupEvents);
+            expect(harness.sandboxFailures).toHaveLength(0);
+            expect(harness.transports).toHaveLength(1);
+            expect(harness.transport.recoverySuspends).toBe(0);
+            expect(harness.transport.forceStops).toBe(0);
+          } finally {
+            await supervised.stop();
           }
-          await harness.clock.advanceBy(1_000);
-          expect(supervised.snapshot()).toMatchObject({
-            state: "ready",
-            incarnation: 1,
-            capacity: baseline.capacity,
-            available: baseline.available,
-            active: 0,
-            quarantined: 0,
-            recentFailureRate: 0,
-            completionEwmaMs: baseline.completionEwmaMs,
-            failure: null,
-          });
-          expect(supervised.supervisorSnapshot()).toMatchObject({ phase: "healthy", childGeneration: 1 });
-          expect(replacements).toBe(0);
-          expect(recoveryEvents).toHaveLength(startupEvents);
-          expect(harness.sandboxFailures).toHaveLength(0);
-          expect(harness.transports).toHaveLength(1);
-          expect(harness.transport.recoverySuspends).toBe(0);
-          expect(harness.transport.forceStops).toBe(0);
-        } finally {
-          await supervised.stop();
-        }
-      });
+        });
+      }
     }
   }
 
@@ -3027,6 +3893,341 @@ describe("V2SandboxRuntime", () => {
     expect(events).toEqual(["shutdown", "close"]);
     closed.resolve(); await stopping;
     expect(events).toEqual(["shutdown", "close", "destroy"]);
+  });
+
+  it.each(["stop", "drain"] as const)("reserves live supervisor cleanup time after a silent transport %s", async kind => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, shutdownDeadlineMs: () => shutdownDeadline });
+    await harness.runtime.start();
+    const retirement = Promise.withResolvers<void>();
+    const proof = Promise.withResolvers<void>();
+    let supervisorSignal: AbortSignal | undefined;
+    let enteredDrain = false;
+    harness.transport.drain = async (_reason?: string, signal?: AbortSignal) => {
+      enteredDrain = true;
+      if (signal?.aborted) throw signal.reason;
+      await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    };
+    harness.transport.forceStop = async () => { harness.transport.forceStops++; await retirement.promise; };
+    harness.bootstrap.forceStop = async () => { harness.bootstrap.forceStops++; await retirement.promise; };
+    harness.transport.close = async () => { harness.transport.closes++; retirement.resolve(); };
+    harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+      harness.supervisor.shutdowns++;
+      supervisorSignal = signal;
+      signal?.throwIfAborted();
+      await proof.promise;
+      signal?.throwIfAborted();
+    };
+    shutdownDeadline = harness.clock.now() + 60_000;
+    let settled = false;
+    const stopping = (kind === "drain" ? harness.runtime.drain("silent-mixed-flight") : harness.runtime.stop())
+      .then(() => null, error => error).finally(() => { settled = true; });
+    try {
+      for (let turn = 0; turn < 100 && !(kind === "drain" ? enteredDrain : harness.transport.forceStops); turn++) await Promise.resolve();
+      if (kind === "drain") {
+        await harness.clock.advanceBy(45_000);
+        for (let turn = 0; turn < 100 && !harness.transport.forceStops; turn++) await Promise.resolve();
+        expect(harness.transport.forceStops).toBe(1);
+        await harness.clock.advanceBy(7_500);
+      } else {
+        await harness.clock.advanceBy(45_000);
+      }
+      for (let turn = 0; turn < 100 && !harness.supervisor.shutdowns; turn++) await Promise.resolve();
+      expect(harness.supervisor.shutdowns).toBe(1);
+      expect(supervisorSignal?.aborted).toBe(false);
+      expect(settled).toBe(false);
+      expect(harness.clock.now()).toBeLessThan(shutdownDeadline);
+      proof.resolve();
+      await expect(stopping).resolves.toBeNull();
+      expect(harness.supervisor.closes).toBe(1);
+      expect(harness.transport.closes).toBe(1);
+    } finally {
+      retirement.resolve(); proof.resolve();
+      await harness.clock.advanceBy(60_000);
+      await stopping;
+    }
+  });
+
+  it("obtains exact supervisor cleanup when the real R10 peer refuses a mixed draining flight", async () => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, stopTimeoutMs: 1_000,
+      shutdownDeadlineMs: () => shutdownDeadline });
+    const binding: ProtocolBinding = { protocolRevision: "r2", projectId: PROJECT,
+      sessionId: "sandbox-session-1", leaderGeneration: 4, buildHash: "a".repeat(64),
+      schemaHash: "b".repeat(64), launchNonce: "mixed-drain-launch" };
+    const providers = new Map<string, { awareness: Awareness }>();
+    const docs = { data: new Y.Doc(), control: new Y.Doc() };
+    const host = { data: new Awareness(docs.data), control: new Awareness(docs.control) };
+    const accepted: HostFrame[] = [];
+    const peer = new R10DenoAwarenessPeer({
+      binding, instanceId: "mixed-drain-sidecar",
+      credential: { url: "wss://prism.test/y/d/offline/ws", baseUrl: "https://prism.test/y/d/offline",
+        docId: PROJECT, token: "offline-only", authorization: "full", rotationKey: createCredentialRotationKey() },
+      engine: { snapshot: () => ({ ready: true, credits: 8, active: 0, queued: 0, draining: false }),
+        setHostCeiling() {}, accept: async (frame: HostFrame) => { accepted.push(frame); } } as any,
+      providerFactory: (doc, _credential, lane) => {
+        const listeners = new Map<string, Set<(...args: any[]) => void>>();
+        const awareness = new Awareness(doc);
+        const provider = {
+          awareness,
+          on(event: string, listener: (...args: any[]) => void) {
+            if (!listeners.has(event)) listeners.set(event, new Set());
+            listeners.get(event)!.add(listener);
+          },
+          off(event: string, listener: (...args: any[]) => void) { listeners.get(event)?.delete(listener); },
+          connect() { queueMicrotask(() => { for (const listener of listeners.get("sync") ?? []) listener(true); }); },
+          disconnect() {}, destroy() { awareness.destroy(); },
+        };
+        providers.set(lane, provider);
+        return provider;
+      },
+      publicationIntervalMs: 60_000, retransmitMs: 60_000, connectTimeoutMs: 100,
+    });
+    let revision = 0;
+    const send = (lane: "data" | "control", draining: boolean, frames: unknown[] = []) => {
+      host[lane].setLocalStateField(lane === "data" ? "ghostprovV2Data" : "ghostprovV2Control", {
+        protocol: "gp-awareness-v2", schemaVersion: 2, ...binding, peerId: "host",
+        instanceId: "mixed-drain-host", targetInstanceId: "mixed-drain-sidecar", lane,
+        epoch: 1, revision: revision++, ack: { epoch: 1, sequence: -1 }, credits: 8,
+        active: 0, queued: 0, draining, frames,
+      });
+      applyAwarenessUpdate(providers.get(lane)!.awareness,
+        encodeAwarenessUpdate(host[lane], [docs[lane].clientID]), "offline-runtime-composition");
+    };
+    const proof = Promise.withResolvers<void>();
+    let supervisorSignal: AbortSignal | undefined;
+    let entered = false;
+    let settled = false;
+    let stopping: Promise<void> | undefined;
+    try {
+      await peer.connect();
+      await harness.runtime.start();
+      send("control", false);
+      harness.transport.drain = async (_reason?: string, signal?: AbortSignal) => {
+        entered = true;
+        send("control", true);
+        send("data", true, [
+          { kind: "request_open", requestId: "mixed-new-request", requestDigest: "c".repeat(64),
+            decodedBytes: 1, encodedBytes: 1, encoding: "identity", partCount: 1, epoch: 1, sequence: 0 },
+          { kind: "drain", reason: "shutdown", epoch: 1, sequence: 1 },
+        ]);
+        await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      };
+      harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+        harness.supervisor.shutdowns++; supervisorSignal = signal;
+        signal?.throwIfAborted(); await proof.promise; signal?.throwIfAborted();
+      };
+      shutdownDeadline = harness.clock.now() + 1_000;
+      stopping = harness.runtime.drain("mixed-flight-cleanup").finally(() => { settled = true; });
+      for (let turn = 0; turn < 100 && !entered; turn++) await Promise.resolve();
+      expect(accepted).toHaveLength(0);
+      await harness.clock.advanceBy(500);
+      for (let turn = 0; turn < 100 && !harness.supervisor.shutdowns; turn++) await Promise.resolve();
+      expect(harness.transport.forceStops).toBe(1);
+      expect(harness.supervisor.shutdowns).toBe(1);
+      expect(supervisorSignal?.aborted).toBe(false);
+      expect(settled).toBe(false);
+      proof.resolve();
+      await stopping;
+      expect(harness.runtime.localCleanupComplete()).toBe(true);
+      expect(accepted).toHaveLength(0);
+    } finally {
+      proof.resolve();
+      await stopping?.catch(() => undefined);
+      await peer.close();
+      for (const awareness of Object.values(host)) awareness.destroy();
+      for (const doc of Object.values(docs)) doc.destroy();
+    }
+  });
+
+  it("preserves most of a long graceful budget while reserving the configured cleanup budget", async () => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, shutdownDeadlineMs: () => shutdownDeadline });
+    await harness.runtime.start();
+    let drainSignal: AbortSignal | undefined;
+    const drain = Promise.withResolvers<void>();
+    harness.transport.drain = async (_reason?: string, signal?: AbortSignal) => { drainSignal = signal; await drain.promise; };
+    shutdownDeadline = harness.clock.now() + 300_000;
+    const stopping = harness.runtime.drain("long-graceful-budget");
+    for (let turn = 0; turn < 100 && !drainSignal; turn++) await Promise.resolve();
+    await harness.clock.advanceBy(280_000);
+    expect(drainSignal?.aborted).toBe(false);
+    expect(harness.transport.forceStops).toBe(0);
+    expect(harness.supervisor.shutdowns).toBe(0);
+    drain.resolve();
+    await stopping;
+    expect(harness.transport.forceStops).toBe(0);
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(harness.runtime.localCleanupComplete()).toBe(true);
+    expect(harness.clock.now()).toBeLessThan(shutdownDeadline);
+  });
+
+  it("keeps the local cleanup witness false until delayed closes finish after remote proof fails", async () => {
+    const harness = runtimeHarness({ enableSupervisor: true, stopTimeoutMs: 100 });
+    await harness.runtime.start();
+    const closed = Promise.withResolvers<void>();
+    harness.supervisor.shutdown = async () => { throw new Error("exact remote proof unavailable"); };
+    harness.supervisor.close = async () => { harness.supervisor.closes++; await closed.promise; };
+    const stopping = harness.runtime.stop().then(() => null, error => error);
+    for (let turn = 0; turn < 100 && !harness.supervisor.closes; turn++) await Promise.resolve();
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
+    await harness.clock.advanceBy(100);
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
+    closed.resolve();
+    for (let turn = 0; turn < 100 && !harness.runtime.localCleanupComplete(); turn++) await Promise.resolve();
+    expect(harness.runtime.localCleanupComplete()).toBe(true);
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+  });
+
+  it("keeps the local cleanup witness false when a physical close fails", async () => {
+    const harness = runtimeHarness({ enableSupervisor: true });
+    await harness.runtime.start();
+    harness.transport.close = async () => { throw new Error("local transport close failed"); };
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
+  });
+
+  it("fails the local witness closed when rejected bootstrap retirement has no physical witness", async () => {
+    const harness = runtimeHarness({ enableSupervisor: true });
+    await harness.runtime.start();
+    harness.bootstrap.forceStop = async () => { throw new Error("abortable bootstrap retirement rejected"); };
+    harness.supervisor.shutdown = async () => { throw new Error("remote proof unavailable"); };
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
+  });
+
+  it("joins bootstrap retirement ownership after its abortable public stop has settled", async () => {
+    const harness = runtimeHarness({ enableSupervisor: true });
+    await harness.runtime.start();
+    let retired = false;
+    (harness.bootstrap as V2RuntimeBootstrap).retirementSettled = () => retired;
+    harness.supervisor.shutdown = async () => { throw new Error("remote proof unavailable"); };
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
+    retired = true;
+    expect(harness.runtime.localCleanupComplete()).toBe(true);
+    expect(harness.bootstrap.forceStops).toBe(1);
+  });
+
+  it("uses the shared system deadline for supervisor cleanup beyond the recovery stop timeout", async () => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, shutdownDeadlineMs: () => shutdownDeadline });
+    await harness.runtime.start();
+    const cleanup = Promise.withResolvers<void>();
+    let supervisorSignal: AbortSignal | undefined;
+    harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+      harness.supervisor.shutdowns++;
+      supervisorSignal = signal;
+      await cleanup.promise;
+    };
+    shutdownDeadline = harness.clock.now() + 60_000;
+    let settled = false;
+    const stopping = harness.runtime.drain("system-shutdown").finally(() => { settled = true; });
+    for (let turn = 0; turn < 100 && harness.supervisor.shutdowns === 0; turn++) await Promise.resolve();
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(supervisorSignal?.aborted).toBe(false);
+
+    await harness.clock.advanceBy(35_000);
+    expect(settled).toBe(false);
+    cleanup.resolve();
+    await expect(stopping).resolves.toBeUndefined();
+    expect(harness.supervisor.closes).toBe(1);
+    expect(harness.runtime.snapshot().state).toBe("stopped");
+    expect(harness.clock.waiters).toHaveLength(0);
+  });
+
+  it.each([50_000, 60_000])("bounds supervisor cleanup to the system time remaining after a %d ms drain", async drainMs => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, shutdownDeadlineMs: () => shutdownDeadline });
+    await harness.runtime.start();
+    let draining = false;
+    harness.transport.drain = async () => { draining = true; await harness.clock.sleep(drainMs); };
+    let supervisorSignal: AbortSignal | undefined;
+    let alreadyExpired: boolean | undefined;
+    let destroys = 0;
+    harness.ydoc.destroy = async () => { destroys++; };
+    harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+      harness.supervisor.shutdowns++;
+      supervisorSignal = signal;
+      alreadyExpired = signal?.aborted;
+      signal?.throwIfAborted();
+      await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    };
+    shutdownDeadline = harness.clock.now() + 60_000;
+    let settled = false;
+    const stopping = harness.runtime.drain("system-shutdown")
+      .then(() => null, error => error).finally(() => { settled = true; });
+    for (let turn = 0; turn < 100 && !draining; turn++) await Promise.resolve();
+    await harness.clock.advanceBy(drainMs);
+    for (let turn = 0; turn < 100 && harness.supervisor.shutdowns === 0; turn++) await Promise.resolve();
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(alreadyExpired).toBe(drainMs === 60_000);
+    if (drainMs < 60_000) {
+      await harness.clock.advanceBy(9_999);
+      expect(supervisorSignal?.aborted).toBe(false);
+      expect(settled).toBe(false);
+      await harness.clock.advanceBy(1);
+    }
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    for (let turn = 0; turn < 100 && destroys === 0; turn++) await Promise.resolve();
+    expect(supervisorSignal?.aborted).toBe(true);
+    expect(harness.supervisor.closes).toBe(1);
+    expect(destroys).toBe(1);
+    expect(harness.clock.waiters).toHaveLength(0);
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+  });
+
+  it("does not extend cleanup already started before system shutdown", async () => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, stopTimeoutMs: 10, shutdownDeadlineMs: () => shutdownDeadline });
+    const cleanup = Promise.withResolvers<void>();
+    let supervisorSignal: AbortSignal | undefined;
+    harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+      harness.supervisor.shutdowns++;
+      supervisorSignal = signal;
+      await cleanup.promise;
+    };
+    harness.transport.connect = async () => { throw new Error("offline startup failure"); };
+    const starting = harness.runtime.start().then(() => null, error => error);
+    for (let turn = 0; turn < 100 && harness.supervisor.shutdowns === 0; turn++) await Promise.resolve();
+    expect(harness.supervisor.shutdowns).toBe(1);
+    expect(supervisorSignal?.aborted).toBe(false);
+    shutdownDeadline = harness.clock.now() + 60_000;
+    const stopping = harness.runtime.stop().then(() => null, error => error);
+
+    await harness.clock.advanceBy(10);
+    expect(supervisorSignal?.aborted).toBe(true);
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect((await starting)?.message).toBe("offline startup failure");
+    cleanup.resolve();
+    for (let turn = 0; turn < 100 && harness.supervisor.closes === 0; turn++) await Promise.resolve();
+    expect(harness.supervisor.closes).toBe(1);
+    await expect(harness.runtime.stop()).rejects.toThrow("cleanup was incomplete");
+  });
+
+  it("rejects supervisor cleanup that resolves at the deadline before its timer runs", async () => {
+    let shutdownDeadline: number | undefined;
+    const harness = runtimeHarness({ enableSupervisor: true, shutdownDeadlineMs: () => shutdownDeadline });
+    await harness.runtime.start();
+    const cleanup = Promise.withResolvers<void>();
+    let supervisorSignal: AbortSignal | undefined;
+    harness.supervisor.shutdown = async (_reason?: string, signal?: AbortSignal) => {
+      harness.supervisor.shutdowns++;
+      supervisorSignal = signal;
+      await cleanup.promise;
+    };
+    shutdownDeadline = harness.clock.now() + 60_000;
+    const stopping = harness.runtime.drain("system-shutdown").then(() => null, error => error);
+    for (let turn = 0; turn < 100 && harness.supervisor.shutdowns === 0; turn++) await Promise.resolve();
+    // Advance the clock without dispatching timers, as after a stalled event loop.
+    harness.clock.value = shutdownDeadline;
+    expect(supervisorSignal?.aborted).toBe(false);
+    cleanup.resolve();
+    expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(supervisorSignal?.aborted).toBe(true);
+    expect(harness.supervisor.closes).toBe(1);
+    expect(harness.clock.waiters).toHaveLength(0);
   });
 
   it.each(["stop", "drain"] as const)("reports rejected supervisor cleanup through %s after releasing local resources", async kind => {
@@ -3268,6 +4469,7 @@ describe("V2SandboxRuntime", () => {
       await harness.clock.advanceBy(10);
     }
     expect((await stopping)?.message).toContain("cleanup was incomplete");
+    expect(harness.runtime.localCleanupComplete()).toBe(false);
     resolveReady({
       instanceId: "late-sidecar",
       releaseRevision: "r1",
@@ -3279,6 +4481,8 @@ describe("V2SandboxRuntime", () => {
       capacity: 8,
     });
     await starting;
+    for (let turn = 0; turn < 100 && !harness.runtime.localCleanupComplete(); turn++) await Promise.resolve();
+    expect(harness.runtime.localCleanupComplete()).toBe(true);
 
     expect(harness.runtime.snapshot().state).toBe("stopped");
     expect(harness.transport.snapshotValue.connected).toBe(false);

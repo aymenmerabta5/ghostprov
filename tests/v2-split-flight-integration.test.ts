@@ -1,12 +1,19 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as Y from "yjs";
 import {
   Awareness,
   applyAwarenessUpdate,
   encodeAwarenessUpdate,
+  removeAwarenessStates,
 } from "y-protocols/awareness";
 import { DenoAwarenessPeer, type DenoAwarenessProviderLike } from "../sandbox/v2/awareness-peer";
-import { parseYSweetEnvelope } from "../src/prism/protocol";
+import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../sandbox/v2/r10-awareness-peer";
+import { SidecarEngine as R10SidecarEngine } from "../src/v2/sidecar/r10-engine";
+import { OutputBackpressure } from "../src/v2/sidecar/output-sink";
+import { createExactSizedV2Request } from "./support/v2-performance-harness";
+import { parseProvisionedSandbox, parseResourceCredential, parseYSweetEnvelope } from "../src/prism/protocol";
+import { V2SandboxRuntime, type V2RuntimeLivenessDiagnostic } from "../src/v2/runtime";
+import type { RunHandle } from "../src/relay/run-handle";
 import { projectId } from "../src/sandbox/types";
 import { SplitAwarenessChannel } from "../src/v2/awareness/split-channel";
 import {
@@ -20,7 +27,7 @@ import type {
   ReliableFrame,
   SidecarFrame,
 } from "../src/v2/protocol/shared";
-import { utf8Bytes } from "../src/v2/protocol/shared";
+import { canonicalJson, utf8Bytes, utf8Text } from "../src/v2/protocol/shared";
 import { TranscriptProof } from "../src/v2/protocol/transcript";
 import { parseAwarenessEnvelope } from "../src/v2/protocol/validate";
 import { V2TransportSession } from "../src/v2/transport/session";
@@ -48,6 +55,9 @@ class HubProvider implements AwarenessProviderLike, DenoAwarenessProviderLike {
   readonly awareness: Awareness;
   readonly listeners = new Map<string, Set<(...args: any[]) => void>>();
   connected = false;
+  connects = 0;
+  disconnects = 0;
+  syncGate: Promise<void> | null = null;
 
   constructor(
     readonly hub: AwarenessHub,
@@ -70,13 +80,18 @@ class HubProvider implements AwarenessProviderLike, DenoAwarenessProviderLike {
 
   connect(): void {
     if (this.connected) return;
+    this.connects++;
     this.connected = true;
     this.hub.connect(this);
-    queueMicrotask(() => this.emit("sync", true));
+    queueMicrotask(() => {
+      if (this.syncGate) void this.syncGate.then(() => this.emit("sync", true));
+      else this.emit("sync", true);
+    });
   }
 
   disconnect(): void {
     if (!this.connected) return;
+    this.disconnects++;
     this.connected = false;
     this.hub.disconnect(this);
   }
@@ -104,12 +119,14 @@ class AwarenessHub {
   readonly providers = new Set<HubProvider>();
   readonly bytesByLabel = new Map<string, number>();
   dropBroadcast?: (source: HubProvider) => boolean;
+  onConnect?: (source: HubProvider) => void;
 
   create(doc: Y.Doc, label: string): HubProvider {
     return new HubProvider(this, doc, label);
   }
 
   connect(provider: HubProvider): void {
+    this.onConnect?.(provider);
     for (const existing of this.providers) {
       this.copyLocal(existing, provider);
       this.copyLocal(provider, existing);
@@ -150,6 +167,243 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("V2 split-flight production components", () => {
+  it.each([
+    ["manual control", false, "control"],
+    ["automatic control", true, "control"],
+    ["automatic data", true, "data"],
+  ] as const)("recovers %s while retaining a 901KB tail and committed R10 output", async (_name, automatic, faultLane) => {
+    const hub = new AwarenessHub();
+    const nonce = "11111111-1111-4111-8111-111111111111";
+    const binding: ProtocolBinding = { ...BINDING, protocolRevision: "r2", launchNonce: nonce };
+    const credential = parseYSweetEnvelope({ url: `wss://prism.test/y/d/${PROJECT}/ws`,
+      baseUrl: `https://prism.test/y/d/${PROJECT}`, docId: PROJECT, token: "offline-current", authorization: "full" });
+    const providers = new Map<string, HubProvider>();
+    const createProvider = (doc: Y.Doc, label: string) => {
+      const provider = hub.create(doc, label); providers.set(label, provider); return provider;
+    };
+    const hostLane = (lane: "data" | "control") => new YSweetAwarenessChannel<HostFrame, SidecarFrame>({
+      envelope: credential, localPeerId: `host:${lane}`,
+      field: lane === "data" ? "ghostprovV2Data" : "ghostprovV2Control",
+      parseRemote: value => parseAwarenessEnvelope(value, binding, "sidecar"),
+      providerFactory: doc => createProvider(doc, `host-${lane}`), syncTimeoutMs: 500,
+    });
+    const channel = new SplitAwarenessChannel({ data: hostLane("data"), control: hostLane("control") });
+    const session = new V2TransportSession({ binding, channel,
+      expectedSidecarInstanceId: "silent-control-sidecar", hostInstanceId: "silent-control-host",
+      maxResponseBytes: 2 * 1024 * 1024, publicationIntervalMs: 1, retransmitMs: 25, livenessTimeoutMs: 60,
+      // The incident's lost-progress fallback uses this exact32-frame R2 flight.
+      transportProfile: "standard", gzip: async bytes => bytes,
+    });
+    const journal = new ClaimJournal({ storage: new FakeSidecarStorage([]), flushIntervalMs: 0, maxBatch: 16 });
+    const admission = new AdmissionController({ physicalMax: 4, acceptedMax: 8, hostCeiling: 4,
+      memoryBudgetBytes: 64 * 1024 * 1024 });
+    const pressure = new OutputBackpressure({ highFrames: 256, highBytes: 256 * 1024,
+      lowFrames: 64, lowBytes: 64 * 1024, hardFrames: 1024, hardBytes: 1024 * 1024 });
+    const outputGate = Promise.withResolvers<void>();
+    const bodies: Record<string, unknown>[] = [];
+    let peer!: R10DenoAwarenessPeer;
+    let responseFrames = 0;
+    let peakWindowBytes = 0;
+    const engine = new R10SidecarEngine({ binding,
+      assembler: new RequestAssembler({ maxReservedBytes: 64 * 1024 * 1024 }), journal, admission,
+      batching: true, outputBackpressure: pressure, assertExecutionFence: frame => peer.assertExecutionFence(frame),
+      upstream: { execute: async input => {
+        const ordinal = bodies.length;
+        bodies.push(JSON.parse(utf8Text(input.body)));
+        await input.beforeFetch();
+        if (ordinal === 0) await outputGate.promise;
+        await input.onPrelude({ status: 200, contentType: "text/event-stream", upstreamRequestId: null });
+        const responseId = `resp_control_${ordinal}`;
+        const delta = "x".repeat(1024);
+        const final = { id: responseId, object: "response", status: "completed",
+          output: [{ type: "message", content: [{ type: "output_text", text: delta.repeat(254) }] }] };
+        const events = [
+          { event: "response.created", data: JSON.stringify({ type: "response.created", response: { id: responseId } }) },
+          ...Array.from({ length: 254 }, () => ({ event: "response.output_text.delta",
+            data: JSON.stringify({ type: "response.output_text.delta", delta }) })),
+          { event: "response.completed", data: JSON.stringify({ type: "response.completed", response: final }) },
+        ];
+        const proof = new TranscriptProof("upstream", "0".repeat(64), { retainBytes: false });
+        for (let index = 0; index < events.length; index++) {
+          await proof.appendCanonicalStream(events[index]!, { onChunk: input.onTranscriptBytes });
+          if (index !== events.length - 1) await input.onEvent(events[index]!);
+        }
+        const terminal = await proof.createTerminal();
+        return { responseId, status: terminal.terminalStatus, eventCount: terminal.eventCount,
+          byteCount: terminal.byteCount, transcriptSha256: terminal.transcriptSha256,
+          finalEventIndex: terminal.finalEventIndex, finalSha256: terminal.finalSha256,
+          final, event: events.at(-1)! };
+      } },
+      emit: (frame, priority, stream) => {
+        if (frame.kind === "response_event" || frame.kind === "response_batch") responseFrames++;
+        peer.enqueue(frame, priority, stream);
+        const current = providers.get("sidecar-data")?.awareness.getLocalState()?.ghostprovV2Data;
+        if (current) peakWindowBytes = Math.max(peakWindowBytes,
+          current.frames.reduce((total: number, entry: unknown) => total + utf8Bytes(JSON.stringify(entry)).byteLength, 0));
+      },
+    });
+    peer = new R10DenoAwarenessPeer({ binding, instanceId: "silent-control-sidecar", engine,
+      credential: { url: credential.url, baseUrl: credential.baseUrl, docId: PROJECT,
+        token: "offline-current", authorization: "full", rotationKey: createCredentialRotationKey() },
+      providerFactory: (doc, _credential, lane) => createProvider(doc, `sidecar-${lane}`),
+      outputBackpressure: pressure, publicationIntervalMs: 1, retransmitMs: 25,
+      connectTimeoutMs: 100, initialActivePerSandbox: 4, maxActivePerSandbox: 4,
+    });
+    let provisions = 0;
+    let bootstrapCreates = 0;
+    let credentialMints = 0;
+    let forcedStops = 0;
+    const liveness: V2RuntimeLivenessDiagnostic[] = [];
+    const sandbox = parseProvisionedSandbox({ url: "https://prism.test/offline", token: "offline-sandbox",
+      sandbox_session_id: binding.sessionId });
+    const resource = parseResourceCredential({ access_token: "offline-resource", expires_at: (Date.now() + 600_000) / 1000,
+      scopes: ["project_files:read"], resources_base_url: "https://prism.test/resources" }, Date.now());
+    const runtime = automatic ? new V2SandboxRuntime({
+      projectId: PROJECT, workerIndex: 1, leaderGeneration: binding.leaderGeneration,
+      assets: { revision: "r10", protocolRevision: "r2", transportProfile: "standard",
+        buildHash: binding.buildHash, schemaHash: binding.schemaHash, entrypointPath: "offline/sidecar.bundle.js",
+        manifest: { path: "offline/manifest.json", logicalPath: "manifest.json", content: "{}", sha256: "c".repeat(64) },
+        obsoletePaths: [], files: [] },
+      transportReservationBytes: 16 * 1024 * 1024,
+      governor: { snapshot: () => ({ reservationCapacityBytes: 256 * 1024 * 1024, reservedBytes: 0, paused: false }) },
+      provisioning: {
+        provision: async (_project, _signal, hooks) => {
+          provisions++; await hooks?.onSandboxAcquired?.(sandbox);
+          return { projectId: PROJECT, sandbox, resource, ySweet: credential, provisionedAtMs: Date.now() };
+        },
+        refreshResources: async () => resource,
+        mintYSweet: async () => { credentialMints++; return credential; },
+      },
+      sidecarProbePeriodMs: 50, sidecarSuspectRecheckMs: 10, stopTimeoutMs: 1_000,
+      sidecarCommitStallMs: faultLane === "data" ? 200 : undefined,
+      createGateway: () => ({ heartbeat: async () => ({ ok: true, status: 200, durationMs: 1, sessionId: binding.sessionId }) }),
+      createHeartbeat: () => ({ start() {}, stop: async () => undefined, snapshot: () => ({ lastSuccessAtMs: Date.now() }) }),
+      createYDoc: () => ({ connect: async () => undefined, destroy: async () => undefined }),
+      createAwareness: actual => { expect(actual).toEqual(binding); return channel; },
+      createBootstrap: () => {
+        bootstrapCreates++;
+        return { ensureReady: async () => ({ instanceId: "silent-control-sidecar", releaseRevision: "r10", protocolRevision: "r2",
+          launchNonce: binding.launchNonce, buildHash: binding.buildHash, schemaHash: binding.schemaHash,
+          leaderGeneration: binding.leaderGeneration, capacity: 4 }),
+        drainAndStop: async () => undefined, forceStop: async () => { forcedStops++; },
+        sealCredentialRotation: async () => "{}" };
+      },
+      createTransport: () => session,
+      onLivenessDiagnostic: event => liveness.push(event),
+    }) : null;
+    const run = (body: Record<string, unknown>) => runtime ? runtime.run(body) : session.run(body);
+    let blocked = false;
+    let firstRootParts = 0;
+    let blockedTail: readonly unknown[] | null = null;
+    let rootRequestId: string | null = null;
+    hub.onConnect = provider => {
+      if (provider.label === `host-${faultLane}` && provider.connects > 1) blocked = false;
+    };
+    hub.dropBroadcast = source => {
+      if (source.label === "host-data") {
+        const frames = source.awareness.getLocalState()?.ghostprovV2Data?.frames as ReliableFrame<HostFrame>[] | undefined;
+        const opened = frames?.find(frame => frame.kind === "request_open" && frame.decodedBytes === 901_823);
+        if (opened && "requestId" in opened) rootRequestId = opened.requestId;
+        const data = frames?.filter(frame => frame.kind === "request_data" && frame.requestId === rootRequestId) ?? [];
+        if (data.length && firstRootParts === 0) firstRootParts = data.length;
+        if (!blockedTail && data.some(frame => frame.kind === "request_data" && frame.partIndex >= 31)) {
+          blocked = true;
+          blockedTail = structuredClone(frames!);
+          // Model remote Awareness expiry on a silent control socket. The data
+          // socket remains connected; no close/error event reaches the host.
+          if (faultLane === "control") {
+            removeAwarenessStates(providers.get("sidecar-control")!.awareness,
+              [providers.get("host-control")!.doc.clientID], hub);
+          }
+        }
+      }
+      return blocked && (faultLane === "control" ? source.label.endsWith("control") : source.label === "host-data");
+    };
+    const complete = async (handle: RunHandle) => {
+      const events = Array.fromAsync(handle.events());
+      const final = await handle.final;
+      expect(await events).toHaveLength(256);
+      expect(final.status).toBe("completed");
+    };
+    let pending: Promise<unknown> | undefined;
+    try {
+      await engine.start(); await peer.connect();
+      if (runtime) {
+        const random = spyOn(crypto, "randomUUID").mockReturnValueOnce(nonce);
+        try { await runtime.start(); } finally { random.mockRestore(); }
+      } else await session.connect();
+      await waitFor(() => session.snapshot().credits > 0);
+      const background = await run(createExactSizedV2Request(4096, 0));
+      const backgroundDone = complete(background);
+      void backgroundDone.catch(() => undefined);
+      const root = createExactSizedV2Request(901_823, 1, "incompressible");
+      let rootCommitted = false;
+      const rootRun = run(root).then(handle => { rootCommitted = true; return handle; });
+      void rootRun.catch(() => undefined);
+      pending = rootRun;
+      await waitFor(() => blockedTail !== null);
+      expect(firstRootParts).toBe(31);
+      expect(rootCommitted).toBe(false);
+      const healthyLane = faultLane === "control" ? "data" : "control";
+      const healthyConnects = providers.get(`host-${healthyLane}`)!.connects;
+      outputGate.resolve();
+      await waitFor(() => responseFrames > 0);
+      const synced = Promise.withResolvers<void>();
+      providers.get(`host-${faultLane}`)!.syncGate = synced.promise;
+      let reconnecting: Promise<void> | undefined;
+      if (runtime) {
+        await waitFor(() => providers.get(`host-${faultLane}`)!.connects === 2);
+        expect(liveness).toEqual(expect.arrayContaining([
+          expect.objectContaining({ signal: "sidecar_probe", outcome: "failed", errorKind: faultLane === "control" ? "timeout" : "reliable_stall" }),
+          expect.objectContaining({ signal: "awareness", outcome: "started", awarenessLane: faultLane }),
+        ]));
+      } else {
+        await expect(session.probeLiveness()).rejects.toMatchObject({ code: "timeout" });
+        await session.resumeAwareness();
+        expect(providers.get("host-control")!.connects).toBe(1);
+        expect(rootCommitted).toBe(false);
+        expect(providers.get("host-data")!.awareness.getLocalState()!.ghostprovV2Data.frames).toEqual(blockedTail);
+        reconnecting = session.reconnectAwareness?.("control", AbortSignal.timeout(2_000)) ??
+          session.resumeAwareness(AbortSignal.timeout(2_000));
+        void reconnecting.catch(() => undefined);
+      }
+      // Outgoing ACK/RTO work continues during this delayed handshake. It must
+      // retain reliable ownership instead of turning reconnect into a protocol failure.
+      await Bun.sleep(100);
+      expect(session.snapshot().connected).toBe(true);
+      expect(session.snapshot().ambiguousQuarantined).toBe(0);
+      synced.resolve();
+      await reconnecting;
+      if (runtime) await waitFor(() => liveness.some(event => event.signal === "awareness" && event.outcome === "succeeded"));
+      else await expect(session.probeLiveness()).resolves.toMatchObject({ sentAtMs: expect.any(Number) });
+      const rootHandle = await rootRun;
+      await complete(rootHandle);
+      await backgroundDone;
+      const deltaBody = createExactSizedV2Request(21_052, 2, "incompressible");
+      deltaBody.previous_response_id = "resp_control_1";
+      deltaBody.input = (deltaBody.input as string).slice(0,
+        (deltaBody.input as string).length - (utf8Bytes(canonicalJson(deltaBody)).byteLength - 21_052));
+      await complete(await run(deltaBody));
+      expect(bodies).toHaveLength(3);
+      expect(bodies[1]).toEqual(root);
+      expect(bodies[2]).toEqual(deltaBody);
+      expect(utf8Bytes(canonicalJson(bodies[1])).byteLength).toBe(901_823);
+      expect(utf8Bytes(canonicalJson(bodies[2])).byteLength).toBe(21_052);
+      expect(providers.get(`host-${faultLane}`)!.connects).toBe(2);
+      expect(providers.get(`host-${healthyLane}`)!.connects).toBe(healthyConnects);
+      expect(peakWindowBytes).toBeLessThanOrEqual(128 * 1024);
+      expect(pressure.snapshot().hardExceeded).toBe(false);
+      if (runtime) {
+        expect(provisions).toBe(1); expect(bootstrapCreates).toBe(1);
+        expect(credentialMints).toBe(0); expect(forcedStops).toBe(0);
+        expect(runtime.snapshot().state).toBe("ready");
+      }
+    } finally {
+      outputGate.resolve(); await runtime?.stop(); await session.close(); await pending?.catch(() => undefined);
+      await peer.close(); admission.close(); await journal.close();
+    }
+  }, 10_000);
+
   it("commits a request through independent host and sidecar lane providers", async () => {
     const hub = new AwarenessHub();
     const ySweet = parseYSweetEnvelope({

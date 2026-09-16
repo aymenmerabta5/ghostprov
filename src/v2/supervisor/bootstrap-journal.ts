@@ -4,6 +4,7 @@ import { FileLease } from "../../core/file-lease";
 import { validateBootstrapBinding, type BootstrapBinding } from "../bootstrap/crypto";
 import { canonicalJson } from "../protocol/shared";
 import type { SealedSupervisorSessionBootstrap } from "./session-bootstrap";
+import { validateDirectSupervisorExecAcceptance, type DirectSupervisorExecStarted } from "../../prism/direct-exec";
 
 const MAX_BYTES = 16 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\s\S])/;
@@ -16,6 +17,8 @@ export interface SupervisorBootstrapAttempt {
   readonly binding: BootstrapBinding;
   readonly connectTimeoutMs: number;
   readonly sealed: SealedSupervisorSessionBootstrap;
+  /** Optional for legacy records; omission is unknown acceptance, never proof of no execution. */
+  readonly commandAcceptance?: DirectSupervisorExecStarted;
 }
 
 export interface BootstrapJournalEntry {
@@ -30,18 +33,27 @@ export interface SupervisorBootstrapJournal {
 
 function parse(raw: string, project: string): SupervisorBootstrapAttempt {
   if (Buffer.byteLength(raw) > MAX_BYTES) throw new Error("Supervisor bootstrap journal exceeds its bound");
-  const v = JSON.parse(raw) as SupervisorBootstrapAttempt;
+  return validateSupervisorBootstrapAttempt(JSON.parse(raw), project);
+}
+
+/** Pure structural validation shared by persisted journals and read-only recovery assessment. */
+export function validateSupervisorBootstrapAttempt(value: unknown, expectedProject?: string): SupervisorBootstrapAttempt {
+  const v = value as SupervisorBootstrapAttempt;
   if (!v || typeof v !== "object" || Array.isArray(v) ||
-    Object.keys(v).sort().join(",") !== "binding,connectTimeoutMs,phase,sealed,sessionId,version" ||
+    Object.keys(v).filter(key => key !== "commandAcceptance").sort().join(",") !== "binding,connectTimeoutMs,phase,sealed,sessionId,version" ||
     v.version !== 1 || !["prepared", "submitted", "cleanup_proven"].includes(v.phase) ||
     typeof v.sessionId !== "string" || !UUID.test(v.sessionId) ||
     !Number.isSafeInteger(v.connectTimeoutMs) || v.connectTimeoutMs < 1 || v.connectTimeoutMs > 300_000) {
     throw new Error("Supervisor bootstrap journal is invalid");
   }
   const binding = validateBootstrapBinding(v.binding);
-  if (binding.projectId !== project || !v.sealed || typeof v.sealed !== "object" ||
+  if ((expectedProject !== undefined && binding.projectId !== expectedProject) || !v.sealed || typeof v.sealed !== "object" ||
     canonicalJson(validateBootstrapBinding(v.sealed.binding)) !== canonicalJson(binding)) {
     throw new Error("Supervisor bootstrap journal binding does not match");
+  }
+  if (Object.hasOwn(v, "commandAcceptance")) {
+    if (v.phase === "prepared") throw new Error("Prepared bootstrap cannot contain command acceptance");
+    validateDirectSupervisorExecAcceptance(v.commandAcceptance, v.sessionId);
   }
   return v;
 }

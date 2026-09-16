@@ -3,6 +3,11 @@ import { Buffer } from "node:buffer";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
+import * as decoding from "lib0/decoding";
+import { withLocalAwarenessPublisher } from "../v2/awareness/local-publisher";
+import { AtomicBytePermitPool, type AtomicBytePermit } from "../v2/memory/atomic-byte-permits";
+import { ServerReadbackChannel } from "./remote-readback-channel";
+import { prepareRemotePathExpectations, verifyRemotePathUpdate, RemotePathReadbackError } from "./remote-path-readback";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
 import type { YSweetEnvelope } from "../prism/protocol";
 import type { ProjectId } from "./types";
@@ -12,6 +17,14 @@ export type YProviderEvent = "sync" | "connection-close";
 export interface YProviderLike {
   on(event: YProviderEvent, listener: (...args: any[]) => void): void;
   destroy(): void;
+  readFullServerState?(request: {
+    readonly signal: AbortSignal;
+    readonly acceptUpdate: (update: Uint8Array) => boolean;
+  }): Promise<void>;
+}
+
+export interface YDocPublicationReceipt {
+  readonly assertCurrent: () => void;
 }
 
 export interface YProviderFactory {
@@ -25,6 +38,8 @@ export interface SandboxYDocOptions {
   clock?: Clock;
   syncTimeoutMs?: number;
   appendDelayMs?: number;
+  /** Application composition always supplies the authoritative governor. */
+  reserveRemoteReadbackBytes?: (bytes: number) => { release(): void };
 }
 
 export interface YDocFileMeta {
@@ -71,26 +86,54 @@ export class YDocSessionError extends Error {
 const DEFAULT_PROVIDER_FACTORY: YProviderFactory = {
   create(envelope, doc) {
     const token = envelope.token.reveal();
+    let currentSocket: WebSocket | null = null;
+    let readbackFenced = false;
+    let readbackOutstanding = false;
     class AuthenticatedWebSocket extends WebSocket {
       constructor(url: string | URL, protocols?: string | string[]) {
         const raw = String(url);
         super(`${raw}${raw.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`, protocols);
+        currentSocket = this;
       }
     }
-    return new WebsocketProvider(
+    const provider = withLocalAwarenessPublisher(new WebsocketProvider(
       envelope.url,
       envelope.docId,
       doc,
       {
-        connect: true,
+        connect: false,
         WebSocketPolyfill: AuthenticatedWebSocket,
       } as any,
-    ) as unknown as YProviderLike;
+    ));
+    for (let index = 0; index < provider.messageHandlers.length; index++) {
+      const handler = provider.messageHandlers[index];
+      if (handler) provider.messageHandlers[index] = (...args) => { if (!readbackFenced) handler(...args); };
+    }
+    const fence = (socket: WebSocket) => { readbackFenced = true; socket.terminate(); };
+    const destroy = provider.destroy.bind(provider);
+    provider.destroy = () => {
+      readbackFenced = true;
+      if (readbackOutstanding) currentSocket?.terminate();
+      destroy();
+    };
+    const readback = new ServerReadbackChannel(() => currentSocket, fence);
+    Object.defineProperty(provider, "readFullServerState", {
+      value: (request: Parameters<ServerReadbackChannel["request"]>[0]) => {
+        readbackOutstanding = true;
+        return readback.request(request).finally(() => { readbackOutstanding = false; });
+      },
+    });
+    provider.connect();
+    return provider as unknown as YProviderLike;
   },
 };
 
 const MAX_GUARDED_PATH_OPERATIONS = 128;
 const MAX_GUARDED_PATH_CONTENT_CHARS = 2 * 1024 * 1024;
+const REMOTE_READBACK_RESERVATION_BYTES = 128 * 1024 * 1024;
+// Standalone tools remain bounded; application composition additionally charges its governor.
+const REMOTE_READBACK_MEMORY = new AtomicBytePermitPool({ ordinaryBytes: 256 * 1024 * 1024, jumboBytes: 0, maxWaiters: 8 });
+export function remoteReadbackMemorySnapshot() { return REMOTE_READBACK_MEMORY.snapshot(); }
 
 interface Connection {
   doc: Y.Doc;
@@ -101,6 +144,17 @@ interface Connection {
   connectedAtMs: number;
   disconnected: boolean;
   destroyed: boolean;
+  readbackInFlight: boolean;
+  readonly readbackAbort: AbortController;
+  publicationFence: PublicationFence | null;
+}
+
+interface PublicationFence {
+  readonly watched: ReadonlySet<unknown>;
+  readonly maps: ReadonlyMap<unknown, ReadonlySet<string>>;
+  readonly nodeIds: ReadonlySet<string>;
+  readonly parentNames: ReadonlySet<string>;
+  invalidated: boolean;
 }
 
 function readContent(map: Y.Map<any>): string | null {
@@ -250,6 +304,7 @@ export class SandboxYDoc {
   readonly #clock: Clock;
   readonly #syncTimeoutMs: number;
   readonly #appendDelayMs: number;
+  readonly #reserveRemoteReadbackBytes?: SandboxYDocOptions["reserveRemoteReadbackBytes"];
   #connection: Connection | null = null;
   #connecting: Promise<Connection> | null = null;
   #generation = 0;
@@ -262,10 +317,107 @@ export class SandboxYDoc {
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#syncTimeoutMs = options.syncTimeoutMs ?? 15_000;
     this.#appendDelayMs = options.appendDelayMs ?? 20;
+    this.#reserveRemoteReadbackBytes = options.reserveRemoteReadbackBytes;
   }
 
   async connect(): Promise<void> {
     await this.#getConnection();
+  }
+
+  /** Server-returned document proof only; never a receipt for an execution filesystem. */
+  async verifyRemotePaths(
+    paths: readonly { readonly path: string; readonly content: string }[],
+    signal?: AbortSignal,
+  ): Promise<YDocPublicationReceipt> {
+    if (signal?.aborted) throw new YDocSessionError("Remote document readback was aborted", "sync");
+    const connection = this.#connection;
+    if (!connection) throw new YDocSessionError("Remote document readback requires the staged connection", "sync");
+    this.#assertConnectionActive(connection);
+    if (!connection.provider.readFullServerState) throw new YDocSessionError("Remote document readback is unsupported", "sync");
+    if (connection.readbackInFlight) throw new YDocSessionError("Remote document readback is busy", "sync");
+    connection.readbackInFlight = true;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), 10_000);
+    const combined = AbortSignal.any([timeout.signal, connection.readbackAbort.signal, ...(signal ? [signal] : [])]);
+    let stopWaiting!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      stopWaiting = () => reject(new YDocSessionError("Remote document readback was aborted", "sync"));
+      combined.addEventListener("abort", stopWaiting, { once: true });
+      if (combined.aborted) stopWaiting();
+    });
+    // Admission may reject before this promise participates in the query race.
+    void cancelled.catch(() => undefined);
+    let permit: AtomicBytePermit | null = null;
+    let governorLease: { release(): void } | undefined;
+    let queryStarted = false, succeeded = false;
+    try {
+      permit = await REMOTE_READBACK_MEMORY.acquire(REMOTE_READBACK_RESERVATION_BYTES, { signal: combined, label: "staged-document-readback" });
+      combined.throwIfAborted();
+      governorLease = this.#reserveRemoteReadbackBytes?.(REMOTE_READBACK_RESERVATION_BYTES);
+      if (this.#reserveRemoteReadbackBytes && (!governorLease || typeof governorLease.release !== "function")) {
+        throw new YDocSessionError("Remote document memory reservation is unavailable", "sync");
+      }
+      this.#assertConnectionActive(connection);
+      const prepared = prepareRemotePathExpectations(paths);
+      const immutable = Object.freeze(paths.map(value => Object.freeze({ path: value.path, content: value.content })));
+      const assertPaths = () => {
+        this.#assertConnectionActive(connection);
+        for (const expected of immutable) {
+          const node = this.#findPathNode(connection, normalizedPath(expected.path));
+          const value = node?.map.get("content");
+          const content = value instanceof Y.Text ? value.toString() : typeof value === "string" ? value : null;
+          if (!node || node.map.get("deleted") === true || content !== expected.content) {
+            throw new YDocSessionError("Staged document paths changed during readback", "sync");
+          }
+        }
+      };
+      assertPaths();
+      const fence = this.#capturePublicationFence(connection, immutable);
+      if (connection.publicationFence) connection.publicationFence.invalidated = true;
+      connection.publicationFence = fence;
+      const targetVector = Y.encodeStateVector(connection.doc);
+      if (targetVector.byteLength > 16 * 1024 || decoding.readVarUint(decoding.createDecoder(targetVector)) > 1024) {
+        throw new YDocSessionError("Staged document vector exceeds its bound", "sync");
+      }
+      let verified = false;
+      queryStarted = true;
+      const query = connection.provider.readFullServerState({
+        signal: combined,
+        acceptUpdate: update => {
+          combined.throwIfAborted();
+          assertPaths();
+          if (fence.invalidated || connection.publicationFence !== fence) throw new YDocSessionError("Staged document changed during readback", "sync");
+          try { verifyRemotePathUpdate(update, prepared, targetVector); }
+          catch (error) {
+            if (error instanceof RemotePathReadbackError && error.reason === "stale_snapshot") return false;
+            throw error;
+          }
+          verified = true;
+          return true;
+        },
+      });
+      await Promise.race([query, cancelled]);
+      combined.throwIfAborted();
+      assertPaths();
+      if (!verified || fence.invalidated || connection.publicationFence !== fence) throw new YDocSessionError("Remote document publication is unproved", "sync");
+      succeeded = true;
+      return Object.freeze({ assertCurrent: () => {
+        this.#assertConnectionActive(connection);
+        if (connection.readbackAbort.signal.aborted || fence.invalidated || connection.publicationFence !== fence) {
+          throw new YDocSessionError("Remote document publication receipt is stale", "sync");
+        }
+      } });
+    } catch (error) {
+      if (error instanceof YDocSessionError) throw error;
+      throw new YDocSessionError(error instanceof RemotePathReadbackError
+        ? `Remote document readback failed: ${error.reason}` : "Remote document readback failed", "sync");
+    } finally {
+      clearTimeout(timer);
+      combined.removeEventListener("abort", stopWaiting);
+      timeout.abort();
+      if (queryStarted && !succeeded) this.#destroyConnection(connection);
+      try { governorLease?.release(); } finally { permit?.release(); connection.readbackInFlight = false; }
+    }
   }
 
   async listFiles(): Promise<YDocFileMeta[]> {
@@ -285,74 +437,24 @@ export class SandboxYDoc {
 
   async ensurePath(path: string): Promise<{ fileId: string; folderId: string }> {
     const parts = normalizedPath(path);
-    return this.#withConnection(connection => {
-      const root = this.#rootFolderId(connection);
-      if (!root) throw new YDocSessionError("root folder not found", "missing");
-      let result: { fileId: string; folderId: string } | null = null;
-      connection.doc.transact(() => {
-        let parentId = root;
-        for (const folderName of parts.slice(0, -1)) {
-          let folder = this.#findChild(connection, parentId, folderName);
-          if (folder && folder.map.get("type") !== "folder") {
-            throw new YDocSessionError(`Path component is not a folder: ${folderName}`, "missing");
-          }
-          if (!folder) {
-            const id = crypto.randomUUID();
-            const map = new Y.Map();
-            map.set("id", id);
-            map.set("filename", folderName);
-            map.set("deleted", false);
-            map.set("inFolder", parentId);
-            map.set("type", "folder");
-            connection.content.set(id, map);
-            folder = { uuid: id, map };
-          }
-          parentId = String(folder.map.get("id") ?? folder.uuid);
-        }
-
-        const filename = parts.at(-1)!;
-        const existing = this.#findChild(connection, parentId, filename);
-        if (existing?.map.get("type") === "folder") {
-          throw new YDocSessionError(`Project path is an existing folder: ${path}`, "missing");
-        }
-        if (existing) {
-          const id = String(existing.map.get("id") ?? existing.uuid);
-          const current = readContent(existing.map) ?? "";
-          if (!(existing.map.get("content") instanceof Y.Text)) {
-            const text = new Y.Text();
-            if (current) text.insert(0, current);
-            existing.map.set("content", text);
-          }
-          existing.map.set("type", "text");
-          existing.map.set("inFolder", parentId);
-          result = { fileId: id, folderId: parentId };
-          return;
-        }
-
-        const id = crypto.randomUUID();
-        const map = new Y.Map();
-        map.set("id", id);
-        map.set("filename", filename);
-        map.set("deleted", false);
-        map.set("inFolder", parentId);
-        map.set("type", "text");
-        map.set("content", new Y.Text());
-        connection.content.set(id, map);
-        result = { fileId: id, folderId: parentId };
-      });
-      if (!result) throw new YDocSessionError(`Failed to ensure project path: ${path}`, "missing");
-      return result;
-    });
+    return this.#withConnection(connection => connection.doc.transact(() => (
+      this.#ensurePathInTransaction(connection, path, parts)
+    )));
   }
 
   async writePath(path: string, content: string): Promise<void> {
-    const ensured = await this.ensurePath(path);
+    const parts = normalizedPath(path);
     await this.#withConnection(connection => {
-      const map = connection.content.get(ensured.fileId) as Y.Map<any> | undefined;
-      if (!map || map.get("deleted") === true) {
-        throw new YDocSessionError(`Project path disappeared: ${path}`, "missing");
-      }
-      writeContent(connection.doc, map, content);
+      // Publish new folders, the file, and its initial content together. A
+      // separate ensurePath transaction would expose an empty file remotely.
+      connection.doc.transact(() => {
+        const ensured = this.#ensurePathInTransaction(connection, path, parts);
+        const map = connection.content.get(ensured.fileId) as Y.Map<any> | undefined;
+        if (!map || map.get("deleted") === true) {
+          throw new YDocSessionError(`Project path disappeared: ${path}`, "missing");
+        }
+        writeContent(connection.doc, map, content);
+      });
     });
   }
 
@@ -817,6 +919,63 @@ export class SandboxYDoc {
     if (connection) this.#destroyConnection(connection);
   }
 
+  #ensurePathInTransaction(
+    connection: Connection,
+    path: string,
+    parts: readonly string[],
+  ): { fileId: string; folderId: string } {
+    const root = this.#rootFolderId(connection);
+    if (!root) throw new YDocSessionError("root folder not found", "missing");
+    let parentId = root;
+    for (const folderName of parts.slice(0, -1)) {
+      let folder = this.#findChild(connection, parentId, folderName);
+      if (folder && folder.map.get("type") !== "folder") {
+        throw new YDocSessionError(`Path component is not a folder: ${folderName}`, "missing");
+      }
+      if (!folder) {
+        const id = crypto.randomUUID();
+        const map = new Y.Map();
+        map.set("id", id);
+        map.set("filename", folderName);
+        map.set("deleted", false);
+        map.set("inFolder", parentId);
+        map.set("type", "folder");
+        connection.content.set(id, map);
+        folder = { uuid: id, map };
+      }
+      parentId = String(folder.map.get("id") ?? folder.uuid);
+    }
+
+    const filename = parts.at(-1)!;
+    const existing = this.#findChild(connection, parentId, filename);
+    if (existing?.map.get("type") === "folder") {
+      throw new YDocSessionError(`Project path is an existing folder: ${path}`, "missing");
+    }
+    if (existing) {
+      const id = String(existing.map.get("id") ?? existing.uuid);
+      const current = readContent(existing.map) ?? "";
+      if (!(existing.map.get("content") instanceof Y.Text)) {
+        const text = new Y.Text();
+        if (current) text.insert(0, current);
+        existing.map.set("content", text);
+      }
+      existing.map.set("type", "text");
+      existing.map.set("inFolder", parentId);
+      return { fileId: id, folderId: parentId };
+    }
+
+    const id = crypto.randomUUID();
+    const map = new Y.Map();
+    map.set("id", id);
+    map.set("filename", filename);
+    map.set("deleted", false);
+    map.set("inFolder", parentId);
+    map.set("type", "text");
+    map.set("content", new Y.Text());
+    connection.content.set(id, map);
+    return { fileId: id, folderId: parentId };
+  }
+
   async #withConnection<T>(operation: (connection: Connection) => T | Promise<T>): Promise<T> {
     const connection = await this.#getConnection();
     this.#assertConnectionActive(connection);
@@ -907,15 +1066,74 @@ export class SandboxYDoc {
       connectedAtMs: this.#clock.now(),
       disconnected: false,
       destroyed: false,
+      readbackInFlight: false,
+      readbackAbort: new AbortController(),
+      publicationFence: null,
     };
+    doc.on("afterTransaction", (transaction: Y.Transaction) => {
+      const fence = connection.publicationFence;
+      if (!fence || fence.invalidated) return;
+      for (const [type, keys] of transaction.changed) {
+        if (fence.watched.has(type)) { fence.invalidated = true; break; }
+        const fields = fence.maps.get(type);
+        if (fields && [...keys].some(key => key === null || fields.has(key))) { fence.invalidated = true; break; }
+        if ((type as unknown) !== connection.content) continue;
+        for (const key of keys) {
+          if (key === null || fence.nodeIds.has(key)) { fence.invalidated = true; break; }
+          const node = connection.content.get(key);
+          if (node instanceof Y.Map && node.get("deleted") !== true &&
+            fence.parentNames.has(JSON.stringify([node.get("inFolder") ?? null, node.get("filename")]))) {
+            fence.invalidated = true; break;
+          }
+        }
+      }
+    });
     provider.on("connection-close", () => {
       connection.disconnected = true;
+      connection.readbackAbort.abort();
       if (this.#connection === connection) this.#connection = null;
       // y-websocket emits connection-close before it clears its current socket.
       // Destroying it inline would recursively re-enter that same close path.
       queueMicrotask(() => this.#destroyConnection(connection));
     });
     return connection;
+  }
+
+  #capturePublicationFence(connection: Connection, paths: readonly { readonly path: string; readonly content: string }[]): PublicationFence {
+    if (connection.content.size > 4096) throw new YDocSessionError("Staged document node bound exceeded", "sync");
+    const watched = new Set<unknown>(), maps = new Map<unknown, ReadonlySet<string>>(), nodeIds = new Set<string>(), parentNames = new Set<string>();
+    const topology = new Set(["id", "filename", "inFolder", "type", "deleted"]);
+    const fileFields = new Set([...topology, "content"]);
+    const child = (parent: string | null, filename: string) => {
+      let found: { uuid: string; map: Y.Map<any> } | null = null;
+      for (const [uuid, value] of connection.content.entries()) {
+        if (!(value instanceof Y.Map) || value.get("deleted") === true ||
+          (value.get("inFolder") ?? null) !== parent || value.get("filename") !== filename) continue;
+        if (found) throw new YDocSessionError("Staged document contains duplicate paths", "sync");
+        found = { uuid, map: value };
+      }
+      if (!found) throw new YDocSessionError("Staged document path is missing", "sync");
+      maps.set(found.map, topology); nodeIds.add(found.uuid); parentNames.add(JSON.stringify([parent, filename]));
+      return found;
+    };
+    const root = child(null, "root");
+    if (root.map.get("type") !== "folder") throw new YDocSessionError("Staged document root is invalid", "sync");
+    for (const expected of paths) {
+      const parts = normalizedPath(expected.path);
+      let parent = String(root.map.get("id") ?? root.uuid);
+      for (let index = 0; index < parts.length; index++) {
+        const node = child(parent, parts[index]!);
+        if (index < parts.length - 1) {
+          if (node.map.get("type") !== "folder") throw new YDocSessionError("Staged document parent is invalid", "sync");
+          parent = String(node.map.get("id") ?? node.uuid);
+        } else {
+          maps.set(node.map, fileFields);
+          const text = node.map.get("content");
+          if (text instanceof Y.Text) watched.add(text);
+        }
+      }
+    }
+    return { watched, maps, nodeIds, parentNames, invalidated: false };
   }
 
   #findEntry(connection: Connection, filename: string): { uuid: string; map: Y.Map<any> } | null {
@@ -980,6 +1198,10 @@ export class SandboxYDoc {
     if (connection.destroyed) return;
     connection.destroyed = true;
     connection.disconnected = true;
+    if (this.#connection === connection) this.#connection = null;
+    if (connection.publicationFence) connection.publicationFence.invalidated = true;
+    connection.publicationFence = null;
+    connection.readbackAbort.abort();
     try { connection.provider.destroy(); } catch {}
     try { connection.doc.destroy(); } catch {}
   }

@@ -1,7 +1,7 @@
 import type { Clock, RandomSource } from "../../core/ports";
 import { SYSTEM_CLOCK, SYSTEM_RANDOM } from "../../core/ports";
 import type { YSweetEnvelope } from "../../prism/protocol";
-import type { GuardedYDocMutation, RenderSyncState } from "../../sandbox/ydoc";
+import type { GuardedYDocMutation, RenderSyncState, YDocPublicationReceipt } from "../../sandbox/ydoc";
 import type { ProjectId } from "../../sandbox/types";
 import type { AwarenessChannel } from "../awareness/channel";
 import {
@@ -477,6 +477,7 @@ function bootstrapMainSource(outputPath: string): string {
 }
 
 export interface V2BootstrapYDoc {
+  verifyRemotePaths?(paths: readonly { readonly path: string; readonly content: string }[], signal?: AbortSignal): Promise<YDocPublicationReceipt>;
   readPath(path: string): Promise<string | null>;
   writePath(path: string, content: string): Promise<void>;
   tombstonePath(path: string): Promise<boolean>;
@@ -1299,6 +1300,8 @@ export class V2BootstrapController {
   #ensuring: Promise<V2ReadyDescriptor> | null = null;
   #retiring: Promise<void> | null = null;
   #forceRetiring: Promise<void> | null = null;
+  #retirementSettled = false;
+  #retirementTailPending = false;
   readonly #lifecycleAbort = new AbortController();
   readonly #projectMutationOwner: ProjectBootstrapMutationOwner = {
     superseded: false,
@@ -1615,6 +1618,11 @@ export class V2BootstrapController {
       this.#forceRetiring ?? this.#retiring ?? Promise.resolve(),
       signal,
     );
+  }
+
+  /** No authority for remote cleanup; only proves all local mutation owners settled. */
+  retirementSettled(): boolean {
+    return this.#closed && this.#retirementSettled && this.#ensuring === null && !this.#retirementTailPending;
   }
 
   async #ensureReady(signal?: AbortSignal): Promise<V2ReadyDescriptor> {
@@ -2156,13 +2164,17 @@ export class V2BootstrapController {
       descriptor,
       binding,
       [...this.#possiblyLaunched.values()],
-    );
+    ).finally(() => { this.#retirementSettled = true; });
     this.#retiring = retiring;
     if (force) this.#forceRetiring = retiring;
     // An abort-ignoring bootstrap attempt is fenced by #closed before it can
     // publish readiness. Re-apply inert cleanup after its eventual settlement.
     if (ensuring) {
-      void ensuring.finally(() => this.#cleanupTransient(false)).catch(() => undefined);
+      this.#retirementTailPending = true;
+      void ensuring.then(
+        () => this.#cleanupTransient(false),
+        () => this.#cleanupTransient(false),
+      ).finally(() => { this.#retirementTailPending = false; }).catch(() => undefined);
     }
     return retiring;
   }

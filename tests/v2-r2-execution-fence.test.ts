@@ -9,6 +9,7 @@ import {
   DenoAwarenessPeer,
   type DenoAwarenessProviderLike,
 } from "../sandbox/v2/awareness-peer";
+import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../sandbox/v2/r10-awareness-peer";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import {
   GP_V2_R2_SCHEMA_VERSION,
@@ -86,7 +87,7 @@ class FakeProvider implements DenoAwarenessProviderLike {
 interface TestRuntime {
   readonly instanceId: string;
   readonly providers: Map<AwarenessLane, FakeProvider>;
-  readonly peer: DenoAwarenessPeer;
+  readonly peer: DenoAwarenessPeer | R10DenoAwarenessPeer;
   readonly engine: SidecarEngine;
   readonly assembler: RequestAssembler;
   readonly admission: AdmissionController;
@@ -101,6 +102,7 @@ async function createRuntime(
   instanceId: string,
   options: {
     beforeFence?: (check: number) => Promise<void>;
+    r10?: boolean;
   } = {},
 ): Promise<TestRuntime> {
   const providers = new Map<AwarenessLane, FakeProvider>();
@@ -122,7 +124,7 @@ async function createRuntime(
     hostCeiling: 1,
     memoryBudgetBytes: 16 * 1024 * 1024,
   });
-  let peer!: DenoAwarenessPeer;
+  let peer!: DenoAwarenessPeer | R10DenoAwarenessPeer;
   let fenceChecks = 0;
   const engine = new SidecarEngine({
     binding: BINDING,
@@ -149,7 +151,8 @@ async function createRuntime(
       peer.enqueue(frame, priority, streamId);
     },
   });
-  peer = new DenoAwarenessPeer({
+  const Peer = options.r10 ? R10DenoAwarenessPeer : DenoAwarenessPeer;
+  peer = new Peer({
     credential: {
       url: `wss://prism.test/y/d/${PROJECT}/ws`,
       baseUrl: `https://prism.test/y/d/${PROJECT}`,
@@ -372,8 +375,8 @@ function expectProtocolFailure(value: unknown, code: string): void {
 }
 
 describe("R2 exact execution fencing", () => {
-  it("revokes election on control revision rollback and while the exact host is draining", async () => {
-    const runtime = await createRuntime(SELECTED_SIDECAR);
+  it.each([false, true])("revokes election on control revision rollback and while the exact host is draining (R10=%s)", async r10 => {
+    const runtime = await createRuntime(SELECTED_SIDECAR, { r10 });
     const hostDoc = new Y.Doc();
     const host = new Awareness(hostDoc);
     try {

@@ -1,6 +1,8 @@
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
+import { withLocalAwarenessPublisher } from "../awareness/local-publisher";
+import { awarenessSocketTarget } from "../awareness/socket-target";
 import { SYSTEM_CLOCK, type Clock } from "../../core/ports";
 import {
   sealCredentialRotation,
@@ -90,6 +92,8 @@ export interface V2SupervisorHostOptions {
   readonly commandTimeoutMs?: number;
   /** Only journal-authorized recovery may attach to a previously used supervisor. */
   readonly recoverExisting?: boolean;
+  /** Explicit proof that this submitted execution never returned acceptance, so no host command could follow sequence zero. */
+  readonly recoverUnacceptedInitial?: boolean;
   readonly clock?: Clock;
   readonly providerFactory?: (
     doc: Y.Doc,
@@ -109,23 +113,24 @@ interface PendingStatus {
 function defaultProviderFactory(
   credential: () => YSweetEnvelope,
 ): (doc: Y.Doc) => SupervisorAwarenessProviderLike {
+  const { url: initialUrl, docId: expectedDocId } = credential();
   class AuthenticatedWebSocket extends WebSocket {
-    constructor(url: string | URL, protocols?: string | string[]) {
-      const target = new URL(String(url));
-      target.searchParams.set("token", credential().token.reveal());
+    constructor(_url: string | URL, protocols?: string | string[]) {
+      const { url, docId, token } = credential();
+      const target = awarenessSocketTarget({ url, docId, token: token.reveal() }, expectedDocId);
       super(target, protocols as any);
     }
   }
-  return doc => new WebsocketProvider(
-    credential().url,
-    credential().docId,
+  return doc => withLocalAwarenessPublisher(new WebsocketProvider(
+    initialUrl,
+    expectedDocId,
     doc,
     {
       connect: false,
       disableBc: true,
       WebSocketPolyfill: AuthenticatedWebSocket as any,
     },
-  ) as unknown as SupervisorAwarenessProviderLike;
+  )) as unknown as SupervisorAwarenessProviderLike;
 }
 
 /** Shared production provider factory; guarded live verifiers observe the same transport. */
@@ -157,6 +162,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   readonly #connectTimeoutMs: number;
   readonly #commandTimeoutMs: number;
   readonly #recoverExisting: boolean;
+  readonly #recoverUnacceptedInitial: boolean;
   readonly #clock: Clock;
   readonly #doc: Y.Doc;
   readonly #provider: SupervisorAwarenessProviderLike;
@@ -172,6 +178,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
   #connectReject: ((error: unknown) => void) | null = null;
   #connectContinue: (() => void) | null = null;
   #connectPhase: V2SupervisorPhase | null = null;
+  #initialReadyVerification: Promise<void> | null = null;
   #pending: PendingStatus | null = null;
   #sequence = 0;
   #confirmedSequence = 0;
@@ -187,6 +194,10 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     this.#connectTimeoutMs = boundedPositive(options.connectTimeoutMs, 20_000, "connectTimeoutMs");
     this.#commandTimeoutMs = boundedPositive(options.commandTimeoutMs, 45_000, "commandTimeoutMs");
     this.#recoverExisting = options.recoverExisting ?? false;
+    this.#recoverUnacceptedInitial = options.recoverUnacceptedInitial ?? false;
+    if (this.#recoverUnacceptedInitial && !this.#recoverExisting) {
+      throw new TypeError("Unaccepted initial recovery requires journal-authorized recovery");
+    }
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#doc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:supervisor:host` });
     const credential = () => this.#credential;
@@ -259,7 +270,12 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
           this.#acceptStatus(retired);
           return;
         }
-        if (!this.#bootstrapProven) { this.#connectPhase = "bootstrap"; return; }
+        if (!this.#bootstrapProven) {
+          if ((this.#recoverExisting && !this.#recoverUnacceptedInitial) || this.#initialReadyVerification) {
+            this.#connectPhase = "bootstrap";
+            return;
+          }
+        }
         // A signed retained reply can establish which command was consumed,
         // but only a new challenge reply can establish current peer liveness.
         if (this.#confirmedSequence !== this.#sequence) { this.#connectPhase = "sequence"; return; }
@@ -414,6 +430,7 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
     this.#connectReject?.(new V2SupervisorError("V2 supervisor host closed during connection", "closed"));
     this.#rejectPending(new V2SupervisorError("V2 supervisor host closed during command", "closed"));
     await this.#mailbox.close();
+    await this.#initialReadyVerification;
     await this.#operationTail.catch(() => undefined);
     this.#provider.awareness.off("change", this.#onAwarenessChange);
     this.#provider.off("connection-error", this.#onConnectionError);
@@ -558,12 +575,37 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       parsed.supervisorInstanceId !== this.instanceId ||
       (parsed.sequence !== this.#pending?.sequence &&
         !(this.#recoverExisting && this.#connectResolve && parsed.message.kind === "shutdown") &&
-        !(parsed.sequence === 0 && parsed.message.kind === "ready" && !this.#bootstrapProven && this.#connectResolve) &&
+        !(parsed.sequence === 0 && parsed.message.kind === "ready" && !this.#bootstrapProven &&
+          this.#sequence === 0 && !this.#pending && this.#connectResolve) &&
         !(this.#recoverExisting && !this.#bootstrapProven && this.#sequence === 0 && this.#connectResolve &&
           (parsed.message.kind === "shutdown" || parsed.sequence > 0 && parsed.message.kind !== "ready")) &&
         !(this.#connectResolve && this.#sequence > this.#confirmedSequence && parsed.sequence === this.#sequence))
     ) return;
+    if (!this.#recoverExisting && parsed.sequence === 0 && parsed.message.kind === "ready" &&
+      !this.#bootstrapProven && this.#sequence === 0 && !this.#pending && this.#connectResolve) {
+      this.#verifyInitialReady(parsed);
+      return;
+    }
     this.#mailbox.offer(parsed);
+  }
+
+  #verifyInitialReady(parsed: SignedSupervisorSandboxMessage): void {
+    if (this.#initialReadyVerification) return;
+    const connectionVersion = this.#connectionVersion;
+    const connectResolve = this.#connectResolve;
+    let verification!: Promise<void>;
+    verification = (async () => {
+      if (!await verifySupervisorSandboxMessage(this.#rotationKey, parsed)) return;
+      if (this.#closed || this.#recoverExisting || this.#bootstrapProven || this.#sequence !== 0 ||
+        this.#pending || !this.#transportSynced || connectionVersion !== this.#connectionVersion ||
+        this.#connectResolve !== connectResolve) return;
+      connectResolve?.();
+    })().catch(() => undefined).finally(() => {
+      if (this.#initialReadyVerification !== verification) return;
+      this.#initialReadyVerification = null;
+      this.#connectContinue?.();
+    });
+    this.#initialReadyVerification = verification;
   }
 
   async #verifyStatus(parsed: SignedSupervisorSandboxMessage): Promise<void> {
@@ -588,7 +630,8 @@ export class V2SupervisorHost implements V2BootstrapSupervisor {
       return;
     }
     if (parsed.sequence === 0 && parsed.message.kind === "ready") {
-      if (!this.#bootstrapProven && this.#transportSynced && connectionVersion === this.#connectionVersion) {
+      if (!this.#bootstrapProven && this.#sequence === 0 && !this.#pending &&
+        this.#transportSynced && connectionVersion === this.#connectionVersion) {
         this.#connectResolve?.();
       }
       return;

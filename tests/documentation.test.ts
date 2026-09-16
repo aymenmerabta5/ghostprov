@@ -63,7 +63,7 @@ describe("project documentation", () => {
     expect(readme).toContain("| `GP_V2_INITIAL_ACTIVE_PER_SANDBOX` | `8`");
     expect(readme).toContain("| `GP_V2_MAX_ACTIVE_PER_SANDBOX` | `8`");
     expect(readme).toContain("| `GP_HEARTBEAT_MS` | `10000`");
-    expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `120000`");
+    expect(readme).toContain("| `GP_ROUTER_QUEUE_TIMEOUT_MS` | `180000`");
     expect(readme).toContain("| `GP_TARGET_SANDBOXES` | `8`");
     expect(readme).toContain("| `GP_PROJECT_REPLACEMENT_FAILURES` | `3`");
     expect(readme).toContain("| `GP_COLD_START_CONCURRENCY` | `2`");
@@ -89,7 +89,7 @@ describe("project documentation", () => {
     expect(envExample).toContain("GP_V2_MAX_ACTIVE_PER_SANDBOX=8");
     expect(envExample).toContain("GP_V2_SIDECAR_REVISION=r10");
     expect(envExample).toContain("GP_V2_SIDECAR_PROJECT_REVISIONS=project-uuid-2=r7");
-    expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=120000");
+    expect(envExample).toContain("GP_ROUTER_QUEUE_TIMEOUT_MS=180000");
     expect(envExample).toContain("GP_TARGET_SANDBOXES=8");
     expect(envExample).toContain("GP_PROJECT_REPLACEMENT_FAILURES=3");
     expect(envExample).toContain("GP_COLD_START_CONCURRENCY=2");
@@ -448,7 +448,8 @@ describe("project documentation", () => {
     expect(readme).toContain("a fully drained transport restores credits immediately");
     expect(readme).toContain("a second independent sample two seconds later");
     expect(readme).toContain("One slow sample never relaunches");
-    expect(readme).toContain("default reliable-stall threshold is sixty seconds");
+    expect(readme).toContain("host and R10 peer use a sixty-second default");
+    expect(readme).toContain("scheduler's independent 128-frame/256-KiB pressure gate");
     expect(readme).toContain("completion estimates cap extreme model durations");
     expect(readme).toContain("neutral ten-second baseline every idle minute");
   });

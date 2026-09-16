@@ -3,12 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveMultiSandboxConfig } from "../src/config/multi-sandbox";
-import { DEFAULT_V2_SIDECAR_REVISION } from "../src/v2/sidecar/assets";
+import { DEFAULT_V2_SIDECAR_REVISION, loadV2SidecarAssets } from "../src/v2/sidecar/assets";
 import type { Clock, MachineSample } from "../src/core/ports";
-import { MAX_PENDING_FLEET_RECOVERY_EVENTS, ProjectFleetManager } from "../src/fleet/manager";
+import { MAX_PENDING_FLEET_RECOVERY_EVENTS, ProjectFleetManager, type ProjectFleetManagerOptions } from "../src/fleet/manager";
 import { FleetManifestStore } from "../src/fleet/manifest";
 import { FileBootstrapHoldMigration, prepareBootstrapHoldMigrationLedger } from "../src/fleet/bootstrap-migration";
 import { FileSupervisorBootstrapJournal } from "../src/v2/supervisor/bootstrap-journal";
+import { V2SupervisorBootstrapError, finalizeHeldSupervisorBootstrapCleanup } from "../src/v2/supervisor/controller";
+import { V2SupervisorError } from "../src/v2/supervisor/host";
 import { sealSupervisorSessionBootstrap } from "../src/v2/supervisor/session-bootstrap";
 import { V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY } from "../src/v2/sidecar/retirement-identities";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
@@ -22,7 +24,7 @@ import {
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import type { PrismProjectSummary } from "../src/prism/projects-client";
 import type { FleetRecoverySnapshot } from "../src/prism/recovery-coordinator";
-import type { SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
+import { SupervisedSandboxRuntime, type SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
 
 const A = projectId("e631d12c-d917-4434-b360-41b4715d6679");
 const B = projectId("69288e8b-c183-45f3-9131-d64b05b98928");
@@ -666,6 +668,9 @@ function manager(input: {
   recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
   canRetireProject?: (projectId: ProjectId) => boolean;
   bootstrapMigration?: FileBootstrapHoldMigration;
+  cleanupHeldBootstrap?: ProjectFleetManagerOptions["cleanupHeldBootstrap"];
+  finalizeHeldBootstrapCleanup?: ProjectFleetManagerOptions["finalizeHeldBootstrapCleanup"];
+  bootstrapCleanupTimeoutMs?: number;
   onLifecycleEvent?: (event: FleetLifecycleEvent) => void;
 }) {
   const factory = input.factory ?? new FakeFactory();
@@ -690,6 +695,9 @@ function manager(input: {
       recoveryCircuitSnapshot: input.recoveryCircuitSnapshot,
       canRetireProject: input.canRetireProject,
       bootstrapMigration: input.bootstrapMigration,
+      cleanupHeldBootstrap: input.cleanupHeldBootstrap,
+      finalizeHeldBootstrapCleanup: input.finalizeHeldBootstrapCleanup,
+      bootstrapCleanupTimeoutMs: input.bootstrapCleanupTimeoutMs,
       onLifecycleEvent: input.onLifecycleEvent,
     }),
   };
@@ -769,10 +777,10 @@ describe("ProjectFleetManager", () => {
     }
   });
 
-  it("restores two exact legacy migration projects beyond four holds and never refills their grants", async () => {
+  it.each([2, 3])("restores %i exact legacy migration projects beyond four holds and never refills their grants", async grantCount => {
     const files = await state();
     const manifestFile = path.join(files.root, "fleet.json");
-    const ids = Array.from({ length: 14 }, (_, index) =>
+    const ids = Array.from({ length: 12 + grantCount }, (_, index) =>
       projectId(`00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
     await files.manifest.initialize("authenticated");
     await files.manifest.completeLegacyMigration();
@@ -782,7 +790,7 @@ describe("ProjectFleetManager", () => {
       await files.manifest.markCreated(id, 2);
       if (index < 4) await files.manifest.markDraining(id, "bootstrap_hold", 3);
     }
-    for (const id of ids.slice(10, 12)) {
+    for (const id of ids.slice(12 - grantCount, 12)) {
       const identity = V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY;
       const binding = { projectId: id, sandboxSessionId: "offline-old-sandbox", leaderGeneration: 1,
         buildHash: identity.buildHash, schemaHash: identity.schemaHash, nonce: "offline-old-bootstrap",
@@ -795,27 +803,29 @@ describe("ProjectFleetManager", () => {
       await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, id).withLease(undefined, entry =>
         entry.save({ version: 1, phase: "submitted", sessionId, binding, connectTimeoutMs: 1_000, sealed }));
     }
-    await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: ids.slice(10, 12) });
+    await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: ids.slice(12 - grantCount, 12) });
     const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
     const migration = new FileBootstrapHoldMigration({ manifestFile, identityFingerprint: FINGERPRINT });
     const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
       manifest: files.manifest, projects, clock: new BlockingClock(), bootstrapMigration: migration,
-      randomUuid: uuidSequence(ids[12]!, ids[13]!), canRetireProject: () => false });
+      randomUuid: uuidSequence(...ids.slice(12)), canRetireProject: () => false });
     try {
-      const firstJournal = new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, ids[10]!);
+      const firstJournal = new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, ids[12 - grantCount]!);
       const original = await firstJournal.withLease(undefined, entry => entry.load());
       await firstJournal.withLease(undefined, entry => entry.save({ ...original!, connectTimeoutMs: 2_000 }));
       // A stale grant denies extra holds, but must not prevent ordinary workers
       // from starting or reconciling after that project recovers independently.
       await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 8 });
       await firstJournal.withLease(undefined, entry => entry.save(original!));
-      for (const id of ids.slice(10, 12)) {
+      for (const id of ids.slice(12 - grantCount, 12)) {
         harness.factory.runtimes.get(id)!.state = "recovering";
         for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
       }
-      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 7 });
-      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
-      expect(harness.value.snapshot().heldProjects).toHaveLength(6);
+      for (let replacement = 1; replacement <= grantCount; replacement++) {
+        await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 8 - grantCount + replacement });
+      }
+      expect(harness.value.snapshot()).toMatchObject({ ready: 8, unavailable: 0 });
+      expect(harness.value.snapshot().heldProjects).toHaveLength(4 + grantCount);
       expect(projects.created.map(worker => worker.projectId)).toEqual(ids.slice(12));
       expect(projects.deleted).toEqual([]);
       for (const id of [ids[4]!, ids[12]!]) {
@@ -823,10 +833,10 @@ describe("ProjectFleetManager", () => {
         for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
       }
       await harness.value.reconcile();
-      expect(projects.created).toHaveLength(2);
-      expect(harness.value.snapshot().heldProjects).toHaveLength(6);
+      expect(projects.created).toHaveLength(grantCount);
+      expect(harness.value.snapshot().heldProjects).toHaveLength(4 + grantCount);
     } finally { await harness.value.shutdown("migration-restart"); }
-    for (const id of ids.slice(10, 12)) {
+    for (const id of ids.slice(12 - grantCount, 12)) {
       await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, id).withLease(undefined, entry => entry.clear());
     }
     const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
@@ -835,8 +845,8 @@ describe("ProjectFleetManager", () => {
     try {
       await expect(restarted.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
       await restarted.value.reconcile();
-      expect(restarted.value.snapshot().heldProjects).toHaveLength(6);
-      expect(projects.created).toHaveLength(2);
+      expect(restarted.value.snapshot().heldProjects).toHaveLength(4 + grantCount);
+      expect(projects.created).toHaveLength(grantCount);
       expect(projects.deleted).toEqual([]);
     } finally { await restarted.value.shutdown("test-complete"); }
   });
@@ -877,6 +887,58 @@ describe("ProjectFleetManager", () => {
       await harness.value.shutdown("test-complete");
       await reconciling;
     }
+  });
+
+  it("counts one submitted cleanup debt across changing supervisor failure phases", async () => {
+    const files = await state();
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      clock: new BlockingClock(),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      await harness.value.reconcile();
+      harness.factory.runtimes.get(A)!.state = "recovering";
+      for (const [index, bootstrapReason] of ([undefined, "transport", "challenge"] as const).entries()) {
+        const event = blockedBootstrap(A, index + 1);
+        harness.value.observeRecoveryEvent({
+          ...event,
+          failure: { ...event.failure!, bootstrapReason },
+        });
+      }
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)
+        ?.replacementEvidence?.count).toBe(3);
+      expect(lifecycle.some(event => event.type === "replacement_qualified" && event.projectId === A)).toBe(true);
+    } finally { await harness.value.shutdown("test-complete"); }
+  });
+
+  it("keeps different bootstrap ownership conflicts as distinct replacement evidence", async () => {
+    const files = await state();
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [A] }),
+      manifest: files.manifest,
+      projects: new FakeProjects([project(A)]),
+      clock: new BlockingClock(),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      await harness.value.reconcile();
+      harness.factory.runtimes.get(A)!.state = "recovering";
+      for (const [index, bootstrapReason] of (["file_mismatch", "generation_conflict"] as const).entries()) {
+        const event = recoveryRetry(A, index + 1, "deploy");
+        harness.value.observeRecoveryEvent({ ...event, failure: { ...event.failure!, bootstrapPhase: "deploy",
+          bootstrapCode: "bootstrap_ownership_conflict", bootstrapReason } });
+      }
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)
+        ?.replacementEvidence?.count).toBe(1);
+      expect(lifecycle.some(event => event.type === "replacement_qualified")).toBe(false);
+    } finally { await harness.value.shutdown("test-complete"); }
   });
 
   it("invalidates replacement evidence across a bounded recovery-event overflow", async () => {
@@ -1253,6 +1315,228 @@ describe("ProjectFleetManager", () => {
     await harness.value.shutdown("test-complete");
   });
 
+  it.each(["rejected", "pending"] as const)("keeps a %s held cleanup owner without blocking unrelated fleet capacity", async outcome => {
+    const files = await state(), projects = new FakeProjects([]);
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock: new BlockingClock(), runtimeCleanupTimeoutMs: 5,
+      randomUuid: uuidSequence(A, B, C, D, E) });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)!;
+    old.state = "recovering";
+    let finish!: () => void;
+    let calls = 0;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const stopping = outcome === "pending" ? pending : Promise.reject(new Error("offline exact cleanup unproven"));
+    void stopping.catch(() => undefined);
+    old.stop = () => { calls++; old.state = "stopped"; return stopping; };
+    for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+    try {
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, heldProjects: [A] });
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, heldProjects: [A] });
+      expect(harness.registry.get(A)).toBe(old);
+      expect(old.snapshot()).toMatchObject({ state: "stopped", active: 0, quarantined: 0 });
+      expect(calls).toBe(1);
+      expect(projects.created.map(value => value.projectId)).toEqual([A, B, C, D, E]);
+      expect(projects.deleted).toEqual([]);
+      if (outcome === "pending") {
+        finish();
+        await harness.value.reconcile();
+        expect(harness.registry.get(A)).toBeUndefined();
+      }
+    } finally {
+      finish();
+      if (outcome === "rejected") await expect(harness.value.shutdown("test-complete")).rejects.toThrow("incomplete");
+      else await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("does not let a retained held runtime starve another held project's cleanup", async () => {
+    const files = await state(), projects = new FakeProjects([]), cleaned: ProjectId[] = [];
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock: new BlockingClock(), runtimeCleanupTimeoutMs: 5,
+      randomUuid: uuidSequence(A, B, C, D, E),
+      cleanupHeldBootstrap: async worker => { cleaned.push(worker.projectId); return false; },
+      finalizeHeldBootstrapCleanup: async () => {} });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)!;
+    old.state = "recovering";
+    old.stop = async () => { old.state = "stopped"; throw new Error("offline cleanup unproven"); };
+    await files.manifest.reserveWorker({ index: 6, projectId: F, title: "independent hold", nowMs: 1_000 });
+    await files.manifest.markDraining(F, "bootstrap_hold", 1_000);
+    try {
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+      await harness.value.reconcile();
+      expect(cleaned).toEqual([F]);
+      expect(harness.registry.get(A)).toBe(old);
+      expect(projects.deleted).toEqual([]);
+    } finally { await expect(harness.value.shutdown("test-complete")).rejects.toThrow("incomplete"); }
+  });
+
+  it("retries exact held cleanup after the failed owner's real local cleanup finishes", async () => {
+    const files = await state(), projects = new FakeProjects([]);
+    const clock = new BlockingClock();
+    let now = 1000;
+    clock.now = () => now;
+    let localComplete = false, proof = false, probes = 0, finalized = 0, stopCalls = 0;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock, runtimeCleanupTimeoutMs: 5,
+      randomUuid: uuidSequence(A, B, C, D, E),
+      cleanupHeldBootstrap: async worker => { expect(worker.projectId).toBe(A); probes++; return proof; },
+      finalizeHeldBootstrapCleanup: async worker => { expect(worker.projectId).toBe(A); finalized++; } });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)! as FakeRuntime & { localCleanupComplete(): boolean };
+    old.state = "recovering";
+    old.localCleanupComplete = () => localComplete;
+    old.stop = async () => { stopCalls++; old.state = "stopped"; throw new Error("offline remote cleanup unproven"); };
+    try {
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+      await harness.value.reconcile();
+      expect(harness.value.snapshot().ready).toBe(4);
+      expect(probes).toBe(0);
+      expect(harness.registry.get(A)).toBe(old);
+      // A public rejection does not authorize touching an internally pending owner.
+      await harness.value.reconcile();
+      expect(probes).toBe(0);
+      localComplete = true;
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(probes).toBe(1);
+      expect(harness.registry.get(A)).toBe(old);
+      expect(projects.deleted).toEqual([]);
+      // The exact supervisor becomes reachable after the bounded retry delay.
+      proof = true;
+      now += 30_001;
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(probes).toBe(2);
+      expect(finalized).toBe(1);
+      expect(stopCalls).toBe(1);
+      expect(harness.registry.get(A)).toBeUndefined();
+      expect(projects.deleted).toEqual([A]);
+      expect((await files.manifest.load()).workers.some(worker => worker.projectId === A)).toBe(false);
+    } finally {
+      if (harness.registry.get(A)) await expect(harness.value.shutdown("test-complete")).rejects.toThrow("incomplete");
+      else await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("requires exact remote proof when cleanup debt arrives after a cached successful stop", async () => {
+    const files = await state(), projects = new FakeProjects([]), clock = new BlockingClock();
+    let now = 1000, localComplete = false, needsProof = false, proof = false, probes = 0, stops = 0;
+    clock.now = () => now;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock, runtimeCleanupTimeoutMs: 5, randomUuid: uuidSequence(A, B, C, D, E),
+      cleanupHeldBootstrap: async () => { probes++; return proof; }, finalizeHeldBootstrapCleanup: async () => {} });
+    await harness.value.reconcile();
+    const old = harness.factory.runtimes.get(A)! as FakeRuntime & { localCleanupComplete(): boolean; cleanupProofRequired(): boolean };
+    old.localCleanupComplete = () => localComplete;
+    old.cleanupProofRequired = () => needsProof;
+    old.state = "recovering";
+    old.stop = async () => { stops++; old.state = "stopped"; };
+    try {
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(A, count));
+      await harness.value.reconcile();
+      expect(harness.registry.get(A)).toBe(old);
+      expect(probes).toBe(0);
+      // A late child physically closes but reports missing remote cleanup proof.
+      localComplete = true;
+      needsProof = true;
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(harness.registry.get(A)).toBe(old);
+      expect(probes).toBe(1);
+      expect(projects.deleted).toEqual([]);
+      proof = true; now += 30_001;
+      for (let turn = 0; turn < 4; turn++) await harness.value.reconcile();
+      expect(probes).toBe(2);
+      expect(harness.registry.get(A)).toBeUndefined();
+      expect(projects.deleted).toEqual([A]);
+      expect(stops).toBe(1);
+    } finally {
+      if (harness.registry.get(A)) await expect(harness.value.shutdown("test-complete")).rejects.toThrow("incomplete");
+      else await harness.value.shutdown("test-complete");
+    }
+  });
+
+  it("recovers a real supervisor's late factory cleanup debt through exact held proof without restarting", async () => {
+    const files = await state(), clock = new BlockingClock();
+    let now = 1000;
+    clock.now = () => now;
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (const [offset, id] of [A, B, C, D].entries()) {
+      await files.manifest.reserveWorker({ index: offset + 1, projectId: id, title: "offline managed worker", nowMs: now });
+      await files.manifest.nextLeaderGeneration(id, now);
+      await files.manifest.markState(id, "ready", now);
+    }
+    const initial = new FakeRuntime(A);
+    let deliver!: (child: RoutableSandboxRuntime) => void;
+    const pendingChild = new Promise<RoutableSandboxRuntime>(resolve => { deliver = resolve; });
+    let entered!: () => void;
+    const factoryEntered = new Promise<void>(resolve => { entered = resolve; });
+    const supervisor = new SupervisedSandboxRuntime({ projectId: A, initialChild: initial, clock,
+      createChild: () => { entered(); return pendingChild; } });
+    await supervisor.start();
+    const peers = [B, C, D].map(id => new FakeRuntime(id));
+    await Promise.all(peers.map(peer => peer.start()));
+    const registry = new SandboxRegistry([supervisor, ...peers]);
+    const projects = new FakeProjects([A, B, C, D].map(id => project(id)));
+    let reachable = false, proofCommitted = false, proofCalls = 0, lateStops = 0;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, registry, clock, runtimeCleanupTimeoutMs: 5, randomUuid: uuidSequence(E),
+      cleanupHeldBootstrap: async worker => {
+        expect(worker.projectId).toBe(A);
+        expect(supervisor.localCleanupComplete()).toBe(true);
+        expect(supervisor.cleanupProofRequired()).toBe(true);
+        proofCalls++;
+        if (reachable) proofCommitted = true;
+        return reachable;
+      },
+      finalizeHeldBootstrapCleanup: async () => {
+        expect(proofCommitted).toBe(true);
+        expect(registry.get(A)).toBeUndefined();
+      },
+    });
+    const late = new FakeRuntime(A) as FakeRuntime & { localCleanupComplete(): boolean };
+    late.localCleanupComplete = () => late.state === "stopped";
+    late.stop = async () => { lateStops++; late.state = "stopped"; throw new Error("offline late remote cleanup unproven"); };
+    try {
+      await harness.value.reconcile();
+      initial.state = "failed"; initial.emit();
+      await factoryEntered;
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent({ ...blockedBootstrap(A, count), leaderGeneration: 1 });
+      await harness.value.reconcile();
+      await expect(supervisor.stop()).resolves.toBeUndefined();
+      expect(supervisor.localCleanupComplete()).toBe(false);
+      expect(registry.get(A)).toBe(supervisor);
+      expect(harness.value.snapshot().ready).toBe(4);
+      expect(proofCalls).toBe(0);
+      deliver(late);
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(supervisor.localCleanupComplete()).toBe(true);
+      await expect(supervisor.stop()).rejects.toThrow("cleanup was incomplete");
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(registry.get(A)).toBe(supervisor);
+      expect(proofCalls).toBe(1);
+      expect(projects.deleted).toEqual([]);
+      reachable = true; now += 30_001;
+      for (let turn = 0; turn < 4; turn++) await harness.value.reconcile();
+      expect(proofCalls).toBe(2);
+      expect(proofCommitted).toBe(true);
+      expect(registry.get(A)).toBeUndefined();
+      expect(projects.deleted).toEqual([A]);
+      expect(projects.created.map(value => value.projectId)).toEqual([E]);
+      expect(lateStops).toBe(1);
+    } finally {
+      deliver(late);
+      if (registry.get(A)) await expect(harness.value.shutdown("test-complete")).rejects.toThrow("incomplete");
+      else await harness.value.shutdown("test-complete");
+    }
+  });
+
   it("freezes bootstrap holds during a common-mode outage and while requests are active", async () => {
     const files = await state(), projects = new FakeProjects([]);
     let circuit = recoveryCircuit("closed", null);
@@ -1288,6 +1572,363 @@ describe("ProjectFleetManager", () => {
     await harness.value.reconcile(); expect(projects.created).toHaveLength(8); expect(projects.deleted).toEqual([]);
     expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", reason: "bootstrap_hold_limit" }));
     await harness.value.shutdown("test-complete");
+  });
+
+  it("restores seven of eight workers after an exact old hold cleanup frees the exhausted hold budget", async () => {
+    const files = await state();
+    const ids = Array.from({ length: 13 }, (_, index) =>
+      projectId(`10000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (let index = 0; index < 12; index++) {
+      await files.manifest.reserveWorker({ index: index + 1, projectId: ids[index]!, title: `fixture ${index}`, nowMs: 1 });
+      await files.manifest.markCreated(ids[index]!, 2);
+      if (index < 4) await files.manifest.markDraining(ids[index]!, "bootstrap_hold", 3);
+    }
+    const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
+    const finalized: ProjectId[] = [];
+    const proven: ProjectId[] = [];
+    const clock = new StepClock();
+    let proofAvailable = false;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, clock, randomUuid: uuidSequence(ids[12]!),
+      cleanupHeldBootstrap: async worker => { proven.push(worker.projectId); return proofAvailable; },
+      finalizeHeldBootstrapCleanup: async worker => { finalized.push(worker.projectId); },
+    });
+    try {
+      await harness.value.reconcile();
+      const failed = ids[10]!;
+      harness.factory.runtimes.get(failed)!.state = "recovering";
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(failed, count));
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(proven).toContain(ids[0]!);
+      expect(harness.value.snapshot()).toMatchObject({ ready: 7, unavailable: 1, heldProjects: ids.slice(0, 4) });
+      expect(projects.created).toEqual([]);
+      proofAvailable = true;
+      clock.nowMs += 30_000;
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      proofAvailable = false;
+      expect(harness.value.snapshot()).toMatchObject({ ready: 8, unavailable: 0 });
+      expect(projects.created.map(worker => worker.projectId)).toEqual([ids[12]!]);
+      expect(harness.value.snapshot().heldProjects).toHaveLength(4);
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(finalized).toContain(ids[1]!);
+      expect(projects.deleted).toEqual([ids[1]!]);
+      expect(harness.factory.created.some(worker => ids.slice(0, 4).includes(worker.projectId))).toBe(false);
+    } finally { await harness.value.shutdown("test-complete"); }
+  });
+
+  it("proves held cleanup with three of eight workers ready while replacement and deletion remain fenced", async () => {
+    const files = await state(), clock = new BlockingClock();
+    const ids = Array.from({ length: 12 }, (_, index) =>
+      projectId(`20000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (let index = 0; index < ids.length; index++) {
+      await files.manifest.reserveWorker({ index: index + 1, projectId: ids[index]!, title: `fixture ${index}`, nowMs: 1 });
+      await files.manifest.markCreated(ids[index]!, 2);
+      if (index < 4) await files.manifest.markDraining(ids[index]!, "bootstrap_hold", 3);
+    }
+    const failed = new Set(ids.slice(7));
+    const factory = new FakeFactory(), create = factory.create.bind(factory);
+    factory.create = input => {
+      const runtime = create(input);
+      const start = runtime.start.bind(runtime);
+      runtime.start = async () => { await start(); if (failed.has(input.projectId)) runtime.state = "recovering"; };
+      return runtime;
+    };
+    const projects = new FakeProjects(ids.map(id => project(id)));
+    const proven: ProjectId[] = [], lifecycle: FleetLifecycleEvent[] = [];
+    let settleProof: ((proven: boolean) => void) | undefined, finalizations = 0;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, clock, factory, onLifecycleEvent: event => lifecycle.push(event),
+      cleanupHeldBootstrap: async worker => {
+        proven.push(worker.projectId);
+        if (worker.projectId !== ids[0]) return false;
+        return new Promise<boolean>(resolve => { settleProof = resolve; });
+      },
+      finalizeHeldBootstrapCleanup: async () => { finalizations++; },
+    });
+    try {
+      await harness.value.reconcile();
+      expect(harness.value.snapshot()).toMatchObject({ ready: 3, unavailable: 5, heldProjects: ids.slice(0, 4) });
+      expect(proven).toEqual([ids[0]!]);
+      for (const id of failed) {
+        for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      }
+      await harness.value.reconcile();
+      expect(harness.value.snapshot().heldProjects).toHaveLength(4);
+      expect(projects.created).toEqual([]); expect(projects.deleted).toEqual([]);
+      settleProof!(true);
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      const manifest = await files.manifest.load();
+      expect(manifest.workers.find(worker => worker.projectId === ids[0])?.retirementReason).toBe("replacement");
+      expect(harness.value.snapshot()).toMatchObject({ ready: 3, unavailable: 5, heldProjects: ids.slice(1, 4) });
+      expect(projects.created).toEqual([]); expect(projects.deleted).toEqual([]);
+      expect(finalizations).toBe(0);
+      expect(factory.created).toHaveLength(8);
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", reason: "healthy_majority" }));
+      expect(lifecycle.some(event => event.type === "replacement_started")).toBe(false);
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "bootstrap_cleanup_succeeded", projectId: ids[0] }));
+    } finally { settleProof?.(false); await harness.value.shutdown("test-complete"); }
+  });
+
+  it.each([false, true])("restores three of eight workers through five exact v2 grants (early cleanup and restart: %s)", async earlyCleanup => {
+    const files = await state(), manifestFile = path.join(files.root, "fleet.json");
+    const ids = Array.from({ length: 17 }, (_, index) =>
+      projectId(`30000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
+    const granted = ids.slice(7, 12), successors = ids.slice(12), blocked = new Set(granted);
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (let index = 0; index < 12; index++) {
+      await files.manifest.reserveWorker({ index: index + 1, projectId: ids[index]!, title: `fixture ${index}`, nowMs: 1 });
+      await files.manifest.markCreated(ids[index]!, 2);
+      if (index < 4) await files.manifest.markDraining(ids[index]!, "bootstrap_hold", 3);
+    }
+    const originalJournals = new Map<ProjectId, string>();
+    for (const id of granted) {
+      const identity = V2_R10_INITIAL_RELEASE_RETIREMENT_IDENTITY;
+      const binding = { projectId: id, sandboxSessionId: "offline-old-sandbox", leaderGeneration: 1,
+        buildHash: identity.buildHash, schemaHash: identity.schemaHash, nonce: "offline-old-bootstrap",
+        protocolRevision: "r2" as const, schemaVersion: 2 as const };
+      const sessionId = crypto.randomUUID();
+      const sealed = await sealSupervisorSessionBootstrap({ sessionId, binding, payload: {
+        instanceId: "offline-old-instance", credential: { url: "wss://offline.invalid/ws", baseUrl: "https://offline.invalid/",
+          docId: id, token: "offline-token", authorization: "full", rotationKey: createCredentialRotationKey() },
+      } });
+      const attempt = { version: 1 as const, phase: "submitted" as const, sessionId, binding, connectTimeoutMs: 1000, sealed };
+      await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, id).withLease(undefined, entry => entry.save(attempt));
+      originalJournals.set(id, await Bun.file(path.join(`${manifestFile}.bootstrap`, `${id}.json`)).text());
+    }
+    await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: granted, operatorRecovery: true });
+    const migration = new FileBootstrapHoldMigration({ manifestFile, identityFingerprint: FINGERPRINT });
+    const factory = new FakeFactory(), create = factory.create.bind(factory);
+    let work: "active" | "quarantined" | "ambiguousQuarantined" | null = null;
+    factory.create = input => {
+      const runtime = create(input), start = runtime.start.bind(runtime), snapshot = runtime.snapshot.bind(runtime);
+      runtime.start = async () => { await start(); if (blocked.has(input.projectId)) runtime.state = "recovering"; };
+      runtime.snapshot = () => ({ ...snapshot(), ...(blocked.has(input.projectId) && work ? { [work]: 1 } : {}) });
+      return runtime;
+    };
+    const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
+    const clock = new StepClock();
+    let circuit = recoveryCircuit("closed", null);
+    let proofEnabled = false;
+    const cleanupPorts = earlyCleanup ? {
+      cleanupHeldBootstrap: async (worker: Readonly<import("../src/fleet/types").FleetWorkerRecord>, signal: AbortSignal) => {
+        if (!proofEnabled || worker.projectId !== granted[0]) return false;
+        await new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, worker.projectId).withLease(signal, async entry => {
+          const current = await entry.load();
+          await entry.save({ ...current!, phase: "cleanup_proven" });
+        });
+        return true;
+      },
+      finalizeHeldBootstrapCleanup: async () => { throw new Error("Project deletion must stay blocked"); },
+    } : {};
+    const construct = (remaining: readonly ProjectId[]) => manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, factory, clock, bootstrapMigration: migration, ...cleanupPorts,
+      randomUuid: uuidSequence(...remaining), canRetireProject: () => false, recoveryCircuitSnapshot: () => circuit });
+    let harness = construct(successors);
+    try {
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 3, unavailable: 5 });
+      for (const id of granted) for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      circuit = recoveryCircuit("open", "outage");
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(0); expect(harness.value.snapshot().heldProjects).toHaveLength(4);
+      circuit = recoveryCircuit("closed", null);
+      for (const pending of ["active", "quarantined", "ambiguousQuarantined"] as const) {
+        work = pending;
+        await harness.value.reconcile();
+        expect(projects.created).toHaveLength(0); expect(harness.value.snapshot().heldProjects).toHaveLength(4);
+      }
+      work = null;
+      for (let replacement = 1; replacement <= 5; replacement++) {
+        await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 3 + replacement, unavailable: 5 - replacement });
+        if (earlyCleanup && replacement === 1) {
+          // Keep unused grants fenced while the real manager commits exact cleanup of the first hold.
+          work = "active"; proofEnabled = true;
+          for (let rotation = 0; rotation < 6; rotation++) {
+            clock.nowMs += 30_001;
+            await harness.value.reconcile(); await harness.value.reconcile();
+            const current = (await files.manifest.load()).workers.find(worker => worker.projectId === granted[0])!;
+            if (current.retirementReason === "replacement") break;
+          }
+          const retired = (await files.manifest.load()).workers.find(worker => worker.projectId === granted[0])!;
+          expect(retired.retirementReason).toBe("replacement");
+          expect(projects.created).toHaveLength(1);
+          const journal = new FileSupervisorBootstrapJournal(`${manifestFile}.bootstrap`, retired.projectId);
+          await finalizeHeldSupervisorBootstrapCleanup({ worker: retired, assets: await loadV2SidecarAssets({ revision: "r10" }),
+            bootstrapJournal: journal,
+            getYSweet: async () => { throw new Error("Cleanup proof must already be durable"); },
+            getArtifacts: async () => ({
+              ydoc: { async readPath() { return null; }, async writePath() {}, async tombstonePath() { return false; },
+                async compareAndMutatePaths() { return true; }, async renderSyncState() { return { clientStateVector: "", clientDeleteSetUpdate: "" }; } },
+              gateway: { async syncWorkspace() {} }, async close() {},
+            }),
+          }, new AbortController().signal);
+          await journal.withLease(undefined, async entry => { expect(await entry.load()).toBeNull(); });
+          work = null; proofEnabled = false;
+          await harness.value.shutdown("restart-after-early-grant-finalization");
+          harness = construct(successors.slice(1));
+          await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 4, unavailable: 4 });
+        }
+      }
+      expect(projects.created.map(worker => worker.projectId)).toEqual(successors);
+      expect(new Set(projects.created.map(worker => worker.projectId)).size).toBe(5);
+      expect(harness.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 8 : 9);
+      expect(projects.deleted).toEqual([]);
+      expect((await files.manifest.load()).workers).toHaveLength(17);
+      for (const id of granted) {
+        if (earlyCleanup && id === granted[0]) expect(await Bun.file(path.join(`${manifestFile}.bootstrap`, `${id}.json`)).exists()).toBe(false);
+        else expect(await Bun.file(path.join(`${manifestFile}.bootstrap`, `${id}.json`)).text()).toBe(originalJournals.get(id)!);
+        expect(factory.created.filter(worker => worker.projectId === id)).toHaveLength(earlyCleanup && id !== granted[0] ? 2 : 1);
+      }
+      // Neither an ordinary worker nor a successor inherits a consumed operator grant.
+      for (const id of [ids[4]!, successors[0]!]) {
+        factory.runtimes.get(id)!.state = "recovering";
+        for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+      }
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(5); expect(harness.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 8 : 9);
+      expect(projects.deleted).toEqual([]);
+    } finally { await harness.value.shutdown("operator-recovery-complete"); }
+    const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+      manifest: files.manifest, projects, clock, bootstrapMigration: migration,
+      canRetireProject: () => false,
+      randomUuid: () => { throw new Error("consumed operator grants cannot refill"); } });
+    try {
+      await expect(restarted.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
+      expect(restarted.factory.created.some(worker => granted.includes(worker.projectId))).toBe(false);
+      expect(projects.created).toHaveLength(5); expect(projects.deleted).toEqual([]);
+      expect(restarted.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 8 : 9);
+    } finally { await restarted.value.shutdown("operator-recovery-restart-complete"); }
+  }, 30_000);
+
+  it.each(["proof_returned_false", "proof_threw", "finalize_threw"] as const)("reports %s cleanup evidence without changing hold or retry policy", async cleanupStage => {
+    const files = await state(), clock = new BlockingClock();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({ index: 1, projectId: A, title: "held", nowMs: 1 });
+    await files.manifest.markDraining(A, "bootstrap_hold", 2);
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const projects = new FakeProjects([project(A)]);
+    const failure = new V2SupervisorBootstrapError("PRIVATE_CLEANUP_CANARY", "deploy", {
+      remoteCode: "bootstrap_cleanup_unproven", reason: "challenge",
+      cause: new V2SupervisorError("PRIVATE_CLEANUP_CANARY", "timeout", undefined, "challenge"),
+    });
+    let proofs = 0, finalizations = 0;
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock, randomUuid: uuidSequence(B, C, D, E),
+      cleanupHeldBootstrap: async () => {
+        proofs++;
+        if (cleanupStage === "proof_threw") throw failure;
+        return cleanupStage === "finalize_threw";
+      },
+      finalizeHeldBootstrapCleanup: async () => { finalizations++; throw failure; },
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      for (let index = 0; index < 4; index++) await harness.value.reconcile();
+      const reason = cleanupStage === "finalize_threw" ? "cleanup_failed" : "proof_unavailable";
+      const failures = lifecycle.filter(event => event.type === "bootstrap_cleanup_deferred" && event.reason === reason);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ cleanupStage, reason });
+      if (cleanupStage === "proof_returned_false") expect(failures[0]).not.toHaveProperty("errorName");
+      else expect(failures[0]).toMatchObject({ errorName: "V2SupervisorError", bootstrapPhase: "deploy",
+        bootstrapCode: "bootstrap_cleanup_unproven", bootstrapReason: "challenge", supervisorPhase: "challenge" });
+      expect(JSON.stringify(failures)).not.toContain("PRIVATE");
+      expect(proofs).toBe(1);
+      expect(finalizations).toBe(cleanupStage === "finalize_threw" ? 1 : 0);
+      expect(projects.deleted).toEqual([]);
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)?.retirementReason)
+        .toBe(cleanupStage === "finalize_threw" ? "replacement" : "bootstrap_hold");
+    } finally { await harness.value.shutdown("test-complete"); }
+  });
+
+  it("keeps timed out cleanup ownership bounded and rejects its late proof", async () => {
+    const files = await state(), clock = new StepClock();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({ index: 1, projectId: A, title: "held", nowMs: 1 });
+    await files.manifest.markDraining(A, "bootstrap_hold", 2);
+    let settle!: (value: boolean) => void;
+    let calls = 0;
+    let attemptSignal: AbortSignal | undefined;
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const projects = new FakeProjects([project(A)]);
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, clock, randomUuid: uuidSequence(B, C, D, E),
+      bootstrapCleanupTimeoutMs: 100,
+      cleanupHeldBootstrap: async (_worker, signal) => {
+        calls++; attemptSignal = signal; return new Promise<boolean>(resolve => { settle = resolve; });
+      }, finalizeHeldBootstrapCleanup: async () => {}, onLifecycleEvent: event => lifecycle.push(event) });
+    try {
+      await harness.value.reconcile();
+      expect(calls).toBe(1);
+      // The operation timer is installed before the background retry timer.
+      clock.releaseNext();
+      await Promise.resolve();
+      expect(attemptSignal?.aborted).toBe(true);
+      for (let count = 0; count < 4; count++) await harness.value.reconcile();
+      expect(calls).toBe(1);
+      settle(true);
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)?.retirementReason).toBe("bootstrap_hold");
+      expect(projects.deleted).toEqual([]);
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "bootstrap_cleanup_deferred", reason: "timeout" }));
+    } finally { settle(false); await harness.value.shutdown("test-complete"); }
+  });
+
+  it("fences shutdown and changed held records before committing delayed cleanup proof", async () => {
+    const files = await state(), clock = new BlockingClock();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({ index: 1, projectId: A, title: "held", nowMs: 1 });
+    await files.manifest.markDraining(A, "bootstrap_hold", 2);
+    let settle!: (value: boolean) => void;
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects: new FakeProjects([project(A)]), clock, randomUuid: uuidSequence(B, C, D, E),
+      cleanupHeldBootstrap: async () => new Promise<boolean>(resolve => { settle = resolve; }),
+      finalizeHeldBootstrapCleanup: async () => {}, onLifecycleEvent: event => lifecycle.push(event) });
+    try {
+      await harness.value.reconcile();
+      await files.manifest.markDraining(A, "bootstrap_hold", 3);
+      settle(true);
+      await harness.value.reconcile();
+      await harness.value.reconcile();
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "bootstrap_cleanup_deferred", reason: "worker_changed" }));
+      const closing = harness.value.shutdown("test-complete");
+      settle(true);
+      await closing;
+      expect((await files.manifest.load()).workers.find(worker => worker.projectId === A)?.retirementReason).toBe("bootstrap_hold");
+    } finally { settle(false); await harness.value.shutdown("test-complete"); }
+  });
+
+  it("requires closed circuits before held cleanup", async () => {
+    const files = await state();
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    await files.manifest.reserveWorker({ index: 1, projectId: A, title: "held", nowMs: 1 });
+    await files.manifest.markDraining(A, "bootstrap_hold", 2);
+    let calls = 0;
+    let circuit = recoveryCircuit("open", "outage");
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects: new FakeProjects([project(A)]), clock: new BlockingClock(), randomUuid: uuidSequence(B, C, D, E),
+      recoveryCircuitSnapshot: () => circuit,
+      cleanupHeldBootstrap: async () => { calls++; return false; }, finalizeHeldBootstrapCleanup: async () => {} });
+    try {
+      await harness.value.reconcile();
+      expect(calls).toBe(0);
+      circuit = recoveryCircuit("closed", null);
+      await harness.value.reconcile();
+      expect(calls).toBe(1);
+    } finally { await harness.value.shutdown("test-complete"); }
   });
 
   it("fences replacement while a continuation binding or fleet outage exists", async () => {
@@ -2089,8 +2730,12 @@ describe("ProjectFleetManager", () => {
       registry,
     });
 
-    await expect(harness.value.shutdown("test-shutdown"))
-      .rejects.toThrow("Fleet shutdown was incomplete");
+    const failure = await harness.value.shutdown("test-shutdown").catch(error => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.message).toBe(
+      `Fleet shutdown was incomplete (failed runtimes: 1; remaining runtimes: 1; projects: ${A})`,
+    );
+    expect(failure.message).not.toContain("forced stop failed");
 
     expect(registry.get(A)).toBe(runtime);
     expect(harness.value.snapshot()).toMatchObject({ desired: 1, ready: 1 });

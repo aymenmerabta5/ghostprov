@@ -11,6 +11,21 @@ function owner(shutdown: () => Promise<void>, close: () => Promise<void>): Pick<
 }
 
 describe("system supervisor cleanup ownership", () => {
+  it("reports project-scoped debt until every exact incarnation is proven", () => {
+    const lifecycle = new SupervisorLifecycle(3);
+    const other = { ...binding, nonce: "other-incarnation", leaderGeneration: 2 };
+    const unrelated = { ...binding, projectId: "22222222-2222-4222-8222-222222222222" };
+    lifecycle.requireCleanup(binding); lifecycle.requireCleanup(other); lifecycle.requireCleanup(unrelated);
+    expect(lifecycle.hasPendingCleanup(binding.projectId)).toBe(true);
+    lifecycle.confirmCleanup({ ...binding, nonce: "unrelated-proof" });
+    expect(lifecycle.hasPendingCleanup(binding.projectId)).toBe(true);
+    lifecycle.confirmCleanup(binding);
+    expect(lifecycle.hasPendingCleanup(binding.projectId)).toBe(true);
+    lifecycle.confirmCleanup(other);
+    expect(lifecycle.hasPendingCleanup(binding.projectId)).toBe(false);
+    expect(lifecycle.hasPendingCleanup(unrelated.projectId)).toBe(true);
+  });
+
   it("keeps dependent resources open until retained shutdown and close actually settle", async () => {
     const lifecycle = new SupervisorLifecycle(2);
     const shutdown = Promise.withResolvers<void>(), closed = Promise.withResolvers<void>();

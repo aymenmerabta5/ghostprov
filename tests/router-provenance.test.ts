@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { RunHandle } from "../src/relay/run-handle";
 import { sseFrame } from "../src/relay/sse";
 import {
@@ -68,7 +68,7 @@ function detachedIncomingLease(): IncomingResourceLease {
 
 class ProvenanceRuntime implements RoutableSandboxRuntime {
   incarnation = 1;
-  state: "ready" | "failed" | "stopped" = "ready";
+  state: "ready" | "failed" | "recovering" | "stopped" = "ready";
   active = 0;
   transferCredits: number | undefined;
   executions = 0;
@@ -631,33 +631,70 @@ describe("MultiSandboxRouter response provenance", () => {
     }
   });
 
-  for (const constraint of ["capacity", "transfer", "recovering"] as const) {
+  for (const constraint of ["capacity", "transfer", "recovering", "control-repair"] as const) {
     it(`routes a known continuation to a healthy peer when its origin is ${constraint} constrained`, async () => {
-      const { router, first, second } = routerSystem([0]);
+      const { router, first, second, authorizationScope } = routerSystem([0]);
+      let restoreSnapshot: (() => void) | undefined;
       try {
-        const seed = await router.startRelay({ model: "gpt-5.6-sol", input: "seed" });
+        const seedBody = {
+          model: "gpt-5.6-terra",
+          input: Array.from({ length: 191 }, () => ({ type: "message", role: "user", content: "" })),
+          stream: true, store: true, service_tier: "fast",
+        };
+        seedBody.input[0]!.content = "s".repeat(901_823 - Buffer.byteLength(JSON.stringify(seedBody)));
+        const seed = await router.startRelay(seedBody);
         const seedFinal = first.completeNext();
         await seed.final;
+        expect(router.lookupResponseProvenance(seedFinal.id, authorizationScope)).toEqual({
+          kind: "known", provenance: { projectId: first.projectId, incarnation: 1 },
+        });
 
         if (constraint === "capacity") first.active = first.capacity;
         else if (constraint === "transfer") first.transferCredits = 0;
-        else first.state = "failed";
+        else if (constraint === "recovering") first.state = "recovering";
+        else {
+          const snapshot = first.snapshot.bind(first);
+          const observed = spyOn(first, "snapshot").mockImplementation(() => ({
+            ...snapshot(), available: 0, transportConnected: false,
+            availabilityReason: "awareness_reconnect" as const,
+          }));
+          restoreSnapshot = () => observed.mockRestore();
+        }
         first.notify();
-        const continuation = await router.startRelay({
-          model: "gpt-5.6-sol",
-          input: "continue through available capacity",
+        const delta = {
+          model: "gpt-5.6-terra",
+          input: [{ type: "message", role: "user", content: "" }],
           previous_response_id: seedFinal.id,
-        });
+          stream: true, store: true, service_tier: "fast",
+        };
+        delta.input[0]!.content = "d".repeat(21_052 - Buffer.byteLength(JSON.stringify(delta)));
+        const expectedDelta = JSON.stringify(delta);
+        const continuation = await router.startRelay(delta);
+        // A remains constrained until after B completes. The next turn must
+        // not wait for its parent's original runtime or resend the root input.
         expect(first.executions).toBe(1);
         expect(second.executions).toBe(1);
-        expect(second.bodies[0]).toMatchObject({ previous_response_id: seedFinal.id });
-        second.completeNext();
+        expect(first.bodies[0]!.input).toHaveLength(191);
+        expect(Buffer.byteLength(JSON.stringify(first.bodies[0]))).toBe(901_823);
+        expect(JSON.stringify(second.bodies[0])).toBe(expectedDelta);
+        expect(Buffer.byteLength(JSON.stringify(second.bodies[0]))).toBe(21_052);
+        expect(second.bodies[0]!.input).toHaveLength(1);
+        expect(second.bodies[0]).toMatchObject({ previous_response_id: seedFinal.id, stream: true, store: true });
+        expect(JSON.stringify(delta)).toBe(expectedDelta);
+        const childFinal = second.completeNext();
         await continuation.final;
+        expect(router.lookupResponseProvenance(seedFinal.id, authorizationScope)).toEqual({
+          kind: "known", provenance: { projectId: first.projectId, incarnation: 1 },
+        });
+        expect(router.lookupResponseProvenance(childFinal.id, authorizationScope)).toEqual({
+          kind: "known", provenance: { projectId: second.projectId, incarnation: 1 },
+        });
         expect(router.snapshot()).toMatchObject({
           queued: 0,
           provenance: { reservedRecords: 0, reservedBytes: 0 },
         });
       } finally {
+        restoreSnapshot?.();
         first.active = 0;
         while (first.pending.length > 0) first.completeNext();
         while (second.pending.length > 0) second.completeNext();

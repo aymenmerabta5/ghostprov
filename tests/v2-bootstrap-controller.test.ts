@@ -1512,6 +1512,26 @@ describe("V2BootstrapController", () => {
     expect(harness.awareness.clears).toBe(1);
   });
 
+  it("keeps the retirement witness false after public cancellation until its actual owner settles", async () => {
+    const harness = bootstrapHarness();
+    await harness.controller.ensureReady();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    harness.gateway.triggerRender = async () => { entered(); await pending; throw new Error("offline remote proof unavailable"); };
+    const cancellation = new AbortController();
+    const retiring = harness.controller.forceStop("offline cleanup", cancellation.signal);
+    await started;
+    cancellation.abort();
+    await expect(retiring).rejects.toBeInstanceOf(DOMException);
+    expect(harness.controller.retirementSettled()).toBe(false);
+    release();
+    await expect(harness.controller.forceStop("join exact owner")).rejects.toThrow();
+    expect(harness.controller.retirementSettled()).toBe(true);
+    expect(harness.awareness.clears).toBe(1);
+  });
+
   it("retains every possibly launched retry nonce for forced termination", async () => {
     const harness = bootstrapHarness("first-wrong-nonce");
     await harness.controller.ensureReady();
@@ -1621,12 +1641,15 @@ describe("V2BootstrapController", () => {
     await started;
 
     const stopping = harness.controller.forceStop("recovery during launch");
+    expect(harness.controller.retirementSettled()).toBe(false);
     releaseFirst();
     await expect(stopping).resolves.toBeUndefined();
     expect(await failed).toMatchObject({ name: "AbortError" });
     expect(harness.ydoc.files.get(".latexmkrc"))
       .toContain("GhostProv V2 launcher inactive");
     await expect(harness.controller.ensureReady()).rejects.toThrow("retired");
+    for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+    expect(harness.controller.retirementSettled()).toBe(true);
   });
 
   it("proves a bound ping round trip before handing the sidecar to transport", async () => {

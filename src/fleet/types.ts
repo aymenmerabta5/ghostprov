@@ -29,8 +29,40 @@ export type FleetMutationBlockReason =
   | "bootstrap_hold_limit"
   | "bootstrap_cleanup";
 
+export const FLEET_BOOTSTRAP_CLEANUP_REASONS = Object.freeze([
+  "release_policy", "recovery_circuit", "mutation_backoff", "healthy_majority",
+  "work_in_flight", "proof_unavailable", "cleanup_failed", "timeout", "aborted", "worker_changed",
+] as const);
+export type FleetBootstrapCleanupReason = typeof FLEET_BOOTSTRAP_CLEANUP_REASONS[number];
+
+export const FLEET_BOOTSTRAP_CLEANUP_STAGES = Object.freeze([
+  "proof_returned_false", "proof_threw", "finalize_threw",
+] as const);
+export interface FleetBootstrapCleanupDiagnostic {
+  cleanupStage?: typeof FLEET_BOOTSTRAP_CLEANUP_STAGES[number];
+  /** Innermost bounded cause category, never an exception message. */
+  errorName?: import("../observability/events").FleetBootstrapCleanupErrorName;
+  bootstrapPhase?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapPhase"];
+  bootstrapCode?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapCode"];
+  bootstrapReason?: import("../sandbox/types").SandboxFailureSnapshot["bootstrapReason"];
+  supervisorPhase?: import("../observability/events").SandboxSupervisorPhase;
+}
+
 /** Content-free fleet transitions suitable for bounded observability. */
 export type FleetLifecycleEvent =
+  | {
+      type: "bootstrap_cleanup_started" | "bootstrap_cleanup_succeeded";
+      projectId: ProjectId;
+      workerIndex: number;
+      leaderGeneration: number;
+    }
+  | (FleetBootstrapCleanupDiagnostic & {
+      type: "bootstrap_cleanup_deferred";
+      projectId: ProjectId;
+      workerIndex: number;
+      leaderGeneration: number;
+      reason: FleetBootstrapCleanupReason;
+    })
   | {
       type: "replacement_qualified";
       projectId: ProjectId;

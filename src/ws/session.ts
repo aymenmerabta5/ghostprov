@@ -25,6 +25,7 @@ import {
 } from "../v2/memory/permit-carrier";
 import { jsonEncodedByteLengthAsync } from "../router/workload";
 import type { ElasticByteReservation } from "../core/elastic-byte-reservation";
+import { recordRequestCancellation } from "../core/cancellation-metadata";
 
 import {
   isAuthenticatedTenantScope,
@@ -799,13 +800,14 @@ export class ResponsesWebSocketSession {
     });
   }
 
-  close(cause: WebSocketCloseCause = "remote_close"): void {
+  close(cause: WebSocketCloseCause = "remote_close", observedCloseCode?: number): void {
     this.#shutdown(
       new WebSocketDeliveryError(
         "WebSocket connection closed",
         "websocket_closed",
       ),
       cause,
+      observedCloseCode,
     );
   }
 
@@ -1449,11 +1451,15 @@ export class ResponsesWebSocketSession {
   #shutdown(
     error: WebSocketDeliveryError,
     cause: WebSocketCloseCause,
+    observedCloseCode?: number,
   ): void {
     if (this.#closed) return;
     this.#closed = true;
     this.#telemetry?.sessionClosed(cause, this.#activeResponses);
-    for (const controller of this.#controllers) controller.abort();
+    for (const controller of this.#controllers) {
+      recordRequestCancellation(controller.signal, `websocket_${cause}`, observedCloseCode);
+      controller.abort();
+    }
     this.#controllers.clear();
     this.#semaphore.close();
     this.#graph.clear();

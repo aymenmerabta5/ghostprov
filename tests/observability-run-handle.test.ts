@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { Clock } from "../src/core/ports";
 import type { RunHandle } from "../src/relay/run-handle";
-import type { LoggerLike } from "../src/observability/logger";
+import { ObservabilityLogger, type LoggerLike } from "../src/observability/logger";
+import { resolveObservabilityConfig } from "../src/observability/config";
+import { requestFailureFields } from "../src/observability/request-error";
+import { createHash } from "node:crypto";
+import { apiErrorEvent, apiErrorResponse } from "../src/http/errors";
+import { recordRequestCancellation } from "../src/core/cancellation-metadata";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { traceRunHandle } from "../src/observability/traced-run-handle";
 import { assertSafeObservabilityEvent } from "../src/observability/redaction";
@@ -241,7 +246,7 @@ describe("traceRunHandle", () => {
     expect(logger.events[0]).toMatchObject({
       event: "request.failed",
       error_kind: "stream",
-      upstream_request_id: "req_generic_stream_failure",
+      upstream_request_id_sha256: createHash("sha256").update("req_generic_stream_failure").digest("hex"),
       committed: true,
       quarantined: true,
     });
@@ -274,7 +279,7 @@ describe("traceRunHandle", () => {
 
     await expect(traced.final).rejects.toThrow("stream failed");
     await Bun.sleep(0);
-    expect(logger.events[0]).not.toHaveProperty("upstream_request_id");
+    expect(logger.events[0]).not.toHaveProperty("upstream_request_id_sha256");
   });
 
   it("omits a credential-shaped prelude ID without dropping the failure", async () => {
@@ -306,7 +311,7 @@ describe("traceRunHandle", () => {
 
     await expect(traced.final).rejects.toThrow("stream failed");
     expect(logger.events).toHaveLength(1);
-    expect(logger.events[0]).not.toHaveProperty("upstream_request_id");
+    expect(logger.events[0]).not.toHaveProperty("upstream_request_id_sha256");
     expect(() => assertSafeObservabilityEvent(logger.events[0]!)).not.toThrow();
   });
 
@@ -358,8 +363,113 @@ describe("traceRunHandle", () => {
       error_kind: "invalid_json",
       status: 400,
       provider_origin: "sse",
-      upstream_request_id: "req_invalid_json_1",
+      upstream_request_id_sha256: createHash("sha256").update("req_invalid_json_1").digest("hex"),
     });
     expect(JSON.stringify(logger.events[0])).not.toContain("invalid_request_error");
+  });
+
+  it("keeps reflected HTTP and SSE error content out of sinks without changing client errors", async () => {
+    for (const origin of ["http", "sse"] as const) {
+      const canary = "PRIVATE_ACQUISITION_PLAN_854cbf";
+      const message = `Invalid input_text: ${canary}`;
+      const providerError = await createProviderErrorEnvelope({
+        origin, status: 400,
+        value: { error: { message, type: "invalid_request_error", code: canary, param: "input" } },
+        headers: new Headers({ "x-request-id": `req_${canary}` }),
+      });
+      const error = new V2CommittedError(message, canary, false, undefined, providerError);
+      Object.defineProperty(error, "name", { value: canary });
+      const lines: string[] = [];
+      const logger = new ObservabilityLogger({ config: resolveObservabilityConfig({}), sinks: [{
+        writeBatch: async batch => { lines.push(...batch); }, close: async () => {},
+      }] });
+      const final = Promise.reject(error);
+      void final.catch(() => undefined);
+      const traced = traceRunHandle({ async *events() {}, final, stats: { bytes: 0, firstByteMs: null, frames: 0 } }, {
+        logger, clock: new FakeClock(), traceId: "trace-reflection", projectId: "00000000-0000-4000-8000-000000000001",
+        acceptedAtMs: 90, committedAtMs: 99, queueWaitMs: 1, commitAckMs: 2, retryCount: 0, slowRequestMs: 1_000,
+      });
+      expect(await traced.final.catch(value => value)).toBe(error);
+      await logger.close();
+      expect(lines).toHaveLength(1);
+      expect(lines.join("")).not.toContain(canary);
+      expect(JSON.parse(lines[0]!)).toMatchObject({
+        event: "request.failed", error_name: "Error", error_kind: "other", error_message: "Request failed",
+        status: 400, provider_origin: origin, committed: true, quarantined: false,
+        upstream_request_id_sha256: createHash("sha256").update(`req_${canary}`).digest("hex"),
+      });
+      expect(logger.snapshot().sinkErrors).toBe(0);
+      const response = apiErrorResponse(error);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { message, code: canary } });
+      expect(apiErrorEvent(error)).toMatchObject({ error: { message, code: canary } });
+      expect(providerError.error.message).toBe(message);
+    }
+  });
+
+  it("projects unsafe request failure metadata without invoking accessors", () => {
+    let reads = 0;
+    const error = Object.defineProperties({}, Object.fromEntries(
+      ["name", "kind", "code", "message", "status", "committed", "ambiguous"].map(key => [key, {
+        get() { reads++; throw new Error("PRIVATE_ACCESSOR"); },
+      }]),
+    ));
+    expect(requestFailureFields(error)).toEqual({
+      error_name: "Error", error_kind: null, error_message: "Request failed", status: null,
+      committed: false, quarantined: false,
+    });
+    expect(reads).toBe(0);
+    expect(requestFailureFields(new DOMException("private abort reason", "AbortError")))
+      .toMatchObject({ error_name: "AbortError", error_message: "Request failed" });
+  });
+
+  it("rejects direct, revoked, and inherited proxies without invoking any traps", () => {
+    let traps = 0;
+    const trap = () => { traps++; throw new Error("unexpected request error proxy trap"); };
+    const handler = { get: trap, getOwnPropertyDescriptor: trap, getPrototypeOf: trap, ownKeys: trap };
+    const direct = new Proxy(new TypeError("PRIVATE_PROXY_DETAIL"), handler);
+    const callable = new Proxy(() => undefined, handler);
+    const revoked = Proxy.revocable({}, handler); revoked.revoke();
+    const inherited = Object.create(new Proxy({}, handler));
+    const revokedInherited = Object.create(revoked.proxy);
+    for (const error of [direct, callable, revoked.proxy, inherited, revokedInherited]) {
+      expect(requestFailureFields(error, 502)).toEqual({ error_name: "Error", error_kind: null,
+        error_message: "Request failed", status: 502, committed: false, quarantined: false });
+      expect(traps).toBe(0);
+    }
+  });
+
+  it("bounds native-name classification while retaining ordinary native error subclasses", () => {
+    class LocalTypeError extends TypeError {}
+    expect(requestFailureFields(new LocalTypeError("private"))).toMatchObject({ error_name: "TypeError" });
+    let error: object = TypeError.prototype;
+    for (let index = 0; index < 32; index++) error = Object.create(error);
+    expect(requestFailureFields(error)).toMatchObject({ error_name: "Error", error_message: "Request failed" });
+  });
+
+  it.each(["prepared_expired", "prepared_failed"])("retains the known internal %s category without error text", code => {
+    const fields = requestFailureFields({ name: "V2PreCommitError", code, message: "PRIVATE_PREPARATION_DETAIL" });
+    expect(fields).toMatchObject({ error_name: "V2PreCommitError", error_kind: code, error_message: "Request failed" });
+    expect(JSON.stringify(fields)).not.toContain("PRIVATE_PREPARATION_DETAIL");
+    expect(requestFailureFields({ code: `${code}\n` }).error_kind).toBe("other");
+  });
+
+  it("does not attribute a provider failure to a racing caller cancellation", async () => {
+    const controller = new AbortController();
+    recordRequestCancellation(controller.signal, "websocket_remote_close", 1001);
+    controller.abort();
+    const error = new V2CommittedError("private provider detail", "stream", true);
+    const final = Promise.reject(error);
+    void final.catch(() => undefined);
+    const logger = new MemoryLogger();
+    const traced = traceRunHandle({ async *events() {}, final, stats: { bytes: 0, firstByteMs: null, frames: 0 } }, {
+      logger, clock: new FakeClock(), traceId: "trace-racing-close", projectId: "00000000-0000-4000-8000-000000000001",
+      acceptedAtMs: 90, committedAtMs: 99, queueWaitMs: 1, commitAckMs: 2, retryCount: 0, slowRequestMs: 1_000,
+      callerSignal: controller.signal,
+    });
+    expect(await traced.final.catch(value => value)).toBe(error);
+    expect(logger.events[0]).toMatchObject({ error_kind: "stream", quarantined: true });
+    expect(logger.events[0]).not.toHaveProperty("cancellation_origin");
+    expect(logger.events[0]).not.toHaveProperty("websocket_close_code");
   });
 });

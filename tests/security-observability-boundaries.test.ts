@@ -83,6 +83,35 @@ function routerWithPrivateCanaries(): RouterLike {
 }
 
 describe("public authentication and authority boundaries", () => {
+  it("keeps reflected provider error atoms out of the fallback console while preserving the authenticated response", async () => {
+    const { createProviderErrorEnvelope } = await import("../src/v2/provider-error");
+    const { V2CommittedError } = await import("../src/v2/transport/run-handle");
+    for (const origin of ["http", "sse"] as const) {
+      const canary = "PRIVATE_ERROR_ATOM_854";
+      const envelope = await createProviderErrorEnvelope({ origin, status: 400,
+        value: { error: { message: "synthetic provider message", type: canary, code: canary } },
+      });
+      const router = routerWithPrivateCanaries();
+      router.startRelay = async () => {
+        throw new V2CommittedError("synthetic provider message", canary, false, undefined, envelope);
+      };
+      const app = createGhostProvApp({ router, apiKey: API_KEY });
+      const captured: string[] = [];
+      const prior = console.error;
+      console.error = (...values: unknown[]) => { captured.push(values.join(" ")); };
+      try {
+        const response = await app.request("/v1/responses", {
+          method: "POST", headers: { authorization: `Bearer ${API_KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-5.6-terra", input: "synthetic" }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: { message: "synthetic provider message", type: canary, code: canary } });
+        expect(captured).toEqual(["[responses] 400 V2CommittedError other"]);
+        expect(captured.join(" ")).not.toContain(canary);
+      } finally { console.error = prior; }
+    }
+  });
+
   it("requires an explicit inbound API key and accepts personal-project keys", () => {
     expect(() => resolveGhostProvApiKey(undefined)).toThrow("required");
     expect(() => resolveGhostProvApiKey("")).toThrow("required");
@@ -284,7 +313,7 @@ describe("observability confidentiality and bounds", () => {
     ] as const) {
       const sanitized = sanitizeDiagnosticMessage(raw);
       for (const canary of canaries) expect(sanitized).not.toContain(canary);
-      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.failed", {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("monitor.error", {
         error_message: sanitized,
       }))).not.toThrow();
     }

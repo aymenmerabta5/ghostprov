@@ -2,6 +2,8 @@
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import type { Awareness } from "y-protocols/awareness";
+import { withLocalAwarenessPublisher } from "../../src/v2/awareness/local-publisher.ts";
+import { awarenessSocketTarget } from "../../src/v2/awareness/socket-target.ts";
 import type { BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
 import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
 import {
@@ -35,21 +37,24 @@ import { ReliableDeliveryTiming } from "../../src/v2/protocol/delivery-timing.ts
 import {
   PublicationPacer,
   type PublicationReason,
+  type PublicationTimer,
 } from "../../src/v2/protocol/publication-pacer.ts";
 import type { SidecarEngine as SidecarEngineImplementation } from "../../src/v2/sidecar/engine.ts";
 type SidecarEngine = Pick<SidecarEngineImplementation, keyof SidecarEngineImplementation>;
 import type { SidecarDiagnosticsObserver } from "../../src/v2/diagnostics/sidecar-observer.ts";
+import { encodedDiagnosticBytes, type V2EnvelopeDiagnostics, type V2TransportDiagnostics } from "../../src/v2/diagnostics/types.ts";
 import { parseAwarenessEnvelopeWithDiagnostics } from "../../src/v2/protocol/validate.ts";
 import type { OutputBackpressure } from "../../src/v2/sidecar/output-sink.ts";
-import { TransportCongestion } from "../../src/v2/transport/congestion.ts";
+import { ProgressAwareCongestion as TransportCongestion } from "../../src/v2/transport/progress-congestion.ts";
 import { AdaptiveTransportCapacity } from "../../src/v2/transport/adaptive-capacity.ts";
+import { R10ControlMirrorRecovery } from "./r10-control-mirror-recovery.ts";
 import { V2_TERMINAL_SPOOL_CAPACITY } from "../../src/v2/sidecar/capacity.ts";
 import {
   DEFAULT_V2_INITIAL_RETRANSMIT_MS,
   deterministicV2JitterSeed,
 } from "../../src/v2/protocol/retransmit.ts";
 
-const DEFAULT_TRANSPORT_STALL_MS = 2_000;
+const DEFAULT_TRANSPORT_STALL_MS = 60_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
 const STALL_DERATE_STRIKES = 2;
 const STALL_DERATE_WINDOW_MS = 60_000;
@@ -78,6 +83,9 @@ export interface DenoAwarenessPeerOptions {
   maxActivePerSandbox?: number;
   closeTimeoutMs?: number;
   transportStallMs?: number;
+  /** Deterministic transport-clock seam; production uses performance.now. */
+  now?: () => number;
+  publicationTimer?: PublicationTimer;
   onAcceptError?: (
     error: Error,
     frame: ReliableFrame<HostFrame>,
@@ -112,28 +120,29 @@ export class SidecarCloseError extends Error {
   }
 }
 
-function defaultProviderFactory(
+export function createR10AwarenessProvider(
   doc: Y.Doc,
   credential: () => BootstrapCredentialPayload,
   _lane: AwarenessLane,
 ): DenoAwarenessProviderLike {
+  const { url: initialUrl, docId: expectedDocId } = credential();
   class AuthenticatedWebSocket extends WebSocket {
-    constructor(url: string | URL, protocols?: string | string[]) {
-      const target = new URL(String(url));
-      target.searchParams.set("token", credential().token);
+    constructor(_url: string | URL, protocols?: string | string[]) {
+      const { url, docId, token } = credential();
+      const target = awarenessSocketTarget({ url, docId, token }, expectedDocId);
       super(target, protocols);
     }
   }
-  return new WebsocketProvider(
-    credential().url,
-    credential().docId,
+  return withLocalAwarenessPublisher(new WebsocketProvider(
+    initialUrl,
+    expectedDocId,
     doc,
     {
       connect: false,
       disableBc: true,
       WebSocketPolyfill: AuthenticatedWebSocket,
     } as any,
-  ) as DenoAwarenessProviderLike;
+  )) as DenoAwarenessProviderLike;
 }
 
 type PublicationUrgency = "paced" | "urgent";
@@ -194,7 +203,8 @@ export class DenoAwarenessPeer {
   #bootstrapProcessedAck = { epoch: 1, sequence: -1 };
   #processedFlightHigh = -1;
   #bootstrapProcessedFlightHigh = -1;
-  readonly #scheduler = new WeightedFrameScheduler<SidecarFrame>();
+  readonly #scheduler: WeightedFrameScheduler<SidecarFrame>;
+  readonly #now: () => number;
   readonly #flight = new AckClockedFlight({ epoch: 1 });
   readonly #retransmitMs: number;
   readonly #connectTimeoutMs: number;
@@ -231,6 +241,9 @@ export class DenoAwarenessPeer {
   #hostCredits = -1;
   #timer: number | null = null;
   #stallTimer: number | null = null;
+  readonly #controlMirrorRecovery = new R10ControlMirrorRecovery();
+  #controlRepairTimer: number | null = null;
+  #controlRepairInProgress = false;
   #retransmissions = 0;
   #publications = 0;
   #pacedPublications = 0;
@@ -257,7 +270,7 @@ export class DenoAwarenessPeer {
   #goodputUpdatedAtMs: number | null = null;
   #uniqueAcknowledgedBytes = 0;
   #retransmittedBytes = 0;
-  #lastFastRetransmitAtMs: number | null = null;
+  #lastRetransmitAtMs: number | null = null;
   #stallTimerDueAtMs: number | null = null;
   readonly #lifecycleAbort = new AbortController();
   #closed = false;
@@ -279,6 +292,8 @@ export class DenoAwarenessPeer {
   readonly #bootstrapProcessedReady = new Map<number, ReliableFrame<HostFrame>>();
 
   constructor(options: DenoAwarenessPeerOptions) {
+    this.#now = options.now ?? (() => performance.now());
+    this.#scheduler = new WeightedFrameScheduler<SidecarFrame>({ now: this.#now });
     this.#binding = options.binding;
     this.#transportProfile = options.transportProfile ?? "standard";
     this.#limits = protocolTransportLimits(
@@ -332,7 +347,7 @@ export class DenoAwarenessPeer {
     }
     this.#dataDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:data` });
     this.#controlDoc = new Y.Doc({ guid: `${options.credential.docId}:ghostprov:control` });
-    const providerFactory = options.providerFactory ?? defaultProviderFactory;
+    const providerFactory = options.providerFactory ?? createR10AwarenessProvider;
     const credential = () => this.#rotator.current();
     this.#dataProvider = providerFactory(this.#dataDoc, credential, "data");
     this.#controlProvider = providerFactory(this.#controlDoc, credential, "control");
@@ -345,6 +360,7 @@ export class DenoAwarenessPeer {
     });
     this.#pacer = new PublicationPacer({
       intervalMs: options.publicationIntervalMs,
+      timer: options.publicationTimer,
       publish: reason => this.#publish(reason),
     });
     const initialTransportCapacity = options.initialActivePerSandbox ?? 8;
@@ -355,6 +371,9 @@ export class DenoAwarenessPeer {
       // Active congestion still advertises zero until progress resumes; the
       // persistent penalty only halves the normal eight-slot ceiling.
       minimum: Math.min(4, initialTransportCapacity),
+      // A healthy Prism round trip may take 1–2.5 seconds. Recovery still
+      // requires clean ACK samples below the severe-latency threshold.
+      healthyRttMs: 3_000,
     });
     this.#dataProvider.awareness.on("change", this.#onDataAwarenessChange);
     this.#controlProvider.awareness.on("change", this.#onControlAwarenessChange);
@@ -390,6 +409,15 @@ export class DenoAwarenessPeer {
     ) {
       throw new Error("R2 execution fence is no longer elected");
     }
+    const current = this.#currentHostControl();
+    if (!current || current.draining) {
+      throw new Error("R2 execution fence is no longer elected");
+    }
+  }
+
+  /** Exact control ownership survives draining; permission to execute does not. */
+  #currentHostControl(): R2AwarenessEnvelope<HostFrame> | null {
+    if (this.#hostClientId.control === null || this.#hostInstanceId === null) return null;
     const raw = this.#controlProvider.awareness.getStates()
       .get(this.#hostClientId.control)?.ghostprovV2Control;
     try {
@@ -404,12 +432,24 @@ export class DenoAwarenessPeer {
         current.instanceId !== this.#hostInstanceId ||
         current.targetInstanceId !== this.#instanceId ||
         current.lane !== "control" ||
-        current.revision !== this.#hostRevision.control ||
-        current.draining
-      ) throw new Error("R2 control election state is not current");
-    } catch (error) {
-      throw new Error("R2 execution fence is no longer elected", { cause: error });
+        current.revision !== this.#hostRevision.control
+      ) return null;
+      return current;
+    } catch {
+      return null;
     }
+  }
+
+  #isDrainingHostCleanup(envelope: AwarenessEnvelope<HostFrame>): boolean {
+    if (this.#currentHostControl()?.draining !== true) return false;
+    const accepted = this.#inbound.ack();
+    // A cumulative retransmission can still contain already-accepted request
+    // frames. Only newly accepted frames need to be cleanup-only; skipping an
+    // unaccepted sequence would forge a processed ACK and is never allowed.
+    return envelope.frames.every(frame =>
+      frame.epoch < accepted.epoch ||
+      (frame.epoch === accepted.epoch && frame.sequence <= accepted.sequence) ||
+      hostFrameIsControl(frame));
   }
 
   connect(signal?: AbortSignal): Promise<void> {
@@ -482,7 +522,11 @@ export class DenoAwarenessPeer {
         onAbort();
         return;
       }
-      provider.connect();
+      try {
+        provider.connect();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(`Y-Sweet sidecar ${lane} connection failed`));
+      }
     });
   }
 
@@ -493,6 +537,13 @@ export class DenoAwarenessPeer {
     weight = 1,
   ): void {
     if (this.#closed) return;
+    if (frame.kind === "request_cancelled") {
+      // The engine emits this proof only after durable cancellation wins. The
+      // host no longer consumes that request's output. Retire only unnumbered
+      // scheduler entries; the published reliable flight remains immutable and
+      // other request streams retain their ordering and byte accounting.
+      this.#scheduler.removeStream(frame.requestId);
+    }
     if (
       this.#recoveryReplayInProgress &&
       frame.kind === "response_terminal" &&
@@ -556,12 +607,13 @@ export class DenoAwarenessPeer {
 
   async #close(graceful: boolean): Promise<void> {
     this.#closing = true;
+    this.#clearControlRepairTimer();
     this.#inboundFrozen = true;
     this.#connected = false;
     if (!graceful) {
       this.#lifecycleAbort.abort(new DOMException("Awareness peer closed", "AbortError"));
     }
-    const deadline = performance.now() + this.#closeTimeoutMs;
+    const deadline = this.#now() + this.#closeTimeoutMs;
     const lifecycleErrors: unknown[] = [];
     try {
       if (this.#recoveryReplayPromise) {
@@ -642,7 +694,7 @@ export class DenoAwarenessPeer {
         new Promise<{ kind: "timeout" }>(resolve => {
           timer = setTimeout(
             () => resolve({ kind: "timeout" }),
-            Math.max(0, deadline - performance.now()),
+            Math.max(0, deadline - this.#now()),
           );
           (timer as any).unref?.();
         }),
@@ -661,13 +713,13 @@ export class DenoAwarenessPeer {
   }
 
   async #awaitOutputDrain(deadline: number): Promise<void> {
-    while (performance.now() < deadline) {
+    while (this.#now() < deadline) {
       const outbound = this.#outbound.snapshot();
       const scheduled = this.#scheduler.snapshot();
       if (outbound.frames.length === 0 && scheduled.queuedFrames === 0) return;
       await new Promise<void>(resolve => setTimeout(
         resolve,
-        Math.min(10, Math.max(0, deadline - performance.now())),
+        Math.min(10, Math.max(0, deadline - this.#now())),
       ));
     }
     throw new SidecarCloseError(
@@ -688,12 +740,18 @@ export class DenoAwarenessPeer {
 
   readonly #onDataAwarenessChange = (
     change: { added: number[]; updated: number[]; removed: number[] },
-  ): void => this.#onAwarenessChange(
-    "data",
-    this.#dataProvider,
-    "ghostprovV2Data",
-    change,
-  );
+  ): void => {
+    this.#onAwarenessChange("data", this.#dataProvider, "ghostprovV2Data", change);
+    const controlClientId = this.#controlMirrorRecovery.clientId;
+    if (controlClientId === null) return;
+    if (change.removed.includes(controlClientId)) {
+      this.#controlMirrorRecovery.invalidateMirror();
+      this.#armControlRepair();
+    } else if (change.added.includes(controlClientId) || change.updated.includes(controlClientId)) {
+      this.#observeControlMirror();
+      this.#armControlRepair();
+    }
+  };
 
   readonly #onControlAwarenessChange = (
     change: { added: number[]; updated: number[]; removed: number[] },
@@ -711,6 +769,72 @@ export class DenoAwarenessPeer {
     this.#livenessPong = null;
     this.#hostRevision.control = -1;
   };
+
+  #observeControlMirror(): void {
+    const clientId = this.#controlMirrorRecovery.clientId;
+    if (this.#binding.protocolRevision !== "r2" || clientId === null) return;
+    const raw = this.#dataProvider.awareness.getStates().get(clientId)?.ghostprovV2Control;
+    try {
+      const envelope = parseAwarenessEnvelopeWithDiagnostics(
+        raw, this.#binding, "host", this.#transportProfile,
+      ).envelope as R2AwarenessEnvelope<HostFrame>;
+      if (
+        envelope.peerId !== "host" || envelope.lane !== "control" ||
+        envelope.instanceId !== this.#controlMirrorRecovery.hostInstanceId ||
+        envelope.instanceId !== this.#hostInstanceId ||
+        envelope.targetInstanceId !== this.#instanceId || envelope.frames.length !== 0
+      ) throw new Error("Control mirror does not match the elected host");
+      this.#controlMirrorRecovery.mirror(envelope.revision, this.#now());
+    } catch {
+      this.#controlMirrorRecovery.invalidateMirror();
+    }
+  }
+
+  #clearControlRepairTimer(): void {
+    if (this.#controlRepairTimer !== null) clearTimeout(this.#controlRepairTimer);
+    this.#controlRepairTimer = null;
+  }
+
+  #armControlRepair(): void {
+    this.#clearControlRepairTimer();
+    if (
+      this.#closed || this.#closing || !this.#connected ||
+      this.#lifecycleAbort.signal.aborted || this.#controlRepairInProgress
+    ) return;
+    const delay = this.#controlMirrorRecovery.nextDelayMs(this.#now());
+    if (delay === null) return;
+    const timer = setTimeout(() => {
+      if (this.#controlRepairTimer !== timer) return;
+      this.#controlRepairTimer = null;
+      this.#observeControlMirror();
+      if (
+        this.#closed || this.#closing || this.#lifecycleAbort.signal.aborted ||
+        this.#controlRepairInProgress || !this.#controlMirrorRecovery.beginAttempt(this.#now())
+      ) return;
+      this.#controlRepairInProgress = true;
+      void this.#repairControlProvider().finally(() => {
+        this.#controlRepairInProgress = false;
+        this.#armControlRepair();
+      });
+    }, delay) as unknown as number;
+    this.#controlRepairTimer = timer;
+    (timer as any).unref?.();
+  }
+
+  async #repairControlProvider(): Promise<void> {
+    // Mirrored state only identifies a stale receive path. Revoke the dynamic
+    // fence before touching the socket; native CONTROL must establish it again.
+    // Keep the provider/doc/local identity and every immutable reliable flight.
+    this.#onControlConnectionUnavailable();
+    try {
+      this.#controlProvider.disconnect();
+      if (this.#closed || this.#closing || this.#lifecycleAbort.signal.aborted) return;
+      await this.#connectProvider(this.#controlProvider, "control", this.#lifecycleAbort.signal);
+    } catch {
+      // Failure cannot supply authority. The provider owns ordinary reconnect;
+      // only a new mirror revision can justify another bounded try.
+    }
+  }
 
   #onAwarenessChange(
     lane: AwarenessLane,
@@ -847,9 +971,8 @@ export class DenoAwarenessPeer {
       } else {
         if (this.#binding.protocolRevision === "r2") {
           // R2 election is proven only by a currently present, exact control
-          // state. Data is executable only while that live control proof is
-          // active. The pinned ID survives removal solely to permit a
-          // same-host reconnect; a replacement ID can never take over.
+          // state. Draining revokes execution but keeps exact-owner cleanup
+          // admissible. Removal revokes both; a replacement ID cannot take over.
           if (this.#hostInstanceId === null) {
             if (lane !== "control") continue;
             this.#hostPeerId = envelope.peerId;
@@ -880,7 +1003,7 @@ export class DenoAwarenessPeer {
             continue;
           }
           if (lane === "control") this.#steadyHostActive = !envelope.draining;
-          else if (!this.#steadyHostActive) continue;
+          else if (!this.#steadyHostActive && !this.#isDrainingHostCleanup(envelope)) continue;
           this.#hostClientId[lane] = clientId;
           this.#hostRevision[lane] = envelope.revision;
           this.#observeBoundHostTransport(envelope);
@@ -940,7 +1063,7 @@ export class DenoAwarenessPeer {
           this.#queueOutcomeAcknowledgements(acknowledgedOutcomeIds);
         }
         const flightCompleted = this.#flight.acknowledged(envelope.ack);
-        const now = performance.now();
+        const now = this.#now();
         if (flightCompleted) {
           this.#flightCompletions++;
           this.#recordAcknowledgedFlight(now);
@@ -951,10 +1074,10 @@ export class DenoAwarenessPeer {
           this.#outbound.snapshot().frames.length > 0,
           now,
         );
-        let congestionChanged = this.#updateCongestion();
+        let congestionChanged = this.#updateCongestion(acknowledgementAdvanced);
         let capacityChanged = false;
         if (acknowledgementAdvanced) {
-          this.#lastFastRetransmitAtMs = null;
+          this.#lastRetransmitAtMs = null;
           const rttMs = this.#delivery.roundTripEwmaMs;
           const freshHealthyRtt = this.#delivery.roundTripSamples > rttSamplesBefore &&
             !this.#congestion.congested;
@@ -1041,6 +1164,10 @@ export class DenoAwarenessPeer {
             ? "urgent"
             : urgency,
         );
+        if (this.#binding.protocolRevision === "r2" && steadyHost && lane === "control" && envelope.lane === "control") {
+          this.#controlMirrorRecovery.native(clientId, envelope.instanceId, envelope.revision, this.#now());
+          this.#armControlRepair();
+        }
       } catch (error) {
         this.#reportEngineError(error, "Bound host protocol transition failed");
       }
@@ -1071,7 +1198,27 @@ export class DenoAwarenessPeer {
   }
 
   #updateBackpressure():void{const value=this.#scheduler.snapshot();this.#outputBackpressure?.update({frames:value.queuedFrames,bytes:value.queuedEncodedBytes});}
-  #updateCongestion():boolean{const scheduled=this.#scheduler.snapshot();const outbound=this.#outbound.snapshot();const before=this.#congestion.congested;const ackProgressAgeMs=this.#delivery.ackProgressAgeMs(performance.now());this.#congestion.update({schedulerFrames:scheduled.queuedFrames,schedulerBytes:scheduled.queuedEncodedBytes,oldestQueuedFrameMs:scheduled.oldestQueuedFrameMs,ackProgressAgeMs,windowFrames:outbound.frames.length});if(!before&&this.#congestion.congested&&outbound.frames.length>0&&ackProgressAgeMs>=this.#transportStallMs){this.#stallEvents++;this.#recordStall();}return before!==this.#congestion.congested;}
+  #updateCongestion(ackProgressed = false): boolean {
+    const scheduled = this.#scheduler.snapshot();
+    const outbound = this.#outbound.snapshot();
+    const before = this.#congestion.congested;
+    const stalledBefore = this.#congestion.stalled;
+    this.#congestion.update({
+      schedulerFrames: scheduled.queuedFrames,
+      schedulerBytes: scheduled.queuedEncodedBytes,
+      oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs,
+      ackProgressAgeMs: this.#delivery.ackProgressAgeMs(this.#now()),
+      windowFrames: outbound.frames.length,
+      ackProgressed,
+      roundTripMs: this.#delivery.roundTripEwmaMs,
+      roundTripVariationMs: this.#delivery.roundTripVariationMs,
+    });
+    if (!stalledBefore && this.#congestion.stalled && outbound.frames.length > 0) {
+      this.#stallEvents++;
+      this.#recordStall();
+    }
+    return before !== this.#congestion.congested;
+  }
 
   #requestPublication(urgency: PublicationUrgency | null): void {
     if (urgency === "urgent") this.#pacer.requestUrgent();
@@ -1085,7 +1232,7 @@ export class DenoAwarenessPeer {
     const publishData = reason === "retransmission" || this.#dataDirty;
     if (publishData) {
       if (!this.#flight.active) {
-        this.#flightStartedAtMs = performance.now();
+        this.#flightStartedAtMs = this.#now();
         this.#flightUniqueBytes = outbound.frames
           .filter(sidecarFrameCarriesResponseData)
           .reduce(
@@ -1097,7 +1244,7 @@ export class DenoAwarenessPeer {
         this.#retransmittedBytes += outbound.encodedBytes;
       }
       this.#flight.published(outbound.frames);
-      this.#delivery.published(outbound.frames, performance.now());
+      this.#delivery.published(outbound.frames, this.#now());
       this.#publishLane("data", outbound.frames, reason);
       this.#dataDirty = false;
     }
@@ -1108,9 +1255,36 @@ export class DenoAwarenessPeer {
     this.#armStallWatchdog();
   }
 
+  #sampleTransportDiagnostics(): V2TransportDiagnostics {
+    const transport = this.#engine.snapshot();
+    const outbound = this.#outbound.snapshot();
+    const scheduled = this.#scheduler.snapshot();
+    const adaptive = this.#adaptiveCapacity.snapshot();
+    const sample: V2TransportDiagnostics = { windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: this.#delivery.ackProgressAgeMs(this.#now()), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, roundTripVariationMs: this.#delivery.roundTripVariationMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0, acknowledgedGoodputBytesPerSecond: this.#currentGoodput(), uniqueAcknowledgedBytesTotal: this.#uniqueAcknowledgedBytes, retransmittedBytesTotal: this.#retransmittedBytes, stallEventsTotal: this.#stallEvents };
+    this.#diagnostics?.transport(sample);
+    return sample;
+  }
+
+  #controlDiagnostics(transport: V2TransportDiagnostics): V2EnvelopeDiagnostics {
+    // Reliable receive recovery must remain available with resource and request
+    // diagnostics disabled. These bounded counters carry no request content.
+    const diagnostics: V2EnvelopeDiagnostics = this.#diagnostics?.enabled ? this.#diagnostics.envelope()
+      : { version: 1, resource: null, transport, malformedCount: 0 };
+    // The existing wire parser caps the entire diagnostic object at 2 KiB.
+    // Preserve full resource telemetry when it fits. At maximal legal numeric
+    // widths, resource:null plus every transport field needs only 1,441 bytes;
+    // retain exact counters so metadata growth cannot disable receive repair.
+    return encodedDiagnosticBytes(diagnostics) <= 2_048
+      ? diagnostics
+      : { ...diagnostics, resource: null };
+  }
+
   #publishLivenessPong(sentAtMs: number): void {
     const current = this.#controlProvider.awareness.getLocalState()
       ?.ghostprovV2Control as AwarenessEnvelope<SidecarFrame> | undefined;
+    this.#publications++;
+    this.#urgentPublications++;
+    const diagnosticSample = this.#sampleTransportDiagnostics();
     const transport = this.#engine.snapshot();
     const common = {
       protocol: "gp-awareness-v2",
@@ -1133,7 +1307,7 @@ export class DenoAwarenessPeer {
       frames: [],
       lane: "control",
       liveness: { kind: "pong", sentAtMs },
-      ...(current?.diagnostics ? { diagnostics: current.diagnostics } : {}),
+      diagnostics: this.#controlDiagnostics(diagnosticSample),
     } as const;
     const envelope: AwarenessEnvelope<SidecarFrame> =
       this.#binding.protocolRevision === "r2"
@@ -1149,8 +1323,6 @@ export class DenoAwarenessPeer {
       envelope,
       0,
     );
-    this.#publications++;
-    this.#urgentPublications++;
     this.#publishedBytes += encodedBytes;
     this.#controlPublications++;
     this.#controlPublishedBytes += encodedBytes;
@@ -1164,12 +1336,10 @@ export class DenoAwarenessPeer {
   ): void {
     const transport = this.#engine.snapshot();
     const outbound = this.#outbound.snapshot();
-    const scheduled = this.#scheduler.snapshot();
     this.#publications++;
     if (reason === "paced") this.#pacedPublications++;
     else if (reason === "urgent") this.#urgentPublications++;
-    const adaptive = this.#adaptiveCapacity.snapshot();
-    this.#diagnostics?.transport({ windowFrames: outbound.frames.length, windowBytes: outbound.encodedBytes, schedulerFrames: scheduled.queuedFrames, schedulerBytes: scheduled.queuedEncodedBytes, schedulerStreams: scheduled.streams, oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs, ackProgressAgeMs: this.#delivery.ackProgressAgeMs(performance.now()), retransmissionAttempt: this.#delivery.attempt, peakRetransmissionAttempt: this.#peakAttempt, retransmissionsTotal: this.#retransmissions, publicationsTotal: this.#publications, publishedBytesTotal: this.#publishedBytes, admittedUncommitted: transport.active, roundTripEwmaMs: this.#delivery.roundTripEwmaMs, roundTripVariationMs: this.#delivery.roundTripVariationMs, pacedPublicationsTotal: this.#pacedPublications, urgentPublicationsTotal: this.#urgentPublications, logicalEventsTotal: this.#logicalEvents, responseBatchFramesTotal: this.#responseBatchFrames, batchedEventsTotal: this.#batchedEvents, dataPublicationsTotal: this.#dataPublications, controlPublicationsTotal: this.#controlPublications, dataPublishedBytesTotal: this.#dataPublishedBytes, controlPublishedBytesTotal: this.#controlPublishedBytes, flightCompletionsTotal: this.#flightCompletions, adaptiveCapacity: adaptive.limit, capacityIncreasesTotal: adaptive.increases, capacityReductionsTotal: adaptive.reductions, unadmittedTimeoutsTotal: 0, acknowledgedGoodputBytesPerSecond: this.#currentGoodput(), uniqueAcknowledgedBytesTotal: this.#uniqueAcknowledgedBytes, retransmittedBytesTotal: this.#retransmittedBytes, stallEventsTotal: this.#stallEvents });
+    const diagnosticSample = this.#sampleTransportDiagnostics();
     const common = {
       protocol: "gp-awareness-v2",
       schemaHash: this.#binding.schemaHash,
@@ -1199,8 +1369,8 @@ export class DenoAwarenessPeer {
           this.#livenessPong.hostInstanceId === this.#hostInstanceId
         ? { liveness: { kind: "pong" as const, sentAtMs: this.#livenessPong.sentAtMs } }
         : {}),
-      ...(lane === "control" && this.#diagnostics?.enabled
-        ? { diagnostics: this.#diagnostics.envelope() }
+      ...(lane === "control"
+        ? { diagnostics: this.#controlDiagnostics(diagnosticSample) }
         : {}),
     } as const;
     const envelope: AwarenessEnvelope<SidecarFrame> =
@@ -1236,12 +1406,14 @@ export class DenoAwarenessPeer {
     if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
     const revision = this.#dataRevision + this.#controlRevision;
     const jitterSeed = deterministicV2JitterSeed(this.#instanceId, revision);
-    const delay = this.#delivery.nextDelayMs(performance.now(), jitterSeed);
+    const delay = this.#delivery.nextDelayMs(this.#now(), jitterSeed);
     if (delay === null) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
       if (this.#closed || this.#outbound.snapshot().frames.length === 0) return;
-      this.#delivery.retransmitted(performance.now());
+      const now = this.#now();
+      this.#lastRetransmitAtMs = now;
+      this.#delivery.retransmitted(now);
       this.#retransmissions++;
       this.#peakAttempt = Math.max(this.#peakAttempt, this.#delivery.attempt);
       this.#pacer.flushNow("retransmission");
@@ -1252,7 +1424,7 @@ export class DenoAwarenessPeer {
     if (
       this.#acknowledgedGoodputBytesPerSecond === null ||
       this.#goodputUpdatedAtMs === null ||
-      performance.now() - this.#goodputUpdatedAtMs >= GOODPUT_IDLE_RESET_MS
+      this.#now() - this.#goodputUpdatedAtMs >= GOODPUT_IDLE_RESET_MS
     ) return null;
     return this.#acknowledgedGoodputBytesPerSecond;
   }
@@ -1283,16 +1455,13 @@ export class DenoAwarenessPeer {
       if (this.#updateCongestion()) this.#pacer.requestUrgent();
       return;
     }
-    const now = performance.now();
-    const age = Math.max(
-      scheduled.oldestQueuedFrameMs,
-      outbound.frames.length > 0
-        ? this.#delivery.ackProgressAgeMs(now)
-        : 0,
-    );
+    const now = this.#now();
+    const age = outbound.frames.length > 0
+      ? this.#delivery.ackProgressAgeMs(now)
+      : scheduled.oldestQueuedFrameMs;
     const delay = this.#congestion.congested
       ? Math.max(100, Math.min(500, this.#transportStallMs / 2))
-      : Math.max(1, this.#transportStallMs - age);
+      : Math.max(1, this.#congestion.stallThresholdMs - age);
     const dueAt = now + delay;
     if (
       this.#stallTimer !== null && this.#stallTimerDueAtMs !== null &&
@@ -1320,13 +1489,15 @@ export class DenoAwarenessPeer {
     );
     if (this.#delivery.ackProgressAgeMs(now) < threshold) return false;
     if (
-      this.#lastFastRetransmitAtMs !== null &&
-      now - this.#lastFastRetransmitAtMs < Math.max(
+      this.#lastRetransmitAtMs !== null &&
+      now - this.#lastRetransmitAtMs < Math.max(
         this.#fastRetransmitFloorMs,
         (rtt ?? this.#fastRetransmitFloorMs) * 2,
       )
     ) return false;
-    this.#lastFastRetransmitAtMs = now;
+    // A stale ACK is not a second loss signal immediately after the timeout
+    // path has already republished this same immutable flight.
+    this.#lastRetransmitAtMs = now;
     this.#delivery.retransmitted(now);
     this.#retransmissions++;
     this.#peakAttempt = Math.max(this.#peakAttempt, this.#delivery.attempt);
@@ -1335,7 +1506,7 @@ export class DenoAwarenessPeer {
   }
 
   #recordStall(): void {
-    const now = performance.now();
+    const now = this.#now();
     if (
       this.#lastStallAtMs === null ||
       now - this.#lastStallAtMs > STALL_DERATE_WINDOW_MS

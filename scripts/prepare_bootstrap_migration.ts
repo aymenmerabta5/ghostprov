@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { prepareBootstrapHoldMigrationLedger } from "../src/fleet/bootstrap-migration";
+import { MAX_BOOTSTRAP_MIGRATION_PROJECTS, MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS, prepareBootstrapHoldMigrationLedger, type OperatorRecoveryPreparationControls } from "../src/fleet/bootstrap-migration";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 
 const SHA256 = /^[a-f0-9]{64}$(?![\s\S])/;
@@ -9,14 +9,18 @@ export interface BootstrapMigrationCommand {
   readonly manifestFile: string;
   readonly identityFingerprint: string;
   readonly projectIds: readonly ProjectId[];
+  readonly operatorRecovery?: true;
 }
 
 /** Explicit local inputs only: no account resolution or browser/API credential files. */
 export function parseBootstrapMigrationArguments(args: readonly string[]): BootstrapMigrationCommand {
-  if (args.length > 9) throw new Error("Bootstrap migration accepts at most two explicit projects");
+  if (args.length > 5 + 2 * MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS) {
+    throw new Error(`Bootstrap migration accepts at most ${MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS} explicit projects`);
+  }
   let manifestFile: string | undefined;
   let identityFingerprint: string | undefined;
   let confirmed = false;
+  let operatorRecovery = false;
   const projectIds: ProjectId[] = [];
 
   for (let index = 0; index < args.length; index++) {
@@ -44,13 +48,16 @@ export function parseBootstrapMigrationArguments(args: readonly string[]): Boots
       if (!value || !UUID.test(value)) throw new Error("--project requires an exact lowercase project UUID");
       const id = projectId(value);
       if (projectIds.includes(id)) throw new Error("--project targets must be unique");
-      if (projectIds.length === 2) throw new Error("Bootstrap migration accepts at most two explicit projects");
+      if (projectIds.length === MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS) {
+        throw new Error(`Bootstrap migration accepts at most ${MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS} explicit projects`);
+      }
       projectIds.push(id);
       continue;
     }
-    if (argument === "--confirm-legacy-bootstrap-migration") {
+    if (argument === "--confirm-legacy-bootstrap-migration" || argument === "--confirm-operator-bootstrap-recovery") {
       if (confirmed) throw new Error("The migration confirmation flag may be supplied only once");
       confirmed = true;
+      operatorRecovery = argument === "--confirm-operator-bootstrap-recovery";
       continue;
     }
     throw new Error("Unknown bootstrap migration argument");
@@ -60,19 +67,24 @@ export function parseBootstrapMigrationArguments(args: readonly string[]): Boots
   if (identityFingerprint === undefined) throw new Error("--identity-fingerprint is required");
   if (projectIds.length === 0) throw new Error("At least one explicit --project is required");
   if (!confirmed) throw new Error("--confirm-legacy-bootstrap-migration is required");
+  if (!operatorRecovery && projectIds.length > MAX_BOOTSTRAP_MIGRATION_PROJECTS) {
+    throw new Error(`Legacy bootstrap migration accepts at most ${MAX_BOOTSTRAP_MIGRATION_PROJECTS} explicit projects`);
+  }
   return Object.freeze({
     manifestFile,
     identityFingerprint,
     projectIds: Object.freeze(projectIds),
+    ...(operatorRecovery ? { operatorRecovery: true as const } : {}),
   });
 }
 
 export async function main(
   args: readonly string[] = process.argv.slice(2),
   output: (value: string) => void = value => console.log(value),
+  controls: OperatorRecoveryPreparationControls = {},
 ): Promise<void> {
   const command = parseBootstrapMigrationArguments(args);
-  const result = await prepareBootstrapHoldMigrationLedger(command);
+  const result = await prepareBootstrapHoldMigrationLedger(command, controls);
   output(JSON.stringify(result, null, 2));
 }
 

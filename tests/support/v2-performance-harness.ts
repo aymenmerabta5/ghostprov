@@ -44,6 +44,8 @@ import {
 import { AdmissionController } from "../../src/v2/sidecar/admission";
 import { RequestAssembler } from "../../src/v2/sidecar/assembler";
 import { SidecarEngine } from "../../src/v2/sidecar/engine";
+import { SidecarEngine as R10SidecarEngine } from "../../src/v2/sidecar/r10-engine";
+import { OutputBackpressure } from "../../src/v2/sidecar/output-sink";
 import { ClaimJournal } from "../../src/v2/sidecar/journal";
 import type {
   DirectResponsesExecution,
@@ -60,6 +62,7 @@ import {
   DenoAwarenessPeer,
   type DenoAwarenessProviderLike,
 } from "../../sandbox/v2/awareness-peer";
+import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../../sandbox/v2/r10-awareness-peer";
 import { FakeSidecarStorage } from "./fake-v2-sidecar";
 import * as Y from "yjs";
 import {
@@ -108,6 +111,8 @@ export interface V2HarnessTransientDisconnect {
 }
 
 export interface V2PerformanceHarnessOptions {
+  /** Selects the real mutable R10 engine/peer, including its output backpressure. */
+  sidecarRevision?: "r8" | "r10";
   /** Defaults to R2. R1 selects source-level wire limits, not the frozen bundle. */
   protocolRevision?: ProtocolRevision;
   transportProfile?: V2TransportProfile;
@@ -119,6 +124,12 @@ export interface V2PerformanceHarnessOptions {
   requestBytesByRequest?: readonly number[];
   /** Logical SSE events emitted per response, including created/completed. */
   responseEventCount?: number;
+  /** Bounded response delta payload; zero preserves the small digest fixture. */
+  responseDeltaBytes?: number;
+  /** Deterministic delay between streamed response events. */
+  responseIntervalMs?: number;
+  /** Emit responses while later requests are still being admitted. */
+  streamWhileAdmitting?: boolean;
   corpus?: V2PerformanceCorpus;
   linkBandwidthBytesPerSecond?: number;
   serializationBytesPerSecond?: number;
@@ -236,6 +247,8 @@ export interface V2PerformanceHarnessReport {
     calls: number;
     maxActive: number;
   };
+  responseEventsEmitted: number;
+  admissionReopenedDuringResponses: number;
   transport: {
     retransmissions: number;
     ackRounds: number;
@@ -509,6 +522,10 @@ class FaultyAwarenessHub {
   onActivity(listener: () => void): () => void {
     this.#activity.add(listener);
     return () => this.#activity.delete(listener);
+  }
+
+  delay(ms: number): Promise<void> {
+    return new Promise(resolve => { this.publicationTimer("sidecar").set(resolve, ms); });
   }
 
   connect(provider: HarnessAwarenessProvider): void {
@@ -823,10 +840,15 @@ class DigestingUpstream {
   calls = 0;
   active = 0;
   maxActive = 0;
+  emittedEvents = 0;
   readonly proofs = new Map<number, UpstreamProof>();
   readonly #gate = new HoldGate();
 
-  constructor(readonly responseEventCount = 2) {}
+  constructor(
+    readonly responseEventCount = 2,
+    readonly responseDeltaBytes = 0,
+    readonly pause: (() => Promise<void>) | null = null,
+  ) {}
 
   async execute(input: DirectResponsesExecution): Promise<UpstreamTerminal> {
     await input.beforeFetch();
@@ -848,6 +870,7 @@ class DigestingUpstream {
         contentType: "text/event-stream",
         upstreamRequestId: `upstream_perf_${String(index).padStart(6, "0")}`,
       });
+      const delta = this.responseDeltaBytes > 0 ? "x".repeat(this.responseDeltaBytes) : null;
       const final = {
         id: responseId,
         object: "response",
@@ -858,7 +881,7 @@ class DigestingUpstream {
           status: "completed",
           content: [{
             type: "output_text",
-            text: `ok:${index}:${requestDigest}`,
+            text: delta === null ? `ok:${index}:${requestDigest}` : delta.repeat(this.responseEventCount - 2),
           }],
         }],
       };
@@ -874,7 +897,7 @@ class DigestingUpstream {
           event: "response.output_text.delta",
           data: JSON.stringify({
             type: "response.output_text.delta",
-            delta: `${index}:${eventIndex}`,
+            delta: delta ?? `${index}:${eventIndex}`,
           }),
         })),
         {
@@ -884,8 +907,10 @@ class DigestingUpstream {
       ];
       const transcript = new TranscriptProof("upstream", "0".repeat(64), { retainBytes: false });
       for (const event of events) {
+        if (this.pause) await this.pause();
         await transcript.appendCanonicalStream(event, { onChunk: input.onTranscriptBytes });
         await input.onEvent(event);
+        this.emittedEvents++;
       }
       const terminal = await transcript.createTerminal();
       this.proofs.set(index, {
@@ -946,14 +971,19 @@ function recordPeak(
   peaks.sidecarSchedulerBytes = Math.max(peaks.sidecarSchedulerBytes, sidecar.schedulerBytes);
 }
 
+type PerformancePeer = Pick<DenoAwarenessPeer, keyof DenoAwarenessPeer>;
+type PerformanceEngine = Pick<SidecarEngine, keyof SidecarEngine>;
+
 class PerformanceRuntime implements RoutableSandboxRuntime {
   readonly projectId: ProjectId = PROJECT;
   readonly upstream: DigestingUpstream;
   readonly peaks = emptyPeaks();
+  admissionReopenedDuringResponses = 0;
+  #lastAdmissionCredits: number | null = null;
   readonly #hub: FaultyAwarenessHub;
   readonly #session: V2TransportSession;
-  readonly #peer: DenoAwarenessPeer;
-  readonly #engine: SidecarEngine;
+  readonly #peer: PerformancePeer;
+  readonly #engine: PerformanceEngine;
   readonly #journal: ClaimJournal;
   readonly #sampler: SidecarResourceSampler;
   readonly #binding: ProtocolBinding;
@@ -973,8 +1003,8 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   private constructor(options: {
     hub: FaultyAwarenessHub;
     session: V2TransportSession;
-    peer: DenoAwarenessPeer;
-    engine: SidecarEngine;
+    peer: PerformancePeer;
+    engine: PerformanceEngine;
     upstream: DigestingUpstream;
     journal: ClaimJournal;
     sampler: SidecarResourceSampler;
@@ -1076,7 +1106,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       maxBufferedResponseBytes: 512 * KiB,
       hostCeiling: options.concurrency,
       retransmitMs,
-      publicationIntervalMs: 1,
+      publicationIntervalMs: options.sidecarRevision === "r10" ? 25 : 1,
       publicationTimer: hostPublicationTimer,
       unadmittedTimeoutMs: options.timeoutMs ?? 20_000,
       gzip: async bytes => {
@@ -1123,9 +1153,19 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       now: () => clock.now(),
       sampler,
     });
-    let peer!: DenoAwarenessPeer;
-    const upstream = new DigestingUpstream(options.responseEventCount ?? 2);
-    const engine = new SidecarEngine({
+    let peer!: PerformancePeer;
+    const r10 = options.sidecarRevision === "r10";
+    const outputBackpressure = r10 ? new OutputBackpressure({
+      highFrames: 256, highBytes: 256 * KiB, lowFrames: 64, lowBytes: 64 * KiB,
+      hardFrames: 1024, hardBytes: MiB,
+    }) : undefined;
+    const upstream = new DigestingUpstream(
+      options.responseEventCount ?? 2,
+      options.responseDeltaBytes ?? 0,
+      options.responseIntervalMs ? () => hub.delay(options.responseIntervalMs!) : null,
+    );
+    const Engine = r10 ? R10SidecarEngine : SidecarEngine;
+    const engine = new Engine({
       binding,
       assembler: new RequestAssembler({
         maxReservedBytes: sidecarMemoryBudget,
@@ -1135,6 +1175,7 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       upstream,
       diagnostics,
       batching: true,
+      ...(outputBackpressure ? { outputBackpressure } : {}),
       assertExecutionFence: frame => peer.assertExecutionFence(frame),
       emit: (frame, priority, streamId) => peer.enqueue(frame, priority, streamId),
     });
@@ -1147,15 +1188,18 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
       rotationKey: createCredentialRotationKey(),
     };
     const peerErrors: Error[] = [];
-    peer = new DenoAwarenessPeer({
+    const Peer = r10 ? R10DenoAwarenessPeer : DenoAwarenessPeer;
+    peer = new Peer({
       credential,
       binding,
       transportProfile,
       instanceId: SIDECAR_INSTANCE,
       engine,
       diagnostics,
+      ...(outputBackpressure ? { outputBackpressure } : {}),
+      ...(r10 ? { now: () => clock.now(), publicationTimer: hub.publicationTimer("sidecar") } : {}),
       providerFactory: (doc, _credential, lane) => hub.create(doc, "sidecar", lane),
-      publicationIntervalMs: 1,
+      publicationIntervalMs: r10 ? 25 : 1,
       retransmitMs,
       connectTimeoutMs: 1_000,
       closeTimeoutMs: 2_000,
@@ -1388,7 +1432,14 @@ class PerformanceRuntime implements RoutableSandboxRuntime {
   }
 
   sample(): void {
-    const diagnostics = this.#session.snapshot().diagnostics;
+    const snapshot = this.#session.snapshot();
+    const credits = snapshot.admissionCredits ?? snapshot.credits;
+    if (this.#lastAdmissionCredits === 0 && credits > 0 &&
+        this.upstream.active > 0 && this.upstream.emittedEvents > 0) {
+      this.admissionReopenedDuringResponses++;
+    }
+    this.#lastAdmissionCredits = credits;
+    const diagnostics = snapshot.diagnostics;
     recordPeak(
       this.peaks,
       diagnostics!.host,
@@ -1564,6 +1615,21 @@ function validateOptions(options: V2PerformanceHarnessOptions): void {
   ) {
     throw new RangeError("responseEventCount must be 2 through 4096");
   }
+  if (options.sidecarRevision !== undefined && options.sidecarRevision !== "r8" && options.sidecarRevision !== "r10") {
+    throw new RangeError("sidecarRevision is invalid");
+  }
+  if (options.sidecarRevision === "r10" && options.protocolRevision === "r1") {
+    throw new RangeError("The R10 response harness requires R2");
+  }
+  const deltaBytes = options.responseDeltaBytes ?? 0;
+  if (!Number.isSafeInteger(deltaBytes) || deltaBytes < 0 || deltaBytes > 8 * KiB ||
+      (options.responseEventCount ?? 2) * deltaBytes > 768 * KiB) {
+    throw new RangeError("Response fixture exceeds its bounded payload budget");
+  }
+  if (options.responseIntervalMs !== undefined &&
+      (!Number.isFinite(options.responseIntervalMs) || options.responseIntervalMs < 0 || options.responseIntervalMs > 1_000)) {
+    throw new RangeError("Response fixture interval is invalid");
+  }
   if (
     options.corpus !== undefined &&
     options.corpus !== "compressible" &&
@@ -1668,6 +1734,7 @@ export async function runV2PerformanceHarness(
   });
   try {
     await runtime.start();
+    if (options.streamWhileAdmitting) runtime.releaseUpstream();
     const corpus = options.corpus ?? "incompressible";
     const requestSizes = performanceRequestSizes(options);
     const bodies = requestSizes.map((requestBytes, index) =>
@@ -1701,8 +1768,12 @@ export async function runV2PerformanceHarness(
           transcript.append(event);
           eventCount++;
         }
+        const modeledEventsDoneMs = clock.now() - modeledStarts[index]!;
+        const wallEventsDoneMs = performance.now() - wallStarts[index]!;
         const terminal = await transcript.createTerminal();
         return {
+          modeledEventsDoneMs,
+          wallEventsDoneMs,
           modeledFirstEventMs:
             modeledFirstEventMs ?? clock.now() - modeledStarts[index]!,
           wallFirstEventMs:
@@ -1712,6 +1783,16 @@ export async function runV2PerformanceHarness(
           finalDigest: terminal.finalSha256,
         };
       })();
+      const finalResult = handle.final.then(final => ({
+        final,
+        modeledFinalMs: clock.now() - modeledStarts[index]!,
+        wallFinalMs: performance.now() - wallStarts[index]!,
+      }));
+      // If another admission fails first, teardown closes this stream before
+      // Promise.all(handles) can attach its observer. Preserve the rejection for
+      // that observer without leaking an unhandled failure into the next test.
+      void events.catch(() => undefined);
+      void finalResult.catch(() => undefined);
       return {
         index,
         handle,
@@ -1723,6 +1804,7 @@ export async function runV2PerformanceHarness(
         requestEncoding: trace.encoding,
         ackRoundsAtCommit: trace.flights.size,
         events,
+        finalResult,
       };
     });
     const credentialRotation = options.rotateCredentialDuringTransfer
@@ -1768,17 +1850,20 @@ export async function runV2PerformanceHarness(
         peerErrors: runtime.peerErrorMessages(),
       })}`, { cause });
     }
-    await waitFor(
-      () => runtime.upstream.active === options.concurrency,
-      timeoutMs,
-      "V2 harness upstream concurrency",
-    );
+    if (!options.streamWhileAdmitting) {
+      await waitFor(
+        () => runtime.upstream.active === options.concurrency,
+        timeoutMs,
+        "V2 harness upstream concurrency",
+      );
+    }
     runtime.releaseUpstream();
     const requests = await withTimeout(Promise.all(handles.map(async value => {
-      const [final, observed] = await Promise.all([
-        value.handle.final,
+      const [settled, observed] = await Promise.all([
+        value.finalResult,
         value.events,
       ]);
+      const final = settled.final;
       const upstream = runtime.upstream.proofs.get(value.index);
       if (!upstream) throw new Error(`Missing upstream proof for request ${value.index}`);
       const finalDigest = await sha256Hex(canonicalJson(final));
@@ -1792,10 +1877,13 @@ export async function runV2PerformanceHarness(
         upstreamDigest: upstream.requestDigest,
         modeledCommitMs: value.modeledCommitMs,
         modeledFirstEventMs: observed.modeledFirstEventMs,
-        modeledTotalMs: clock.now() - modeledStarts[value.index]!,
+        // Integrity verification below can await hashing while unrelated ACK
+        // traffic advances the model clock. Measure the actual public terminal
+        // and stream completion, not that test-only verification/cleanup delay.
+        modeledTotalMs: Math.max(settled.modeledFinalMs, observed.modeledEventsDoneMs),
         wallCommitMs: value.wallCommitMs,
         wallFirstEventMs: observed.wallFirstEventMs,
-        wallTotalMs: performance.now() - wallStarts[value.index]!,
+        wallTotalMs: Math.max(settled.wallFinalMs, observed.wallEventsDoneMs),
         hostPreparationWallMs: value.hostPreparationWallMs,
         ackRoundsAtCommit: value.ackRoundsAtCommit,
         eventCount: observed.eventCount,
@@ -1864,6 +1952,8 @@ export async function runV2PerformanceHarness(
         calls: runtime.upstream.calls,
         maxActive: runtime.upstream.maxActive,
       },
+      responseEventsEmitted: runtime.upstream.emittedEvents,
+      admissionReopenedDuringResponses: runtime.admissionReopenedDuringResponses,
       transport: {
         retransmissions: transport.retransmissions,
         ackRounds: host.flightCompletionsTotal,

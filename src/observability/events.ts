@@ -1,3 +1,6 @@
+import type { FleetBootstrapCleanupDiagnostic, FleetBootstrapCleanupReason } from "../fleet/types";
+export { FLEET_BOOTSTRAP_CLEANUP_REASONS, FLEET_BOOTSTRAP_CLEANUP_STAGES } from "../fleet/types";
+
 export type ObservabilityPriority = "terminal" | "progress" | "sample";
 
 /** Bounded router scheduler classes safe to expose in request telemetry. */
@@ -13,6 +16,9 @@ export const FLEET_LIFECYCLE_EVENT_NAMES = [
   "fleet.replacement.old_retired",
   "fleet.mutation.blocked",
   "fleet.startup_permits.changed",
+  "fleet.bootstrap_cleanup.started",
+  "fleet.bootstrap_cleanup.succeeded",
+  "fleet.bootstrap_cleanup.deferred",
 ] as const;
 export type FleetLifecycleObservabilityEventName =
   typeof FLEET_LIFECYCLE_EVENT_NAMES[number];
@@ -200,6 +206,12 @@ export const SANDBOX_RECOVERY_ERROR_NAMES = [
 ] as const;
 export type SandboxRecoveryErrorName = typeof SANDBOX_RECOVERY_ERROR_NAMES[number];
 
+export const FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES = [
+  ...SANDBOX_RECOVERY_ERROR_NAMES, ...SANDBOX_LIVENESS_ERROR_NAMES,
+  "V2SupervisorBootstrapError", "TimeoutError", "TypeError", "RangeError", "SyntaxError",
+] as const;
+export type FleetBootstrapCleanupErrorName = typeof FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES[number];
+
 export const SANDBOX_RECOVERY_ERROR_KINDS = [
   "local",
   "auth",
@@ -353,6 +365,7 @@ export type ObservabilityEventName =
   | "websocket.payload_rejected"
   | "websocket.http_fallback"
   | "fleet.sample"
+  | "fleet.runtime_sample"
   | "monitor.sample"
   | "monitor.error"
   | "logger.dropped"
@@ -437,6 +450,13 @@ export interface FleetLifecycleObservabilityFields {
   managed?: boolean;
   mutation_operation?: typeof FLEET_MUTATION_OPERATIONS[number];
   block_reason?: typeof FLEET_MUTATION_BLOCK_REASONS[number];
+  cleanup_reason?: FleetBootstrapCleanupReason;
+  cleanup_stage?: FleetBootstrapCleanupDiagnostic["cleanupStage"];
+  error_name?: FleetBootstrapCleanupErrorName;
+  bootstrap_phase?: FleetBootstrapCleanupDiagnostic["bootstrapPhase"];
+  bootstrap_code?: FleetBootstrapCleanupDiagnostic["bootstrapCode"];
+  bootstrap_reason?: FleetBootstrapCleanupDiagnostic["bootstrapReason"];
+  supervisor_phase?: SandboxSupervisorPhase;
   cold_start?: boolean;
   permit_action?: typeof FLEET_STARTUP_PERMIT_ACTIONS[number];
   total_limit?: number;

@@ -5,8 +5,9 @@ import { FileBootstrapHoldMigration } from "../fleet/bootstrap-migration";
 import { defaultFleetManifestFile, FleetManifestStore } from "../fleet/manifest";
 import { FileSupervisorBootstrapJournal } from "../v2/supervisor/bootstrap-journal";
 import { SupervisorLifecycle } from "../v2/supervisor/lifecycle";
-import { assertBootstrapCleanupComplete, type SupervisorBootstrapJournalFactory } from "../v2/supervisor/bootstrap-cleanup-proof";
+import { assertBootstrapCleanupComplete, BootstrapCleanupProofError, type SupervisorBootstrapJournalFactory } from "../v2/supervisor/bootstrap-cleanup-proof";
 import { FleetStartupPermitPool } from "../fleet/startup-permits";
+import { createHeldBootstrapMaintenance, type HeldBootstrapMaintenanceOptions } from "./held-bootstrap-maintenance";
 import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../fleet/types";
 import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
@@ -33,13 +34,14 @@ import { SandboxRegistry, type RoutableSandboxRuntime } from "../sandbox/registr
 import type { ProjectId } from "../sandbox/types";
 import {
   SupervisedSandboxRuntime,
+  type BootstrapCleanupAssessment,
   type SandboxSupervisorEvent,
 } from "../sandbox/supervised-runtime";
 import { SandboxYDoc } from "../sandbox/ydoc";
 import { YSweetAwarenessChannel, type YSweetAwarenessChannelOptions } from "../v2/awareness/y-sweet-channel";
 import type { AwarenessChannel } from "../v2/awareness/channel";
 import { SplitAwarenessChannel } from "../v2/awareness/split-channel";
-import { V2BootstrapController } from "../v2/bootstrap/controller";
+import { V2BootstrapController, V2BootstrapError } from "../v2/bootstrap/controller";
 import { bootstrapBindingFromProtocol } from "../v2/bootstrap/binding";
 import type { HostFrame, SidecarFrame } from "../v2/protocol/shared";
 import { parseAwarenessEnvelope } from "../v2/protocol/validate";
@@ -48,6 +50,7 @@ import {
   type V2RuntimeGateway,
   type V2RuntimeHeartbeat,
   type V2RuntimeHeartbeatCallbacks,
+  type V2RuntimeLivenessDiagnostic,
 } from "../v2/runtime";
 import type { V2SidecarAssets } from "../v2/sidecar/assets";
 import { createBundledV2SidecarRevisionSelector } from "../v2/sidecar/revisions";
@@ -336,6 +339,8 @@ export interface BrowserlessSystemDependencies {
   }) => V2RuntimeHeartbeat;
   /** Integration seam for observing and exercising the authenticated R9 lifecycle. */
   sandboxSupervisorFactory?: (options: V2SandboxSupervisorOptions) => V2BootstrapSupervisor;
+  /** Integration seam for observing exact held-supervisor cleanup; production omits it. */
+  heldBootstrapHostFactory?: NonNullable<HeldBootstrapMaintenanceOptions["hostFactory"]>;
   /** Integration seam for bounded loss on dedicated test transport lanes. */
   awarenessChannelFactory?: (options: YSweetAwarenessChannelOptions<SidecarFrame>) => AwarenessChannel<HostFrame, SidecarFrame>;
 }
@@ -406,8 +411,67 @@ export function selectV2ProjectRelease(
   return selected;
 }
 
-function emitFleetLifecycle(logger: LoggerLike, event: FleetLifecycleEvent): void {
+export function emitSandboxLivenessDiagnostic(
+  logger: LoggerLike,
+  projectId: ProjectId,
+  workerIndex: number,
+  diagnostic: V2RuntimeLivenessDiagnostic,
+): void {
+  logger.emit(sandboxLivenessObservabilityEvent({
+    project_id: projectId,
+    worker_index: workerIndex,
+    transport: "v2",
+    liveness_signal: diagnostic.signal,
+    liveness_outcome: diagnostic.outcome,
+    attempt: diagnostic.attempt,
+    consecutive_failures: diagnostic.consecutiveFailures,
+    status: diagnostic.status,
+    error_name: diagnostic.errorName,
+    error_kind: diagnostic.errorKind,
+    duration_ms: diagnostic.durationMs,
+    heartbeat_age_ms: diagnostic.heartbeatAgeMs,
+    sidecar_peer_age_ms: diagnostic.sidecarPeerAgeMs,
+    transport_connected: diagnostic.transportConnected,
+    reliable_stall: diagnostic.reliableStall,
+    awareness_lane: diagnostic.awarenessLane,
+    connection_code: diagnostic.connectionCode,
+    reconnect_phase: diagnostic.reconnectPhase,
+    supervisor_phase: diagnostic.supervisorPhase,
+  }), "terminal");
+}
+
+export function emitFleetLifecycle(logger: LoggerLike, event: FleetLifecycleEvent): void {
   switch (event.type) {
+    case "bootstrap_cleanup_started":
+    case "bootstrap_cleanup_succeeded":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        event.type === "bootstrap_cleanup_started"
+          ? "fleet.bootstrap_cleanup.started"
+          : "fleet.bootstrap_cleanup.succeeded",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          leader_generation: event.leaderGeneration,
+        },
+      ), "terminal");
+      return;
+    case "bootstrap_cleanup_deferred":
+      logger.emit(fleetLifecycleObservabilityEvent(
+        "fleet.bootstrap_cleanup.deferred",
+        {
+          project_id: event.projectId,
+          worker_index: event.workerIndex,
+          leader_generation: event.leaderGeneration,
+          cleanup_reason: event.reason,
+          cleanup_stage: event.cleanupStage,
+          error_name: event.errorName,
+          bootstrap_phase: event.bootstrapPhase,
+          bootstrap_code: event.bootstrapCode,
+          bootstrap_reason: event.bootstrapReason,
+          supervisor_phase: event.supervisorPhase,
+        },
+      ), "terminal");
+      return;
     case "replacement_qualified":
     case "replacement_started":
       logger.emit(fleetLifecycleObservabilityEvent(
@@ -466,7 +530,11 @@ function emitFleetLifecycle(logger: LoggerLike, event: FleetLifecycleEvent): voi
           block_reason: event.reason,
         },
       ), "terminal");
+      return;
   }
+  const exhaustive: never = event;
+  void exhaustive;
+  throw new TypeError("Unknown fleet lifecycle event");
 }
 
 function defaultRuntimeFactory(options: {
@@ -483,6 +551,9 @@ function defaultRuntimeFactory(options: {
   logger: LoggerLike;
   sandboxLogs: SandboxLogService;
   supervisorLifecycle: SupervisorLifecycle;
+  startupPermits: FleetStartupPermitPool;
+  recoverBootstrapCleanup?(projectId: ProjectId, signal: AbortSignal): Promise<BootstrapCleanupAssessment>;
+  shutdownDeadlineMs(): number | undefined;
   heartbeatFactory?: BrowserlessSystemDependencies["heartbeatFactory"];
   sandboxSupervisorFactory?: BrowserlessSystemDependencies["sandboxSupervisorFactory"];
   awarenessChannelFactory?: BrowserlessSystemDependencies["awarenessChannelFactory"];
@@ -502,6 +573,9 @@ function defaultRuntimeFactory(options: {
     logger,
     sandboxLogs,
     supervisorLifecycle,
+    startupPermits,
+    recoverBootstrapCleanup,
+    shutdownDeadlineMs,
     heartbeatFactory,
     sandboxSupervisorFactory,
     awarenessChannelFactory,
@@ -528,6 +602,7 @@ function defaultRuntimeFactory(options: {
       maxResponseBytes: config.v2ResponseMaxBytes,
       eventMemoryPool: hostEventMemory.permits,
       ySweetRefreshMs: config.v2YSweetRefreshMs,
+      shutdownDeadlineMs,
       initialSandbox: input.initialSandbox,
       acquireSandboxForAuth: (status, signal) => acquireSandboxForAuth(
         projectId,
@@ -545,29 +620,7 @@ function defaultRuntimeFactory(options: {
           credential_refresh_outcome: outcome,
         }), "progress");
       },
-      onLivenessDiagnostic: diagnostic => {
-        logger.emit(sandboxLivenessObservabilityEvent({
-          project_id: projectId,
-          worker_index: workerIndex,
-          transport: "v2",
-          liveness_signal: diagnostic.signal,
-          liveness_outcome: diagnostic.outcome,
-          attempt: diagnostic.attempt,
-          consecutive_failures: diagnostic.consecutiveFailures,
-          status: diagnostic.status,
-          error_name: diagnostic.errorName,
-          error_kind: diagnostic.errorKind,
-          duration_ms: diagnostic.durationMs,
-          heartbeat_age_ms: diagnostic.heartbeatAgeMs,
-          sidecar_peer_age_ms: diagnostic.sidecarPeerAgeMs,
-          transport_connected: diagnostic.transportConnected,
-          reliable_stall: diagnostic.reliableStall,
-          awareness_lane: diagnostic.awarenessLane,
-          connection_code: diagnostic.connectionCode,
-          reconnect_phase: diagnostic.reconnectPhase,
-          supervisor_phase: diagnostic.supervisorPhase,
-        }), "terminal");
-      },
+      onLivenessDiagnostic: diagnostic => emitSandboxLivenessDiagnostic(logger, projectId, workerIndex, diagnostic),
       gzip,
       createGateway: sandbox => new SandboxGateway({
         projectId,
@@ -590,6 +643,7 @@ function defaultRuntimeFactory(options: {
         let first = true;
         return new SandboxYDoc({
           projectId,
+          reserveRemoteReadbackBytes: bytes => governor.reserveFixedBytes(bytes),
           mintYSweet: async () => {
             if (first) {
               first = false;
@@ -704,28 +758,6 @@ function defaultRuntimeFactory(options: {
     });
   };
 
-  const startupPermits = new FleetStartupPermitPool(
-    config.provisionConcurrency,
-    config.coldStartConcurrency,
-    {
-      onTransition: transition => {
-        const snapshot = transition.snapshot;
-        logger.emit(fleetLifecycleObservabilityEvent(
-          "fleet.startup_permits.changed",
-          {
-            cold_start: transition.coldStart,
-            permit_action: transition.action,
-            total_limit: snapshot.total.limit,
-            total_in_use: snapshot.total.inUse,
-            total_queued: snapshot.total.queued,
-            cold_limit: snapshot.cold.limit,
-            cold_in_use: snapshot.cold.inUse,
-            cold_queued: snapshot.cold.queued,
-          },
-        ), "progress");
-      },
-    },
-  );
   const acquireSandboxForAuth = async (
     _projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"],
     _status: number,
@@ -754,6 +786,7 @@ function defaultRuntimeFactory(options: {
         projectId: input.projectId,
         initialChild,
         startupTimeoutMs: config.sandboxStartupTimeoutMs,
+        shutdownDeadlineMs,
         // Recovery always reuses the same Prism project/worker. Only the
         // disposable sandbox session and its fenced leader generation change.
         createChild: async seed => {
@@ -765,6 +798,9 @@ function defaultRuntimeFactory(options: {
           }, seed);
         },
         acquirePermit: signal => startupPermits.acquire(!reachedReady, signal),
+        ...(recoverBootstrapCleanup ? {
+          recoverBootstrapCleanup: (signal: AbortSignal) => recoverBootstrapCleanup(input.projectId, signal),
+        } : {}),
         recoveryCoordinator,
         workerIndex: input.workerIndex,
         transport: "v2",
@@ -1040,6 +1076,33 @@ export async function createBrowserlessSystem(
   });
   const sandboxLogs = new SandboxLogService({ governor, maxSources: Math.min(256, config.maxProjects) });
   const supervisorLifecycle = new SupervisorLifecycle(Math.min(256, config.maxProjects * 2 + config.provisionConcurrency));
+  const startupPermits = new FleetStartupPermitPool(config.provisionConcurrency, config.coldStartConcurrency, {
+    onTransition: transition => {
+      const snapshot = transition.snapshot;
+      logger.emit(fleetLifecycleObservabilityEvent("fleet.startup_permits.changed", {
+        cold_start: transition.coldStart,
+        permit_action: transition.action,
+        total_limit: snapshot.total.limit,
+        total_in_use: snapshot.total.inUse,
+        total_queued: snapshot.total.queued,
+        cold_limit: snapshot.cold.limit,
+        cold_in_use: snapshot.cold.inUse,
+        cold_queued: snapshot.cold.queued,
+      }), "progress");
+    },
+  });
+  const bootstrapMaintenance = supportsVerifiedShutdown && shutdownJournalFactory
+    ? createHeldBootstrapMaintenance({
+        journalFactory: shutdownJournalFactory,
+        assets: project => selectV2ProjectRelease(revisionSelector, project).assets,
+        provisioning,
+        account: identity.account,
+        acquirePermit: signal => startupPermits.acquire(false, signal),
+        lifecycle: supervisorLifecycle,
+        ...(dependencies.heldBootstrapHostFactory ? { hostFactory: dependencies.heldBootstrapHostFactory } : {}),
+      })
+    : undefined;
+  let runtimeShutdownDeadlineMs: number | undefined;
   const runtimeFactory = dependencies.runtimeFactory ?? defaultRuntimeFactory({
     config,
     identity,
@@ -1063,6 +1126,21 @@ export async function createBrowserlessSystem(
     onRecoveryEvent: event => fleet?.observeRecoveryEvent(event),
     sandboxLogs,
     supervisorLifecycle,
+    startupPermits,
+    ...(bootstrapMaintenance ? {
+      recoverBootstrapCleanup: async (project: ProjectId, signal: AbortSignal) => {
+        signal.throwIfAborted();
+        const worker = (await manifest.load()).workers.find(value => value.projectId === project);
+        signal.throwIfAborted();
+        if (!worker || worker.state === "draining" || worker.retirementReason !== null) return "unproved";
+        try { return await bootstrapMaintenance.cleanupBlockedBootstrap(worker, signal); }
+        catch (cause) {
+          signal.throwIfAborted();
+          throw new V2BootstrapError("Recorded supervisor cleanup remains unavailable", "deploy", 0, { cause });
+        }
+      },
+    } : {}),
+    shutdownDeadlineMs: () => runtimeShutdownDeadlineMs,
   });
   fleet = new ProjectFleetManager({
     config,
@@ -1071,6 +1149,10 @@ export async function createBrowserlessSystem(
     manifest,
     registry,
     runtimeFactory,
+    ...(bootstrapMaintenance ? {
+      cleanupHeldBootstrap: bootstrapMaintenance.cleanupHeldBootstrap,
+      finalizeHeldBootstrapCleanup: bootstrapMaintenance.finalizeHeldBootstrapCleanup,
+    } : {}),
     // Only the constructed production manifest has this exact trusted path.
     // Injected test manifests must not read another manifest's private ledger.
     ...(!dependencies.manifest ? {
@@ -1247,12 +1329,23 @@ export async function createBrowserlessSystem(
             throw new DOMException("GhostProv startup aborted", "AbortError");
           }
           const snapshot = router.snapshot();
+          const fleetReadiness = fleet.snapshot();
+          const timing = router.admissionTiming();
           logger.emit(observabilityEvent("server.started", {
             port: config.port,
             transport: "v2",
             runtimes: snapshot.runtimes.length,
             capacity: snapshot.capacity,
+            desired: fleetReadiness.desired,
+            ready: fleetReadiness.ready,
+            routable: snapshot.runtimes.filter(runtime => runtime.available > 0).length,
+            held_project_count: fleetReadiness.heldProjects?.length ?? 0,
+            fleet_readiness: fleetReadiness.ready >= fleetReadiness.desired ? "ready" : "degraded",
             pid: process.pid,
+            router_queue_timeout_ms: timing.queueTimeoutMs,
+            initial_route_attempt_timeout_ms: timing.routeAttemptTimeoutMs,
+            committed_handle_timeout_ms: timing.committedHandleTimeoutMs,
+            prepared_proof_uses_attempt_budget: timing.preparedProofUsesAttemptBudget,
             release: summarizeV2Releases(snapshot.runtimes) as unknown as JsonValue,
           }), "terminal");
           unlinkExternalStartup();
@@ -1267,8 +1360,16 @@ export async function createBrowserlessSystem(
       if (closing) return closing;
       closing = (async () => {
         unlinkExternalStartup();
+        // Publish the shared deadline before cancellation can start a child's
+        // cleanup, so production shutdown does not inherit recovery's 15s cap.
+        runtimeShutdownDeadlineMs = SYSTEM_CLOCK.now() + config.shutdownDrainMs;
         startupController.abort();
         const shutdownDeadlineMs = Date.now() + config.shutdownDrainMs;
+        // Held or ambiguous requests may never make the router idle. Keep an
+        // explicit part of the same deadline for exact supervisor retirement
+        // and the final journal audit instead of starting them after it expires.
+        const cleanupReserveMs = Math.min(60_000, config.shutdownDrainMs / 2);
+        const routerDrainDeadlineMs = runtimeShutdownDeadlineMs - cleanupReserveMs;
         supervisorLifecycle.beginShutdown();
         const before = router.snapshot();
         logger.emit(observabilityEvent("server.stopping", {
@@ -1291,7 +1392,7 @@ export async function createBrowserlessSystem(
         let firstError: unknown = null;
         await sampler.close().catch(error => { firstError ??= error; });
         try {
-          await router.awaitIdle(config.shutdownDrainMs);
+          await router.awaitIdle(Math.max(1, Math.floor(routerDrainDeadlineMs - SYSTEM_CLOCK.now())));
         } catch (error) {
           firstError = error;
         }
@@ -1317,6 +1418,11 @@ export async function createBrowserlessSystem(
               journalFactory: shutdownJournalFactory,
               signal: proofSignal,
             });
+            // Missing journal files cannot clear an unresolved cleanup hold.
+            // Only the fleet manager's verified transition releases this debt.
+            if (finalManifest.workers.some(worker => worker.retirementReason === "bootstrap_hold")) {
+              throw new BootstrapCleanupProofError();
+            }
           } catch (error) { firstError ??= error; }
         }
         await router.close().catch(error => { firstError ??= error; });

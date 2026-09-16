@@ -22,11 +22,74 @@ import { assertSafeObservabilityEvent } from "../src/observability/redaction";
 import { describeSandboxFailure } from "../src/sandbox/failure";
 import { V2BootstrapError } from "../src/v2/bootstrap/controller";
 import { V2SupervisorBootstrapError } from "../src/v2/supervisor/controller";
+import { V2SupervisorError } from "../src/v2/supervisor/host";
+import { bootstrapCleanupFailureDiagnostic } from "../src/fleet/manager";
 import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_REASONS } from "../src/sandbox/types";
 
 const PROJECT_ID = "e631d12c-d917-4434-b360-41b4715d6679";
 
 describe("recovery observability schema", () => {
+  it.each(["bootstrap", "challenge"] as const)("preserves a wrapped cleanup %s failure without raw details", phase => {
+    const inner = new V2SupervisorError("PRIVATE_CLEANUP_CANARY https://private.example", "timeout", undefined, phase);
+    const supervisor = new V2SupervisorBootstrapError("private supervisor", "deploy", {
+      cause: inner, remoteCode: "bootstrap_cleanup_unproven", reason: phase,
+    });
+    const error = new V2BootstrapError("private wrapper", "deploy", 1, { cause: supervisor });
+    const diagnostic = bootstrapCleanupFailureDiagnostic(error);
+    expect(diagnostic).toEqual({ errorName: "V2SupervisorError", bootstrapPhase: "deploy",
+      bootstrapCode: "bootstrap_cleanup_unproven", bootstrapReason: phase, supervisorPhase: phase });
+    expect(JSON.stringify(diagnostic)).not.toContain("private");
+  });
+
+  it("retains the cleanup wrapper while classifying a journal-save cause separately from supervisor transport", () => {
+    const error = new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", {
+      cause: new Error("PRIVATE_JOURNAL_PATH token=PRIVATE_CLEANUP_CANARY"), remoteCode: "bootstrap_cleanup_unproven",
+    });
+    const diagnostic = bootstrapCleanupFailureDiagnostic(error);
+    expect(diagnostic.errorName).toBe("Error");
+    expect(diagnostic.bootstrapCode).toBe("bootstrap_cleanup_unproven");
+    expect(diagnostic.bootstrapPhase).toBe("deploy");
+    expect(diagnostic.bootstrapReason).toBeUndefined();
+    expect(diagnostic.supervisorPhase).toBeUndefined();
+    expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
+  });
+
+  it("bounds cleanup cause inspection to six records, stops cycles and never invokes accessors", () => {
+    const cause = new V2SupervisorError("private", "timeout", undefined, "challenge");
+    let boundary: unknown = cause;
+    for (let index = 0; index < 5; index++) boundary = new Error("private", { cause: boundary });
+    expect(bootstrapCleanupFailureDiagnostic(boundary).supervisorPhase).toBe("challenge");
+    expect(bootstrapCleanupFailureDiagnostic(new Error("private", { cause: boundary })).supervisorPhase).toBeUndefined();
+    const cyclic: Record<string, unknown> = { name: "V2SupervisorError", phase: "bootstrap" };
+    cyclic.cause = cyclic;
+    expect(bootstrapCleanupFailureDiagnostic(cyclic).supervisorPhase).toBe("bootstrap");
+    const getters: Record<string, unknown> = {};
+    let calls = 0;
+    for (const key of ["name", "cause", "kind", "phase", "remoteCode", "reason", "message", "status", "code", "committed", "ambiguous"]) {
+      Object.defineProperty(getters, key, { get: () => { calls++; throw new Error("must not execute"); } });
+    }
+    expect(bootstrapCleanupFailureDiagnostic(getters)).toEqual({ errorName: "Error" });
+    expect(calls).toBe(0);
+    expect(bootstrapCleanupFailureDiagnostic(new Proxy({}, {
+      getOwnPropertyDescriptor: () => { throw new Error("private descriptor failure"); },
+    }))).toEqual({ errorName: "Error" });
+  });
+
+  it("accepts only exact cleanup bootstrap atoms and ignores unrelated error payloads", () => {
+    const diagnostic = bootstrapCleanupFailureDiagnostic({ name: "V2SupervisorBootstrapError", kind: "deploy\n",
+      remoteCode: "bootstrap_cleanup_unproven/private", reason: "CHALLENGE", message: "PRIVATE_CLEANUP_CANARY",
+      cause: { name: "V2SupervisorError", phase: "challenge\n", error: { name: "V2SupervisorError", phase: "command" } },
+    });
+    expect(diagnostic.errorName).toBe("V2SupervisorError");
+    expect(diagnostic.bootstrapPhase).toBeUndefined();
+    expect(diagnostic.bootstrapCode).toBeUndefined();
+    expect(diagnostic.bootstrapReason).toBeUndefined();
+    expect(diagnostic.supervisorPhase).toBeUndefined();
+    expect(bootstrapCleanupFailureDiagnostic({ name: "PRIVATE_CLEANUP_CANARY" }).errorName).toBe("Error");
+    expect(bootstrapCleanupFailureDiagnostic({ name: "Error", remoteCode: "bootstrap_cleanup_unproven", reason: "bootstrap", phase: "command" }))
+      .toEqual({ errorName: "Error" });
+  });
+
   it("retains only fixed recovery reasons and synchronization outcomes", () => {
     for (const reason of BOOTSTRAP_FAILURE_REASONS) {
       const inner = new V2SupervisorBootstrapError("private detail", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason });
@@ -158,7 +221,7 @@ describe("recovery observability schema", () => {
     }
   });
 
-  it("accepts the fixed fleet replacement and startup-permit vocabulary", () => {
+  it("accepts the fixed fleet replacement, startup-permit, and cleanup vocabulary", () => {
     const shared = {
       project_id: PROJECT_ID,
       worker_index: 3,
@@ -179,8 +242,14 @@ describe("recovery observability schema", () => {
       cold_queued: 1,
     };
     for (const eventName of FLEET_LIFECYCLE_EVENT_NAMES) {
+      const fields = eventName.startsWith("fleet.bootstrap_cleanup.") ? {
+        project_id: PROJECT_ID,
+        worker_index: 3,
+        leader_generation: 7,
+        ...(eventName === "fleet.bootstrap_cleanup.deferred" ? { cleanup_reason: "proof_unavailable" as const } : {}),
+      } : shared;
       expect(() => assertSafeObservabilityEvent(
-        fleetLifecycleObservabilityEvent(eventName, shared),
+        fleetLifecycleObservabilityEvent(eventName, fields),
       )).not.toThrow();
     }
   });

@@ -3,6 +3,7 @@ import {
   DIRECT_SUPERVISOR_EXEC_RESPONSE_BYTES,
   directSupervisorExecBody,
   parseDirectSupervisorExecStarted,
+  validateDirectSupervisorExecAcceptance,
 } from "../src/prism/direct-exec";
 import { SandboxGateway } from "../src/sandbox/gateway";
 import { parseProvisionedSandbox } from "../src/prism/protocol";
@@ -40,6 +41,18 @@ describe("Prism direct supervisor execution protocol", () => {
       { ...ack(), direct_mode_active: false }, { ...ack(), effective_model: "other" },
       { ...ack(), job_id: "" }, { ...ack(), job_id: "job\n" }, { ...ack(), job_id: "x".repeat(257) },
     ]) expect(() => parseDirectSupervisorExecStarted(value, SESSION)).toThrow();
+  });
+
+  it("validates an immutable private acceptance projection without extra fields", () => {
+    const input = { sessionId: SESSION, workspaceRoot: `/codex_workspace/${SESSION}`, jobId: "job-1" };
+    const accepted = validateDirectSupervisorExecAcceptance(input, SESSION);
+    input.jobId = "changed";
+    expect(accepted.jobId).toBe("job-1");
+    expect(Object.isFrozen(accepted)).toBe(true);
+    for (const value of [null, {}, { ...accepted, sessionId: OTHER }, { ...accepted, workspaceRoot: `/codex_workspace/${OTHER}` },
+      { ...accepted, workspaceRoot: `${accepted.workspaceRoot}/extra` }, { ...accepted, workspaceRoot: `${accepted.workspaceRoot}\n` },
+      { ...accepted, jobId: "" }, { ...accepted, jobId: "j".repeat(257) }, { ...accepted, jobId: "job\n" },
+      { ...accepted, runnerPid: 12 }]) expect(() => validateDirectSupervisorExecAcceptance(value, SESSION)).toThrow();
   });
 });
 

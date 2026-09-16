@@ -51,7 +51,8 @@ import {
   HostRequestDiagnosticsObserver,
   type VersionedHostTransportDiagnostics,
 } from "../diagnostics/host-observer";
-import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../diagnostics/types";
+import type { V2EnvelopeDiagnostics } from "../diagnostics/types";
+import { V2_RECEIVE_EVIDENCE_MAX_AGE_MS, type V2HostTransportDiagnostics } from "../diagnostics/host-types";
 import {
   MAX_TRANSCRIPT_CHUNK_BYTES,
   TranscriptProof,
@@ -63,7 +64,7 @@ import {
   InboundFrameCursor,
   OutboundFrameWindow,
 } from "../protocol/window";
-import { TransportCongestion } from "./congestion";
+import { ProgressAwareCongestion as TransportCongestion } from "./progress-congestion";
 import {
   V2CommittedError,
   V2PreCommitError,
@@ -99,7 +100,7 @@ export const V2_LATENCY_CRITICAL_REQUEST_BYTES = 256 * 1024;
 const MAX_PRECOMMIT_EXECUTION_RESERVATIONS = 4;
 const MAX_BULK_BODY_PREFETCH_RESERVATIONS = 6;
 const ACCELERATION_RECOVERY_CLEAN_FLIGHTS = 2;
-const DEFAULT_TRANSPORT_STALL_MS = 2_000;
+const DEFAULT_TRANSPORT_STALL_MS = 60_000;
 const GOODPUT_IDLE_RESET_MS = 60_000;
 // Keep sub-MiB interactive requests on the original single-turn fast path;
 // larger canonicalization yields often enough to bound host event-loop stalls.
@@ -665,6 +666,8 @@ export interface V2TransportSnapshot {
   preparing?: number;
   /** Body-only R2 reservations waiting behind the four-start safety gate. */
   prefetched?: number;
+  /** Pre-execution cancellations retaining one credit until their reliable ACK. */
+  retainedPrecommitCancellations?: number;
   queued: number;
   quarantined: number;
   ambiguousQuarantined?: number;
@@ -680,7 +683,7 @@ export interface V2TransportSnapshot {
   awarenessRttMs: number | null;
   /** Age of the newest valid envelope from the bootstrap-bound sidecar instance. */
   sidecarPeerAgeMs?: number | null;
-  diagnostics?: { host: V2TransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
+  diagnostics?: { host: V2HostTransportDiagnostics; sidecar: V2EnvelopeDiagnostics | null };
 }
 
 export type V2AdmissionBlockReason =
@@ -763,7 +766,7 @@ export interface V2TransportSessionOptions {
   eventMemoryPool?: AtomicBytePermitPool;
   /** Coalesced notification when admission or transport-health state changes. */
   onStateChange?(): void;
-  /** Deterministic tests may shorten the production two-second stall fence. */
+  /** Deterministic tests may shorten the production sixty-second stall fence. */
   transportStallMs?: number;
 }
 
@@ -959,10 +962,11 @@ function abortError(message: string): DOMException {
   return new DOMException(message, "AbortError");
 }
 
-function preCommitCancellationError(): V2PreCommitError {
+function preCommitCancellationError(transportSettlement?: Promise<void>): V2PreCommitError {
   return new V2PreCommitError(
     "V2 request was cancelled before provider execution",
     "cancelled_precommit",
+    transportSettlement ? { transportSettlement } : undefined,
   );
 }
 
@@ -1108,6 +1112,7 @@ export class V2TransportSession {
   readonly #transportStallMs: number;
   readonly #fastRetransmitFloorMs: number;
   #hostCeiling: number;
+  #lastPublishedHostCreditCeiling: number | null = null;
   readonly #rotationTimeoutMs: number;
   readonly #unadmittedTimeoutMs: number;
   readonly #preparationTimeoutMs: number;
@@ -1117,6 +1122,8 @@ export class V2TransportSession {
   readonly #outbound: OutboundFrameWindow<HostFrame>;
   readonly #inbound: InboundFrameCursor<SidecarFrame>;
   #processedInboundAck = { epoch: 1, sequence: -1 };
+  #lastInboundAcceptedAtMs: number | null = null;
+  #lastInboundProcessedAtMs: number | null = null;
   readonly #scheduler = new WeightedFrameScheduler<HostFrame>();
   readonly #delivery: ReliableDeliveryTiming;
   readonly #flight = new AckClockedFlight({ epoch: 1 });
@@ -1138,6 +1145,14 @@ export class V2TransportSession {
   readonly #idleWaiters = new Set<() => void>();
   readonly #retiredSidecarInstances = new Set<string>();
   readonly #terminalReceipts = new Map<string, TerminalReceipt>();
+  // Transfers an existing credit reservation; never retains request content.
+  // The six-slot precommit admission ceiling bounds this map independently of
+  // the reliable scheduler/window. A null cursor means cancellation is queued.
+  readonly #retainedPrecommitCancellations = new Map<string, {
+    cursor: { epoch: number; sequence: number } | null;
+    readonly settlement: Promise<void>;
+    readonly resolveSettlement: () => void;
+  }>();
   readonly #terminalReceiptCoalescing: boolean;
   // Shares the receipt registry's count bound; never holds response content.
   readonly #deferredTerminalReceipts = new Set<string>();
@@ -1187,6 +1202,8 @@ export class V2TransportSession {
     control: -1,
   };
   #lastValidPeerAtMs: number | null = null;
+  readonly #lastValidPeerAtMsByLane: Record<AwarenessLane, number | null> = { data: null, control: null };
+  readonly #awarenessReconnects = new Map<AwarenessLane, Promise<void>>();
   #lastLivenessSentAtMs = -1;
   #livenessProbe: LivenessProbe | null = null;
   #remoteCredits = 0;
@@ -1205,6 +1222,10 @@ export class V2TransportSession {
   #drainFrameQueued = false;
   #remoteDrained = false;
   #sidecarDiagnostics: V2EnvelopeDiagnostics | null = null;
+  #sidecarDiagnosticsPublication = -1;
+  #lastSidecarDiagnosticsAtMs: number | null = null;
+  #sidecarPendingSinceAtMs: number | null = null;
+  #sidecarPendingDataPublicationsBaseline = 0;
   #publications = 0;
   #pacedPublications = 0;
   #urgentPublications = 0;
@@ -1232,7 +1253,7 @@ export class V2TransportSession {
   #goodputUpdatedAtMs: number | null = null;
   #uniqueAcknowledgedBytes = 0;
   #retransmittedBytes = 0;
-  #lastFastRetransmitAtMs: number | null = null;
+  #lastRetransmitAtMs: number | null = null;
   #stallTimerDueAtMs: number | null = null;
 
   constructor(options: V2TransportSessionOptions) {
@@ -1381,6 +1402,97 @@ export class V2TransportSession {
       );
     }
     this.#pacer.flushNow("urgent");
+  }
+
+  reconnectAwareness(lane: AwarenessLane, signal?: AbortSignal): Promise<void> {
+    if (lane !== "data" && lane !== "control") return Promise.reject(new TypeError("Unknown Awareness lane"));
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    const existing = this.#awarenessReconnects.get(lane);
+    if (existing) return existing;
+    const reconnecting = this.#performAwarenessReconnect(lane, signal).finally(() => {
+      if (this.#awarenessReconnects.get(lane) === reconnecting) this.#awarenessReconnects.delete(lane);
+    });
+    this.#awarenessReconnects.set(lane, reconnecting);
+    return reconnecting;
+  }
+
+  async #performAwarenessReconnect(lane: AwarenessLane, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw abortError("V2 Awareness reconnect aborted");
+    if (this.#closed || this.#draining || this.#protocolFailed || !this.#connected || !this.#channel.reconnect) {
+      throw new V2TransportLivenessError("V2 transport cannot explicitly reconnect this Awareness lane", "unavailable");
+    }
+    const lifecycleEpoch = this.#lifecycleEpoch;
+    const priorWindow = this.#outbound.snapshot();
+    const priorSequence = lane === "data" ? priorWindow.frames[0]?.sequence : undefined;
+    const priorInbound = this.#inbound.ack();
+    const priorSidecarCompletions = this.#sidecarDiagnostics?.transport.flightCompletionsTotal ?? 0;
+    const needsReceiveProof = this.#sidecarPendingSinceAtMs !== null &&
+      this.#lastSidecarDiagnosticsAtMs !== null &&
+      this.#clock.now() - this.#lastSidecarDiagnosticsAtMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS;
+    await this.#channel.reconnect(lane, signal);
+    if (signal?.aborted) throw abortError("V2 Awareness reconnect aborted");
+    if (!this.#ownsLifecycle(lifecycleEpoch) || this.#draining) {
+      throw new V2TransportLivenessError("V2 transport changed during Awareness reconnect", "unavailable");
+    }
+    // The existing window, sequence numbers, request states and provider IDs
+    // are untouched. Republish current control; reliable retransmission keeps
+    // its original immutable flight and processing/ACK fence.
+    this.#pacer.flushNow("urgent");
+    if (priorSequence !== undefined || needsReceiveProof) {
+      await this.#waitForReconnectProgress(lifecycleEpoch, priorWindow.epoch, priorSequence,
+        needsReceiveProof ? { ...priorInbound, sidecarCompletions: priorSidecarCompletions } : undefined, signal);
+    }
+  }
+
+  #waitForReconnectProgress(
+    lifecycleEpoch: number, epoch: number, sequence: number | undefined,
+    receive: { epoch: number; sequence: number; sidecarCompletions: number } | undefined,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      let poll: ReturnType<typeof setTimeout> | null = null;
+      let settled = false;
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        if (poll) clearTimeout(poll);
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        error === undefined ? resolve() : reject(error);
+      };
+      const onAbort = () => finish(signal?.reason ?? abortError("Awareness reconnect aborted"));
+      const timeout = setTimeout(() => finish(new V2TransportLivenessError(
+        "Reconnected data lane did not advance its retained reliable work", "timeout",
+      )), this.#livenessTimeoutMs);
+      const check = () => {
+        const current = this.#outbound.snapshot();
+        if (!this.#ownsLifecycle(lifecycleEpoch) || current.epoch !== epoch) {
+          finish(new V2TransportLivenessError("Transport changed during data-lane proof", "unavailable"));
+        } else if (sequence !== undefined && !current.frames.some(frame => frame.sequence === sequence)) {
+          // Only a validated cumulative ACK removes an existing window frame.
+          finish();
+        } else if (receive && this.#receiveProgressed(receive)) {
+          finish();
+        } else {
+          poll = setTimeout(check, 25);
+        }
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      else check();
+    });
+  }
+
+  #receiveProgressed(previous: { epoch: number; sequence: number; sidecarCompletions: number }): boolean {
+    const accepted = this.#inbound.ack();
+    if (accepted.epoch !== previous.epoch) return false;
+    if (accepted.sequence > previous.sequence) return true;
+    // A retained flight may already be fully processed locally. A fresh peer
+    // completion then proves that replaying its cumulative ACK repaired loss.
+    return this.#lastSidecarDiagnosticsAtMs !== null &&
+      this.#clock.now() - this.#lastSidecarDiagnosticsAtMs <= V2_RECEIVE_EVIDENCE_MAX_AGE_MS &&
+      (this.#sidecarDiagnostics?.transport.flightCompletionsTotal ?? 0) > previous.sidecarCompletions;
   }
 
   /**
@@ -1886,6 +1998,7 @@ export class V2TransportSession {
       this.#detachStateForRecovery(state);
       payload.states.push(state);
     }
+    this.#clearRetainedPrecommitCancellations();
     this.#creditReservations = 0;
     this.#transferReservations = 0;
     this.#startReservations = 0;
@@ -1922,6 +2035,11 @@ export class V2TransportSession {
     this.#inboundFrameBarrier = Promise.resolve();
     this.#dataDirty = false;
     this.#sidecarDiagnostics = null;
+    this.#sidecarDiagnosticsPublication = -1;
+    this.#lastSidecarDiagnosticsAtMs = null;
+    this.#sidecarPendingSinceAtMs = null;
+    this.#lastInboundAcceptedAtMs = null;
+    this.#lastInboundProcessedAtMs = null;
 
     this.#closed = true;
     SIDECAR_RECOVERY_CAPSULES.set(token, payload);
@@ -2086,9 +2204,14 @@ export class V2TransportSession {
           true,
         ));
       } else {
+        if (published && !this.#retainPrecommitCancellation(state)) continue;
+        const transportSettlement = this.#retainedPrecommitSettlement(state.requestId);
         this.#failPreCommit(state, new V2PreCommitError(
           "V2 request stopped before execution during sandbox recovery",
           "sandbox_recovery",
+          transportSettlement
+            ? { transportSettlement }
+            : undefined,
         ));
       }
       if (published) {
@@ -2323,6 +2446,7 @@ export class V2TransportSession {
       }
       this.#scheduler.removeStream("control");
       this.#terminalReceipts.clear();
+      this.#clearRetainedPrecommitCancellations();
       this.#clearOrphanRecoveryCandidates();
       this.#startupRecoveryOwnedRequestIds.clear();
       this.#creditReservations = 0;
@@ -2363,6 +2487,7 @@ export class V2TransportSession {
       active: this.#committedRequestCount + executionReservations,
       preparing: this.#preparations.size,
       prefetched,
+      retainedPrecommitCancellations: this.#retainedPrecommitCancellations.size,
       queued: this.#unadmittedRequestCount + prefetched +
         this.#preparations.size + this.#preparationWaiters.length,
       quarantined: this.#quarantined,
@@ -2543,6 +2668,7 @@ export class V2TransportSession {
       if (
         !this.#requests.has(requestId) &&
         !this.#terminalReceipts.has(requestId) &&
+        !this.#retainedPrecommitCancellations.has(requestId) &&
         !this.#ambiguityTombstones.has(requestId) &&
         !this.#orphanRecoveryCandidates.has(requestId) &&
         !this.#startupRecoveryOwnedRequestIds.has(requestId) &&
@@ -2596,6 +2722,7 @@ export class V2TransportSession {
     if (envelope.revision <= this.#observedPeerRevision[lane]) return;
     this.#observedPeerRevision[lane] = envelope.revision;
     this.#lastValidPeerAtMs = this.#clock.now();
+    this.#lastValidPeerAtMsByLane[lane] = this.#lastValidPeerAtMs;
     if (lane !== "control") return;
 
     const pong = envelope.liveness;
@@ -2795,11 +2922,22 @@ export class V2TransportSession {
       nextSequence++;
       advanced = true;
     }
+    if (advanced) {
+      this.#lastInboundProcessedAtMs = this.#clock.now();
+      this.#sidecarPendingSinceAtMs = null;
+    }
     this.#maybeCompleteSidecarRecovery();
     if (!this.#ownsLifecycle(lifecycleEpoch)) return;
     this.#admitPending();
     const urgency = this.#pump();
-    this.#requestPublication(advanced ? "urgent" : urgency);
+    // The sender cannot extend an immutable flight until its high ACK. Pace
+    // partial processed progress instead of publishing once per async frame;
+    // always release the complete accepted flight immediately. A partial ACK
+    // still escapes on the normal cadence if another consumer is paused.
+    const ackUrgency = advanced
+      ? this.#processedInboundAck.sequence === accepted.sequence ? "urgent" : "paced"
+      : null;
+    this.#requestPublication(strongestUrgency(ackUrgency, urgency));
     this.#armStallWatchdog();
   }
 
@@ -2874,6 +3012,7 @@ export class V2TransportSession {
         }
       }
       const nextEpoch = this.#outbound.snapshot().epoch + 1;
+      this.#clearRetainedPrecommitCancellations();
       this.#outbound.reset(nextEpoch);
       this.#delivery.reset(nextEpoch);
       this.#flight.reset(nextEpoch);
@@ -2906,7 +3045,7 @@ export class V2TransportSession {
     }
     let creditsChanged = false;
     if (lane === "control" || legacy) {
-      this.#sidecarDiagnostics = envelope.diagnostics ?? null;
+      this.#observeSidecarReceiveEvidence(envelope);
       const nextCredits = Math.max(0, Math.min(128, envelope.credits));
       creditsChanged = nextCredits !== this.#remoteCredits;
       this.#remoteCredits = nextCredits;
@@ -2929,10 +3068,10 @@ export class V2TransportSession {
       now,
     );
     if (acknowledgementAdvanced) {
-      this.#lastFastRetransmitAtMs = null;
+      this.#lastRetransmitAtMs = null;
       this.#armRetransmission();
     }
-    const congestionChanged = this.#updateCongestion();
+    const congestionChanged = this.#updateCongestion(acknowledgementAdvanced);
     if (creditsChanged || congestionChanged || goodputChanged) this.#notifyStateChange();
     if (!acknowledgementAdvanced && lane === "control") {
       this.#maybeFastRetransmit(now);
@@ -2966,6 +3105,10 @@ export class V2TransportSession {
         -1,
       );
       delivered = this.#inbound.accept(envelope.frames);
+      if (delivered.length > 0) {
+        this.#lastInboundAcceptedAtMs = now;
+        this.#sidecarPendingSinceAtMs = null;
+      }
       if (
         this.#inbound.ack().epoch !== this.#processedInboundAck.epoch ||
         this.#inbound.ack().sequence - this.#processedInboundAck.sequence >
@@ -4966,6 +5109,21 @@ export class V2TransportSession {
       }
     }
     this.#outbound.acknowledge(cursor);
+    let cancellationCreditReleased = false;
+    for (const [requestId, cancellation] of this.#retainedPrecommitCancellations) {
+      if (
+        cancellation.cursor?.epoch === cursor.epoch &&
+        cancellation.cursor.sequence <= cursor.sequence
+      ) {
+        this.#retainedPrecommitCancellations.delete(requestId);
+        this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+        cancellation.resolveSettlement();
+        cancellationCreditReleased = true;
+      }
+    }
+    // A cancellation-only ACK can restore admission without changing remote
+    // credits, congestion or body goodput. Wake the router's cached capacity.
+    if (cancellationCreditReleased) this.#notifyStateChange();
     // Validate and apply the cumulative ACK before notifying observers. A
     // forged future cursor must never look like transfer progress.
     if (progressed) {
@@ -5200,7 +5358,11 @@ export class V2TransportSession {
 
   #failRequestStaging(state: RequestState, error: V2PreCommitError): void {
     const published = state.published;
-    this.#failPreCommit(state, error);
+    if (published && !this.#closed && !this.#retainPrecommitCancellation(state)) return;
+    const transportSettlement = this.#retainedPrecommitSettlement(state.requestId);
+    this.#failPreCommit(state, transportSettlement
+      ? new V2PreCommitError(error.message, error.code, { transportSettlement })
+      : error);
     if (!published || this.#closed) return;
     try {
       this.#scheduler.enqueue("control", state.requestId, {
@@ -5383,6 +5545,12 @@ export class V2TransportSession {
           receipt.cursor = { epoch: reliable.epoch, sequence: reliable.sequence };
         }
       }
+      if (reliable.kind === "request_cancel") {
+        const cancellation = this.#retainedPrecommitCancellations.get(reliable.requestId);
+        if (cancellation) {
+          cancellation.cursor = { epoch: reliable.epoch, sequence: reliable.sequence };
+        }
+      }
       this.#dataDirty = true;
       urgency = strongestUrgency(urgency, hostFrameUrgency(reliable));
       if ("requestId" in reliable && typeof reliable.requestId === "string") {
@@ -5455,7 +5623,8 @@ export class V2TransportSession {
     if (!value || typeof value !== "object") return false;
     const error = value as { name?: unknown; kind?: unknown };
     return error.name === "AwarenessChannelError" &&
-      (error.kind === "auth" || error.kind === "disconnected");
+      (error.kind === "auth" || error.kind === "disconnected" ||
+        error.kind === "connect" || error.kind === "timeout");
   }
 
   #publishLane(
@@ -5553,12 +5722,83 @@ export class V2TransportSession {
       }
     }
     this.#channel.publish(envelope, lane);
+    if (lane === "control") this.#lastPublishedHostCreditCeiling = envelope.credits;
   }
 
-  #hostTransportDiagnostics(): V2TransportDiagnostics {
+  #observeSidecarReceiveEvidence(envelope: AwarenessEnvelope<SidecarFrame>): void {
+    const diagnostics = envelope.diagnostics;
+    if (!diagnostics) {
+      this.#sidecarDiagnostics = null;
+      this.#lastSidecarDiagnosticsAtMs = null;
+      this.#sidecarPendingSinceAtMs = null;
+      return;
+    }
+    if (envelope.lane !== "control") {
+      this.#sidecarDiagnostics = diagnostics;
+      return;
+    }
+    const publication = diagnostics.transport.publicationsTotal;
+    // Older peers copy diagnostics into fresh pongs. Only an independently
+    // advanced sample can refresh evidence; queued old controls cannot either.
+    if (!Number.isSafeInteger(publication) || publication <= this.#sidecarDiagnosticsPublication ||
+        envelope.revision !== this.#observedPeerRevision.control) return;
+    const sampledAt = this.#lastValidPeerAtMsByLane.control;
+    if (sampledAt === null) return;
+    const accepted = this.#inbound.ack();
+    const locallyDrained = this.#inboundFrameTasks.size === 0 &&
+      accepted.epoch === this.#processedInboundAck.epoch &&
+      accepted.sequence === this.#processedInboundAck.sequence;
+    if (this.#lastSidecarDiagnosticsAtMs === null ||
+        sampledAt - this.#lastSidecarDiagnosticsAtMs > V2_RECEIVE_EVIDENCE_MAX_AGE_MS) {
+      this.#sidecarPendingSinceAtMs = null;
+    }
+    this.#sidecarDiagnostics = diagnostics;
+    this.#sidecarDiagnosticsPublication = publication;
+    this.#lastSidecarDiagnosticsAtMs = sampledAt;
+    if (diagnostics.transport.windowFrames > 0 && locallyDrained) {
+      if (this.#sidecarPendingSinceAtMs === null) {
+        this.#sidecarPendingDataPublicationsBaseline = diagnostics.transport.dataPublicationsTotal;
+      }
+      this.#sidecarPendingSinceAtMs ??= sampledAt;
+    } else {
+      this.#sidecarPendingSinceAtMs = null;
+    }
+  }
+
+  #hostTransportDiagnostics(): V2HostTransportDiagnostics {
     const window = this.#outbound.snapshot();
     const scheduler = this.#scheduler.snapshot();
+    const now = this.#clock.now();
+    const accepted = this.#inbound.ack();
     return {
+      inboundAcceptedEpoch: accepted.epoch,
+      inboundAcceptedSequence: accepted.sequence,
+      inboundProcessedEpoch: this.#processedInboundAck.epoch,
+      inboundProcessedSequence: this.#processedInboundAck.sequence,
+      inboundAcceptedProgressAgeMs: this.#lastInboundAcceptedAtMs === null ? null
+        : Math.max(0, now - this.#lastInboundAcceptedAtMs),
+      inboundProcessedProgressAgeMs: this.#lastInboundProcessedAtMs === null ? null
+        : Math.max(0, now - this.#lastInboundProcessedAtMs),
+      inboundProcessingFrames: this.#inboundFrameTasks.size,
+      sidecarDiagnosticsAgeMs: this.#lastSidecarDiagnosticsAtMs === null ? null
+        : Math.max(0, now - this.#lastSidecarDiagnosticsAtMs),
+      sidecarPendingAgeMs: this.#sidecarPendingSinceAtMs === null ? null
+        : Math.max(0, now - this.#sidecarPendingSinceAtMs),
+      sidecarPendingDataPublications: this.#sidecarPendingSinceAtMs === null ? 0
+        : Math.max(0, (this.#sidecarDiagnostics?.transport.dataPublicationsTotal ?? 0) -
+          this.#sidecarPendingDataPublicationsBaseline),
+      dataPeerAgeMs: this.#lastValidPeerAtMsByLane.data === null ? null
+        : Math.max(0, now - this.#lastValidPeerAtMsByLane.data),
+      controlPeerAgeMs: this.#lastValidPeerAtMsByLane.control === null ? null
+        : Math.max(0, now - this.#lastValidPeerAtMsByLane.control),
+      lastDataRevision: this.#observedPeerRevision.data < 0 ? null : this.#observedPeerRevision.data,
+      lastControlRevision: this.#observedPeerRevision.control < 0 ? null : this.#observedPeerRevision.control,
+      retainedPrecommitCancellations: this.#retainedPrecommitCancellations.size,
+      lastPublishedHostCreditCeiling: this.#lastPublishedHostCreditCeiling,
+      oldestOutstandingFrameKind: window.frames[0]?.kind ?? null,
+      outstandingFlightAgeMs: this.#flight.active && this.#flightStartedAtMs !== null
+        ? Math.max(0, this.#clock.now() - this.#flightStartedAtMs)
+        : null,
       windowFrames: window.frames.length,
       windowBytes: window.encodedBytes,
       schedulerFrames: scheduler.queuedFrames,
@@ -5626,7 +5866,7 @@ export class V2TransportSession {
     this.#currentFlightRetransmitted = false;
     this.#acceleratedFlightsHealthy = true;
     this.#cleanRequestFlightsSinceTrouble = 0;
-    this.#lastFastRetransmitAtMs = null;
+    this.#lastRetransmitAtMs = null;
   }
 
   #markAccelerationTrouble(): void {
@@ -5648,8 +5888,9 @@ export class V2TransportSession {
     this.#cleanRequestFlightsSinceTrouble = 0;
   }
 
-  #updateCongestion(): boolean {
+  #updateCongestion(ackProgressed = false): boolean {
     const before = this.#congestion.congested;
+    const stalledBefore = this.#congestion.stalled;
     const scheduled = this.#scheduler.snapshot();
     const outbound = this.#outbound.snapshot();
     const ackProgressAgeMs = this.#delivery.ackProgressAgeMs(this.#clock.now());
@@ -5659,10 +5900,12 @@ export class V2TransportSession {
       oldestQueuedFrameMs: scheduled.oldestQueuedFrameMs,
       ackProgressAgeMs,
       windowFrames: outbound.frames.length,
+      ackProgressed,
+      roundTripMs: this.#delivery.roundTripEwmaMs,
+      roundTripVariationMs: this.#delivery.roundTripVariationMs,
     });
     if (
-      !before && this.#congestion.congested && outbound.frames.length > 0 &&
-      ackProgressAgeMs >= this.#transportStallMs
+      !stalledBefore && this.#congestion.stalled && outbound.frames.length > 0
     ) {
       this.#stallEvents++;
       this.#markAccelerationTrouble();
@@ -5682,15 +5925,12 @@ export class V2TransportSession {
       return;
     }
     const now = this.#clock.now();
-    const age = Math.max(
-      scheduled.oldestQueuedFrameMs,
-      outbound.frames.length > 0
-        ? this.#delivery.ackProgressAgeMs(now)
-        : 0,
-    );
+    const age = outbound.frames.length > 0
+      ? this.#delivery.ackProgressAgeMs(now)
+      : scheduled.oldestQueuedFrameMs;
     const delay = this.#congestion.congested
       ? Math.max(100, Math.min(500, this.#transportStallMs / 2))
-      : Math.max(1, this.#transportStallMs - age);
+      : Math.max(1, this.#congestion.stallThresholdMs - age);
     const dueAt = now + delay;
     if (
       this.#stallTimer && this.#stallTimerDueAtMs !== null &&
@@ -5720,13 +5960,13 @@ export class V2TransportSession {
     );
     if (this.#delivery.ackProgressAgeMs(now) < threshold) return false;
     if (
-      this.#lastFastRetransmitAtMs !== null &&
-      now - this.#lastFastRetransmitAtMs < Math.max(
+      this.#lastRetransmitAtMs !== null &&
+      now - this.#lastRetransmitAtMs < Math.max(
         this.#fastRetransmitFloorMs,
         (rtt ?? this.#fastRetransmitFloorMs) * 2,
       )
     ) return false;
-    this.#lastFastRetransmitAtMs = now;
+    this.#lastRetransmitAtMs = now;
     this.#currentFlightRetransmitted = true;
     this.#markAccelerationTrouble();
     this.#delivery.retransmitted(now);
@@ -5757,7 +5997,9 @@ export class V2TransportSession {
       if (this.#outbound.snapshot().frames.length === 0) return;
       this.#currentFlightRetransmitted = true;
       this.#markAccelerationTrouble();
-      this.#delivery.retransmitted(this.#clock.now());
+      const now = this.#clock.now();
+      this.#lastRetransmitAtMs = now;
+      this.#delivery.retransmitted(now);
       this.#retransmissions++;
       this.#peakRetransmissionAttempt = Math.max(
         this.#peakRetransmissionAttempt,
@@ -5850,11 +6092,14 @@ export class V2TransportSession {
 
   #abortRequest(state: RequestState): void {
     if (!this.#requests.has(state.requestId)) return;
+    const executionRisk = this.#hasExecutionRisk(state) ||
+      (this.#binding.protocolRevision === "r1" && state.commitStaged);
+    if (!executionRisk && state.published && !this.#retainPrecommitCancellation(state)) return;
+    const transportSettlement = !executionRisk
+      ? this.#retainedPrecommitSettlement(state.requestId)
+      : null;
     this.#scheduler.removeStream(state.requestId);
-    if (
-      this.#hasExecutionRisk(state) ||
-      (this.#binding.protocolRevision === "r1" && state.commitStaged)
-    ) {
+    if (executionRisk) {
       const acknowledged = state.committed;
       // A staged commit cannot be retracted from the cumulative window. The
       // already-scheduled publication may still send it after this callback.
@@ -5877,7 +6122,7 @@ export class V2TransportSession {
       this.#enqueueCancellation(state.requestId, "client aborted");
     } else {
       const published = state.published;
-      const error = preCommitCancellationError();
+      const error = preCommitCancellationError(transportSettlement ?? undefined);
       this.#removeState(state);
       state.rejectRun(error);
       state.handle.cancel(error);
@@ -5900,6 +6145,43 @@ export class V2TransportSession {
       // assembly state while this session falsely remained healthy.
       this.#failProtocol(cause);
     }
+  }
+
+  #retainPrecommitCancellation(state: RequestState): boolean {
+    if (!state.admitted || this.#hasExecutionRisk(state)) return true;
+    if (this.#retainedPrecommitCancellations.has(state.requestId)) return true;
+    if (this.#retainedPrecommitCancellations.size >= MAX_BULK_BODY_PREFETCH_RESERVATIONS) {
+      this.#failProtocol(new Error("Precommit cancellation ownership exceeds admission capacity"));
+      return false;
+    }
+    // An immutable request_commit may still arrive after local cancellation.
+    // Preserve its existing credit until the later request_cancel is processed
+    // and ACKed, or zero-credit control can deadlock that same reliable flight.
+    let resolveSettlement!: () => void;
+    const settlement = new Promise<void>(resolve => { resolveSettlement = resolve; });
+    this.#retainedPrecommitCancellations.set(state.requestId, {
+      cursor: null,
+      settlement,
+      resolveSettlement,
+    });
+    return true;
+  }
+
+  #retainedPrecommitSettlement(requestId: string): Promise<void> | null {
+    return this.#retainedPrecommitCancellations.get(requestId)?.settlement ?? null;
+  }
+
+  #clearRetainedPrecommitCancellations(): void {
+    const retained = [...this.#retainedPrecommitCancellations];
+    for (const [requestId] of retained) {
+      this.#scheduler.removeStream(requestId);
+    }
+    this.#creditReservations = Math.max(
+      0,
+      this.#creditReservations - this.#retainedPrecommitCancellations.size,
+    );
+    this.#retainedPrecommitCancellations.clear();
+    for (const [, cancellation] of retained) cancellation.resolveSettlement();
   }
 
   #failPreCommit(state: RequestState, error: Error): void {
@@ -5970,7 +6252,9 @@ export class V2TransportSession {
     if (pendingIndex >= 0) this.#pending.splice(pendingIndex, 1);
     this.#scheduler.removeStream(state.requestId);
     if (state.admitted && !state.committed) {
-      this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+      if (!this.#retainedPrecommitCancellations.has(state.requestId)) {
+        this.#creditReservations = Math.max(0, this.#creditReservations - 1);
+      }
       this.#transferReservations = Math.max(
         0,
         this.#transferReservations - state.transferCost,

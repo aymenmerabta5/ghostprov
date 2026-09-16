@@ -35,6 +35,7 @@ import {
 
 import { createProviderErrorEnvelope } from "../src/v2/provider-error";
 import { RouterQueueFullError } from "../src/router/router";
+import { requestCancellationMetadata } from "../src/core/cancellation-metadata";
 import { AtomicBytePermitPool } from "../src/v2/memory/atomic-byte-permits";
 import {
   V2CommittedError,
@@ -133,6 +134,28 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("Responses WebSocket server", () => {
+  it("records observed peer close codes without retaining their reason text", async () => {
+    let signal: AbortSignal | undefined;
+    const socket = await startServer(async (_body, options) => {
+      signal = options.signal;
+      const handle = new V2RunHandle({});
+      signal?.addEventListener("abort", () => {
+        handle.fail(new V2CommittedError("Request cancelled", "cancelled", false));
+      }, { once: true });
+      return handle;
+    });
+    socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-terra", input: "question" }));
+    await waitFor(() => signal !== undefined);
+    socket.close(1000, "plain private peer close reason");
+    await waitFor(() => signal?.aborted === true);
+    expect(requestCancellationMetadata(signal)).toEqual({
+      origin: "websocket_remote_close", websocketCloseCode: 1000,
+    });
+    expect(signal?.reason).toBeInstanceOf(DOMException);
+    expect(signal?.reason.name).toBe("AbortError");
+    expect(JSON.stringify(requestCancellationMetadata(signal))).not.toContain("private");
+  });
+
   it("rejects hostile WebSocket Host and Origin before auth or process allocation", async () => {
     const server = createServer((_req, res) => { res.writeHead(404).end(); });
     const budget = new WebSocketProcessBudget({

@@ -64,6 +64,7 @@ implements AwarenessChannel<TLocal, TRemote> {
   #connected = false;
   #everConnected = false;
   #connecting: Promise<void> | null = null;
+  readonly #reconnecting = new Map<AwarenessLane, Promise<void>>();
 
   constructor(options: SplitAwarenessChannelOptions<TLocal, TRemote>) {
     if (options.data.projectId !== options.control.projectId) {
@@ -97,6 +98,7 @@ implements AwarenessChannel<TLocal, TRemote> {
       this.#data.connect(signal),
       this.#control.connect(signal),
     ]).then(() => {
+      if (this.#closed) throw new Error("Split Awareness channel closed during connection");
       this.#connected = true;
       this.#everConnected = true;
     }).catch(async error => {
@@ -108,6 +110,34 @@ implements AwarenessChannel<TLocal, TRemote> {
     });
     this.#connecting = connecting;
     return connecting;
+  }
+
+  reconnect(lane: AwarenessLane, signal?: AbortSignal): Promise<void> {
+    if (lane !== "data" && lane !== "control") return Promise.reject(new TypeError("Unknown Awareness lane"));
+    if (this.#closed) return Promise.reject(new Error("Split Awareness channel is closed"));
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    const pending = this.#reconnecting.get(lane);
+    if (pending) return pending;
+    const selected = lane === "data" ? this.#data : this.#control;
+    if (!selected.reconnect) return Promise.reject(new Error("Awareness lane does not support explicit reconnect"));
+    this.#connected = false;
+    const reconnecting = selected.reconnect(lane, signal).then(async () => {
+      if (this.#closed || signal?.aborted) throw signal?.reason ?? new Error("Split Awareness channel closed during reconnect");
+      // Ordinary connect is idempotent for the other healthy lane. A real
+      // concurrent disconnect there still has to finish its own handshake.
+      const other = lane === "data" ? this.#control : this.#data;
+      await other.connect(signal);
+      if (this.#closed || signal?.aborted) throw signal?.reason ?? new Error("Split Awareness channel closed during reconnect");
+      this.#connected = true;
+      this.#everConnected = true;
+    }).catch(error => {
+      this.#connected = false;
+      throw error;
+    }).finally(() => {
+      if (this.#reconnecting.get(lane) === reconnecting) this.#reconnecting.delete(lane);
+    });
+    this.#reconnecting.set(lane, reconnecting);
+    return reconnecting;
   }
 
   publish(envelope: AwarenessEnvelope<TLocal>, lane: AwarenessLane = "data"): void {

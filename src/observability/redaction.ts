@@ -1,7 +1,13 @@
 import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES, BOOTSTRAP_FAILURE_REASONS } from "../sandbox/types";
+import { HOST_TRANSPORT_FRAME_KINDS } from "../v2/diagnostics/host-types";
+import { REQUEST_FAILURE_KINDS, REQUEST_FAILURE_MESSAGE, REQUEST_FAILURE_NAMES, safeRequestFailureStatus } from "./request-error";
+import { REQUEST_CANCELLATION_ORIGINS } from "../core/cancellation-metadata";
 import {
   CREDENTIAL_REFRESH_OUTCOMES,
   FLEET_LIFECYCLE_EVENT_NAMES,
+  FLEET_BOOTSTRAP_CLEANUP_REASONS,
+  FLEET_BOOTSTRAP_CLEANUP_STAGES,
+  FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES,
   FLEET_MUTATION_BLOCK_REASONS,
   FLEET_MUTATION_OPERATIONS,
   FLEET_REPLACEMENT_FAILURE_KINDS,
@@ -112,6 +118,9 @@ const FLEET_LIFECYCLE_FIELDS = new Set([
   "cold_in_use",
   "cold_queued",
 ]);
+const FLEET_BOOTSTRAP_CLEANUP_FIELDS = new Set([
+  "project_id", "worker_index", "leader_generation",
+]);
 const LIVENESS_FIELDS = new Set([
   "project_id",
   "worker_index",
@@ -134,21 +143,22 @@ const LIVENESS_FIELDS = new Set([
   "supervisor_phase",
 ]);
 const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
-  "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release"]),
+  "server.started": new Set(["port", "transport", "runtimes", "capacity", "pid", "release", "router_queue_timeout_ms", "initial_route_attempt_timeout_ms", "committed_handle_timeout_ms", "prepared_proof_uses_attempt_budget", "desired", "ready", "routable", "held_project_count", "fleet_readiness"]),
   "server.stopping": new Set(["reason", "active", "queued"]),
   "request.accepted": new Set(["trace_id", "source", "model", "service_tier", "reasoning_effort", "stream", "workload_class", "request_bytes", "input_items", "has_previous_response_id", "transfer_admission_cost", "reserved_bytes", "capacity", "active", "available", "queued"]),
   "admission.acquired": new Set(["trace_id", "admission_wait_ms", "reserved_bytes", "reserved_total_bytes", "reservation_capacity_bytes", "memory_paused"]),
   "request.queued": new Set(["trace_id", "queued", "queued_bytes", "client_queue_depth", "queue_class", "active", "available"]),
   "route.selected": new Set(["trace_id", "project_id", "route_ms", "queue_wait_ms", "sandbox_capacity", "sandbox_active", "sandbox_admission_credits", "sandbox_reserved", "sandbox_queued", "sandbox_quarantined", "sandbox_commit_backlog", "sandbox_scheduler_bytes", "sandbox_scheduler_oldest_ms", "sandbox_throughput_bytes_per_sec", "awareness_rtt_ms", "completion_ewma_ms", "recent_failure_rate", "heartbeat_age_ms", "sidecar_peer_age_ms", "credential_expires_in_ms", "memory_pressure", "eligible_candidates", "queue_class", "fair_cost_bytes", "transfer_admission_cost", "fleet_transfer_cost", "fleet_transfer_reserved", "fleet_transfer_budget", "route_attempt", "capacity_reason"]),
-  "route.attempt_expired": new Set(["trace_id", "project_id", "route_attempt", "attempt_ms", "progress_observed", "progress_age_ms", "progress_stage", "progress_acknowledged_encoded_bytes", "progress_total_encoded_bytes", "deadline_exhausted", "capacity_reason", "transfer_admission_cost"]),
+  "route.attempt_expired": new Set(["trace_id", "project_id", "route_attempt", "attempt_ms", "progress_observed", "progress_observer_enabled", "progress_age_ms", "progress_stage", "progress_acknowledged_encoded_bytes", "progress_total_encoded_bytes", "deadline_exhausted", "remaining_admission_ms", "fallback_peer_available", "capacity_reason", "transfer_admission_cost"]),
   "transport.committed": new Set(["trace_id", "project_id", "transport", "queue_wait_ms", "commit_ack_ms", "retry_count", "request_decoded_bytes", "request_encoded_bytes", "request_part_count", "request_encoding", "request_compression_ratio", "host_prepare_ms", "host_scheduler_wait_ms", "host_publish_to_ack_ms", "sidecar_first_frame_to_commit_ms", "sidecar_commit_to_assembly_ms", "sidecar_claim_sync_ms", "sidecar_admission_wait_ms", "sidecar_prepared_to_fetch_start_ms", "sidecar_fetch_start_sync_ms", "sidecar_commit_processing_ms", "transport_commit_residual_ms"]),
   "response.first_event": new Set(["trace_id", "project_id", "first_event_ms", "post_commit_first_event_ms", "upstream_first_event_ms", "sidecar_scheduler_ms", "host_ack_to_first_frame_ms", "host_assembly_to_delivery_ms"]),
   "request.completed": new Set(["trace_id", "project_id", "total_ms", "queue_wait_ms", "commit_ack_ms", "first_event_ms", "first_text_ms", "first_tool_ms", "upstream_total_ms", "response_bytes", "frames", "terminal_status", "retry_count", "slow"]),
-  "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "first_text_ms", "first_tool_ms", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id", "committed", "quarantined", "retry_count"]),
+  "request.failed": new Set(["trace_id", "project_id", "total_ms", "stage", "first_text_ms", "first_tool_ms", "error_name", "error_kind", "status", "error_message", "provider_origin", "upstream_request_id_sha256", "committed", "quarantined", "retry_count", "cancellation_origin", "websocket_close_code"]),
   "request.model_fallback": new Set(["trace_id", "parent_trace_id", "requested_model", "fallback_model", "error_kind", "provider_origin", "retry_count"]),
   "websocket.payload_rejected": new Set(["limit_bytes", "http_fallback_available"]),
   "websocket.http_fallback": new Set(["status", "limit_bytes"]),
-  "fleet.sample": new Set(["capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "held_project_count", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
+  "fleet.sample": new Set(["sample_id", "capacity", "active", "available", "queued", "queued_bytes", "desired", "ready", "routable", "unavailable", "unavailable_projects", "unavailable_projects_truncated", "pending_retirements", "held_project_count", "project_mutation_state", "project_mutation_failures", "project_mutation_retry_ms", "rss_bytes", "heap_bytes", "external_bytes", "array_buffer_bytes", "system_total_bytes", "system_free_bytes", "event_loop_p50_ms", "event_loop_p95_ms", "event_loop_max_ms", "cpu_percent", "resources", "logger", "runtimes", "provisioning_circuit", "traffic", "websocket", "release"]),
+  "fleet.runtime_sample": new Set(["sample_id", "runtime_index", "runtime_count", "runtime"]),
   "monitor.sample": new Set(["poll_ms", "health_status", "sandboxes_status", "capacity", "active", "available", "queued", "resources", "runtimes"]),
   "monitor.error": new Set(["poll_ms", "attempt", "status", "error_name", "error_message", "retry_ms"]),
   "logger.dropped": new Set(["samples", "progress", "terminals", "queued_events", "queued_bytes"]),
@@ -162,6 +172,10 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "fleet.replacement.old_retired": FLEET_LIFECYCLE_FIELDS,
   "fleet.mutation.blocked": FLEET_LIFECYCLE_FIELDS,
   "fleet.startup_permits.changed": FLEET_LIFECYCLE_FIELDS,
+  "fleet.bootstrap_cleanup.started": FLEET_BOOTSTRAP_CLEANUP_FIELDS,
+  "fleet.bootstrap_cleanup.succeeded": FLEET_BOOTSTRAP_CLEANUP_FIELDS,
+  "fleet.bootstrap_cleanup.deferred": new Set([...FLEET_BOOTSTRAP_CLEANUP_FIELDS,
+    "cleanup_reason", "cleanup_stage", "error_name", "bootstrap_phase", "bootstrap_code", "bootstrap_reason", "supervisor_phase"]),
   "sandbox.recovery.started": RECOVERY_FIELDS,
   "sandbox.recovery.retry_scheduled": RECOVERY_FIELDS,
   "sandbox.recovery.completed": RECOVERY_FIELDS,
@@ -205,6 +219,13 @@ const RECOVERY_DURATION_FIELDS = new Set([
   "duration_ms",
 ]);
 const FLEET_LIFECYCLE_ENUM_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  cleanup_reason: new Set(FLEET_BOOTSTRAP_CLEANUP_REASONS),
+  cleanup_stage: new Set(FLEET_BOOTSTRAP_CLEANUP_STAGES),
+  error_name: new Set(FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES),
+  bootstrap_phase: new Set(BOOTSTRAP_FAILURE_PHASES),
+  bootstrap_code: new Set(BOOTSTRAP_FAILURE_CODES),
+  bootstrap_reason: new Set(BOOTSTRAP_FAILURE_REASONS),
+  supervisor_phase: new Set(SANDBOX_SUPERVISOR_PHASES),
   failure_kind: new Set(FLEET_REPLACEMENT_FAILURE_KINDS),
   retirement_reason: new Set(FLEET_RETIREMENT_REASONS),
   mutation_operation: new Set(FLEET_MUTATION_OPERATIONS),
@@ -268,6 +289,7 @@ const ROUTER_NULLABLE_FIELDS = new Set([
 const ROUTER_NUMERIC_FIELDS = new Set([
   ...ROUTER_INTEGER_FIELDS,
   "attempt_ms",
+  "remaining_admission_ms",
   "progress_age_ms",
   "sandbox_scheduler_oldest_ms",
   "sandbox_throughput_bytes_per_sec",
@@ -277,6 +299,9 @@ const RUNTIME_PRIVATE_FIELD_NAMES = new Set([
   "instanceid", "resourcetoken", "ysweettoken", "apikey", "password",
   "accesstoken", "refreshtoken", "sessiontoken",
 ]);
+
+const HOST_TRANSPORT_FRAME_KIND_SET = new Set<string>(HOST_TRANSPORT_FRAME_KINDS);
+const REQUEST_CANCELLATION_ORIGIN_SET = new Set<string>(REQUEST_CANCELLATION_ORIGINS);
 
 function redactCredentialText(value: string): string {
   return value
@@ -382,6 +407,13 @@ function assertSafeRecoveryFields(event: ObservabilityEvent): void {
 }
 
 function assertSafeFleetLifecycleFields(event: ObservabilityEvent): void {
+  if (event.event.startsWith("fleet.bootstrap_cleanup.")) {
+    if (typeof event.project_id !== "string" || event.project_id.length !== 36 ||
+      ![...FLEET_BOOTSTRAP_CLEANUP_FIELDS].every(key => key in event) ||
+      (event.event === "fleet.bootstrap_cleanup.deferred" && !("cleanup_reason" in event))) {
+      throw new TypeError("Fleet bootstrap cleanup identity or reason is missing");
+    }
+  }
   for (const [key, value] of Object.entries(event)) {
     if (COMMON.has(key)) continue;
     if (key === "project_id") {
@@ -544,11 +576,10 @@ function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
     "capacity_reason" in event &&
     !SANDBOX_AVAILABILITY_REASON_SET.has(String(event.capacity_reason))
   ) throw new TypeError("Router observability capacity_reason is invalid");
-  if ("progress_observed" in event && typeof event.progress_observed !== "boolean") {
-    throw new TypeError("Router observability progress_observed is invalid");
-  }
-  if ("deadline_exhausted" in event && typeof event.deadline_exhausted !== "boolean") {
-    throw new TypeError("Router observability deadline_exhausted is invalid");
+  for (const key of ["progress_observed", "deadline_exhausted", "progress_observer_enabled", "fallback_peer_available"]) {
+    if (key in event && typeof event[key] !== "boolean") {
+      throw new TypeError(`Router observability ${key} is invalid`);
+    }
   }
   if (
     "progress_stage" in event && event.progress_stage !== null &&
@@ -582,8 +613,92 @@ function assertSafeRouterTelemetry(event: ObservabilityEvent): void {
   ) throw new TypeError("Router observability transfer_admission_cost is invalid");
 }
 
+function assertSafeHostTransportDiagnostics(runtime: Record<string, JsonValue>): void {
+  const diagnostics = runtime.diagnostics;
+  if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return;
+  const host = diagnostics.host;
+  if (host === undefined || host === null) return;
+  if (typeof host !== "object" || Array.isArray(host)) {
+    throw new TypeError("Host transport diagnostics must be an object");
+  }
+  for (const key of ["retained_precommit_cancellations", "last_published_host_credit_ceiling"] as const) {
+    if (!(key in host)) continue;
+    const value = host[key];
+    if (key === "last_published_host_credit_ceiling" && value === null) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 128) {
+      throw new TypeError(`Host transport diagnostics ${key} is invalid`);
+    }
+  }
+  if ("oldest_outstanding_frame_kind" in host) {
+    const kind = host.oldest_outstanding_frame_kind;
+    if (kind !== null && (typeof kind !== "string" || !HOST_TRANSPORT_FRAME_KIND_SET.has(kind))) {
+      throw new TypeError("Host transport diagnostics oldest_outstanding_frame_kind is invalid");
+    }
+  }
+  for (const key of ["outstanding_flight_age_ms", "data_peer_age_ms", "control_peer_age_ms",
+    "inbound_accepted_progress_age_ms", "inbound_processed_progress_age_ms", "sidecar_diagnostics_age_ms", "sidecar_pending_age_ms"]) {
+    if (!(key in host)) continue;
+    const age = host[key];
+    if (age !== null && (typeof age !== "number" || !Number.isFinite(age) || age < 0 || age > Number.MAX_SAFE_INTEGER)) {
+      throw new TypeError(`Host transport diagnostics ${key} is invalid`);
+    }
+  }
+  for (const key of ["last_data_revision", "last_control_revision", "inbound_accepted_epoch", "inbound_processed_epoch",
+    "inbound_processing_frames", "sidecar_pending_data_publications"]) {
+    if (!(key in host)) continue;
+    const revision = host[key];
+    if (revision !== null && (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0)) {
+      throw new TypeError(`Host transport diagnostics ${key} is invalid`);
+    }
+  }
+  for (const key of ["inbound_accepted_sequence", "inbound_processed_sequence"]) {
+    if (!(key in host)) continue;
+    const sequence = host[key];
+    if (sequence !== null && (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < -1)) {
+      throw new TypeError(`Host transport diagnostics ${key} is invalid`);
+    }
+  }
+}
+
 function assertSafeFleetRelease(event: ObservabilityEvent): void {
+  if (event.event === "fleet.sample" || event.event === "fleet.runtime_sample") {
+    if (("sample_id" in event || event.event === "fleet.runtime_sample") &&
+      (typeof event.sample_id !== "number" || !Number.isSafeInteger(event.sample_id) || event.sample_id < 1)) {
+      throw new TypeError("Fleet sample identity is invalid");
+    }
+  }
+  if (event.event === "fleet.runtime_sample") {
+    if (typeof event.runtime_count !== "number" || !Number.isSafeInteger(event.runtime_count) ||
+      event.runtime_count < 1 || event.runtime_count > 256 ||
+      typeof event.runtime_index !== "number" || !Number.isSafeInteger(event.runtime_index) ||
+      event.runtime_index < 0 || event.runtime_index >= event.runtime_count ||
+      !event.runtime || typeof event.runtime !== "object" || Array.isArray(event.runtime)) {
+      throw new TypeError("Fleet runtime sample boundary is invalid");
+    }
+    assertSafeFleetRuntime(event.runtime);
+    return;
+  }
   if (event.event !== "fleet.sample" && event.event !== "server.started") return;
+  if (event.event === "server.started") {
+    for (const key of ["desired", "ready", "routable", "held_project_count"]) {
+      if (key in event && (typeof event[key] !== "number" || !Number.isSafeInteger(event[key]) || event[key] < 0)) {
+        throw new TypeError("Server startup readiness count is invalid");
+      }
+    }
+    if ("fleet_readiness" in event && event.fleet_readiness !== "ready" && event.fleet_readiness !== "degraded") {
+      throw new TypeError("Server startup fleet readiness is invalid");
+    }
+    for (const key of ["router_queue_timeout_ms", "initial_route_attempt_timeout_ms", "committed_handle_timeout_ms"]) {
+      if (!(key in event)) continue;
+      const value = event[key];
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+        throw new TypeError(`Server startup timing ${key} is invalid`);
+      }
+    }
+    if ("prepared_proof_uses_attempt_budget" in event && typeof event.prepared_proof_uses_attempt_budget !== "boolean") {
+      throw new TypeError("Server startup preparation policy must be boolean");
+    }
+  }
   if ("release" in event && parseSafeV2ReleaseSummary(event.release) === null) {
     throw new TypeError("Fleet release observability is invalid");
   }
@@ -638,8 +753,14 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
   }
   if (!Array.isArray(event.runtimes)) return;
   for (const value of event.runtimes) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    assertSafeFleetRuntime(value);
+  }
+}
+
+function assertSafeFleetRuntime(value: JsonValue): void {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
     const runtime = value as Record<string, JsonValue>;
+    assertSafeHostTransportDiagnostics(runtime);
     if (
       "availability_reason" in runtime &&
       !SANDBOX_AVAILABILITY_REASON_SET.has(String(runtime.availability_reason))
@@ -664,18 +785,17 @@ function assertSafeFleetRelease(event: ObservabilityEvent): void {
     }
     const hasReleaseFields = ["release_revision", "protocol_revision", "build_hash", "schema_hash"]
       .some(key => key in runtime);
-    if (!hasReleaseFields) continue;
+    if (!hasReleaseFields) return;
     const hasRelease = runtime.release_revision !== null ||
       runtime.protocol_revision !== null ||
       runtime.build_hash !== null || runtime.schema_hash !== null;
-    if (!hasRelease) continue;
+    if (!hasRelease) return;
     if (safeV2ReleaseIdentity({
       releaseRevision: runtime.release_revision,
       protocolRevision: runtime.protocol_revision,
       buildHash: runtime.build_hash,
       schemaHash: runtime.schema_hash,
     }) === null) throw new TypeError("Fleet runtime release identity is invalid");
-  }
 }
 
 export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
@@ -693,6 +813,27 @@ export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
   }
   if (containsCredential(event)) {
     throw new TypeError("Observability event contains credential-shaped data");
+  }
+  if (event.event === "request.failed") {
+    if ("cancellation_origin" in event && (
+      typeof event.cancellation_origin !== "string" || !REQUEST_CANCELLATION_ORIGIN_SET.has(event.cancellation_origin) ||
+      (event.error_name !== "AbortError" && event.error_kind !== "cancelled" && event.error_kind !== "cancelled_precommit")
+    )) throw new TypeError("Request failure cancellation origin is invalid");
+    if ("websocket_close_code" in event && (
+      !("cancellation_origin" in event) || typeof event.websocket_close_code !== "number" ||
+      !Number.isInteger(event.websocket_close_code) || event.websocket_close_code < 1000 || event.websocket_close_code > 4999
+    )) throw new TypeError("Request failure WebSocket close code is invalid");
+    if (("error_name" in event && (typeof event.error_name !== "string" || !REQUEST_FAILURE_NAMES.has(event.error_name))) ||
+      ("error_kind" in event && event.error_kind !== null && (typeof event.error_kind !== "string" || !REQUEST_FAILURE_KINDS.has(event.error_kind))) ||
+      ("error_message" in event && event.error_message !== REQUEST_FAILURE_MESSAGE) ||
+      ("status" in event && event.status !== null && safeRequestFailureStatus(event.status) === null) ||
+      ("provider_origin" in event && event.provider_origin !== "http" && event.provider_origin !== "sse") ||
+      ("upstream_request_id_sha256" in event && (typeof event.upstream_request_id_sha256 !== "string" || !/^[a-f0-9]{64}$(?![\s\S])/.test(event.upstream_request_id_sha256)))) {
+      throw new TypeError("Request failure telemetry contains an unrecognized category");
+    }
+    for (const key of ["committed", "quarantined"]) {
+      if (key in event && typeof event[key] !== "boolean") throw new TypeError("Request failure state must be boolean");
+    }
   }
   if (event.event === "request.model_fallback") assertSafeModelFallbackFields(event);
   if (event.event === "websocket.payload_rejected" || event.event === "websocket.http_fallback") {

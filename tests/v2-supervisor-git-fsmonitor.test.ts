@@ -198,6 +198,8 @@ describe("Git fsmonitor supervisor integration", () => {
       expect(f.hosts).toHaveLength(1);
       expect(f.hosts[0]!.connects).toBe(1);
       expect(f.supervisor.instanceId).toBe(f.hosts[0]!.instanceId);
+      expect(f.supervisor.diagnosticExecutions()).toMatchObject([{ dispatchState: "may_have_started", durableAcceptance: false }]);
+      expect(f.supervisor.diagnosticExecutions()[0]?.commandAcceptance).toBeUndefined();
       expect(f.files.get("/home/sandbox/.gitconfig")).toBe("original\n");
       expect(f.staged.has("exec")).toBe(false);
       expect(f.staged.has(".ghostprov-v2/supervisor/bootstrap.enc.json")).toBe(false);

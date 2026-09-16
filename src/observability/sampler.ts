@@ -8,6 +8,7 @@ import { observabilityEvent, type JsonValue } from "./events";
 import type { LoggerLike } from "./logger";
 import type { WebSocketTelemetrySnapshot } from "../ws/telemetry";
 import type { V2EnvelopeDiagnostics, V2TransportDiagnostics } from "../v2/diagnostics/types";
+import type { V2HostTransportDiagnostics } from "../v2/diagnostics/host-types";
 import type { FleetRecoverySnapshot } from "../prism/recovery-coordinator";
 import type { AtomicBytePermitPoolSnapshot } from "../v2/memory/atomic-byte-permits";
 import {
@@ -23,7 +24,7 @@ function ratio(numerator: number, denominator: number): number {
   return denominator > 0 ? Math.round((numerator / denominator) * 1_000) / 1_000 : 0;
 }
 
-function transportJson(value: V2TransportDiagnostics): JsonValue {
+function transportJson(value: V2TransportDiagnostics): { [key: string]: JsonValue } {
   return {
     window_frames: value.windowFrames,
     window_bytes: value.windowBytes,
@@ -73,6 +74,31 @@ function transportJson(value: V2TransportDiagnostics): JsonValue {
     ),
   };
 }
+
+function hostTransportJson(value: V2HostTransportDiagnostics): JsonValue {
+  return {
+    ...transportJson(value),
+    retained_precommit_cancellations: value.retainedPrecommitCancellations ?? 0,
+    last_published_host_credit_ceiling: value.lastPublishedHostCreditCeiling ?? null,
+    oldest_outstanding_frame_kind: value.oldestOutstandingFrameKind ?? null,
+    outstanding_flight_age_ms: value.outstandingFlightAgeMs ?? null,
+    data_peer_age_ms: value.dataPeerAgeMs ?? null,
+    control_peer_age_ms: value.controlPeerAgeMs ?? null,
+    last_data_revision: value.lastDataRevision ?? null,
+    last_control_revision: value.lastControlRevision ?? null,
+    inbound_accepted_epoch: value.inboundAcceptedEpoch ?? null,
+    inbound_accepted_sequence: value.inboundAcceptedSequence ?? null,
+    inbound_processed_epoch: value.inboundProcessedEpoch ?? null,
+    inbound_processed_sequence: value.inboundProcessedSequence ?? null,
+    inbound_accepted_progress_age_ms: value.inboundAcceptedProgressAgeMs ?? null,
+    inbound_processed_progress_age_ms: value.inboundProcessedProgressAgeMs ?? null,
+    inbound_processing_frames: value.inboundProcessingFrames ?? null,
+    sidecar_diagnostics_age_ms: value.sidecarDiagnosticsAgeMs ?? null,
+    sidecar_pending_age_ms: value.sidecarPendingAgeMs ?? null,
+    sidecar_pending_data_publications: value.sidecarPendingDataPublications ?? null,
+  };
+}
+
 function sidecarJson(value: V2EnvelopeDiagnostics | null): JsonValue {
   if (!value) return null;
   const resource = value.resource;
@@ -213,6 +239,7 @@ export class FleetSampler {
   #timer: ReturnType<typeof setInterval> | null = null;
   #sampling = false;
   #closed = false;
+  #sampleId = 0;
 
   constructor(options: FleetSamplerOptions) {
     if (!Number.isFinite(options.intervalMs) || options.intervalMs < 100) {
@@ -249,6 +276,8 @@ export class FleetSampler {
     this.#sampling = true;
     try {
       const now = this.#clock.now();
+      this.#sampleId = this.#sampleId === Number.MAX_SAFE_INTEGER ? 1 : this.#sampleId + 1;
+      const sampleId = this.#sampleId;
       const elapsedMs = Math.max(0, now - this.#lastSampleAtMs);
       const cpu = this.#cpuUsage(this.#lastCpu);
       this.#lastCpu = this.#cpuUsage();
@@ -307,7 +336,7 @@ export class FleetSampler {
           })()
           : null,
       };
-      const runtimes: JsonValue = router.runtimes.map(runtime => {
+      const runtimeDetails = router.runtimes.map(runtime => {
         const release = safeV2ReleaseIdentity(runtime);
         return {
         project_id: runtime.projectId,
@@ -347,7 +376,7 @@ export class FleetSampler {
           .slice(0, 16)
           .map(([model, value]) => rateLimitObservationJson(model, value)),
         diagnostics: runtime.diagnostics ? {
-          host: transportJson(runtime.diagnostics.host),
+          host: hostTransportJson(runtime.diagnostics.host),
           sidecar: sidecarJson(runtime.diagnostics.sidecar),
         } : null,
       };
@@ -357,7 +386,20 @@ export class FleetSampler {
       const fleet = this.#fleetSnapshot?.();
       const unavailableProjects = (fleet?.unavailableProjects ?? [])
         .slice(0, MAX_UNAVAILABLE_PROJECT_SAMPLES);
+      // Each detailed runtime owns a separate bounded record. A full supported
+      // fleet must not make the aggregate exceed the logger's event ceiling.
+      // Emit details first: sample eviction under pressure then preserves the
+      // newest aggregate instead of a fragment of its runtime details.
+      for (let index = 0; index < runtimeDetails.length; index++) {
+        this.#logger.emit(observabilityEvent("fleet.runtime_sample", {
+          sample_id: sampleId,
+          runtime_index: index,
+          runtime_count: runtimeDetails.length,
+          runtime: runtimeDetails[index]!,
+        }, now), "sample");
+      }
       this.#logger.emit(observabilityEvent("fleet.sample", {
+        sample_id: sampleId,
         capacity: router.capacity,
         active: router.active,
         available: router.available,
@@ -387,7 +429,17 @@ export class FleetSampler {
         cpu_percent: rounded(cpuPercent),
         resources,
         logger: this.#logger.snapshot() as unknown as JsonValue,
-        runtimes,
+        runtimes: runtimeDetails.map(runtime => ({
+          project_id: runtime.project_id,
+          state: runtime.state,
+          capacity: runtime.capacity,
+          active: runtime.active,
+          available: runtime.available,
+          availability_reason: runtime.availability_reason,
+          quarantined: runtime.quarantined,
+          ambiguous_quarantined: runtime.ambiguous_quarantined,
+          queue_depth: runtime.queue_depth,
+        })),
         provisioning_circuit: circuit ? {
           state: circuit.state,
           scope: circuit.scope,
@@ -401,7 +453,7 @@ export class FleetSampler {
         traffic: traffic ? trafficJson(traffic, this.#intervalMs) : null,
         websocket: this.#webSocketSnapshot?.() as unknown as JsonValue ?? null,
         release: summarizeV2Releases(router.runtimes) as unknown as JsonValue,
-      }), "sample");
+      }, now), "sample");
       this.#eventLoop.reset();
     } finally {
       this.#sampling = false;

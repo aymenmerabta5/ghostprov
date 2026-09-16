@@ -1,5 +1,7 @@
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
+import { withLocalAwarenessPublisher } from "../../src/v2/awareness/local-publisher.ts";
+import { awarenessSocketTarget } from "../../src/v2/awareness/socket-target.ts";
 import type { BootstrapBinding, BootstrapCredentialPayload } from "../../src/v2/bootstrap/crypto.ts";
 import { protocolBindingFromBootstrap } from "../../src/v2/bootstrap/binding.ts";
 import { SidecarCredentialRotator } from "../../src/v2/bootstrap/rotation.ts";
@@ -52,23 +54,24 @@ export interface DenoSupervisorPeerOptions {
 function defaultProviderFactory(
   credential: () => BootstrapCredentialPayload,
 ): (doc: Y.Doc) => SupervisorAwarenessProviderLike {
+  const { url: initialUrl, docId: expectedDocId } = credential();
   class AuthenticatedWebSocket extends WebSocket {
-    constructor(url: string | URL, protocols?: string | string[]) {
-      const target = new URL(String(url));
-      target.searchParams.set("token", credential().token);
+    constructor(_url: string | URL, protocols?: string | string[]) {
+      const { url, docId, token } = credential();
+      const target = awarenessSocketTarget({ url, docId, token }, expectedDocId);
       super(target, protocols);
     }
   }
-  return doc => new WebsocketProvider(
-    credential().url,
-    credential().docId,
+  return doc => withLocalAwarenessPublisher(new WebsocketProvider(
+    initialUrl,
+    expectedDocId,
     doc,
     {
       connect: false,
       disableBc: true,
       WebSocketPolyfill: AuthenticatedWebSocket as any,
     } as any,
-  ) as unknown as SupervisorAwarenessProviderLike;
+  )) as unknown as SupervisorAwarenessProviderLike;
 }
 
 export function createR10SupervisorProvider(

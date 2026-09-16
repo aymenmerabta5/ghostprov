@@ -37,6 +37,15 @@ export class FleetManifestError extends Error {
 const SHA256 = /^[a-f0-9]{64}$/;
 export const MAX_MANIFEST_WORKERS = 128;
 
+/** Compare the complete persisted record, including its hold generation and timestamp. */
+export function sameFleetWorkerRecord(left: Readonly<FleetWorkerRecord>, right: Readonly<FleetWorkerRecord>): boolean {
+  return left.index === right.index && left.projectId === right.projectId && left.title === right.title &&
+    left.state === right.state && left.createdAtMs === right.createdAtMs && left.updatedAtMs === right.updatedAtMs &&
+    left.leaderGeneration === right.leaderGeneration && left.hasReachedReady === right.hasReachedReady &&
+    left.managed === right.managed && left.retirementReason === right.retirementReason &&
+    JSON.stringify(left.replacementEvidence) === JSON.stringify(right.replacementEvidence);
+}
+
 export function defaultFleetManifestFile(
   identityFingerprint: string,
   homeDirectory = homedir(),
@@ -468,6 +477,24 @@ export class FleetManifestStore {
       });
       if (!found) throw new FleetManifestError("Managed worker was not found", "missing_worker");
       return { ...current, workers: Object.freeze(workers) };
+    });
+  }
+
+  /** Trusted cleanup composition calls this only after durable, exact supervisor cleanup proof. */
+  completeBootstrapHoldCleanup(expected: Readonly<FleetWorkerRecord>, nowMs: number): Promise<FleetManifest> {
+    const original = parseWorker(expected);
+    if (!original.managed || original.state !== "draining" || original.retirementReason !== "bootstrap_hold" ||
+      !Number.isFinite(nowMs) || nowMs < original.updatedAtMs) {
+      return Promise.reject(new FleetManifestError("Bootstrap cleanup does not match a managed hold", "conflict"));
+    }
+    return this.#mutate(current => {
+      const worker = current.workers.find(value => value.projectId === original.projectId);
+      if (!worker || !sameFleetWorkerRecord(worker, original)) {
+        throw new FleetManifestError("Bootstrap cleanup hold changed before proof was committed", "conflict");
+      }
+      return { ...current, workers: Object.freeze(current.workers.map(value => value === worker
+        ? updatedWorker(value, { retirementReason: "replacement", updatedAtMs: nowMs })
+        : value)) };
     });
   }
 

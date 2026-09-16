@@ -1,6 +1,7 @@
 import type { ObservabilityConfig } from "./config";
 import {
   observabilityEvent,
+  SANDBOX_AVAILABILITY_REASONS,
   type ObservabilityEvent,
   type ObservabilityEventName,
   type ObservabilityPriority,
@@ -8,6 +9,8 @@ import {
 import { assertSafeObservabilityEvent } from "./redaction";
 import { RotatingJsonlSink } from "./rotating-jsonl";
 import { WEBSOCKET_CLOSE_CAUSES } from "../ws/telemetry";
+
+const AVAILABILITY_REASONS = new Set<string>(SANDBOX_AVAILABILITY_REASONS);
 
 export interface ObservabilitySink {
   writeBatch(lines: readonly string[]): Promise<void>;
@@ -102,11 +105,16 @@ export function formatConsoleObservabilityLine(line: string): string {
     const event = record(JSON.parse(trimmed));
     if (!event || event.event !== "fleet.sample") return trimmed;
     const runtimeStates: Record<string, number> = {};
+    const availabilityReasons: Record<string, number> = {};
     if (Array.isArray(event.runtimes)) {
       for (const candidate of event.runtimes) {
         const runtime = record(candidate);
         const state = typeof runtime?.state === "string" ? runtime.state : "unknown";
         runtimeStates[state] = (runtimeStates[state] ?? 0) + 1;
+        const reason = runtime?.availability_reason;
+        if (typeof reason === "string" && AVAILABILITY_REASONS.has(reason)) {
+          availabilityReasons[reason] = (availabilityReasons[reason] ?? 0) + 1;
+        }
       }
     }
     const resources = record(event.resources);
@@ -124,11 +132,13 @@ export function formatConsoleObservabilityLine(line: string): string {
       queued_bytes: event.queued_bytes,
       desired: event.desired,
       ready: event.ready,
+      routable: event.routable,
       unavailable: event.unavailable,
       cpu_percent: event.cpu_percent,
       rss_bytes: event.rss_bytes,
       event_loop_p95_ms: event.event_loop_p95_ms,
       runtime_states: runtimeStates,
+      ...(Object.keys(availabilityReasons).length ? { availability_reasons: availabilityReasons } : {}),
       pressure: resources ? {
         memory_paused: resources.memory_paused,
         governor_queued: resources.governor_queued,
@@ -189,6 +199,9 @@ const CONSOLE_ALWAYS = new Set<ObservabilityEventName>([
   "fleet.replacement.old_retired",
   "fleet.mutation.blocked",
   "fleet.startup_permits.changed",
+  "fleet.bootstrap_cleanup.started",
+  "fleet.bootstrap_cleanup.succeeded",
+  "fleet.bootstrap_cleanup.deferred",
 ]);
 
 function lineEvent(line: string): ObservabilityEventName | null {
@@ -228,6 +241,9 @@ export class ConsoleSink implements ObservabilitySink {
     const now = this.#now();
     for (const line of lines) {
       const event = lineEvent(line);
+      // Detailed records live in JSONL. Keep the console's sampled slot for
+      // the aggregate which describes the complete fleet.
+      if (event === "fleet.runtime_sample") continue;
       if (event && CONSOLE_ALWAYS.has(event)) {
         output.push(formatConsoleObservabilityLine(line));
       } else if (!sampled && now >= this.#nextProgressAtMs) {
@@ -473,6 +489,9 @@ export class ObservabilityLogger implements LoggerLike {
       "fleet.replacement.successor_activated",
       "fleet.replacement.old_retired",
       "fleet.mutation.blocked",
+      "fleet.bootstrap_cleanup.started",
+      "fleet.bootstrap_cleanup.succeeded",
+      "fleet.bootstrap_cleanup.deferred",
     ].includes(eventName)) return;
     const normalizedPriority: ObservabilityPriority = priority in this.#queues
       ? priority

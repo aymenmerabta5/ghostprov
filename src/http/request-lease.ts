@@ -76,6 +76,9 @@ export function incomingLeaseTimingView(
   )) return undefined;
   return {
     release() {},
+    ...(lease.completeAdmission === undefined ? {} : {
+      completeAdmission: () => lease.completeAdmission!(),
+    }),
     ...(lease.acceptedAtMs === undefined ? {} : { acceptedAtMs: lease.acceptedAtMs }),
     ...(lease.deadlineMs === undefined ? {} : { deadlineMs: lease.deadlineMs }),
     ...(lease.signal === undefined ? {} : { signal: lease.signal }),

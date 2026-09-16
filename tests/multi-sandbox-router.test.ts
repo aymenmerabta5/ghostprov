@@ -58,6 +58,7 @@ class FakeRuntime implements RoutableSandboxRuntime {
   reflectedTransferUsed = 0;
   postAdmissionDelayMs = 0;
   waitForPostAdmissionAbort = false;
+  postAdmissionTransferSettlement: ReturnType<typeof deferred<void>> | null = null;
   reflectExecutionRisk = true;
   failAfterExecutionRiskError: Error | null = null;
   returnPendingHandleOnAbortAfterExecutionRisk = false;
@@ -254,12 +255,18 @@ class FakeRuntime implements RoutableSandboxRuntime {
             reject(new V2PreCommitError(
               "fake runtime proved admitted work never started",
               "test_precommit_abort",
+              this.postAdmissionTransferSettlement
+                ? { transportSettlement: this.postAdmissionTransferSettlement.promise }
+                : undefined,
             ));
             return;
           }
           signal?.addEventListener("abort", () => reject(new V2PreCommitError(
             "fake runtime proved admitted work never started",
             "test_precommit_abort",
+            this.postAdmissionTransferSettlement
+              ? { transportSettlement: this.postAdmissionTransferSettlement.promise }
+              : undefined,
           )), { once: true });
         });
       } finally {
@@ -409,6 +416,7 @@ function controlledAdmission(runtime: FakeRuntime) {
   const attempts: Array<{
     signal?: AbortSignal;
     progress(value: SandboxAdmissionProgress): void;
+    reflectExecutionRisk(): void;
     commit(): void;
   }> = [];
   const run = spyOn(runtime, "run").mockImplementation(async (body, signal, options) => {
@@ -423,6 +431,7 @@ function controlledAdmission(runtime: FakeRuntime) {
     attempts.push({
       signal,
       progress: value => options?.onAdmissionProgress?.(value),
+      reflectExecutionRisk: () => options?.onExecutionRiskReflected?.(),
       commit: () => admitted.resolve(),
     });
     signal?.addEventListener("abort", abort, { once: true });
@@ -467,12 +476,21 @@ function controlledAdmission(runtime: FakeRuntime) {
 function mediumAdmissionFixture(
   requestBytes = 2_012_715,
   profile: "standard" | "bulk-v1" = "bulk-v1",
-  useDefaultTimeouts = false,
+  useDefaultTimeouts: boolean | {
+    queueTimeoutMs: number;
+    projects?: number;
+    slots?: number;
+    inputItems?: number;
+    authorizationScope?: AuthenticatedTenantScope;
+    previousResponseId?: string;
+  } = false,
 ) {
   const timers = manualRouterTimers();
+  const configured = typeof useDefaultTimeouts === "object" ? useDefaultTimeouts : null;
   const system = createSystem(
-    2, 1, useDefaultTimeouts ? undefined : 30_000,
+    configured?.projects ?? 2, configured?.slots ?? 1, configured?.queueTimeoutMs ?? (useDefaultTimeouts ? undefined : 30_000),
     undefined, undefined, timers.clock, useDefaultTimeouts ? undefined : 15_000,
+    configured?.authorizationScope ?? (configured?.previousResponseId ? createAuthenticatedTenantScope() : undefined),
   );
   const controls = system.runtimes.map(runtime => {
     runtime.transportProfile = profile;
@@ -481,9 +499,16 @@ function mediumAdmissionFixture(
     return controlledAdmission(runtime);
   });
   const body = {
-    model: "gpt-5.6-sol", input: "", stream: true, store: true, service_tier: "fast",
+    model: "gpt-5.6-sol",
+    input: configured?.inputItems
+      ? Array.from({ length: configured.inputItems }, () => ({ type: "message", role: "user", content: "" }))
+      : "",
+    stream: true, store: true, service_tier: "fast",
+    ...(configured?.previousResponseId ? { previous_response_id: configured.previousResponseId } : {}),
   };
-  body.input = "x".repeat(requestBytes - Buffer.byteLength(JSON.stringify(body)));
+  const padding = "x".repeat(requestBytes - Buffer.byteLength(JSON.stringify(body)));
+  if (Array.isArray(body.input)) body.input[0]!.content = padding;
+  else body.input = padding;
   const controller = new AbortController();
   const pending = system.router.startRelay(body, {
     source: "websocket",
@@ -494,7 +519,7 @@ function mediumAdmissionFixture(
   });
   const outcome = pending.then(handle => ({ handle }), error => ({ error }));
   return {
-    ...system, timers, controls, requestBytes, body, pending, outcome,
+    ...system, timers, controls, requestBytes, body, pending, outcome, controller,
     async close() {
       try {
         controller.abort();
@@ -510,7 +535,501 @@ function mediumAdmissionFixture(
   };
 }
 
+// Reproduce logged router inputs and exact transport-reported ACK counts using
+// synthetic JSON. This is not the private original history or gzip/live proof.
+const OBSERVED_ADMISSION_REQUEST_BYTES = 901_823;
+const OBSERVED_ADMISSION_ENCODED_BYTES = 453_720;
+const OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES = 368_900;
+
+function observedAdmissionFixture(queueTimeoutMs: number, options: {
+  projects?: number;
+  slots?: number;
+  authorizationScope?: AuthenticatedTenantScope;
+  previousResponseId?: string;
+} = {}) {
+  return mediumAdmissionFixture(OBSERVED_ADMISSION_REQUEST_BYTES, "bulk-v1", {
+    queueTimeoutMs, inputItems: 191, ...options,
+  });
+}
+
+async function waitForObservedAttempts(
+  fixture: ReturnType<typeof mediumAdmissionFixture>,
+  count = 1,
+): Promise<void> {
+  for (let turn = 0; turn < 100; turn++) {
+    if (fixture.controls.reduce((total, control) => total + control.attempts.length, 0) >= count) return;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await flush(100);
+  }
+  throw new Error("Observed admission did not reach its explicit runtime gate");
+}
+
+async function advanceObservedAdmission(
+  fixture: ReturnType<typeof mediumAdmissionFixture>,
+  elapsedMs: number,
+): Promise<void> {
+  // The incident had healthy unrelated heartbeat/data updates while the exact
+  // control ACK flight stalled. Keep those independent runtime observations
+  // current so this test does not accidentally suppress all fallback peers.
+  while (fixture.timers.clock.now() - 100_000 < elapsedMs) {
+    await fixture.timers.advanceTo(Math.min(
+      elapsedMs,
+      fixture.timers.clock.now() - 100_000 + 5_000,
+    ));
+    for (const runtime of fixture.runtimes) runtime.notify();
+  }
+  await flush(100);
+}
+
+function observedControlRepair(runtime: FakeRuntime, clock: Clock) {
+  const snapshot = runtime.snapshot.bind(runtime);
+  let recovery: { readonly startedAtMs: number; readonly deadlineAtMs: number } | null = null;
+  const observed = spyOn(runtime, "snapshot").mockImplementation(() => recovery
+    ? {
+        ...snapshot(), available: 0, admissionCredits: 0, prefetchCredits: 0,
+        transportConnected: false, availabilityReason: "awareness_reconnect" as const,
+        livenessRecovery: recovery,
+      }
+    : snapshot());
+  return {
+    begin() {
+      recovery = Object.freeze({ startedAtMs: clock.now(), deadlineAtMs: clock.now() + 10_000 });
+      runtime.notify();
+    },
+    finish() { recovery = null; runtime.notify(); },
+    restore() { observed.mockRestore(); runtime.notify(); },
+  };
+}
+
+describe("observed control-ACK admission recovery budget", () => {
+  it("reproduces the 60-second incident deadline after two incomplete first flights", async () => {
+    const fixture = observedAdmissionFixture(60_000);
+    try {
+      await waitForObservedAttempts(fixture);
+      expect(Buffer.byteLength(JSON.stringify(fixture.body))).toBe(OBSERVED_ADMISSION_REQUEST_BYTES);
+      expect(fixture.body.input).toHaveLength(191);
+      expect(fixture.body).not.toHaveProperty("previous_response_id");
+      expect(fixture.router.admissionTiming().routeAttemptTimeoutMs).toBe(30_000);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 30_000);
+      expect(first.signal?.aborted).toBe(true);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+      expect(fixture.runtimes[0]!.bodies[0]).toBe(fixture.runtimes[1]!.bodies[0]);
+      const second = fixture.controls[0]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 57_535);
+      second.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 60_000);
+      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 0]);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  for (const queueTimeoutMs of [180_000, 300_000]) {
+    it(`preserves the uploaded copy through bounded control repair with a ${queueTimeoutMs / 1_000}-second budget`, async () => {
+      const fixture = observedAdmissionFixture(queueTimeoutMs, { previousResponseId: "resp_exact_recovery_parent" });
+      const repair = observedControlRepair(fixture.runtimes[1]!, fixture.timers.clock);
+      try {
+        await waitForObservedAttempts(fixture);
+        expect(fixture.router.admissionTiming().routeAttemptTimeoutMs).toBe(60_000);
+        const first = fixture.controls[1]!.attempts[0]!;
+        await advanceObservedAdmission(fixture, 16_909);
+        first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+          totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+        await advanceObservedAdmission(fixture, 30_000);
+        repair.begin();
+        await advanceObservedAdmission(fixture, 39_999);
+        expect(first.signal?.aborted).toBe(false);
+        expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+        await advanceObservedAdmission(fixture, 40_000);
+        repair.finish();
+        // Exact new ACKs, rather than duplicate progress or a recovery timer,
+        // retain this original attempt beyond its initial 60-second window.
+        for (const [at, acknowledged] of [
+          [42_000, 380_000], [46_000, 390_000], [50_000, 400_000],
+          [54_000, 410_000], [58_000, 420_000], [62_000, 430_000],
+          [66_000, 440_000], [70_000, 450_000], [74_000, OBSERVED_ADMISSION_ENCODED_BYTES],
+        ] as const) {
+          await advanceObservedAdmission(fixture, at);
+          expect(first.signal?.aborted).toBe(false);
+          first.progress({ stage: "request_data", acknowledgedEncodedBytes: acknowledged,
+            totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+        }
+        await advanceObservedAdmission(fixture, 76_000);
+        first.progress({ stage: "request_prepared", acknowledgedEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES,
+          totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+        first.commit();
+        const handle = await fixture.pending;
+        expect(fixture.controls.map(control => control.safeAborts)).toEqual([0, 0]);
+        expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 1]);
+        expect(fixture.runtimes[1]!.bodies[0]!.previous_response_id).toBe("resp_exact_recovery_parent");
+        expect(fixture.runtimes[1]!.bodies[0]).toMatchObject({ stream: true, store: true });
+        fixture.runtimes[1]!.completeOne();
+        await handle.final;
+        expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+        expect(fixture.router.snapshot().fleetTransferReserved).toBe(0);
+      } finally { repair.restore(); await fixture.close(); }
+    });
+  }
+
+  it("expires permanently stalled partial uploads at the exact 180-second hard deadline", async () => {
+    const fixture = observedAdmissionFixture(180_000);
+    try {
+      await waitForObservedAttempts(fixture);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 179_999);
+      expect(fixture.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+      expect(fixture.controls.flatMap(control => control.attempts).filter(attempt => !attempt.signal?.aborted)).toHaveLength(1);
+      await advanceObservedAdmission(fixture, 180_000);
+      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
+      await advanceObservedAdmission(fixture, 300_000);
+      expect(fixture.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(3);
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 0]);
+      expect(fixture.router.snapshot()).toMatchObject({ queued: 0, active: 0, fleetTransferReserved: 0 });
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  it("keeps caller cancellation immediate while the original partial flight is recovering", async () => {
+    const fixture = observedAdmissionFixture(180_000, { previousResponseId: "resp_cancel_exact_parent" });
+    const repair = observedControlRepair(fixture.runtimes[1]!, fixture.timers.clock);
+    try {
+      await waitForObservedAttempts(fixture);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 30_000);
+      repair.begin();
+      await advanceObservedAdmission(fixture, 35_000);
+      const cancelledAt = fixture.timers.clock.now();
+      fixture.controller.abort(new DOMException("Caller cancelled", "AbortError"));
+      await flush(100);
+      expect(await fixture.outcome).toMatchObject({ error: { name: "AbortError" } });
+      expect(fixture.timers.clock.now()).toBe(cancelledAt);
+      expect(first.signal?.aborted).toBe(true);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 0]);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { repair.restore(); await fixture.close(); }
+  });
+
+  it("awaits a recovered committed handle beyond sixty seconds without replay or lineage changes", async () => {
+    const fixture = observedAdmissionFixture(180_000, { previousResponseId: "resp_exact_recovered_ack" });
+    const originalBody = JSON.stringify(fixture.body);
+    try {
+      await waitForObservedAttempts(fixture);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 30_000);
+      first.reflectExecutionRisk();
+      // The transport's existing 150-second recovery window can still be
+      // restoring delivery after the old 60-second handle proof expired.
+      await advanceObservedAdmission(fixture, 110_000);
+      expect(first.signal?.aborted).toBe(false);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      expect(fixture.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+      expect(JSON.stringify(fixture.runtimes[1]!.bodies[0])).toBe(originalBody);
+      first.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[1]!.completeOne();
+      await handle.final;
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 1]);
+      expect(fixture.controls.map(control => control.safeAborts)).toEqual([0, 0]);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+      expect(fixture.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
+    } finally { await fixture.close(); }
+  });
+
+  it("never reroutes execution-risk work even when control proof exceeds its bounded grace", async () => {
+    const fixture = observedAdmissionFixture(180_000, { previousResponseId: "resp_committed_exact_parent" });
+    try {
+      await waitForObservedAttempts(fixture);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 45_000);
+      first.reflectExecutionRisk();
+      await advanceObservedAdmission(fixture, 224_999);
+      expect(first.signal?.aborted).toBe(false);
+      await advanceObservedAdmission(fixture, 225_000);
+      expect(await fixture.outcome).toMatchObject({ error: {
+        code: "execution_risk_handle_unproven", committed: true, ambiguous: true,
+      } });
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      expect(fixture.runtimes[1]!.bodies[0]!.previous_response_id).toBe("resp_committed_exact_parent");
+    } finally { await fixture.close(); }
+  });
+
+  it("keeps a 21KB provider-ID delta small beside the recovering 901KB root", async () => {
+    const fixture = observedAdmissionFixture(180_000, {
+      projects: 1, slots: 2, authorizationScope: createAuthenticatedTenantScope(),
+    });
+    const repair = observedControlRepair(fixture.runtimes[0]!, fixture.timers.clock);
+    try {
+      await waitForObservedAttempts(fixture);
+      const root = fixture.controls[0]!.attempts[0]!;
+      await advanceObservedAdmission(fixture, 10_000);
+      const delta = { model: "gpt-5.6-terra", input: [{ type: "message", role: "user", content: "" }],
+        previous_response_id: "resp_exact_small_delta", stream: true, store: true, service_tier: "fast" };
+      delta.input[0]!.content = "d".repeat(21_052 - Buffer.byteLength(JSON.stringify(delta)));
+      const deltaBefore = JSON.stringify(delta);
+      const smallPending = fixture.router.startRelay(delta, {
+        source: "websocket", authorizationScope: fixture.router.responseProvenanceAuthorizationScope()!,
+        signal: fixture.controller.signal,
+      });
+      void smallPending.catch(() => undefined);
+      await waitForObservedAttempts(fixture, 2);
+      expect(fixture.controls[0]!.attempts).toHaveLength(2);
+      const small = fixture.controls[0]!.attempts[1]!;
+      await advanceObservedAdmission(fixture, 16_909);
+      root.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_FIRST_FLIGHT_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      await advanceObservedAdmission(fixture, 30_000);
+      repair.begin();
+      await advanceObservedAdmission(fixture, 40_000);
+      expect(root.signal?.aborted).toBe(false);
+      expect(small.signal?.aborted).toBe(false);
+      repair.finish();
+      small.commit();
+      const smallHandle = await smallPending;
+      const sent = fixture.runtimes[0]!.bodies[1]!;
+      expect(JSON.stringify(sent)).toBe(deltaBefore);
+      expect(Buffer.byteLength(JSON.stringify(sent))).toBe(21_052);
+      expect(sent.input).toHaveLength(1);
+      expect(sent.previous_response_id).toBe("resp_exact_small_delta");
+      expect(fixture.runtimes[0]!.bodies[0]!.input).toHaveLength(191);
+      expect(fixture.runtimes[0]!.bodies[0]).not.toHaveProperty("previous_response_id");
+      fixture.runtimes[0]!.completeOne();
+      await smallHandle.final;
+      await advanceObservedAdmission(fixture, 44_000);
+      root.progress({ stage: "request_data", acknowledgedEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      root.progress({ stage: "request_prepared", acknowledgedEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES,
+        totalEncodedBytes: OBSERVED_ADMISSION_ENCODED_BYTES });
+      root.commit();
+      const rootHandle = await fixture.pending;
+      fixture.runtimes[0]!.completeOne();
+      await rootHandle.final;
+      expect(fixture.controls[0]!.providerStarts).toBe(2);
+      expect(fixture.controls[0]!.safeAborts).toBe(0);
+      expect(fixture.runtimes[0]!.executions).toBe(2);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { repair.restore(); await fixture.close(); }
+  });
+
+  it("keeps larger configured budgets explicit, finite, and payload-bounded", () => {
+    for (const [base, largest] of [[180_000, 1_470_000], [300_000, 2_450_000]] as const) {
+      expect(requestRoutingTimeouts(OBSERVED_ADMISSION_REQUEST_BYTES, base, 60_000, true)).toEqual({
+        queueTimeoutMs: base, routeAttemptTimeoutMs: 60_000,
+      });
+      expect(requestRoutingTimeouts(64 * 1024 ** 2, base, 60_000, true)).toEqual({
+        queueTimeoutMs: largest, routeAttemptTimeoutMs: 480_000,
+      });
+    }
+  });
+});
+
 describe("MultiSandboxRouter", () => {
+  it("reports the actual resolved admission timing for injected router settings", async () => {
+    for (const [queue, attempt, expectedQueue, expectedAttempt] of [
+      [undefined, undefined, 180_000, 60_000],
+      [30_000, undefined, 30_000, 15_000],
+      [30_000, 10_000, 30_000, 10_000],
+    ] as const) {
+      const system = createSystem(0, 1, queue, undefined, undefined, undefined, attempt);
+      try {
+        const timing = system.router.admissionTiming();
+        expect(timing).toEqual({ queueTimeoutMs: expectedQueue, routeAttemptTimeoutMs: expectedAttempt,
+          committedHandleTimeoutMs: Math.min(expectedQueue + 25, 180_000),
+          preparedProofUsesAttemptBudget: true });
+        expect(Object.isFrozen(timing)).toBe(true);
+      } finally { await system.router.close(); }
+    }
+  });
+
+  it("preserves failover time with an explicit 30-second public admission budget", async () => {
+    const fixture = mediumAdmissionFixture(128 * 1024, "bulk-v1", {
+      queueTimeoutMs: 30_000, previousResponseId: "resp_exact_unchanged_lineage",
+    });
+    try {
+      await flush(100);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await fixture.timers.advanceTo(14_999);
+      expect(first.signal?.aborted).toBe(false);
+      await fixture.timers.advanceTo(15_000);
+      expect(first.signal?.aborted).toBe(true);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
+      expect(fixture.runtimes[0]!.bodies[0]).toBe(fixture.runtimes[1]!.bodies[0]);
+      expect(fixture.runtimes[0]!.bodies[0]!.previous_response_id).toBe("resp_exact_unchanged_lineage");
+      await fixture.timers.advanceTo(25_000);
+      fixture.controls[0]!.attempts[0]!.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[0]!.completeOne();
+      await handle.final;
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([1, 0]);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  it("retains a sole healthy sandbox through the original public deadline", async () => {
+    const fixture = mediumAdmissionFixture(128 * 1024, "bulk-v1", { queueTimeoutMs: 30_000, projects: 1 });
+    try {
+      await flush(100);
+      const first = fixture.controls[0]!.attempts[0]!;
+      await fixture.timers.advanceTo(25_000);
+      expect(first.signal?.aborted).toBe(false);
+      expect(fixture.runtimes[0]!.executions).toBe(1);
+      first.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[0]!.completeOne();
+      await handle.final;
+      expect(fixture.controls[0]!.safeAborts).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  it("retains a fully acknowledged body while prepared proof takes longer than five seconds", async () => {
+    const fixture = mediumAdmissionFixture(undefined, "bulk-v1", { queueTimeoutMs: 30_000 });
+    try {
+      await flush(100);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await fixture.timers.advanceTo(8_000);
+      first.progress({ stage: "request_data", acknowledgedEncodedBytes: fixture.requestBytes,
+        totalEncodedBytes: fixture.requestBytes });
+      await fixture.timers.advanceTo(16_000);
+      expect(first.signal?.aborted).toBe(false);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      first.progress({ stage: "request_prepared", acknowledgedEncodedBytes: fixture.requestBytes,
+        totalEncodedBytes: fixture.requestBytes });
+      first.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[1]!.completeOne();
+      await handle.final;
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 1]);
+      expect(fixture.controls.map(control => control.safeAborts)).toEqual([0, 0]);
+    } finally { await fixture.close(); }
+  });
+
+  it("does not extend the hard deadline for full-body ACKs or duplicate progress", async () => {
+    const fixture = mediumAdmissionFixture(undefined, "bulk-v1", { queueTimeoutMs: 30_000, projects: 1 });
+    try {
+      await flush(100);
+      const first = fixture.controls[0]!.attempts[0]!;
+      await fixture.timers.advanceTo(14_000);
+      const progress = { stage: "request_data" as const, acknowledgedEncodedBytes: fixture.requestBytes,
+        totalEncodedBytes: fixture.requestBytes };
+      first.progress(progress);
+      await fixture.timers.advanceTo(29_999);
+      first.progress(progress);
+      expect(first.signal?.aborted).toBe(false);
+      await fixture.timers.advanceTo(30_000);
+      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
+      expect(fixture.controls[0]!.providerStarts).toBe(0);
+      expect(fixture.runtimes[0]!.executions).toBe(1);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  it("uses a peer that becomes admissible after retaining the sole running attempt", async () => {
+    const fixture = mediumAdmissionFixture(128 * 1024, "bulk-v1", { queueTimeoutMs: 30_000 });
+    try {
+      await flush(100);
+      const first = fixture.controls[1]!.attempts[0]!;
+      fixture.runtimes[0]!.state = "draining";
+      fixture.runtimes[0]!.notify();
+      await fixture.timers.advanceTo(16_000);
+      expect(first.signal?.aborted).toBe(false);
+      fixture.runtimes[0]!.state = "ready";
+      fixture.runtimes[0]!.notify();
+      await fixture.timers.advanceTo(16_250);
+      expect(first.signal?.aborted).toBe(true);
+      fixture.controls[0]!.attempts[0]!.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[0]!.completeOne();
+      await handle.final;
+      expect(fixture.controls.map(control => control.providerStarts)).toEqual([1, 0]);
+    } finally { await fixture.close(); }
+  });
+
+  it("retains the current copy when otherwise eligible peers lack a fleet pacing token", async () => {
+    const fixture = mediumAdmissionFixture(undefined, "bulk-v1", { queueTimeoutMs: 30_000, projects: 3 });
+    try {
+      await flush(100);
+      const firstIndex = fixture.controls.findIndex(control => control.attempts.length > 0);
+      const first = fixture.controls[firstIndex]!.attempts[0]!;
+      await fixture.timers.advanceTo(14_900);
+      const competing = fixture.router.startRelay(fixture.body, { clientId: "pacing-peer", source: "http" });
+      await flush(100);
+      const competitorIndex = fixture.controls.findIndex((control, index) => index !== firstIndex && control.attempts.length > 0);
+      expect(competitorIndex).toBeGreaterThanOrEqual(0);
+      fixture.controls[competitorIndex]!.attempts[0]!.commit();
+      const completed = await competing;
+      fixture.runtimes[competitorIndex]!.completeOne();
+      await completed.final;
+      await fixture.timers.advanceTo(15_000);
+      expect(first.signal?.aborted).toBe(false);
+      first.commit();
+      const handle = await fixture.pending;
+      fixture.runtimes[firstIndex]!.completeOne();
+      await handle.final;
+      expect(fixture.controls[firstIndex]!.safeAborts).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
+  it("never replays execution-risk work after the shortened initial attempt budget", async () => {
+    const fixture = mediumAdmissionFixture(128 * 1024, "bulk-v1", { queueTimeoutMs: 30_000 });
+    try {
+      await flush(100);
+      const first = fixture.controls[1]!.attempts[0]!;
+      await fixture.timers.advanceTo(10_000);
+      first.reflectExecutionRisk();
+      await fixture.timers.advanceTo(15_000);
+      expect(first.signal?.aborted).toBe(false);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+      await fixture.timers.advanceTo(30_025);
+      expect(first.signal?.aborted).toBe(false);
+      await fixture.timers.advanceTo(40_025);
+      expect(await fixture.outcome).toMatchObject({ error: {
+        code: "execution_risk_handle_unproven", committed: true, ambiguous: true,
+      } });
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    } finally { await fixture.close(); }
+  });
+
+  it("allows a late execution-risk handoff to return its handle without replay", async () => {
+    const fixture = mediumAdmissionFixture(128 * 1024, "bulk-v1", {
+      queueTimeoutMs: 60_000, projects: 1, previousResponseId: "resp-exact-late-start",
+    });
+    try {
+      await flush(100);
+      const first = fixture.controls[0]!.attempts[0]!;
+      await fixture.timers.advanceTo(59_000);
+      first.reflectExecutionRisk();
+      await fixture.timers.advanceTo(62_000);
+      expect(first.signal?.aborted).toBe(false);
+      expect(fixture.runtimes[0]!.executions).toBe(1);
+      expect(fixture.governor.snapshot().reservedBytes).toBeGreaterThan(0);
+      first.commit();
+      const handle = await fixture.pending;
+      expect(fixture.runtimes[0]!.bodies[0]!.previous_response_id).toBe("resp-exact-late-start");
+      fixture.runtimes[0]!.completeOne();
+      await handle.final;
+      expect(fixture.controls[0]!.providerStarts).toBe(1);
+      expect(fixture.controls[0]!.safeAborts).toBe(0);
+      expect(fixture.governor.snapshot().reservedBytes).toBe(0);
+    } finally { await fixture.close(); }
+  });
+
   it("returns a preparation timeout once without rerouting the same CPU work", async () => {
     const system = createSystem(2, 4, 5_000);
     for (const runtime of system.runtimes) {
@@ -1291,6 +1810,10 @@ describe("MultiSandboxRouter", () => {
       queueTimeoutMs: 61_250,
       routeAttemptTimeoutMs: 15_000,
     });
+    expect(requestRoutingTimeouts(3.75 * 1024 ** 2, 60_000, 30_000, true)).toEqual({
+      queueTimeoutMs: 122_500,
+      routeAttemptTimeoutMs: 60_000,
+    });
     expect(requestRoutingTimeouts(8 * 1024 ** 2, 30_000, 15_000)).toEqual({
       queueTimeoutMs: 125_000,
       routeAttemptTimeoutMs: 15_000,
@@ -1422,7 +1945,7 @@ describe("MultiSandboxRouter", () => {
       stream: true,
     }, { source: "http", incomingLease });
     expect(replacementRequestBytes).toBe(13 * 1024 ** 2 + 13);
-    expect(replacementDeadlineMs).toBe(acceptedAtMs + 500_000);
+    expect(replacementDeadlineMs).toBe(acceptedAtMs + 750_000);
     system.runtimes[0]!.completeOne();
     await handle.final;
     await system.router.close();
@@ -1433,15 +1956,15 @@ describe("MultiSandboxRouter", () => {
     const declared = await system.router.acquireIncomingBody(13 * 1024 ** 2, undefined, {
       maxBytes: 64 * 1024 ** 2,
     });
-    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(500_000);
+    expect(declared.deadlineMs! - declared.acceptedAtMs!).toBe(750_000);
     declared.release();
 
     const chunked = await system.router.acquireIncomingBody(0, undefined, {
       maxBytes: 64 * 1024 ** 2,
     });
-    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(120_000);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(180_000);
     await chunked.ensureBytes!(13 * 1024 ** 2);
-    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(500_000);
+    expect(chunked.deadlineMs! - chunked.acceptedAtMs!).toBe(750_000);
     chunked.release();
     await system.router.close();
   });
@@ -2379,7 +2902,7 @@ describe("MultiSandboxRouter", () => {
       expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 1]);
       fixture.runtimes[1]!.completeOne();
       await handle.final;
-      await fixture.timers.advanceTo(120_001);
+      await fixture.timers.advanceTo(180_001);
       expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
       expect(fixture.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
       expect(fixture.governor.snapshot().reservedBytes).toBe(0);
@@ -2388,7 +2911,7 @@ describe("MultiSandboxRouter", () => {
     }
   });
 
-  it("bounds silent default admission to 60 seconds per sandbox and 120 seconds overall", async () => {
+  it("bounds silent default admission to 60 seconds per eligible sandbox and 180 seconds overall", async () => {
     const fixture = mediumAdmissionFixture(2_013_194, "bulk-v1", true);
     try {
       await flush(100);
@@ -2406,13 +2929,15 @@ describe("MultiSandboxRouter", () => {
       expect(first.signal?.aborted).toBe(true);
       expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
       const second = fixture.controls[0]!.attempts[0]!;
-      await fixture.timers.advanceTo(119_999);
+      await advanceObservedAdmission(fixture, 119_999);
       expect(second.signal?.aborted).toBe(false);
-      await fixture.timers.advanceTo(120_000);
-      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
+      await advanceObservedAdmission(fixture, 120_000);
       expect(second.signal?.aborted).toBe(true);
+      expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 2]);
+      await advanceObservedAdmission(fixture, 180_000);
+      expect(await fixture.outcome).toMatchObject({ error: { code: "transport_admission_timeout" } });
       expect(fixture.controls.map(control => control.providerStarts)).toEqual([0, 0]);
-      expect(fixture.controls.map(control => control.safeAborts)).toEqual([1, 1]);
+      expect(fixture.controls.map(control => control.safeAborts)).toEqual([1, 2]);
       expect(fixture.router.snapshot()).toMatchObject({ active: 0, queued: 0, fleetTransferReserved: 0 });
       expect(fixture.governor.snapshot().reservedBytes).toBe(0);
     } finally {
@@ -2541,19 +3066,22 @@ describe("MultiSandboxRouter", () => {
         totalEncodedBytes: fixture.requestBytes,
       });
       await fixture.timers.advanceTo(12_000);
+      for (const runtime of fixture.runtimes) runtime.notify();
       first.progress({
         stage: "request_data", acknowledgedEncodedBytes: fixture.requestBytes,
         totalEncodedBytes: fixture.requestBytes,
       });
-      // RTT 600 ms gives exactly 3 seconds for assembly/claim proof. Repeated
-      // full-data ACKs must not reset that grace or impersonate prepared proof.
-      await fixture.timers.advanceTo(14_999);
+      // Full data ACK advances the phase once and grants the configured 15s
+      // window for prepared proof. Repeated ACKs must not renew that window.
+      await fixture.timers.advanceTo(20_000);
+      for (const runtime of fixture.runtimes) runtime.notify();
+      await fixture.timers.advanceTo(26_999);
       expect(first.signal?.aborted).toBe(false);
       first.progress({
         stage: "request_data", acknowledgedEncodedBytes: fixture.requestBytes,
         totalEncodedBytes: fixture.requestBytes,
       });
-      await fixture.timers.advanceTo(15_000);
+      await fixture.timers.advanceTo(27_000);
       expect(first.signal?.aborted).toBe(true);
       expect(fixture.controls[1]!.safeAborts).toBe(1);
       expect(fixture.runtimes.map(runtime => runtime.executions)).toEqual([1, 1]);
@@ -2731,6 +3259,114 @@ describe("MultiSandboxRouter", () => {
     const handle = await pending;
     system.runtimes[0]!.completeOne();
     await handle.final;
+    await system.router.close();
+  });
+
+  it("holds bulk fleet weight until a cancelled reliable flight settles", async () => {
+    const system = createSystem(2, 1, 1_000, undefined, undefined, undefined, 25);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const stalled = system.runtimes[1]!;
+    const transferSettlement = deferred<void>();
+    stalled.reflectExecutionRisk = false;
+    stalled.waitForPostAdmissionAbort = true;
+    stalled.postAdmissionTransferSettlement = transferSettlement;
+
+    const pending = system.router.startRelay(
+      { model: "gpt-6-astra", input: "contained-long-context", stream: true },
+      {
+        clientId: "contained-long-context",
+        source: "websocket",
+        encodedBodyBytes: 3 * 1024 ** 2,
+        structuralBodyBytes: 3 * 1024 ** 2,
+      },
+    );
+    await flush();
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+
+    await Bun.sleep(70);
+    expect(system.runtimes.map(runtime => runtime.executions)).toEqual([0, 1]);
+    expect(system.router.snapshot().fleetTransferReserved).toBe(4);
+
+    stalled.waitForPostAdmissionAbort = false;
+    transferSettlement.resolve();
+    const handle = await pending;
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
+    expect(system.router.snapshot().fleetTransferReserved).toBe(0);
+    system.runtimes.find(runtime => runtime.finals.length > 0)!.completeOne();
+    await handle.final;
+    await system.router.close();
+  });
+
+  it("contains one unsettled flight while seven long-context agents remain recoverable", async () => {
+    const system = createSystem(8, 1, 1_000, undefined, undefined, undefined, 25);
+    for (const runtime of system.runtimes) {
+      runtime.transportProfile = "bulk-v1";
+      runtime.notify();
+    }
+    const stalled = system.runtimes[7]!;
+    for (const runtime of system.runtimes.slice(0, 7)) {
+      runtime.state = "draining";
+      runtime.notify();
+    }
+    const transferSettlement = deferred<void>();
+    stalled.reflectExecutionRisk = false;
+    stalled.waitForPostAdmissionAbort = true;
+    stalled.postAdmissionTransferSettlement = transferSettlement;
+    const longOptions = (clientId: string) => ({
+      clientId,
+      source: "websocket" as const,
+      encodedBodyBytes: 3 * 1024 ** 2,
+      structuralBodyBytes: 3 * 1024 ** 2,
+    });
+    const longJobs = [system.router.startRelay(
+      { model: "gpt-6-astra", input: "long-0", stream: true },
+      longOptions("long-0"),
+    )];
+    await flush();
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(1);
+
+    for (const runtime of system.runtimes.slice(0, 7)) {
+      runtime.state = "ready";
+      runtime.notify();
+    }
+    for (let index = 1; index < 7; index++) {
+      longJobs.push(system.router.startRelay(
+        { model: "gpt-6-astra", input: `long-${index}`, stream: true },
+        longOptions(`long-${index}`),
+      ));
+    }
+    const latencyHandle = await system.router.startRelay({
+      model: "gpt-5.6-sol", input: "latency-headroom", stream: true,
+    }, { clientId: "latency-headroom", source: "websocket" });
+    system.runtimes.find(runtime => runtime.finals.length > 0)!.completeOne();
+    await latencyHandle.final;
+
+    await Bun.sleep(70);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(2);
+    expect(system.router.snapshot()).toMatchObject({
+      queued: 7,
+      fleetTransferReserved: 4,
+      fleetBulkTransferReserved: 4,
+    });
+
+    stalled.waitForPostAdmissionAbort = false;
+    stalled.reflectExecutionRisk = true;
+    transferSettlement.resolve();
+    const handles = await Promise.all(longJobs);
+    expect(system.runtimes.reduce((sum, runtime) => sum + runtime.executions, 0)).toBe(9);
+    for (const runtime of system.runtimes) {
+      while (runtime.finals.length > 0) runtime.completeOne();
+    }
+    await Promise.all(handles.map(handle => handle.final));
+    expect(system.router.snapshot()).toMatchObject({
+      active: 0,
+      queued: 0,
+      fleetTransferReserved: 0,
+      fleetBulkTransferReserved: 0,
+    });
     await system.router.close();
   });
 
@@ -3062,7 +3698,7 @@ describe("MultiSandboxRouter", () => {
     expect(outcome).toMatchObject({
       kind: "error",
       error: {
-        code: "capacity_timeout_cancellation_unproven",
+        code: "route_timeout_cancellation_unproven",
         committed: true,
         ambiguous: true,
       },

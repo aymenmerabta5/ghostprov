@@ -278,14 +278,14 @@ export function attachResponsesWebSocket(
     }
     let cleaned = false;
     let pingSentAt: number | null = null;
-    const cleanup = (cause: WebSocketCloseCause = "remote_close") => {
+    const cleanup = (cause: WebSocketCloseCause = "remote_close", observedCloseCode?: number) => {
       if (cleaned) return;
       cleaned = true;
       const firstCause = firstSocketCloseCause(socket, cause);
       socketCloseHandlers.delete(socket);
       processLease.releaseIngress();
       clearInterval(heartbeat);
-      session.close(firstCause);
+      session.close(firstCause, observedCloseCode);
       recordIngressBudget();
     };
     const terminate = (cause: WebSocketCloseCause) => {
@@ -399,10 +399,10 @@ export function attachResponsesWebSocket(
       // reason text as evidence of a local parser rejection.
       if (!cleaned && code === 1006 && isWebSocketPayloadLimitError(reason)) {
         recordParserRejection();
-        cleanup("protocol_error");
+        cleanup("protocol_error", code);
         return;
       }
-      cleanup();
+      cleanup("remote_close", code);
     });
     socket.once("error", error => {
       if (isWebSocketPayloadLimitError(error)) {

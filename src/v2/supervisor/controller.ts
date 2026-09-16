@@ -1,5 +1,8 @@
 import type { YSweetEnvelope } from "../../prism/protocol";
+import { validateDirectSupervisorExecAcceptance, type DirectSupervisorExecStarted } from "../../prism/direct-exec";
+import type { FleetWorkerRecord } from "../../fleet/types";
 import { BOOTSTRAP_FAILURE_REASONS, type SandboxFailureSnapshot } from "../../sandbox/types";
+import type { YDocPublicationReceipt } from "../../sandbox/ydoc";
 import type {
   BootstrapBinding,
   SealedBootstrapCredential,
@@ -26,6 +29,7 @@ import { supervisorStaticConfig as r10SupervisorStaticConfig } from "./r10-launc
 import { directSupervisorLaunchFiles as r10DirectSupervisorLaunchFiles, supervisorCleanupFiles as r10SupervisorCleanupFiles, isRegisteredR10Entrypoint } from "./r10-direct-launcher";
 import { decodeSandboxLogResponse } from "../diagnostics/read-sandbox-log";
 import { canonicalJson } from "../protocol/shared";
+import { sameSupervisorBinding } from "./protocol";
 import { GitFsmonitorBootstrap } from "./git-fsmonitor";
 import { GitSshSigningBootstrap } from "./git-ssh-signing";
 import { GitCleanFilterBootstrap } from "./git-clean-filter";
@@ -82,10 +86,255 @@ function safeReason(value: string): string {
   return normalized || "unspecified";
 }
 
+export interface V2HeldSupervisorBootstrapCleanupOptions {
+  /** The manager keeps this exact manifest record fenced until settlement. */
+  readonly worker: Readonly<FleetWorkerRecord>;
+  readonly assets: V2SidecarAssets;
+  readonly bootstrapJournal: SupervisorBootstrapJournal;
+  readonly getYSweet: (signal: AbortSignal) => Promise<YSweetEnvelope>;
+  readonly getArtifacts: (binding: BootstrapBinding, signal: AbortSignal) => Promise<{
+    readonly ydoc: V2BootstrapYDoc;
+    readonly gateway: Pick<V2BootstrapGateway, "syncWorkspace">;
+    close(): Promise<void>;
+  }>;
+  readonly hostFactory?: V2SandboxSupervisorOptions["hostFactory"];
+  /** One-shot incident authority; ignored unless the submitted journal has no command acceptance. */
+  readonly recoverUnacceptedInitial?: boolean;
+  readonly connectTimeoutMs?: number;
+  readonly commandTimeoutMs?: number;
+  readonly onCleanupRequired?: (binding: BootstrapBinding) => void;
+  readonly onCleanupProven?: (binding: BootstrapBinding) => void;
+}
+
+/** Private execution correlation only; neither acknowledgement nor log presence proves cleanup. */
+export interface SupervisorDiagnosticExecution {
+  readonly sessionId: string;
+  readonly workspaceRoot: string;
+  readonly leaderGeneration: number;
+  readonly binding: BootstrapBinding;
+  readonly dispatchState: "not_started" | "may_have_started" | "accepted";
+  readonly commandAcceptance?: DirectSupervisorExecStarted;
+  readonly durableAcceptance: boolean;
+}
+
+const MAX_DIAGNOSTIC_EXECUTIONS = 2;
+
+async function bootstrapRecoveryAssets(attempt: SupervisorBootstrapAttempt, assets: V2SidecarAssets): Promise<V2SidecarAssets> {
+  let recovered: V2SidecarAssets;
+  try {
+    // Resolve the exact registered tuple, including archived R10 releases.
+    recovered = await loadV2SidecarRecoveryAssets({ revision: assets.revision,
+      buildHash: attempt.binding.buildHash, schemaHash: attempt.binding.schemaHash });
+  } catch (cause) {
+    throw new V2SupervisorBootstrapError("Previous bootstrap release is not registered", "deploy", {
+      cause, remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch",
+    });
+  }
+  if ((recovered.revision !== "r9" && recovered.revision !== "r10") ||
+    attempt.binding.protocolRevision !== recovered.protocolRevision) {
+    throw new V2SupervisorBootstrapError("Previous bootstrap protocol does not match its registered release", "deploy", {
+      remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch",
+    });
+  }
+  return recovered;
+}
+
+async function assertBootstrapPaths(
+  ydoc: V2BootstrapYDoc,
+  files: readonly { readonly path: string; readonly content: string | null }[],
+  remoteCode: "bootstrap_stage_lost" | "bootstrap_cleanup_not_persisted",
+): Promise<void> {
+  // A reconnect can replace the Y.Doc after a successful local transaction.
+  const observed = await Promise.all(files.map(file => ydoc.readPath(file.path)));
+  if (files.some((file, index) => observed[index] !== file.content)) {
+    throw new V2SupervisorBootstrapError("Bootstrap synchronization did not preserve the expected files", "deploy", { remoteCode });
+  }
+}
+
+async function cleanupBootstrapAttemptFiles(options: {
+  readonly projectId: string;
+  readonly ydoc: V2BootstrapYDoc;
+  readonly gateway: Pick<V2BootstrapGateway, "syncWorkspace">;
+  readonly assets: V2SidecarAssets;
+}, attempt: SupervisorBootstrapAttempt, signal?: AbortSignal): Promise<void> {
+  const { assets, ydoc, gateway } = options;
+  if (attempt.binding.projectId !== options.projectId ||
+    attempt.binding.buildHash !== assets.buildHash || attempt.binding.schemaHash !== assets.schemaHash) {
+    throw new V2SupervisorBootstrapError("Previous bootstrap release does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch" });
+  }
+  const files = (assets.revision === "r10" ? r10SupervisorCleanupFiles : directSupervisorLaunchFiles)({
+    entrypointPath: assets.entrypointPath, supervisorNonce: attempt.binding.nonce,
+  });
+  const staticConfig = (assets.revision === "r10" ? r10SupervisorStaticConfig : supervisorStaticConfig)({
+    binding: attempt.binding, entrypointPath: assets.entrypointPath, connectTimeoutMs: attempt.connectTimeoutMs,
+  });
+  const expected = [
+    { path: DIRECT_SUPERVISOR_LAUNCH_PATH, content: files.launcher },
+    { path: DIRECT_SUPERVISOR_INSTALL_PATH, content: files.installer },
+    { path: SUPERVISOR_CREDENTIAL_PATH, content: JSON.stringify(attempt.sealed) },
+  ];
+  const currentStatic = await ydoc.readPath(SUPERVISOR_STATIC_PATH);
+  const observed = await Promise.all(expected.map(async file => ({ ...file, current: await ydoc.readPath(file.path) })));
+  if (observed.every(file => file.current === null)) {
+    await gateway.syncWorkspace(signal);
+    await assertBootstrapPaths(ydoc, expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
+    return;
+  }
+  if (currentStatic !== staticConfig || observed.some(file => file.current !== null && file.current !== file.content)) {
+    throw new V2SupervisorBootstrapError("Previous bootstrap files have another owner", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "file_mismatch" });
+  }
+  signal?.throwIfAborted();
+  const applied = await ydoc.compareAndMutatePaths({
+    guards: [{ path: SUPERVISOR_STATIC_PATH, equals: currentStatic }, ...observed.map(file => ({ path: file.path, equals: file.current }))],
+    mutations: observed.filter(file => file.current !== null).map(file => ({ kind: "tombstone", path: file.path })),
+  });
+  if (!applied) throw new V2SupervisorBootstrapError("Previous bootstrap files changed during cleanup", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "ownership_changed" });
+  await gateway.syncWorkspace(signal);
+  await assertBootstrapPaths(ydoc, expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
+}
+
+async function proveSubmittedBootstrapCleanup(options: {
+  readonly hostFactory: NonNullable<V2SandboxSupervisorOptions["hostFactory"]>;
+  readonly getYSweet: (signal?: AbortSignal) => Promise<YSweetEnvelope>;
+  readonly connectTimeoutMs: number;
+  readonly commandTimeoutMs: number;
+  readonly onCleanupProven: (binding: BootstrapBinding) => void;
+  readonly recoverUnacceptedInitial?: boolean;
+}, journal: BootstrapJournalEntry, previous: SupervisorBootstrapAttempt, signal?: AbortSignal): Promise<SupervisorBootstrapAttempt> {
+  const payload = await openSupervisorSessionBootstrap({ sessionId: previous.sessionId, expectedBinding: previous.binding, sealed: previous.sealed });
+  signal?.throwIfAborted();
+  const credential = await options.getYSweet(signal);
+  signal?.throwIfAborted();
+  if (credential.docId !== previous.binding.projectId) {
+    throw new V2SupervisorBootstrapError("Supervisor recovery credential belongs to another project", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+  }
+  const host = options.hostFactory({ binding: previous.binding, instanceId: payload.instanceId,
+    rotationKey: payload.credential.rotationKey, credential,
+    connectTimeoutMs: options.connectTimeoutMs, commandTimeoutMs: options.commandTimeoutMs,
+    recoverExisting: true,
+    ...(options.recoverUnacceptedInitial && previous.commandAcceptance === undefined
+      ? { recoverUnacceptedInitial: true }
+      : {}),
+  });
+  try {
+    // Shutdown consumes exact authenticated cleanup proof, never live readiness
+    // or a fresh launch. Persist irreversible proof even if cancellation races.
+    await host.shutdown("interrupted_bootstrap_recovery", signal);
+    const proven = { ...previous, phase: "cleanup_proven" as const };
+    await journal.save(proven);
+    options.onCleanupProven(proven.binding);
+    return proven;
+  } catch (cause) {
+    const phase = cause instanceof Error ? Object.getOwnPropertyDescriptor(cause, "phase")?.value : undefined;
+    throw new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", {
+      cause, remoteCode: "bootstrap_cleanup_unproven", ...(BOOTSTRAP_FAILURE_REASONS.includes(phase) ? { reason: phase } : {}),
+    });
+  } finally { await host.close(); }
+}
+
+function heldCleanupSignal(options: V2HeldSupervisorBootstrapCleanupOptions, signal: AbortSignal): AbortSignal {
+  const connectTimeoutMs = options.connectTimeoutMs ?? 90_000, commandTimeoutMs = options.commandTimeoutMs ?? 75_000;
+  if (![connectTimeoutMs, commandTimeoutMs].every(value => Number.isSafeInteger(value) && value >= 1 && value <= 300_000)) {
+    throw new RangeError("Supervisor cleanup timeout is invalid");
+  }
+  return AbortSignal.any([signal, AbortSignal.timeout(connectTimeoutMs + commandTimeoutMs)]);
+}
+
+function assertHeldCleanupWorker(worker: Readonly<FleetWorkerRecord>, finalizing: boolean): void {
+  if (!worker.managed || worker.state !== "draining" ||
+    (finalizing ? worker.retirementReason !== "replacement" && worker.retirementReason !== "missing" : worker.retirementReason !== "bootstrap_hold") ||
+    !Number.isSafeInteger(worker.index) || worker.index < 1 ||
+    !Number.isSafeInteger(worker.leaderGeneration) || worker.leaderGeneration < 1) {
+    throw new V2SupervisorBootstrapError("Held bootstrap manifest authority does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+  }
+}
+
+async function validateHeldBootstrapAttempt(options: V2HeldSupervisorBootstrapCleanupOptions, attempt: SupervisorBootstrapAttempt): Promise<V2SidecarAssets> {
+  if (attempt.binding.projectId !== options.worker.projectId || attempt.binding.leaderGeneration > options.worker.leaderGeneration) {
+    throw new V2SupervisorBootstrapError("Held bootstrap identity does not match its manifest", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+  }
+  const assets = await bootstrapRecoveryAssets(attempt, options.assets);
+  // Validate sealed authority even for a durable receipt before releasing debt.
+  await openSupervisorSessionBootstrap({ sessionId: attempt.sessionId, expectedBinding: attempt.binding, sealed: attempt.sealed });
+  return assets;
+}
+
+/** Keeps durable proof until the manager has persisted the exact hold transition. */
+export async function proveHeldSupervisorBootstrapCleanup(options: V2HeldSupervisorBootstrapCleanupOptions, signal: AbortSignal): Promise<boolean> {
+  assertHeldCleanupWorker(options.worker, false);
+  return proveJournalSupervisorBootstrapCleanup(options, signal);
+}
+
+/** A blocked active generation may prove only its already-recorded supervisor's cleanup. */
+export async function proveBlockedSupervisorBootstrapCleanup(options: V2HeldSupervisorBootstrapCleanupOptions, signal: AbortSignal): Promise<boolean> {
+  const worker = options.worker;
+  if (worker.state === "draining" || worker.retirementReason !== null ||
+    !Number.isSafeInteger(worker.index) || worker.index < 1 ||
+    !Number.isSafeInteger(worker.leaderGeneration) || worker.leaderGeneration < 1) {
+    throw new V2SupervisorBootstrapError("Blocked bootstrap manifest authority does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+  }
+  return proveJournalSupervisorBootstrapCleanup(options, signal);
+}
+
+async function proveJournalSupervisorBootstrapCleanup(options: V2HeldSupervisorBootstrapCleanupOptions, signal: AbortSignal): Promise<boolean> {
+  const cleanupSignal = heldCleanupSignal(options, signal);
+  cleanupSignal.throwIfAborted();
+  return options.bootstrapJournal.withLease(cleanupSignal, async journal => {
+    cleanupSignal.throwIfAborted();
+    let attempt = await journal.load();
+    if (!attempt || attempt.phase === "prepared") return false;
+    if (attempt.phase !== "submitted" && attempt.phase !== "cleanup_proven") {
+      throw new V2SupervisorBootstrapError("Held bootstrap journal phase is invalid", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+    }
+    await validateHeldBootstrapAttempt(options, attempt);
+    cleanupSignal.throwIfAborted();
+    if (attempt.phase === "submitted") {
+      options.onCleanupRequired?.(attempt.binding);
+      attempt = await proveSubmittedBootstrapCleanup({
+        hostFactory: options.hostFactory ?? (input => new V2SupervisorHost(input)),
+        getYSweet: () => options.getYSweet(cleanupSignal),
+        connectTimeoutMs: options.connectTimeoutMs ?? 90_000, commandTimeoutMs: options.commandTimeoutMs ?? 75_000,
+        onCleanupProven: binding => options.onCleanupProven?.(binding),
+        recoverUnacceptedInitial: options.recoverUnacceptedInitial,
+      }, journal, attempt, cleanupSignal);
+    } else options.onCleanupProven?.(attempt.binding);
+    cleanupSignal.throwIfAborted();
+    return true;
+  });
+}
+
+/** Called only after ordinary retirement is durable, before deleting a project. */
+export async function finalizeHeldSupervisorBootstrapCleanup(options: V2HeldSupervisorBootstrapCleanupOptions, signal: AbortSignal): Promise<void> {
+  assertHeldCleanupWorker(options.worker, true);
+  const cleanupSignal = heldCleanupSignal(options, signal);
+  cleanupSignal.throwIfAborted();
+  await options.bootstrapJournal.withLease(cleanupSignal, async journal => {
+    cleanupSignal.throwIfAborted();
+    const attempt = await journal.load();
+    // A crash may occur after the earlier finalizer cleared the journal. The
+    // persisted ordinary retirement, unlike a hold, allows that idempotent case.
+    if (!attempt) return;
+    if (attempt.phase !== "cleanup_proven") {
+      throw new V2SupervisorBootstrapError("Held bootstrap cleanup remains unproven", "deploy", { remoteCode: "bootstrap_cleanup_unproven" });
+    }
+    const assets = await validateHeldBootstrapAttempt(options, attempt);
+    cleanupSignal.throwIfAborted();
+    const resources = await options.getArtifacts(attempt.binding, cleanupSignal);
+    try {
+      cleanupSignal.throwIfAborted();
+      await cleanupBootstrapAttemptFiles({ projectId: options.worker.projectId, assets, ...resources }, attempt, cleanupSignal);
+      cleanupSignal.throwIfAborted();
+      await journal.clear();
+      options.onCleanupProven?.(attempt.binding);
+    } finally { await resources.close(); }
+  });
+}
+
 export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   readonly binding: BootstrapBinding;
   #instanceId = "pending";
   #executionSessionId: string | null = null;
+  readonly #diagnosticExecutions = new Map<string, SupervisorDiagnosticExecution>();
   readonly #onClosed?: () => void;
   readonly #onCleanupRequired?: (binding: BootstrapBinding) => void;
   readonly #onCleanupProven?: (binding: BootstrapBinding) => void;
@@ -103,6 +352,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   #host: V2BootstrapSupervisor | null = null;
   #activeAttempt: SupervisorBootstrapAttempt | null = null;
   #ensuring: Promise<void> | null = null;
+  #interruptedRecovery = false;
   readonly #lifecycle = new AbortController();
   #shutdown: Promise<void> | null = null;
   #closing: Promise<void> | null = null;
@@ -175,7 +425,14 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   async #ensure(signal?: AbortSignal): Promise<void> {
     if (this.#bootstrapMode !== "llm") {
       if (this.#bootstrapJournal) return this.#bootstrapJournal.withLease(signal, async journal => {
-        await this.#recoverBootstrap(journal, signal);
+        try { await this.#recoverBootstrap(journal, signal); }
+        catch (cause) {
+          // A stop can interrupt cleanup of the exact prior supervisor. Its
+          // canceled startup signal does not own the final cleanup attempt.
+          // Ordinary completed recovery failures keep their existing cadence.
+          this.#interruptedRecovery = signal?.aborted === true;
+          throw cause;
+        }
         await this.#ensureDirect(signal, journal);
       });
       return this.#ensureDirect(signal);
@@ -184,51 +441,14 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
   }
 
   async #cleanupBootstrapAttempt(attempt: SupervisorBootstrapAttempt, signal?: AbortSignal, assets: V2SidecarAssets = this.#assets): Promise<void> {
-    if (attempt.binding.projectId !== this.binding.projectId ||
-      attempt.binding.buildHash !== assets.buildHash || attempt.binding.schemaHash !== assets.schemaHash) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap release does not match", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch" });
-    }
-    const files = (assets.revision === "r10" ? r10SupervisorCleanupFiles : directSupervisorLaunchFiles)({
-      entrypointPath: assets.entrypointPath, supervisorNonce: attempt.binding.nonce,
-    });
-    const staticConfig = (assets.revision === "r10" ? r10SupervisorStaticConfig : supervisorStaticConfig)({
-      binding: attempt.binding, entrypointPath: assets.entrypointPath, connectTimeoutMs: attempt.connectTimeoutMs,
-    });
-    const expected = [
-      { path: DIRECT_SUPERVISOR_LAUNCH_PATH, content: files.launcher },
-      { path: DIRECT_SUPERVISOR_INSTALL_PATH, content: files.installer },
-      { path: SUPERVISOR_CREDENTIAL_PATH, content: JSON.stringify(attempt.sealed) },
-    ];
-    const currentStatic = await this.#ydoc.readPath(SUPERVISOR_STATIC_PATH);
-    const observed = await Promise.all(expected.map(async file => ({ ...file, current: await this.#ydoc.readPath(file.path) })));
-    if (observed.every(file => file.current === null)) {
-      await this.#gateway.syncWorkspace(signal);
-      await this.#assertBootstrapPaths(expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
-      return;
-    }
-    if (currentStatic !== staticConfig || observed.some(file => file.current !== null && file.current !== file.content)) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap files have another owner", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "file_mismatch" });
-    }
-    signal?.throwIfAborted();
-    const applied = await this.#ydoc.compareAndMutatePaths({
-      guards: [{ path: SUPERVISOR_STATIC_PATH, equals: currentStatic }, ...observed.map(file => ({ path: file.path, equals: file.current }))],
-      mutations: observed.filter(file => file.current !== null).map(file => ({ kind: "tombstone", path: file.path })),
-    });
-    if (!applied) throw new V2SupervisorBootstrapError("Previous bootstrap files changed during cleanup", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "ownership_changed" });
-    await this.#gateway.syncWorkspace(signal);
-    await this.#assertBootstrapPaths(expected.map(file => ({ path: file.path, content: null })), "bootstrap_cleanup_not_persisted");
+    await cleanupBootstrapAttemptFiles({ projectId: this.binding.projectId, ydoc: this.#ydoc, gateway: this.#gateway, assets }, attempt, signal);
   }
 
   async #assertBootstrapPaths(
     files: readonly { readonly path: string; readonly content: string | null }[],
     remoteCode: "bootstrap_stage_lost" | "bootstrap_cleanup_not_persisted",
   ): Promise<void> {
-    // A reconnect can replace the Y.Doc after a successful local transaction.
-    // Workspace readiness alone does not prove that this generation survived.
-    const observed = await Promise.all(files.map(file => this.#ydoc.readPath(file.path)));
-    if (files.some((file, index) => observed[index] !== file.content)) {
-      throw new V2SupervisorBootstrapError("Bootstrap synchronization did not preserve the expected files", "deploy", { remoteCode });
-    }
+    await assertBootstrapPaths(this.#ydoc, files, remoteCode);
   }
 
   async #recoverBootstrap(journal: BootstrapJournalEntry, signal?: AbortSignal): Promise<void> {
@@ -240,47 +460,16 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
         remoteCode: "bootstrap_ownership_conflict", reason: previous.binding.leaderGeneration >= this.binding.leaderGeneration ? "generation_conflict" : "release_mismatch",
       });
     }
-    let previousAssets = this.#assets;
-    if (previous.binding.buildHash !== this.#assets.buildHash || previous.binding.schemaHash !== this.#assets.schemaHash) {
-      try {
-        // Upgrade cleanup resolves one pinned prior tuple. It never changes the
-        // release selected for the new supervisor or accepts caller-made hashes.
-        previousAssets = await loadV2SidecarRecoveryAssets({ revision: this.#assets.revision,
-          buildHash: previous.binding.buildHash, schemaHash: previous.binding.schemaHash });
-      } catch (cause) {
-        throw new V2SupervisorBootstrapError("Previous bootstrap release is not registered", "deploy", {
-          cause, remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch",
-        });
-      }
-    }
-    if (previous.binding.protocolRevision !== previousAssets.protocolRevision) {
-      throw new V2SupervisorBootstrapError("Previous bootstrap protocol does not match its registered release", "deploy", {
-        remoteCode: "bootstrap_ownership_conflict", reason: "release_mismatch",
-      });
-    }
+    const previousAssets = await bootstrapRecoveryAssets(previous, this.#assets);
+    this.#rememberDiagnosticExecution(previous, previous.phase === "prepared" ? "not_started"
+      : previous.commandAcceptance ? "accepted" : "may_have_started", true);
     if (previous.phase === "cleanup_proven") this.#confirmCleanup(previous.binding);
     if (previous.phase === "submitted") {
-      // A durable submission is never replayed. Reconnect only to its exact
-      // authenticated supervisor and obtain child-cleanup proof before reuse.
-      const payload = await openSupervisorSessionBootstrap({ sessionId: previous.sessionId, expectedBinding: previous.binding, sealed: previous.sealed });
       this.#executionSessionId = previous.sessionId;
-      const host = this.#hostFactory({ binding: previous.binding, instanceId: payload.instanceId,
-        rotationKey: payload.credential.rotationKey, credential: this.#ySweet,
-        connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs,
-        recoverExisting: true });
-      try {
-        // Shutdown owns connection recovery and can consume an authenticated
-        // retained terminal without claiming that a retired supervisor is live.
-        await host.shutdown("interrupted_bootstrap_recovery", signal);
-        previous = { ...previous, phase: "cleanup_proven" };
-        await journal.save(previous);
-        this.#confirmCleanup(previous.binding);
-      } catch (cause) {
-        const phase = cause instanceof Error ? Object.getOwnPropertyDescriptor(cause, "phase")?.value : undefined;
-        throw new V2SupervisorBootstrapError("Previous bootstrap cleanup remains unproven", "deploy", {
-          cause, remoteCode: "bootstrap_cleanup_unproven", ...(BOOTSTRAP_FAILURE_REASONS.includes(phase) ? { reason: phase } : {}),
-        });
-      } finally { await host.close(); }
+      previous = await proveSubmittedBootstrapCleanup({ hostFactory: this.#hostFactory,
+        getYSweet: async () => this.#ySweet, connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs,
+        onCleanupProven: binding => this.#confirmCleanup(binding),
+      }, journal, previous, signal);
     }
     await this.#cleanupBootstrapAttempt(previous, signal, previousAssets);
     await journal.clear();
@@ -288,6 +477,19 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
 
   async #ensureDirect(signal?: AbortSignal, journal?: BootstrapJournalEntry): Promise<void> {
     signal?.throwIfAborted();
+    const requiresPublicationProof = this.#assets.revision === "r10" && this.#bootstrapMode === "direct";
+    const verifyRemotePaths = requiresPublicationProof ? this.#ydoc.verifyRemotePaths?.bind(this.#ydoc) : undefined;
+    if (requiresPublicationProof && !verifyRemotePaths) {
+      throw new V2SupervisorBootstrapError("Supervisor publication verification is unavailable", "deploy", { remoteCode: "bootstrap_stage_lost" });
+    }
+    const entrypoints = requiresPublicationProof
+      ? this.#assets.files.filter(file => file.path === this.#assets.entrypointPath) : [];
+    if (requiresPublicationProof && entrypoints.length !== 1) {
+      throw new V2SupervisorBootstrapError("Supervisor entrypoint publication identity is unavailable", "deploy", { remoteCode: "bootstrap_stage_lost" });
+    }
+    // Capture strings before any asynchronous work. No proof may substitute a
+    // changed asset or bootstrap credential into the later submission guards.
+    const entrypoint = entrypoints[0] ? Object.freeze({ path: entrypoints[0].path, content: entrypoints[0].content }) : undefined;
     const start = this.#gitBootstrap
       ? (request: { readonly sessionId: string }, signal?: AbortSignal) => this.#gitBootstrap!.start({
           binding: this.binding, ySweet: this.#ySweet, ydoc: this.#ydoc,
@@ -310,11 +512,17 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     const sealedJson = JSON.stringify(sealed);
     let attempt: SupervisorBootstrapAttempt = { version: 1, phase: "prepared", sessionId,
       binding: this.binding, connectTimeoutMs: this.#connectTimeoutMs, sealed };
+    this.#rememberDiagnosticExecution(attempt, "not_started", false);
     const transients = [
       { path: DIRECT_SUPERVISOR_LAUNCH_PATH, content: files.launcher },
       { path: DIRECT_SUPERVISOR_INSTALL_PATH, content: files.installer },
       { path: SUPERVISOR_CREDENTIAL_PATH, content: sealedJson },
     ] as const;
+    const stagedFiles = Object.freeze([
+      ...(entrypoint ? [entrypoint] : []),
+      { path: SUPERVISOR_STATIC_PATH, content: staticConfig },
+      ...transients,
+    ].map(file => Object.freeze(file)));
     let host: V2BootstrapSupervisor | null = null;
     let ready = false;
     let staged = false;
@@ -347,23 +555,50 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       });
       if (!applied) throw new V2SupervisorBootstrapError("Supervisor workspace authority changed", "deploy", { remoteCode: "bootstrap_ownership_conflict", reason: "ownership_changed" });
       staged = true;
+      // This proves the exact server-returned document staging only. Backend
+      // workspace synchronization remains separate and follows the proof.
+      let publication: YDocPublicationReceipt | undefined;
+      try { publication = await verifyRemotePaths?.(stagedFiles, signal); }
+      catch {
+        signal?.throwIfAborted();
+        throw new V2SupervisorBootstrapError("Supervisor publication verification failed", "deploy", { remoteCode: "bootstrap_stage_lost" });
+      }
+      if (requiresPublicationProof && typeof publication?.assertCurrent !== "function") {
+        throw new V2SupervisorBootstrapError("Supervisor publication verification is unavailable", "deploy", { remoteCode: "bootstrap_stage_lost" });
+      }
+      const assertPublicationCurrent = () => {
+        signal?.throwIfAborted();
+        try { publication?.assertCurrent(); }
+        catch { throw new V2SupervisorBootstrapError("Supervisor publication proof is no longer current", "deploy", { remoteCode: "bootstrap_stage_lost" }); }
+      };
+      assertPublicationCurrent();
       await this.#gateway.syncWorkspace(signal);
-      signal?.throwIfAborted();
-      const stagedFiles = [{ path: SUPERVISOR_STATIC_PATH, content: staticConfig }, ...transients];
+      assertPublicationCurrent();
       await this.#assertBootstrapPaths(stagedFiles, "bootstrap_stage_lost");
+      assertPublicationCurrent();
       host = this.#hostFactory({ binding: this.binding, instanceId, rotationKey, credential: this.#ySweet,
         connectTimeoutMs: this.#connectTimeoutMs, commandTimeoutMs: this.#commandTimeoutMs });
       phase = "exec";
       attempt = { ...attempt, phase: "submitted" };
       await journal?.save(attempt);
-      signal?.throwIfAborted();
+      assertPublicationCurrent();
       await this.#assertBootstrapPaths(stagedFiles, "bootstrap_stage_lost");
-      signal?.throwIfAborted();
+      assertPublicationCurrent();
       // One immutable submission. The selected bootstrap never falls back or
       // resubmits after a failed or ambiguous trigger.
       this.#requireCleanup(this.binding);
       submissionStarted = true;
-      await start(Object.freeze({ sessionId }), signal);
+      this.#rememberDiagnosticExecution(attempt, "may_have_started", false);
+      const started = await start(Object.freeze({ sessionId }), signal);
+      if (!this.#gitBootstrap) {
+        // The service accepted this exact execution. Persist its private job
+        // identity before honoring cancellation or waiting for readiness. A
+        // lost/invalid acknowledgement or failed save remains ambiguous.
+        attempt = { ...attempt, commandAcceptance: validateDirectSupervisorExecAcceptance(started, sessionId) };
+        this.#rememberDiagnosticExecution(attempt, "accepted", false);
+        await journal?.save(attempt);
+        this.#rememberDiagnosticExecution(attempt, "accepted", journal !== undefined);
+      }
       signal?.throwIfAborted();
       phase = "readiness";
       await host.connect(signal);
@@ -431,6 +666,16 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
       }
       if (signedShutdown && this.#gitBootstrap) {
         await this.#gitBootstrap.cleanupAfterSignedShutdown(true, AbortSignal.timeout(this.#commandTimeoutMs)).catch(() => undefined);
+      }
+      if (journal && submissionStarted && !signedShutdown && attempt.phase === "submitted") {
+        const cleanupReason = cause instanceof Error
+          ? Object.getOwnPropertyDescriptor(cause, "phase")?.value
+          : undefined;
+        throw new V2SupervisorBootstrapError("Submitted supervisor cleanup remains unproven", "deploy", {
+          cause,
+          remoteCode: "bootstrap_cleanup_unproven",
+          ...(BOOTSTRAP_FAILURE_REASONS.includes(cleanupReason) ? { reason: cleanupReason } : {}),
+        });
       }
       if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
       if (cause instanceof V2SupervisorBootstrapError) throw cause;
@@ -599,6 +844,14 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
     this.#lifecycle.abort(new DOMException("Supervisor shutdown", "AbortError"));
     this.#shutdown = (async () => {
       await this.#ensuring?.catch(() => undefined);
+      if (!this.#host && this.#interruptedRecovery && this.#bootstrapJournal) {
+        this.#interruptedRecovery = false;
+        const cleanupDeadline = AbortSignal.timeout(this.#connectTimeoutMs + this.#commandTimeoutMs);
+        const cleanupSignal = signal ? AbortSignal.any([signal, cleanupDeadline]) : cleanupDeadline;
+        // Cleanup only: reuse the exact durable binding and registered release
+        // checks, without submitting a successor or repeating the launch.
+        await this.#bootstrapJournal.withLease(cleanupSignal, journal => this.#recoverBootstrap(journal, cleanupSignal));
+      }
       if (this.#host) {
         await this.#host.shutdown(safeReason(reason), signal);
         const attempt = this.#activeAttempt;
@@ -639,11 +892,47 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
 
   #confirmCleanup(binding: BootstrapBinding): void {
     this.#onCleanupProven?.(binding);
-    if (this.#pendingCleanupBinding === binding) this.#pendingCleanupBinding = null;
+    if (this.#pendingCleanupBinding && sameSupervisorBinding(this.#pendingCleanupBinding, binding)) {
+      this.#pendingCleanupBinding = null;
+    }
   }
 
   async readDiagnosticLog(file: SandboxLogFile, signal?: AbortSignal): Promise<string | null> {
     const sessionId = this.#executionSessionId;
+    if (!sessionId) throw new Error("Sandbox diagnostics are unavailable for this supervisor");
+    return this.#readExecutionDiagnosticLog(sessionId, file, signal);
+  }
+
+  /** At most the recovered predecessor and this controller's own attempted execution. */
+  diagnosticExecutions(): readonly SupervisorDiagnosticExecution[] {
+    return Object.freeze([...this.#diagnosticExecutions.values()]);
+  }
+
+  async readDiagnosticLogForExecution(sessionId: string, file: SandboxLogFile, signal?: AbortSignal): Promise<string | null> {
+    if (!this.#diagnosticExecutions.has(sessionId)) throw new Error("Unknown supervisor diagnostic execution");
+    return this.#readExecutionDiagnosticLog(sessionId, file, signal);
+  }
+
+  #rememberDiagnosticExecution(attempt: SupervisorBootstrapAttempt, dispatchState: SupervisorDiagnosticExecution["dispatchState"], durable: boolean): void {
+    if (attempt.binding.projectId !== this.binding.projectId) throw new V2SupervisorBootstrapError(
+      "Diagnostic execution belongs to another project", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+    const acceptance = attempt.commandAcceptance
+      ? validateDirectSupervisorExecAcceptance(attempt.commandAcceptance, attempt.sessionId) : undefined;
+    const previous = this.#diagnosticExecutions.get(attempt.sessionId);
+    if (previous && !sameSupervisorBinding(previous.binding, attempt.binding)) throw new V2SupervisorBootstrapError(
+      "Diagnostic execution binding changed", "deploy", { remoteCode: "bootstrap_ownership_conflict" });
+    if (!previous && this.#diagnosticExecutions.size >= MAX_DIAGNOSTIC_EXECUTIONS) {
+      this.#diagnosticExecutions.delete(this.#diagnosticExecutions.keys().next().value!);
+    }
+    this.#diagnosticExecutions.set(attempt.sessionId, Object.freeze({
+      sessionId: attempt.sessionId, workspaceRoot: `/codex_workspace/${attempt.sessionId}`,
+      leaderGeneration: attempt.binding.leaderGeneration, binding: Object.freeze({ ...attempt.binding }),
+      dispatchState, ...(acceptance ? { commandAcceptance: acceptance } : {}),
+      durableAcceptance: acceptance !== undefined && durable,
+    }));
+  }
+
+  async #readExecutionDiagnosticLog(sessionId: string, file: SandboxLogFile, signal?: AbortSignal): Promise<string | null> {
     if (this.#assets.revision !== "r10" || !sessionId || !this.#gateway.readDiagnosticFile || this.#closed) {
       throw new Error("Sandbox diagnostics are unavailable for this supervisor");
     }

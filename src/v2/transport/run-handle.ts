@@ -26,9 +26,24 @@ const RESPONSE_TERMINAL_EVENTS = new Set([
 export class V2PreCommitError extends Error {
   readonly name = "V2PreCommitError";
   readonly committed = false;
+  readonly #transportSettlement: Promise<void> | null;
 
-  constructor(message: string, readonly code: string) {
+  constructor(
+    message: string,
+    readonly code: string,
+    options: { readonly transportSettlement?: Promise<void> } = {},
+  ) {
     super(message);
+    this.#transportSettlement = options.transportSettlement ?? null;
+  }
+
+  /**
+   * Process-local proof that already-published pre-execution frames no longer
+   * own reliable transport. It carries no request content and is never
+   * serialized into a provider or public error.
+   */
+  get transportSettlement(): Promise<void> | null {
+    return this.#transportSettlement;
   }
 }
 

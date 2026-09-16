@@ -7,11 +7,87 @@ import {
 import {
   observabilityEvent,
   sandboxLivenessObservabilityEvent,
+  fleetLifecycleObservabilityEvent,
+  FLEET_BOOTSTRAP_CLEANUP_REASONS,
+  FLEET_BOOTSTRAP_CLEANUP_STAGES,
+  FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES,
+  SANDBOX_SUPERVISOR_PHASES,
   type ObservabilityEvent,
+  type JsonValue,
 } from "../src/observability/events";
 import { V2_R3_RELEASE } from "../src/v2/sidecar/assets";
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES, BOOTSTRAP_FAILURE_REASONS } from "../src/sandbox/types";
 
 describe("observability privacy", () => {
+  it("keeps cleanup failure diagnostics optional, fixed and confined to deferred events", () => {
+    const identity = { project_id: "00000000-0000-4000-8000-000000000032", worker_index: 31, leader_generation: 7 };
+    for (const [key, values] of [
+      ["cleanup_stage", FLEET_BOOTSTRAP_CLEANUP_STAGES], ["error_name", FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES],
+      ["bootstrap_phase", BOOTSTRAP_FAILURE_PHASES], ["bootstrap_code", BOOTSTRAP_FAILURE_CODES],
+      ["bootstrap_reason", BOOTSTRAP_FAILURE_REASONS], ["supervisor_phase", SANDBOX_SUPERVISOR_PHASES],
+    ] as const) {
+      for (const value of values) {
+        const valid = observabilityEvent("fleet.bootstrap_cleanup.deferred", { ...identity, cleanup_reason: "proof_unavailable", [key]: value });
+        expect(() => assertSafeObservabilityEvent(valid)).not.toThrow();
+        for (const invalid of ["PRIVATE_CLEANUP_CANARY", value + "\n", "prefix" + value, value + "suffix", null, 1]) {
+          expect(() => assertSafeObservabilityEvent({ ...valid, [key]: invalid })).toThrow();
+        }
+        for (const event of ["fleet.bootstrap_cleanup.started", "fleet.bootstrap_cleanup.succeeded", "fleet.mutation.blocked"] as const) {
+          expect(() => assertSafeObservabilityEvent(observabilityEvent(event, { ...identity, [key]: value }))).toThrow();
+        }
+      }
+    }
+  });
+
+  it("accepts only exact held-bootstrap cleanup identities and deferred reasons", () => {
+    const identity = { project_id: "00000000-0000-4000-8000-000000000032", worker_index: 31, leader_generation: 7 };
+    for (const event of ["fleet.bootstrap_cleanup.started", "fleet.bootstrap_cleanup.succeeded"] as const) {
+      expect(() => assertSafeObservabilityEvent(fleetLifecycleObservabilityEvent(event, identity))).not.toThrow();
+      expect(() => assertSafeObservabilityEvent(fleetLifecycleObservabilityEvent(event, { ...identity, cleanup_reason: "timeout" }))).toThrow();
+    }
+    for (const cleanup_reason of FLEET_BOOTSTRAP_CLEANUP_REASONS) {
+      expect(() => assertSafeObservabilityEvent(fleetLifecycleObservabilityEvent("fleet.bootstrap_cleanup.deferred", {
+        ...identity, cleanup_reason,
+      }))).not.toThrow();
+    }
+    const valid: Record<string, JsonValue> = { ...identity, cleanup_reason: "proof_unavailable" };
+    const invalidFields: Array<Record<string, JsonValue>> = [
+      { cleanup_reason: "PRIVATE_CLEANUP_CANARY" }, { cleanup_reason: "timeout\n" },
+      { cleanup_reason: "TIMEOUT" }, { cleanup_reason: null }, { cleanup_reason: 1 },
+      { reason: "timeout" }, { error_message: "PRIVATE_CLEANUP_CANARY" },
+      { project_id: identity.project_id + "\n" }, { project_id: "prefix" + identity.project_id },
+      { project_id: identity.project_id + "suffix" }, { worker_index: -1 }, { worker_index: "private" },
+      { leader_generation: 1.5 }, { leader_generation: Number.MAX_SAFE_INTEGER + 1 },
+    ];
+    for (const fields of invalidFields) {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.bootstrap_cleanup.deferred", { ...valid, ...fields }))).toThrow();
+    }
+    for (const key of ["project_id", "worker_index", "leader_generation", "cleanup_reason"]) {
+      const missing = { ...valid };
+      delete missing[key];
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("fleet.bootstrap_cleanup.deferred", missing))).toThrow();
+    }
+  });
+  it("keeps effective timeout and route-progress diagnostics numeric and content-free", () => {
+    const startup = observabilityEvent("server.started", {
+      router_queue_timeout_ms: 60_000, initial_route_attempt_timeout_ms: 30_000,
+      committed_handle_timeout_ms: 60_000, prepared_proof_uses_attempt_budget: true,
+    });
+    expect(() => assertSafeObservabilityEvent(startup)).not.toThrow();
+    for (const key of ["router_queue_timeout_ms", "initial_route_attempt_timeout_ms", "committed_handle_timeout_ms"]) {
+      for (const value of [-1, 0, Number.NaN, Infinity, "private timeout"]) {
+        expect(() => assertSafeObservabilityEvent({ ...startup, [key]: value })).toThrow();
+      }
+    }
+    const expiry = observabilityEvent("route.attempt_expired", {
+      progress_observer_enabled: true, fallback_peer_available: false, remaining_admission_ms: 123.5,
+    });
+    expect(() => assertSafeObservabilityEvent(expiry)).not.toThrow();
+    expect(() => assertSafeObservabilityEvent({ ...expiry, progress_observer_enabled: "private state" })).toThrow();
+    expect(() => assertSafeObservabilityEvent({ ...expiry, fallback_peer_available: 1 })).toThrow();
+    expect(() => assertSafeObservabilityEvent({ ...expiry, remaining_admission_ms: -1 })).toThrow();
+  });
+
   it("records only bounded reasoning effort labels without reading reasoning content", () => {
     for (const effort of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
       expect(safeObservabilityReasoningEffort({ effort, summary: "private reasoning" })).toBe(effort);
@@ -133,9 +209,43 @@ describe("observability privacy", () => {
       status: 400,
       error_kind: "invalid_json",
       provider_origin: "sse",
-      upstream_request_id: "req_invalid_json_1",
+      upstream_request_id_sha256: "a".repeat(64),
       committed: true,
     }))).not.toThrow();
+  });
+
+  it("rejects free-form request failure text and malformed correlation fields", () => {
+    const invalidFailures: Array<Record<string, JsonValue>> = [
+      { error_message: "ordinary reflected private text" }, { error_name: "PRIVATE_CANARY" },
+      { error_kind: "PRIVATE_CANARY" }, { upstream_request_id: "req_PRIVATE_CANARY" },
+      { upstream_request_id_sha256: "a".repeat(64) + "\n" }, { upstream_request_id_sha256: "PRIVATE_CANARY" },
+      { provider_origin: "PRIVATE_CANARY" }, { status: 42.5 }, { committed: "PRIVATE_CANARY" },
+      { error_kind: "cancelled", cancellation_origin: "PRIVATE_CANARY" },
+      { error_kind: "stream", cancellation_origin: "websocket_remote_close" },
+      { error_kind: "cancelled", websocket_close_code: 1001 },
+      { error_kind: "cancelled", cancellation_origin: "websocket_remote_close", websocket_close_code: 1001.5 },
+      { error_kind: "cancelled", cancellation_origin: "websocket_remote_close", websocket_close_code: 5000 },
+    ];
+    for (const fields of invalidFailures) {
+      expect(() => assertSafeObservabilityEvent(observabilityEvent("request.failed", fields))).toThrow();
+    }
+  });
+
+  it("validates bounded runtime-detail sample correlation and privacy", () => {
+    const sample = observabilityEvent("fleet.runtime_sample", {
+      sample_id: 1, runtime_index: 31, runtime_count: 32,
+      runtime: { availability_reason: "available", diagnostics: { host: { oldest_outstanding_frame_kind: "ping" } } },
+    });
+    expect(() => assertSafeObservabilityEvent(sample)).not.toThrow();
+    const invalidSamples: Array<Record<string, JsonValue>> = [
+      { sample_id: 0 }, { sample_id: "private" }, { runtime_index: 32 }, { runtime_index: -1 },
+      { runtime_count: 257 }, { runtime_count: 1.5 }, { runtime: null },
+      { runtime: { diagnostics: { instance_id: "private" } } },
+      { runtime: { diagnostics: { host: { oldest_outstanding_frame_kind: "private" } } } },
+    ];
+    for (const fields of invalidSamples) {
+      expect(() => assertSafeObservabilityEvent({ ...sample, ...fields })).toThrow();
+    }
   });
 
   it("rejects forbidden fields and credential values", () => {
@@ -278,6 +388,91 @@ describe("observability privacy", () => {
     expect(() => assertSafeObservabilityEvent(observabilityEvent("route.selected", {
       transfer_admission_cost: 1.5,
     }))).toThrow();
+  });
+
+  it("accepts bounded host-only transport evidence and exact frame categories", () => {
+    const fields = {
+      retained_precommit_cancellations: 1,
+      last_published_host_credit_ceiling: 128,
+      oldest_outstanding_frame_kind: "request_cancel",
+      outstanding_flight_age_ms: 25.5,
+      data_peer_age_ms: 2_000.25,
+      control_peer_age_ms: 30_000,
+      last_data_revision: 987,
+      last_control_revision: 12,
+    };
+    const hostEvent = (host: Record<string, string | number | boolean | null>) =>
+      observabilityEvent("fleet.sample", { runtimes: [{ diagnostics: { host } }] });
+    expect(() => assertSafeObservabilityEvent(hostEvent(fields))).not.toThrow();
+    const detailEvent = (host: Record<string, JsonValue>) => observabilityEvent("fleet.runtime_sample", {
+      sample_id: 1, runtime_index: 0, runtime_count: 32, runtime: { diagnostics: { host } },
+    });
+    expect(() => assertSafeObservabilityEvent(detailEvent(fields))).not.toThrow();
+    for (const key of ["data_peer_age_ms", "control_peer_age_ms", "inbound_accepted_progress_age_ms",
+      "inbound_processed_progress_age_ms", "sidecar_diagnostics_age_ms", "sidecar_pending_age_ms"]) {
+      for (const age of [null, 0, 0.25, Number.MAX_SAFE_INTEGER]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: age }))).not.toThrow();
+      }
+      for (const age of [-1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "PRIVATE_LANE_AGE", false, [], {}]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: age }))).toThrow(TypeError);
+      }
+    }
+    for (const key of ["last_data_revision", "last_control_revision", "inbound_accepted_epoch", "inbound_processed_epoch",
+      "inbound_processing_frames", "sidecar_pending_data_publications"]) {
+      for (const revision of [null, 0, 987, Number.MAX_SAFE_INTEGER]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: revision }))).not.toThrow();
+      }
+      for (const revision of [-1, 0.25, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "PRIVATE_LANE_REVISION", false, [], {}]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: revision }))).toThrow(TypeError);
+      }
+    }
+    for (const key of ["inbound_accepted_sequence", "inbound_processed_sequence"]) {
+      for (const sequence of [null, -1, 0, 987, Number.MAX_SAFE_INTEGER]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: sequence }))).not.toThrow();
+      }
+      for (const sequence of [-2, 0.25, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "PRIVATE_SEQUENCE", false, [], {}]) {
+        expect(() => assertSafeObservabilityEvent(detailEvent({ ...fields, [key]: sequence }))).toThrow(TypeError);
+      }
+    }
+    for (const key of ["retained_precommit_cancellations", "last_published_host_credit_ceiling"] as const) {
+      for (const value of [0, 128]) {
+        expect(() => assertSafeObservabilityEvent(hostEvent({ ...fields, [key]: value })))
+          .not.toThrow();
+      }
+      for (const value of [-1, 0.5, 129, Number.NaN, Infinity, "private count"]) {
+        expect(() => assertSafeObservabilityEvent(hostEvent({ ...fields, [key]: value })))
+          .toThrow(TypeError);
+      }
+    }
+    for (const value of [
+      null, "request_open", "request_data", "request_commit", "request_start", "request_cancel",
+      "response_ack", "credential_rotate", "drain", "ping",
+    ]) {
+      expect(() => assertSafeObservabilityEvent(hostEvent({
+        ...fields, oldest_outstanding_frame_kind: value,
+      }))).not.toThrow();
+    }
+    for (const value of ["response_data", "request_cancel\n", "REQUEST_CANCEL", "private frame", 1, false]) {
+      expect(() => assertSafeObservabilityEvent(hostEvent({
+        ...fields, oldest_outstanding_frame_kind: value,
+      }))).toThrow(TypeError);
+    }
+    expect(() => assertSafeObservabilityEvent(hostEvent({
+      retained_precommit_cancellations: 0,
+      last_published_host_credit_ceiling: null,
+      oldest_outstanding_frame_kind: null,
+      outstanding_flight_age_ms: null,
+    }))).not.toThrow();
+    expect(() => assertSafeObservabilityEvent(hostEvent({ ...fields, outstanding_flight_age_ms: 0 })))
+      .not.toThrow();
+    for (const value of [-1, Number.NaN, Infinity, "private age"]) {
+      expect(() => assertSafeObservabilityEvent(hostEvent({ ...fields, outstanding_flight_age_ms: value })))
+        .toThrow(TypeError);
+    }
+    for (const key of ["session_id", "instance_id", "request_body", "authorization"]) {
+      expect(() => assertSafeObservabilityEvent(hostEvent({ ...fields, [key]: "PRIVATE_HOST_CANARY" })))
+        .toThrow(TypeError);
+    }
   });
 
   it("accepts only exact release hashes and rejects lifecycle binding fields", () => {

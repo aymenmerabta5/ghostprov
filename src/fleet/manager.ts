@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { MultiSandboxConfig } from "../config/multi-sandbox";
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
+import { FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES, SANDBOX_SUPERVISOR_PHASES } from "../observability/events";
+import { requestFailureFields } from "../observability/request-error";
 import type { FleetRecoverySnapshot } from "../prism/recovery-coordinator";
 import type { PrismIdentityKind } from "../prism/session-manager";
 import type { PrismProjectSummary } from "../prism/projects-client";
@@ -11,11 +13,13 @@ import {
   type RoutableSandboxSnapshot,
 } from "../sandbox/registry";
 import type { SandboxSupervisorEvent } from "../sandbox/supervised-runtime";
-import { projectId, type ProjectId } from "../sandbox/types";
-import { FleetManifestStore, MAX_MANIFEST_WORKERS } from "./manifest";
-import { FileBootstrapHoldMigration, MAX_BOOTSTRAP_MIGRATION_PROJECTS } from "./bootstrap-migration";
+import { BOOTSTRAP_FAILURE_CODES, BOOTSTRAP_FAILURE_PHASES, BOOTSTRAP_FAILURE_REASONS, projectId, type ProjectId } from "../sandbox/types";
+import { FleetManifestStore, MAX_MANIFEST_WORKERS, sameFleetWorkerRecord } from "./manifest";
+import { FileBootstrapHoldMigration, MAX_BOOTSTRAP_MIGRATION_PROJECTS, MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS } from "./bootstrap-migration";
 import type {
   FleetLifecycleEvent,
+  FleetBootstrapCleanupDiagnostic,
+  FleetBootstrapCleanupReason,
   FleetManifest,
   FleetMutationBlockReason,
   FleetMutationOperation,
@@ -74,6 +78,18 @@ interface RuntimeStart {
 interface RuntimeStop {
   state: "pending" | "fulfilled" | "rejected";
   observation: Promise<boolean>;
+}
+
+interface BootstrapCleanupOperation {
+  readonly kind: "prove" | "finalize";
+  readonly worker: Readonly<FleetWorkerRecord>;
+  readonly runtimeOwner: RoutableSandboxRuntime | null;
+  readonly controller: AbortController;
+  readonly deadlineMs: number;
+  completion: Promise<void>;
+  settled: boolean;
+  succeeded: boolean;
+  deferredReason: FleetBootstrapCleanupReason | null;
 }
 
 const DEFAULT_RETRY_INITIAL_DELAY_MS = 500;
@@ -142,6 +158,40 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function cleanupOwnData(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function cleanupAtom<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  return typeof value === "string" && allowed.includes(value as T) ? value as T : undefined;
+}
+
+/** At most six own-data cause records; getters, messages and arbitrary payloads are never read. */
+export function bootstrapCleanupFailureDiagnostic(error: unknown): FleetBootstrapCleanupDiagnostic {
+  const diagnostic: FleetBootstrapCleanupDiagnostic = { errorName: "Error" };
+  const seen = new Set<object>();
+  let value = error;
+  for (let depth = 0; depth < 6 && value !== null && typeof value === "object" && !seen.has(value); depth++) {
+    seen.add(value);
+    const name = cleanupOwnData(value, "name");
+    diagnostic.errorName = cleanupAtom(name, FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES) ??
+      cleanupAtom(requestFailureFields(value).error_name, FLEET_BOOTSTRAP_CLEANUP_ERROR_NAMES) ?? "Error";
+    if (name === "V2SupervisorBootstrapError") {
+      diagnostic.bootstrapPhase ??= cleanupAtom(cleanupOwnData(value, "kind"), BOOTSTRAP_FAILURE_PHASES);
+      diagnostic.bootstrapCode ??= cleanupAtom(cleanupOwnData(value, "remoteCode"), BOOTSTRAP_FAILURE_CODES);
+      diagnostic.bootstrapReason ??= cleanupAtom(cleanupOwnData(value, "reason"), BOOTSTRAP_FAILURE_REASONS);
+    }
+    if (name === "V2SupervisorError") {
+      diagnostic.supervisorPhase ??= cleanupAtom(cleanupOwnData(value, "phase"), SANDBOX_SUPERVISOR_PHASES);
+    }
+    value = cleanupOwnData(value, "cause");
+  }
+  return diagnostic;
+}
+
 function statusOf(error: unknown): number | null {
   const status = record(error)?.status;
   return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599
@@ -187,6 +237,8 @@ function replacementFailureSignature(
   failure: SandboxSupervisorEvent["failure"],
 ): { signatureHash: string; kind: FleetReplacementFailureKind } | null {
   if (!failure || failure.name !== "V2BootstrapError") return null;
+  const cleanupBlocked = failure.kind === "deploy" &&
+    failure.bootstrapCode === "bootstrap_cleanup_unproven";
   const bootstrapBlocked = failure.kind === "deploy" &&
     (failure.bootstrapCode === "bootstrap_cleanup_unproven" || failure.bootstrapCode === "bootstrap_ownership_conflict");
   if (!bootstrapBlocked && (!failure.kind || !REPLACEABLE_BOOTSTRAP_KINDS.has(failure.kind))) return null;
@@ -201,7 +253,8 @@ function replacementFailureSignature(
     failure.sidecarCauseName ?? "",
     failure.sidecarPhase ?? "",
     failure.sidecarPermission ?? "",
-    ...(bootstrapBlocked ? [failure.bootstrapPhase ?? "", failure.bootstrapCode!, failure.bootstrapReason ?? ""] : []),
+    ...(bootstrapBlocked ? [failure.bootstrapPhase ?? "", failure.bootstrapCode!,
+      ...(cleanupBlocked ? [] : [failure.bootstrapReason ?? ""])] : []),
   ].join("|");
   return Object.freeze({
     signatureHash: createHash("sha256").update(signature).digest("hex"),
@@ -245,6 +298,11 @@ export interface ProjectFleetManagerOptions {
   recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
   canRetireProject?: (projectId: ProjectId) => boolean;
   bootstrapMigration?: FileBootstrapHoldMigration;
+  /** Cleanup-only trusted composition port: true requires durable exact cleanup_proven, retained until finalization. */
+  cleanupHeldBootstrap?: (worker: Readonly<FleetWorkerRecord>, signal: AbortSignal) => Promise<boolean>;
+  /** Finalizes proven bootstrap artifacts before any managed retirement deletes its project or manifest record. */
+  finalizeHeldBootstrapCleanup?: (worker: Readonly<FleetWorkerRecord>, signal: AbortSignal) => Promise<void>;
+  bootstrapCleanupTimeoutMs?: number;
   onLifecycleEvent?: (event: FleetLifecycleEvent) => void;
 }
 
@@ -275,7 +333,16 @@ export class ProjectFleetManager {
   readonly #recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
   readonly #canRetireProject: (projectId: ProjectId) => boolean;
   readonly #bootstrapMigration?: FileBootstrapHoldMigration;
+  readonly #cleanupHeldBootstrap?: ProjectFleetManagerOptions["cleanupHeldBootstrap"];
+  readonly #finalizeHeldBootstrapCleanup?: ProjectFleetManagerOptions["finalizeHeldBootstrapCleanup"];
+  readonly #bootstrapCleanupTimeoutMs: number;
+  #bootstrapCleanup: BootstrapCleanupOperation | null = null;
+  #finalizedBootstrapRetirement: Readonly<FleetWorkerRecord> | null = null;
+  #bootstrapCleanupRetryAtMs = 0;
+  #lastHeldCleanupIndex = 0;
+  #lastCleanupDeferral: string | null = null;
   #migrationProjects: ReadonlySet<ProjectId> = new Set();
+  #operatorRecoveryProjects: ReadonlySet<ProjectId> = new Set();
   readonly #onLifecycleEvent?: (event: FleetLifecycleEvent) => void;
   readonly #unavailableProjects = new Set<ProjectId>();
   readonly #replacementCandidates = new Set<ProjectId>();
@@ -325,6 +392,12 @@ export class ProjectFleetManager {
     this.#recoveryCircuitSnapshot = options.recoveryCircuitSnapshot;
     this.#canRetireProject = options.canRetireProject ?? (() => true);
     this.#bootstrapMigration = options.bootstrapMigration;
+    this.#cleanupHeldBootstrap = options.cleanupHeldBootstrap;
+    this.#finalizeHeldBootstrapCleanup = options.finalizeHeldBootstrapCleanup;
+    this.#bootstrapCleanupTimeoutMs = options.bootstrapCleanupTimeoutMs ?? this.#runtimeCleanupTimeoutMs;
+    if (this.#cleanupHeldBootstrap && !this.#finalizeHeldBootstrapCleanup) {
+      throw new TypeError("Held bootstrap recovery requires retirement cleanup finalization");
+    }
     this.#onLifecycleEvent = options.onLifecycleEvent;
     this.#withProvisionPermit = concurrencyGate(this.#config.provisionConcurrency);
     if (
@@ -335,7 +408,8 @@ export class ProjectFleetManager {
       !Number.isSafeInteger(this.#metadataAttemptTimeoutMs) ||
       this.#metadataAttemptTimeoutMs < 1 ||
       !Number.isSafeInteger(this.#runtimeCleanupTimeoutMs) ||
-      this.#runtimeCleanupTimeoutMs < 1
+      this.#runtimeCleanupTimeoutMs < 1 ||
+      !Number.isSafeInteger(this.#bootstrapCleanupTimeoutMs) || this.#bootstrapCleanupTimeoutMs < 1
     ) {
       throw new RangeError("Fleet retry delays are invalid");
     }
@@ -545,6 +619,11 @@ export class ProjectFleetManager {
 
   async shutdown(reason: string): Promise<void> {
     this.#shuttingDown = true;
+    const bootstrapCleanup = this.#bootstrapCleanup;
+    if (bootstrapCleanup && !bootstrapCleanup.settled) {
+      this.#deferBootstrapCleanup(bootstrapCleanup, "aborted");
+      bootstrapCleanup.controller.abort(new DOMException("Fleet shutdown", "AbortError"));
+    }
     this.#retryController?.abort();
     this.#activeReconcile?.abort();
     for (const start of this.#runtimeStarts.values()) start.controller.abort();
@@ -566,6 +645,10 @@ export class ProjectFleetManager {
     const failures = stopped.flatMap(result =>
       result.status === "rejected" ? [result.reason] : []
     );
+    if (bootstrapCleanup && !bootstrapCleanup.settled &&
+      !await this.#settleWithin(() => bootstrapCleanup.completion, this.#runtimeCleanupTimeoutMs)) {
+      failures.push(new FleetReconciliationError("Bootstrap cleanup operation did not stop", "runtime"));
+    }
     if (this.#registry.runtimes().length === 0) {
       this.#unavailableProjects.clear();
       this.#selectedProjects = Object.freeze([]);
@@ -584,7 +667,19 @@ export class ProjectFleetManager {
         "runtime",
       ));
     }
-    if (failures.length) throw new AggregateError(failures, "Fleet shutdown was incomplete");
+    if (failures.length) {
+      // The server prints only the outer error. Keep the failed ownership visible
+      // without copying nested exception messages or an unbounded fleet listing.
+      const failedProjects = runtimes.flatMap((runtime, index) =>
+        stopped[index]?.status === "rejected" ? [runtime.projectId] : []
+      );
+      const shownProjects = failedProjects.slice(0, 8);
+      throw new AggregateError(failures,
+        `Fleet shutdown was incomplete (failed runtimes: ${failedProjects.length}; ` +
+        `remaining runtimes: ${this.#registry.runtimes().length}; ` +
+        `projects: ${shownProjects.join(", ") || "none"}${failedProjects.length > shownProjects.length ? ", ..." : ""})`,
+      );
+    }
   }
 
   snapshot(): FleetSnapshot {
@@ -634,6 +729,7 @@ export class ProjectFleetManager {
     this.#throwIfAborted(signal);
     let manifest = await this.#manifest.initialize(this.#identity.kind);
     manifest = await this.#importLegacyProjects(manifest, signal);
+    manifest = await this.#commitHeldBootstrapCleanup(manifest, signal);
     this.#hydrateReplacementCandidates(manifest);
     this.#hydrateReplacementSuccessors(manifest);
     const failedHold: { runtime: RoutableSandboxRuntime | null } = { runtime: null };
@@ -642,9 +738,10 @@ export class ProjectFleetManager {
       if (this.#bootstrapMigration) {
         let applying = false;
         try {
-          manifest = await this.#bootstrapMigration.withValidated(manifest, async projects => {
+          manifest = await this.#bootstrapMigration.withValidatedAuthority(manifest, async authority => {
             applying = true;
-            this.#migrationProjects = projects;
+            this.#migrationProjects = authority.projects;
+            this.#operatorRecoveryProjects = authority.operatorRecoveryProjects;
             return apply();
           });
         } catch (error) {
@@ -652,6 +749,7 @@ export class ProjectFleetManager {
           // A stale or unavailable private grant removes only migration authority.
           // Ordinary fleet work continues; an entered mutation is never replayed.
           this.#migrationProjects = new Set();
+          this.#operatorRecoveryProjects = new Set();
           manifest = await apply();
         }
       } else {
@@ -726,6 +824,7 @@ export class ProjectFleetManager {
     if (this.#snapshot.ready >= this.#desiredSandboxes) {
       manifest = await this.#cleanupOneRetirement(manifest, signal);
     }
+    this.#startHeldBootstrapCleanup(manifest, signal);
     this.#pendingRetirements = manifest.workers.filter(
       worker => worker.state === "draining",
     ).length;
@@ -737,6 +836,8 @@ export class ProjectFleetManager {
     this.#pendingMaintenance = this.#unavailableProjects.size > 0 ||
       activeCount < this.#desiredSandboxes ||
       automaticRetirements > 0 ||
+      !!this.#bootstrapCleanup ||
+      (!!this.#cleanupHeldBootstrap && manifest.workers.some(worker => worker.retirementReason === "bootstrap_hold")) ||
       this.#replacementCandidates.size > 0 ||
       this.#mutationRetryInMs() !== null;
     this.#refreshSnapshot();
@@ -787,7 +888,7 @@ export class ProjectFleetManager {
       const runtime = hold ? this.#registry.get(id) : undefined;
       // Fence admission synchronously after the zero-work check. A recovered
       // heartbeat must not make the old project routable while the hold is saved.
-      if (runtime) void runtime.stop().catch(() => undefined);
+      if (runtime) this.#observeRuntimeStop(runtime, this.#runtimeCleanupTimeoutMs);
       try {
         current = await this.#manifest.markDraining(id,
           hold ? "bootstrap_hold" : "replacement", this.#clock.now());
@@ -840,7 +941,9 @@ export class ProjectFleetManager {
       const held = manifest.workers.filter(value => value.retirementReason === "bootstrap_hold");
       const ordinaryHeld = held.filter(value => !this.#migrationProjects.has(value.projectId)).length;
       const granted = this.#migrationProjects.has(worker.projectId);
-      if (held.length >= MAX_BOOTSTRAP_HELD_PROJECTS + MAX_BOOTSTRAP_MIGRATION_PROJECTS ||
+      const grantedLimit = this.#operatorRecoveryProjects.size > 0
+        ? MAX_BOOTSTRAP_OPERATOR_RECOVERY_PROJECTS : MAX_BOOTSTRAP_MIGRATION_PROJECTS;
+      if (held.length >= MAX_BOOTSTRAP_HELD_PROJECTS + grantedLimit ||
         (!granted && ordinaryHeld >= Math.min(MAX_BOOTSTRAP_HELD_PROJECTS, this.#config.maxProjects)) ||
         manifest.workers.length >= MAX_MANIFEST_WORKERS) {
         return this.#blockMutation(worker, "replace", "bootstrap_hold_limit");
@@ -868,7 +971,10 @@ export class ProjectFleetManager {
       isRuntimeHealthy(value) &&
       value.releaseRevision === this.#config.v2SidecarRevision
     ).length;
-    if (healthyPeers < Math.floor(this.#desiredSandboxes / 2) + 1) {
+    // Only an explicit v2 operator grant authorizes this retained bootstrap
+    // hold below majority. Ordinary/destructive replacement keeps the gate.
+    if (healthyPeers < Math.floor(this.#desiredSandboxes / 2) + 1 &&
+      !(hold && this.#operatorRecoveryProjects.has(worker.projectId))) {
       return this.#blockMutation(worker, "replace", "healthy_majority");
     }
     this.#clearMutationBlock(worker.projectId, "replace");
@@ -884,11 +990,176 @@ export class ProjectFleetManager {
       // Stop only local routing/recovery ownership. The original project and
       // private bootstrap receipt remain intact even when remote cleanup fails.
       const runtime = this.#registry.get(worker.projectId);
-      if (runtime && !await this.#stopAndRemoveRuntime(runtime)) {
-        throw new FleetReconciliationError("Held project could not be fenced locally", "runtime");
+      if (runtime) {
+        const stop = this.#observeRuntimeStop(runtime, this.#runtimeCleanupTimeoutMs);
+        const snapshot = runtime.snapshot();
+        const locallyFenced = stop !== undefined && snapshot.state === "stopped" && snapshot.capacity === 0 && snapshot.available === 0 &&
+          snapshot.active === 0 && snapshot.quarantined === 0 && (snapshot.ambiguousQuarantined ?? 0) === 0 &&
+          !this.#runtimeStarts.has(runtime);
+        // Remote cleanup can remain unresolved after the permanent local stop.
+        // Keep that exact owner registered, and keep its hold/journal, while
+        // independent workers and a separate successor recover fleet capacity.
+        const physicallyComplete = this.#runtimeLocalCleanupComplete(runtime);
+        if ((stop?.state === "fulfilled" && physicallyComplete && !this.#runtimeCleanupProofRequired(runtime)) || !locallyFenced) {
+          if (!await this.#stopAndRemoveRuntime(runtime)) {
+            throw new FleetReconciliationError("Held project could not be fenced locally", "runtime");
+          }
+        }
       }
       this.#blockMutation(worker, "delete", "bootstrap_cleanup");
     }
+  }
+
+  #reportBootstrapCleanupDeferred(worker: Readonly<FleetWorkerRecord>, reason: FleetBootstrapCleanupReason,
+    diagnostic?: FleetBootstrapCleanupDiagnostic): void {
+    const key = `${worker.projectId}:${worker.leaderGeneration}:${reason}`;
+    if (this.#lastCleanupDeferral === key) return;
+    this.#lastCleanupDeferral = key;
+    this.#emitLifecycle({ type: "bootstrap_cleanup_deferred", projectId: worker.projectId,
+      workerIndex: worker.index, leaderGeneration: worker.leaderGeneration, reason, ...diagnostic });
+  }
+
+  #deferBootstrapCleanup(operation: BootstrapCleanupOperation, reason: FleetBootstrapCleanupReason,
+    diagnostic?: FleetBootstrapCleanupDiagnostic): void {
+    if (operation.deferredReason !== null) return;
+    operation.deferredReason = reason;
+    this.#reportBootstrapCleanupDeferred(operation.worker, reason, diagnostic);
+  }
+
+  #beginBootstrapCleanup(kind: BootstrapCleanupOperation["kind"], worker: Readonly<FleetWorkerRecord>): void {
+    const controller = new AbortController();
+    const timeoutController = new AbortController();
+    const operation: BootstrapCleanupOperation = { kind, worker, controller,
+      runtimeOwner: this.#registry.get(worker.projectId) ?? null,
+      deadlineMs: this.#clock.now() + this.#bootstrapCleanupTimeoutMs,
+      completion: Promise.resolve(), settled: false, succeeded: false, deferredReason: null };
+    this.#bootstrapCleanup = operation;
+    this.#lastCleanupDeferral = null;
+    this.#emitLifecycle({ type: "bootstrap_cleanup_started", projectId: worker.projectId,
+      workerIndex: worker.index, leaderGeneration: worker.leaderGeneration });
+    void this.#clock.waitUntil(operation.deadlineMs, timeoutController.signal).then(() => {
+      if (operation.settled) return;
+      this.#deferBootstrapCleanup(operation, "timeout");
+      controller.abort(new DOMException("Bootstrap cleanup deadline expired", "TimeoutError"));
+    }, () => undefined);
+    // Retain this one owner after timeout until its actual operation settles.
+    // A disconnected or uncooperative cleanup cannot spawn accumulating retries.
+    operation.completion = Promise.resolve().then(async () => {
+      controller.signal.throwIfAborted();
+      if (kind === "prove") return this.#cleanupHeldBootstrap!(worker, controller.signal);
+      await this.#finalizeHeldBootstrapCleanup!(worker, controller.signal);
+      return true;
+    }).then(proven => {
+      if (this.#clock.now() >= operation.deadlineMs) this.#deferBootstrapCleanup(operation, "timeout");
+      if (this.#shuttingDown || controller.signal.aborted) this.#deferBootstrapCleanup(operation, "aborted");
+      if (proven !== true) this.#deferBootstrapCleanup(operation, "proof_unavailable", { cleanupStage: "proof_returned_false" });
+      operation.succeeded = proven === true && operation.deferredReason === null;
+    }, error => {
+      this.#deferBootstrapCleanup(operation, controller.signal.aborted
+        ? "aborted" : kind === "prove" ? "proof_unavailable" : "cleanup_failed", {
+        cleanupStage: kind === "prove" ? "proof_threw" : "finalize_threw",
+        ...bootstrapCleanupFailureDiagnostic(error),
+      });
+    }).finally(() => {
+      operation.settled = true;
+      timeoutController.abort();
+      this.#bootstrapCleanupRetryAtMs = this.#clock.now() + (operation.succeeded ? 0 : this.#retryMaxDelayMs);
+      if (!this.#shuttingDown) {
+        this.#pendingMaintenance = true;
+        this.#wakeRetry();
+        this.#scheduleRetry();
+      }
+    });
+  }
+
+  async #commitHeldBootstrapCleanup(manifest: FleetManifest, signal: AbortSignal): Promise<FleetManifest> {
+    const operation = this.#bootstrapCleanup;
+    if (!operation?.settled) return manifest;
+    this.#bootstrapCleanup = null;
+    if (!operation.succeeded) return manifest;
+    this.#throwIfAborted(signal);
+    const worker = manifest.workers.find(value => value.projectId === operation.worker.projectId);
+    const runtime = this.#registry.get(operation.worker.projectId) ?? null;
+    if (!worker || !sameFleetWorkerRecord(worker, operation.worker) || runtime !== operation.runtimeOwner ||
+      (runtime && !this.#heldRuntimeCleanupReady(runtime))) {
+      this.#reportBootstrapCleanupDeferred(operation.worker, "worker_changed");
+      return manifest;
+    }
+    if (operation.kind === "finalize") {
+      this.#finalizedBootstrapRetirement = operation.worker;
+      return manifest;
+    }
+    try {
+      // Exact proof has settled, but the original hold still witnesses one-shot
+      // grant consumption. Persist that fact before retirement can clear it.
+      await this.#bootstrapMigration?.recordConsumedHold(operation.worker, signal);
+      if (runtime) {
+        // The port has persisted the exact journal's remote cleanup proof.
+        // Release this registration only after its independent physical-local
+        // witness, never merely because its bounded public stop rejected.
+        await this.#registry.removeStopped(runtime.projectId);
+        this.#runtimeStops.delete(runtime);
+      }
+      this.#throwIfAborted(signal);
+      const next = await this.#manifest.completeBootstrapHoldCleanup(operation.worker, this.#clock.now());
+      this.#clearMutationBlock(worker.projectId);
+      this.#emitLifecycle({ type: "bootstrap_cleanup_succeeded", projectId: worker.projectId,
+        workerIndex: worker.index, leaderGeneration: worker.leaderGeneration });
+      return next;
+    } catch (error) {
+      this.#reportBootstrapCleanupDeferred(operation.worker, "worker_changed");
+      throw error;
+    }
+  }
+
+  #startHeldBootstrapCleanup(manifest: FleetManifest, signal: AbortSignal): void {
+    if (!this.#cleanupHeldBootstrap || this.#bootstrapCleanup || this.#clock.now() < this.#bootstrapCleanupRetryAtMs) return;
+    this.#throwIfAborted(signal);
+    const held = manifest.workers.filter(worker => worker.managed && worker.retirementReason === "bootstrap_hold")
+      .sort((left, right) => left.index - right.index);
+    const after = held.findIndex(value => value.index > this.#lastHeldCleanupIndex);
+    const ordered = after < 1 ? held : [...held.slice(after), ...held.slice(0, after)];
+    // An exact runtime owner may remain after remote cleanup failed. Preserve
+    // it, but do not let it starve cleanup proof for independent held projects.
+    const worker = ordered.find(value => {
+      const runtime = this.#registry.get(value.projectId);
+      return !runtime || this.#heldRuntimeCleanupReady(runtime);
+    });
+    if (!worker && held[0]) this.#reportBootstrapCleanupDeferred(held[0], "work_in_flight");
+    if (!worker) return;
+    const gate = this.#mutationGateBlockReason();
+    if (gate) { this.#reportBootstrapCleanupDeferred(worker, gate); return; }
+    if (this.#config.v2SidecarRevision !== "r10") {
+      this.#reportBootstrapCleanupDeferred(worker, "release_policy"); return;
+    }
+    // This only proves the already-recorded supervisor's exact cleanup. It
+    // cannot launch, create, or delete a project. Requiring a healthy majority
+    // here deadlocks a degraded fleet with a full hold budget before any proof
+    // can be obtained. Replacement and project deletion retain their own gates.
+    this.#lastHeldCleanupIndex = worker.index;
+    this.#beginBootstrapCleanup("prove", worker);
+  }
+
+  #heldRuntimeCleanupReady(runtime: RoutableSandboxRuntime): boolean {
+    const state = this.#runtimeStops.get(runtime)?.state;
+    if ((state !== "rejected" && !(state === "fulfilled" && this.#runtimeCleanupProofRequired(runtime))) ||
+      this.#runtimeStarts.has(runtime)) return false;
+    try {
+      const snapshot = runtime.snapshot();
+      return snapshot.state === "stopped" && snapshot.capacity === 0 && snapshot.available === 0 &&
+        snapshot.active === 0 && snapshot.quarantined === 0 && (snapshot.ambiguousQuarantined ?? 0) === 0 &&
+        runtime.localCleanupComplete?.() === true;
+    } catch { return false; }
+  }
+
+  #runtimeLocalCleanupComplete(runtime: RoutableSandboxRuntime): boolean {
+    try { return runtime.localCleanupComplete ? runtime.localCleanupComplete() : true; }
+    catch { return false; }
+  }
+
+  #runtimeCleanupProofRequired(runtime: RoutableSandboxRuntime): boolean {
+    try { return runtime.cleanupProofRequired?.() === true; }
+    catch { return true; }
   }
 
   async #retireSurplusIntents(
@@ -1403,6 +1674,17 @@ export class ProjectFleetManager {
       this.#blockMutation(worker, "delete", "project_client");
       return manifest;
     }
+    if (this.#finalizeHeldBootstrapCleanup) {
+      const finalized = this.#finalizedBootstrapRetirement;
+      if (!finalized || !sameFleetWorkerRecord(worker, finalized)) {
+        if (this.#bootstrapCleanup) return manifest;
+        if (this.#clock.now() < this.#bootstrapCleanupRetryAtMs) return manifest;
+        this.#beginBootstrapCleanup("finalize", worker);
+        return manifest;
+      }
+      this.#finalizedBootstrapRetirement = null;
+      this.#throwIfAborted(signal);
+    }
     try {
       await this.#withMetadataTimeout(
         attempt => this.#projects.deleteManaged!(worker.projectId, attempt),
@@ -1578,15 +1860,36 @@ export class ProjectFleetManager {
     this.#runtimeStarts.get(runtime)?.controller.abort();
     // A supervisor fences routing by reporting stopped before its asynchronous
     // cleanup finishes. Await the idempotent stop operation as cleanup proof.
+    const stop = this.#observeRuntimeStop(runtime, timeoutMs);
+    if (!stop) return false;
+    if (stop.state === "pending" && !await stop.observation) return false;
+    if (stop.state !== "fulfilled" || runtime.snapshot().state !== "stopped" ||
+      !this.#runtimeLocalCleanupComplete(runtime) || this.#runtimeCleanupProofRequired(runtime)) return false;
+    if (this.#registry.get(runtime.projectId) === runtime) {
+      await this.#registry.removeStopped(runtime.projectId).catch(() => undefined);
+    }
+    const removed = this.#registry.get(runtime.projectId) !== runtime;
+    if (removed) this.#runtimeStops.delete(runtime);
+    return removed;
+  }
+
+  #observeRuntimeStop(runtime: RoutableSandboxRuntime, timeoutMs: number): RuntimeStop | undefined {
+    this.#runtimeStarts.get(runtime)?.controller.abort();
     let stop = this.#runtimeStops.get(runtime);
     if (!stop) {
       // New starts stop reserving at half this bound, leaving room to fence all
       // currently registered/starting runtimes even if older cleanup is stuck.
-      if (this.#runtimeStops.size >= MAX_RUNTIME_STOP_OBSERVATIONS) return false;
+      if (this.#runtimeStops.size >= MAX_RUNTIME_STOP_OBSERVATIONS) return undefined;
       stop = { state: "pending", observation: Promise.resolve(false) };
       this.#runtimeStops.set(runtime, stop);
       const observation = stop;
-      const stopping = Promise.resolve().then(() => runtime.stop()).then(
+      // stop() synchronously fences admission before a durable hold is saved.
+      // Observe it once, including terminal rejection, rather than calling an
+      // already-failed owner again on every reconciliation.
+      let operation: Promise<void>;
+      try { operation = Promise.resolve(runtime.stop()); }
+      catch (error) { operation = Promise.reject(error); }
+      const stopping = operation.then(
         () => { observation.state = "fulfilled"; },
         error => { observation.state = "rejected"; throw error; },
       ).finally(() => {
@@ -1599,17 +1902,7 @@ export class ProjectFleetManager {
       // reuses this settled timeout while the real cleanup remains pending.
       stop.observation = this.#settleWithin(() => stopping, timeoutMs);
     }
-    if (stop.state === "pending" && !await stop.observation) return false;
-    if (stop.state !== "fulfilled" || runtime.snapshot().state !== "stopped") {
-      if (stop.state !== "pending") this.#runtimeStops.delete(runtime);
-      return false;
-    }
-    if (this.#registry.get(runtime.projectId) === runtime) {
-      await this.#registry.removeStopped(runtime.projectId).catch(() => undefined);
-    }
-    const removed = this.#registry.get(runtime.projectId) !== runtime;
-    if (removed) this.#runtimeStops.delete(runtime);
-    return removed;
+    return stop;
   }
 
   async #settleWithin(operation: () => Promise<void>, timeoutMs: number): Promise<boolean> {

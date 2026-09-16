@@ -8,10 +8,11 @@ import {
   type SandboxRunOptions,
 } from "../src/sandbox/registry";
 import { projectId } from "../src/sandbox/types";
-import type { LoggerLike } from "../src/observability/logger";
+import { ObservabilityLogger, type LoggerLike } from "../src/observability/logger";
+import { resolveObservabilityConfig } from "../src/observability/config";
 import type { ObservabilityEvent } from "../src/observability/events";
 import { assertSafeObservabilityEvent } from "../src/observability/redaction";
-import { V2PreCommitError } from "../src/v2/transport/run-handle";
+import { V2CommittedError, V2PreCommitError } from "../src/v2/transport/run-handle";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -95,6 +96,34 @@ class Runtime implements RoutableSandboxRuntime {
 }
 
 describe("router observability", () => {
+  it("projects provider rejection metadata before the router failure reaches a persistent sink", async () => {
+    const canary = "PRIVATE_REJECTION_971ac2";
+    const error = new V2CommittedError(`Invalid input: ${canary}`, canary, false);
+    Object.defineProperty(error, "name", { value: canary });
+    const runtime = new Runtime();
+    runtime.run = async () => { throw error; };
+    const lines: string[] = [];
+    const logger = new ObservabilityLogger({ config: resolveObservabilityConfig({}), sinks: [{
+      writeBatch: async batch => { lines.push(...batch); }, close: async () => {},
+    }] });
+    const governor = new ResourceGovernor({ probe: { sample: () => ({
+      totalBytes: 32 * 1024 ** 3, freeBytes: 20 * 1024 ** 3, rssBytes: 100 * 1024 ** 2,
+      heapBytes: 50 * 1024 ** 2, externalBytes: 10 * 1024 ** 2, logicalProcessors: 12,
+    }) } });
+    const router = new MultiSandboxRouter({ registry: new SandboxRegistry([runtime]), governor, logger });
+    try {
+      expect(await router.startRelay({ model: "gpt-5.6-sol", input: "test", stream: true }).catch(value => value)).toBe(error);
+      await logger.close();
+      const failures = lines.map(line => JSON.parse(line)).filter(event => event.event === "request.failed");
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ error_name: "Error", error_kind: "other", error_message: "Request failed", committed: true, quarantined: false });
+      expect(lines.join("")).not.toContain(canary);
+      expect(logger.snapshot().sinkErrors).toBe(0);
+    } finally {
+      await router.close();
+      governor.close();
+    }
+  });
   it("emits ordered lifecycle phases with no request content", async () => {
     const logger = new MemoryLogger();
     const runtime = new Runtime();

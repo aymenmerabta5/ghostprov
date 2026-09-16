@@ -166,7 +166,7 @@ export const V2_R9_RELEASE: V2SidecarReleaseIdentity = Object.freeze({
 });
 
 /** Immutable R10 diagnostics release; validation scope is recorded in docs/validation. */
-export const V2_R10_RELEASE: V2SidecarReleaseIdentity = Object.freeze({"revision":"r10","protocolRevision":"r2","transportProfile":"bulk-v1","buildHash":"9d2aa8b7aecefcad429dff4a1f7fb0707b95dec9abe0beac4fb6d77ad70e5b7b","schemaHash":"51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f","bundleSha256":"21c83c16d210b3208a1cb097df2363f4690fac705ae6d1ccc71e143805854121"});
+export const V2_R10_RELEASE: V2SidecarReleaseIdentity = Object.freeze({"revision":"r10","protocolRevision":"r2","transportProfile":"bulk-v1","buildHash":"4229ac2bbf849dc4703012458297117db1c77b558d1a69d9e256eb2fa0d68fd4","schemaHash":"51eab64c3b30ea9c7989b47c21cdf4743bbb5e718e754849fb64f4216a6b604f","bundleSha256":"efcd880f6c48fb5a8d3d977c02098957721f12aede0d9dd09a9540065b6537dd"});
 
 /**
  * The first R2 artifact was declared frozen before the later selectable R2

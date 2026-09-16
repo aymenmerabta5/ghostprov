@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync, writeFileSync } from "node:fs";
+import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { FileLease, FileLeaseOwnershipError } from "../src/core/file-lease";
 import {
   MAX_SHUTDOWN_CONTROL_BYTES,
   MAX_SHUTDOWN_WAIT_MS,
@@ -147,6 +148,25 @@ describe("bounded shutdown protocol", () => {
     expect(calls).toBe(1);
   });
 
+  it.each([false, true])("rejects a displaced startup gate before the post-cleanup action (replacement=%s)", async replace => {
+    const value = await fixture();
+    let actions = 0;
+    const pending = requestGhostProvShutdown(value.root, { processProbe: probe,
+      afterCleanup: async () => { actions++; } }).catch(error => error);
+    await waitForRequest(value.file("shutdown.request.json"));
+    const gate = value.file("shutdown-request.lock");
+    await rename(gate, `${gate}.displaced`);
+    const replacement = new FileLease({ file: gate, staleAfterMs: 120_000, processProbe: probe });
+    try {
+      if (replace) await replacement.acquire({ timeoutMs: 1 });
+      await value.control.finish(true);
+      expect(await pending).toBeInstanceOf(FileLeaseOwnershipError);
+      expect(actions).toBe(0);
+      if (replace) await replacement.acquire({ timeoutMs: 1 });
+      else expect(existsSync(gate)).toBe(false);
+    } finally { await replacement.release(); }
+  });
+
   it("rejects a clean receipt that arrives after the monotonic deadline", async () => {
     const value = await fixture();
     let calls = 0;
@@ -196,12 +216,25 @@ describe("bounded shutdown protocol", () => {
 
   it("pins one instance and never rewrites a request to its successor", async () => {
     const value = await fixture();
-    const pending = requestGhostProvShutdown(value.root, { processProbe: probe });
+    let successorPublished = false;
+    const pending = requestGhostProvShutdown(value.root, {
+      processProbe: probe,
+      isProcessAlive: () => {
+        if (!successorPublished && existsSync(value.file("shutdown.request.json"))) {
+          // This callback runs between descriptor reads. Publish the successor
+          // here so the fixture tests pinned identity, rather than racing an
+          // in-place write against the separate file-open identity guard.
+          writeFileSync(value.file("shutdown-control.json"), JSON.stringify({ ...value.control.descriptor,
+            target: { ...value.control.descriptor.target, instanceNonce: randomUUID() } }), { mode: 0o600 });
+          successorPublished = true;
+        }
+        return true;
+      },
+    });
     const rejected = pending.catch(error => error);
     const accepted = await waitForRequest(value.file("shutdown.request.json"));
-    await writeFile(value.file("shutdown-control.json"), JSON.stringify({ ...value.control.descriptor,
-      target: { ...value.control.descriptor.target, instanceNonce: randomUUID() } }), { mode: 0o600 });
     expect((await rejected).message).toContain("instance changed");
+    expect(successorPublished).toBe(true);
     expect(JSON.parse(await readFile(value.file("shutdown.request.json"), "utf8"))).toEqual(accepted);
     await expect(value.control.finish(true)).rejects.toThrow("owner changed");
     expect(await readFile(value.file("shutdown.result.json"), "utf8").catch(() => null)).toBeNull();

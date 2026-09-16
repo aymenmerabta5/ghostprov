@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import {
   SandboxYDoc,
   YDocSessionError,
+  remoteReadbackMemorySnapshot,
   type YProviderEvent,
   type YProviderFactory,
   type YProviderLike,
@@ -61,6 +62,40 @@ class FakeProviderFactory implements YProviderFactory {
   }
 }
 
+class ReplicatingProviderFactory extends FakeProviderFactory {
+  readonly remoteDoc = new Y.Doc();
+
+  override create(envelope: YSweetEnvelope, doc: Y.Doc): YProviderLike {
+    const provider = super.create(envelope, doc);
+    Y.applyUpdate(this.remoteDoc, Y.encodeStateAsUpdate(doc));
+    doc.on("update", (update: Uint8Array) => {
+      Y.applyUpdate(this.remoteDoc, update);
+    });
+    return provider;
+  }
+}
+
+class ReadbackProviderFactory extends FakeProviderFactory {
+  readonly remoteDoc = new Y.Doc();
+  replicate = true;
+  queries = 0;
+  onRead?: (request: { signal: AbortSignal; acceptUpdate(update: Uint8Array): boolean }) => Promise<void>;
+  override create(envelope: YSweetEnvelope, doc: Y.Doc): YProviderLike {
+    const provider = super.create(envelope, doc);
+    Y.applyUpdate(this.remoteDoc, Y.encodeStateAsUpdate(doc));
+    doc.on("update", (update: Uint8Array) => { if (this.replicate) Y.applyUpdate(this.remoteDoc, update); });
+    provider.readFullServerState = async request => {
+      this.queries++;
+      if (this.onRead) return this.onRead(request);
+      const update = Y.encodeStateAsUpdate(this.remoteDoc);
+      if (!request.acceptUpdate(update)) throw new Error("Server has not received the local changes");
+      // The real provider applies the same server reply after the proof listener.
+      Y.applyUpdate(doc, update, provider);
+    };
+    return provider;
+  }
+}
+
 function envelopes(project: ProjectId, ...tokens: string[]) {
   let index = 0;
   return async () => parseYSweetEnvelope({
@@ -86,6 +121,126 @@ function createDoc(project: ProjectId, factory = new FakeProviderFactory(), ...t
 }
 
 describe("SandboxYDoc", () => {
+  it("proves staged server bytes independently and returns a frozen current-generation receipt", async () => {
+    const factory = new ReadbackProviderFactory(), { doc } = createDoc(A, factory);
+    try {
+      await doc.connect(); await doc.writePath("exec", "first\n"); await doc.writePath("exec", "staged\n");
+      const receipt = await doc.verifyRemotePaths([{ path: "exec", content: "staged\n" }]);
+      expect(Object.isFrozen(receipt)).toBe(true); expect(() => receipt.assertCurrent()).not.toThrow();
+      expect(factory.queries).toBe(1);
+      await doc.writePath("exec", "staged\n");
+      expect(() => receipt.assertCurrent()).toThrow("stale");
+      expect(remoteReadbackMemorySnapshot().ordinaryUsedBytes).toBe(0);
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("does not turn local-only matching paths or an unsupported provider into proof", async () => {
+    const factory = new ReadbackProviderFactory(); factory.replicate = false;
+    const { doc } = createDoc(A, factory), unsupported = createDoc(B).doc;
+    try {
+      await doc.connect(); await doc.writePath("exec", "local-only"); expect(await doc.readPath("exec")).toBe("local-only");
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "local-only" }])).rejects.toMatchObject({ name: "YDocSessionError", kind: "sync" });
+      await unsupported.connect(); await unsupported.writePath("exec", "local-only");
+      await expect(unsupported.verifyRemotePaths([{ path: "exec", content: "local-only" }])).rejects.toThrow("unsupported");
+      expect(remoteReadbackMemorySnapshot().ordinaryUsedBytes).toBe(0);
+    } finally { await doc.destroy(); await unsupported.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("requires a real callback result and rejects provider success without server data", async () => {
+    const factory = new ReadbackProviderFactory(); factory.onRead = async () => {};
+    const { doc } = createDoc(A, factory);
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }])).rejects.toThrow("unproved");
+      expect(remoteReadbackMemorySnapshot().activePermits).toBe(0);
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("charges the app governor before querying and releases it on success and rejection", async () => {
+    const factory = new ReadbackProviderFactory(); let reserved = 0, released = 0;
+    const doc = new SandboxYDoc({ projectId: A, mintYSweet: envelopes(A, "test-token"), providerFactory: factory,
+      reserveRemoteReadbackBytes: bytes => { reserved += bytes; return { release: () => { released += bytes; } }; } });
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      await doc.verifyRemotePaths([{ path: "exec", content: "staged" }]);
+      expect(reserved).toBe(128 * 1024 * 1024); expect(released).toBe(reserved);
+      factory.onRead = async () => { throw new Error("private response must not escape"); };
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }])).rejects.not.toThrow("private response");
+      expect(released).toBe(reserved); expect(remoteReadbackMemorySnapshot().activePermits).toBe(0);
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("does not query when governor reservation fails", async () => {
+    const factory = new ReadbackProviderFactory();
+    const doc = new SandboxYDoc({ projectId: A, mintYSweet: envelopes(A, "test-token"), providerFactory: factory,
+      reserveRemoteReadbackBytes: () => { throw new Error("private governor detail"); } });
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }])).rejects.toMatchObject({ kind: "sync" });
+      expect(factory.queries).toBe(0); expect(remoteReadbackMemorySnapshot().ordinaryUsedBytes).toBe(0);
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("fences a pending readback on abort, connection close and destruction", async () => {
+    for (const mode of ["abort", "close", "destroy"] as const) {
+      const factory = new ReadbackProviderFactory(), stop = new AbortController(); let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      factory.onRead = request => new Promise<void>((_resolve, reject) => {
+        entered(); request.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+      const { doc } = createDoc(A, factory);
+      try {
+        await doc.connect(); await doc.writePath("exec", "staged");
+        const result = doc.verifyRemotePaths([{ path: "exec", content: "staged" }], stop.signal).then(() => null, error => error);
+        await started;
+        await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }])).rejects.toThrow("busy");
+        if (mode === "abort") stop.abort(); else if (mode === "close") factory.providers[0]!.emit("connection-close"); else await doc.destroy();
+        expect(await result).toBeInstanceOf(YDocSessionError); expect(remoteReadbackMemorySnapshot().activePermits).toBe(0);
+      } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+    }
+  });
+
+  it("invalidates a receipt on disconnect even before another connection is installed", async () => {
+    const factory = new ReadbackProviderFactory(), { doc } = createDoc(A, factory);
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      const receipt = await doc.verifyRemotePaths([{ path: "exec", content: "staged" }]);
+      factory.providers[0]!.emit("connection-close");
+      expect(() => receipt.assertCurrent()).toThrow();
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("keeps unrelated writes valid but invalidates a newly colliding selected path", async () => {
+    const factory = new ReadbackProviderFactory(), { doc } = createDoc(A, factory);
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      const receipt = await doc.verifyRemotePaths([{ path: "exec", content: "staged" }]);
+      await doc.writePath("unrelated.txt", "metadata");
+      expect(() => receipt.assertCurrent()).not.toThrow();
+      const local = factory.docs[0]!, content = local.getMap<Y.Map<unknown>>("content");
+      const original = [...content.values()].find(node => node.get("filename") === "exec")!;
+      const duplicate = new Y.Map<unknown>(), text = new Y.Text("staged");
+      local.transact(() => {
+        duplicate.set("id", "duplicate-exec"); duplicate.set("filename", "exec");
+        duplicate.set("inFolder", original.get("inFolder")); duplicate.set("type", "text");
+        duplicate.set("deleted", false); duplicate.set("content", text); content.set("duplicate-exec", duplicate);
+      });
+      expect(() => receipt.assertCurrent()).toThrow("stale");
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
+  it("aborts a non-cooperative provider without leaving reservations or an active waiter", async () => {
+    const factory = new ReadbackProviderFactory(); factory.onRead = async () => new Promise<void>(() => {});
+    const { doc } = createDoc(A, factory);
+    try {
+      await doc.connect(); await doc.writePath("exec", "staged");
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }], AbortSignal.timeout(5))).rejects.toMatchObject({ kind: "sync" });
+      expect(remoteReadbackMemorySnapshot().activePermits).toBe(0);
+      expect(doc.snapshot().connected).toBe(false);
+      await expect(doc.verifyRemotePaths([{ path: "exec", content: "staged" }])).rejects.toThrow("staged connection");
+    } finally { await doc.destroy(); factory.remoteDoc.destroy(); }
+  });
+
   it("keeps filename indexes and document state isolated by project", async () => {
     const left = createDoc(A);
     const right = createDoc(B);
@@ -171,6 +326,7 @@ describe("SandboxYDoc", () => {
     const first = await doc.ensurePath(".ghostprov-v2/src/main.ts");
     const second = await doc.ensurePath(".ghostprov-v2/src/main.ts");
     expect(second).toEqual(first);
+    expect(await doc.readPath(".ghostprov-v2/src/main.ts")).toBe("");
     await doc.writePath(".ghostprov-v2/src/main.ts", "one");
     await doc.writePath(".ghostprov-v2/src/main.ts", "two");
     expect(await doc.readPath(".ghostprov-v2/src/main.ts")).toBe("two");
@@ -186,6 +342,105 @@ describe("SandboxYDoc", () => {
     await doc.writePath("same/same", "repeated component");
     expect(await doc.readPath("same/same")).toBe("repeated component");
     expect(await doc.tombstonePath("same/same")).toBe(true);
+  });
+
+  it("publishes a newly created nested path with its complete initial content", async () => {
+    const factory = new ReplicatingProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    const remoteContents: Array<string | null> = [];
+    factory.remoteDoc.on("update", () => {
+      const entry = [...factory.remoteDoc.getMap<Y.Map<any>>("content").values()]
+        .find(value => value.get("filename") === "main.ts" && value.get("deleted") !== true);
+      remoteContents.push(entry?.get("content")?.toString() ?? null);
+    });
+
+    try {
+      await doc.writePath(".ghostprov-v2/src/main.ts", "export const ready = true;\n");
+
+      expect(remoteContents).toEqual(["export const ready = true;\n"]);
+      const entries = [...factory.remoteDoc.getMap<Y.Map<any>>("content").values()];
+      const root = entries.find(value => value.get("filename") === "root")!;
+      const assets = entries.find(value => value.get("filename") === ".ghostprov-v2")!;
+      const source = entries.find(value => value.get("filename") === "src")!;
+      const file = entries.find(value => value.get("filename") === "main.ts")!;
+      expect(assets.get("inFolder")).toBe(root.get("id"));
+      expect(source.get("inFolder")).toBe(assets.get("id"));
+      expect(file.get("inFolder")).toBe(source.get("id"));
+      expect(file.get("content")).toBeInstanceOf(Y.Text);
+    } finally {
+      await doc.destroy();
+      factory.remoteDoc.destroy();
+    }
+  });
+
+  it("updates an existing path in one publication without replacing either replica's Y.Text", async () => {
+    const factory = new ReplicatingProviderFactory(true, false);
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    await doc.writePath("assets/main.ts", "old content");
+    const localEntry = [...factory.docs[0].getMap<Y.Map<any>>("content").values()]
+      .find(value => value.get("filename") === "main.ts")!;
+    const remoteEntry = [...factory.remoteDoc.getMap<Y.Map<any>>("content").values()]
+      .find(value => value.get("filename") === "main.ts")!;
+    const localText = localEntry.get("content") as Y.Text;
+    const remoteText = remoteEntry.get("content") as Y.Text;
+    const remoteContents: string[] = [];
+    let observerCalls = 0;
+    remoteText.observe(() => { observerCalls++; });
+    factory.remoteDoc.on("update", () => { remoteContents.push(remoteText.toString()); });
+
+    try {
+      await doc.writePath("assets/main.ts", "new content");
+
+      expect(localEntry.get("content")).toBe(localText);
+      expect(remoteEntry.get("content")).toBe(remoteText);
+      expect(localText.toString()).toBe("new content");
+      expect(remoteContents).toEqual(["new content"]);
+      expect(observerCalls).toBe(1);
+    } finally {
+      await doc.destroy();
+      factory.remoteDoc.destroy();
+    }
+  });
+
+  it("preserves legacy content when ensuring a path and normalizes it for later writes", async () => {
+    const factory = new FakeProviderFactory();
+    const { doc } = createDoc(A, factory);
+    await doc.connect();
+    const legacy = new Y.Map();
+    factory.docs[0].transact(() => {
+      legacy.set("id", "legacy-source");
+      legacy.set("filename", "source.ts");
+      legacy.set("inFolder", `root-${A}`);
+      legacy.set("type", "text");
+      legacy.set("content", "legacy source");
+      factory.docs[0].getMap("content").set("legacy-source", legacy);
+    });
+
+    expect(await doc.ensurePath("source.ts")).toEqual({ fileId: "legacy-source", folderId: `root-${A}` });
+    const normalizedText = legacy.get("content");
+    expect(normalizedText).toBeInstanceOf(Y.Text);
+    expect(await doc.readPath("source.ts")).toBe("legacy source");
+    await doc.writePath("source.ts", "replacement source");
+    expect(legacy.get("content")).toBe(normalizedText);
+    expect(await doc.readPath("source.ts")).toBe("replacement source");
+  });
+
+  it("rejects a nested path write when its provider disconnects during publication", async () => {
+    const factory = new FakeProviderFactory();
+    const { doc } = createDoc(A, factory, "token-1", "token-2");
+    await doc.connect();
+    factory.docs[0].once("update", () => {
+      factory.providers[0].emit("connection-close");
+    });
+
+    await expect(doc.writePath("assets/main.ts", "not-proven")).rejects.toMatchObject({
+      name: "YDocSessionError",
+      kind: "sync",
+    } satisfies Partial<YDocSessionError>);
+    expect(factory.tokens).toEqual(["token-1"]);
+    expect(doc.snapshot().connected).toBe(false);
   });
 
   it("atomically guards bootstrap path replacement without partial mutation", async () => {
@@ -304,14 +559,22 @@ describe("SandboxYDoc", () => {
     const { doc } = createDoc(A);
     await doc.connect();
 
-    for (const invalid of ["/absolute", "../escape", "a//b", "a/./b", "a\\b", "a/\0b", ""]) {
+    for (const invalid of [
+      "/absolute", "../escape", "a//b", "a/./b", "a\\b", "a/\0b", "",
+      "a".repeat(256), [...Array(4).fill("a".repeat(255)), "b"].join("/"),
+    ]) {
       await expect(doc.ensurePath(invalid)).rejects.toMatchObject({ kind: "missing" });
+      await expect(doc.writePath(invalid, "invalid")).rejects.toMatchObject({ kind: "missing" });
     }
 
     await doc.writePath("collision", "file");
     await expect(doc.ensurePath("collision/child.ts")).rejects.toThrow("not a folder");
+    await expect(doc.writePath("collision/child.ts", "invalid")).rejects.toThrow("not a folder");
     await doc.ensurePath("folder/child.ts");
     await expect(doc.ensurePath("folder")).rejects.toThrow("folder");
+    await expect(doc.writePath("folder", "invalid")).rejects.toThrow("folder");
+    expect(await doc.readPath("collision")).toBe("file");
+    expect(await doc.readPath("folder/child.ts")).toBe("");
   });
 
   it("initializes an empty project root once and attaches new entries to it", async () => {

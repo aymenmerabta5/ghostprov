@@ -1,5 +1,7 @@
 # GhostProv V2 Transport Throughput Design
 
+> Historical design: its two-second stall thresholds describe the original transport. The selected host and R10 peer now use a sixty-second default; frozen legacy sidecar releases remain unchanged.
+
 ## Objective
 
 Eliminate multi-agent token stalls while preserving exact-once execution, ordered streaming, terminal proof, bounded memory, and fair sharing across requests.

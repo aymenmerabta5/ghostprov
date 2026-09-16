@@ -7,7 +7,7 @@ type SupervisorCleanupOwner = Pick<V2BootstrapSupervisor, "shutdown" | "close">;
 /** Retains bounded supervisor cleanup ownership beyond a runtime's stop waiter. */
 export class SupervisorLifecycle {
   readonly #owners = new Set<SupervisorCleanupOwner>();
-  readonly #pendingCleanup = new Set<string>();
+  readonly #pendingCleanup = new Map<string, Readonly<BootstrapBinding>>();
   readonly #limit: number;
   #closing = false;
   #shutdown: Promise<void> | null = null;
@@ -33,10 +33,17 @@ export class SupervisorLifecycle {
 
   /** Content-free obligations outlive closed transports and are cleared only by exact cleanup proof. */
   requireCleanup(binding: BootstrapBinding): void {
-    const key = canonicalJson(validateBootstrapBinding(binding));
+    const validated = validateBootstrapBinding(binding);
+    const key = canonicalJson(validated);
     if (this.#pendingCleanup.has(key)) return;
     if (this.#pendingCleanup.size >= this.#limit) throw new Error("Supervisor cleanup evidence capacity is exhausted");
-    this.#pendingCleanup.add(key);
+    this.#pendingCleanup.set(key, Object.freeze(validated));
+  }
+
+  /** A project remains blocked until every exact submitted binding is proven. */
+  hasPendingCleanup(projectId: string): boolean {
+    for (const binding of this.#pendingCleanup.values()) if (binding.projectId === projectId) return true;
+    return false;
   }
 
   confirmCleanup(binding: BootstrapBinding): void {

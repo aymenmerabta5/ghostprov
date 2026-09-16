@@ -1,11 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { MachineProbe } from "../src/core/ports";
+import { SYSTEM_CLOCK, type MachineProbe } from "../src/core/ports";
 import { isAuthenticatedTenantScope } from "../src/http/api-key";
 import { FleetManifestStore } from "../src/fleet/manifest";
-import type { ManagedRuntimeFactory } from "../src/fleet/types";
+import type { FleetLifecycleEvent, ManagedRuntimeFactory } from "../src/fleet/types";
+import type { FleetLifecycleObservabilityEventName, ObservabilityEvent, ObservabilityPriority } from "../src/observability/events";
+import type { LoggerLike } from "../src/observability/logger";
 import type { RunHandle } from "../src/relay/run-handle";
 import { sseFrame } from "../src/relay/sse";
 import { ResourceGovernor } from "../src/router/resource-governor";
@@ -16,14 +18,19 @@ import type {
 } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import { SupervisedSandboxRuntime } from "../src/sandbox/supervised-runtime";
+import { parseYSweetEnvelope } from "../src/prism/protocol";
 import {
   createBrowserlessSystem,
   createV2CpuGzip,
+  emitFleetLifecycle,
   selectV2ProjectRelease,
   type BrowserlessSystemDependencies,
   type BrowserlessSystemServer,
 } from "../src/server/system";
-import type { V2SidecarAssets } from "../src/v2/sidecar/assets";
+import { loadV2SidecarAssets, type V2SidecarAssets } from "../src/v2/sidecar/assets";
+import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
+import type { SupervisorBootstrapAttempt } from "../src/v2/supervisor/bootstrap-journal";
+import { sealSupervisorSessionBootstrap } from "../src/v2/supervisor/session-bootstrap";
 import type { PrismProjectSummary } from "../src/prism/projects-client";
 import { V2RunHandle } from "../src/v2/transport/run-handle";
 import {
@@ -326,6 +333,84 @@ async function harness(): Promise<{
 }
 
 describe("V2 browserless system composition", () => {
+  const sharedLifecycle = { projectId: IDS[0]!, workerIndex: 1 };
+  const lifecycleFields = { project_id: IDS[0]!, worker_index: 1 };
+  const lifecycleCases = {
+    bootstrap_cleanup_started: {
+      input: { ...sharedLifecycle, type: "bootstrap_cleanup_started", leaderGeneration: 3 },
+      name: "fleet.bootstrap_cleanup.started", fields: { ...lifecycleFields, leader_generation: 3 },
+    },
+    bootstrap_cleanup_succeeded: {
+      input: { ...sharedLifecycle, type: "bootstrap_cleanup_succeeded", leaderGeneration: 3 },
+      name: "fleet.bootstrap_cleanup.succeeded", fields: { ...lifecycleFields, leader_generation: 3 },
+    },
+    bootstrap_cleanup_deferred: {
+      input: { ...sharedLifecycle, type: "bootstrap_cleanup_deferred", leaderGeneration: 3, reason: "proof_unavailable",
+        cleanupStage: "proof_threw", errorName: "V2SupervisorError", bootstrapPhase: "deploy",
+        bootstrapCode: "bootstrap_cleanup_unproven", bootstrapReason: "bootstrap", supervisorPhase: "bootstrap" },
+      name: "fleet.bootstrap_cleanup.deferred", fields: { ...lifecycleFields, leader_generation: 3, cleanup_reason: "proof_unavailable",
+        cleanup_stage: "proof_threw", error_name: "V2SupervisorError", bootstrap_phase: "deploy",
+        bootstrap_code: "bootstrap_cleanup_unproven", bootstrap_reason: "bootstrap", supervisor_phase: "bootstrap" },
+    },
+    replacement_qualified: {
+      input: { ...sharedLifecycle, type: "replacement_qualified", leaderGeneration: 3, failureKind: "bootstrap_blocked", failureCount: 4 },
+      name: "fleet.replacement.qualified", fields: { ...lifecycleFields, leader_generation: 3, failure_kind: "bootstrap_blocked", failure_count: 4 },
+    },
+    replacement_started: {
+      input: { ...sharedLifecycle, type: "replacement_started", leaderGeneration: 3, failureKind: "bootstrap_blocked", failureCount: 4 },
+      name: "fleet.replacement.started", fields: { ...lifecycleFields, leader_generation: 3, failure_kind: "bootstrap_blocked", failure_count: 4 },
+    },
+    successor_reserved: {
+      input: { ...sharedLifecycle, type: "successor_reserved" },
+      name: "fleet.replacement.successor_reserved", fields: lifecycleFields,
+    },
+    successor_created: {
+      input: { ...sharedLifecycle, type: "successor_created" },
+      name: "fleet.replacement.successor_created", fields: lifecycleFields,
+    },
+    successor_activated: {
+      input: { ...sharedLifecycle, type: "successor_activated", leaderGeneration: 3 },
+      name: "fleet.replacement.successor_activated", fields: { ...lifecycleFields, leader_generation: 3 },
+    },
+    old_retired: {
+      input: { ...sharedLifecycle, type: "old_retired", retirementReason: "replacement", managed: true },
+      name: "fleet.replacement.old_retired", fields: { ...lifecycleFields, retirement_reason: "replacement", managed: true },
+    },
+    mutation_blocked: {
+      input: { ...sharedLifecycle, type: "mutation_blocked", operation: "replace", reason: "bootstrap_hold_limit" },
+      name: "fleet.mutation.blocked", fields: { ...lifecycleFields, mutation_operation: "replace", block_reason: "bootstrap_hold_limit" },
+    },
+  } satisfies {
+    [K in FleetLifecycleEvent["type"]]: {
+      input: FleetLifecycleEvent & { type: K };
+      name: FleetLifecycleObservabilityEventName;
+      fields: Record<string, string | number | boolean>;
+    };
+  };
+
+  it.each(Object.entries(lifecycleCases))("forwards the %s lifecycle variant exactly once", (_type, value) => {
+    const emitted: Array<{ event: ObservabilityEvent; priority?: ObservabilityPriority }> = [];
+    const logger: LoggerLike = {
+      emit: (event, priority) => { emitted.push({ event, priority }); },
+      snapshot: () => ({ queuedEvents: 0, queuedBytes: 0, droppedSamples: 0, droppedProgress: 0, droppedTerminals: 0, sinkErrors: 0 }),
+      close: async () => {},
+    };
+    emitFleetLifecycle(logger, value.input);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({ event: { event: value.name, ...value.fields }, priority: "terminal" });
+    expect(Object.keys(emitted[0]!.event).sort()).toEqual(["schema", "event", "ts", "mono_ms", ...Object.keys(value.fields)].sort());
+  });
+
+  it("rejects an unknown lifecycle variant rather than silently dropping it", () => {
+    const logger: LoggerLike = {
+      emit: () => { throw new Error("unknown lifecycle event must not be emitted"); },
+      snapshot: () => ({ queuedEvents: 0, queuedBytes: 0, droppedSamples: 0, droppedProgress: 0, droppedTerminals: 0, sinkErrors: 0 }),
+      close: async () => {},
+    };
+    expect(() => emitFleetLifecycle(logger, { ...sharedLifecycle, type: "unknown_variant" } as never))
+      .toThrow("Unknown fleet lifecycle event");
+  });
+
   it("backs completed image batches with the system governor while freeing the event lane", async () => {
     const value = await harness();
     const bodies: Record<string, unknown>[] = [];
@@ -641,6 +726,12 @@ describe("V2 browserless system composition", () => {
 
   it("binds after one ready runtime while remaining projects reconcile independently", async () => {
     const value = await harness();
+    const events: unknown[] = [];
+    value.dependencies.logger = {
+      emit: event => { events.push(event); },
+      snapshot: () => ({ queuedEvents: 0, queuedBytes: 0, droppedSamples: 0, droppedProgress: 0, droppedTerminals: 0, sinkErrors: 0 }),
+      close: async () => {},
+    };
     const system = await createBrowserlessSystem(value.env, value.dependencies);
     expect(isAuthenticatedTenantScope(
       system.router.responseProvenanceAuthorizationScope(),
@@ -652,6 +743,8 @@ describe("V2 browserless system composition", () => {
     expect(value.server.listening).toBe(true);
     expect(value.sampler.starts).toBe(1);
     expect(system.registry.readyRuntimes()).toHaveLength(1);
+    expect(events).toContainEqual(expect.objectContaining({ event: "server.started", desired: 4, ready: 1,
+      routable: 1, held_project_count: 0, fleet_readiness: "degraded" }));
     expect(system.hostEventMemory.reservedBytes).toBe(system.config.v2HostEventMemory.totalBytes);
     expect(system.hostEventMemory.snapshot()).toMatchObject({
       ordinaryCapacityBytes: system.config.v2HostEventMemory.ordinaryBytes,
@@ -705,6 +798,136 @@ describe("V2 browserless system composition", () => {
     expect(value.order.indexOf("journal-check")).toBeGreaterThan(value.order.indexOf("runtime-stop"));
     expect(value.order.indexOf("account-close")).toBeGreaterThan(value.order.lastIndexOf("journal-check"));
     expect(value.sessionCloses()).toBe(1);
+  });
+
+  it("connects default R10 maintenance to held journals after healthy fleet readiness", async () => {
+    const value = await harness();
+    const events: unknown[] = [];
+    value.dependencies.logger = {
+      emit: event => { events.push(event); },
+      snapshot: () => ({ queuedEvents: 0, queuedBytes: 0, droppedSamples: 0, droppedProgress: 0, droppedTerminals: 0, sinkErrors: 0 }),
+      close: async () => {},
+    };
+    const held = projectId("00000000-0000-4000-8000-000000000005");
+    const manifest = value.dependencies.manifest!;
+    await manifest.initialize("authenticated");
+    await manifest.reserveWorker({ index: 5, projectId: held, title: "offline held project", nowMs: 1 });
+    await manifest.nextLeaderGeneration(held, 2);
+    await manifest.markDraining(held, "bootstrap_hold", 3);
+    let heldReads = 0;
+    value.dependencies.bootstrapJournalFactory = id => ({
+      withLease: async (_signal, operation) => operation({
+        load: async () => { if (id === held) heldReads++; return null; },
+        save: async () => { throw new Error("absent proof must not be created"); },
+        clear: async () => { throw new Error("absent proof must not be cleared"); },
+      }),
+    });
+    value.dependencies.runtimeFactory = { create: input => {
+      const runtime = new DeferredRuntime(input.projectId, false, value.order);
+      const snapshot = runtime.snapshot.bind(runtime);
+      runtime.snapshot = () => ({ ...snapshot(), releaseRevision: "r10" });
+      return runtime;
+    } };
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    try {
+      await system.start();
+      await system.fleet.waitForReady(4);
+      await system.fleet.reconcile();
+      for (let turn = 0; turn < 10; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+      expect(heldReads).toBeGreaterThan(0);
+      expect(events).toContainEqual(expect.objectContaining({ event: "fleet.bootstrap_cleanup.started",
+        project_id: held, worker_index: 5, leader_generation: 1 }));
+      expect(events).toContainEqual(expect.objectContaining({ event: "fleet.bootstrap_cleanup.deferred",
+        project_id: held, worker_index: 5, leader_generation: 1, cleanup_reason: "proof_unavailable" }));
+      expect((await manifest.load()).workers.find(worker => worker.projectId === held)?.retirementReason).toBe("bootstrap_hold");
+    } finally {
+      // A missing journal cannot resolve the manifest's outstanding cleanup
+      // hold or authorize an unattended poweroff.
+      await expect(system.close()).rejects.toThrow("bootstrap cleanup was incomplete");
+      expect(value.sessionCloses()).toBe(1);
+      expect((await manifest.load()).workers.find(worker => worker.projectId === held)?.retirementReason).toBe("bootstrap_hold");
+    }
+  });
+
+  it("forwards the held-maintenance host factory to exact submitted cleanup", async () => {
+    const value = await harness();
+    const assets = await loadV2SidecarAssets({ revision: "r10" });
+    const held = projectId("00000000-0000-4000-8000-000000000005");
+    const manifest = value.dependencies.manifest!;
+    await manifest.initialize("authenticated");
+    await manifest.reserveWorker({ index: 5, projectId: held, title: "offline held project", nowMs: 1 });
+    await manifest.nextLeaderGeneration(held, 2);
+    await manifest.markDraining(held, "bootstrap_hold", 3);
+    const ySweet = parseYSweetEnvelope({ docId: held, url: "wss://offline.invalid/ws",
+      baseUrl: "https://offline.invalid/", token: "offline-token", authorization: "full" });
+    const binding = { projectId: held, sandboxSessionId: "offline-held-session", leaderGeneration: 1,
+      nonce: "offline-held-supervisor", buildHash: assets.buildHash, schemaHash: assets.schemaHash,
+      protocolRevision: "r2" as const, schemaVersion: 2 as const };
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    const rotationKey = createCredentialRotationKey();
+    const sealed = await sealSupervisorSessionBootstrap({ sessionId, binding, payload: {
+      instanceId: "offline-held-instance", credential: { url: ySweet.url, baseUrl: ySweet.baseUrl,
+        docId: held, token: "offline-token", authorization: "full", rotationKey },
+    } });
+    let record: SupervisorBootstrapAttempt | null = {
+      version: 1, phase: "submitted", sessionId, binding, connectTimeoutMs: 1000, sealed,
+    };
+    value.dependencies.bootstrapJournalFactory = id => ({
+      withLease: async (signal, operation) => {
+        signal?.throwIfAborted();
+        return operation({
+          load: async () => id === held ? record : null,
+          save: async next => { if (id === held) record = next; },
+          clear: async () => { if (id === held) record = null; },
+        });
+      },
+    });
+    const resolveIdentity = value.dependencies.sessionManager!.resolve.bind(value.dependencies.sessionManager);
+    value.dependencies.sessionManager!.resolve = async signal => {
+      const identity = await resolveIdentity(signal);
+      return { ...identity, account: { request: async (url: string | URL) => {
+        expect(String(url)).toBe("/api/y");
+        return Response.json({ docId: held, url: ySweet.url, baseUrl: ySweet.baseUrl,
+          token: "offline-token", authorization: "full" });
+      } } as any };
+    };
+    value.dependencies.assets = assets;
+    value.dependencies.runtimeFactory = {
+      create: input => new DeferredRuntime(input.projectId, false, value.order),
+    };
+    const calls: string[] = [];
+    value.dependencies.heldBootstrapHostFactory = input => {
+      expect(input.binding).toEqual(binding);
+      expect(input.instanceId).toBe("offline-held-instance");
+      expect(input.rotationKey).toBe(rotationKey);
+      return {
+        binding: input.binding,
+        instanceId: input.instanceId,
+        async connect() { throw new Error("cleanup must not request readiness"); },
+        async ensureReady() { throw new Error("cleanup must not request readiness"); },
+        async launch() { throw new Error("cleanup must not launch"); },
+        async deliverCredential() { throw new Error("cleanup must not deliver credentials"); },
+        async stop() { throw new Error("cleanup must not stop a sidecar"); },
+        async rotateCredential() { throw new Error("cleanup must not rotate independently"); },
+        async shutdown() { calls.push("shutdown"); },
+        async close() { calls.push("close"); },
+      };
+    };
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    try {
+      await system.start();
+      await system.fleet.waitForReady(4);
+      await system.fleet.reconcile();
+      for (let turn = 0; turn < 100 && record?.phase !== "cleanup_proven"; turn++) {
+        await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+      }
+      expect(record?.phase).toBe("cleanup_proven");
+      expect(calls).toEqual(["shutdown", "close"]);
+    } finally {
+      // The unit stops before the manager's later artifact-finalization pass.
+      record = null;
+      await expect(system.close()).rejects.toThrow("bootstrap cleanup was incomplete");
+    }
   });
 
   it("uses Anthropic model overrides from the supplied system environment", async () => {
@@ -950,6 +1173,97 @@ describe("V2 browserless system composition", () => {
       "account-close",
       "cpu-pool-close",
     ]);
+  });
+
+  it.each([
+    { totalMs: 1_000, setupMs: 0, completesAtMs: null },
+    { totalMs: 180_000, setupMs: 0, completesAtMs: null },
+    { totalMs: 1_000, setupMs: 300, completesAtMs: null },
+    { totalMs: 1_000, setupMs: 0, completesAtMs: 200 },
+  ])("reserves exact cleanup time within the shared shutdown deadline (%j)", async ({ totalMs, setupMs, completesAtMs }) => {
+    const value = await harness();
+    const cleanupTimeMs = 100;
+    const allDraining = Promise.withResolvers<void>();
+    const proofAvailable = Promise.withResolvers<void>();
+    const signedShutdowns = new Set<ProjectId>();
+    const cleanupStarts: number[] = [];
+    let held = true;
+    let heldRuntime: DeferredRuntime | undefined;
+    let now = SYSTEM_CLOCK.now();
+    const shutdownStartedAt = now;
+    value.dependencies.runtimeFactory = { create: input => new class extends DeferredRuntime {
+      constructor() {
+        super(input.projectId, false, value.order);
+        if (input.projectId === IDS[0]) heldRuntime = this;
+      }
+      override snapshot(): RoutableSandboxSnapshot {
+        return { ...super.snapshot(), active: this.projectId === IDS[0] && held ? 1 : 0 };
+      }
+      override async drain(): Promise<void> {
+        cleanupStarts.push(now);
+        if (cleanupStarts.length === IDS.length) allDraining.resolve();
+        // The fake supervisor cannot produce its exact cleanup proof until
+        // its independent remote operation has had time to complete.
+        await proofAvailable.promise;
+        if (now >= shutdownStartedAt + totalMs) throw new Error("signed supervisor cleanup deadline expired");
+        signedShutdowns.add(this.projectId);
+        if (this.projectId === IDS[0]) held = false;
+        await super.drain();
+      }
+      override async stop(): Promise<void> {
+        if (!signedShutdowns.has(this.projectId)) throw new Error("signed supervisor cleanup remains unproven");
+        await super.stop();
+      }
+    }() };
+    value.dependencies.bootstrapJournalFactory = id => ({
+      withLease: async (_signal, operation) => operation({
+        load: async () => signedShutdowns.has(id) ? null : { phase: "submitted" } as never,
+        save: async () => { throw new Error("final audit must not create proof"); },
+        clear: async () => { throw new Error("final audit must not manufacture cleanup"); },
+      }),
+    });
+    const system = await createBrowserlessSystem({ ...value.env, GP_SHUTDOWN_DRAIN_MS: String(totalMs) }, value.dependencies);
+    await system.start();
+    await system.fleet.waitForReady(IDS.length);
+    await system.fleet.reconcile();
+    const closeSampler = value.sampler.close.bind(value.sampler);
+    value.sampler.close = async () => { now += setupMs; await closeSampler(); };
+    const clockNow = spyOn(SYSTEM_CLOCK, "now").mockImplementation(() => now);
+    const clockSleep = spyOn(SYSTEM_CLOCK, "sleep").mockImplementation(async (ms, signal) => {
+      signal?.throwIfAborted();
+      now += ms;
+      if (held && completesAtMs !== null && now >= shutdownStartedAt + completesAtMs) {
+        held = false;
+        heldRuntime?.emit();
+        value.order.push("active-response-completed");
+      }
+    });
+    const closing = system.close().then(() => null, error => error);
+    try {
+      await allDraining.promise;
+      now += cleanupTimeMs;
+      proofAvailable.resolve();
+      const error = await closing;
+
+      if (completesAtMs === null) {
+        expect(error).toMatchObject({ name: "RouterShutdownError" });
+        expect(error.message).toContain("active work");
+      } else {
+        expect(error).toBeNull();
+        expect(value.order.indexOf("active-response-completed")).toBeLessThan(value.order.indexOf("runtime-drain"));
+      }
+      expect(cleanupStarts).toHaveLength(IDS.length);
+      expect(Math.max(...cleanupStarts) + cleanupTimeMs).toBeLessThan(shutdownStartedAt + totalMs);
+      expect(signedShutdowns.size).toBe(IDS.length);
+      expect(system.registry.runtimes()).toHaveLength(0);
+      expect(now).toBeLessThan(shutdownStartedAt + totalMs);
+      expect(value.sessionCloses()).toBe(1);
+    } finally {
+      proofAvailable.resolve();
+      await closing;
+      clockSleep.mockRestore();
+      clockNow.mockRestore();
+    }
   });
 
   it("cancels a pending listen and cannot resurrect a listener after close", async () => {

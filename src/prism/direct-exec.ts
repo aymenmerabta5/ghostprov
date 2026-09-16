@@ -17,6 +17,21 @@ export interface DirectSupervisorExecStarted {
   readonly jobId: string;
 }
 
+/** Validates the bounded private projection retained after an authenticated acknowledgement. */
+export function validateDirectSupervisorExecAcceptance(value: unknown, expectedSessionId: string): DirectSupervisorExecStarted {
+  if (typeof expectedSessionId !== "string" || !SESSION_ID.test(expectedSessionId) ||
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "jobId,sessionId,workspaceRoot") {
+    throw new TypeError("Invalid direct execution acceptance");
+  }
+  const { sessionId, workspaceRoot, jobId } = value as Record<string, unknown>;
+  if (sessionId !== expectedSessionId || workspaceRoot !== `/codex_workspace/${expectedSessionId}` ||
+    typeof jobId !== "string" || !JOB_ID.test(jobId)) {
+    throw new TypeError("Direct execution acceptance does not match its session");
+  }
+  return Object.freeze({ sessionId: expectedSessionId, workspaceRoot, jobId });
+}
+
 export function directSupervisorExecBody(request: DirectSupervisorExecRequest) {
   if (typeof request.sessionId !== "string" || !SESSION_ID.test(request.sessionId)) {
     throw new TypeError("Invalid direct execution session identity");
@@ -49,5 +64,5 @@ export function parseDirectSupervisorExecStarted(
     raw.effective_model !== DIRECT_SUPERVISOR_EXEC_MODEL || typeof raw.job_id !== "string" || !JOB_ID.test(raw.job_id)
   ) throw new TypeError("Direct execution acknowledgement does not match its request");
   // A returned PID is deliberately neither retained nor treated as authority.
-  return Object.freeze({ sessionId: expectedSessionId, workspaceRoot, jobId: raw.job_id });
+  return validateDirectSupervisorExecAcceptance({ sessionId: expectedSessionId, workspaceRoot, jobId: raw.job_id }, expectedSessionId);
 }

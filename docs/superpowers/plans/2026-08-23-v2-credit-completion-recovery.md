@@ -1,5 +1,7 @@
 # V2 Credit and Completion Recovery Implementation Plan
 
+> Historical plan: its two-second stall examples describe the revision implemented at that time. The selected host and R10 peer now use a sixty-second default; frozen legacy sidecar releases remain unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prevent idle-time ACK clocks and drained congestion from latching sandbox credits at zero, and prevent extreme model durations from permanently removing healthy runtimes from routing.

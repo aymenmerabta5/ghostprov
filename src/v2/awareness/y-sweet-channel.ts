@@ -8,7 +8,11 @@ import type {
   AwarenessChannel,
   AwarenessPeerUpdate,
 } from "./channel";
-import type { AwarenessEnvelope } from "../protocol/shared";
+import type { AwarenessEnvelope, AwarenessLane } from "../protocol/shared";
+import { withLocalAwarenessPublisher } from "./local-publisher";
+import { awarenessSocketTarget } from "./socket-target";
+
+const MAX_AWARENESS_SYNC_PEERS = 128;
 
 export interface AwarenessProviderLike {
   readonly awareness: Pick<Awareness,
@@ -58,24 +62,82 @@ export interface YSweetAwarenessChannelOptions<TRemote> {
 
 function defaultProviderFactory(
   credential: () => YSweetEnvelope,
-): (doc: Y.Doc) => AwarenessProviderLike {
+): (doc: Y.Doc) => WebsocketProvider {
+  const { url: initialUrl, docId: expectedDocId } = credential();
   class AuthenticatedWebSocket extends WebSocket {
-    constructor(url: string | URL, protocols?: string | string[]) {
-      const target = new URL(String(url));
-      target.searchParams.set("token", credential().token.reveal());
+    constructor(_url: string | URL, protocols?: string | string[]) {
+      const { url, docId, token } = credential();
+      const target = awarenessSocketTarget({ url, docId, token: token.reveal() }, expectedDocId);
       super(target, protocols as any);
     }
   }
-  return doc => new WebsocketProvider(
-    credential().url,
-    credential().docId,
+  return doc => withLocalAwarenessPublisher(new WebsocketProvider(
+    initialUrl,
+    expectedDocId,
     doc,
     {
       connect: false,
       disableBc: true,
       WebSocketPolyfill: AuthenticatedWebSocket as any,
     },
-  ) as AwarenessProviderLike;
+  ));
+}
+
+/** Native production provider shared with guarded, passive transport observers. */
+export function createYSweetAwarenessProvider(
+  doc: Y.Doc,
+  credential: () => YSweetEnvelope,
+): WebsocketProvider {
+  return defaultProviderFactory(credential)(doc);
+}
+
+/**
+ * The pinned y-websocket provider guards old close callbacks but not old
+ * open/message/error callbacks. Fence them before they mutate provider state.
+ * Custom providers without a ws slot keep their own lifecycle contract.
+ */
+function fenceProviderSocketCallbacks(provider: AwarenessProviderLike): boolean {
+  if (!("ws" in provider)) return true;
+  const slot = Object.getOwnPropertyDescriptor(provider, "ws");
+  if (!slot?.configurable || !("value" in slot) || !slot.writable) return false;
+  let current: unknown = slot.value;
+  const install = (socket: object): void => {
+    for (const name of ["onopen", "onmessage", "onerror", "onclose"] as const) {
+      const own = Object.getOwnPropertyDescriptor(socket, name);
+      if (own?.configurable === false) throw new AwarenessChannelError("Provider socket callbacks cannot be fenced", "state");
+      let descriptor = own;
+      let prototype = Object.getPrototypeOf(socket);
+      for (let depth = 0; !descriptor && prototype && depth < 8; depth++) {
+        descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        prototype = Object.getPrototypeOf(prototype);
+      }
+      const accessor = descriptor?.set ? descriptor : null;
+      let handler = descriptor?.get ? descriptor.get.call(socket) : descriptor?.value;
+      const assign = (value: unknown): void => {
+        handler = typeof value === "function" ? function (...args: unknown[]) {
+          if (current === socket) return value.apply(socket, args);
+        } : value;
+        accessor?.set?.call(socket, handler);
+      };
+      Object.defineProperty(socket, name, {
+        configurable: true,
+        enumerable: descriptor?.enumerable ?? true,
+        get: () => accessor?.get ? accessor.get.call(socket) : handler,
+        set: assign,
+      });
+      assign(handler);
+    }
+  };
+  Object.defineProperty(provider, "ws", {
+    configurable: true, enumerable: slot.enumerable,
+    get: () => current,
+    set: value => {
+      current = value;
+      if (value && typeof value === "object") install(value);
+    },
+  });
+  if (current && typeof current === "object") install(current);
+  return true;
 }
 
 export class YSweetAwarenessChannel<TLocal, TRemote>
@@ -87,12 +149,14 @@ implements AwarenessChannel<TLocal, TRemote> {
   readonly #syncTimeoutMs: number;
   readonly #doc: Y.Doc;
   readonly #provider: AwarenessProviderLike;
+  readonly #socketCallbacksFenced: boolean;
   readonly #listeners = new Set<(update: AwarenessPeerUpdate<TRemote>) => void>();
   readonly #failureListeners = new Set<(error: Error) => void>();
   readonly #peers = new Map<number, string>();
   #connected = false;
   #closed = false;
   #connecting: Promise<void> | null = null;
+  #reconnecting: Promise<void> | null = null;
   #cancelConnecting: ((error: Error) => void) | null = null;
   #providerGeneration = 0;
   #providerLifecycle: {
@@ -122,7 +186,8 @@ implements AwarenessChannel<TLocal, TRemote> {
     const credential = () => this.#credential;
     this.#provider = options.providerFactory
       ? options.providerFactory(this.#doc, credential)
-      : defaultProviderFactory(credential)(this.#doc);
+      : createYSweetAwarenessProvider(this.#doc, credential);
+    this.#socketCallbacksFenced = fenceProviderSocketCallbacks(this.#provider);
     this.#provider.awareness.on("change", this.#onAwarenessChange);
   }
 
@@ -172,6 +237,7 @@ implements AwarenessChannel<TLocal, TRemote> {
         this.#lastConnectionError = null;
         cleanupWait();
         resolve();
+        this.#replayCurrentPeers(generation);
       };
       const onError = (...args: any[]) => fail(this.#connectionFailure(
         "Y-Sweet Awareness connection failed",
@@ -204,6 +270,38 @@ implements AwarenessChannel<TLocal, TRemote> {
     });
     this.#connecting = connecting;
     return connecting;
+  }
+
+  reconnect(lane: AwarenessLane, signal?: AbortSignal): Promise<void> {
+    if (lane !== "data" && lane !== "control") return Promise.reject(new TypeError("Unknown Awareness lane"));
+    if (this.#closed) return Promise.reject(new AwarenessChannelError("Awareness channel is closed", "closed"));
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (!this.#socketCallbacksFenced) return Promise.reject(new AwarenessChannelError("Provider cannot safely reconnect its current socket", "state"));
+    if ((this.#field === "ghostprovV2Data" && lane !== "data") ||
+        (this.#field === "ghostprovV2Control" && lane !== "control")) {
+      return Promise.reject(new AwarenessChannelError("Awareness reconnect lane does not match this provider", "state"));
+    }
+    if (this.#reconnecting) return this.#reconnecting;
+    const previous = this.#connecting;
+    this.#cancelConnecting?.(new AwarenessChannelError("Awareness connection superseded by reconnect", "connect"));
+    void previous?.catch(() => undefined);
+    this.#connecting = null;
+    // Fence callbacks before closing the socket. Keep the provider, Y.Doc,
+    // local Awareness state, exact client identity and current credential.
+    this.#providerGeneration++;
+    this.#detachProviderLifecycle();
+    this.#connected = false;
+    this.#peers.clear();
+    this.#lastConnectionError = new AwarenessChannelError("Awareness channel is reconnecting", "disconnected");
+    try { this.#provider.disconnect(); }
+    catch {
+      return Promise.reject(new AwarenessChannelError("Awareness provider could not disconnect for reconnect", "connect"));
+    }
+    const reconnecting = this.connect(signal).finally(() => {
+      if (this.#reconnecting === reconnecting) this.#reconnecting = null;
+    });
+    this.#reconnecting = reconnecting;
+    return reconnecting;
   }
 
   publish(envelope: AwarenessEnvelope<TLocal>): void {
@@ -312,32 +410,58 @@ implements AwarenessChannel<TLocal, TRemote> {
     }
   }
 
+  #isCurrentConnection(generation: number): boolean {
+    return !this.#closed && this.#connected && generation === this.#providerGeneration;
+  }
+
+  #replayCurrentPeers(generation: number): void {
+    // Awareness can retain an update before document sync. Its identical-state
+    // clock renewals emit no "change", so revisit the retained state once for
+    // this synchronized connection without waiting for another publication.
+    let scanned = 0;
+    for (const clientId of this.#provider.awareness.getStates().keys()) {
+      if (!this.#isCurrentConnection(generation)) return;
+      if (clientId === this.#doc.clientID) continue;
+      if (scanned >= MAX_AWARENESS_SYNC_PEERS) return;
+      scanned++;
+      this.#readPeer(clientId, generation);
+    }
+  }
+
+  #readPeer(clientId: number, generation: number): void {
+    if (!this.#isCurrentConnection(generation) || clientId === this.#doc.clientID) return;
+    const state = this.#provider.awareness.getStates().get(clientId);
+    const raw = state?.[this.#field];
+    if (raw == null) {
+      this.#peers.delete(clientId);
+      return;
+    }
+    let envelope: AwarenessEnvelope<TRemote>;
+    try {
+      envelope = this.#parseRemote(raw);
+    } catch {
+      if (this.#isCurrentConnection(generation)) this.#peers.delete(clientId);
+      return;
+    }
+    if (!this.#isCurrentConnection(generation)) return;
+    this.#peers.set(clientId, envelope.peerId);
+    const update: AwarenessPeerUpdate<TRemote> = {
+      peerClientId: clientId,
+      envelope,
+    };
+    for (const listener of this.#listeners) {
+      if (!this.#isCurrentConnection(generation)) return;
+      listener(update);
+    }
+  }
+
   readonly #onAwarenessChange = (
     change: { added: number[]; updated: number[]; removed: number[] },
   ): void => {
     if (this.#closed || !this.#connected) return;
+    const generation = this.#providerGeneration;
     for (const clientId of change.removed) this.#peers.delete(clientId);
-    for (const clientId of [...change.added, ...change.updated]) {
-      if (clientId === this.#doc.clientID) continue;
-      const state = this.#provider.awareness.getStates().get(clientId);
-      const raw = state?.[this.#field];
-      if (raw == null) {
-        this.#peers.delete(clientId);
-        continue;
-      }
-      let envelope: AwarenessEnvelope<TRemote>;
-      try {
-        envelope = this.#parseRemote(raw);
-      } catch {
-        this.#peers.delete(clientId);
-        continue;
-      }
-      this.#peers.set(clientId, envelope.peerId);
-      const update: AwarenessPeerUpdate<TRemote> = {
-        peerClientId: clientId,
-        envelope,
-      };
-      for (const listener of this.#listeners) listener(update);
-    }
+    for (const clientId of change.added) this.#readPeer(clientId, generation);
+    for (const clientId of change.updated) this.#readPeer(clientId, generation);
   };
 }

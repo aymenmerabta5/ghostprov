@@ -8,6 +8,7 @@ import {
 import { ApiError } from "../src/http/errors";
 import { decodeReasoningItem } from "../src/anthropic/reasoning";
 import { projectAnthropicReplay } from "../src/anthropic/continuation";
+import { responseToAnthropic } from "../src/anthropic/response";
 import type { AnthropicAdapterMessage } from "../src/anthropic/types";
 import {
   CONTEXT,
@@ -594,6 +595,116 @@ describe("Responses to Anthropic stream translation", () => {
       type: "message_delta",
       delta: { stop_reason: "stop_sequence", stop_sequence: "STOP" },
     });
+  });
+
+  it.each([
+    [["bc", "abcd"], "zabcdtail"],
+    [["abcd", "bc"], "zabcXtail"],
+    [["abcd", "bc"], "zabc"],
+    [["abc", "ab"], "zabctail"],
+    [["ab", "abc"], "zabctail"],
+    [["🚀b", "a🚀bc"], "za🚀bctail"],
+  ] as const)("reconciles stops %j with the nonstream projection at every split of %s", (stops, text) => {
+    const responseContext = context({ stopSequences: [...stops] });
+    const final = finalResponse("resp_overlap", [
+      message("msg_overlap", [textPart(text)]),
+    ]);
+    const projected = responseToAnthropic(final, responseContext);
+    const expectedText = projected.content.flatMap(block => block.type === "text" ? [block.text] : []).join("");
+    const partitions = [
+      [text],
+      text.split(""),
+      ...Array.from({ length: text.length + 1 }, (_, split) => [text.slice(0, split), text.slice(split)]),
+    ];
+    for (const chunks of partitions) {
+      const translator = new AnthropicStreamTranslator(responseContext);
+      const events = collect(translator, [
+        ...chunks.map(delta => frame("response.output_text.delta", {
+          item_id: "msg_overlap", output_index: 0, content_index: 0, delta,
+        })),
+        frame("response.output_text.done", {
+          item_id: "msg_overlap", output_index: 0, content_index: 0, text,
+        }),
+        frame("response.completed", { response: final }),
+      ]);
+      expect(events.some(event => event.type === "error")).toBe(false);
+      expect(deltas(events, "text_delta", "text").join("")).toBe(expectedText);
+      expect(events.at(-2)).toMatchObject({
+        type: "message_delta",
+        delta: { stop_reason: projected.stop_reason, stop_sequence: projected.stop_sequence },
+      });
+      expect(events.at(-1)?.type).toBe("message_stop");
+    }
+  });
+
+  it("keeps overlapping candidates across adjacent content owners until the earliest stop wins", () => {
+    const parts = ["za", "bc", "dtail"];
+    const responseContext = context({ stopSequences: ["bc", "abcd"] });
+    const final = finalResponse("resp_overlap_owners", [
+      message("msg_overlap_owners", parts.map(textPart)),
+    ]);
+    const projected = responseToAnthropic(final, responseContext);
+    const translator = new AnthropicStreamTranslator(responseContext);
+    const events = collect(translator, [
+      ...parts.flatMap((text, content_index) => [
+        frame("response.output_text.delta", {
+          item_id: "msg_overlap_owners", output_index: 0, content_index, delta: text,
+        }),
+        frame("response.output_text.done", {
+          item_id: "msg_overlap_owners", output_index: 0, content_index, text,
+        }),
+      ]),
+      frame("response.completed", { response: final }),
+    ]);
+    expect(projected.content).toEqual([{ type: "text", text: "z", citations: null }]);
+    expect(events.some(event => event.type === "error")).toBe(false);
+    expect(deltas(events, "text_delta", "text").join("")).toBe("z");
+    expect(events.filter(event => event.type === "content_block_start")).toHaveLength(1);
+    expect(events.at(-2)).toMatchObject({ delta: { stop_sequence: projected.stop_sequence } });
+    expect(events.at(-1)?.type).toBe("message_stop");
+  });
+
+  it.each(["reasoning", "tool"] as const)("settles an overlapping candidate at a %s boundary before exposing later content", kind => {
+    const boundaryItem = kind === "reasoning"
+      ? reasoning("rs_overlap_boundary", "later reasoning")
+      : tool("fc_overlap_boundary", "call_overlap_boundary", "Read", "{}");
+    const addedItem = kind === "reasoning"
+      ? { type: "reasoning", id: "rs_overlap_boundary", status: "in_progress", summary: [] }
+      : {
+          type: "function_call", id: "fc_overlap_boundary", status: "in_progress",
+          call_id: "call_overlap_boundary", name: "Read", arguments: "",
+        };
+    const responseContext = context({ stopSequences: ["abcd", "bc"] });
+    const final = finalResponse("resp_overlap_boundary", [
+      message("msg_overlap_before", [textPart("zabc")]),
+      boundaryItem,
+      message("msg_overlap_after", [textPart("dtail")]),
+    ]);
+    const projected = responseToAnthropic(final, responseContext);
+    const translator = new AnthropicStreamTranslator(responseContext);
+    const events = collect(translator, [
+      frame("response.output_text.delta", {
+        item_id: "msg_overlap_before", output_index: 0, content_index: 0, delta: "zabc",
+      }),
+      frame("response.output_text.done", {
+        item_id: "msg_overlap_before", output_index: 0, content_index: 0, text: "zabc",
+      }),
+      frame("response.output_item.added", { output_index: 1, item: addedItem }),
+      frame("response.output_item.done", { output_index: 1, item: boundaryItem }),
+      frame("response.output_text.delta", {
+        item_id: "msg_overlap_after", output_index: 2, content_index: 0, delta: "dtail",
+      }),
+      frame("response.output_text.done", {
+        item_id: "msg_overlap_after", output_index: 2, content_index: 0, text: "dtail",
+      }),
+      frame("response.completed", { response: final }),
+    ]);
+    expect(projected.content).toEqual([{ type: "text", text: "za", citations: null }]);
+    expect(events.some(event => event.type === "error")).toBe(false);
+    expect(deltas(events, "text_delta", "text").join("")).toBe("za");
+    expect(events.filter(event => event.type === "content_block_start")).toHaveLength(1);
+    expect(events.at(-2)).toMatchObject({ delta: { stop_sequence: projected.stop_sequence } });
+    expect(events.at(-1)?.type).toBe("message_stop");
   });
 
   it("matches stops across adjacent ordinary text blocks but resets at reasoning boundaries", () => {

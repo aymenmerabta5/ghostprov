@@ -11,6 +11,8 @@ export interface AwarenessChannel<TLocal, TRemote> {
   readonly projectId: ProjectId;
   readonly localPeerId: string;
   connect(signal?: AbortSignal): Promise<void>;
+  /** Explicitly renew one existing provider connection without replacing its credential or state. */
+  reconnect?(lane: AwarenessLane, signal?: AbortSignal): Promise<void>;
   publish(envelope: AwarenessEnvelope<TLocal>, lane?: AwarenessLane): void;
   clear(lane?: AwarenessLane): void;
   subscribe(listener: (update: AwarenessPeerUpdate<TRemote>) => void): () => void;

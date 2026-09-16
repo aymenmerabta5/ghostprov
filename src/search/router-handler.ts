@@ -209,6 +209,10 @@ export function createRouterStandaloneSearchHandler(
           body.id,
           (previousResponseId, compareDelete) =>
             execute(previousResponseId, compareDelete),
+          {
+            signal: context.signal,
+            deadlineMs: context.incomingLease?.deadlineMs,
+          },
         );
       }
       return (await execute(null)).value;

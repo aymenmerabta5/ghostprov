@@ -1,5 +1,6 @@
 import { createServer as createHttpServer, type Server } from "node:http";
 import type { Hono } from "hono";
+import { getPath } from "hono/utils/url";
 import { writeFetchResponse } from "../http/adapter";
 import {
   collectRequestBody,
@@ -9,7 +10,8 @@ import {
 import { ApiError, apiErrorResponse } from "../http/errors";
 import {
   isAnthropicRequestPath,
-  requestBodyLimitForUrl,
+  acceptsRequestBody,
+  requestBodyLimitForPath,
   requestPath,
 } from "../http/request-policy";
 import {
@@ -110,8 +112,7 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
     request.once("aborted", abortRelay);
     response.once("close", abortOnIncompleteClose);
     void (async () => {
-      const path = requestPath(request.url);
-      const anthropicPath = isAnthropicRequestPath(path);
+      let anthropicPath = isAnthropicRequestPath(requestPath(request.url));
       try {
         const authorityFailure = publicRequestAuthorityFailure({
           host: request.headers.host,
@@ -132,6 +133,12 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
           ), anthropicPath));
           return;
         }
+        // Use Hono's exact path semantics for authentication, admission policy
+        // and dispatch. A raw URL pathname leaves encoded route aliases outside
+        // the authentication/body-limit boundary until after body reservation.
+        const target = new Request(`http://${request.headers.host!}${request.url ?? "/"}`);
+        const path = getPath(target);
+        anthropicPath = isAnthropicRequestPath(path);
         if (
           options.apiKey &&
           (isProtectedApiPath(path) || path === "/__sandboxes") &&
@@ -156,7 +163,6 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
           await writeFetchResponse(response, unauthorized);
           return;
         }
-        const host = request.headers.host!;
         const headers = new Headers();
         for (const [name, value] of Object.entries(request.headers)) {
           if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(",") : String(value));
@@ -165,9 +171,9 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
         let fetchResponse: Response;
         try {
           let body: Uint8Array | undefined;
-          if (request.method !== "GET" && request.method !== "HEAD") {
-            const maxBodyBytes = requestBodyLimitForUrl(
-              request.url,
+          if (acceptsRequestBody(request.method, path)) {
+            const maxBodyBytes = requestBodyLimitForPath(
+              path,
               options.maxBodyBytes ?? 64 * 1024 ** 2,
             );
             if (contentLengthExceeds(request.headers["content-length"], maxBodyBytes)) {
@@ -199,8 +205,13 @@ export function createGhostProvServer(options: GhostProvServerOptions): Server {
                 : undefined,
             });
             if (collected.length) body = new Uint8Array(collected);
+          } else {
+            // Route/method errors and public health requests need no body.
+            // Drain without retaining bytes, preserving Hono's normal status
+            // and error envelope instead of waiting on an untrusted upload.
+            request.resume();
           }
-          const fetchRequest = new Request(`http://${host}${request.url ?? "/"}`, {
+          const fetchRequest = new Request(target.url, {
             method: request.method,
             headers,
             body: body as unknown as BodyInit,

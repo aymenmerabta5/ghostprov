@@ -9,6 +9,8 @@ import {
   observabilityEvent,
   recoveryObservabilityEvent,
   sandboxLivenessObservabilityEvent,
+  fleetLifecycleObservabilityEvent,
+  FLEET_BOOTSTRAP_CLEANUP_REASONS,
   type JsonValue,
 } from "../src/observability/events";
 import type { ObservabilityConfig } from "../src/observability/config";
@@ -16,6 +18,9 @@ import {
   assertSafeObservabilityEvent,
   safeObservabilityModel,
 } from "../src/observability/redaction";
+import { emitSandboxLivenessDiagnostic } from "../src/server/system";
+import { projectId } from "../src/sandbox/types";
+import type { V2RuntimeLivenessDiagnostic } from "../src/v2/runtime";
 
 function config(overrides: Partial<ObservabilityConfig> = {}): ObservabilityConfig {
   return {
@@ -54,6 +59,100 @@ function modelFallbackEvent(fields: Record<string, JsonValue> = {}) {
 }
 
 describe("ObservabilityLogger", () => {
+  it("persists data and control recovery through the production diagnostic mapper and both sinks", async () => {
+    const sink = new MemorySink();
+    const writes: string[] = [];
+    const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink,
+      new ConsoleSink({ now: () => 0, write: batch => writes.push(batch) }),
+    ] });
+    const id = projectId("00000000-0000-4000-8000-000000000032");
+    const diagnostics: V2RuntimeLivenessDiagnostic[] = [
+      { signal: "awareness", outcome: "failed", attempt: 7, awarenessLane: "control", errorName: "V2TransportLivenessError", errorKind: "timeout", durationMs: 30_000 },
+      { signal: "awareness", outcome: "started", attempt: 7, awarenessLane: "control" },
+      { signal: "awareness", outcome: "succeeded", attempt: 7, awarenessLane: "control", reconnectPhase: "host_reconnect", durationMs: 125.5 },
+      { signal: "awareness", outcome: "superseded", attempt: 7, awarenessLane: "control", reconnectPhase: "host_reconnect", durationMs: 130 },
+      { signal: "awareness", outcome: "failed", attempt: 8, awarenessLane: "control", reconnectPhase: "host_reconnect", errorName: "V2TransportLivenessError", errorKind: "unavailable", durationMs: 12_000 },
+      { signal: "awareness", outcome: "failed", attempt: 9, awarenessLane: "data", errorName: "V2TransportLivenessError", errorKind: "reliable_stall", durationMs: 2_000 },
+      { signal: "awareness", outcome: "started", attempt: 9, awarenessLane: "data" },
+      { signal: "awareness", outcome: "succeeded", attempt: 9, awarenessLane: "data", reconnectPhase: "host_reconnect", durationMs: 150.5 },
+    ];
+    for (const diagnostic of diagnostics) emitSandboxLivenessDiagnostic(logger, id, 31, diagnostic);
+    await logger.close();
+    const events = sink.events();
+    expect(events).toHaveLength(diagnostics.length);
+    expect(events.map(event => event.liveness_outcome)).toEqual(diagnostics.map(diagnostic => diagnostic.outcome));
+    for (let index = 0; index < diagnostics.length; index++) {
+      expect(events[index]).toMatchObject({ event: "sandbox.liveness", project_id: id, worker_index: 31, transport: "v2", liveness_signal: "awareness", awareness_lane: diagnostics[index]!.awarenessLane, attempt: diagnostics[index]!.attempt });
+    }
+    expect(events[0]).toMatchObject({ error_name: "V2TransportLivenessError", error_kind: "timeout", duration_ms: 30_000 });
+    expect(events[1]).not.toHaveProperty("error_kind");
+    expect(events[2]).toMatchObject({ reconnect_phase: "host_reconnect", duration_ms: 125.5 });
+    expect(events[3]).toMatchObject({ reconnect_phase: "host_reconnect", duration_ms: 130 });
+    expect(events[4]).toMatchObject({ error_kind: "unavailable", reconnect_phase: "host_reconnect", duration_ms: 12_000 });
+    expect(events[5]).toMatchObject({ error_kind: "reliable_stall", awareness_lane: "data", duration_ms: 2_000 });
+    expect(events[6]).not.toHaveProperty("error_kind");
+    expect(events[7]).toMatchObject({ reconnect_phase: "host_reconnect", awareness_lane: "data", duration_ms: 150.5 });
+    expect(writes.join("\n").split("\n").map(line => JSON.parse(line))).toEqual(events);
+    expect(logger.snapshot()).toMatchObject({ sinkErrors: 0, droppedTerminals: 0, queuedEvents: 0, queuedBytes: 0 });
+  });
+  it("retains every held-bootstrap cleanup transition and reason at error level without console sampling", async () => {
+    const sink = new MemorySink();
+    const writes: string[] = [];
+    const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink,
+      new ConsoleSink({ now: () => 0, write: batch => writes.push(batch) }),
+    ] });
+    const identity = { project_id: "00000000-0000-4000-8000-000000000032", worker_index: 31, leader_generation: 7 };
+    const transitions = [
+      fleetLifecycleObservabilityEvent("fleet.bootstrap_cleanup.started", identity),
+      ...FLEET_BOOTSTRAP_CLEANUP_REASONS.map(cleanup_reason =>
+        fleetLifecycleObservabilityEvent("fleet.bootstrap_cleanup.deferred", { ...identity, cleanup_reason })),
+      fleetLifecycleObservabilityEvent("fleet.bootstrap_cleanup.succeeded", identity),
+    ];
+    for (const event of transitions) logger.emit(event, "terminal");
+    await logger.close();
+    expect(sink.events()).toEqual(transitions);
+    expect(writes.join("\n").split("\n").map(line => JSON.parse(line))).toEqual(transitions);
+    expect(logger.snapshot()).toMatchObject({ queuedEvents: 0, queuedBytes: 0, droppedTerminals: 0, sinkErrors: 0 });
+  });
+
+  it("never writes raw held-bootstrap cleanup reasons or extra error details to a sink", async () => {
+    const sink = new MemorySink();
+    const logger = new ObservabilityLogger({ config: config({ level: "error" }), sinks: [sink] });
+    const identity = { project_id: "00000000-0000-4000-8000-000000000032", worker_index: 31, leader_generation: 7 };
+    const invalidEvents: Array<Record<string, JsonValue>> = [
+      { cleanup_reason: "PRIVATE_CLEANUP_CANARY" },
+      { cleanup_reason: "timeout", message: "PRIVATE_CLEANUP_CANARY" },
+      { cleanup_reason: "timeout", error_message: "PRIVATE_CLEANUP_CANARY" },
+    ];
+    for (const fields of invalidEvents) logger.emit(observabilityEvent("fleet.bootstrap_cleanup.deferred", { ...identity, ...fields }), "terminal");
+    await logger.close();
+    expect(sink.lines).toHaveLength(0);
+    expect(logger.snapshot().sinkErrors).toBe(3);
+  });
+  it("retains degraded startup readiness in JSONL and console", async () => {
+    const memory = new MemorySink();
+    const consoleLines: string[] = [];
+    const logger = new ObservabilityLogger({ config: config(), sinks: [memory,
+      new ConsoleSink({ write: batch => consoleLines.push(batch) }),
+    ] });
+    logger.emit(observabilityEvent("server.started", {
+      desired: 8, ready: 5, routable: 4, held_project_count: 3, fleet_readiness: "degraded",
+    }));
+    await logger.close();
+    expect(memory.events()).toMatchObject([{ event: "server.started", desired: 8, ready: 5, routable: 4, held_project_count: 3, fleet_readiness: "degraded" }]);
+    expect(consoleLines).toHaveLength(1);
+    expect(JSON.parse(consoleLines[0]!)).toMatchObject(memory.events()[0]);
+  });
+  it("keeps the console sample slot for the aggregate after runtime detail pages", async () => {
+    const writes: string[] = [];
+    const sink = new ConsoleSink({ now: () => 0, write: batch => writes.push(batch) });
+    await sink.writeBatch([
+      JSON.stringify(observabilityEvent("fleet.runtime_sample", { sample_id: 1, runtime_index: 0, runtime_count: 1, runtime: {} })),
+      JSON.stringify(observabilityEvent("fleet.sample", { sample_id: 1, capacity: 128, runtimes: [] })),
+    ]);
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(writes[0]!)).toMatchObject({ event: "fleet.sample", capacity: 128 });
+  });
   it("records bounded model fallback attribution at error level without console sampling", async () => {
     const sink = new MemorySink();
     const writes: string[] = [];
@@ -223,6 +322,23 @@ describe("ObservabilityLogger", () => {
     expect(compact).not.toContain("private-99");
     expect(formatConsoleObservabilityLine('{"event":"request.completed"}\n'))
       .toBe('{"event":"request.completed"}');
+  });
+
+  it("shows routable capacity and bounded blocker counts when ready workers cannot admit work", () => {
+    const reasons = ["sidecar_suspect", "sidecar_suspect", "sidecar_suspect", "awareness_reconnect",
+      "transport_congested", "transport_congested", "zero_remote_credits", "lifecycle_unavailable"];
+    const compact = formatConsoleObservabilityLine(JSON.stringify(observabilityEvent("fleet.sample", {
+      desired: 8, ready: 7, routable: 0, capacity: 4, active: 2, available: 0,
+      runtimes: [...reasons, "private-unrecognized-reason"].map((reason, index) => ({
+        state: index < 7 ? "ready" : "recovering", availability_reason: reason,
+      })),
+    })));
+    expect(JSON.parse(compact)).toMatchObject({
+      ready: 7, routable: 0, capacity: 4, available: 0,
+      availability_reasons: { sidecar_suspect: 3, awareness_reconnect: 1,
+        transport_congested: 2, zero_remote_credits: 1, lifecycle_unavailable: 1 },
+    });
+    expect(compact).not.toContain("private-unrecognized-reason");
   });
 
   it("preserves terminal events and drops samples first under a bounded queue", async () => {

@@ -48,6 +48,8 @@ class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> 
   connects = 0;
   closes = 0;
   failConnect = false;
+  reconnects = 0;
+  reconnectGate: Promise<void> | null = null;
 
   constructor(
     readonly projectId: ProjectId,
@@ -58,6 +60,11 @@ class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> 
   async connect(): Promise<void> {
     this.connects++;
     if (this.failConnect) throw new Error("lane connect failed");
+  }
+
+  async reconnect(): Promise<void> {
+    this.reconnects++;
+    if (this.reconnectGate) await this.reconnectGate;
   }
 
   publish(value: AwarenessEnvelope<TLocal>): void {
@@ -102,6 +109,24 @@ class LaneChannel<TLocal, TRemote> implements AwarenessChannel<TLocal, TRemote> 
 }
 
 describe("SplitAwarenessChannel", () => {
+  it("joins one lane reconnect and prevents late completion from reopening a closed split", async () => {
+    const data = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:data", "sidecar:data");
+    const control = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:control", "sidecar:control");
+    const split = new SplitAwarenessChannel({ data, control });
+    await split.connect();
+    const gate = Promise.withResolvers<void>();
+    control.reconnectGate = gate.promise;
+    const pending = split.reconnect("control");
+    expect(split.reconnect("control")).toBe(pending);
+    expect(control.reconnects).toBe(1);
+    expect(data.reconnects).toBe(0);
+    await split.close();
+    gate.resolve();
+    await expect(pending).rejects.toThrow("closed");
+    expect(data.connects).toBe(1);
+    expect(() => split.publish(envelope("host", 1))).toThrow("closed");
+  });
+
   it("keeps control and data publications in independent ephemeral states", async () => {
     const data = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:data", "sidecar:data");
     const control = new LaneChannel<HostFrame, SidecarFrame>(PROJECT, "host:control", "sidecar:control");

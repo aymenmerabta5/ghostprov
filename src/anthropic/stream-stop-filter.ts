@@ -120,6 +120,7 @@ export class UnicodeStopFilter<T> {
   #pendingPoints = 0;
   #processedPoints = 0;
   #danglingHigh: { owner: T; code: number } | null = null;
+  #pendingMatch: StopMatch | null = null;
   #matchedSequence: string | null = null;
 
   constructor(stopSequences: readonly string[]) {
@@ -161,19 +162,29 @@ export class UnicodeStopFilter<T> {
     };
   }
 
-  endSegment(): OwnedTextChunk<T>[] {
+  endSegment(): UnicodeStopFilterResult<T> {
     if (this.#matchedSequence !== null) {
       this.#discardPending();
       this.#danglingHigh = null;
       this.#resetMatchers();
-      return [];
+      return { chunks: [], matchedSequence: this.#matchedSequence };
     }
     if (this.#danglingHigh !== null) {
       throw new TypeError("Responses stream ended ordinary text within an astral character");
     }
+    if (this.#pendingMatch !== null) {
+      // A stop cannot continue across a non-text boundary. Any completed
+      // candidate therefore wins over the unfinished prefixes held beside it.
+      const start = this.#processedPoints - this.#pendingPoints;
+      const chunks = this.#take(this.#pendingMatch.start - start);
+      this.#matchedSequence = this.#pendingMatch.sequence.source;
+      this.#discardPending();
+      this.#resetMatchers();
+      return { chunks, matchedSequence: this.#matchedSequence };
+    }
     const chunks = this.#take(this.#pendingPoints);
     this.#resetMatchers();
-    return chunks;
+    return { chunks, matchedSequence: null };
   }
 
   hasPending(owner: T): boolean {
@@ -229,7 +240,7 @@ export class UnicodeStopFilter<T> {
       start = 1;
     }
     const span = validatedSpan(value, start);
-    let selected: StopMatch | null = null;
+    let selected = this.#pendingMatch;
     const observe = (point: number): void => {
       const candidate = this.#advanceMatchers(point);
       if (candidate !== null && (
@@ -260,6 +271,19 @@ export class UnicodeStopFilter<T> {
     }
     if (span.danglingHigh !== null) {
       this.#danglingHigh = { owner, code: span.danglingHigh };
+    }
+    this.#pendingMatch = selected;
+    if (selected !== null) {
+      for (const sequence of this.#sequences) {
+        if (sequence.matched === 0) continue;
+        const start = this.#processedPoints - sequence.matched;
+        // KMP retains the longest matching prefix, hence its earliest possible
+        // start. Shorter suffixes cannot beat a candidate this prefix cannot.
+        // While a contender exists, the candidate remains within the same
+        // maximum-length-minus-one suffix already retained between appends.
+        if (start < selected.start || (start === selected.start &&
+          sequence.order < selected.sequence.order)) return null;
+      }
     }
     return selected;
   }
@@ -341,6 +365,7 @@ export class UnicodeStopFilter<T> {
 
   #resetMatchers(): void {
     this.#processedPoints = 0;
+    this.#pendingMatch = null;
     for (const sequence of this.#sequences) sequence.matched = 0;
   }
 }

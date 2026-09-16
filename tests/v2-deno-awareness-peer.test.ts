@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as Y from "yjs";
 import {
   Awareness,
@@ -19,6 +19,7 @@ import type {
   AwarenessEnvelope,
   HostFrame,
   ProtocolBinding,
+  ReliableFrame,
   SidecarFrame,
 } from "../src/v2/protocol/shared";
 import {
@@ -38,7 +39,13 @@ const BINDING: ProtocolBinding = {
   schemaHash: "b".repeat(64),
 };
 
-function r10LivenessHarness() {
+function r10LivenessHarness(options: {
+  accept?: (frame: HostFrame) => Promise<void>;
+  retransmitMs?: number;
+  outputBackpressure?: OutputBackpressure;
+  now?: () => number;
+  transportStallMs?: number;
+} = {}) {
   const binding: ProtocolBinding = {
     ...BINDING,
     protocolRevision: "r2",
@@ -66,7 +73,10 @@ function r10LivenessHarness() {
     engine: {
       snapshot: () => ({ ready: true, credits: 8, active: 0, queued: 0, draining: false }),
       setHostCeiling: (credits: number) => { hostCeilings.push(credits); },
-      accept: async (frame: HostFrame) => { accepted.push(frame); },
+      accept: async (frame: HostFrame) => {
+        accepted.push(frame);
+        await options.accept?.(frame);
+      },
     } as any,
     providerFactory: (doc, _credential, lane) => {
       const provider = new FakeProvider(doc);
@@ -74,7 +84,10 @@ function r10LivenessHarness() {
       return provider;
     },
     publicationIntervalMs: 60_000,
-    retransmitMs: 60_000,
+    retransmitMs: options.retransmitMs ?? 60_000,
+    outputBackpressure: options.outputBackpressure,
+    now: options.now,
+    transportStallMs: options.transportStallMs,
     connectTimeoutMs: 100,
   });
   const publish = (envelope: AwarenessEnvelope<HostFrame>, lane: "data" | "control" = "data") => {
@@ -104,6 +117,18 @@ function r10LivenessHarness() {
         ...overrides,
       } as AwarenessEnvelope<HostFrame>, "control");
     },
+    sendData(frames: readonly ReliableFrame<HostFrame>[], overrides: Record<string, unknown> = {}) {
+      publish({
+        ...hostEnvelope(-1, revision++),
+        protocolRevision: "r2",
+        schemaVersion: 2,
+        launchNonce: binding.launchNonce,
+        targetInstanceId: "sidecar-instance-1",
+        lane: "data",
+        frames,
+        ...overrides,
+      } as AwarenessEnvelope<HostFrame>);
+    },
     async close() {
       await peer.close();
       for (const awareness of Object.values(hostAwareness)) awareness.destroy();
@@ -113,6 +138,285 @@ function r10LivenessHarness() {
 }
 
 describe("R10 Awareness liveness state", () => {
+  it("keeps a cold response flight credited below the sixty-second default while queue pressure remains fail-closed", async () => {
+    let now = 1_000;
+    const harness = r10LivenessHarness({ now: () => now });
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.peer.enqueue(responseEvent(0, "req-cold-response"), "data", "req-cold-response");
+      harness.peer.publishEngineState();
+      const data = () => harness.providers.get("data")!.awareness.getLocalState()!
+        .ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+      const original = data();
+
+      now += 39_249;
+      harness.sendControl({ ack: { epoch: 1, sequence: -1 } });
+      harness.peer.publishEngineState();
+      expect(harness.control().credits).toBe(8);
+      expect(data().frames).toEqual(original.frames);
+      expect(harness.control().diagnostics?.transport).toMatchObject({
+        stallEventsTotal: 0,
+      });
+
+      for (let index = 1; index <= 128; index++) {
+        harness.peer.enqueue(
+          responseEvent(index, "req-cold-response"),
+          "data",
+          "req-cold-response",
+        );
+      }
+      harness.peer.publishEngineState();
+      expect(harness.control().credits).toBe(0);
+      expect(harness.control().diagnostics?.transport.schedulerFrames).toBeGreaterThanOrEqual(128);
+      expect(data().frames).toEqual(original.frames);
+    } finally { await harness.close(); }
+  });
+
+  it("retires unpublished cancelled output without changing its active flight or another stream", async () => {
+    const outputBackpressure = new OutputBackpressure({
+      highFrames: 16, highBytes: 2_048, lowFrames: 4, lowBytes: 1_024,
+      hardFrames: 128, hardBytes: 16_384,
+    });
+    const harness = r10LivenessHarness({ outputBackpressure });
+    const requestId = "req-cancelled-output";
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.peer.enqueue(responseEvent(0, requestId), "data", requestId);
+      harness.peer.publishEngineState();
+      const data = () => harness.providers.get("data")!.awareness.getLocalState()!
+        .ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+      const activeFlight = data();
+      for (let index = 1; index <= 32; index++) {
+        harness.peer.enqueue(responseEvent(index, requestId), "data", requestId);
+      }
+      harness.peer.enqueue(responseEvent(0, "req-active"), "data", "req-active");
+      const pressureBefore = outputBackpressure.snapshot();
+      expect(pressureBefore).toMatchObject({ paused: true, frames: 33 });
+      let pressureReleased = false;
+      const released = outputBackpressure.wait().then(() => { pressureReleased = true; });
+      // The engine emits this only after durable cancellation has won.
+      harness.peer.enqueue({ kind: "request_cancelled", requestId }, "control", requestId);
+      await released;
+      expect(pressureReleased).toBe(true);
+      expect(outputBackpressure.snapshot()).toMatchObject({ paused: false, frames: 2, waiters: 0 });
+      expect(outputBackpressure.snapshot().bytes).toBeLessThan(pressureBefore.bytes);
+      harness.peer.publishEngineState();
+      expect(data().frames).toEqual(activeFlight.frames);
+      harness.sendControl({ ack: { epoch: 1, sequence: activeFlight.frames.at(-1)!.sequence } });
+      harness.peer.publishEngineState();
+      const nextFlight = data();
+      expect(nextFlight.frames.map(frame => frame.kind)).toEqual([
+        "request_cancelled", "response_event",
+      ]);
+      expect(nextFlight.frames.map(frame => "requestId" in frame ? frame.requestId : null))
+        .toEqual([requestId, "req-active"]);
+      expect(nextFlight.frames.map(frame => frame.sequence)).toEqual([1, 2]);
+      expect(outputBackpressure.snapshot()).toMatchObject({ frames: 0, bytes: 0, waiters: 0 });
+    } finally { await harness.close(); }
+  });
+
+  it("does not immediately duplicate a timer retransmission when a stale ACK arrives", async () => {
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+    const timers = new Map<object, { at: number; callback(): void }>();
+    const set = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay = 0) => {
+      const handle = { unref() { return handle; } };
+      timers.set(handle, { at: now + delay, callback });
+      return handle;
+    }) as typeof setTimeout);
+    const clear = spyOn(globalThis, "clearTimeout").mockImplementation((handle => {
+      timers.delete(handle as object);
+    }) as typeof clearTimeout);
+    const harness = r10LivenessHarness({ retransmitMs: 1_000 });
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.peer.enqueue(responseEvent(0, "req-retransmission"), "data", "req-retransmission");
+      harness.peer.publishEngineState();
+      const data = () => (harness.providers.get("data")!.awareness.getLocalState()!
+        .ghostprovV2Data as AwarenessEnvelope<SidecarFrame>);
+      const original = data();
+      now += 1_600;
+      for (const [handle, timer] of [...timers]) {
+        if (timer.at > now) continue;
+        timers.delete(handle);
+        timer.callback();
+      }
+      const retransmitted = data();
+      expect(retransmitted.revision).toBeGreaterThan(original.revision);
+      harness.sendControl({ ack: { epoch: 1, sequence: -1 } });
+      expect(data().revision).toBe(retransmitted.revision);
+      expect(data().frames).toEqual(original.frames);
+      now += 2_000;
+      harness.sendControl({ ack: { epoch: 1, sequence: -1 } });
+      expect(data().revision).toBeGreaterThan(retransmitted.revision);
+      expect(data().frames).toEqual(original.frames);
+    } finally {
+      await harness.close();
+      set.mockRestore(); clear.mockRestore(); clock.mockRestore();
+    }
+  });
+
+  it("keeps exact-owner cleanup usable after draining control overtakes data", async () => {
+    const harness = r10LivenessHarness();
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.sendControl({ draining: true });
+      harness.sendData([
+        { kind: "request_cancel", requestId: "req-draining", reason: "client", epoch: 1, sequence: 0 },
+        { kind: "response_ack", requestId: "req-terminal", terminalDigest: "a".repeat(64), epoch: 1, sequence: 1 },
+        { kind: "drain", reason: "shutdown", epoch: 1, sequence: 2 },
+      ], { draining: true });
+      await Bun.sleep(0);
+      expect(harness.accepted.map(frame => frame.kind)).toEqual([
+        "request_cancel", "response_ack", "drain",
+      ]);
+      expect(harness.control().ack).toEqual({ epoch: 1, sequence: 2 });
+    } finally { await harness.close(); }
+  });
+
+  it("does not ACK draining cleanup before its durable processing settles", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const harness = r10LivenessHarness({ accept: () => gate });
+    try {
+      await harness.peer.connect();
+      harness.sendControl({ draining: true });
+      harness.sendData([
+        { kind: "response_ack", requestId: "req-terminal", terminalDigest: "a".repeat(64), epoch: 1, sequence: 0 },
+      ], { draining: true });
+      await Bun.sleep(0);
+      expect(harness.accepted).toHaveLength(1);
+      expect(harness.control().ack).toEqual({ epoch: 1, sequence: -1 });
+      release();
+      await Bun.sleep(0);
+      expect(harness.control().ack).toEqual({ epoch: 1, sequence: 0 });
+    } finally { release(); await harness.close(); }
+  });
+
+  it.each(["missing", "removed", "rollback", "foreign", "target", "binding"] as const)(
+    "rejects draining cleanup without current exact control authority: %s", async failure => {
+      const harness = r10LivenessHarness();
+      try {
+        await harness.peer.connect();
+        if (failure !== "missing") {
+          harness.sendControl();
+          harness.sendControl({ draining: true });
+          if (failure === "removed") {
+            harness.hostAwareness.control.setLocalStateField("ghostprovV2Control", null);
+            applyAwarenessUpdate(harness.providers.get("control")!.awareness,
+              encodeAwarenessUpdate(harness.hostAwareness.control, [harness.hostDocs.control.clientID]), "removed-host");
+          } else {
+            const invalid = failure === "rollback" ? { revision: 0 }
+              : failure === "foreign" ? { instanceId: "foreign-host" }
+              : failure === "target" ? { targetInstanceId: "foreign-sidecar" }
+              : { buildHash: "c".repeat(64) };
+            harness.sendControl({ draining: true, ...invalid });
+          }
+        }
+        harness.sendData([{ kind: "drain", reason: "shutdown", epoch: 1, sequence: 0 }], { draining: true });
+        await Bun.sleep(0);
+        expect(harness.accepted).toHaveLength(0);
+        expect(harness.control().ack).toEqual({ epoch: 1, sequence: -1 });
+      } finally { await harness.close(); }
+    },
+  );
+
+  it("does not admit new request data or skip its sequence while draining", async () => {
+    const harness = r10LivenessHarness();
+    try {
+      await harness.peer.connect();
+      harness.sendControl({ draining: true });
+      harness.sendData([
+        { kind: "request_open", requestId: "req-new", requestDigest: "a".repeat(64),
+          decodedBytes: 1, encodedBytes: 1, encoding: "identity", partCount: 1, epoch: 1, sequence: 0 },
+        { kind: "drain", reason: "shutdown", epoch: 1, sequence: 1 },
+      ], { draining: true });
+      await Bun.sleep(0);
+      expect(harness.accepted).toHaveLength(0);
+      expect(harness.control().ack).toEqual({ epoch: 1, sequence: -1 });
+    } finally { await harness.close(); }
+  });
+
+  it("recovers derated capacity during steady 1200ms ACK rounds", async () => {
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+    // Short deterministic override for the adaptive boundary; production R10 is 60 seconds.
+    const harness = r10LivenessHarness({ transportStallMs: 2_000 });
+    let acknowledged = -1;
+    let eventIndex = 0;
+    const round = (latencyMs: number, stall: boolean) => {
+      harness.peer.enqueue(responseEvent(eventIndex++, "req-rtt-recovery"), "data", "req-rtt-recovery");
+      harness.peer.publishEngineState();
+      const flight = harness.providers.get("data")!.awareness.getLocalState()!.ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+      now += latencyMs;
+      if (stall) {
+        harness.sendControl({ ack: { epoch: 1, sequence: acknowledged } });
+        harness.peer.publishEngineState();
+        expect(harness.control().credits).toBe(0);
+      }
+      acknowledged = flight.frames.at(-1)!.sequence;
+      harness.sendControl({ ack: { epoch: 1, sequence: acknowledged } });
+      harness.peer.publishEngineState();
+    };
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      round(2_100, true);
+      round(7_000, true);
+      expect(harness.control().credits).toBe(4);
+      for (let index = 0; index < 9; index++) round(1_200, false);
+      expect(harness.control().credits).toBeGreaterThan(4);
+      expect(harness.control().credits).toBeLessThanOrEqual(8);
+    } finally {
+      await harness.close();
+      clock.mockRestore();
+    }
+  });
+
+  it("keeps response admission usable after ACK progress while queued output remains", async () => {
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+    const harness = r10LivenessHarness();
+    try {
+      await harness.peer.connect();
+      harness.sendControl();
+      harness.peer.enqueue(responseEvent(0, "req-output-stream"), "data", "req-output-stream");
+      harness.peer.publishEngineState();
+      const first = harness.providers.get("data")!.awareness.getLocalState()!.ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+      expect(first.frames).toHaveLength(1);
+      let eventIndex = 1;
+      const dataBase64Url = Buffer.from(JSON.stringify({ delta: "x".repeat(2_200) })).toString("base64url");
+      const enqueue = (count: number) => {
+        for (let index = 0; index < count; index++) {
+          harness.peer.enqueue({ ...responseEvent(eventIndex++, "req-output-stream"),
+            dataBase64Url } as SidecarFrame, "data", "req-output-stream");
+        }
+      };
+      enqueue(60);
+      // This models the logged 2.24s queue age with fresh ACK progress. The
+      // response queue stays below its hard byte/frame admission watermarks.
+      now += 2_500;
+      let flight = first;
+      for (let round = 0; round < 6; round++) {
+        harness.sendControl({ ack: { epoch: 1, sequence: flight.frames.at(-1)!.sequence } });
+        harness.peer.publishEngineState();
+        flight = harness.providers.get("data")!.awareness.getLocalState()!.ghostprovV2Data as AwarenessEnvelope<SidecarFrame>;
+        expect(flight.frames.length).toBeGreaterThan(0);
+        expect(flight.frames.length).toBeLessThanOrEqual(32);
+        expect(harness.control().credits).toBeGreaterThan(0);
+        if (round < 5) enqueue(flight.frames.length);
+        now += 1_200;
+      }
+    } finally {
+      await harness.close();
+      clock.mockRestore();
+    }
+  });
+
   it.each([1, 2])("recovers an idle host probe after %i isolated pong losses", async lostPongs => {
     const harness = r10LivenessHarness();
     const pings: AwarenessEnvelope<HostFrame>[] = [];

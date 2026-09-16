@@ -346,6 +346,10 @@ export async function requestGhostProvShutdown(cwd = process.cwd(), options: Req
         Date.parse(result.completedAt) >= Date.parse(request.requestedAt)) {
         if (result.outcome !== "clean") throw new Error("GhostProv reported incomplete cleanup; shutdown is unproven");
         await assertDescriptor();
+        // A receipt cannot authorize the final action after this requester has
+        // lost the startup gate. Re-acquiring an already-held lease asserts its
+        // exact ownership; waiting until finally would detect loss too late.
+        await lease.acquire({ timeoutMs: 1 });
         options.signal?.throwIfAborted();
         if (now() >= deadline) throw new Error("GhostProv cleanup receipt arrived after the shutdown deadline");
         await options.afterCleanup?.(result);

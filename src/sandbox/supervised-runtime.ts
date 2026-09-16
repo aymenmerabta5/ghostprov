@@ -28,6 +28,7 @@ const DEFAULT_HEARTBEAT_GRACE_MS = 40_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 120_000;
 const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 const DEFAULT_MAX_BACKOFF_MS = 60_000;
+const MAX_RETAINED_CHILD_CLEANUP_OWNERS = 4;
 
 const IMMEDIATELY_UNHEALTHY_STATES = new Set([
   "auth_required",
@@ -84,6 +85,8 @@ export interface SandboxSupervisorEvent {
   failure: SandboxFailureSnapshot | null;
 }
 
+export type BootstrapCleanupAssessment = "not_required" | "proven" | "unproved";
+
 export interface SupervisedSandboxRuntimeOptions {
   /** Stable registry identity. Every child returned by createChild must match it. */
   projectId: ProjectId;
@@ -99,6 +102,8 @@ export interface SupervisedSandboxRuntimeOptions {
   checkIntervalMs?: number;
   heartbeatGraceMs?: number;
   startupTimeoutMs?: number;
+  /** Host-owned system shutdown deadline in this runtime's clock domain. Absent during ordinary recovery. */
+  shutdownDeadlineMs?: () => number | undefined;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   /**
@@ -106,6 +111,8 @@ export interface SupervisedSandboxRuntimeOptions {
    * held only while a child is created and its start() call is in flight.
    */
   acquirePermit?(signal: AbortSignal): Promise<() => void>;
+  /** Checks authoritative journal/debt state before cold admission; proof uses no new backend. */
+  recoverBootstrapCleanup?(signal: AbortSignal): Promise<BootstrapCleanupAssessment>;
   recoveryCoordinator?: FleetRecoveryCoordinator;
   workerIndex?: number;
   transport?: "v2";
@@ -128,6 +135,13 @@ interface PendingRecovery {
 
 interface Retirement {
   promise: Promise<void>;
+}
+
+interface ChildCleanupOwner {
+  stopping: Promise<void> | null;
+  stopState: "unstarted" | "pending" | "fulfilled" | "rejected";
+  pendingDrains: number;
+  drainSucceeded: boolean;
 }
 
 class ChildStartupTimeoutError extends Error {
@@ -228,10 +242,16 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   readonly #checkIntervalMs: number;
   readonly #heartbeatGraceMs: number;
   readonly #startupTimeoutMs: number;
+  readonly #shutdownDeadlineMs?: () => number | undefined;
+  readonly #recoverBootstrapCleanup?: SupervisedSandboxRuntimeOptions["recoverBootstrapCleanup"];
   readonly #initialBackoffMs: number;
   readonly #maxBackoffMs: number;
   readonly #listeners = new Set<() => void>();
   readonly #retirements = new Map<RoutableSandboxRuntime, Retirement>();
+  readonly #childCleanupOwners = new Map<RoutableSandboxRuntime, ChildCleanupOwner>();
+  #pendingChildFactories = 0;
+  #pendingChildStarts = 0;
+  #failedChildCleanup = false;
 
   #child: RoutableSandboxRuntime | null = null;
   #childUnsubscribe: (() => void) | null = null;
@@ -250,6 +270,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   #pendingRecovery: PendingRecovery | null = null;
   #startPromise: Promise<void> | null = null;
   #shutdownPromise: Promise<void> | null = null;
+  #shutdownSucceeded = false;
   #recovery: SandboxRecoverySnapshot | null = null;
   #recoveryStartedAtMs: number | null = null;
   #recoveryAttemptStartedAtMs: number | null = null;
@@ -263,6 +284,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#workerIndex = options.workerIndex;
     this.#transportMode = options.transport;
     this.#onRecoveryEvent = options.onRecoveryEvent;
+    this.#shutdownDeadlineMs = options.shutdownDeadlineMs;
+    this.#recoverBootstrapCleanup = options.recoverBootstrapCleanup;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#random = options.random ?? SYSTEM_RANDOM;
     this.#checkIntervalMs = positiveInteger(
@@ -296,6 +319,15 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
   }
+
+  localCleanupComplete(): boolean {
+    this.#pruneChildCleanupOwners();
+    return this.#permanentlyStopped && this.#phase === "stopped" && this.#child === null &&
+      this.#pendingChildFactories === 0 && this.#pendingChildStarts === 0 && this.#childCleanupOwners.size === 0 &&
+      this.#retirements.size === 0 && this.#monitorPromise === null && this.#recoveryPromise === null;
+  }
+
+  cleanupProofRequired(): boolean { return this.#failedChildCleanup; }
 
   start(): Promise<void> {
     if (this.#permanentlyStopped) {
@@ -591,6 +623,27 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         }
         if (!this.#isActive(signal)) throw abortError();
 
+        if (this.#recoverBootstrapCleanup) {
+          this.#pruneChildCleanupOwners();
+          // The first attached child has not started yet. Every retired owner
+          // must have physically settled before journal inspection or recovery;
+          // a rejected stop or a public timeout is not that local writer fence.
+          const hasRetiredOwner = [...this.#childCleanupOwners.keys()].some(owner => owner !== child);
+          if (hasRetiredOwner || this.#pendingChildFactories > 0 || this.#pendingChildStarts > 0) {
+            throw attemptFailure ?? new Error("Previous bootstrap local ownership remains unsettled");
+          }
+          const assessment = await this.#recoverBootstrapCleanup(signal);
+          if (!this.#isActive(signal)) throw abortError();
+          // First readiness failures already retain a submitted journal even
+          // without the later cleanup error code. Check that authority before
+          // taking cold capacity or creating/provisioning another generation.
+          // Connection/authentication failures retain their existing error and
+          // circuit classification; local closure never supplies remote proof.
+          if (assessment === "unproved") throw attemptFailure ?? new Error("Recorded supervisor cleanup remains unproven");
+          if (assessment !== "not_required" && assessment !== "proven") throw new Error("Invalid bootstrap cleanup assessment");
+          if (assessment === "proven") this.#failedChildCleanup = false;
+        }
+
         let releasePermit: (() => void) | null = null;
         try {
           releasePermit = await this.#takePermit(signal);
@@ -631,6 +684,12 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
         }
 
         this.#phase = "healthy";
+        this.#pruneChildCleanupOwners();
+        // A new healthy generation crossed the child bootstrap's exact prior
+        // retirement gate. Older local owners must also have finished before
+        // that successful recovery can discharge a previous stop failure.
+        if (this.#childCleanupOwners.size === 1 && this.#childCleanupOwners.has(child) &&
+          this.#pendingChildFactories === 0 && this.#pendingChildStarts === 0) this.#failedChildCleanup = false;
         this.#notifyRecovery(
           "completed",
           pending.reason,
@@ -698,7 +757,16 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     signal: AbortSignal,
     seed: ProvisionedSandbox | null,
   ): Promise<RoutableSandboxRuntime> {
-    const source = Promise.resolve().then(() => this.#createChild(seed ?? undefined));
+    this.#pruneChildCleanupOwners();
+    if (this.#childCleanupOwners.size + this.#pendingChildFactories + this.#pendingChildStarts >= MAX_RETAINED_CHILD_CLEANUP_OWNERS) {
+      throw new Error("Sandbox child cleanup ownership capacity is exhausted");
+    }
+    this.#pendingChildFactories++;
+    const source = Promise.resolve().then(() => this.#createChild(seed ?? undefined)).then(child => {
+      // Retain a late factory result before releasing its creation ownership.
+      this.#retainChildCleanupOwner(child);
+      return child;
+    }).finally(() => { this.#pendingChildFactories--; });
     const timeoutController = new AbortController();
     const timeout = this.#clock.sleep(this.#startupTimeoutMs, timeoutController.signal)
       .then(() => ({ type: "timeout" as const }));
@@ -748,7 +816,9 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     const onAbort = () => timeoutController.abort();
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) timeoutController.abort();
-    const starting = Promise.resolve().then(() => child.start());
+    this.#pendingChildStarts++;
+    const starting = Promise.resolve().then(() => child.start())
+      .finally(() => { this.#pendingChildStarts--; });
     const timeout = this.#clock.sleep(this.#startupTimeoutMs, timeoutController.signal)
       .then(() => { throw new ChildStartupTimeoutError(this.#startupTimeoutMs); });
     try {
@@ -761,6 +831,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
 
   #attachChild(child: RoutableSandboxRuntime): void {
     this.#assertProject(child.projectId);
+    this.#retainChildCleanupOwner(child);
     if (this.#child && this.#child !== child) {
       throw new Error(`Sandbox supervisor ${this.projectId} already has a child`);
     }
@@ -814,9 +885,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     let retirement = this.#retirements.get(child);
     if (!retirement) {
       const timeoutController = new AbortController();
-      const stopping = Promise.resolve()
-        .then(() => child.stop())
-        .catch(() => undefined);
+      const stopping = this.#stopChild(child).catch(() => undefined);
       const timeout = this.#clock.sleep(this.#startupTimeoutMs, timeoutController.signal)
         .catch(() => undefined);
       const promise = Promise.race([stopping, timeout])
@@ -832,6 +901,47 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       return;
     }
     await this.#abortable(retirement.promise, signal);
+  }
+
+  #retainChildCleanupOwner(child: RoutableSandboxRuntime): ChildCleanupOwner {
+    let owner = this.#childCleanupOwners.get(child);
+    if (!owner) {
+      if (this.#childCleanupOwners.size >= MAX_RETAINED_CHILD_CLEANUP_OWNERS) {
+        throw new Error("Sandbox child cleanup ownership capacity is exhausted");
+      }
+      owner = { stopping: null, stopState: "unstarted", pendingDrains: 0, drainSucceeded: false };
+      this.#childCleanupOwners.set(child, owner);
+    }
+    return owner;
+  }
+
+  #stopChild(child: RoutableSandboxRuntime): Promise<void> {
+    const owner = this.#retainChildCleanupOwner(child);
+    if (owner.stopping) return owner.stopping;
+    owner.stopState = "pending";
+    const stopping = Promise.resolve().then(() => child.stop()).then(
+      () => { owner.stopState = "fulfilled"; },
+      error => { owner.stopState = "rejected"; this.#failedChildCleanup = true; throw error; },
+    );
+    owner.stopping = stopping;
+    void stopping.catch(() => undefined);
+    return stopping;
+  }
+
+  #pruneChildCleanupOwners(): void {
+    // A late factory/start can still hand us a child or finish mutating one we
+    // already stopped. Keep exact references until those actual sources settle.
+    if (this.#pendingChildFactories > 0 || this.#pendingChildStarts > 0) return;
+    for (const [child, owner] of this.#childCleanupOwners) {
+      if (child === this.#child || owner.stopState === "pending" || owner.pendingDrains > 0) continue;
+      try {
+        if (child.snapshot().state !== "stopped") continue;
+        const complete = child.localCleanupComplete
+          ? child.localCleanupComplete()
+          : owner.stopState === "fulfilled" || owner.drainSucceeded;
+        if (complete) this.#childCleanupOwners.delete(child);
+      } catch { /* Missing physical proof retains this exact child owner. */ }
+    }
   }
 
   #observeChild(child: RoutableSandboxRuntime): RoutableSandboxSnapshot {
@@ -912,7 +1022,17 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   }
 
   #beginShutdown(kind: "drain" | "stop", reason: string): Promise<void> {
-    if (this.#shutdownPromise) return this.#shutdownPromise;
+    if (this.#shutdownPromise) {
+      // A timed-out factory can hand us its exact child after this waiter
+      // completed. Its later cleanup rejection invalidates the cached success
+      // without issuing stop again; managers also inspect the dynamic debt.
+      if (this.#shutdownSucceeded && this.#failedChildCleanup) {
+        this.#shutdownSucceeded = false;
+        this.#shutdownPromise = Promise.reject(new Error("Sandbox shutdown cleanup was incomplete"));
+        void this.#shutdownPromise.catch(() => undefined);
+      }
+      return this.#shutdownPromise;
+    }
     if (this.#phase === "stopped" && this.#permanentlyStopped) return Promise.resolve();
     this.#permanentlyStopped = true;
     this.#intendedLive = false;
@@ -936,6 +1056,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
 
     const shutdown = this.#shutdown(kind, reason);
     this.#shutdownPromise = shutdown;
+    void shutdown.then(() => { this.#shutdownSucceeded = true; }, () => undefined);
     return shutdown;
   }
 
@@ -967,7 +1088,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#phase = "stopped";
     this.#recovery = null;
     this.#emit();
-    if (retired.some(result => result.status === "rejected")) throw new Error("Sandbox shutdown cleanup was incomplete");
+    if (this.#failedChildCleanup || retired.some(result => result.status === "rejected")) throw new Error("Sandbox shutdown cleanup was incomplete");
   }
 
   #isActive(signal: AbortSignal): boolean {
@@ -980,22 +1101,42 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     reason: string,
   ): Promise<void> {
     const timeoutMs = Math.min(this.#startupTimeoutMs, 30_000);
+    // System shutdown shares the host's remaining cleanup budget. Recovery
+    // keeps its shorter bounds, and drain-to-stop never renews the host budget.
+    const systemDeadline = this.#shutdownDeadlineMs?.();
+    if (systemDeadline !== undefined && (!Number.isFinite(systemDeadline) || systemDeadline < 0)) {
+      throw new RangeError("System shutdown deadline must be finite and nonnegative");
+    }
     const runBounded = async (operation: Promise<void>): Promise<boolean> => {
+      if (systemDeadline !== undefined && this.#clock.now() >= systemDeadline) {
+        // The fence still starts, but a late result cannot certify an expired
+        // shutdown budget or become an unhandled rejection after this waiter.
+        void operation.catch(() => undefined);
+        return false;
+      }
       const timeoutController = new AbortController();
       try {
         return await Promise.race([
-          operation.then(() => true, () => false),
-          this.#clock.sleep(timeoutMs, timeoutController.signal).then(() => false),
+          operation.then(() => systemDeadline === undefined || this.#clock.now() < systemDeadline, () => false),
+          this.#clock.sleep(
+            systemDeadline === undefined ? timeoutMs : Math.max(0, systemDeadline - this.#clock.now()),
+            timeoutController.signal,
+          ).then(() => false),
         ]);
       } finally {
         timeoutController.abort();
       }
     };
-    const completed = await runBounded(Promise.resolve().then(() => (
-      graceful ? child.drain(reason) : child.stop()
-    )));
+    const owner = this.#retainChildCleanupOwner(child);
+    let retiring: Promise<void>;
+    if (graceful) {
+      owner.pendingDrains++;
+      retiring = Promise.resolve().then(() => child.drain(reason)).then(() => { owner.drainSucceeded = true; })
+        .finally(() => { owner.pendingDrains--; });
+    } else retiring = this.#stopChild(child);
+    const completed = await runBounded(retiring);
     if (completed) return;
-    if (graceful && await runBounded(Promise.resolve().then(() => child.stop()))) return;
+    if (graceful && await runBounded(this.#stopChild(child))) return;
     throw new Error("Sandbox shutdown cleanup was incomplete");
   }
 

@@ -118,6 +118,14 @@ export interface RoutableSandboxRuntime {
   start(): Promise<void>;
   drain(reason: string): Promise<void>;
   stop(): Promise<void>;
+  /**
+   * True only after this stopped generation's actual local resources and
+   * asynchronous owners have finished cleanup. This is independent of remote
+   * supervisor cleanup proof; a bounded/rejected stop promise is not a witness.
+   */
+  localCleanupComplete?(): boolean;
+  /** Remote cleanup debt may arrive after a bounded public stop has fulfilled. */
+  cleanupProofRequired?(): boolean;
   snapshot(): RoutableSandboxSnapshot;
   run(
     body: Record<string, unknown>,
