@@ -13,6 +13,7 @@ import type { PrismAccountSession } from "../prism/account-session";
 import { PrismProjectsClient } from "../prism/projects-client";
 import { PrismProvisioningClient } from "../prism/provisioning-client";
 import { FleetRecoveryCoordinator } from "../prism/recovery-coordinator";
+import { createPrismConnectivityProbe, PrismConnectivityMonitor, type PrismConnectivityProbeResult, type RecoveryConnectivity } from "../prism/connectivity";
 import {
   PrismSessionManager,
   type ResolvedPrismIdentity,
@@ -330,6 +331,8 @@ export interface BrowserlessSystemDependencies {
   revisionSelector?: BrowserlessV2RevisionSelector;
   logger?: LoggerLike;
   sampler?: BrowserlessFleetSampler;
+  /** Offline tests inject this probe; production uses credential-free Prism HTTPS. */
+  connectivityProbe?: (signal: AbortSignal) => Promise<PrismConnectivityProbeResult>;
   /** Test/integration seam; production omits it and uses SandboxHeartbeat. */
   heartbeatFactory?: (input: {
     projectId: ProjectId;
@@ -366,7 +369,12 @@ export interface BrowserlessSystem {
   logger: LoggerLike;
   sampler: BrowserlessFleetSampler;
   start(): Promise<void>;
-  close(): Promise<void>;
+  close(options?: BrowserlessSystemCloseOptions): Promise<void>;
+}
+
+export interface BrowserlessSystemCloseOptions {
+  /** Strict stop/poweroff audit; ordinary signals may preserve already-held historical debt. */
+  requireRetainedBootstrapCleanup?: boolean;
 }
 
 export function createV2CpuGzip(
@@ -547,6 +555,7 @@ function defaultRuntimeFactory(options: {
   revisionSelector: BrowserlessV2RevisionSelector;
   nextLeaderGeneration(projectId: Parameters<ManagedRuntimeFactory["create"]>[0]["projectId"]): Promise<number>;
   recoveryCoordinator: FleetRecoveryCoordinator;
+  connectivity: RecoveryConnectivity;
   revalidateAccount(signal: AbortSignal): Promise<ResolvedPrismIdentity>;
   logger: LoggerLike;
   sandboxLogs: SandboxLogService;
@@ -569,6 +578,7 @@ function defaultRuntimeFactory(options: {
     revisionSelector,
     nextLeaderGeneration,
     recoveryCoordinator,
+    connectivity,
     revalidateAccount,
     logger,
     sandboxLogs,
@@ -596,6 +606,7 @@ function defaultRuntimeFactory(options: {
       workerIndex,
       leaderGeneration,
       provisioning,
+      connectivity,
       governor,
       assets: release.assets,
       transportReservationBytes: config.v2TransportReservationBytes,
@@ -802,6 +813,7 @@ function defaultRuntimeFactory(options: {
           recoverBootstrapCleanup: (signal: AbortSignal) => recoverBootstrapCleanup(input.projectId, signal),
         } : {}),
         recoveryCoordinator,
+        connectivity,
         workerIndex: input.workerIndex,
         transport: "v2",
         onRecoveryEvent: event => {
@@ -1029,6 +1041,16 @@ export async function createBrowserlessSystem(
   }
   const provisioning = new PrismProvisioningClient({ account: identity.account });
   let fleet!: ProjectFleetManager;
+  const connectivity = new PrismConnectivityMonitor({
+    probe: dependencies.connectivityProbe ?? createPrismConnectivityProbe(config.prismOrigin),
+    onTransition: snapshot => {
+      logger.emit(observabilityEvent("prism.connectivity.changed", {
+        connectivity_state: snapshot.state,
+        connectivity_reason: snapshot.reason,
+      }), "terminal");
+      fleet?.observeConnectivity();
+    },
+  });
   const recoveryCoordinator = new FleetRecoveryCoordinator({
     revalidateAccount: signal => sessionManager.revalidate
       ? sessionManager.revalidate(signal)
@@ -1116,6 +1138,7 @@ export async function createBrowserlessSystem(
       SYSTEM_CLOCK.now(),
     ),
     recoveryCoordinator,
+    connectivity,
     revalidateAccount: signal => sessionManager.revalidate
       ? sessionManager.revalidate(signal)
       : Promise.resolve(identity),
@@ -1159,6 +1182,7 @@ export async function createBrowserlessSystem(
       bootstrapMigration: new FileBootstrapHoldMigration({ manifestFile: fleetManifestFile, identityFingerprint: identity.fingerprint }),
     } : {}),
     recoveryCircuitSnapshot: () => recoveryCoordinator.snapshot(),
+    connectivity,
     canRetireProject: project => router.responseProvenanceBindingsForProject(project) === 0,
     onLifecycleEvent: event => emitFleetLifecycle(logger, event),
   });
@@ -1356,8 +1380,9 @@ export async function createBrowserlessSystem(
       })();
       return starting;
     },
-    close() {
+    close(options: BrowserlessSystemCloseOptions = {}) {
       if (closing) return closing;
+      const requireRetainedBootstrapCleanup = options.requireRetainedBootstrapCleanup ?? true;
       closing = (async () => {
         unlinkExternalStartup();
         // Publish the shared deadline before cancellation can start a child's
@@ -1404,6 +1429,8 @@ export async function createBrowserlessSystem(
           await fleet.shutdown("system-shutdown");
         } catch (error) {
           firstError ??= error;
+        } finally {
+          connectivity.close();
         }
         // Runtime stop waiters are bounded independently. Their exact supervisor
         // cleanup still needs the account and project connections until it settles.
@@ -1414,13 +1441,16 @@ export async function createBrowserlessSystem(
             const proofSignal = AbortSignal.timeout(Math.max(1, shutdownDeadlineMs - Date.now()));
             const finalManifest = await abortableStartup(manifest.load(), proofSignal);
             await assertBootstrapCleanupComplete({
-              projectIds: finalManifest.workers.map(worker => worker.projectId),
+              projectIds: finalManifest.workers
+                .filter(worker => requireRetainedBootstrapCleanup || worker.retirementReason !== "bootstrap_hold")
+                .map(worker => worker.projectId),
               journalFactory: shutdownJournalFactory,
               signal: proofSignal,
             });
             // Missing journal files cannot clear an unresolved cleanup hold.
             // Only the fleet manager's verified transition releases this debt.
-            if (finalManifest.workers.some(worker => worker.retirementReason === "bootstrap_hold")) {
+            if (requireRetainedBootstrapCleanup &&
+              finalManifest.workers.some(worker => worker.retirementReason === "bootstrap_hold")) {
               throw new BootstrapCleanupProofError();
             }
           } catch (error) { firstError ??= error; }

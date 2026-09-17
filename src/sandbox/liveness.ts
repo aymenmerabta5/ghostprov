@@ -1,7 +1,7 @@
 export const SANDBOX_LIVENESS_MAX_AGE_MS = 20_000;
 export const SANDBOX_LIVENESS_RECOVERY_MAX_MS = 150_000;
 
-/** One runtime-owned episode; failed retries must never extend its deadline. */
+/** One runtime-owned lease. Fresh external-outage evidence may replace it. */
 export interface SandboxLivenessRecovery {
   readonly startedAtMs: number;
   readonly deadlineAtMs: number;

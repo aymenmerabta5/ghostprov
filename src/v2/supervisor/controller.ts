@@ -8,6 +8,7 @@ import type {
   SealedBootstrapCredential,
 } from "../bootstrap/crypto";
 import { createCredentialRotationKey } from "../bootstrap/crypto";
+import { abortableSleep } from "../bootstrap/sleep";
 import {
   type V2BootstrapGateway,
   type V2BootstrapYDoc,
@@ -44,6 +45,8 @@ import {
 } from "./direct-launcher";
 
 export type SupervisorBootstrapMode = "direct" | "llm" | "git-fsmonitor" | "git-ssh-signing" | "git-clean-filter" | "git-textconv";
+
+const PROVEN_CLEANUP_RETRY_DELAYS_MS = Object.freeze([250, 1_000] as const);
 
 export class V2SupervisorBootstrapError extends Error {
   readonly name = "V2SupervisorBootstrapError";
@@ -442,6 +445,24 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
 
   async #cleanupBootstrapAttempt(attempt: SupervisorBootstrapAttempt, signal?: AbortSignal, assets: V2SidecarAssets = this.#assets): Promise<void> {
     await cleanupBootstrapAttemptFiles({ projectId: this.binding.projectId, ydoc: this.#ydoc, gateway: this.#gateway, assets }, attempt, signal);
+  }
+
+  async #cleanupProvenBootstrapAttempt(
+    attempt: SupervisorBootstrapAttempt,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    for (let attemptIndex = 0;; attemptIndex++) {
+      signal?.throwIfAborted();
+      try {
+        await this.#cleanupBootstrapAttempt(attempt, signal);
+        return;
+      } catch (error) {
+        if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError") ||
+          (error instanceof V2SupervisorBootstrapError && error.remoteCode === "bootstrap_ownership_conflict") ||
+          attemptIndex >= PROVEN_CLEANUP_RETRY_DELAYS_MS.length) throw error;
+        await abortableSleep(PROVEN_CLEANUP_RETRY_DELAYS_MS[attemptIndex]!, signal);
+      }
+    }
   }
 
   async #assertBootstrapPaths(
@@ -869,7 +890,7 @@ export class V2SandboxSupervisor implements V2BootstrapSupervisor {
             await journal.save(proven);
             this.#confirmCleanup(attempt.binding);
             signal?.throwIfAborted();
-            await this.#cleanupBootstrapAttempt(proven, signal);
+            await this.#cleanupProvenBootstrapAttempt(proven, signal);
             await journal.clear();
             this.#activeAttempt = null;
           });

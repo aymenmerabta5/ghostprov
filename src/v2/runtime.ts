@@ -1,4 +1,5 @@
 import { SYSTEM_CLOCK, type Clock } from "../core/ports";
+import type { RecoveryConnectivity } from "../prism/connectivity";
 import type {
   AcquireSandboxOptions,
   ProvisionedRuntimeCredentials,
@@ -22,6 +23,7 @@ import type { SandboxHeartbeatAttemptDiagnostic } from "../sandbox/heartbeat";
 import {
   hasFreshExactSidecarLiveness,
   isActiveSandboxLivenessRecovery,
+  SANDBOX_LIVENESS_MAX_AGE_MS,
   SANDBOX_LIVENESS_RECOVERY_MAX_MS,
   type SandboxLivenessRecovery,
 } from "../sandbox/liveness";
@@ -54,7 +56,7 @@ import type {
 import { V2TransportLivenessError } from "./transport/session";
 import type { V2TransportDiagnostics } from "./diagnostics/types";
 import { V2_RECEIVE_EVIDENCE_MAX_AGE_MS } from "./diagnostics/host-types";
-import { V2PreCommitError } from "./transport/run-handle";
+import { V2CommittedError, V2PreCommitError } from "./transport/run-handle";
 import {
   DecayingRuntimeFailureScore,
   classifyRuntimeError,
@@ -67,6 +69,11 @@ import { applyUpstreamServiceTierPolicy } from "../relay/service-tier-policy";
 
 const AWARENESS_RECONNECT_TIMEOUT_MS = 3_000;
 const SILENT_AWARENESS_RECONNECT_TIMEOUT_MS = 10_000;
+
+function isConnectivityRequestFailure(error: unknown): boolean {
+  return (error instanceof V2PreCommitError || error instanceof V2CommittedError) &&
+    (error.code === "not_connected" || error.code === "closed");
+}
 
 function resolvedRateLimitOutcome(value: unknown, handle: RunHandle): boolean {
   // Successful Responses calls commonly carry budget headers. Those headers
@@ -253,6 +260,7 @@ function livenessErrorKind(
         if (error && typeof error === "object" && "name" in error) name = String(error.name);
       } catch {}
       if (name === "TimeoutError") return "timeout";
+      if (name === "AccountTransportError") return "account_transport";
       return fallback;
     }
   }
@@ -280,6 +288,36 @@ function livenessConnectionCode(error: unknown): number | null {
 
 function transientRecoveryPreflightStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
+}
+
+function livenessErrorStatus(error: unknown): number | null {
+  try {
+    if (!error || typeof error !== "object" || !("status" in error)) return null;
+    return normalizedHttpStatus(error.status as number | null);
+  } catch {
+    return null;
+  }
+}
+
+function isExternalRecoveryOutageEvidence(
+  errorKind: SandboxLivenessErrorKind,
+  status: number | null,
+  reconnectPhase: SandboxReconnectPhase,
+  supervisorPhase: SandboxSupervisorPhase | null,
+): boolean {
+  if (status !== null && transientRecoveryPreflightStatus(status)) return true;
+  if (reconnectPhase === "mint_credential") {
+    return errorKind === "account_transport" || errorKind === "provision_timeout" || errorKind === "provision_transport" ||
+      errorKind === "rate_limit" || errorKind === "server" || errorKind === "timeout" ||
+      errorKind === "transport";
+  }
+  if (supervisorPhase === "transport") {
+    return errorKind === "connect" || errorKind === "disconnected" || errorKind === "sync" ||
+      errorKind === "timeout" || errorKind === "transport";
+  }
+  return reconnectPhase === "host_reconnect" &&
+    (errorKind === "connect" || errorKind === "disconnected" || errorKind === "sync" ||
+      errorKind === "timeout" || errorKind === "transport");
 }
 
 export interface V2RuntimeProvisioning {
@@ -471,6 +509,7 @@ export interface V2SandboxRuntimeOptions {
   eventMemoryPool?: AtomicBytePermitPool;
   gzip?: (bytes: Uint8Array, options?: V2GzipOptions) => Promise<Uint8Array>;
   clock?: Clock;
+  connectivity?: RecoveryConnectivity;
   resourceRefreshLeadMs?: number;
   ySweetRefreshMs?: number;
   sidecarProbePeriodMs?: number;
@@ -579,6 +618,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   } | null = null;
   #livenessRecovery: SandboxLivenessRecovery | null = null;
   #livenessRecoveryTimer: AbortController | null = null;
+  #heartbeatOutageEvidenceAtMs: number | null = null;
+  #connectivityUnsubscribe: (() => void) | null = null;
+  #pendingConnectivityHealthFailures = 0;
   #gateway: V2RuntimeGateway | null = null;
   #heartbeat: V2RuntimeHeartbeat | null = null;
   #ydoc: V2RuntimeYDoc | null = null;
@@ -810,7 +852,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         "not_ready",
       );
     }
-    if (this.#sidecarSuspect || this.#sidecarRelaunching || this.#ySweetReconnectPending) {
+    if (this.#sidecarSuspect || this.#sidecarRelaunching || this.#ySweetReconnectPending ||
+      this.#options.connectivity?.snapshot().state === "unreachable") {
       throw new V2PreCommitError(
         "V2 sandbox sidecar is recovering",
         "recovering",
@@ -826,7 +869,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         options,
       );
     } catch (error) {
-      this.#runtimeHealth.record(classifyRuntimeError(error));
+      this.#recordRequestFailure(error);
       this.#deferAmbiguityHealthDuringRelaunch(error);
       this.#emit();
       throw error;
@@ -852,7 +895,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         return value;
       },
       error => {
-        this.#runtimeHealth.record(classifyRuntimeError(error));
+        this.#recordRequestFailure(error);
         this.#deferAmbiguityHealthDuringRelaunch(error);
         this.#emit();
         throw error;
@@ -970,6 +1013,24 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     const controller = new AbortController();
     this.#controller = controller;
     this.#failure = null;
+    this.#heartbeatOutageEvidenceAtMs = null;
+    this.#pendingConnectivityHealthFailures = 0;
+    this.#connectivityUnsubscribe?.();
+    this.#connectivityUnsubscribe = this.#options.connectivity?.subscribe(() => {
+      if (controller.signal.aborted || generation !== this.#generation || this.#state !== "ready") return;
+      const state = this.#options.connectivity!.snapshot().state;
+      if (state === "unreachable") {
+        this.#pendingConnectivityHealthFailures = 0;
+        this.#sidecarSuspect = true;
+        this.#beginLivenessRecovery();
+        this.#renewLivenessRecovery();
+      } else if (state === "reachable") {
+        for (let count = this.#pendingConnectivityHealthFailures; count > 0; count--) this.#runtimeHealth.record("unhealthy");
+        this.#pendingConnectivityHealthFailures = 0;
+        this.#renewLivenessRecovery();
+      }
+      this.#emit();
+    }) ?? null;
     this.#setState("provisioning");
     let effectiveSandbox = this.#options.initialSandbox ?? null;
     const startHeartbeat = (sandbox: ProvisionedSandbox) => {
@@ -997,26 +1058,42 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           this.#credentialRefreshPending = true;
           this.#emit();
           let candidate: ProvisionedSandbox;
-          try {
-            candidate = this.#options.acquireSandboxForAuth
-              ? await this.#options.acquireSandboxForAuth(status, controller.signal)
-              : await this.#options.provisioning.acquireSandbox!(
-                controller.signal,
-                { maxAttempts: 1 },
+          for (;;) {
+            try {
+              if (this.#options.connectivity) await this.#options.connectivity.waitForRecovery(controller.signal);
+              candidate = this.#options.acquireSandboxForAuth
+                ? await this.#options.acquireSandboxForAuth(status, controller.signal)
+                : await this.#options.provisioning.acquireSandbox!(
+                  controller.signal,
+                  { maxAttempts: 1 },
+                );
+              break;
+            } catch (error) {
+              const value = error && typeof error === "object"
+                ? error as { kind?: unknown; status?: unknown }
+                : {};
+              this.#notifyCredentialRefresh(
+                controller.signal.aborted
+                  ? "aborted"
+                  : value.kind === "auth" || value.status === 401 || value.status === 403
+                    ? "auth_rejected"
+                    : "transport_failed",
+                status,
               );
-          } catch (error) {
-            const value = error && typeof error === "object"
-              ? error as { kind?: unknown; status?: unknown }
-              : {};
-            this.#notifyCredentialRefresh(
-              controller.signal.aborted
-                ? "aborted"
-                : value.kind === "auth" || value.status === 401 || value.status === 403
-                  ? "auth_rejected"
-                  : "transport_failed",
-              status,
-            );
-            return "expired";
+              const connectivity = this.#options.connectivity;
+              if (!controller.signal.aborted && connectivity && isExternalRecoveryOutageEvidence(
+                livenessErrorKind(error), livenessErrorStatus(error), "mint_credential", null,
+              )) {
+                const previousRecovery = connectivity.snapshot().recoveredAtMs;
+                connectivity.requestCheck();
+                await connectivity.waitForRecovery(controller.signal);
+                // Retry credential acquisition only after an independently
+                // observed outage has ended. Definitive auth/session failures
+                // retain the existing expiry path.
+                if (connectivity.snapshot().recoveredAtMs !== previousRecovery) continue;
+              }
+              return "expired";
+            }
           }
           if (!callbackIsCurrent()) return "expired";
           if (gateway.rotateSameSession?.(candidate)) {
@@ -1044,7 +1121,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           if (!callbackIsCurrent()) return;
           const recovered = diagnostic.outcome === "success" &&
             diagnostic.previousConsecutiveFailures > 0;
-          if (diagnostic.outcome === "success" && !recovered) return;
+          if (diagnostic.outcome === "success") {
+            this.#heartbeatOutageEvidenceAtMs = null;
+            if (!recovered) return;
+          }
           const errorKind: SandboxLivenessErrorKind | null =
             diagnostic.outcome === "http_error"
               ? "http"
@@ -1053,6 +1133,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
                 : diagnostic.outcome === "transport_error"
                   ? "transport"
                   : null;
+          if (!recovered && errorKind !== null) {
+            const externalOutage = errorKind === "timeout" || errorKind === "transport" ||
+              (typeof diagnostic.status === "number" &&
+                transientRecoveryPreflightStatus(diagnostic.status));
+            this.#heartbeatOutageEvidenceAtMs = externalOutage ? this.#clock.now() : null;
+            if (externalOutage) {
+              this.#options.connectivity?.requestCheck();
+              if (this.#livenessRecovery) this.#renewLivenessRecovery();
+              else this.#beginLivenessRecovery();
+            }
+          }
           this.#notifyLiveness({
             signal: "heartbeat",
             outcome: recovered ? "recovered" : "failed",
@@ -1066,7 +1157,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         },
         onSuccess: () => {
           if (!callbackIsCurrent()) return;
+          this.#heartbeatOutageEvidenceAtMs = null;
           this.#credentialRefreshPending = false;
+          this.#finishLivenessRecovery();
           this.#emit();
         },
         onExpired: status => {
@@ -1079,7 +1172,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         onAuthenticationFailure: refreshAuthentication,
         onTransientFailure: () => {
           if (!callbackIsCurrent()) return;
-          this.#runtimeHealth.record("unhealthy");
+          this.#recordControlPathFailure();
           this.#emit();
         },
         onUnreachable: status => {
@@ -1097,9 +1190,20 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             // control paths. Preserve the live generation when the bound peer
             // is still proving liveness, while retaining a health penalty so
             // routing naturally prefers an entirely healthy peer.
-            this.#runtimeHealth.record("unhealthy");
+            this.#recordControlPathFailure();
             this.#emit();
             return;
+          }
+          if (
+            this.#state === "ready" &&
+            this.#sidecarLoop !== null &&
+            this.#hasFreshHeartbeatOutageEvidence(this.#clock.now())
+          ) {
+            // A sustained heartbeat outage can win the callback race before
+            // the periodic sidecar monitor samples the same common loss. Give
+            // the exact R2 generation the same bounded recovery ownership.
+            this.#sidecarSuspect = true;
+            this.#beginLivenessRecovery();
           }
           if (
             this.#state === "ready" &&
@@ -1110,7 +1214,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             // routing and owns a bounded same-session recovery. Do not let a
             // correlated Prism heartbeat outage abort that safer recovery and
             // force a whole sandbox generation replacement.
-            this.#runtimeHealth.record("unhealthy");
+            this.#recordControlPathFailure();
             this.#emit();
             return;
           }
@@ -1264,7 +1368,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       if (generation !== this.#generation) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
       const failedSandbox = effectiveSandbox ?? this.#credentials?.sandbox ?? null;
-      if (failedSandbox && shouldQuarantineSandboxSession(error)) {
+      if (failedSandbox && shouldQuarantineSandboxSession(error) && !this.#isSharedLivenessOutage(error)) {
         this.#reportSandboxFailure(failedSandbox);
       }
       this.#failure = error;
@@ -1340,7 +1444,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
           consecutiveReliableStalls = 0;
           recheckSourceBeforeRelaunch = true;
           this.#sidecarSuspect = true;
-          this.#runtimeHealth.record("unhealthy");
+          this.#options.connectivity?.requestCheck();
+          this.#renewLivenessRecovery();
+          this.#recordControlPathFailure();
           this.#emit();
           this.#notifyLiveness({
             signal: "sidecar_recovery",
@@ -1382,6 +1488,13 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         if (signal.aborted) return;
       }
       if (signal.aborted || generation !== this.#generation) return;
+      if (this.#options.connectivity?.snapshot().state === "unreachable") {
+        this.#beginLivenessRecovery();
+        this.#renewLivenessRecovery();
+        recheckSourceBeforeRelaunch = true;
+        deadline = this.#clock.now() + this.#sidecarProbePeriodMs;
+        continue;
+      }
       if (this.#awarenessReconnectOwner === monitoredTransport) {
         // The one reconnect owner must finish its fresh challenge before a
         // periodic probe can race it or escalate the same half-open lane.
@@ -1559,10 +1672,10 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     parentSignal.addEventListener("abort", forwardAbort, { once: true });
     if (parentSignal.aborted) forwardAbort();
     const timeoutController = new AbortController();
-    const recoveryDeadline = Math.min(
-      this.#clock.now() + this.#sidecarRecoveryTimeoutMs,
-      this.#livenessRecovery?.deadlineAtMs ?? Number.POSITIVE_INFINITY,
-    );
+    // The attempt has its own fixed bound. The generation-owned recovery lease
+    // may be renewed by independent, fresh outage evidence while this attempt
+    // is pending; its timer still aborts the generation when evidence stops.
+    const recoveryDeadline = this.#clock.now() + this.#sidecarRecoveryTimeoutMs;
     void this.#clock.waitUntil(recoveryDeadline, timeoutController.signal).then(() => {
       controller.abort(new DOMException(
         "V2 in-place sidecar recovery deadline expired",
@@ -1589,6 +1702,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     signal: AbortSignal,
     recheckSourceBeforeRelaunch: boolean,
   ): Promise<V2RuntimeTransport> {
+    if (this.#options.connectivity?.isRecoveryBlocked()) throw new V2SidecarRecoveryPreflightUnavailableError();
     const binding = this.#binding;
     const gateway = this.#gateway;
     const ydoc = this.#ydoc;
@@ -1953,6 +2067,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       );
       await this.#clock.waitUntil(deadline, signal);
       if (signal.aborted || generation !== this.#generation) return;
+      await this.#options.connectivity?.waitForRecovery(signal);
+      if (signal.aborted || generation !== this.#generation) return;
       const current = this.#credentials;
       if (!current) return;
       try {
@@ -1965,8 +2081,17 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         this.#emit();
       } catch (error) {
         if (signal.aborted) return;
-        this.#runtimeHealth.record("unhealthy");
-        if (this.#clock.now() >= current.resource.expiresAtMs) throw error;
+        const externalOutage = isExternalRecoveryOutageEvidence(
+          livenessErrorKind(error), livenessErrorStatus(error), "mint_credential", null,
+        );
+        if (externalOutage) {
+          this.#options.connectivity?.requestCheck();
+          this.#beginLivenessRecovery();
+          this.#renewLivenessRecovery();
+        }
+        this.#recordControlPathFailure(externalOutage);
+        if (this.#clock.now() >= current.resource.expiresAtMs &&
+          !(externalOutage && this.#options.connectivity?.isRecoveryBlocked())) throw error;
         await this.#clock.sleep(30_000, signal);
       }
     }
@@ -1986,6 +2111,9 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#ySweetReconnectPending = true;
       this.#beginLivenessRecovery();
       const kind = livenessErrorKind(error);
+      if (kind === "disconnected" || kind === "connect" || kind === "timeout" || kind === "transport") {
+        this.#options.connectivity?.requestCheck();
+      }
       this.#ySweetReconnectNeedsRotation ||= kind !== "disconnected" &&
         kind !== "connect" && kind !== "timeout";
       this.#awarenessFailureVersion++;
@@ -2154,8 +2282,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     ) return;
     let credentialRefreshDeadline = this.#clock.now() + this.#ySweetRefreshMs;
     let deadline = credentialRefreshDeadline;
+    let unprovedRotationPending = false;
     while (!signal.aborted && generation === this.#generation) {
       await this.#waitForYSweetRefresh(deadline, signal);
+      if (signal.aborted || generation !== this.#generation) return;
+      await this.#options.connectivity?.waitForRecovery(signal);
       if (signal.aborted || generation !== this.#generation) return;
       const relaunching = this.#sidecarRelaunching;
       if (relaunching) {
@@ -2202,6 +2333,50 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       try {
         let reusedCredential = false;
         let renewalRetryAtMs: number | null = null;
+        if (unprovedRotationPending) {
+          reconnectPhase = "host_reconnect";
+          let repaired = false;
+          try {
+            repaired = await this.#repairUnprovedCredentialRotation(
+              transport,
+              signal,
+              rotationIsCurrent,
+            );
+          } catch (repairError) {
+            if (repairError instanceof V2SidecarRecoveryPreflightUnavailableError) {
+              this.#renewLivenessRecovery();
+            } else {
+              this.#failGeneration(generation,
+                new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: repairError }));
+            }
+            throw repairError;
+          }
+          if (!repaired) {
+            await this.#clock.sleep(30_000, signal);
+            deadline = this.#clock.now();
+            continue;
+          }
+          unprovedRotationPending = false;
+          this.#ySweetReconnectPending = false;
+          this.#silentAwarenessReconnectLane = null;
+          this.#ySweetReconnectNeedsRotation = false;
+          this.#ySweetRefreshRequested = false;
+          this.#sidecarSuspect = false;
+          this.#finishLivenessRecovery();
+          this.#emit();
+          this.#notifyLiveness({
+            signal: "awareness",
+            outcome: "succeeded",
+            attempt: this.#awarenessFailureVersion,
+            reconnectPhase,
+            awarenessLane: reconnectLane,
+            durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
+          });
+          deadline = credentialRefreshDeadline <= this.#clock.now()
+            ? this.#clock.now() + 30_000
+            : credentialRefreshDeadline;
+          continue;
+        }
         const rotation = (async () => {
           if (reconnectAttempt && !this.#ySweetReconnectNeedsRotation &&
               this.#clock.now() < credentialRefreshDeadline) {
@@ -2213,12 +2388,11 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
             reconnected = await this.#tryReconnectAwareness(
                 transport,
                 Math.min(credentialRefreshDeadline,
-                  this.#livenessRecovery?.deadlineAtMs ?? Number.POSITIVE_INFINITY,
                   reconnectStartedAtMs + (silentReconnect ? SILENT_AWARENESS_RECONNECT_TIMEOUT_MS : AWARENESS_RECONNECT_TIMEOUT_MS)),
                 signal,
                 forcedLane ?? undefined,
-                { deadline: Math.min(credentialRefreshDeadline,
-                  this.#livenessRecovery?.deadlineAtMs ?? reconnectStartedAtMs + SANDBOX_LIVENESS_RECOVERY_MAX_MS),
+              { deadline: Math.min(credentialRefreshDeadline,
+                  reconnectStartedAtMs + SANDBOX_LIVENESS_RECOVERY_MAX_MS),
                   isCurrent: () => rotationIsCurrent() && failureVersion === this.#awarenessFailureVersion },
               );
             if (
@@ -2314,6 +2488,7 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
                   new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: repairError }));
                 throw repairError;
               }
+              this.#renewLivenessRecovery();
             }
             if (!repaired) { unprovedRotationRepair = true; throw error; }
             // The source is live, but the rotation has no matching ACK. Keep
@@ -2378,28 +2553,42 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
         deadline = applied ? renewalRetryAtMs ?? credentialRefreshDeadline : this.#clock.now();
       } catch (error) {
         if (signal.aborted) return;
+        const errorKind = livenessErrorKind(error);
+        const errorStatus = livenessErrorStatus(error);
+        const errorSupervisorPhase = supervisorErrorPhase(error);
+        const externalOutage = isExternalRecoveryOutageEvidence(
+          errorKind,
+          errorStatus,
+          reconnectPhase,
+          errorSupervisorPhase,
+        );
+        if (externalOutage) {
+          this.#options.connectivity?.requestCheck();
+          this.#renewLivenessRecovery();
+        }
         this.#notifyLiveness({
           signal: "awareness",
           outcome: "failed",
           attempt: this.#awarenessFailureVersion,
           errorName: livenessErrorName(error),
-          errorKind: livenessErrorKind(error),
+          status: errorStatus,
+          errorKind,
           reconnectPhase,
           awarenessLane: reconnectLane,
-          supervisorPhase: supervisorErrorPhase(error),
+          supervisorPhase: errorSupervisorPhase,
           durationMs: Math.max(0, this.#clock.now() - reconnectStartedAtMs),
         });
-        this.#runtimeHealth.record("unhealthy");
+        this.#recordControlPathFailure(externalOutage);
         if (unprovedRotationRepair) {
           // This one repair did not establish authority to resume. Do not
           // remint/reannounce or replace its source to recover this error.
-          // The already-running episode timer remains the final fail-closed
-          // bound, including when all remaining transport proof is silent.
-          const recoveryDeadline = this.#livenessRecovery?.deadlineAtMs;
-          if (recoveryDeadline !== undefined) await this.#clock.waitUntil(recoveryDeadline, signal);
-          if (!signal.aborted) this.#failGeneration(generation,
-            new V2RuntimeLifecycleFailure("sidecar_unreachable", null, { cause: error }));
-          return;
+          // Keep probing the exact source without reminting or republishing
+          // the unproved rotation. Fresh external outage evidence may renew
+          // the generation lease; silence still expires through that timer.
+          unprovedRotationPending = true;
+          await this.#clock.sleep(30_000, signal);
+          deadline = this.#clock.now();
+          continue;
         }
         await this.#clock.sleep(30_000, signal);
         deadline = this.#clock.now();
@@ -2410,14 +2599,35 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     }
   }
 
+  #isSharedLivenessOutage(error: unknown): boolean {
+    if (!this.#options.connectivity?.isRecoveryBlocked() || !(error instanceof V2RuntimeLifecycleFailure)) return false;
+    if (error.kind === "heartbeat_unreachable") return true;
+    if (error.kind !== "sidecar_unreachable") return false;
+    const phase = supervisorErrorPhase(error.cause);
+    return error.cause == null || isConnectivityRequestFailure(error.cause) ||
+      (error.cause instanceof V2TransportLivenessError &&
+        (error.cause.code === "unavailable" || error.cause.code === "timeout")) ||
+      ((phase === null || phase === "transport") && isExternalRecoveryOutageEvidence(
+        livenessErrorKind(error.cause), livenessErrorStatus(error.cause), "host_reconnect", phase,
+      ));
+  }
+
   #failGeneration(generation: number, failure: V2RuntimeLifecycleFailure): void {
     if (generation !== this.#generation) return;
     if (this.#state === "failed" || this.#state === "stopped") return;
-    if (this.#credentials && shouldQuarantineSandboxSession(failure)) {
+    const sharedOutage = this.#isSharedLivenessOutage(failure);
+    if (this.#state === "ready" && sharedOutage) {
+      this.#sidecarSuspect = true;
+      this.#beginLivenessRecovery();
+      this.#armLivenessRecoveryLease(this.#clock.now());
+      this.#emit();
+      return;
+    }
+    if (this.#credentials && shouldQuarantineSandboxSession(failure) && !sharedOutage) {
       this.#reportSandboxFailure(this.#credentials.sandbox);
     }
     this.#failure = failure;
-    this.#runtimeHealth.record("unhealthy");
+    this.#runtimeHealth.record(sharedOutage ? "neutral" : "unhealthy");
     ++this.#generation;
     this.#setState("failed");
     this.#controller?.abort();
@@ -2458,6 +2668,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#generation,
       new V2RuntimeLifecycleFailure(
         transport.connected ? "ambiguity_exhausted" : "sidecar_unreachable",
+        null,
+        { cause: error },
       ),
     );
   }
@@ -2746,6 +2958,8 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
     // when the host later starts shutting down.
     const systemDeadline = deadline ?? this.#options.shutdownDeadlineMs?.();
     this.#localCleanupStarted = true;
+    this.#connectivityUnsubscribe?.();
+    this.#connectivityUnsubscribe = null;
     this.#awarenessFailureUnsubscribe?.();
     this.#awarenessFailureUnsubscribe = null;
     this.#wakeYSweetRefresh?.();
@@ -2841,11 +3055,47 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
   #beginLivenessRecovery(): void {
     if (this.#livenessRecovery || this.#state !== "ready" ||
       this.#binding?.protocolRevision !== "r2" || !this.#transport?.probeLiveness) return;
-    const startedAtMs = this.#clock.now();
+    this.#armLivenessRecoveryLease(this.#clock.now());
+    this.#notifyLiveness({ signal: "sidecar_recovery", outcome: "waiting_for_transport_recovery" });
+  }
+
+  #renewLivenessRecovery(): void {
+    const now = this.#clock.now();
+    if (this.#state !== "ready" ||
+      !isActiveSandboxLivenessRecovery(this.#livenessRecovery, now)) return;
+    this.#armLivenessRecoveryLease(now);
+  }
+
+  #recordRequestFailure(error: unknown): void {
+    const outcome = classifyRuntimeError(error);
+    if (outcome === "unhealthy" && isConnectivityRequestFailure(error)) {
+      this.#options.connectivity?.requestCheck();
+      this.#recordControlPathFailure();
+    } else this.#runtimeHealth.record(outcome);
+  }
+
+  #recordControlPathFailure(externalEvidence = true): void {
+    const state = externalEvidence ? this.#options.connectivity?.snapshot().state : undefined;
+    if (state === "checking") {
+      // One bounded counter defers classification until the shared check can
+      // distinguish host connectivity from a sandbox-specific failure.
+      this.#pendingConnectivityHealthFailures = Math.min(32, this.#pendingConnectivityHealthFailures + 1);
+    }
+    this.#runtimeHealth.record(state === "checking" || state === "unreachable" ? "neutral" : "unhealthy");
+  }
+
+  #hasFreshHeartbeatOutageEvidence(now: number): boolean {
+    const observedAtMs = this.#heartbeatOutageEvidenceAtMs;
+    return observedAtMs !== null && Number.isFinite(now) && observedAtMs <= now &&
+      now - observedAtMs <= SANDBOX_LIVENESS_MAX_AGE_MS;
+  }
+
+  #armLivenessRecoveryLease(startedAtMs: number): void {
     const recovery = Object.freeze({
       startedAtMs,
       deadlineAtMs: startedAtMs + SANDBOX_LIVENESS_RECOVERY_MAX_MS,
     });
+    this.#livenessRecoveryTimer?.abort();
     this.#livenessRecovery = recovery;
     const generation = this.#generation;
     const timer = new AbortController();
@@ -2855,7 +3105,6 @@ export class V2SandboxRuntime implements RoutableSandboxRuntime {
       this.#notifyLiveness({ signal: "sidecar_recovery", outcome: "recovery_deadline_expired" });
       this.#failGeneration(generation, new V2RuntimeLifecycleFailure("sidecar_unreachable", null));
     }, () => undefined);
-    this.#notifyLiveness({ signal: "sidecar_recovery", outcome: "waiting_for_transport_recovery" });
   }
 
   #finishLivenessRecovery(): void {

@@ -4,6 +4,7 @@ import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protoc
 import { DenoAwarenessPeer as R10DenoAwarenessPeer } from "../sandbox/v2/r10-awareness-peer";
 import { createCredentialRotationKey } from "../src/v2/bootstrap/crypto";
 import type { Clock } from "../src/core/ports";
+import { PrismConnectivityMonitor, type RecoveryConnectivity } from "../src/prism/connectivity";
 import type { RunHandle } from "../src/relay/run-handle";
 import {
   parseProvisionedSandbox,
@@ -12,9 +13,10 @@ import {
   type ProvisionedSandbox,
   type YSweetEnvelope,
 } from "../src/prism/protocol";
-import type {
-  ProvisionedRuntimeCredentials,
-  ProvisioningHooks,
+import {
+  ProvisioningError,
+  type ProvisionedRuntimeCredentials,
+  type ProvisioningHooks,
 } from "../src/prism/provisioning-client";
 import type { SandboxRunOptions } from "../src/sandbox/registry";
 import { projectId, type ProjectId } from "../src/sandbox/types";
@@ -415,6 +417,8 @@ function credentials(clock: ManualClock, expiresInMs = 600_000, selectedProject 
 }
 
 function runtimeHarness(options: {
+  clock?: ManualClock;
+  connectivity?: RecoveryConnectivity;
   project?: ProjectId;
   sidecarCapacity?: number;
   credits?: number;
@@ -422,6 +426,8 @@ function runtimeHarness(options: {
   governor?: V2RuntimeGovernor;
   resourceExpiresInMs?: number;
   resourceRefreshError?: Error;
+  resourceRefreshFailure?: () => Error | null;
+  acquireSandboxFailure?: () => Error | null;
   livenessOutcomes?: Array<Error | null>;
   authSandbox?: ProvisionedSandbox;
   rotateSameSession?: boolean;
@@ -429,6 +435,7 @@ function runtimeHarness(options: {
   stopTimeoutMs?: number;
   shutdownDeadlineMs?: () => number | undefined;
   sidecarRecoveryTimeoutMs?: number;
+  sidecarProbePeriodMs?: number;
   sidecarCommitStallMs?: number;
   sidecarStallSampleThreshold?: number;
   sidecarSuspectRecheckMs?: number;
@@ -440,12 +447,13 @@ function runtimeHarness(options: {
   recoveryConnectPending?: boolean;
   gatewayHeartbeatOutcomes?: Array<V2RuntimeHeartbeatResult | Error>;
   gatewayHeartbeat?: () => V2RuntimeHeartbeatResult | Promise<V2RuntimeHeartbeatResult>;
+  ySweetMintFailure?: () => Error | null;
   initialRotationPending?: boolean;
   enableSupervisor?: boolean;
   transportFactory?: (input: Parameters<V2SandboxRuntimeOptions["createTransport"]>[0], clock: ManualClock) => V2RuntimeTransport;
 } = {}) {
   const order: string[] = [];
-  const clock = new ManualClock();
+  const clock = options.clock ?? new ManualClock();
   const selectedProject = options.project ?? PROJECT;
   let current = credentials(clock, options.resourceExpiresInMs ?? 600_000, selectedProject);
   let refreshes = 0;
@@ -482,6 +490,8 @@ function runtimeHarness(options: {
     },
     async acquireSandbox() {
       acquisitions++;
+      const failure = options.acquireSandboxFailure?.();
+      if (failure) throw failure;
       return options.authSandbox ?? current.sandbox;
     },
     async provisionAcquired(
@@ -499,6 +509,8 @@ function runtimeHarness(options: {
       refreshes++;
       refreshedSandboxToken = value.sandbox.token.reveal();
       if (options.resourceRefreshError) throw options.resourceRefreshError;
+      const failure = options.resourceRefreshFailure?.();
+      if (failure) throw failure;
       current = {
         ...value,
         resource: parseResourceCredential({
@@ -512,6 +524,8 @@ function runtimeHarness(options: {
     },
     async mintYSweet() {
       ySweetMints++;
+      const failure = options.ySweetMintFailure?.() ?? null;
+      if (failure) throw failure;
       return parseYSweetEnvelope({
         url: `wss://prism.test/y/d/${selectedProject}/ws`,
         baseUrl: `https://prism.test/y/d/${selectedProject}`,
@@ -570,12 +584,14 @@ function runtimeHarness(options: {
     provisioning: provisioner,
     governor,
     clock,
+    connectivity: options.connectivity,
     assets,
     transportReservationBytes: 16 * 1024 * 1024,
     ySweetRefreshMs: 300_000,
     stopTimeoutMs: options.stopTimeoutMs,
     shutdownDeadlineMs: options.shutdownDeadlineMs,
     sidecarRecoveryTimeoutMs: options.sidecarRecoveryTimeoutMs,
+    sidecarProbePeriodMs: options.sidecarProbePeriodMs,
     sidecarCommitStallMs: options.sidecarCommitStallMs,
     sidecarStallSampleThreshold: options.sidecarStallSampleThreshold,
     sidecarSuspectRecheckMs: options.sidecarSuspectRecheckMs,
@@ -1132,6 +1148,97 @@ describe("V2SandboxRuntime", () => {
     } finally { await h.runtime.stop(); }
   });
 
+  it("repairs an unproved rotation after a long outage without reminting or replaying", async () => {
+    let outage = true;
+    const h = runtimeHarness({
+      enableR2Recovery: true,
+      enableSupervisor: true,
+      resourceExpiresInMs: 1_200_000,
+      livenessOutcomes: [null],
+      gatewayHeartbeat: () => {
+        if (outage) throw new Error("offline heartbeat transport unavailable");
+        return { ok: true, status: 200, durationMs: 1, sessionId: "sandbox-session-1" };
+      },
+    });
+    await h.runtime.start();
+    const body = { model: "gpt-5.6-sol", input: "current delta",
+      previous_response_id: "resp_unproved_parent", stream: true, store: true };
+    const handle = await h.runtime.run(body);
+    void handle.final.catch(() => undefined);
+    const initialDiagnostics = receiveStallDiagnostics({
+      windowFrames: 2,
+      windowBytes: 260,
+      schedulerFrames: 0,
+      schedulerBytes: 0,
+      ackProgressAgeMs: 0,
+      sidecarPendingAgeMs: null,
+      sidecarPendingDataPublications: 0,
+    }, { windowFrames: 0, schedulerFrames: 0 });
+    h.transport.snapshotValue.diagnostics = initialDiagnostics;
+    h.transport.resumeAwareness = async () => {
+      if (++h.transport.awarenessResumes === 1) throw new Error("offline native reconnect unavailable");
+    };
+    h.transport.probeLiveness = async () => ({ rttMs: 1, sentAtMs: h.clock.now() });
+    (h.transport as V2RuntimeTransport).rotateCredential = async (id, _sealed, signal) => {
+      h.transport.rotations++;
+      await h.clock.sleep(30_000, signal);
+      throw new Error(`Credential rotation ACK timed out: ${id}`);
+    };
+    let repairs = 0;
+    (h.transport as V2RuntimeTransport).reconnectAwareness = async () => {
+      repairs++;
+      const before = h.transport.snapshotValue.diagnostics!.host;
+      h.transport.snapshotValue.diagnostics = receiveStallDiagnostics({
+        ...before,
+        windowFrames: 0,
+        windowBytes: 0,
+        flightCompletionsTotal: before.flightCompletionsTotal + 1,
+        uniqueAcknowledgedBytesTotal: (before.uniqueAcknowledgedBytesTotal ?? 0) + 260,
+        inboundAcceptedProgressAgeMs: 0,
+        inboundProcessedProgressAgeMs: 0,
+        sidecarPendingAgeMs: null,
+        sidecarPendingDataPublications: 0,
+        dataPeerAgeMs: 0,
+      }, { windowFrames: 0, schedulerFrames: 0 });
+    };
+    const flush = async () => { for (let turn = 0; turn < 300; turn++) await Promise.resolve(); };
+    try {
+      h.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1006));
+      await flush();
+      for (let elapsed = 0; elapsed < 300_000; elapsed += 30_000) {
+        await h.clock.advanceBy(30_000);
+        await flush();
+        expect(h.runtime.snapshot()).toMatchObject({ state: "ready", available: 0, active: 1 });
+        expect(h.runtime.snapshot().livenessRecovery?.deadlineAtMs).toBeGreaterThan(h.clock.now());
+        expect(h.ySweetMints()).toBe(1);
+        expect(h.transport.rotations).toBe(1);
+        expect(h.transport.bodies).toHaveLength(1);
+      }
+
+      outage = false;
+      for (let elapsed = 0; elapsed < 60_000 && h.runtime.snapshot().available === 0; elapsed += 1_000) {
+        await h.clock.advanceBy(1_000);
+        await flush();
+      }
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available",
+        active: 1, livenessRecovery: null });
+      expect(repairs).toBe(1);
+      expect(h.ySweetMints()).toBe(1);
+      expect(h.transport.rotations).toBe(1);
+      expect(h.supervisor.rotations).toBe(1);
+      expect(h.transports).toHaveLength(1);
+      expect(h.provisions()).toBe(1);
+      expect(h.transport.bodies).toHaveLength(1);
+      expect(h.transport.bodies[0]).toMatchObject(body);
+      h.transport.pending[0]!.resolve({ id: "resp_unproved_done", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_unproved_done" });
+    } finally {
+      outage = false;
+      h.transport.pending[0]?.resolve({ status: "completed" });
+      await h.runtime.stop();
+    }
+  });
+
   it.each([5_000, 45_000])("repairs unseen DATA after a %i ms old prepared duplicate while a newer ACK is pending", async duplicateAgeMs => {
     const test = pairedLaneRecoveryHarness({ receiveStall: true });
     try {
@@ -1392,7 +1499,7 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
   });
 
-  it("does not extend a transport recovery episode after repeated preflight failures", async () => {
+  it("retains one generation through an hour of fresh outage evidence and resumes without replay", async () => {
     let outage = false;
     const harness = runtimeHarness({
       enableR2Recovery: true,
@@ -1407,24 +1514,347 @@ describe("V2SandboxRuntime", () => {
     };
     try {
       await harness.runtime.start();
+      const body = { model: "gpt-5.6-sol", input: "current delta",
+        previous_response_id: "resp_hour_parent", stream: true, store: true };
+      const handle = await harness.runtime.run(body);
+      void handle.final.catch(() => undefined);
       outage = true;
       harness.heartbeat.lastSuccessAtMs = 0;
       await harness.clock.advanceBy(10_000);
-      const episode = harness.runtime.snapshot().livenessRecovery;
-      expect(episode).toEqual({ startedAtMs: 10_000, deadlineAtMs: 160_000 });
-      for (let elapsed = 10_000; elapsed < 159_000; elapsed += 1_000) {
-        await harness.clock.advanceBy(1_000);
+      const firstLease = harness.runtime.snapshot().livenessRecovery;
+      expect(firstLease).toEqual({ startedAtMs: 10_000, deadlineAtMs: 160_000 });
+      for (let elapsed = 0; elapsed < 3_600_000; elapsed += 10_000) {
+        await harness.clock.advanceBy(10_000);
         for (let turn = 0; turn < 30; turn++) await Promise.resolve();
-        expect(harness.runtime.snapshot().livenessRecovery).toBe(episode);
+        const snapshot = harness.runtime.snapshot();
+        expect(snapshot).toMatchObject({ state: "ready", available: 0, active: 1 });
+        expect(snapshot.livenessRecovery?.deadlineAtMs).toBeGreaterThan(harness.clock.now());
+        expect(harness.transport.bodies).toHaveLength(1);
+        expect(harness.transport.bodies[0]).toMatchObject(body);
       }
-      expect(harness.runtime.snapshot().state).toBe("ready");
-      await harness.clock.advanceBy(1_000);
-      expect(harness.runtime.snapshot()).toMatchObject({ state: "failed", livenessRecovery: null });
+      expect(harness.runtime.snapshot().livenessRecovery).not.toBe(firstLease);
       expect(harness.livenessDiagnostics.filter(event => event.outcome === "waiting_for_transport_recovery")).toHaveLength(1);
-      expect(harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(1);
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(0);
       expect(harness.transport.recoverySuspends).toBe(0);
       expect(harness.bootstraps).toHaveLength(1);
+      expect(harness.provisions()).toBe(1);
+
+      outage = false;
+      for (let elapsed = 0; elapsed < 30_000 && harness.runtime.snapshot().available === 0; elapsed += 1_000) {
+        await harness.clock.advanceBy(1_000);
+        for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      }
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available",
+        active: 1, livenessRecovery: null });
+      expect(harness.transport.bodies).toHaveLength(1);
+      expect(harness.transport.bodies[0]).toMatchObject(body);
+      harness.transport.pending[0]!.resolve({ id: "resp_hour_done", status: "completed" });
+      await expect(handle.final).resolves.toMatchObject({ id: "resp_hour_done" });
     } finally {
+      outage = false;
+      harness.transport.pending[0]?.resolve({ status: "completed" });
+      await harness.runtime.stop();
+    }
+  });
+
+  it("does not blame the sandbox for a confirmed heartbeat transport outage", async () => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: false, reason: "transport" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null] });
+    await h.runtime.start();
+    try {
+      h.heartbeatAttempt({ outcome: "transport_error", status: null, errorName: "AccountTransportError",
+        durationMs: 5_000, attempt: 1, previousConsecutiveFailures: 0, consecutiveFailures: 1 });
+      h.heartbeatTransientFailure();
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(connectivity.snapshot().state).toBe("unreachable");
+      expect(h.runtime.snapshot().recentFailureRate).toBe(0);
+      expect(h.sandboxFailures).toEqual([]);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+  });
+
+  it("keeps sandbox-specific heartbeat penalties when independent Prism connectivity succeeds", async () => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: true, reason: "reachable" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null] });
+    await h.runtime.start();
+    try {
+      h.heartbeatAttempt({ outcome: "transport_error", status: null, errorName: "AccountTransportError",
+        durationMs: 5_000, attempt: 1, previousConsecutiveFailures: 0, consecutiveFailures: 1 });
+      h.heartbeatTransientFailure();
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(connectivity.snapshot().state).toBe("reachable");
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", recentFailureRate: 0.2, capacity: 128 });
+    } finally { await h.runtime.stop(); connectivity.close(); }
+  });
+
+  it("keeps healthy sidecar probes running while a host connectivity check is pending", async () => {
+    const clock = new ManualClock();
+    let finishCheck!: () => void;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: () => new Promise(resolve => {
+      finishCheck = () => resolve({ reachable: true, reason: "reachable" });
+    }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null] });
+    await h.runtime.start();
+    try {
+      await clock.advanceBy(9_999);
+      connectivity.requestCheck();
+      await clock.advanceBy(1);
+      expect(connectivity.snapshot().state).toBe("checking");
+      expect(h.transport.livenessProbes).toBe(2);
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128, recentFailureRate: 0 });
+    } finally { finishCheck(); await h.runtime.stop(); connectivity.close(); }
+  });
+
+  it("preserves eight supervised generations and exact request lineage past credential expiry during internet loss", async () => {
+    const clock = new ManualClock();
+    let outage = false, replacements = 0, probes = 0;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => {
+      probes++;
+      return { reachable: !outage, reason: outage ? "transport" : "reachable" };
+    } });
+    const flush = async () => { for (let turn = 0; turn < 200; turn++) await Promise.resolve(); };
+    const fleet = Array.from({ length: 8 }, (_, index) => {
+      const h = runtimeHarness({
+        clock, connectivity,
+        project: projectId(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`),
+        enableR2Recovery: true, enableSupervisor: true, resourceExpiresInMs: 360_000,
+        resourceRefreshFailure: () => outage ? new ProvisioningError("offline resource transport", "transport") : null,
+      });
+      let lastPeerAt = clock.now();
+      const snapshot = h.transport.snapshot.bind(h.transport);
+      h.transport.snapshot = () => ({ ...snapshot(), sidecarPeerAgeMs: clock.now() - lastPeerAt });
+      h.transport.probeLiveness = async () => {
+        h.transport.livenessProbes++;
+        if (outage) throw new V2TransportLivenessError("offline", "unavailable");
+        lastPeerAt = clock.now();
+        return { rttMs: 1, sentAtMs: lastPeerAt };
+      };
+      const supervised = new SupervisedSandboxRuntime({
+        projectId: h.runtime.projectId, initialChild: h.runtime, clock, connectivity,
+        createChild: () => { replacements++; throw new Error("outage must preserve its exact child"); },
+        random: { next: () => 0 },
+      });
+      return { h, supervised };
+    });
+    const handles: RunHandle[] = [];
+    const bodies = fleet.map((_, index) => ({ model: "gpt-5.6-sol", input: "context ".repeat(8_192),
+      previous_response_id: `resp_prior_${index}`, stream: true, store: true, service_tier: "fast" }));
+    try {
+      for (const [index, { h, supervised }] of fleet.entries()) {
+        await supervised.start();
+        const handle = await supervised.run(bodies[index]!);
+        void handle.final.catch(() => undefined);
+        handles.push(handle);
+        h.heartbeat.lastSuccessAtMs = clock.now();
+      }
+      outage = true;
+      for (const { h } of fleet) {
+        h.heartbeatAttempt({ outcome: "transport_error", status: null, errorName: "AccountTransportError",
+          durationMs: 5_000, attempt: 1, previousConsecutiveFailures: 0, consecutiveFailures: 1 });
+        h.heartbeatTransientFailure();
+        h.transport.snapshotValue.connected = false;
+        h.awareness.fail(new AwarenessChannelError("offline", "disconnected", 1006));
+      }
+      await flush();
+      for (let elapsed = 0; elapsed < 900_000; elapsed += 10_000) {
+        await clock.advanceBy(10_000); await flush();
+        expect(clock.waiters.length).toBeLessThanOrEqual(40);
+        expect(replacements).toBe(0);
+      }
+      expect(probes).toBe(91);
+      for (const [index, { h, supervised }] of fleet.entries()) {
+        expect(supervised.snapshot()).toMatchObject({ state: "ready", incarnation: 1,
+          available: 0, capacity: 0, active: 1, credentialExpiresInMs: 0, recentFailureRate: 0 });
+        expect(h.transport.bodies).toEqual([bodies[index]!]);
+        expect(h.transport.recoverySuspends).toBe(0);
+        expect(h.heartbeat.stops).toBe(0);
+        expect(h.sandboxFailures).toEqual([]);
+      }
+      outage = false;
+      for (const { h } of fleet) {
+        h.transport.snapshotValue.connected = true;
+        h.heartbeat.lastSuccessAtMs = clock.now();
+        h.heartbeatSuccess();
+      }
+      for (let elapsed = 0; elapsed < 40_000; elapsed += 1_000) {
+        await clock.advanceBy(1_000); await flush();
+        if (fleet.every(({ supervised }) => supervised.snapshot().available === 127)) break;
+      }
+      for (const [index, { h, supervised }] of fleet.entries()) {
+        expect(supervised.snapshot()).toMatchObject({ state: "ready", incarnation: 1, capacity: 128, available: 127, recentFailureRate: 0 });
+        expect(supervised.snapshot().credentialExpiresInMs).toBeGreaterThan(30_000);
+        expect(h.provisions()).toBe(1);
+        expect(h.bootstraps).toHaveLength(1);
+        expect(h.transports).toHaveLength(1);
+        expect(h.transport.bodies[0]).toBe(bodies[index]);
+        h.transport.pending[0]!.resolve({ id: `resp_completed_${index}`, status: "completed" });
+        await handles[index]!.final;
+        const delta = { model: "gpt-5.6-sol", input: "next turn", previous_response_id: `resp_completed_${index}`, stream: true, store: true, service_tier: "fast" };
+        const next = await supervised.run(delta);
+        h.transport.pending[1]!.resolve({ id: `resp_next_${index}`, status: "completed" });
+        await next.final;
+        expect(h.transport.bodies).toEqual([bodies[index]!, delta]);
+      }
+      expect(replacements).toBe(0);
+    } finally {
+      await Promise.all(fleet.map(({ supervised }) => supervised.stop()));
+      connectivity.close(); await flush();
+    }
+    expect(clock.waiters).toHaveLength(0);
+  });
+
+  it("detects internet loss from resource refresh itself and resumes the same credential owner", async () => {
+    const clock = new ManualClock();
+    let outage = true;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: !outage, reason: outage ? "dns" : "reachable" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null],
+      resourceExpiresInMs: 1_000,
+      resourceRefreshFailure: () => outage ? new ProvisioningError("offline resource transport", "transport") : null });
+    try {
+      await h.runtime.start();
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      expect(connectivity.snapshot().state).toBe("unreachable");
+      for (let elapsed = 0; elapsed < 300_000; elapsed += 10_000) await clock.advanceBy(10_000);
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", credentialExpiresInMs: 0, recentFailureRate: 0 });
+      expect(h.refreshes()).toBe(1);
+      outage = false;
+      for (let elapsed = 0; elapsed < 40_000 && h.runtime.snapshot().credentialExpiresInMs === 0; elapsed += 1_000) await clock.advanceBy(1_000);
+      expect(h.runtime.snapshot().credentialExpiresInMs).toBeGreaterThan(30_000);
+      expect(h.refreshes()).toBe(2);
+      expect(h.provisions()).toBe(1);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+    expect(clock.waiters).toHaveLength(0);
+  });
+
+  it("fences interrupted startup without blaming its sandbox for confirmed internet loss", async () => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: false, reason: "transport" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true });
+    h.bootstrap.ensureReadyWait = signal => clock.sleep(600_000, signal);
+    const starting = h.runtime.start().catch(error => error);
+    try {
+      for (let turn = 0; turn < 100 && !h.order.includes("bootstrap"); turn++) await Promise.resolve();
+      expect(h.order).toContain("bootstrap");
+      h.heartbeatAttempt({ outcome: "transport_error", status: null, errorName: "AccountTransportError",
+        durationMs: 5_000, attempt: 3, previousConsecutiveFailures: 2, consecutiveFailures: 3 });
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      h.heartbeatUnreachable();
+      await starting;
+      expect(h.runtime.snapshot()).toMatchObject({ state: "failed", recentFailureRate: 0 });
+      expect(h.sandboxFailures).toEqual([]);
+      expect(h.transport.bodies).toEqual([]);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+    expect(clock.waiters).toHaveLength(0);
+  });
+
+  it("waits for internet recovery during authentication refresh instead of expiring the sandbox", async () => {
+    const clock = new ManualClock();
+    let outage = true;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: !outage, reason: outage ? "transport" : "reachable" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null], rotateSameSession: true,
+      acquireSandboxFailure: () => outage ? new ProvisioningError("offline account transport", "transport") : null });
+    await h.runtime.start();
+    try {
+      let settled = false;
+      const refreshing = h.heartbeatAuthenticationFailure()!.then(value => { settled = true; return value; });
+      for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+      for (let elapsed = 0; elapsed < 300_000; elapsed += 10_000) await clock.advanceBy(10_000);
+      expect(settled).toBe(false);
+      expect(h.acquisitions()).toBe(1);
+      expect(h.runtime.snapshot()).toMatchObject({ state: "ready", available: 0, recentFailureRate: 0 });
+      outage = false; await clock.advanceBy(10_000);
+      expect(await refreshing).toBe("retry");
+      h.heartbeatSuccess();
+      expect(h.acquisitions()).toBe(2);
+      expect(h.provisions()).toBe(1);
+      expect(h.sandboxFailures).toEqual([]);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+    expect(clock.waiters).toHaveLength(0);
+  });
+
+  it("cancels a waiting authentication refresh when its isolated runtime stops", async () => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: false, reason: "transport" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null],
+      acquireSandboxFailure: () => new ProvisioningError("offline account transport", "transport") });
+    await h.runtime.start();
+    const refreshing = h.heartbeatAuthenticationFailure()!.catch(error => error);
+    for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+    try {
+      expect(connectivity.snapshot().state).toBe("unreachable");
+      await h.runtime.stop();
+      expect(await refreshing).toMatchObject({ name: "AbortError" });
+      expect(h.acquisitions()).toBe(1);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+    expect(clock.waiters).toHaveLength(0);
+  });
+
+  it.each(["protocol", "instance_changed"])("does not hide an independent %s failure during internet loss", async code => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: false, reason: "transport" }) });
+    const h = runtimeHarness({ clock, connectivity, enableR2Recovery: true, livenessOutcomes: [null] });
+    await h.runtime.start();
+    try {
+      const handle = await h.runtime.run({ model: "gpt-5.6-sol", input: "one execution" });
+      const outcome = handle.final.catch(error => error);
+      connectivity.requestCheck();
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      h.transport.snapshotValue.connected = false;
+      h.transport.pending[0]!.reject(new V2CommittedError("independent transport authority failure", code, true));
+      expect(await outcome).toMatchObject({ code, committed: true, ambiguous: true });
+      expect(h.runtime.snapshot().state).toBe("failed");
+      expect(h.transport.bodies).toHaveLength(1);
+    } finally { await h.runtime.stop(); connectivity.close(); }
+  });
+
+  it("renews recovery while repeated Y-Sweet mint transport failures prove an outage", async () => {
+    let outage = true;
+    const harness = runtimeHarness({
+      enableR2Recovery: true,
+      resourceExpiresInMs: 1_200_000,
+      sidecarProbePeriodMs: 1_000_000,
+      livenessOutcomes: [null],
+      ySweetMintFailure: () => outage
+        ? new ProvisioningError("offline Y-Sweet transport unavailable", "transport", 503)
+        : null,
+    });
+    try {
+      await harness.runtime.start();
+      harness.transport.probeLiveness = async () => {
+        if (outage) throw new V2TransportLivenessError("offline reconnect unavailable", "unavailable");
+        return { rttMs: 1, sentAtMs: harness.clock.now() };
+      };
+      harness.awareness.fail(new AwarenessChannelError("offline disconnect", "disconnected", 1006));
+      for (let turn = 0; turn < 300 && harness.ySweetMints() === 0; turn++) await Promise.resolve();
+      expect(harness.ySweetMints()).toBe(1);
+      const firstLease = harness.runtime.snapshot().livenessRecovery;
+      expect(firstLease).not.toBeNull();
+
+      for (let elapsed = 0; elapsed < 600_000; elapsed += 30_000) {
+        await harness.clock.advanceBy(30_000);
+        for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+        const snapshot = harness.runtime.snapshot();
+        expect(snapshot).toMatchObject({ state: "ready", available: 0 });
+        expect(snapshot.livenessRecovery?.deadlineAtMs).toBeGreaterThan(harness.clock.now());
+        expect(harness.transports).toHaveLength(1);
+        expect(harness.bootstraps).toHaveLength(1);
+      }
+      expect(harness.runtime.snapshot().livenessRecovery).not.toBe(firstLease);
+      expect(harness.livenessDiagnostics.filter(event => event.outcome === "recovery_deadline_expired")).toHaveLength(0);
+
+      outage = false;
+      for (let elapsed = 0; elapsed < 60_000 && harness.runtime.snapshot().available === 0; elapsed += 1_000) {
+        await harness.clock.advanceBy(1_000);
+        for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      }
+      expect(harness.runtime.snapshot()).toMatchObject({ state: "ready", availabilityReason: "available",
+        livenessRecovery: null });
+      expect(harness.transports).toHaveLength(1);
+      expect(harness.bootstraps).toHaveLength(1);
+      expect(harness.provisions()).toBe(1);
+    } finally {
+      outage = false;
       await harness.runtime.stop();
     }
   });
@@ -2015,6 +2445,44 @@ describe("V2SandboxRuntime", () => {
     await harness.runtime.stop();
     harness.heartbeatExpired(410);
     expect(harness.runtime.snapshot().state).toBe("stopped");
+  });
+
+  it("opens an R2 recovery lease when heartbeat outage proof beats the sidecar monitor", async () => {
+    const harness = runtimeHarness({ enableR2Recovery: true, livenessOutcomes: [null] });
+    await harness.runtime.start();
+    harness.transport.snapshotValue.sidecarPeerAgeMs = 20_001;
+    harness.transport.snapshotValue.connected = false;
+
+    harness.heartbeatAttempt({
+      outcome: "transport_error",
+      status: null,
+      errorName: "AccountTransportError",
+      durationMs: 5_000,
+      attempt: 3,
+      previousConsecutiveFailures: 2,
+      consecutiveFailures: 3,
+    });
+    harness.heartbeatUnreachable(null);
+
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 0,
+      available: 0,
+      availabilityReason: "sidecar_suspect",
+      failure: null,
+      livenessRecovery: { startedAtMs: 0, deadlineAtMs: 150_000 },
+    });
+    expect(harness.sandboxFailures).toHaveLength(0);
+
+    harness.transport.snapshotValue.connected = true;
+    await harness.clock.advanceBy(10_000);
+    expect(harness.runtime.snapshot()).toMatchObject({
+      state: "ready",
+      capacity: 128,
+      available: 128,
+      livenessRecovery: null,
+    });
+    await harness.runtime.stop();
   });
 
   it("keeps all eight exact-sidecar runtimes routable through a phased heartbeat outage", async () => {

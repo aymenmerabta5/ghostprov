@@ -132,6 +132,8 @@ export interface FleetWorkerRecord {
   managed: boolean;
   retirementReason: FleetRetirementReason | null;
   replacementEvidence: FleetReplacementEvidence | null;
+  /** Present only while this managed successor has not reached verified readiness. */
+  replacementForProjectId?: ProjectId | null;
 }
 
 export interface ManagedProjectInspection {

@@ -15,6 +15,8 @@ import {
   FLEET_STARTUP_PERMIT_ACTIONS,
   PRISM_CIRCUIT_SCOPES,
   PRISM_CIRCUIT_STATES,
+  PRISM_CONNECTIVITY_STATES,
+  PRISM_CONNECTIVITY_REASONS,
   RECOVERY_OBSERVABILITY_EVENT_NAMES,
   SANDBOX_AWARENESS_LANES,
   SANDBOX_AVAILABILITY_REASONS,
@@ -182,6 +184,7 @@ const EVENT_FIELDS: Record<ObservabilityEventName, ReadonlySet<string>> = {
   "sandbox.recovery.aborted": RECOVERY_FIELDS,
   "sandbox.credential_refresh": RECOVERY_FIELDS,
   "prism.circuit.changed": RECOVERY_FIELDS,
+  "prism.connectivity.changed": new Set(["connectivity_state", "connectivity_reason"]),
 };
 
 const RECOVERY_EVENTS = new Set<string>(RECOVERY_OBSERVABILITY_EVENT_NAMES);
@@ -814,6 +817,10 @@ export function assertSafeObservabilityEvent(event: ObservabilityEvent): void {
   if (containsCredential(event)) {
     throw new TypeError("Observability event contains credential-shaped data");
   }
+  if (event.event === "prism.connectivity.changed" && (
+    typeof event.connectivity_state !== "string" || !(PRISM_CONNECTIVITY_STATES as readonly string[]).includes(event.connectivity_state) ||
+    typeof event.connectivity_reason !== "string" || !(PRISM_CONNECTIVITY_REASONS as readonly string[]).includes(event.connectivity_reason)
+  )) throw new TypeError("Prism connectivity observability category is invalid");
   if (event.event === "request.failed") {
     if ("cancellation_origin" in event && (
       typeof event.cancellation_origin !== "string" || !REQUEST_CANCELLATION_ORIGIN_SET.has(event.cancellation_origin) ||

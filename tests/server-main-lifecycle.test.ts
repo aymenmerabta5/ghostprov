@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,7 +8,7 @@ import {
   runGhostProvMain,
   type GhostProvWorkerProcess,
 } from "../src/server";
-import type { BrowserlessSystem } from "../src/server/system";
+import type { BrowserlessSystem, BrowserlessSystemCloseOptions } from "../src/server/system";
 import { openGhostProvShutdownControl, requestGhostProvShutdown } from "../src/host/shutdown-control";
 
 class FakeWorkerProcess extends EventEmitter implements GhostProvWorkerProcess {
@@ -30,10 +30,11 @@ class FakeWorkerProcess extends EventEmitter implements GhostProvWorkerProcess {
 
 function fakeSystem(options: {
   start?: () => Promise<void>;
-  close?: () => Promise<void>;
+  close?: (options?: BrowserlessSystemCloseOptions) => Promise<void>;
 } = {}) {
   let starts = 0;
   let closes = 0;
+  const closeOptions: Array<BrowserlessSystemCloseOptions | undefined> = [];
   const system = {
     config: { port: 12345, projectIds: ["project-1"] },
     supportsVerifiedShutdown: true,
@@ -41,12 +42,13 @@ function fakeSystem(options: {
       starts++;
       await options.start?.();
     },
-    async close() {
+    async close(input?: BrowserlessSystemCloseOptions) {
       closes++;
-      await options.close?.();
+      closeOptions.push(input);
+      await options.close?.(input);
     },
   } as unknown as BrowserlessSystem;
-  return { system, starts: () => starts, closes: () => closes };
+  return { system, starts: () => starts, closes: () => closes, closeOptions };
 }
 
 async function waitForStopped(worker: FakeWorkerProcess): Promise<any> {
@@ -80,6 +82,7 @@ describe("server main lifecycle", () => {
     expect(stopped).toMatchObject({ type: "ghostprov.stopped", exitCode: 0 });
     expect(worker.sent).toContainEqual({ type: "ghostprov.cleanup", pid: worker.pid, generation: 0, success: true });
     expect(value.closes()).toBe(1);
+    expect(value.closeOptions).toEqual([{ requireRetainedBootstrapCleanup: true }]);
     expect(worker.listenerCount("SIGTERM")).toBe(0);
   });
 
@@ -286,6 +289,7 @@ describe("server main lifecycle", () => {
       expect(await outcome).toBe(fail ? "rejected" : "clean");
       expect(worker.exitCode).toBe(fail ? 1 : 0);
       expect(value.closes()).toBe(1);
+      expect(value.closeOptions).toEqual([{ requireRetainedBootstrapCleanup: true }]);
       expect(worker.sent).toContainEqual({ type: "ghostprov.cleanup", pid: worker.pid, generation: 0, success: !fail });
     } finally {
       gate.resolve();
@@ -319,6 +323,54 @@ describe("server main lifecycle", () => {
       await running;
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("requires the full cleanup audit for a supervised shutdown IPC", async () => {
+    const worker = new FakeWorkerProcess();
+    const value = fakeSystem({ close: async options => {
+      if (options?.requireRetainedBootstrapCleanup) throw new Error("offline retained cleanup debt");
+    } });
+    await runGhostProvMain({ GP_SUPERVISED_CHILD: "1" }, {
+      process: worker, createSystem: async () => value.system,
+    });
+    worker.emit("message", { type: "ghostprov.shutdown", reason: "supervisor-stop", exitCode: 0 });
+    await waitForStopped(worker);
+    expect(value.closeOptions).toEqual([{ requireRetainedBootstrapCleanup: true }]);
+    expect(worker.sent).toContainEqual({ type: "ghostprov.cleanup", pid: worker.pid, generation: 0, success: false });
+    expect(worker.exitCode).toBe(1);
+  });
+
+  it("never certifies a late poweroff request using ordinary Ctrl+C cleanup", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "ghostprov-signal-stop-race-"));
+    const worker = new FakeWorkerProcess();
+    const gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    let powerOffs = 0;
+    const value = fakeSystem({ close: async () => { entered.resolve(); await gate.promise; } });
+    const processProbe = async () => ({ state: "alive" as const });
+    try {
+      await runGhostProvMain({}, {
+        process: worker, cwd: directory, createSystem: async () => value.system,
+        createShutdownControl: options => openGhostProvShutdownControl({ ...options, autoPoll: false, processProbe }),
+      });
+      worker.emit("SIGINT");
+      await entered.promise;
+      const outcome = requestGhostProvShutdown(directory, {
+        timeoutMs: 5_000, processProbe, afterCleanup: async () => { powerOffs++; },
+      }).then(() => "clean", () => "rejected");
+      let written = false;
+      for (let attempt = 0; attempt < 200 && !written; attempt++) {
+        written = await readFile(path.join(directory, ".ghostprov", "shutdown.request.json"), "utf8")
+          .then(() => true, () => false);
+        if (!written) await Bun.sleep(5);
+      }
+      expect(written).toBe(true);
+      gate.resolve();
+      expect(await outcome).toBe("rejected");
+      expect(powerOffs).toBe(0);
+      await waitForStopped(worker);
+      expect(value.closes()).toBe(1);
+    } finally { gate.resolve(); await rm(directory, { recursive: true, force: true }); }
   });
 
   it("does not issue affirmative cleanup proof for a mode without durable restart evidence", async () => {

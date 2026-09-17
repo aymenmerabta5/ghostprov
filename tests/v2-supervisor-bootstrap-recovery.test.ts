@@ -687,18 +687,35 @@ describe("interrupted supervisor bootstrap recovery", () => {
     } finally { await sup.close(); }
   });
 
-  it("retains signed cleanup proof when cleanup synchronization fails", async () => {
+  it("retries transient cleanup synchronization after persisting signed proof", async () => {
     const journal = new Journal(), files = new Files(), events: string[] = [];
-    const sup = controller(journal, files, events, { sync: count => { if (count === 3) throw new Error("offline cleanup sync"); } });
+    let syncs = 0;
+    const sup = controller(journal, files, events, { sync: count => {
+      syncs = count;
+      if (count === 3) throw new Error("offline cleanup sync");
+    } });
     try {
-      await sup.ensureReady(); await expect(sup.shutdown("offline_done")).rejects.toThrow();
+      await sup.ensureReady();
+      await expect(sup.shutdown("offline_done")).resolves.toBeUndefined();
+      expect(syncs).toBe(4);
+      expect(journal.attempt).toBeNull();
+      expect(journal.phases.slice(-2)).toEqual(["cleanup_proven", "cleared"]);
+    } finally { await sup.close(); }
+  });
+
+  it("retains signed cleanup proof when every bounded synchronization retry fails", async () => {
+    const journal = new Journal(), files = new Files(), events: string[] = [];
+    let syncs = 0;
+    const sup = controller(journal, files, events, { sync: count => {
+      syncs = count;
+      if (count >= 3) throw new Error("offline cleanup sync");
+    } });
+    try {
+      await sup.ensureReady();
+      await expect(sup.shutdown("offline_done")).rejects.toThrow();
+      expect(syncs).toBe(5);
       expect(journal.attempt?.phase).toBe("cleanup_proven");
     } finally { await sup.close(); }
-    const next = controller(journal, files, events, { generation: 3 });
-    try {
-      await next.ensureReady();
-      expect(events.filter(event => event === "shutdown:2")).toHaveLength(1);
-    } finally { await next.shutdown("offline_done"); await next.close(); }
   });
 
   it("persists signed cleanup before honoring cancellation after supervisor shutdown", async () => {

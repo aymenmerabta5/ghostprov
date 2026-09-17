@@ -43,6 +43,7 @@ export function sameFleetWorkerRecord(left: Readonly<FleetWorkerRecord>, right: 
     left.state === right.state && left.createdAtMs === right.createdAtMs && left.updatedAtMs === right.updatedAtMs &&
     left.leaderGeneration === right.leaderGeneration && left.hasReachedReady === right.hasReachedReady &&
     left.managed === right.managed && left.retirementReason === right.retirementReason &&
+    (left.replacementForProjectId ?? null) === (right.replacementForProjectId ?? null) &&
     JSON.stringify(left.replacementEvidence) === JSON.stringify(right.replacementEvidence);
 }
 
@@ -192,12 +193,27 @@ function parseWorker(value: unknown): FleetWorkerRecord {
     throw new FleetManifestError("Only a draining worker may have a retirement reason", "protocol");
   }
   const replacementEvidence = parseReplacementEvidence(raw.replacementEvidence);
-  if (raw.state === "draining" && replacementEvidence !== null) {
+  if (raw.state === "draining" && replacementEvidence !== null &&
+    !(replacementEvidence.kind === "bootstrap_blocked" &&
+      (retirementReason === "bootstrap_hold" || retirementReason === "replacement"))) {
     throw new FleetManifestError("A draining worker cannot retain replacement evidence", "protocol");
+  }
+  if (raw.replacementForProjectId !== undefined && raw.replacementForProjectId !== null &&
+    typeof raw.replacementForProjectId !== "string") {
+    throw new FleetManifestError("Fleet successor source is invalid", "protocol");
+  }
+  const replacementForProjectId = raw.replacementForProjectId == null
+    ? null
+    : projectId(raw.replacementForProjectId as string);
+  const parsedProjectId = projectId(raw.projectId);
+  if (replacementForProjectId !== null &&
+    (!raw.managed || raw.state === "ready" || raw.state === "draining" ||
+      replacementForProjectId === parsedProjectId)) {
+    throw new FleetManifestError("Fleet successor binding is invalid", "protocol");
   }
   return Object.freeze({
     index: raw.index as number,
-    projectId: projectId(raw.projectId),
+    projectId: parsedProjectId,
     title: raw.title,
     state: raw.state as FleetWorkerState,
     createdAtMs: finiteNonnegative(raw.createdAtMs, "Fleet worker creation time"),
@@ -211,6 +227,7 @@ function parseWorker(value: unknown): FleetWorkerRecord {
     managed: raw.managed,
     retirementReason: retirementReason ?? null,
     replacementEvidence,
+    replacementForProjectId,
   });
 }
 
@@ -257,6 +274,18 @@ function parseManifest(
     indexes.add(worker.index);
     projects.add(worker.projectId);
   }
+  const successorSources = new Set<ProjectId>();
+  for (const worker of workers) {
+    const sourceId = worker.replacementForProjectId ?? null;
+    if (sourceId === null) continue;
+    const source = workers.find(candidate => candidate.projectId === sourceId);
+    if (!source || source.state !== "draining" ||
+      (source.retirementReason !== "replacement" && source.retirementReason !== "missing" &&
+        source.retirementReason !== "bootstrap_hold") || successorSources.has(sourceId)) {
+      throw new FleetManifestError("Fleet successor source binding conflicts", "protocol");
+    }
+    successorSources.add(sourceId);
+  }
   return Object.freeze({
     version: 1,
     identityKind: raw.identityKind,
@@ -271,7 +300,7 @@ function updatedWorker(
   update: Partial<Pick<
     FleetWorkerRecord,
     "state" | "updatedAtMs" | "leaderGeneration" | "retirementReason"
-      | "replacementEvidence" | "hasReachedReady"
+      | "replacementEvidence" | "hasReachedReady" | "replacementForProjectId"
   >>,
 ): FleetWorkerRecord {
   return Object.freeze({ ...worker, ...update });
@@ -364,6 +393,7 @@ export class FleetManifestStore {
     title: string;
     nowMs: number;
     managed?: boolean;
+    replacementForProjectId?: ProjectId;
   }): Promise<FleetManifest> {
     if (!Number.isInteger(input.index) || input.index < 1) {
       return Promise.reject(new FleetManifestError("Worker index must be positive", "protocol"));
@@ -380,7 +410,8 @@ export class FleetManifestStore {
         if (
           sameProject.index === input.index &&
           sameProject.title === input.title &&
-          sameProject.managed === (input.managed ?? true)
+          sameProject.managed === (input.managed ?? true) &&
+          (sameProject.replacementForProjectId ?? null) === (input.replacementForProjectId ?? null)
         ) return current;
         throw new FleetManifestError("Worker project reservation conflicts", "conflict");
       }
@@ -389,6 +420,16 @@ export class FleetManifestStore {
       }
       if (current.workers.length >= MAX_MANIFEST_WORKERS) {
         throw new FleetManifestError("Fleet worker limit is exceeded", "conflict");
+      }
+      const replacementForProjectId = input.replacementForProjectId ?? null;
+      if (replacementForProjectId !== null) {
+        const source = current.workers.find(worker => worker.projectId === replacementForProjectId);
+        if ((input.managed ?? true) !== true || !source || source.state !== "draining" ||
+          (source.retirementReason !== "replacement" && source.retirementReason !== "missing" &&
+            source.retirementReason !== "bootstrap_hold") ||
+          current.workers.some(worker => worker.replacementForProjectId === replacementForProjectId)) {
+          throw new FleetManifestError("Worker successor reservation conflicts", "conflict");
+        }
       }
       const worker: FleetWorkerRecord = Object.freeze({
         index: input.index,
@@ -402,6 +443,7 @@ export class FleetManifestStore {
         managed: input.managed ?? true,
         retirementReason: null,
         replacementEvidence: null,
+        replacementForProjectId,
       });
       return { ...current, workers: Object.freeze([...current.workers, worker]) };
     });
@@ -435,9 +477,9 @@ export class FleetManifestStore {
           updatedAtMs: nowMs,
           ...(state === "draining" ? {} : { retirementReason: null }),
           ...(state === "ready"
-            ? { hasReachedReady: true, replacementEvidence: null }
+            ? { hasReachedReady: true, replacementEvidence: null, replacementForProjectId: null }
             : state === "draining"
-              ? { replacementEvidence: null }
+              ? { replacementEvidence: null, replacementForProjectId: null }
               : {}),
         });
       });
@@ -471,7 +513,14 @@ export class FleetManifestStore {
         return updatedWorker(worker, {
           state: "draining",
           retirementReason: reason,
-          replacementEvidence: null,
+          // A bootstrap hold may later need to prove, across a host restart,
+          // that exact cleanup freed a bounded successor slot. Retain its
+          // content-free failure identity until the held project is retired.
+          replacementEvidence: reason === "bootstrap_hold" &&
+              worker.replacementEvidence?.kind === "bootstrap_blocked"
+            ? worker.replacementEvidence
+            : null,
+          replacementForProjectId: null,
           updatedAtMs: nowMs,
         });
       });

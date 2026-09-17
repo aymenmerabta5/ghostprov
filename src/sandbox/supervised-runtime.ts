@@ -4,6 +4,7 @@ import {
   type Clock,
   type RandomSource,
 } from "../core/ports";
+import type { RecoveryConnectivity } from "../prism/connectivity";
 import type { RunHandle } from "../relay/run-handle";
 import type { ProvisionedSandbox } from "../prism/protocol";
 import type {
@@ -16,7 +17,7 @@ import type {
   SandboxRunOptions,
 } from "./registry";
 import { describeSandboxFailure } from "./failure";
-import { hasFreshExactSidecarLiveness, isActiveSandboxLivenessRecovery } from "./liveness";
+import { hasFreshExactSidecarLiveness, isActiveSandboxLivenessRecovery, SANDBOX_LIVENESS_RECOVERY_MAX_MS } from "./liveness";
 import type { ProjectId, SandboxFailureSnapshot } from "./types";
 import { V2PreCommitError } from "../v2/transport/run-handle";
 
@@ -114,6 +115,7 @@ export interface SupervisedSandboxRuntimeOptions {
   /** Checks authoritative journal/debt state before cold admission; proof uses no new backend. */
   recoverBootstrapCleanup?(signal: AbortSignal): Promise<BootstrapCleanupAssessment>;
   recoveryCoordinator?: FleetRecoveryCoordinator;
+  connectivity?: RecoveryConnectivity;
   workerIndex?: number;
   transport?: "v2";
   onRecoveryEvent?(event: SandboxSupervisorEvent): void;
@@ -234,6 +236,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
   readonly #createChild: SupervisedSandboxRuntimeOptions["createChild"];
   readonly #acquirePermit?: SupervisedSandboxRuntimeOptions["acquirePermit"];
   readonly #recoveryCoordinator?: FleetRecoveryCoordinator;
+  readonly #connectivity?: RecoveryConnectivity;
   readonly #workerIndex?: number;
   readonly #transportMode?: "v2";
   readonly #onRecoveryEvent?: (event: SandboxSupervisorEvent) => void;
@@ -281,6 +284,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
     this.#createChild = options.createChild;
     this.#acquirePermit = options.acquirePermit;
     this.#recoveryCoordinator = options.recoveryCoordinator;
+    this.#connectivity = options.connectivity;
     this.#workerIndex = options.workerIndex;
     this.#transportMode = options.transport;
     this.#onRecoveryEvent = options.onRecoveryEvent;
@@ -604,6 +608,8 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
       let child: RoutableSandboxRuntime | null = null;
       let circuitLease: FleetRecoveryLease | null = null;
       try {
+        await this.#connectivity?.waitForRecovery(signal);
+        if (!this.#isActive(signal)) throw abortError();
         if (!useCurrentChild) {
           replacementSandbox ??= this.#child?.takeReplacementSandbox?.() ?? null;
         }
@@ -614,6 +620,7 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
             failure: replacementSandbox ? { status: 409 } : attemptFailure,
           }, signal);
         }
+        await this.#connectivity?.waitForRecovery(signal);
         if (!this.#isActive(signal)) throw abortError();
         if (useCurrentChild) {
           child = this.#child;
@@ -964,14 +971,24 @@ export class SupervisedSandboxRuntime implements RoutableSandboxRuntime {
 
   #childProblem(snapshot: RoutableSandboxSnapshot, afterStart: boolean): string | null {
     if (IMMEDIATELY_UNHEALTHY_STATES.has(snapshot.state)) return `state:${snapshot.state}`;
+    if (snapshot.state === "ready" && this.#connectivity) {
+      const recoveredAt = this.#connectivity.snapshot().recoveredAtMs;
+      const now = this.#clock.now();
+      // Credential clocks keep advancing while the host is disconnected. Keep
+      // the exact child, then allow its existing refresh owners one bounded
+      // recovery window. Routing still checks real credentials and liveness.
+      if (this.#connectivity.isRecoveryBlocked() || (recoveredAt !== null &&
+        recoveredAt <= now && now - recoveredAt < SANDBOX_LIVENESS_RECOVERY_MAX_MS)) return null;
+    }
     if (snapshot.credentialExpiresInMs !== null && snapshot.credentialExpiresInMs < 30_000) {
       return "credentials-expiring";
     }
     if (snapshot.state === "ready") {
-      // The child owns recovery until its fixed deadline. It remains unroutable;
-      // a stale heartbeat must not retire it while that exact owner reconnects.
-      if (snapshot.capacity === 0 && snapshot.available === 0 &&
-        isActiveSandboxLivenessRecovery(snapshot.livenessRecovery, this.#clock.now())) return null;
+      // The child owns recovery until its current lease expires. A fresh
+      // heartbeat transport failure can publish that ownership before the
+      // sidecar monitor zeros its local credits; shared routing health still
+      // rejects the runtime once both liveness signals are stale.
+      if (isActiveSandboxLivenessRecovery(snapshot.livenessRecovery, this.#clock.now())) return null;
       const exactSidecarFresh = hasFreshExactSidecarLiveness(snapshot);
       if (
         snapshot.heartbeatAgeMs !== null &&

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Clock } from "../src/core/ports";
+import { PrismConnectivityMonitor, type RecoveryConnectivity } from "../src/prism/connectivity";
 import type { RunHandle } from "../src/relay/run-handle";
 import { parseProvisionedSandbox, type ProvisionedSandbox } from "../src/prism/protocol";
 import type {
@@ -199,6 +200,7 @@ function supervisor(input: {
   startupTimeoutMs?: number;
   shutdownDeadlineMs?: () => number | undefined;
   recoverBootstrapCleanup?: (signal: AbortSignal) => Promise<"not_required" | "proven" | "unproved">;
+  connectivity?: RecoveryConnectivity;
   acquirePermit?: (signal: AbortSignal) => Promise<() => void>;
   onRecoveryEvent?: (event: SandboxSupervisorEvent) => void;
 }): SupervisedSandboxRuntime {
@@ -213,6 +215,7 @@ function supervisor(input: {
     startupTimeoutMs: input.startupTimeoutMs ?? 10_000,
     shutdownDeadlineMs: input.shutdownDeadlineMs,
     recoverBootstrapCleanup: input.recoverBootstrapCleanup,
+    connectivity: input.connectivity,
     initialBackoffMs: 1_000,
     maxBackoffMs: 60_000,
     acquirePermit: input.acquirePermit,
@@ -896,7 +899,7 @@ describe("SupervisedSandboxRuntime", () => {
     await Promise.all(supervisors.map(runtime => runtime.stop()));
   });
 
-  it("defers stale-heartbeat replacement only until the unroutable child's recovery deadline", async () => {
+  it("defers stale-heartbeat replacement when the child publishes recovery before zeroing credits", async () => {
     const clock = new ManualClock();
     const initial = new FakeRuntime();
     const replacement = new FakeRuntime();
@@ -905,7 +908,7 @@ describe("SupervisedSandboxRuntime", () => {
     await runtime.start();
     const snapshot = initial.snapshot.bind(initial);
     const recovery = { startedAtMs: clock.now(), deadlineAtMs: clock.now() + 150_000 };
-    initial.snapshot = () => ({ ...snapshot(), capacity: 0, available: 0, livenessRecovery: recovery });
+    initial.snapshot = () => ({ ...snapshot(), livenessRecovery: recovery });
     initial.heartbeatAgeMs = 40_001;
     initial.transportConnected = false;
     initial.emit();
@@ -913,7 +916,7 @@ describe("SupervisedSandboxRuntime", () => {
     clock.advanceBy(149_999);
     await flush();
     expect(creates).toBe(0);
-    expect(runtime.snapshot()).toMatchObject({ state: "ready", capacity: 0, available: 0 });
+    expect(runtime.snapshot()).toMatchObject({ state: "ready", capacity: 128, available: 128 });
     clock.advanceBy(1);
     initial.emit();
     await waitFor(() => creates === 1);
@@ -938,6 +941,70 @@ describe("SupervisedSandboxRuntime", () => {
     await waitFor(() => creates === 1);
     await waitFor(() => runtime.snapshot().available === 128);
     await runtime.stop();
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("retains expired credentials only during internet loss and one bounded recovery window", async () => {
+    const clock = new ManualClock();
+    let offline = true, creates = 0;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: !offline, reason: offline ? "dns" : "reachable" }) });
+    const initial = new FakeRuntime();
+    const runtime = supervisor({ clock, connectivity, initial, create: () => { creates++; return new FakeRuntime(); } });
+    await runtime.start();
+    try {
+      connectivity.requestCheck(); await flush();
+      initial.credentialExpiresInMs = 0;
+      initial.heartbeatAgeMs = 900_000;
+      initial.emit(); await flush();
+      for (let elapsed = 0; elapsed < 900_000; elapsed += 10_000) { clock.advanceBy(10_000); await flush(); }
+      expect(creates).toBe(0);
+      expect(initial.stops).toBe(0);
+      expect(runtime.supervisorSnapshot().phase).toBe("healthy");
+      offline = false; clock.advanceBy(10_000); await flush();
+      expect(connectivity.snapshot().state).toBe("reachable");
+      clock.advanceBy(149_999); initial.emit(); await flush();
+      expect(creates).toBe(0);
+      clock.advanceBy(1); initial.emit();
+      await waitFor(() => creates === 1);
+      await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+      expect(initial.stops).toBe(1);
+    } finally { await runtime.stop(); connectivity.close(); }
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("preserves a definitive failed state while pausing retirement and provisioning offline", async () => {
+    const clock = new ManualClock();
+    let offline = true, creates = 0;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: !offline, reason: offline ? "transport" : "reachable" }) });
+    const initial = new FakeRuntime();
+    const runtime = supervisor({ clock, connectivity, initial, create: () => { creates++; return new FakeRuntime(); } });
+    await runtime.start();
+    try {
+      connectivity.requestCheck(); await flush();
+      initial.setState("auth_required"); await flush();
+      expect(runtime.supervisorSnapshot().phase).toBe("recovering");
+      expect(creates).toBe(0);
+      expect(initial.stops).toBe(0);
+      offline = false; clock.advanceBy(10_000); await flush();
+      await waitFor(() => runtime.supervisorSnapshot().phase === "healthy");
+      expect(creates).toBe(1);
+      expect(initial.stops).toBe(1);
+    } finally { await runtime.stop(); connectivity.close(); }
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  it("can close an isolated runtime while recovery is waiting for internet", async () => {
+    const clock = new ManualClock();
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: false, reason: "transport" }) });
+    const initial = new FakeRuntime();
+    let creates = 0;
+    const runtime = supervisor({ clock, connectivity, initial, create: () => { creates++; return new FakeRuntime(); } });
+    await runtime.start();
+    connectivity.requestCheck(); await flush();
+    initial.setState("failed"); await flush();
+    await runtime.stop(); connectivity.close();
+    expect(creates).toBe(0);
+    expect(initial.stops).toBe(1);
     expect(clock.pendingTimers()).toBe(0);
   });
 

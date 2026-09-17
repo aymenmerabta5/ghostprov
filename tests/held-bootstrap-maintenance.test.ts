@@ -169,13 +169,13 @@ describe("held bootstrap maintenance composition", () => {
     expect(value.events).not.toContain("workspace.acquire");
   });
 
-  it("retains unproven cleanup debt and releases its permit after failure", async () => {
+  it("retains unproven cleanup in durable state without poisoning process shutdown", async () => {
     const value = await fixture("submitted"); value.controls.failShutdown = true;
     await expect(value.ports.cleanupHeldBootstrap(worker, new AbortController().signal)).rejects.toThrow();
     expect(value.record()?.phase).toBe("submitted");
     expect(value.events.at(-1)).toBe("permit.release");
     expect(value.events).not.toContain("workspace.acquire");
-    await expect(value.lifecycle.shutdown(new AbortController().signal)).rejects.toThrow("incomplete");
+    await expect(value.lifecycle.shutdown(new AbortController().signal)).resolves.toBeUndefined();
   });
 
   it("opens workspace resources only after proof and the retirement transition", async () => {

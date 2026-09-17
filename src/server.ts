@@ -60,6 +60,7 @@ export async function runGhostProvMain(
   let systemCreation: Promise<BrowserlessSystem> | null = null;
   let closing: Promise<void> | null = null;
   let systemClose: Promise<void> | null = null;
+  let retainedBootstrapCleanupRequiredForClose: boolean | null = null;
   let systemStarting: Promise<void> | null = null;
   let startSettled = true;
   let cleanupSucceeded = false;
@@ -70,7 +71,14 @@ export async function runGhostProvMain(
   let intentionalDisconnect = false;
 
   const closeSystem = (candidate: BrowserlessSystem): Promise<void> => {
-    systemClose ??= Promise.resolve().then(() => candidate.close());
+    if (!systemClose) {
+      // A supervised worker's IPC receipt can authorize the outer process to
+      // power off. Only the full journal audit may supply that receipt.
+      retainedBootstrapCleanupRequiredForClose = controlRequestedShutdown || env.GP_SUPERVISED_CHILD === "1";
+      systemClose = Promise.resolve().then(() => candidate.close({
+        requireRetainedBootstrapCleanup: retainedBootstrapCleanupRequiredForClose!,
+      }));
+    }
     return systemClose;
   };
   const reportShutdownFailure = (error: unknown) => {
@@ -103,6 +111,7 @@ export async function runGhostProvMain(
         // non-cooperative construction/start can still own resources later.
         cleanupSucceeded = pendingCreation === null && startSettled &&
           system !== null && system.supportsVerifiedShutdown === true &&
+          retainedBootstrapCleanupRequiredForClose === true &&
           (requestedExitCode === 0 || requestedExitCode === 75);
         for (const [event, listener] of listeners) workerProcess.off(event, listener);
         try {
@@ -202,7 +211,7 @@ export async function runGhostProvMain(
         onShutdown: async () => {
           controlRequestedShutdown = true;
           await requestClose("shutdown-control");
-          if (!cleanupSucceeded || requestedExitCode !== 0) {
+          if (!cleanupSucceeded || retainedBootstrapCleanupRequiredForClose !== true || requestedExitCode !== 0) {
             throw new Error("GhostProv cleanup was not completed successfully");
           }
         },

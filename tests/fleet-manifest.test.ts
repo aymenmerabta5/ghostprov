@@ -147,7 +147,7 @@ describe("FleetManifestStore", () => {
     if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
   });
 
-  it("persists bounded replacement evidence across store restarts and clears it on drain", async () => {
+  it("persists bounded bootstrap evidence across restarts and its non-destructive hold", async () => {
     const file = await manifestPath();
     const first = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
     await first.initialize("authenticated");
@@ -161,7 +161,7 @@ describe("FleetManifestStore", () => {
       await first.recordReplacementFailure({
         id: A,
         signatureHash: "c".repeat(64),
-        kind: "timeout",
+        kind: "bootstrap_blocked",
         observedAtMs: attempt + 1,
         attempt,
         incarnation: attempt,
@@ -173,14 +173,14 @@ describe("FleetManifestStore", () => {
     const second = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
     expect((await second.load()).workers[0]?.replacementEvidence).toMatchObject({
       signatureHash: "c".repeat(64),
-      kind: "timeout",
+      kind: "bootstrap_blocked",
       count: 2,
       totalDurationMs: 140_000,
     });
     await second.recordReplacementFailure({
       id: A,
       signatureHash: "c".repeat(64),
-      kind: "timeout",
+      kind: "bootstrap_blocked",
       observedAtMs: 4,
       attempt: 3,
       incarnation: 3,
@@ -189,8 +189,56 @@ describe("FleetManifestStore", () => {
       totalDurationMs: 210_000,
     });
     expect((await second.load()).workers[0]?.replacementEvidence?.count).toBe(3);
+    await second.markDraining(A, "bootstrap_hold", 5);
+    expect((await second.load()).workers[0]?.replacementEvidence).toMatchObject({
+      signatureHash: "c".repeat(64),
+      kind: "bootstrap_blocked",
+      count: 3,
+    });
+  });
+
+  it("clears replacement evidence for destructive retirement intents", async () => {
+    const file = await manifestPath();
+    const second = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await second.initialize("authenticated");
+    await second.reserveWorker({ index: 1, projectId: A, title: "GhostProv Worker 1", nowMs: 1 });
+    await second.recordReplacementFailure({
+      id: A,
+      signatureHash: "c".repeat(64),
+      kind: "timeout",
+      observedAtMs: 2,
+      attempt: 1,
+      incarnation: 1,
+      leaderGeneration: 1,
+      consecutiveFailures: 1,
+      totalDurationMs: 70_000,
+    });
     await second.markDraining(A, "replacement", 5);
     expect((await second.load()).workers[0]?.replacementEvidence).toBeNull();
+  });
+
+  it("persists an exact pending successor source and clears it at verified readiness", async () => {
+    const file = await manifestPath();
+    const first = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    await first.initialize("authenticated");
+    await first.reserveWorker({ index: 1, projectId: A, title: "old", nowMs: 1 });
+    await first.markCreated(A, 2);
+    await first.markDraining(A, "replacement", 3);
+    await first.reserveWorker({
+      index: 2,
+      projectId: B,
+      title: "successor",
+      nowMs: 4,
+      replacementForProjectId: A,
+    });
+
+    const second = new FleetManifestStore({ file, identityFingerprint: FINGERPRINT });
+    expect((await second.load()).workers.find(worker => worker.projectId === B))
+      .toMatchObject({ state: "creating", replacementForProjectId: A });
+    await expect(second.removeManaged(A)).rejects.toMatchObject({ kind: "protocol" });
+    await second.markState(B, "ready", 5);
+    expect((await second.load()).workers.find(worker => worker.projectId === B)?.replacementForProjectId)
+      .toBeNull();
   });
 
   it("deduplicates one recovery observation and resets every signature-local counter", async () => {

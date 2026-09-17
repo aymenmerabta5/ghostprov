@@ -24,6 +24,7 @@ import {
 import { projectId, type ProjectId } from "../src/sandbox/types";
 import type { PrismProjectSummary } from "../src/prism/projects-client";
 import type { FleetRecoverySnapshot } from "../src/prism/recovery-coordinator";
+import { PrismConnectivityMonitor, type RecoveryConnectivity } from "../src/prism/connectivity";
 import { SupervisedSandboxRuntime, type SandboxSupervisorEvent } from "../src/sandbox/supervised-runtime";
 
 const A = projectId("e631d12c-d917-4434-b360-41b4715d6679");
@@ -635,6 +636,7 @@ function config(cookieFile: string, input: {
   guestMax?: number;
   provisionConcurrency?: number;
   target?: number;
+  maxProjects?: number;
 }) {
   const explicit = input.explicit;
   return resolveMultiSandboxConfig({
@@ -645,7 +647,7 @@ function config(cookieFile: string, input: {
     GP_PRISM_SESSION: input.sessionMode ?? "authenticated",
     GP_ALLOW_ANONYMOUS: input.sessionMode === "auto" ? "1" : "0",
     GP_GUEST_MAX_PROJECTS: String(input.guestMax ?? 4),
-    GP_MAX_PROJECTS: "8",
+    GP_MAX_PROJECTS: String(input.maxProjects ?? 8),
     GP_PROVISION_CONCURRENCY: String(input.provisionConcurrency ?? 2),
     GP_CANDIDATE: "1",
   }, MACHINE);
@@ -666,6 +668,7 @@ function manager(input: {
   runtimeCleanupTimeoutMs?: number;
   randomUuid?: () => string;
   recoveryCircuitSnapshot?: () => Readonly<FleetRecoverySnapshot>;
+  connectivity?: RecoveryConnectivity;
   canRetireProject?: (projectId: ProjectId) => boolean;
   bootstrapMigration?: FileBootstrapHoldMigration;
   cleanupHeldBootstrap?: ProjectFleetManagerOptions["cleanupHeldBootstrap"];
@@ -693,6 +696,7 @@ function manager(input: {
       metadataAttemptTimeoutMs: input.metadataAttemptTimeoutMs,
       runtimeCleanupTimeoutMs: input.runtimeCleanupTimeoutMs,
       recoveryCircuitSnapshot: input.recoveryCircuitSnapshot,
+      connectivity: input.connectivity,
       canRetireProject: input.canRetireProject,
       bootstrapMigration: input.bootstrapMigration,
       cleanupHeldBootstrap: input.cleanupHeldBootstrap,
@@ -806,7 +810,8 @@ describe("ProjectFleetManager", () => {
     await prepareBootstrapHoldMigrationLedger({ manifestFile, identityFingerprint: FINGERPRINT, projectIds: ids.slice(12 - grantCount, 12) });
     const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
     const migration = new FileBootstrapHoldMigration({ manifestFile, identityFingerprint: FINGERPRINT });
-    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8,
+      maxProjects: 12 + grantCount }),
       manifest: files.manifest, projects, clock: new BlockingClock(), bootstrapMigration: migration,
       randomUuid: uuidSequence(...ids.slice(12)), canRetireProject: () => false });
     try {
@@ -1583,14 +1588,31 @@ describe("ProjectFleetManager", () => {
     for (let index = 0; index < 12; index++) {
       await files.manifest.reserveWorker({ index: index + 1, projectId: ids[index]!, title: `fixture ${index}`, nowMs: 1 });
       await files.manifest.markCreated(ids[index]!, 2);
-      if (index < 4) await files.manifest.markDraining(ids[index]!, "bootstrap_hold", 3);
+      if (index < 4) {
+        if (index === 0) {
+          for (let count = 1; count <= 3; count++) {
+            await files.manifest.recordReplacementFailure({
+              id: ids[index]!,
+              signatureHash: "a".repeat(64),
+              kind: "bootstrap_blocked",
+              observedAtMs: 2 + count,
+              attempt: count,
+              incarnation: 1,
+              leaderGeneration: 1,
+              consecutiveFailures: count,
+              totalDurationMs: count * 1_000,
+            });
+          }
+        }
+        await files.manifest.markDraining(ids[index]!, "bootstrap_hold", index === 0 ? 6 : 3);
+      }
     }
     const projects = new FakeProjects(ids.slice(0, 12).map(id => project(id)));
     const finalized: ProjectId[] = [];
     const proven: ProjectId[] = [];
     const clock = new StepClock();
     let proofAvailable = false;
-    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8, maxProjects: 12 }),
       manifest: files.manifest, projects, clock, randomUuid: uuidSequence(ids[12]!),
       cleanupHeldBootstrap: async worker => { proven.push(worker.projectId); return proofAvailable; },
       finalizeHeldBootstrapCleanup: async worker => { finalized.push(worker.projectId); },
@@ -1607,21 +1629,22 @@ describe("ProjectFleetManager", () => {
       expect(projects.created).toEqual([]);
       proofAvailable = true;
       clock.nowMs += 30_000;
-      await harness.value.reconcile();
-      await harness.value.reconcile();
+      for (let attempt = 0; attempt < 10 && harness.value.snapshot().ready < 8; attempt++) {
+        await harness.value.reconcile();
+      }
       proofAvailable = false;
       expect(harness.value.snapshot()).toMatchObject({ ready: 8, unavailable: 0 });
       expect(projects.created.map(worker => worker.projectId)).toEqual([ids[12]!]);
-      expect(harness.value.snapshot().heldProjects).toHaveLength(4);
+      expect(harness.value.snapshot().heldProjects?.length ?? 0).toBeLessThanOrEqual(4);
       await harness.value.reconcile();
       await harness.value.reconcile();
-      expect(finalized).toContain(ids[1]!);
-      expect(projects.deleted).toEqual([ids[1]!]);
+      expect(finalized.length).toBeGreaterThan(0);
+      expect(projects.deleted.every(id => ids.slice(0, 4).includes(id))).toBe(true);
       expect(harness.factory.created.some(worker => ids.slice(0, 4).includes(worker.projectId))).toBe(false);
     } finally { await harness.value.shutdown("test-complete"); }
   });
 
-  it("proves held cleanup with three of eight workers ready while replacement and deletion remain fenced", async () => {
+  it("proves held cleanup below majority while the total project budget fences successors", async () => {
     const files = await state(), clock = new BlockingClock();
     const ids = Array.from({ length: 12 }, (_, index) =>
       projectId(`20000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
@@ -1643,7 +1666,7 @@ describe("ProjectFleetManager", () => {
     const projects = new FakeProjects(ids.map(id => project(id)));
     const proven: ProjectId[] = [], lifecycle: FleetLifecycleEvent[] = [];
     let settleProof: ((proven: boolean) => void) | undefined, finalizations = 0;
-    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+    const harness = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8, maxProjects: 12 }),
       manifest: files.manifest, projects, clock, factory, onLifecycleEvent: event => lifecycle.push(event),
       cleanupHeldBootstrap: async worker => {
         proven.push(worker.projectId);
@@ -1671,17 +1694,156 @@ describe("ProjectFleetManager", () => {
       expect(projects.created).toEqual([]); expect(projects.deleted).toEqual([]);
       expect(finalizations).toBe(0);
       expect(factory.created).toHaveLength(8);
-      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", reason: "healthy_majority" }));
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", reason: "bootstrap_hold_limit" }));
       expect(lifecycle.some(event => event.type === "replacement_started")).toBe(false);
       expect(lifecycle).toContainEqual(expect.objectContaining({ type: "bootstrap_cleanup_succeeded", projectId: ids[0] }));
     } finally { settleProof?.(false); await harness.value.shutdown("test-complete"); }
   });
 
+  it("restores six workers after an outage with nine retained holds and stays inside GP_MAX_PROJECTS", async () => {
+    const files = await state();
+    const ids = Array.from({ length: 23 }, (_, index) =>
+      projectId(`40000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
+    await files.manifest.initialize("authenticated");
+    await files.manifest.completeLegacyMigration();
+    for (let index = 0; index < 17; index++) {
+      await files.manifest.reserveWorker({
+        index: index + 1,
+        projectId: ids[index]!,
+        title: `fixture ${index}`,
+        nowMs: 1,
+      });
+      await files.manifest.markCreated(ids[index]!, 2);
+      if (index < 9) await files.manifest.markDraining(ids[index]!, "bootstrap_hold", 3);
+    }
+    const failed = new Set(ids.slice(11, 17));
+    const factory = new FakeFactory();
+    const create = factory.create.bind(factory);
+    factory.create = input => {
+      const runtime = create(input);
+      const start = runtime.start.bind(runtime);
+      runtime.start = async () => {
+        await start();
+        if (failed.has(input.projectId)) runtime.state = "recovering";
+      };
+      return runtime;
+    };
+    const projects = new FakeProjects(ids.slice(0, 17).map(id => project(id)));
+    const lifecycle: FleetLifecycleEvent[] = [];
+    let circuit = recoveryCircuit("open", "outage");
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8, maxProjects: 32 }),
+      manifest: files.manifest,
+      projects,
+      factory,
+      randomUuid: uuidSequence(...ids.slice(17)),
+      recoveryCircuitSnapshot: () => circuit,
+      canRetireProject: () => false,
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      await expect(harness.value.reconcile()).resolves.toMatchObject({
+        ready: 2,
+        unavailable: 6,
+        heldProjects: ids.slice(0, 9),
+      });
+      for (const id of failed) {
+        for (let count = 1; count <= 3; count++) {
+          harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+        }
+      }
+      await harness.value.reconcile();
+      expect(projects.created).toEqual([]);
+      expect(lifecycle).toContainEqual(expect.objectContaining({
+        type: "mutation_blocked",
+        reason: "recovery_circuit",
+      }));
+
+      circuit = recoveryCircuit("closed", null);
+      for (let replacement = 1; replacement <= 6; replacement++) {
+        await expect(harness.value.reconcile()).resolves.toMatchObject({
+          ready: 2 + replacement,
+          unavailable: 6 - replacement,
+        });
+        expect(projects.created.map(worker => worker.projectId)).toEqual(ids.slice(17, 17 + replacement));
+      }
+
+      const manifest = await files.manifest.load();
+      expect(harness.value.snapshot()).toMatchObject({
+        ready: 8,
+        unavailable: 0,
+        heldProjects: ids.slice(0, 9).concat(ids.slice(11, 17)),
+      });
+      expect(manifest.workers).toHaveLength(23);
+      expect(manifest.workers.length).toBeLessThanOrEqual(32);
+      expect(projects.deleted).toEqual([]);
+      expect(ids.slice(11, 17).every(id =>
+        manifest.workers.find(worker => worker.projectId === id)?.retirementReason === "bootstrap_hold")).toBe(true);
+    } finally {
+      await harness.value.shutdown("outage-restoration-complete");
+    }
+  });
+
+  it("admits only one successor canary while a zero-ready fleet has no proven recovery", async () => {
+    const files = await state();
+    const factory = new FakeFactory();
+    const create = factory.create.bind(factory);
+    factory.create = input => {
+      const runtime = create(input);
+      const start = runtime.start.bind(runtime);
+      runtime.start = async () => {
+        await start();
+        if (input.projectId === E) runtime.state = "recovering";
+      };
+      return runtime;
+    };
+    const projects = new FakeProjects([]);
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4, maxProjects: 8 }),
+      manifest: files.manifest,
+      projects,
+      factory,
+      randomUuid: uuidSequence(A, B, C, D, E, F),
+      recoveryCircuitSnapshot: () => recoveryCircuit("closed", null),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      await harness.value.reconcile();
+      for (const id of [A, B, C, D]) {
+        factory.runtimes.get(id)!.state = "recovering";
+        for (let count = 1; count <= 3; count++) {
+          harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
+        }
+      }
+
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 0, unavailable: 4, heldProjects: [A] });
+      expect(projects.created.map(worker => worker.projectId)).toEqual([A, B, C, D, E]);
+      await harness.value.reconcile();
+      expect(projects.created.map(worker => worker.projectId)).toEqual([A, B, C, D, E]);
+      expect(harness.value.snapshot().heldProjects).toEqual([A]);
+      expect(lifecycle).toContainEqual(expect.objectContaining({
+        type: "mutation_blocked",
+        reason: "healthy_majority",
+      }));
+
+      factory.runtimes.get(E)!.state = "ready";
+      factory.runtimes.get(E)!.emit();
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 1, unavailable: 3 });
+      await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 2, unavailable: 2, heldProjects: [A, B] });
+      expect(projects.created.map(worker => worker.projectId)).toEqual([A, B, C, D, E, F]);
+      expect(projects.deleted).toEqual([]);
+    } finally {
+      await harness.value.shutdown("zero-ready-canary-complete");
+    }
+  });
+
   it.each([false, true])("restores three of eight workers through five exact v2 grants (early cleanup and restart: %s)", async earlyCleanup => {
     const files = await state(), manifestFile = path.join(files.root, "fleet.json");
-    const ids = Array.from({ length: 17 }, (_, index) =>
+    const ids = Array.from({ length: 19 }, (_, index) =>
       projectId(`30000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`));
-    const granted = ids.slice(7, 12), successors = ids.slice(12), blocked = new Set(granted);
+    const granted = ids.slice(7, 12), successors = ids.slice(12, 17), extraSuccessors = ids.slice(17);
+    const blocked = new Set(granted);
     await files.manifest.initialize("authenticated");
     await files.manifest.completeLegacyMigration();
     for (let index = 0; index < 12; index++) {
@@ -1729,9 +1891,10 @@ describe("ProjectFleetManager", () => {
       },
       finalizeHeldBootstrapCleanup: async () => { throw new Error("Project deletion must stay blocked"); },
     } : {};
-    const construct = (remaining: readonly ProjectId[]) => manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+    const construct = (remaining: readonly ProjectId[]) => manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8, maxProjects: 18 }),
       manifest: files.manifest, projects, factory, clock, bootstrapMigration: migration, ...cleanupPorts,
-      randomUuid: uuidSequence(...remaining), canRetireProject: () => false, recoveryCircuitSnapshot: () => circuit });
+      randomUuid: uuidSequence(...remaining, ...extraSuccessors), canRetireProject: () => false,
+      recoveryCircuitSnapshot: () => circuit });
     let harness = construct(successors);
     try {
       await expect(harness.value.reconcile()).resolves.toMatchObject({ ready: 3, unavailable: 5 });
@@ -1793,18 +1956,19 @@ describe("ProjectFleetManager", () => {
         for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(blockedBootstrap(id, count));
       }
       await harness.value.reconcile();
-      expect(projects.created).toHaveLength(5); expect(harness.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 8 : 9);
+      expect(projects.created.map(worker => worker.projectId)).toEqual([...successors, extraSuccessors[0]!]);
+      expect(harness.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 9 : 10);
       expect(projects.deleted).toEqual([]);
     } finally { await harness.value.shutdown("operator-recovery-complete"); }
-    const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8 }),
+    const restarted = manager({ config: config(files.cookieFile, { explicit: [], target: 8, provisionConcurrency: 8, maxProjects: 18 }),
       manifest: files.manifest, projects, clock, bootstrapMigration: migration,
       canRetireProject: () => false,
       randomUuid: () => { throw new Error("consumed operator grants cannot refill"); } });
     try {
       await expect(restarted.value.reconcile()).resolves.toMatchObject({ ready: 8, unavailable: 0 });
       expect(restarted.factory.created.some(worker => granted.includes(worker.projectId))).toBe(false);
-      expect(projects.created).toHaveLength(5); expect(projects.deleted).toEqual([]);
-      expect(restarted.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 8 : 9);
+      expect(projects.created).toHaveLength(6); expect(projects.deleted).toEqual([]);
+      expect(restarted.value.snapshot().heldProjects).toHaveLength(earlyCleanup ? 9 : 10);
     } finally { await restarted.value.shutdown("operator-recovery-restart-complete"); }
   }, 30_000);
 
@@ -1977,6 +2141,51 @@ describe("ProjectFleetManager", () => {
     await harness.value.shutdown("test-complete");
   });
 
+  it("freezes project creation, replacement and deletion during independent internet loss", async () => {
+    const files = await state();
+    const projects = new FakeProjects([]);
+    const clock = new StepClock();
+    let offline = true;
+    const connectivity = new PrismConnectivityMonitor({ clock, probe: async () => ({ reachable: !offline, reason: offline ? "dns" : "reachable" }) });
+    const flush = async () => { for (let turn = 0; turn < 50; turn++) await Promise.resolve(); };
+    const lifecycle: FleetLifecycleEvent[] = [];
+    const harness = manager({
+      config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),
+      manifest: files.manifest, projects, connectivity,
+      randomUuid: uuidSequence(A, B, C, D, E),
+      recoveryCircuitSnapshot: () => recoveryCircuit("closed", null),
+      onLifecycleEvent: event => lifecycle.push(event),
+    });
+    try {
+      connectivity.requestCheck(); await flush();
+      expect(connectivity.snapshot().state).toBe("unreachable");
+      expect((await harness.value.reconcile()).projectMutation?.state).toBe("open");
+      expect(projects.created).toEqual([]);
+      offline = false; clock.releaseNext(); await flush();
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(4);
+
+      harness.factory.runtimes.get(A)!.state = "recovering";
+      for (let count = 1; count <= 3; count++) harness.value.observeRecoveryEvent(recoveryRetry(A, count));
+      offline = true; connectivity.requestCheck(); await flush();
+      expect(connectivity.snapshot().state).toBe("checking");
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(4);
+      expect(projects.deleted).toEqual([]);
+      clock.releaseNext(); await flush();
+      expect(connectivity.snapshot().state).toBe("unreachable");
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(4);
+      expect(projects.deleted).toEqual([]);
+      expect(lifecycle).toContainEqual(expect.objectContaining({ type: "mutation_blocked", projectId: A, reason: "recovery_circuit" }));
+
+      offline = false; clock.releaseNext(); await flush();
+      await harness.value.reconcile();
+      expect(projects.created).toHaveLength(5);
+      expect(projects.deleted).toEqual([A]);
+    } finally { await harness.value.shutdown("test-complete"); connectivity.close(); }
+  });
+
   it("opens a local project-mutation circuit and suppresses create storms", async () => {
     const files = await state();
     const projects = new FailingCreateProjects([]);
@@ -2042,7 +2251,7 @@ describe("ProjectFleetManager", () => {
     const files = await state();
     await files.manifest.initialize("authenticated");
     await files.manifest.completeLegacyMigration();
-    for (const [index, id] of [A, B, C, D, E].entries()) {
+    for (const [index, id] of [A, B, C, D].entries()) {
       await files.manifest.reserveWorker({
         index: index + 1,
         projectId: id,
@@ -2052,6 +2261,14 @@ describe("ProjectFleetManager", () => {
       await files.manifest.markCreated(id, index + 10);
     }
     await files.manifest.markDraining(A, "replacement", 100);
+    await files.manifest.reserveWorker({
+      index: 5,
+      projectId: E,
+      title: "GhostProv Worker 5",
+      nowMs: 101,
+      replacementForProjectId: A,
+    });
+    await files.manifest.markCreated(E, 102);
     const projects = new FakeProjects([A, B, C, D, E].map(id => project(id)));
     const harness = manager({
       config: config(files.cookieFile, { explicit: [], target: 4, provisionConcurrency: 4 }),

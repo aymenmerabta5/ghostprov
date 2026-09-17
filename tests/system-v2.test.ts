@@ -301,6 +301,7 @@ async function harness(): Promise<{
     },
     dependencies: {
       machineProbe,
+      connectivityProbe: async () => ({ reachable: true, reason: "reachable" as const }),
       governor: new ResourceGovernor({ probe: machineProbe }),
       sessionManager: {
         resolve: async () => ({
@@ -800,7 +801,7 @@ describe("V2 browserless system composition", () => {
     expect(value.sessionCloses()).toBe(1);
   });
 
-  it("connects default R10 maintenance to held journals after healthy fleet readiness", async () => {
+  it.each([false, true])("connects R10 held maintenance while retaining strict shutdown policy: %s", async requireRetainedBootstrapCleanup => {
     const value = await harness();
     const events: unknown[] = [];
     value.dependencies.logger = {
@@ -843,7 +844,12 @@ describe("V2 browserless system composition", () => {
     } finally {
       // A missing journal cannot resolve the manifest's outstanding cleanup
       // hold or authorize an unattended poweroff.
-      await expect(system.close()).rejects.toThrow("bootstrap cleanup was incomplete");
+      const closing = system.close({ requireRetainedBootstrapCleanup });
+      if (requireRetainedBootstrapCleanup) {
+        await expect(closing).rejects.toThrow("bootstrap cleanup was incomplete");
+      } else {
+        await expect(closing).resolves.toBeUndefined();
+      }
       expect(value.sessionCloses()).toBe(1);
       expect((await manifest.load()).workers.find(worker => worker.projectId === held)?.retirementReason).toBe("bootstrap_hold");
     }
@@ -1082,6 +1088,37 @@ describe("V2 browserless system composition", () => {
       await system.close();
     }
   }, 30_000);
+
+  it("owns one credential-free connectivity probe and aborts it after fleet shutdown", async () => {
+    const value = await harness();
+    let checks = 0, checkSignal: AbortSignal | undefined;
+    let finishCheck: (() => void) | undefined;
+    const events: ObservabilityEvent[] = [];
+    value.dependencies.logger = {
+      emit: event => { events.push(event); },
+      snapshot: () => ({ queuedEvents: 0, queuedBytes: 0, droppedSamples: 0, droppedProgress: 0, droppedTerminals: 0, sinkErrors: 0 }),
+      close: async () => {},
+    };
+    value.dependencies.projects = { get: async () => { throw new TypeError("offline project connection"); } };
+    value.dependencies.connectivityProbe = signal => {
+      checks++; checkSignal = signal;
+      return new Promise(resolve => { finishCheck = () => resolve({ reachable: true, reason: "reachable" }); });
+    };
+    const system = await createBrowserlessSystem(value.env, value.dependencies);
+    try {
+      await system.fleet.reconcile();
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(checks).toBe(1);
+      expect(system.fleet.snapshot().projectMutation?.state).toBe("open");
+      expect(checkSignal?.aborted).toBe(false);
+      await system.close();
+      expect(checkSignal?.aborted).toBe(true);
+      finishCheck?.();
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(events.filter(event => event.event === "prism.connectivity.changed").map(event => event.connectivity_state))
+        .toEqual(["checking", "closed"]);
+    } finally { await system.close(); finishCheck?.(); }
+  });
 
   it("fails closed when one legal jumbo event cannot fit host headroom", async () => {
     const value = await harness();

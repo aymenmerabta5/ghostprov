@@ -349,6 +349,11 @@ export type PrismCircuitState = typeof PRISM_CIRCUIT_STATES[number];
 export const PRISM_CIRCUIT_SCOPES = ["auth", "outage"] as const;
 export type PrismCircuitScope = typeof PRISM_CIRCUIT_SCOPES[number] | null;
 
+export const PRISM_CONNECTIVITY_STATES = ["unknown", "checking", "reachable", "unreachable", "closed"] as const;
+export const PRISM_CONNECTIVITY_REASONS = [
+  "unobserved", "checking", "reachable", "no_interface", "dns", "timeout", "transport", "service_unavailable", "closed",
+] as const;
+
 export type ObservabilityEventName =
   | "server.started"
   | "server.stopping"
@@ -371,6 +376,7 @@ export type ObservabilityEventName =
   | "logger.dropped"
   | "logger.error"
   | "sandbox.liveness"
+  | "prism.connectivity.changed"
   | FleetLifecycleObservabilityEventName
   | RecoveryObservabilityEventName;
 

@@ -72,7 +72,9 @@ export function createHeldBootstrapMaintenance(options: HeldBootstrapMaintenance
         assets: options.assets(worker.projectId),
         bootstrapJournal: options.journalFactory(worker.projectId),
         ...(options.hostFactory ? { hostFactory: options.hostFactory } : {}),
-        onCleanupRequired: binding => options.lifecycle.requireCleanup(binding),
+        // The manifest hold plus exact submitted journal already persist this
+        // historical obligation. A failed maintenance probe closes its
+        // temporary host and must not poison the current process lifecycle.
         onCleanupProven: binding => options.lifecycle.confirmCleanup(binding),
         getYSweet: async activeSignal => {
           await acquire(activeSignal);
