@@ -2,6 +2,8 @@
 
 GhostProv is a browserless OpenAI-compatible router over independent Prism sandbox projects. Per-project Deno Awareness sidecars distribute work while preserving terminal proof, provider-persisted continuation, GPT Image compatibility, and Claude/Codex streaming.
 
+For education purposes only. its now opensourced
+
 The project is pinned to Bun 1.4.0, TypeScript 7.0.2, and the hermetic `bun run test` gate. Playwright and Chromium are not runtime dependencies.
 
 ## Browserless configuration
